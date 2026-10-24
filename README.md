@@ -12,8 +12,9 @@ Deployed by `kubernetes/droppedneedle` as `music.xarif.de`.
 - **v2 is frozen** (last `main` commit 2026-09-28), so starting on v2 would only buy a
   migration later.
 - **No maintained fork yet.** The fork machinery (base/dagger-modules `docs/fork.md`)
-  follows upstream *releases*; v3 has none, and we carry no patch. Revisit when v3.0.0 is
-  released **and** a patch of our own is needed (skill `maintaining-github-forks-on-forgejo`).
+  follows upstream *releases*; v3 has none, and the only patch is a one-line
+  User-Agent fix (`build/patches/`). Revisit when v3.0.0 is released **and** we
+  carry more than such a one-liner (skill `maintaining-github-forks-on-forgejo`).
 
 ## Updating the pinned commit — only on purpose
 
@@ -46,6 +47,7 @@ upstream commit.
 | pnpm | the version upstream's Dockerfile at that commit installs (read from it) |
 | `python3` | omitted — upstream installs it only to run Python plugins, none run here |
 | `/app/VERSION` | `v3-<12-hex commit>`; also baked into the binary as `COMMIT_TAG` |
+| `build/patches/` | applied with `git apply` on top of the commit; the build fails if one no longer applies. `0001`: the User-Agent in v2.6.1's form, because musicbrainz.org drops v3's `DroppedNeedle/...` form (reasons and removal condition in the patch header) |
 
 ## License
 

@@ -1,0 +1,47 @@
+xarif build: send the User-Agent in DroppedNeedle v2.6.1's form.
+
+Why: musicbrainz.org's edge drops connections whose User-Agent starts with
+`DroppedNeedle/` (upstream v2.6.1 release notes, 2026-08-24: "its edge began
+dropping connections that used DroppedNeedle's old User-Agent"; v2.6.1 moved
+to `DroppedNeedleApp/<version> (<id>; <contact>; <url>)`). The v3 rewrite went
+back to the old `DroppedNeedle/...` form (server/kernel/src/http_client.rs:57
+at f65ebf0), and every request to MusicBrainz is dropped (measured
+2026-10-24: v3 form dropped from two networks, any other form answered).
+MusicBrainz asks for `Application/<version> ( contact )`
+(doc/MusicBrainz_API/Rate_Limiting). The id and url name this build, so a
+problem reaches the people running it.
+
+Remove when: upstream v3 sends a User-Agent MusicBrainz accepts.
+
+diff --git a/server/kernel/src/http_client.rs b/server/kernel/src/http_client.rs
+index fa546d8e..cafee2f4 100644
+--- a/server/kernel/src/http_client.rs
++++ b/server/kernel/src/http_client.rs
+@@ -52,10 +52,16 @@ impl Default for HttpSettings {
+ impl HttpSettings {
+     /// The User-Agent every outbound request carries. MusicBrainz asks for
+     /// an application name, version and contact address.
++    ///
++    /// xarif build: the v2.6.1 form (`DroppedNeedleApp/<version> (<id>;
++    /// <contact>; <url>)`). musicbrainz.org drops connections whose
++    /// User-Agent starts with `DroppedNeedle/` since 2026-08-24, the form v3
++    /// went back to; v2.6.1 replaced it for exactly that reason. The id and
++    /// url name this build, not upstream, so a problem reaches us.
+     pub fn user_agent(&self) -> String {
+         format!(
+-            "DroppedNeedle/{} ( {} ; +https://github.com/DroppedNeedle/DroppedNeedle )",
+-            env!("CARGO_PKG_VERSION"),
++            "DroppedNeedleApp/{} (xarif.de; {}; https://git.xarif.de/docker/droppedneedle)",
++            option_env!("COMMIT_TAG").unwrap_or(env!("CARGO_PKG_VERSION")),
+             self.contact_email
+         )
+     }
+@@ -283,7 +289,7 @@ mod tests {
+ 
+         let (head, status) = one_request(factory.no_redirect().clone(), redirect).await;
+         assert_eq!(status, 302, "the no-redirect client hands back the 3xx");
+-        assert!(head.contains("user-agent: droppedneedle/"));
++        assert!(head.contains("user-agent: droppedneedleapp/"));
+         assert!(head.contains("ops@example.org"));
+ 
+         let ok: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";

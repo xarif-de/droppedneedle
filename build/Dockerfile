@@ -6,9 +6,10 @@
 # tags of main only; the v3 CI builds an image but never pushes it), and v2 is
 # frozen (last main commit 2026-09-28). The maintained-fork machinery
 # (base/dagger-modules docs/fork.md) follows upstream RELEASES, of which v3 has
-# none, and we carry no patch. So: one pinned commit, rebuilt only when that pin
-# is moved on purpose. Turn this into a maintained fork once v3.0.0 is released
-# AND a patch of our own is needed.
+# none. Our only patch is the one-line User-Agent fix in build/patches/, small
+# enough to apply here. So: one pinned commit plus that patch, rebuilt only when
+# the pin is moved on purpose. Turn this into a maintained fork once v3.0.0 is
+# released AND we carry a patch that is more than such a one-liner.
 #
 # ── WHY THE COMMIT ONLY MOVES ON PURPOSE ─────────────────────────────────────
 #
@@ -31,6 +32,12 @@ ARG DROPPEDNEEDLE_REF="v3"
 ARG DROPPEDNEEDLE_COMMIT="f65ebf0c0a9dca3203f312dc9e6f7444a51c5e0e"
 
 WORKDIR /src
+# Local patches on top of the pinned commit (build/patches/, applied in name
+# order). `git apply` refuses a patch whose context no longer matches, so a
+# commit bump that touches a patched line fails the build here instead of
+# shipping without the fix. Each patch's header says why it exists and when it
+# can go.
+COPY patches/ /patches/
 # Fetch exactly one commit by sha; GitHub serves reachable commits by id.
 RUN git init -q . && \
     git remote add origin https://github.com/DroppedNeedle/DroppedNeedle.git && \
@@ -40,6 +47,7 @@ RUN git init -q . && \
     if [ "$actual" != "$DROPPEDNEEDLE_COMMIT" ]; then \
         echo "FATAL: fetched $actual, expected $DROPPEDNEEDLE_COMMIT" >&2; exit 1; \
     fi && \
+    for patch in /patches/*.patch; do git apply --verbose "$patch" || exit 1; done && \
     printf 'v3-%s' "$(git rev-parse --short=12 HEAD)" > /src/.commit_tag && \
     git log -1 --format=%cI > /src/.build_date && \
     sed -n 's/.*npm install -g pnpm@\([0-9.]*\).*/\1/p' Dockerfile > /src/.pnpm_version && \

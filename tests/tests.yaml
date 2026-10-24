@@ -76,3 +76,16 @@ tests:
         output:
           expect:
             - "VERSION_OK"
+
+  - name: user-agent-patch-is-in-the-binary
+    timeout: 60s
+    steps:
+      # build/patches/0001: MusicBrainz drops the `DroppedNeedle/` User-Agent.
+      # The format string's literal pieces land in the binary as plain bytes:
+      # the patched prefix must be there and the dropped form's tail must not,
+      # or a commit bump has silently lost the patch.
+      - run:
+          - sh -c "grep -a 'DroppedNeedleApp/' /usr/local/bin/droppedneedle >/dev/null && ! grep -a '+https://github.com/DroppedNeedle/DroppedNeedle )' /usr/local/bin/droppedneedle >/dev/null && echo UA_PATCHED"
+        output:
+          expect:
+            - "UA_PATCHED"
