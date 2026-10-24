@@ -1,0 +1,117 @@
+Plan an ID3v2.3 file's original date as the year the file can hold.
+
+Why: on ID3v2.3 the original date is written to TORY, which keeps the year
+only (fields.rs Id3Target, id3_edit.rs year_of). The profile planner compared
+the release's full date ("2015-01-12") with the "2015" read back, so every
+plan saw a change. With automatic management on, each scan re-planned and
+rewrote the same albums: measured 2026-10-24, about 15 albums rewritten every
+~6 minutes (one 10 times in 100 minutes), each run only "original_date: 2015
+-> 2015-01-12". The planner now brings the desired value into TORY's form,
+next to the existing "/"-join for v2.3 multi-values.
+
+Tests: new unit test plans a v2.3 file twice; the second plan changes
+nothing. It fails without the fix with the loop's own symptom (pass 0 wants
+"2015-01-12").
+
+Remove when: upstream compares v2.3 original dates by year.
+
+diff --git a/server/library/src/management/profile.rs b/server/library/src/management/profile.rs
+index 0509bae7..9409c60b 100644
+--- a/server/library/src/management/profile.rs
++++ b/server/library/src/management/profile.rs
+@@ -703,11 +703,18 @@ pub fn plan_tags(
+     desired.retain(|_, values| !values.is_empty());
+     if id3v23 {
+         // Compare in the form the file can hold, or every plan would see
+-        // a change.
++        // a change: one "/"-joined value, and only the year of the
++        // original date (`TORY`).
+         for (name, values) in desired.iter_mut() {
+-            if values.len() > 1 && TagField::from_name(name).is_some_and(joined_on_v23) {
++            let field = TagField::from_name(name);
++            if values.len() > 1 && field.is_some_and(joined_on_v23) {
+                 *values = vec![values.join("/")];
+             }
++            if field == Some(TagField::OriginalDate) {
++                for value in values.iter_mut() {
++                    *value = crate::tags::save::year_of(value);
++                }
++            }
+         }
+     }
+     let mut updates = BTreeMap::new();
+@@ -1793,6 +1800,48 @@ mod tests {
+         }
+     }
+ 
++    /// ID3v2.3 keeps only the year of the original date (`TORY`). Planned
++    /// in that form, a second plan finds nothing to change.
++    #[test]
++    fn id3v23_original_date_is_planned_as_its_year() {
++        let (mut release, _) = classical();
++        release.original_date = Some("2015-01-12".to_owned());
++        let settings = settings::initial_settings("");
++        let pinned = pin(&settings, settings::PICARD_ORGANIZER_PROFILE_ID, None).expect("pinned");
++        let mut doc: TagDocument = serde_json::from_value(serde_json::json!({
++            "managed": {},
++            "custom": {}
++        }))
++        .expect("document");
++        for pass in 0..2 {
++            let plan = plan_tags(
++                &pinned,
++                &CompiledScripts::new(&pinned),
++                &FileInput {
++                    release: &release,
++                    track: &release.tracks[0],
++                    doc: &doc,
++                    format: "mp3",
++                    id3v23: true,
++                    writable: true,
++                    overrides: &Overrides::default(),
++                    extras: &AlbumExtras::default(),
++                    track_id: "track",
++                    lyrics: &LyricsAnswer::Off,
++                },
++            )
++            .expect("planned");
++            assert_eq!(plan.desired["original_date"], vec!["2015"], "pass {pass}");
++            assert_eq!(
++                plan.updates.contains_key("original_date"),
++                pass == 0,
++                "pass {pass}: {:?}",
++                plan.updates
++            );
++            doc.managed = plan.desired.clone();
++        }
++    }
++
+     /// Picard's performer wording and the work rules, case by case.
+     #[test]
+     fn performers_and_works_read_as_picard_writes_them() {
+diff --git a/server/library/src/tags/save/id3.rs b/server/library/src/tags/save/id3.rs
+index 7510be85..34981101 100644
+--- a/server/library/src/tags/save/id3.rs
++++ b/server/library/src/tags/save/id3.rs
+@@ -306,7 +306,7 @@ pub(super) fn date_parts(value: &str) -> Option<DateParts<'_>> {
+ }
+ 
+ /// The year of a date, or the value as it is when it is not a date.
+-pub(super) fn year_of(value: &str) -> String {
++pub(crate) fn year_of(value: &str) -> String {
+     match date_parts(value) {
+         Some((year, _, _)) => year.to_owned(),
+         None => value.to_owned(),
+diff --git a/server/library/src/tags/save/mod.rs b/server/library/src/tags/save/mod.rs
+index fbe9c34d..51faae9f 100644
+--- a/server/library/src/tags/save/mod.rs
++++ b/server/library/src/tags/save/mod.rs
+@@ -62,7 +62,7 @@ pub use id3_upgrade::{id3_lands_as_v23, id3_upgrade_notes};
+ pub use kept::{LeftAlone, TagsKept, tags_kept};
+ pub use v2_captured::{CapturedAtom, CapturedTags, CapturedValue, document_from_captured};
+ 
+-pub(crate) use id3::mixed_v23_date;
++pub(crate) use id3::{mixed_v23_date, year_of};
+ 
+ use std::fs::{self, File, OpenOptions};
+ use std::io::ErrorKind;

@@ -1,0 +1,95 @@
+Catalogue a file whose tag holds an item lofty cannot parse.
+
+Why: lofty's default mode fails the whole file on one bad item. 5 MP3s in the
+library carry a TDRL (release time) frame holding a web address instead of a
+date; every scan skipped them as TAG_READ_FAILED, so they were missing from
+the catalogue (checked 2026-10-24 against lofty 0.25.4: BestAttempt fails,
+Relaxed reads 29-36 items each). The catalogue reads (scan metadata, tag
+half, cover art) now use lofty's Relaxed mode, which drops the bad item. The
+save path keeps the default mode, so such a file is still refused for writes
+and left as it is.
+
+Not covered: a frame whose size is corrupt (one file here, a COMM frame) still
+fails in Relaxed mode too.
+
+Tests: new test with a TDRL holding a web address reads, and a save is
+refused with the file unchanged; it fails without the fix.
+
+Remove when: upstream reads leniently or lofty skips such items by default.
+
+diff --git a/server/library/src/tags/read.rs b/server/library/src/tags/read.rs
+index 341fc095..dd223506 100644
+--- a/server/library/src/tags/read.rs
++++ b/server/library/src/tags/read.rs
+@@ -157,7 +157,7 @@ pub fn read_scan_metadata(
+         };
+         return Ok((tag, header));
+     }
+-    let tagged = lofty::read_from_path(path).map_err(|error| {
++    let tagged = read_lenient(path).map_err(|error| {
+         // An I/O failure (a file vanishing mid-scan, a contended disk) is
+         // worth a retry; anything else is a broken file.
+         let io = std::error::Error::source(&error)
+@@ -201,12 +201,24 @@ pub fn read_scan_metadata(
+     Ok((tag, header))
+ }
+ 
++/// The file as the catalog reads it: an item lofty cannot parse (a
++/// `TDRL` holding a web address rather than a date) is dropped instead of
++/// failing the whole file, so the track is still listed. Writes keep
++/// lofty's default mode and refuse such a file.
++fn read_lenient(path: &Path) -> Result<TaggedFile, lofty::error::FileParseError> {
++    lofty::probe::Probe::open(path)?
++        .options(
++            lofty::config::ParseOptions::new().parsing_mode(lofty::config::ParsingMode::Relaxed),
++        )
++        .read()
++}
++
+ /// Read the tag half only. The probe half lives in [`super::probe`].
+ pub fn read_tag_only(path: &Path, format: AudioFormat) -> Result<AudioTag, TagsError> {
+     if format == AudioFormat::Aac {
+         return read_ape_tag(path);
+     }
+-    let tagged = lofty::read_from_path(path).map_err(|error| TagsError::TagRead {
++    let tagged = read_lenient(path).map_err(|error| TagsError::TagRead {
+         path: path.display().to_string(),
+         reason: error.to_string(),
+     })?;
+@@ -289,7 +301,7 @@ pub fn read_cover_art(path: &Path) -> Result<Option<Vec<u8>>, TagsError> {
+     // WMA is unrecognized even here: v2 returned None by falling through,
+     // v3 rejects the extension before any reader runs.
+     format_for_path(path)?;
+-    let tagged = lofty::read_from_path(path).map_err(|error| TagsError::TagRead {
++    let tagged = read_lenient(path).map_err(|error| TagsError::TagRead {
+         path: path.display().to_string(),
+         reason: error.to_string(),
+     })?;
+diff --git a/server/tests/library/library_tags.rs b/server/tests/library/library_tags.rs
+index 52d82a01..a835ac7c 100644
+--- a/server/tests/library/library_tags.rs
++++ b/server/tests/library/library_tags.rs
+@@ -317,6 +317,23 @@ fn routing_recognizes_v2_set_minus_wma() {
+     assert!(format_for_path(Path::new("a.txt")).is_err());
+ }
+ 
++/// A tag item lofty cannot parse (a release date holding a web
++/// address) is dropped on read, so the file is still catalogued; a save
++/// still refuses it and leaves the file as it was.
++#[test]
++fn an_unparsable_tag_item_does_not_hide_the_file() {
++    let frames = vec![
++        ("TIT2", latin1(&["Probe"])),
++        ("TDRL", latin1(&["www.example.com"])),
++    ];
++    let (_dir, path) = raw_id3_mp3("unparsable-item", 3, &frames);
++    let (tag, _) = tags::read_tags(&path).unwrap();
++    assert_eq!(tag.title, "Probe");
++    let before = std::fs::read(&path).unwrap();
++    assert!(tags::save_tags(&path, &[TagEdit::set_title("New")]).is_err());
++    assert_eq!(std::fs::read(&path).unwrap(), before);
++}
++
+ #[test]
+ fn wma_is_unrecognized_on_every_entry() {
+     let path = fixture("management_full.wma");
