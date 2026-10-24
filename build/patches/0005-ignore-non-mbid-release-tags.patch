@@ -1,0 +1,68 @@
+xarif build: ignore a release tag that is not an MBID.
+
+Why: beets' Discogs plugin writes Discogs ids (e.g. `1274403`) into the
+MusicBrainz Album Id tag. LocalAlbum::tagged_release() took that value as a
+release MBID, identification looked it up, MusicBrainz/BrainzMash answered
+400 "Invalid mbid." (measured 2026-10-24 against api.brainzmash.cc), and the
+album was deferred as "musicbrainz unavailable" on every attempt: the
+library's "Identifying changed albums" task never finished (3 of 334 albums
+of the imported Seafile library). A non-MBID tag now counts as no tag, so
+the album goes through the normal search recall.
+
+Tests: two unit tests in matching/model.rs; the Discogs-id test fails
+without the fix and passes with it (cargo test -p droppedneedle-library
+--lib xarif_tagged_release).
+
+Remove when: upstream validates the release tag before looking it up.
+
+diff --git a/server/library/src/matching/model.rs b/server/library/src/matching/model.rs
+index ee50b1e7..782b7f36 100644
+--- a/server/library/src/matching/model.rs
++++ b/server/library/src/matching/model.rs
+@@ -81,6 +81,13 @@ impl LocalAlbum {
+                 continue;
+             };
+             let mbid = mbid.trim().to_ascii_lowercase();
++            // xarif build: a release tag that is not an MBID (beets' Discogs
++            // plugin writes Discogs ids such as `1274403` into this field) is
++            // no tagged release. Looked up, it answers 400 "Invalid mbid." on
++            // every attempt, and identification defers the album forever.
++            if !droppedneedle_providers::musicbrainz::is_valid_mbid(&mbid) {
++                continue;
++            }
+             match counts.iter_mut().find(|(seen, _)| *seen == mbid) {
+                 Some((_, count)) => *count += 1,
+                 None => counts.push((mbid, 1)),
+@@ -397,3 +404,32 @@ fn year_of(date: Option<&str>) -> Option<i32> {
+         .then(|| year.parse().ok())
+         .flatten()
+ }
++
++#[cfg(test)]
++mod xarif_tagged_release_tests {
++    use super::*;
++
++    fn album(ids: &[&str]) -> LocalAlbum {
++        LocalAlbum {
++            tracks: ids
++                .iter()
++                .map(|id| LocalTrack {
++                    release_mbid: Some((*id).to_owned()),
++                    ..LocalTrack::default()
++                })
++                .collect(),
++            ..LocalAlbum::default()
++        }
++    }
++
++    #[test]
++    fn a_discogs_id_in_the_release_tag_is_no_tagged_release() {
++        assert_eq!(album(&["1274403", "1274403"]).tagged_release(), None);
++    }
++
++    #[test]
++    fn a_real_mbid_still_counts() {
++        let id = "64e58cc0-a214-4a4a-97e5-9ca97b03d3bc";
++        assert_eq!(album(&[id, id]).tagged_release().as_deref(), Some(id));
++    }
++}

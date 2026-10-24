@@ -47,7 +47,7 @@ upstream commit.
 | pnpm | the version upstream's Dockerfile at that commit installs (read from it) |
 | `python3` | omitted — upstream installs it only to run Python plugins, none run here |
 | `/app/VERSION` | `v3-<12-hex commit>`; also baked into the binary as `COMMIT_TAG` |
-| `build/patches/` | applied with `git apply` on top of the commit; the build fails if one no longer applies. `0001`: the User-Agent in v2.6.1's form, because musicbrainz.org drops v3's `DroppedNeedle/...` form; `0002`: MusicBrainz paced at 0.5/s and the Cover Art Archive at 1/s instead of 1 and 10; `0003`: the OIDC callback page reads the exchange answer it actually gets (upstream ends a successful SSO sign-in on "Could not reach the server"); `0004`: the login page starts SSO at once (`/login?local` keeps the password form). Reasons and removal conditions in each patch header |
+| `build/patches/` | applied with `git apply` on top of the commit; the build fails if one no longer applies. `0001`: the User-Agent in v2.6.1's form, because musicbrainz.org drops v3's `DroppedNeedle/...` form; `0002`: MusicBrainz paced at 0.5/s and the Cover Art Archive at 1/s instead of 1 and 10; `0003`: the OIDC callback page reads the exchange answer it actually gets (upstream ends a successful SSO sign-in on "Could not reach the server"); `0004`: the login page starts SSO at once (`/login?local` keeps the password form); `0005`: a release tag that is not an MBID (Discogs ids written by beets) is ignored instead of deferring identification forever. Reasons and removal conditions in each patch header |
 
 ## License
 
