@@ -1,0 +1,17 @@
+# Blueprint: https://git.xarif.de/base/dagger-ci-basics
+# Reusable workflow: https://git.xarif.de/base/dagger-modules
+
+[tasks.pipeline]
+description = "The CI pipeline, locally (dagger-ci.yaml): image build + tests; never publishes"
+run = "DAGGER_NO_NAG=1 dagger call -m git.xarif.de/base/dagger-modules.git@main ci --source=."
+
+[tasks.image]
+description = "Build the image and load it into the local Docker engine as xarif-droppedneedle"
+run = """
+export DAGGER_NO_NAG=1
+TARBALL="/tmp/droppedneedle-$$.tar"
+trap 'rm -f "$TARBALL"' EXIT   # a trap, not a last line: it must not mask a failed build
+dagger call -m git.xarif.de/base/dagger-modules.git@main build-image --source=build export --path="$TARBALL" &&
+docker tag "$(docker load -i "$TARBALL" | sed 's/Loaded image.*: //')" xarif-droppedneedle &&
+echo "Image available as: xarif-droppedneedle"
+"""

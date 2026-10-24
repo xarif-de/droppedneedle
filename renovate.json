@@ -1,0 +1,34 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "local>infra/renovate-config"
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "The pinned upstream commit of DroppedNeedle's unreleased v3 branch (build/Dockerfile). Tracks the head of DROPPEDNEEDLE_REF as a git digest.",
+      "managerFilePatterns": ["/(^|/)Dockerfile$/"],
+      "matchStrings": [
+        "ARG DROPPEDNEEDLE_REF=\"(?<currentValue>[^\"]+)\"\\s+ARG DROPPEDNEEDLE_COMMIT=\"(?<currentDigest>[0-9a-f]{40})\""
+      ],
+      "depNameTemplate": "https://github.com/DroppedNeedle/DroppedNeedle.git",
+      "datasourceTemplate": "git-refs",
+      "versioningTemplate": "git"
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "A new upstream commit can carry migrations that a later build refuses to undo, and v3 still edits shipped migrations. It moves only on purpose: never automatic, only after approval in the dependency dashboard, with a database backup first (kubernetes/droppedneedle README, Updating).",
+      "matchDepNames": ["https://github.com/DroppedNeedle/DroppedNeedle.git"],
+      "automerge": false,
+      "dependencyDashboardApproval": true
+    },
+    {
+      "description": "The rust and node base images follow the pinned commit (its rust-toolchain.toml and upstream Dockerfile), not their own release cadence; the Dockerfile fails the build when rust and the toolchain file disagree. Only digest refreshes of the same tag are taken automatically.",
+      "matchDatasources": ["docker"],
+      "matchPackageNames": ["rust", "node", "debian"],
+      "matchUpdateTypes": ["major", "minor", "patch"],
+      "enabled": false
+    }
+  ]
+}

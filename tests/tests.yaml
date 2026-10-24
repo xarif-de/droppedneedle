@@ -1,0 +1,74 @@
+# Test specification for docker/droppedneedle (base/dagger-modules docs/docker-testing.md).
+#
+# The image is one Rust server, its admin tool, the static web UI and ffmpeg. The
+# tests prove what the deployment depends on and what a broken build would hide
+# until the pod crash-loops: both binaries are present AND run (a linking or libc
+# mismatch fails here, not in the cluster), the web UI was built, ffmpeg is there
+# for transcoding, and the image says which upstream commit it is.
+#
+# Deliberately NOT asserted: the commit itself. Moving it is the point of a bump,
+# and a pinned literal here would have to be edited on every one.
+
+tests:
+  - name: image-metadata
+    inspect:
+      # debian-slim + ffmpeg is most of it. The ceiling catches a build that ships
+      # the cargo target directory or node_modules.
+      max_size: 900MiB
+
+  - name: binaries-and-entrypoint-present
+    timeout: 30s
+    steps:
+      - files:
+          - path: /usr/local/bin/droppedneedle
+            mode: "755"
+          - path: /usr/local/bin/droppedneedle-tool
+            mode: "755"
+          - path: /app/entrypoint.sh
+            mode: "755"
+          - path: /app/static/index.html
+          - path: /app/VERSION
+            mode: "644"
+
+  - name: server-binary-runs
+    timeout: 60s
+    steps:
+      # --print-openapi dumps the API contract and exits before touching
+      # /app/config or /app/cache (upstream server/src/main.rs), so it proves the
+      # binary loads and links without needing a database.
+      - run:
+          - sh -c "/usr/local/bin/droppedneedle --print-openapi | grep -q '\"openapi\"' && echo SERVER_RUNS"
+        output:
+          expect:
+            - "SERVER_RUNS"
+
+  - name: admin-tool-runs
+    timeout: 30s
+    steps:
+      # The tool restores backups and upgrades databases; it must start even when
+      # the server cannot. `help` prints its usage (upstream server/tool/src/main.rs).
+      - run:
+          - sh -c "/usr/local/bin/droppedneedle-tool help 2>&1 | grep -q 'Usage:' && echo TOOL_RUNS"
+        output:
+          expect:
+            - "TOOL_RUNS"
+
+  - name: ffmpeg-present
+    timeout: 30s
+    steps:
+      - run:
+          - sh -c "ffmpeg -hide_banner -version | head -1 | grep -q '^ffmpeg version' && echo FFMPEG_OK"
+        output:
+          expect:
+            - "FFMPEG_OK"
+
+  - name: version-names-the-upstream-commit
+    timeout: 30s
+    steps:
+      # v3-<12 hex>: the commit this image was built from, for the README's
+      # rollback table and for telling two builds apart in the cluster.
+      - run:
+          - sh -c "grep -Eq '^v3-[0-9a-f]{12}$' /app/VERSION && echo VERSION_OK"
+        output:
+          expect:
+            - "VERSION_OK"
