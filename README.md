@@ -64,6 +64,7 @@ issues is worth it is decided later.
 | `0003-oidc-callback-reads-exchange-answer` | bug: a successful SSO sign-in ends on "Could not reach the server" | yes |
 | `0004-login-redirects-to-sso` | local policy: SSO only (upstream has no setting for it) | as an opt-in setting, not as is |
 | `0005-ignore-non-mbid-release-tags` | bug: a Discogs id in the release tag defers identification forever | yes (with its unit tests) |
+| `0006-quiet-audio-decoder-logs` | bug: decoder chatter floods the log (28k lines / 10 min while analysing) | yes (with its unit test) |
 
 ## License
 
