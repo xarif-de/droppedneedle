@@ -1,11 +1,11 @@
-Log the cause when Library Management cannot read a file at preview.
+Log the cause when Library Management cannot resolve or read a file at preview.
 
-Why: the dry run of 2026-10-24 blocked 10 files as FILE_UNREADABLE, but the
-path and read step of the planner maps the error to that reason without
-logging it, unlike the tag steps next to it ("tags unreadable at preview").
-The files read back whole afterwards (sha256 over all 10), so the cause was
-transient or a path check, and nothing recorded which. The step now logs the
-error at INFO, as its neighbours do.
+Why: the planner's path and read step maps its error to FILE_UNREADABLE (or a
+symlink/root reason) without logging it, unlike the tag steps right after it
+("tags unreadable at preview"). Correction 2026-10-24: the 10 FILE_UNREADABLE
+files of that day's dry run came from the tag step (the picture reader, see
+0009), which did log; the earlier search missed those lines. This patch only
+closes the gap in the step before it.
 
 Tests: none (a log line); cargo check -p droppedneedle-library.
 

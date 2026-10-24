@@ -1,0 +1,110 @@
+Read and write MP3s whose ID3v2 tag is followed by padding outside its size.
+
+Why: 15 of 2,447 MP3s in the library carry zero bytes between the end of the
+ID3v2 tag (its header size) and the first MPEG frame: 13 x 1044 bytes, one
+1531, one 9405 (in-pod scan 2026-10-24). The picture reader guessed the
+format from the bytes, and lofty's guess looks only 1024 bytes past the tag,
+so these files failed with "no format could be determined" and Library
+Management blocked them as FILE_UNREADABLE (10 in that day's dry run, one
+taking its album along). The format is known from the file name, as for the
+save's own read from the path: the picture reader now passes it. lofty's
+write checks the type from the bytes again with the same 1024-byte reach,
+so the ID3 save widens it to 64 KiB (7x the largest gap measured).
+
+Tests: new test pads a fixture with 1044 zero bytes after its tag; it reads,
+saves, keeps its pictures and its audio bytes. Reverting either half fails it
+(read: picture reader; write: save refused). Full `cargo test --test library`
+and `-p droppedneedle-library --lib`: same pre-existing macOS failure set as
+without the series, one more test passing.
+
+Remove when: upstream reads the format from the file it already knows.
+
+diff --git a/server/library/src/tags/save/document.rs b/server/library/src/tags/save/document.rs
+index db06aa40..3d47560f 100644
+--- a/server/library/src/tags/save/document.rs
++++ b/server/library/src/tags/save/document.rs
+@@ -133,15 +133,16 @@ pub(super) fn read_pictures(
+             Ok(with_info(file.vorbis_comments().pictures()))
+         }
+         AudioFormat::Mp3 | AudioFormat::M4a => {
+-            let tag_type = if format == AudioFormat::Mp3 {
+-                TagType::Id3v2
++            let (tag_type, file_type) = if format == AudioFormat::Mp3 {
++                (TagType::Id3v2, lofty::file::FileType::Mpeg)
+             } else {
+-                TagType::Mp4Ilst
++                (TagType::Mp4Ilst, lofty::file::FileType::Mp4)
+             };
+-            let tagged = lofty::probe::Probe::new(&mut reader)
++            // The format is known, as it is to the save's own read from the
++            // path; guessing it from the bytes fails on an MP3 whose ID3v2
++            // tag is followed by padding outside its size.
++            let tagged = lofty::probe::Probe::with_file_type(&mut reader, file_type)
+                 .options(options)
+-                .guess_file_type()
+-                .map_err(failed)?
+                 .read()
+                 .map_err(failed)?;
+             let mut out: Vec<PictureSpec> = tagged
+diff --git a/server/library/src/tags/save/id3_edit.rs b/server/library/src/tags/save/id3_edit.rs
+index 241a99d9..658796e1 100644
+--- a/server/library/src/tags/save/id3_edit.rs
++++ b/server/library/src/tags/save/id3_edit.rs
+@@ -442,11 +442,21 @@ pub(super) fn apply(
+         Some(tag) => tag.major == 3,
+         None => matches!(native.original_version(), Id3v2Version::V3),
+     };
++    // lofty checks the file's type from its bytes before it writes, and
++    // looks for the first MPEG frame at most `max_junk_bytes` past the
++    // tag; padding left after a tag's size can be longer than its default.
++    let parse = lofty::config::ParseOptions::new().max_junk_bytes(MAX_PADDING_AFTER_TAG);
+     native
+-        .save_to_path(temp, WriteOptions::new().use_id3v23(pin_v23))
++        .save_to_path(
++            temp,
++            WriteOptions::new().use_id3v23(pin_v23).parse_options(parse),
++        )
+         .map_err(save_failed)
+ }
+ 
++/// How far past an ID3v2 tag a save still finds the first MPEG frame.
++const MAX_PADDING_AFTER_TAG: usize = 64 * 1024;
++
+ /// Timestamp ids that alias across ID3 versions: the merge emits v2.4
+ /// ids that the writer converts on v2.3 saves, so each family is cleared
+ /// as a unit before truth goes back.
+diff --git a/server/tests/library/library_tags.rs b/server/tests/library/library_tags.rs
+index f0622ea2..52d82a01 100644
+--- a/server/tests/library/library_tags.rs
++++ b/server/tests/library/library_tags.rs
+@@ -2130,6 +2130,30 @@ fn id3_raw_frames_scrub_and_restore() {
+     assert_eq!(restored.get("id3:WOAR"), Some(&vec![link]));
+ }
+ 
++/// Zero padding between an MP3's ID3v2 tag and its first frame, outside
++/// the tag's size, keeps the file readable and writable, pictures included.
++#[test]
++fn mp3_with_padding_after_the_tag_is_saved() {
++    let (_scratch, path) = temp_copy("management_full.mp3", "padded");
++    let bytes = std::fs::read(&path).unwrap();
++    assert_eq!(&bytes[..3], b"ID3");
++    let size = bytes[6..10]
++        .iter()
++        .fold(0usize, |size, byte| (size << 7) | usize::from(*byte & 0x7F));
++    let end = 10 + size;
++    let mut padded = bytes[..end].to_vec();
++    padded.extend(std::iter::repeat_n(0u8, 1044));
++    padded.extend_from_slice(&bytes[end..]);
++    std::fs::write(&path, padded).unwrap();
++    let pictures = tags::save::read_document(&path).unwrap().pictures;
++    assert_eq!(tags::save::tags_kept(&path).unwrap().refusal, None);
++    tags::save_tags(&path, &[TagEdit::set_title("Padded")]).unwrap();
++    let after = tags::save::read_document(&path).unwrap();
++    assert_eq!(after.values[&TagField::Title], vec!["Padded".to_owned()]);
++    assert_eq!(after.pictures, pictures);
++    assert!(std::fs::read(&path).unwrap().ends_with(&bytes[end..]));
++}
++
+ /// An empty comment reads as absent, so a save drops it and keeps every
+ /// other comment, and a replay of the read document (what an undo
+ /// writes) saves cleanly.

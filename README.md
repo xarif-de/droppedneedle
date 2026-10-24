@@ -66,7 +66,8 @@ issues is worth it is decided later.
 | `0005-ignore-non-mbid-release-tags` | bug: a Discogs id in the release tag defers identification forever | yes (with its unit tests) |
 | `0006-quiet-audio-decoder-logs` | bug: decoder chatter floods the log (28k lines / 10 min while analysing) | yes (with its unit test) |
 | `0007-drop-empty-vorbis-values` | bug: one empty Vorbis comment (`LYRICS=`) blocks every tag write to the file, and with it the whole album | yes (with its tests) |
-| `0008-log-why-a-file-is-unreadable` | bug: a file blocked as unreadable at preview leaves no log line saying why | yes |
+| `0008-log-why-a-file-is-unreadable` | gap: the planner's path/read step blocks a file without logging why (its tag steps do) | yes |
+| `0009-mp3-padding-after-id3-tag` | bug: an MP3 with padding after its ID3v2 tag (15 of 2,447 here) is unreadable to the picture reader and the ID3 save | yes (with its test) |
 
 ## License
 
