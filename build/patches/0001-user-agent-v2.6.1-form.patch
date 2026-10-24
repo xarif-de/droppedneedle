@@ -8,8 +8,8 @@ back to the old `DroppedNeedle/...` form (server/kernel/src/http_client.rs:57
 at f65ebf0), and every request to MusicBrainz is dropped (measured
 2026-10-24: v3 form dropped from two networks, any other form answered).
 MusicBrainz asks for `Application/<version> ( contact )`
-(doc/MusicBrainz_API/Rate_Limiting). The id and url name this build, so a
-problem reaches the people running it.
+(doc/MusicBrainz_API/Rate_Limiting). Same url as v2.6.1; the id slot names
+this installation (`xarif.de`) and the contact is CONTACT_EMAIL.
 
 Remove when: upstream v3 sends a User-Agent MusicBrainz accepts.
 
@@ -25,13 +25,13 @@ index fa546d8e..cafee2f4 100644
 +    /// xarif build: the v2.6.1 form (`DroppedNeedleApp/<version> (<id>;
 +    /// <contact>; <url>)`). musicbrainz.org drops connections whose
 +    /// User-Agent starts with `DroppedNeedle/` since 2026-08-24, the form v3
-+    /// went back to; v2.6.1 replaced it for exactly that reason. The id and
-+    /// url name this build, not upstream, so a problem reaches us.
++    /// went back to; v2.6.1 replaced it for exactly that reason. The id
++    /// slot names this installation; the contact is CONTACT_EMAIL.
      pub fn user_agent(&self) -> String {
          format!(
 -            "DroppedNeedle/{} ( {} ; +https://github.com/DroppedNeedle/DroppedNeedle )",
 -            env!("CARGO_PKG_VERSION"),
-+            "DroppedNeedleApp/{} (xarif.de; {}; https://git.xarif.de/docker/droppedneedle)",
++            "DroppedNeedleApp/{} (xarif.de; {}; https://www.droppedneedle.com)",
 +            option_env!("COMMIT_TAG").unwrap_or(env!("CARGO_PKG_VERSION")),
              self.contact_email
          )
