@@ -1,4 +1,5 @@
-xarif build: pace MetaBrainz below the documented ceilings.
+xarif build: pace MusicBrainz, the Cover Art Archive and BrainzMash below
+upstream's rates.
 
 Why: MusicBrainz allows about 1 request per second per IP and declines every
 request over it (doc/MusicBrainz_API/Rate_Limiting); an IP that "impacts the
@@ -7,10 +8,12 @@ experiment ran two MusicBrainz clients from the same address. Upstream's own
 rate table records that a coverartarchive.org burst made every MetaBrainz
 host refuse the client, and both names resolve to one front door
 (142.132.241.153). So: musicbrainz 1.0 -> 0.5/s (operator decision
-2026-10-24), coverartarchive 10 -> 1/s.
+2026-10-24), coverartarchive 10 -> 1/s. BrainzMash publishes no limit;
+upstream forces 10/s, held at 4/s here (operator decision 2026-10-24).
 
-Cost: the first identification of a large library takes about twice as long,
-and cold cover grids fill more slowly.
+Cost: the first identification of a large library takes about twice as long
+on MusicBrainz and 2.5x as long on BrainzMash, and cold cover grids fill
+more slowly.
 
 Remove when: never automatically; revisit only with MetaBrainz's agreement.
 Tests: cargo test -p droppedneedle-providers --lib shows the same single
@@ -18,10 +21,10 @@ failure with and without this patch (cache::tests::
 a_fetch_that_met_a_failure_stores_nothing, pre-existing at f65ebf0).
 
 diff --git a/server/providers/src/rates.rs b/server/providers/src/rates.rs
-index 55d0976c..307d2adf 100644
+index 55d0976c..e4b79d96 100644
 --- a/server/providers/src/rates.rs
 +++ b/server/providers/src/rates.rs
-@@ -44,12 +44,15 @@ pub struct RateRow {
+@@ -44,23 +44,28 @@ pub struct RateRow {
  pub const RATES: &[RateRow] = &[
      RateRow {
          source: "musicbrainz",
@@ -40,7 +43,23 @@ index 55d0976c..307d2adf 100644
          url: "https://musicbrainz.org/doc/MusicBrainz_API/Rate_Limiting",
      },
      RateRow {
-@@ -124,7 +127,10 @@ pub const RATES: &[RateRow] = &[
+         source: "brainzmash",
+-        per_second: Rate::Fixed(10.0),
++        // xarif build: 4, not 10, the operator's choice (2026-10-24); the pool
++        // publishes no limit, so this is courtesy, not a contract.
++        per_second: Rate::Fixed(4.0),
+         burst: 1,
+         max_in_flight: Some(1),
+         verified_on: "2026-10-18",
+         basis: "No documented limit: the page asks for clean, responsible use and \
+-                approves apps case by case. Kept at the forced 10 per second, one in \
+-                flight; its 429 cooldown is the real governor.",
++                approves apps case by case. Upstream forced 10 per second, one in \
++                flight; its 429 cooldown is the real governor. xarif build: 4.",
+         url: "https://brainzmash.cc",
+     },
+     RateRow {
+@@ -124,14 +129,18 @@ pub const RATES: &[RateRow] = &[
      },
      RateRow {
          source: "coverartarchive",
@@ -52,3 +71,12 @@ index 55d0976c..307d2adf 100644
          burst: 1,
          max_in_flight: None,
          verified_on: "2026-10-18",
+         basis: "No rate limiting rules in place; some endpoints answer 503 when a user \
+                 exceeds a limit. Held at 10 per second, one at a time: a burst of 20 \
+                 cold-grid fetches was followed by a five-minute refusal from every \
+-                MetaBrainz host. Redirect hops to archive.org are not paced.",
++                MetaBrainz host. Redirect hops to archive.org are not paced. \
++                xarif build: 1.",
+         url: "https://musicbrainz.org/doc/Cover_Art_Archive/API",
+     },
+     RateRow {
