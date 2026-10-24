@@ -1,0 +1,42 @@
+xarif build: finish the OIDC sign-in instead of reporting "Could not reach the server".
+
+Why: POST /api/v3/auth/oidc/exchange answers the user object itself
+(server/auth/src/routes/federated.rs:275; server/tests/server/auth_federated.rs:418
+pins that shape), but the callback page reads `data.user`. The undefined
+read throws, the catch treats a non-ApiError as a network failure, and a
+sign-in that succeeded (session cookie set, user created) ends on "Could not
+reach the server." Measured on music.xarif.de 2026-10-24: exchange 200,
+then the error page.
+
+Fix: accept both shapes. svelte-check 0 errors, prettier and eslint clean.
+
+Remove when: upstream's callback page reads the exchange answer it gets.
+
+diff --git a/frontend/src/routes/auth/callback/+page.svelte b/frontend/src/routes/auth/callback/+page.svelte
+index 9dd8ce26..74b05511 100644
+--- a/frontend/src/routes/auth/callback/+page.svelte
++++ b/frontend/src/routes/auth/callback/+page.svelte
+@@ -5,7 +5,7 @@
+ 	import { authStore } from '$lib/stores/authStore.svelte';
+ 	import { ApiError } from '$lib/api/client';
+ 	import { createOidcExchangeMutation } from '$lib/queries/auth/AuthMutations.svelte';
+-	import { toAuthUser } from '$lib/queries/auth/types';
++	import { toAuthUser, type SessionUserLike } from '$lib/queries/auth/types';
+ 	import { onMount } from 'svelte';
+ 	import { Music } from 'lucide-svelte';
+ 	import Button from '$lib/ui/Button.svelte';
+@@ -22,7 +22,13 @@
+ 		}
+ 		try {
+ 			const data = await oidcExchange.mutateAsync({ code });
+-			authStore.setUser(toAuthUser(data.user));
++			// xarif build: the exchange answers the user object itself, not
++			// `{ user }` (server/auth/src/routes/federated.rs:275, pinned by
++			// server/tests/server/auth_federated.rs:418). Reading `data.user`
++			// threw, and the catch below reported it as "Could not reach the
++			// server" after a sign-in that had succeeded.
++			const body = data as unknown as { user?: SessionUserLike } & SessionUserLike;
++			authStore.setUser(toAuthUser(body.user ?? body));
+ 			// hard navigation on purpose: the exchange call just set the session
+ 			// cookie, and a soft goto() can outrun it and bounce the first
+ 			// sign-in back to /login
