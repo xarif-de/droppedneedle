@@ -6,10 +6,10 @@
 # tags of main only; the v3 CI builds an image but never pushes it), and v2 is
 # frozen (last main commit 2026-09-28). The maintained-fork machinery
 # (base/dagger-modules docs/fork.md) follows upstream RELEASES, of which v3 has
-# none. Our only patch is the one-line User-Agent fix in build/patches/, small
-# enough to apply here. So: one pinned commit plus that patch, rebuilt only when
-# the pin is moved on purpose. Turn this into a maintained fork once v3.0.0 is
-# released AND we carry a patch that is more than such a one-liner.
+# none. Our patches (build/patches/: User-Agent, MetaBrainz pacing) are a few
+# lines each, small enough to apply here. So: one pinned commit plus those
+# patches, rebuilt only when the pin is moved on purpose. Turn this into a
+# maintained fork once v3.0.0 is released AND we carry more than such one-liners.
 #
 # ── WHY THE COMMIT ONLY MOVES ON PURPOSE ─────────────────────────────────────
 #
