@@ -36,8 +36,12 @@ tests:
       # --print-openapi dumps the API contract and exits before touching
       # /app/config or /app/cache (upstream server/src/main.rs), so it proves the
       # binary loads and links without needing a database.
+      #
+      # `grep` without -q on purpose: -q exits at the first match and closes the
+      # pipe, and the server then panics with "failed printing to stdout: Broken
+      # pipe", which the output check rejects (first CI run, 2026-10-24).
       - run:
-          - sh -c "/usr/local/bin/droppedneedle --print-openapi | grep -q '\"openapi\"' && echo SERVER_RUNS"
+          - sh -c "/usr/local/bin/droppedneedle --print-openapi | grep '\"openapi\"' >/dev/null && echo SERVER_RUNS"
         output:
           expect:
             - "SERVER_RUNS"
@@ -48,7 +52,7 @@ tests:
       # The tool restores backups and upgrades databases; it must start even when
       # the server cannot. `help` prints its usage (upstream server/tool/src/main.rs).
       - run:
-          - sh -c "/usr/local/bin/droppedneedle-tool help 2>&1 | grep -q 'Usage:' && echo TOOL_RUNS"
+          - sh -c "/usr/local/bin/droppedneedle-tool help 2>&1 | grep 'Usage:' >/dev/null && echo TOOL_RUNS"
         output:
           expect:
             - "TOOL_RUNS"
@@ -57,7 +61,7 @@ tests:
     timeout: 30s
     steps:
       - run:
-          - sh -c "ffmpeg -hide_banner -version | head -1 | grep -q '^ffmpeg version' && echo FFMPEG_OK"
+          - sh -c "ffmpeg -hide_banner -version | grep '^ffmpeg version' >/dev/null && echo FFMPEG_OK"
         output:
           expect:
             - "FFMPEG_OK"
