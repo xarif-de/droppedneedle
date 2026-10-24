@@ -70,6 +70,7 @@ issues is worth it is decided later.
 | `0009-mp3-padding-after-id3-tag` | bug: an MP3 with padding after its ID3v2 tag (15 of 2,447 here) is unreadable to the picture reader and the ID3 save | yes (with its test) |
 | `0010-id3v23-original-date-as-year` | bug: v2.3 files never converge on the original date, so automatic management rewrites them after every scan (endless loop) | yes (with its test) |
 | `0011-catalogue-files-with-unparsable-items` | bug: one unparsable tag item (a TDRL holding a URL) keeps the whole file out of the catalogue | yes (with its test) |
+| `0012-settled-identification-failure` | bug: an identification failure stays on the UI as "Needs attention" after the album's retry succeeded | yes (with its test) |
 
 ## License
 

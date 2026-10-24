@@ -1,0 +1,89 @@
+Do not report an identification failure the album's later success settled.
+
+Why: the activity feed took the newest failed identification job as the
+library's failure, whether or not the same album was identified right after.
+On 2026-10-24 an attempt failed with INPUT_MOVED because Library Management
+moved the album's files mid-attempt (09:08:18 UTC); the retry succeeded one
+second later, yet the UI kept "Album identification failed - 0 albums
+remaining" as "Needs attention" for hours. The failure query now skips a
+failed or attention job when a later job of the same album succeeded; a
+failure nothing settled is still shown.
+
+Tests: new test seeds a failed job settled by a later success (no failure)
+and an unsettled one (shown); it fails without the fix with the settled
+job's id. Full library suites: same pre-existing macOS failure set.
+
+Remove when: upstream settles failures by a later success.
+
+diff --git a/server/library/src/activity/store.rs b/server/library/src/activity/store.rs
+index a14e8e31..c20a2637 100644
+--- a/server/library/src/activity/store.rs
++++ b/server/library/src/activity/store.rs
+@@ -280,10 +280,16 @@ pub fn identification_snapshot(
+          AND NOT EXISTS (SELECT 1 FROM library_identify_reviews r \
+              WHERE r.local_album_id = j.local_album_id AND r.state = 'pending')",
+     )?;
++    // A failure the album's own later success settled (a retry after its
++    // files moved mid-attempt) needs nobody's attention.
+     snapshot.failure = conn
+         .query_row(
+-            "SELECT id, updated_ms FROM library_identify_jobs \
+-             WHERE state IN ('failed','attention') ORDER BY updated_ms DESC, id DESC LIMIT 1",
++            "SELECT j.id, j.updated_ms FROM library_identify_jobs j \
++             WHERE j.state IN ('failed','attention') \
++             AND NOT EXISTS (SELECT 1 FROM library_identify_jobs later \
++                 WHERE later.local_album_id = j.local_album_id \
++                 AND later.state = 'succeeded' AND later.updated_ms > j.updated_ms) \
++             ORDER BY j.updated_ms DESC, j.id DESC LIMIT 1",
+             [],
+             |row| Ok((row.get::<_, String>(0)?, seconds(row.get::<_, i64>(1)?))),
+         )
+diff --git a/server/tests/library/library_identify.rs b/server/tests/library/library_identify.rs
+index ac3eb3a9..8acf3ca3 100644
+--- a/server/tests/library/library_identify.rs
++++ b/server/tests/library/library_identify.rs
+@@ -3155,3 +3155,44 @@ async fn person_commands_leave_what_their_rule_says() {
+ 
+     assert!(differ.is_empty(), "{}", differ.join("\n"));
+ }
++
++/// A failed attempt the album's later success settled is no failure the
++/// activity feed shows; one that nothing settled still is.
++#[test]
++fn a_failure_settled_by_a_later_success_needs_no_attention() {
++    let dir = ScratchDir::new("identify-settled-failure");
++    let path = dir.join("app.db");
++    migrated_db(&path);
++    let conn = rusqlite::Connection::open(&path).expect("opens");
++    conn.execute_batch(
++        "INSERT INTO local_artists (id, display_name, folded_name, kind, created_at, updated_at) \
++         VALUES ('artist', 'Artist', 'artist', 'unknown', 0, 0); \
++         INSERT INTO local_albums (id, root_id, grouping_key, title, title_folded, \
++         album_artist_id, grouping_source, created_at, updated_at) \
++         VALUES ('album-1', 'r', 'k1', 'One', 'one', 'artist', 'automatic', 0, 0), \
++         ('album-2', 'r', 'k2', 'Two', 'two', 'artist', 'automatic', 0, 0);",
++    )
++    .expect("albums seed");
++    let job = |id: &str, album: &str, state: &str, at: i64| {
++        conn.execute(
++            "INSERT INTO library_identify_jobs (id, local_album_id, kind, priority, state, \
++             attempts, not_before_ms, input_revision, idempotency_key, created_ms, updated_ms) \
++             VALUES (?1, ?2, 'automatic', 0, ?3, 1, ?4, 'rev', ?1, ?4, ?4)",
++            params![id, album, state, at],
++        )
++        .expect("job inserts");
++    };
++    job("moved", "album-1", "failed", 1_000);
++    job("retried", "album-1", "succeeded", 2_000);
++    let snapshot =
++        droppedneedle_library::activity::store::identification_snapshot(&conn, 10.0).unwrap();
++    assert_eq!(snapshot.failure, None);
++
++    job("broken", "album-2", "failed", 3_000);
++    let snapshot =
++        droppedneedle_library::activity::store::identification_snapshot(&conn, 10.0).unwrap();
++    assert_eq!(
++        snapshot.failure.map(|(id, _)| id),
++        Some("broken".to_owned())
++    );
++}
