@@ -13,7 +13,7 @@ Fix: accept both shapes. svelte-check 0 errors, prettier and eslint clean.
 Remove when: upstream's callback page reads the exchange answer it gets.
 
 diff --git a/frontend/src/routes/auth/callback/+page.svelte b/frontend/src/routes/auth/callback/+page.svelte
-index 9dd8ce26..74b05511 100644
+index 9dd8ce26..63e675d2 100644
 --- a/frontend/src/routes/auth/callback/+page.svelte
 +++ b/frontend/src/routes/auth/callback/+page.svelte
 @@ -5,7 +5,7 @@
@@ -30,11 +30,11 @@ index 9dd8ce26..74b05511 100644
  		try {
  			const data = await oidcExchange.mutateAsync({ code });
 -			authStore.setUser(toAuthUser(data.user));
-+			// xarif build: the exchange answers the user object itself, not
-+			// `{ user }` (server/auth/src/routes/federated.rs:275, pinned by
-+			// server/tests/server/auth_federated.rs:418). Reading `data.user`
-+			// threw, and the catch below reported it as "Could not reach the
-+			// server" after a sign-in that had succeeded.
++			// The exchange answers the user object itself, not `{ user }`
++			// (server/auth/src/routes/federated.rs, pinned by
++			// server/tests/server/auth_federated.rs). Reading `data.user` threw,
++			// and the catch below reported a sign-in that had succeeded as
++			// "Could not reach the server".
 +			const body = data as unknown as { user?: SessionUserLike } & SessionUserLike;
 +			authStore.setUser(toAuthUser(body.user ?? body));
  			// hard navigation on purpose: the exchange call just set the session

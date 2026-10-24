@@ -49,6 +49,22 @@ upstream commit.
 | `/app/VERSION` | `v3-<12-hex commit>`; also baked into the binary as `COMMIT_TAG` |
 | `build/patches/` | applied with `git apply` on top of the commit; the build fails if one no longer applies. `0001`: the User-Agent in v2.6.1's form, because musicbrainz.org drops v3's `DroppedNeedle/...` form; `0002`: MusicBrainz paced at 0.5/s, the Cover Art Archive at 1/s and BrainzMash at 4/s instead of 1, 10 and 10; `0003`: the OIDC callback page reads the exchange answer it actually gets (upstream ends a successful SSO sign-in on "Could not reach the server"); `0004`: the login page starts SSO at once (`/login?local` keeps the password form); `0005`: a release tag that is not an MBID (Discogs ids written by beets) is ignored instead of deferring identification forever. Reasons and removal conditions in each patch header |
 
+## Patches and upstream
+
+Every problem found in DroppedNeedle is fixed here as one patch in
+`build/patches/`, shaped so it could be sent upstream as a pull request: upstream
+code style, upstream-style comments, tests where upstream has them; the xarif
+reasoning lives in the patch header. Whether a maintained fork with upstream
+issues is worth it is decided later.
+
+| Patch | Kind | Upstream PR as is? |
+| --- | --- | --- |
+| `0001-user-agent-v2.6.1-form` | v3 regression: musicbrainz.org drops `DroppedNeedle/…` | the fix yes; our id and url slot are local |
+| `0002-metabrainz-rates` | local policy: slower MusicBrainz, CAA and BrainzMash pacing | no |
+| `0003-oidc-callback-reads-exchange-answer` | bug: a successful SSO sign-in ends on "Could not reach the server" | yes |
+| `0004-login-redirects-to-sso` | local policy: SSO only (upstream has no setting for it) | as an opt-in setting, not as is |
+| `0005-ignore-non-mbid-release-tags` | bug: a Discogs id in the release tag defers identification forever | yes (with its unit tests) |
+
 ## License
 
 DroppedNeedle is AGPL-3.0-or-later. This repository and the published image are public;

@@ -16,17 +16,17 @@ without the fix and passes with it (cargo test -p droppedneedle-library
 Remove when: upstream validates the release tag before looking it up.
 
 diff --git a/server/library/src/matching/model.rs b/server/library/src/matching/model.rs
-index ee50b1e7..782b7f36 100644
+index ee50b1e7..4b333359 100644
 --- a/server/library/src/matching/model.rs
 +++ b/server/library/src/matching/model.rs
 @@ -81,6 +81,13 @@ impl LocalAlbum {
                  continue;
              };
              let mbid = mbid.trim().to_ascii_lowercase();
-+            // xarif build: a release tag that is not an MBID (beets' Discogs
-+            // plugin writes Discogs ids such as `1274403` into this field) is
-+            // no tagged release. Looked up, it answers 400 "Invalid mbid." on
-+            // every attempt, and identification defers the album forever.
++            // A release tag that is not an MBID is no tagged release: beets'
++            // Discogs plugin writes Discogs ids such as `1274403` into this
++            // field, and looking one up answers 400 "Invalid mbid." on every
++            // attempt, which deferred the album's identification forever.
 +            if !droppedneedle_providers::musicbrainz::is_valid_mbid(&mbid) {
 +                continue;
 +            }
@@ -39,7 +39,7 @@ index ee50b1e7..782b7f36 100644
  }
 +
 +#[cfg(test)]
-+mod xarif_tagged_release_tests {
++mod tagged_release_tests {
 +    use super::*;
 +
 +    fn album(ids: &[&str]) -> LocalAlbum {
