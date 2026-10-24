@@ -1,0 +1,36 @@
+Log the cause when Library Management cannot read a file at preview.
+
+Why: the dry run of 2026-10-24 blocked 10 files as FILE_UNREADABLE, but the
+path and read step of the planner maps the error to that reason without
+logging it, unlike the tag steps next to it ("tags unreadable at preview").
+The files read back whole afterwards (sha256 over all 10), so the cause was
+transient or a path check, and nothing recorded which. The step now logs the
+error at INFO, as its neighbours do.
+
+Tests: none (a log line); cargo check -p droppedneedle-library.
+
+Remove when: upstream logs it.
+
+diff --git a/server/library/src/management/planner.rs b/server/library/src/management/planner.rs
+index 98bab386..deea356e 100644
+--- a/server/library/src/management/planner.rs
++++ b/server/library/src/management/planner.rs
+@@ -564,12 +564,15 @@ fn plan_file(
+     {
+         return Err(reasons::root_unavailable());
+     }
++    let unreadable = |error: PublishError| {
++        tracing::info!(%error, track = track.id, "file unreadable at preview");
++        path_reason(&error)
++    };
+     let path = ctx
+         .sandbox
+         .resolve_no_symlink(&track.root_id, &track.relative_path)
+-        .map_err(|error| path_reason(&error))?;
+-    let bytes =
+-        crate::publish::paths::read_regular_file(&path).map_err(|error| path_reason(&error))?;
++        .map_err(unreadable)?;
++    let bytes = crate::publish::paths::read_regular_file(&path).map_err(unreadable)?;
+     let fingerprint = FileFingerprint {
+         size: bytes.len() as u64,
+         sha256: sha256_hex(&bytes),

@@ -1,0 +1,178 @@
+Read an empty Vorbis comment as absent, so it no longer blocks tag writes.
+
+Why: the tag writer refused any FLAC/Ogg/Opus file holding one empty comment
+(`LYRICS=`, `BAND=`), because lofty drops empties on save. Library Management
+then blocks the file and, through it, its whole album: the activation dry run
+of 2026-10-24 blocked 38 files with "The file's LYRICS/BAND tag is empty" and
+87 more as BUNDLE_BLOCKED. An empty comment carries no value, so the Vorbis
+parser now leaves it out: reads see the field as absent, a save drops the key,
+its verify compares the tag without it, and an undo replays a document that
+never held it (a replay of "" would itself be refused as not expressible).
+
+Tests: the two upstream tests that pinned the refusal now pin the drop (the
+fixture with empty TITLE/ARTIST/ALBUM saves; an injected empty comment goes,
+every other comment stays, and a replay of the read document saves). Both fail
+without the source change. Full `cargo test --test library` and
+`-p droppedneedle-library --lib` on macOS: identical failure set with and
+without the patch (72 + 4, pre-existing, platform).
+
+Remove when: upstream stops refusing empty Vorbis comments.
+
+diff --git a/server/library/src/tags/save/mod.rs b/server/library/src/tags/save/mod.rs
+index a8b3da6d..fbe9c34d 100644
+--- a/server/library/src/tags/save/mod.rs
++++ b/server/library/src/tags/save/mod.rs
+@@ -165,8 +165,6 @@ pub enum Refusal {
+     ReadOnlyFormat { format: String, reason: String },
+     #[error("unencodable {field:?}: {reason}")]
+     UnencodableItem { field: TagField, reason: String },
+-    #[error("empty Vorbis value present under '{key}'; lofty drops empties on save")]
+-    EmptyVorbisValue { key: String },
+     #[error("post-save verify found an out-of-edit delta: {detail}")]
+     VerifyMismatch { detail: String },
+     #[error("no byte inventory possible: {detail}")]
+diff --git a/server/library/src/tags/save/vorbis.rs b/server/library/src/tags/save/vorbis.rs
+index 7950eeda..4c29a663 100644
+--- a/server/library/src/tags/save/vorbis.rs
++++ b/server/library/src/tags/save/vorbis.rs
+@@ -32,8 +32,11 @@ impl TagFormat for Vorbis {
+     type Truth = VorbisTruth;
+     type Edit = VorbisEdit;
+ 
++    /// An empty comment holds nothing and lofty drops it on save, so it
++    /// reads as absent: reads, saves, their verify and an undo's replay
++    /// all see the tag without it.
+     fn parse(format: AudioFormat, bytes: &[u8]) -> Result<Option<VorbisTruth>, Refusal> {
+-        parse_vorbis_truth(format, bytes)
++        Ok(parse_vorbis_truth(format, bytes)?.map(without_empty_values))
+     }
+ 
+     fn list(truth: VorbisTruth, document: &mut FieldDocument) -> Result<(), Refusal> {
+@@ -48,11 +51,6 @@ impl TagFormat for Vorbis {
+     }
+ 
+     fn prepare(truth: VorbisTruth) -> Result<VorbisTruth, Refusal> {
+-        if let Some(key) = empty_key(&truth) {
+-            return Err(Refusal::EmptyVorbisValue {
+-                key: key.to_owned(),
+-            });
+-        }
+         if let Some((upper, variants)) = mixed_spelling(&truth) {
+             return Err(Refusal::NoByteInventory {
+                 detail: format!("comment key '{upper}' has mixed spellings {variants:?}"),
+@@ -64,11 +62,6 @@ impl TagFormat for Vorbis {
+     /// Every item is listed or owned by a field, so nothing is left
+     /// alone; a comment the save would refuse is named instead.
+     fn kept(truth: VorbisTruth) -> Result<TagsKept, Refusal> {
+-        if let Some(key) = empty_key(&truth) {
+-            return Ok(TagsKept::refused(format!(
+-                "The file's {key} tag is empty, and the tag writer cannot keep an empty tag."
+-            )));
+-        }
+         if let Some((upper, variants)) = mixed_spelling(&truth) {
+             return Ok(TagsKept::refused(format!(
+                 "The file spells its {upper} tag more than one way ({}), so saving its tags would merge them.",
+@@ -207,13 +200,11 @@ impl TagFormat for Vorbis {
+     }
+ }
+ 
+-/// The first key holding an empty value, which lofty drops on save.
+-fn empty_key(truth: &VorbisTruth) -> Option<&str> {
++/// The tag without its empty comments (`LYRICS=`, `BAND=`), which lofty
++/// drops on save.
++fn without_empty_values(mut truth: VorbisTruth) -> VorbisTruth {
++    truth.pairs.retain(|(_, value)| !value.is_empty());
+     truth
+-        .pairs
+-        .iter()
+-        .find(|(_, value)| value.is_empty())
+-        .map(|(key, _)| key.as_str())
+ }
+ 
+ /// The first key spelled more than one way (`title` plus `TITLE`), with
+diff --git a/server/tests/library/library_tags.rs b/server/tests/library/library_tags.rs
+index 6f17f78f..f0622ea2 100644
+--- a/server/tests/library/library_tags.rs
++++ b/server/tests/library/library_tags.rs
+@@ -1363,19 +1363,22 @@ fn save_pure_v23_stays_v23() {
+ }
+ 
+ #[test]
+-fn save_refuses_fixture_with_empty_values() {
++fn save_drops_the_empty_values_of_a_fixture() {
+     // flac_no_tags.flac is not tag-free: it carries empty TITLE/ARTIST/
+-    // ALBUM values, which lofty would drop on save.
+-    let (refusal, before, after) = save_refused(
+-        "flac_no_tags.flac",
+-        "no-tags",
+-        &[TagEdit::set_title("Fresh Title")],
+-    );
+-    assert!(
+-        matches!(refusal, Refusal::EmptyVorbisValue { .. }),
+-        "{refusal:?}"
++    // ALBUM values, which read as absent and go with the save.
++    let (_scratch, path) = temp_copy("flac_no_tags.flac", "no-tags");
++    let fields = tags::read_fields(&path).unwrap();
++    for field in [TagField::Title, TagField::Artist, TagField::Album] {
++        assert!(!fields.contains_key(&field), "{field:?}");
++    }
++    assert_eq!(tags::save::tags_kept(&path).unwrap().refusal, None);
++    tags::save_tags(&path, &[TagEdit::set_title("Fresh Title")]).unwrap();
++    assert_eq!(
++        vorbis_values(&path, "TITLE"),
++        vec!["Fresh Title".to_owned()]
+     );
+-    assert_eq!(before, after);
++    assert!(vorbis_values(&path, "ARTIST").is_empty());
++    assert!(vorbis_values(&path, "ALBUM").is_empty());
+ }
+ 
+ #[test]
+@@ -2127,20 +2130,36 @@ fn id3_raw_frames_scrub_and_restore() {
+     assert_eq!(restored.get("id3:WOAR"), Some(&vec![link]));
+ }
+ 
++/// An empty comment reads as absent, so a save drops it and keeps every
++/// other comment, and a replay of the read document (what an undo
++/// writes) saves cleanly.
+ #[test]
+-fn save_refuses_empty_vorbis_values() {
++fn save_drops_empty_vorbis_values() {
+     let (_scratch, path) = temp_copy("management_full.flac", "empty-vorbis");
+-    flac_inject_pairs(&path, &[("ZZZ_EMPTY_TEST", "")]);
+-    let before = std::fs::read(&path).unwrap();
+-    let refusal = match tags::save_tags(&path, &[TagEdit::set_title("WRAP TITLE")]) {
+-        Err(TagsError::SaveRefused { refusal, .. }) => refusal,
+-        other => panic!("expected EmptyVorbisValue, got {other:?}"),
+-    };
+-    assert!(
+-        matches!(refusal, Refusal::EmptyVorbisValue { .. }),
+-        "{refusal:?}"
++    flac_inject_pairs(&path, &[("ZZZ_EMPTY_TEST", ""), ("LYRICS", "")]);
++    let before = tags::save::read_document(&path).unwrap();
++    assert!(!before.native.contains_key("vorbis:ZZZ_EMPTY_TEST"));
++    assert!(!before.values.contains_key(&TagField::Lyrics));
++    let pairs_before: Vec<(String, String)> = vorbis_pairs(&path)
++        .into_iter()
++        .filter(|(key, value)| !value.is_empty() && key != "TITLE")
++        .collect();
++    assert_eq!(tags::save::tags_kept(&path).unwrap().refusal, None);
++    tags::save_tags(&path, &[TagEdit::set_title("WRAP TITLE")]).unwrap();
++    assert!(vorbis_key_values(&path, "ZZZ_EMPTY_TEST").is_empty());
++    assert!(vorbis_key_values(&path, "LYRICS").is_empty());
++    assert_eq!(
++        vorbis_key_values(&path, "TITLE"),
++        vec!["WRAP TITLE".to_owned()]
+     );
+-    assert_eq!(before, std::fs::read(&path).unwrap());
++    let pairs_after: Vec<(String, String)> = vorbis_pairs(&path)
++        .into_iter()
++        .filter(|(key, _)| key != "TITLE")
++        .collect();
++    assert_eq!(pairs_after, pairs_before);
++    let title = before.values[&TagField::Title].clone();
++    tags::save_tags(&path, &[TagEdit::new(TagField::Title, title.clone())]).unwrap();
++    assert_eq!(vorbis_key_values(&path, "TITLE"), title);
+ }
+ 
+ #[test]

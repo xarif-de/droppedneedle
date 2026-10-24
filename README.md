@@ -65,6 +65,8 @@ issues is worth it is decided later.
 | `0004-login-redirects-to-sso` | local policy: SSO only (upstream has no setting for it) | as an opt-in setting, not as is |
 | `0005-ignore-non-mbid-release-tags` | bug: a Discogs id in the release tag defers identification forever | yes (with its unit tests) |
 | `0006-quiet-audio-decoder-logs` | bug: decoder chatter floods the log (28k lines / 10 min while analysing) | yes (with its unit test) |
+| `0007-drop-empty-vorbis-values` | bug: one empty Vorbis comment (`LYRICS=`) blocks every tag write to the file, and with it the whole album | yes (with its tests) |
+| `0008-log-why-a-file-is-unreadable` | bug: a file blocked as unreadable at preview leaves no log line saying why | yes |
 
 ## License
 
