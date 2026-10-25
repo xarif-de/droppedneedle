@@ -74,6 +74,8 @@ issues is worth it is decided later.
 | `0013-no-404-for-missing-art-and-unserved-subsonic` | bug: missing cover art and unserved Subsonic calls answer 404, which a WAF reads as path probing (banned the operator's IPs 3x) | yes (with its tests) |
 | `0014-track-target-prefers-own-release-over-compilation` | behaviour: a single-track request targets a VA compilation over the artist's own single, so its downloads are held as weak matches | yes, as a proposal (upstream pinned the old order in a test) |
 | `0015-listenbrainz-rate-limit-lets-lastfm-stand-in` | gap: a rate-limited ListenBrainz stalls discover builds past the shelf bound (Top Picks, Daily Mixes, Missing Essentials empty) instead of letting Last.fm stand in | yes (with its tests) |
+| `0016-no-restore-offer-for-a-root-with-no-file-left` | bug: Settings > Library offers to "restore" a removed root whose every file is gone (here the merged `seafile` root, 2,483 missing rows) | yes (with its test) |
+| `0017-profile-hides-navidrome-folders-when-not-connected` | bug: the profile shows "Music folder preferences could not be loaded" on every install without Navidrome | yes (with its test) |
 
 ## License
 
