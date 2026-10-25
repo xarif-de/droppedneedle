@@ -1,0 +1,127 @@
+Fetch a single track as the artist's own release before a compilation.
+
+Why: a track request picks the release to fetch by the shared MusicBrainz
+rank, where the primary type (Album > EP > Single) comes before the
+compilation penalty, so a various-artists compilation album beats the
+artist's own single. On 2026-10-24 a request for Zombie Nation's "Kernkraft
+400" (recording bf2754e5, on the 2006 single "Kernkraft 400 Single Mixes"
+and on the 45-track "Wire 08 Compilation") targeted the compilation. Usenet
+had the artist's single; DroppedNeedle downloaded it, but held all 14 files
+as weak matches ("the album title or artist does not agree with the
+release"), and they could not be imported as they were because none of the
+single's mixes is on the compilation. A download is named after the
+artist's album or single, never after a compilation that lists the track.
+The track target now ranks compilations after the artist's own releases,
+with Official and version-keeping still deciding first (an official
+compilation still beats a bootleg single). The shared rank is unchanged.
+
+Tests: the ordering test pinned "comp before single"; it now pins the
+single first. New test for single vs compilation and bootleg single vs
+compilation. Both fail without the change. Acquire suites (integration and
+lib units, symlink-free TMPDIR): same 2 failures with and without the patch.
+
+Remove when: upstream ranks compilations after the artist's own releases.
+
+diff --git a/server/acquire/src/target/choose.rs b/server/acquire/src/target/choose.rs
+index 1234e0c2..171f143a 100644
+--- a/server/acquire/src/target/choose.rs
++++ b/server/acquire/src/target/choose.rs
+@@ -6,7 +6,10 @@
+ //! request fills the album the user already holds, in the edition they
+ //! picked), then the release the user requested it from, then the best
+ //! official release by the shared MusicBrainz rank (Official, not live or
+-//! remix, Album before EP before Single, no secondary types, earliest).
++//! remix, Album before EP before Single, no secondary types, earliest),
++//! with compilations after the artist's own releases: a download is named
++//! after the artist's album or single, never after a compilation, so a
++//! compilation as the target holds every file it brings as a weak match.
+ 
+ use std::collections::{HashMap, HashSet};
+ 
+@@ -57,14 +60,20 @@ pub fn release_order(
+     }
+     let mut ranked: Vec<&ReleaseCandidate> = candidates.iter().collect();
+     ranked.sort_by_key(|candidate| {
++        let rank = recording_release_group_rank(
++            candidate.status.as_deref(),
++            &candidate.secondary_types,
++            candidate.primary_type.as_deref(),
++            candidate.date.as_deref(),
++            &candidate.release_group_mbid,
++        );
++        // Official and version-keeping still decide first; within them,
++        // the artist's own releases come before compilations.
+         (
+-            recording_release_group_rank(
+-                candidate.status.as_deref(),
+-                &candidate.secondary_types,
+-                candidate.primary_type.as_deref(),
+-                candidate.date.as_deref(),
+-                &candidate.release_group_mbid,
+-            ),
++            rank.0,
++            rank.1,
++            is_compilation(candidate),
++            rank,
+             candidate.id.clone(),
+         )
+     });
+@@ -74,6 +83,14 @@ pub fn release_order(
+     out
+ }
+ 
++/// A compilation release group (`Compilation` secondary type).
++fn is_compilation(candidate: &ReleaseCandidate) -> bool {
++    candidate
++        .secondary_types
++        .iter()
++        .any(|kind| kind.eq_ignore_ascii_case("compilation"))
++}
++
+ /// Distinct release groups worth checking for a library edition, best
+ /// ranked first.
+ pub fn groups_to_check(candidates: &[ReleaseCandidate]) -> Vec<String> {
+@@ -119,8 +136,8 @@ mod tests {
+             order[0], "album",
+             "a plain album outranks single and compilation"
+         );
+-        // Album type comes before the compilation penalty (the shared rank).
+-        assert_eq!(order, ["album", "deluxe", "comp", "single"]);
++        // The artist's own single comes before a compilation album.
++        assert_eq!(order, ["album", "deluxe", "single", "comp"]);
+ 
+         let mut library = HashMap::new();
+         library.insert(
+@@ -134,4 +151,32 @@ mod tests {
+         assert_eq!(order[0], ("deluxe".to_owned(), "manual_identity"));
+         assert_eq!(order[1], ("single".to_owned(), "requested_release"));
+     }
++
++    /// A track only on the artist's single and on a various-artists
++    /// compilation is fetched as the single; an official compilation
++    /// still beats a bootleg single.
++    #[test]
++    fn a_single_before_a_compilation_album() {
++        let candidates = vec![
++            candidate("wire-08", "g-wire", "Album", &["Compilation"]),
++            candidate("single-mixes", "g-single", "Single", &[]),
++        ];
++        let order: Vec<_> = release_order(&candidates, &HashMap::new(), None)
++            .into_iter()
++            .map(|(id, _)| id)
++            .collect();
++        assert_eq!(order, ["single-mixes", "wire-08"]);
++
++        let mut bootleg = candidate("bootleg", "g-boot", "Single", &[]);
++        bootleg.status = Some("Bootleg".to_owned());
++        let candidates = vec![
++            bootleg,
++            candidate("wire-08", "g-wire", "Album", &["Compilation"]),
++        ];
++        let order: Vec<_> = release_order(&candidates, &HashMap::new(), None)
++            .into_iter()
++            .map(|(id, _)| id)
++            .collect();
++        assert_eq!(order, ["wire-08", "bootleg"]);
++    }
+ }

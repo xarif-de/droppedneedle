@@ -72,6 +72,7 @@ issues is worth it is decided later.
 | `0011-catalogue-files-with-unparsable-items` | bug: one unparsable tag item (a TDRL holding a URL) keeps the whole file out of the catalogue | yes (with its test) |
 | `0012-settled-identification-failure` | bug: an identification failure stays on the UI as "Needs attention" after the album's retry succeeded | yes (with its test) |
 | `0013-no-404-for-missing-art-and-unserved-subsonic` | bug: missing cover art and unserved Subsonic calls answer 404, which a WAF reads as path probing (banned the operator's IPs 3x) | yes (with its tests) |
+| `0014-track-target-prefers-own-release-over-compilation` | behaviour: a single-track request targets a VA compilation over the artist's own single, so its downloads are held as weak matches | yes, as a proposal (upstream pinned the old order in a test) |
 
 ## License
 
