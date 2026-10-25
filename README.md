@@ -71,6 +71,7 @@ issues is worth it is decided later.
 | `0010-id3v23-original-date-as-year` | bug: v2.3 files never converge on the original date, so automatic management rewrites them after every scan (endless loop) | yes (with its test) |
 | `0011-catalogue-files-with-unparsable-items` | bug: one unparsable tag item (a TDRL holding a URL) keeps the whole file out of the catalogue | yes (with its test) |
 | `0012-settled-identification-failure` | bug: an identification failure stays on the UI as "Needs attention" after the album's retry succeeded | yes (with its test) |
+| `0013-no-404-for-missing-art-and-unserved-subsonic` | bug: missing cover art and unserved Subsonic calls answer 404, which a WAF reads as path probing (banned the operator's IPs 3x) | yes (with its tests) |
 
 ## License
 

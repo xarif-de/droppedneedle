@@ -1,0 +1,717 @@
+Answer "no art" and unserved Subsonic calls without HTTP 404.
+
+Why: a WAF in front of the server (CrowdSec's http-probing: more than 10
+distinct 404 URIs in 10 s) banned the operator's own IPs three times on
+2026-10-24/25, every *.xarif.de service at once. Every 404 came from ordinary
+use of music.xarif.de:
+- the web UI's album grid: /api/v3/library/albums/{id}/artwork answered 404
+  for each album without art (alert 80482: 11 such 404s);
+- a signed-in Subsonic client: getCoverArt for ids the library no longer has
+  (albums merged by a rescan) answered a text 404, and getPodcasts,
+  getNewestPodcasts, getInternetRadioStations were unknown methods (404).
+Changes:
+- cover endpoints (release-group, release, artist, album artwork, library
+  artist artwork) answer a missing picture with 204 + x-cover-state: missing;
+  the web UI treats 204 like 404 (settled miss, no polling);
+- Subsonic getCoverArt answers any miss (unknown or retired id included)
+  with the neutral placeholder the playlists already use;
+- getPodcasts / getNewestPodcasts / getInternetRadioStations answer empty
+  lists. Unknown methods stay a plain 404 (Navidrome 0.62.0 parity, pinned by
+  upstream's golden test), and an unauthenticated call still gets HTTP 200
+  with code 10/40, so anonymous probing stays visible to a WAF.
+- OpenAPI snapshot and generated TypeScript refreshed (5 responses 404->204).
+
+Tests: catalog cover tests now expect 204; Subsonic cover test expects the
+placeholder for unknown ids; new test for the empty lists plus anonymous code
+10; new vitest spec for the frontend's missing-art check. Each fails without
+its source change. Full suites (library, catalog, compat, lib units) with a
+symlink-free TMPDIR on macOS: same failures with and without the patch series
+(compat's symfonium journey is flaky on both: 1/5 vs 2/5). svelte-check 0
+errors, prettier and eslint clean.
+
+Remove when: upstream stops answering 404 for missing art and these calls.
+
+diff --git a/frontend/src/lib/api/v3/openapi.d.ts b/frontend/src/lib/api/v3/openapi.d.ts
+index 7ff4ef77..2b314ec6 100644
+--- a/frontend/src/lib/api/v3/openapi.d.ts
++++ b/frontend/src/lib/api/v3/openapi.d.ts
+@@ -26615,6 +26615,13 @@ export interface operations {
+                 };
+                 content?: never;
+             };
++            /** @description No image for this artist */
++            204: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content?: never;
++            };
+             /** @description Image unchanged */
+             304: {
+                 headers: {
+@@ -26640,15 +26647,6 @@ export interface operations {
+                     "application/json": components["schemas"]["ErrorEnvelope"];
+                 };
+             };
+-            /** @description No image for this artist */
+-            404: {
+-                headers: {
+-                    [name: string]: unknown;
+-                };
+-                content: {
+-                    "application/json": components["schemas"]["ErrorEnvelope"];
+-                };
+-            };
+         };
+     };
+     artist_cover_credit: {
+@@ -26712,6 +26710,13 @@ export interface operations {
+                 };
+                 content?: never;
+             };
++            /** @description No art for this release group */
++            204: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content?: never;
++            };
+             /** @description Cover unchanged */
+             304: {
+                 headers: {
+@@ -26737,15 +26742,6 @@ export interface operations {
+                     "application/json": components["schemas"]["ErrorEnvelope"];
+                 };
+             };
+-            /** @description No art for this release group */
+-            404: {
+-                headers: {
+-                    [name: string]: unknown;
+-                };
+-                content: {
+-                    "application/json": components["schemas"]["ErrorEnvelope"];
+-                };
+-            };
+         };
+     };
+     cover_from_release: {
+@@ -26777,6 +26773,13 @@ export interface operations {
+                 };
+                 content?: never;
+             };
++            /** @description No art for this release */
++            204: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content?: never;
++            };
+             /** @description Cover unchanged */
+             304: {
+                 headers: {
+@@ -26802,15 +26805,6 @@ export interface operations {
+                     "application/json": components["schemas"]["ErrorEnvelope"];
+                 };
+             };
+-            /** @description No art for this release */
+-            404: {
+-                headers: {
+-                    [name: string]: unknown;
+-                };
+-                content: {
+-                    "application/json": components["schemas"]["ErrorEnvelope"];
+-                };
+-            };
+         };
+     };
+     get_discover: {
+@@ -31966,6 +31960,13 @@ export interface operations {
+                 };
+                 content?: never;
+             };
++            /** @description The album has no local art */
++            204: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content?: never;
++            };
+             /** @description Image unchanged */
+             304: {
+                 headers: {
+@@ -31991,15 +31992,6 @@ export interface operations {
+                     "application/json": components["schemas"]["ErrorEnvelope"];
+                 };
+             };
+-            /** @description The album has no local art */
+-            404: {
+-                headers: {
+-                    [name: string]: unknown;
+-                };
+-                content: {
+-                    "application/json": components["schemas"]["ErrorEnvelope"];
+-                };
+-            };
+         };
+     };
+     create_contribution: {
+@@ -32829,6 +32821,13 @@ export interface operations {
+                 };
+                 content?: never;
+             };
++            /** @description None of the artist's albums has art */
++            204: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content?: never;
++            };
+             /** @description Image unchanged */
+             304: {
+                 headers: {
+@@ -32854,15 +32853,6 @@ export interface operations {
+                     "application/json": components["schemas"]["ErrorEnvelope"];
+                 };
+             };
+-            /** @description None of the artist's albums has art */
+-            404: {
+-                headers: {
+-                    [name: string]: unknown;
+-                };
+-                content: {
+-                    "application/json": components["schemas"]["ErrorEnvelope"];
+-                };
+-            };
+         };
+     };
+     musicbrainz_callback: {
+diff --git a/frontend/src/lib/utils/coverWarmCoordinator.spec.ts b/frontend/src/lib/utils/coverWarmCoordinator.spec.ts
+new file mode 100644
+index 00000000..cfdefc6b
+--- /dev/null
++++ b/frontend/src/lib/utils/coverWarmCoordinator.spec.ts
+@@ -0,0 +1,35 @@
++import { afterEach, describe, expect, it, vi } from 'vitest';
++import { coverAnsweredMissing } from './coverWarmCoordinator';
++
++const URL_A = '/api/v3/library/albums/a/artwork?size=250';
++
++function answered(status: number) {
++	vi.spyOn(performance, 'getEntriesByName').mockReturnValue([
++		{ responseStatus: status } as unknown as PerformanceEntry
++	]);
++}
++
++describe('coverAnsweredMissing', () => {
++	afterEach(() => {
++		vi.restoreAllMocks();
++	});
++
++	it('takes a 204 or a 404 as the server saying there is no art', () => {
++		for (const status of [204, 404]) {
++			answered(status);
++			expect(coverAnsweredMissing(URL_A), String(status)).toBe(true);
++		}
++	});
++
++	it('keeps polling on a warming answer or a server error', () => {
++		for (const status of [202, 500]) {
++			answered(status);
++			expect(coverAnsweredMissing(URL_A), String(status)).toBe(false);
++		}
++	});
++
++	it('keeps polling when the browser recorded no status', () => {
++		vi.spyOn(performance, 'getEntriesByName').mockReturnValue([]);
++		expect(coverAnsweredMissing(URL_A)).toBe(false);
++	});
++});
+diff --git a/frontend/src/lib/utils/coverWarmCoordinator.ts b/frontend/src/lib/utils/coverWarmCoordinator.ts
+index 23afdfb2..871773ed 100644
+--- a/frontend/src/lib/utils/coverWarmCoordinator.ts
++++ b/frontend/src/lib/utils/coverWarmCoordinator.ts
+@@ -66,6 +66,11 @@ async function poll(key: string, entry: WarmEntry) {
+ 			return;
+ 		}
+ 
++		if (isMissingStatus(response.status)) {
++			notify(entry, { status: 'failed' });
++			return;
++		}
++
+ 		if (response.ok && response.headers.get('x-cover-source') !== 'placeholder') {
+ 			const objectUrl = URL.createObjectURL(await response.blob());
+ 			notify(entry, { status: 'ready', url: objectUrl });
+@@ -89,22 +94,32 @@ async function poll(key: string, entry: WarmEntry) {
+ 
+ // The browser keeps 250 resource timing entries by default and then drops new
+ // ones; the app's own scripts and a long grid pass that, which would turn the
+-// 404 check below off. Raised once, when this module loads.
++// missing-art check below off. Raised once, when this module loads.
+ const RESOURCE_TIMING_ENTRIES = 1000;
+ if (typeof performance !== 'undefined') {
+ 	performance.setResourceTimingBufferSize?.(RESOURCE_TIMING_ENTRIES);
+ }
+ 
+ /**
+- * True when the browser saw `url` answer 404: the server's word that there is
+- * no art, so polling would only ask again. Browsers without the status in
+- * their resource timing entries report false and keep polling.
++ * The server's word that there is no art: 204 (a cover endpoint's miss) or
++ * 404 (an unknown address). Polling would only ask again.
++ */
++function isMissingStatus(status: number): boolean {
++	return status === 204 || status === 404;
++}
++
++/**
++ * True when the browser saw `url` answer that there is no art. Browsers
++ * without the status in their resource timing entries report false and keep
++ * polling.
+  */
+ export function coverAnsweredMissing(url: string): boolean {
+ 	if (typeof performance === 'undefined' || !url) return false;
+ 	const entries = performance.getEntriesByName(url, 'resource');
+ 	const last = entries[entries.length - 1];
+-	return Boolean(last && 'responseStatus' in last && last.responseStatus === 404);
++	return Boolean(
++		last && 'responseStatus' in last && isMissingStatus(last.responseStatus as number)
++	);
+ }
+ 
+ export function watchWarmingCover(url: string, listener: Listener): () => void {
+diff --git a/server/catalog/src/reads/platform/covers.rs b/server/catalog/src/reads/platform/covers.rs
+index dd2ac5cc..dbbcb1b1 100644
+--- a/server/catalog/src/reads/platform/covers.rs
++++ b/server/catalog/src/reads/platform/covers.rs
+@@ -392,11 +392,13 @@ fn warming_response() -> Response {
+         .into_response()
+ }
+ 
+-/// No art: a 404 with no body, so the browser draws nothing and the web UI
+-/// keeps its own fallback.
++/// No art: a 204 with no body, so the browser draws nothing and the web UI
++/// keeps its own fallback. Not a 404: a grid of albums without art would
++/// otherwise read as path probing to a WAF in front of the server (one 404
++/// per tile), and a missing picture is an answer, not an unknown address.
+ fn missing_response() -> Response {
+     (
+-        StatusCode::NOT_FOUND,
++        StatusCode::NO_CONTENT,
+         [
+             (header::CACHE_CONTROL, NO_STORE),
+             (header::HeaderName::from_static("x-cover-state"), "missing"),
+@@ -462,7 +464,7 @@ fn lookup_response(lookup: CoverLookup, headers: &HeaderMap) -> Response {
+         (status = 304, description = "Cover unchanged"),
+         (status = 400, description = "Unsupported size"),
+         (status = 401, description = "Not authenticated"),
+-        (status = 404, description = "No art for this release group"),
++        (status = 204, description = "No art for this release group"),
+     )
+ )]
+ pub async fn cover_from_release_group(
+@@ -497,7 +499,7 @@ pub async fn cover_from_release_group(
+         (status = 304, description = "Cover unchanged"),
+         (status = 400, description = "Unsupported size"),
+         (status = 401, description = "Not authenticated"),
+-        (status = 404, description = "No art for this release"),
++        (status = 204, description = "No art for this release"),
+     )
+ )]
+ pub async fn cover_from_release(
+@@ -532,7 +534,7 @@ pub async fn cover_from_release(
+         (status = 304, description = "Image unchanged"),
+         (status = 400, description = "Bad query string"),
+         (status = 401, description = "Not authenticated"),
+-        (status = 404, description = "No image for this artist"),
++        (status = 204, description = "No image for this artist"),
+     )
+ )]
+ pub async fn artist_cover(
+@@ -595,7 +597,7 @@ pub async fn artist_cover_credit(
+         (status = 304, description = "Image unchanged"),
+         (status = 400, description = "Bad query string or unsupported size"),
+         (status = 401, description = "Not authenticated"),
+-        (status = 404, description = "The album has no local art"),
++        (status = 204, description = "The album has no local art"),
+     )
+ )]
+ pub async fn album_artwork(
+@@ -643,7 +645,7 @@ pub async fn album_artwork(
+         (status = 304, description = "Image unchanged"),
+         (status = 400, description = "Bad query string or unsupported size"),
+         (status = 401, description = "Not authenticated"),
+-        (status = 404, description = "None of the artist's albums has art"),
++        (status = 204, description = "None of the artist's albums has art"),
+     )
+ )]
+ pub async fn library_artist_artwork(
+diff --git a/server/compat/src/subsonic/browse.rs b/server/compat/src/subsonic/browse.rs
+index f51ce868..ef85e290 100644
+--- a/server/compat/src/subsonic/browse.rs
++++ b/server/compat/src/subsonic/browse.rs
+@@ -92,6 +92,37 @@ pub async fn license<P: Principal, S: Store, B: AudioBackend>(
+     Ok(Outcome::keyed("license", SLicense { valid: true }.render()))
+ }
+ 
++/// Podcasts: none on this server. An empty list rather than an unknown
++/// method, so clients that ask on start show an empty section.
++pub async fn podcasts<P: Principal, S: Store, B: AudioBackend>(
++    _ctx: &'_ Ctx<'_, P, S, B>,
++) -> Result<Outcome, SubsonicError> {
++    Ok(Outcome::keyed(
++        "podcasts",
++        obj(vec![("channel", Val::List(Vec::new()))]),
++    ))
++}
++
++/// Newest podcast episodes: none, as for [`podcasts`].
++pub async fn newest_podcasts<P: Principal, S: Store, B: AudioBackend>(
++    _ctx: &'_ Ctx<'_, P, S, B>,
++) -> Result<Outcome, SubsonicError> {
++    Ok(Outcome::keyed(
++        "newestPodcasts",
++        obj(vec![("episode", Val::List(Vec::new()))]),
++    ))
++}
++
++/// Internet radio stations: none on this server, an empty list.
++pub async fn internet_radio_stations<P: Principal, S: Store, B: AudioBackend>(
++    _ctx: &'_ Ctx<'_, P, S, B>,
++) -> Result<Outcome, SubsonicError> {
++    Ok(Outcome::keyed(
++        "internetRadioStations",
++        obj(vec![("internetRadioStation", Val::List(Vec::new()))]),
++    ))
++}
++
+ /// Advertised OpenSubsonic extensions, all v1. Public (no auth).
+ /// The set is owned by `compat::shared::extensions`: every served
+ /// extension.
+diff --git a/server/compat/src/subsonic/media.rs b/server/compat/src/subsonic/media.rs
+index 75cdcbd3..30016e72 100644
+--- a/server/compat/src/subsonic/media.rs
++++ b/server/compat/src/subsonic/media.rs
+@@ -146,6 +146,18 @@ pub async fn library_picture<S: Store>(
+ /// branch needs explicit headers.
+ pub async fn cover_art<P: Principal, S: Store, B: AudioBackend>(
+     ctx: &'_ Ctx<'_, P, S, B>,
++) -> Result<Outcome, SubsonicError> {
++    // A target that is not (or no longer) in the library gets the neutral
++    // placeholder, as a playlist without a cover does: a cover is never a
++    // reason for a client to see an error.
++    match cover_art_target(ctx).await {
++        Err(error) if error.code == NOT_FOUND => placeholder("").ok_or(error),
++        other => other,
++    }
++}
++
++async fn cover_art_target<P: Principal, S: Store, B: AudioBackend>(
++    ctx: &'_ Ctx<'_, P, S, B>,
+ ) -> Result<Outcome, SubsonicError> {
+     let sid = ctx.p("id")?.unwrap_or_default();
+     // Unknown prefix -> 70 -> 404-as-text on the binary path.
+diff --git a/server/compat/src/subsonic/mod.rs b/server/compat/src/subsonic/mod.rs
+index 4db12ea4..f3dedd29 100644
+--- a/server/compat/src/subsonic/mod.rs
++++ b/server/compat/src/subsonic/mod.rs
+@@ -26,7 +26,7 @@
+ //! | getRandomSongs | randomSongs | yes | filters |
+ //! | getMusicDirectory | directory | yes | 1 -> artists; artist -> albums; album -> songs |
+ //! | search3/search2 | searchResult3/2 | yes | missing/empty/`""` query = match-all |
+-//! | getCoverArt | bytes | yes | RG art/artist image/playlist file; miss -> WebP; size buckets |
++//! | getCoverArt | bytes | yes | RG art/artist image/playlist file; miss or unknown id -> WebP; size buckets |
+ //! | stream/download | bytes | yes | decide() policy; ranges; 416; HEAD |
+ //! | getTranscodeDecision | transcodeDecision | yes | POST-only, JSON-only |
+ //! | getTranscodeStream | bytes | yes | signed params |
+@@ -51,6 +51,8 @@
+ //! | getScanStatus/startScan | scanStatus | yes | startScan admin-only -> 50 |
+ //! | getTopSongs | topSongs | yes | exact artist-name match else 70 |
+ //! | getSimilarSongs[2] | similarSongs[2] | yes | takes an artist id |
++//! | getPodcasts/getNewestPodcasts | podcasts/newestPodcasts | yes | always empty: no podcasts here |
++//! | getInternetRadioStations | internetRadioStations | yes | always empty: no radio here |
+ //!
+ //! # Quirk citations (all ported, none dropped)
+ //!
+@@ -69,7 +71,11 @@
+ //!   `error.stream-unknown-id`): an unknown method is a plain 404 text in
+ //!   every format; a `stream` failure with code 70 (an unknown id, or no
+ //!   audio behind a known one) is the envelope over HTTP 200. `download`
+-//!   and `getCoverArt` misses were not recorded, so they stay text 404s.
++//!   misses were not recorded, so they stay text 404s. A `getCoverArt`
++//!   miss, an unknown id included, is the neutral placeholder: clients keep
++//!   ids of albums a rescan merged and ask for their art for a long time,
++//!   and a stream of 404s from a signed-in client reads as path probing to
++//!   a WAF in front of the server.
+ //! - Navidrome 0.62.0 ratings (recording `navidrome-0.62.0-ratings`): a
+ //!   song, album or ID3 artist carries the caller's `userRating` and the
+ //!   mean of every user's as `averageRating` (whole means as integers).
+@@ -688,6 +694,9 @@ pub fn is_known_endpoint(name: &str) -> bool {
+             | "gettopsongs"
+             | "getsimilarsongs2"
+             | "getsimilarsongs"
++            | "getpodcasts"
++            | "getnewestpodcasts"
++            | "getinternetradiostations"
+     )
+ }
+ 
+@@ -742,6 +751,9 @@ async fn run_handler<P: Principal, S: Store, B: AudioBackend>(
+         "getlyricsbysongid" => library::lyrics_by_song_id(ctx).await?,
+         "getlyrics" => library::lyrics(ctx).await?,
+         "getgenres" => library::genres(ctx).await?,
++        "getpodcasts" => browse::podcasts(ctx).await?,
++        "getnewestpodcasts" => browse::newest_podcasts(ctx).await?,
++        "getinternetradiostations" => browse::internet_radio_stations(ctx).await?,
+         "getsongsbygenre" => library::songs_by_genre(ctx).await?,
+         "getuser" => library::user(ctx).await?,
+         "getscanstatus" => library::scan_status(ctx).await?,
+diff --git a/server/openapi/openapi.json b/server/openapi/openapi.json
+index 697add01..eb2103b0 100644
+--- a/server/openapi/openapi.json
++++ b/server/openapi/openapi.json
+@@ -4056,6 +4056,9 @@
+           "202": {
+             "description": "Image is warming; poll again"
+           },
++          "204": {
++            "description": "No image for this artist"
++          },
+           "304": {
+             "description": "Image unchanged"
+           },
+@@ -4078,16 +4081,6 @@
+                 }
+               }
+             }
+-          },
+-          "404": {
+-            "description": "No image for this artist",
+-            "content": {
+-              "application/json": {
+-                "schema": {
+-                  "$ref": "#/components/schemas/ErrorEnvelope"
+-                }
+-              }
+-            }
+           }
+         },
+         "security": [
+@@ -4183,6 +4176,9 @@
+           "202": {
+             "description": "Cover is warming; poll again"
+           },
++          "204": {
++            "description": "No art for this release group"
++          },
+           "304": {
+             "description": "Cover unchanged"
+           },
+@@ -4205,16 +4201,6 @@
+                 }
+               }
+             }
+-          },
+-          "404": {
+-            "description": "No art for this release group",
+-            "content": {
+-              "application/json": {
+-                "schema": {
+-                  "$ref": "#/components/schemas/ErrorEnvelope"
+-                }
+-              }
+-            }
+           }
+         },
+         "security": [
+@@ -4260,6 +4246,9 @@
+           "202": {
+             "description": "Cover is warming; poll again"
+           },
++          "204": {
++            "description": "No art for this release"
++          },
+           "304": {
+             "description": "Cover unchanged"
+           },
+@@ -4282,16 +4271,6 @@
+                 }
+               }
+             }
+-          },
+-          "404": {
+-            "description": "No art for this release",
+-            "content": {
+-              "application/json": {
+-                "schema": {
+-                  "$ref": "#/components/schemas/ErrorEnvelope"
+-                }
+-              }
+-            }
+           }
+         },
+         "security": [
+@@ -11841,6 +11820,9 @@
+           "200": {
+             "description": "Image bytes"
+           },
++          "204": {
++            "description": "The album has no local art"
++          },
+           "304": {
+             "description": "Image unchanged"
+           },
+@@ -11863,16 +11845,6 @@
+                 }
+               }
+             }
+-          },
+-          "404": {
+-            "description": "The album has no local art",
+-            "content": {
+-              "application/json": {
+-                "schema": {
+-                  "$ref": "#/components/schemas/ErrorEnvelope"
+-                }
+-              }
+-            }
+           }
+         },
+         "security": [
+@@ -13092,6 +13064,9 @@
+           "200": {
+             "description": "Image bytes"
+           },
++          "204": {
++            "description": "None of the artist's albums has art"
++          },
+           "304": {
+             "description": "Image unchanged"
+           },
+@@ -13114,16 +13089,6 @@
+                 }
+               }
+             }
+-          },
+-          "404": {
+-            "description": "None of the artist's albums has art",
+-            "content": {
+-              "application/json": {
+-                "schema": {
+-                  "$ref": "#/components/schemas/ErrorEnvelope"
+-                }
+-              }
+-            }
+           }
+         },
+         "security": [
+diff --git a/server/tests/catalog/reads_artwork.rs b/server/tests/catalog/reads_artwork.rs
+index 5d56bbaf..dc11ef1f 100644
+--- a/server/tests/catalog/reads_artwork.rs
++++ b/server/tests/catalog/reads_artwork.rs
+@@ -249,7 +249,7 @@ async fn archive_failures_are_remembered_for_as_long_as_they_mean() {
+             assert_eq!(status, StatusCode::ACCEPTED, "{name}: still warming");
+         } else {
+             assert!(
+-                matches!(status, StatusCode::NOT_FOUND | StatusCode::ACCEPTED),
++                matches!(status, StatusCode::NO_CONTENT | StatusCode::ACCEPTED),
+                 "{name}: no cover to serve, got {status}"
+             );
+         }
+@@ -369,7 +369,7 @@ async fn a_library_artist_shows_the_art_of_their_own_album() {
+     assert_eq!(header(&headers, "x-cover-source"), Some("folder"));
+ 
+     let (status, _, _) = get(rig.app(true), "/api/v3/library/artists/nobody/artwork").await;
+-    assert_eq!(status, StatusCode::NOT_FOUND);
++    assert_eq!(status, StatusCode::NO_CONTENT);
+ }
+ 
+ #[tokio::test]
+diff --git a/server/tests/catalog/reads_platform.rs b/server/tests/catalog/reads_platform.rs
+index 8da9bf66..eaae52bb 100644
+--- a/server/tests/catalog/reads_platform.rs
++++ b/server/tests/catalog/reads_platform.rs
+@@ -173,14 +173,15 @@ async fn release_group_cover_hit_serves_bytes_and_revalidates() {
+ }
+ 
+ #[tokio::test]
+-async fn release_group_cover_miss_answers_404_without_a_body() {
++async fn release_group_cover_miss_answers_204_without_a_body() {
+     let (status, headers, body) = get(
+         covers_app(covers_fixture()),
+         "/api/v3/covers/release-group/unknown",
+         &[],
+     )
+     .await;
+-    assert_eq!(status, StatusCode::NOT_FOUND);
++    assert_eq!(status, StatusCode::NO_CONTENT);
++    assert_eq!(header(&headers, "x-cover-state"), Some("missing"));
+     assert_eq!(header(&headers, "content-type"), None);
+     assert_eq!(header(&headers, "cache-control"), Some("no-store"));
+     assert!(body.is_empty());
+diff --git a/server/tests/compat/compat_subsonic_library.rs b/server/tests/compat/compat_subsonic_library.rs
+index 81b01112..385d09ee 100644
+--- a/server/tests/compat/compat_subsonic_library.rs
++++ b/server/tests/compat/compat_subsonic_library.rs
+@@ -1105,7 +1105,7 @@ async fn cover_art_buckets_caching_and_misses() {
+     assert_eq!(playlist.content_type(), "image/png");
+     // A known album without art gets a WebP placeholder drawn from its id:
+     // the same id always gets the same bytes, another album other colours.
+-    // Unknown ids 404 text.
++    // Unknown ids get the neutral placeholder, never a 404.
+     let ids = Ids::read(&client).await;
+     let mut drawn = Vec::new();
+     for id in [
+@@ -1128,17 +1128,50 @@ async fn cover_art_buckets_caching_and_misses() {
+     }
+     assert_eq!(drawn[0], drawn[1], "one album, one placeholder");
+     assert_ne!(drawn[0], drawn[2], "two albums, two placeholders");
+-    for id in ["al-nope", "xx-1"] {
++    for id in ["al-nope", "xx-1", ""] {
+         let answer = client.get("getCoverArt", &[("id", id)]).await;
+         assert_eq!(
+             (answer.status, answer.content_type()),
+-            (StatusCode::NOT_FOUND, "text/plain"),
++            (StatusCode::OK, "image/webp"),
+             "{id}"
+         );
+     }
+     rig.stop().await;
+ }
+ 
++/// Podcasts and internet radio are not served, yet a signed-in client
++/// that asks gets an empty list, not an unknown method; without
++/// credentials the answer is still the sign-in error over HTTP 200.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn podcasts_and_radio_are_empty_lists() {
++    let rig = CompatApp::start("compat-sub-podcasts").await;
++    let client = Client::player(&rig);
++    for (endpoint, key, list) in [
++        ("getPodcasts", "podcasts", "channel"),
++        ("getNewestPodcasts", "newestPodcasts", "episode"),
++        (
++            "getInternetRadioStations",
++            "internetRadioStations",
++            "internetRadioStation",
++        ),
++    ] {
++        let answer = client.ok(endpoint, &[]).await;
++        assert_eq!(
++            answer[key][list],
++            serde_json::json!([]),
++            "{endpoint}: {answer}"
++        );
++        let xml = client.get(endpoint, &[]).await;
++        assert_eq!(xml.status, StatusCode::OK, "{endpoint}");
++        assert!(xml.text().contains("status=\"ok\""), "{endpoint}");
++        let anonymous = unsigned(&rig, "GET", endpoint, &[]).await;
++        assert_code(&anonymous, 10, endpoint);
++    }
++    let anonymous = unsigned(&rig, "GET", "getCoverArt", &[("id", "al-nope")]).await;
++    assert_code(&anonymous, 10, "getCoverArt");
++    rig.stop().await;
++}
++
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+ async fn binary_endpoints_render_errors_as_text() {
+     use base64::Engine as _;
