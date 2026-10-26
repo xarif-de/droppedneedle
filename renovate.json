@@ -6,5 +6,14 @@
     // through fork-sync; a Renovate PR on them would be rejected by fork-check (non-sync
     // PRs may only change infra paths).
     "enabledManagers": ["custom.regex"],
-    "ignorePaths": [".github/**", "server/**", "frontend/**", "sdk/**", "examples/**", "docs/**", "templates/**", "Images/**", "Dockerfile", "docker-compose.example.yml", "Makefile", "rust-toolchain.toml", "entrypoint.sh"]
+    "ignorePaths": [".github/**", "server/**", "frontend/**", "sdk/**", "examples/**", "docs/**", "templates/**", "Images/**", "Dockerfile", "docker-compose.example.yml", "Makefile", "rust-toolchain.toml", "entrypoint.sh"],
+    "packageRules": [
+        {
+            "description": "The suite images replay upstream's CI: the toolchain is upstream's (rust-toolchain.toml, .github/node-version), not the image's tag — rustup follows the toolchain file in any rust image. Only digest refreshes of the same tag; a version bump here is noise (10 step PRs rust 1.90..1.99 on 2026-10-26) and races the sync PR.",
+            "matchFileNames": ["dagger-ci.yaml"],
+            "matchPackageNames": ["rust", "node"],
+            "matchUpdateTypes": ["major", "minor", "patch"],
+            "enabled": false
+        }
+    ]
 }
