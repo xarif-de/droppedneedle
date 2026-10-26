@@ -44,23 +44,28 @@ pub struct RateRow {
 pub const RATES: &[RateRow] = &[
     RateRow {
         source: "musicbrainz",
-        per_second: Rate::Fixed(1.0),
+        // xarif build: half the documented ceiling, so a second MetaBrainz
+        // client on the same IP cannot push the address over it.
+        per_second: Rate::Fixed(0.5),
         burst: 1,
         max_in_flight: None,
-        verified_on: "2026-10-18",
+        verified_on: "2026-10-24",
         basis: "About 1 request per second per IP; over it every request is declined \
-                with HTTP 503. No burst, so two callers never share an instant.",
+                with HTTP 503. No burst, so two callers never share an instant. \
+                xarif build: held at 0.5.",
         url: "https://musicbrainz.org/doc/MusicBrainz_API/Rate_Limiting",
     },
     RateRow {
         source: "brainzmash",
-        per_second: Rate::Fixed(10.0),
+        // xarif build: 4, not 10, the operator's choice (2026-10-24); the pool
+        // publishes no limit, so this is courtesy, not a contract.
+        per_second: Rate::Fixed(4.0),
         burst: 1,
         max_in_flight: Some(1),
         verified_on: "2026-10-18",
         basis: "No documented limit: the page asks for clean, responsible use and \
-                approves apps case by case. Kept at the forced 10 per second, one in \
-                flight; its 429 cooldown is the real governor.",
+                approves apps case by case. Upstream forced 10 per second, one in \
+                flight; its 429 cooldown is the real governor. xarif build: 4.",
         url: "https://brainzmash.cc",
     },
     RateRow {
@@ -124,14 +129,18 @@ pub const RATES: &[RateRow] = &[
     },
     RateRow {
         source: "coverartarchive",
-        per_second: Rate::Fixed(10.0),
+        // xarif build: 1, not 10. The basis below records that a burst here
+        // made every MetaBrainz host refuse this client, and musicbrainz.org
+        // shares the same front door (142.132.241.153 for both, 2026-10-24).
+        per_second: Rate::Fixed(1.0),
         burst: 1,
         max_in_flight: None,
         verified_on: "2026-10-18",
         basis: "No rate limiting rules in place; some endpoints answer 503 when a user \
                 exceeds a limit. Held at 10 per second, one at a time: a burst of 20 \
                 cold-grid fetches was followed by a five-minute refusal from every \
-                MetaBrainz host. Redirect hops to archive.org are not paced.",
+                MetaBrainz host. Redirect hops to archive.org are not paced. \
+                xarif build: 1.",
         url: "https://musicbrainz.org/doc/Cover_Art_Archive/API",
     },
     RateRow {
