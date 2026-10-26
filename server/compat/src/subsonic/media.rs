@@ -161,6 +161,16 @@ async fn picture_of(
 /// names the live one). HEAD is served by the HTTP layer (which strips
 /// bodies); only the playlist branch needs explicit headers.
 pub async fn cover_art(ctx: &Ctx<'_>) -> Result<Outcome, SubsonicError> {
+    // A target that is not (or no longer) in the library gets the neutral
+    // placeholder, as a playlist without a cover does: a cover is never a
+    // reason for a client to see an error.
+    match cover_art_target(ctx).await {
+        Err(error) if error.code == NOT_FOUND => placeholder("").ok_or(error),
+        other => other,
+    }
+}
+
+async fn cover_art_target(ctx: &Ctx<'_>) -> Result<Outcome, SubsonicError> {
     let sid = ctx.p("id")?.unwrap_or_default();
     // Unknown prefix -> 70 -> 404-as-text on the binary path. An album's
     // cover version is dropped here, so any version opens today's picture.
