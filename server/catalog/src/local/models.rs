@@ -57,7 +57,7 @@ pub struct AlbumView {
     /// embedded picture.
     pub cover_available: bool,
     /// True when the server knows the cover routes the web UI would ask
-    /// answer 404: no art of its own, and no release group, or one whose
+    /// answer "no art": no art of its own, and no release group, or one whose
     /// cover is known missing with no other copy's art standing in. False
     /// means ask.
     pub art_missing: bool,
@@ -232,7 +232,7 @@ pub struct ArtistView {
     /// First import time, unix seconds.
     pub date_added: Option<f64>,
     /// True when the server knows the picture route the web UI would ask
-    /// answers 404: a linked artist's picture is known missing, or an
+    /// answers "no art": a linked artist's picture is known missing, or an
     /// unlinked artist has no album art to draw from. False means ask.
     pub art_missing: bool,
     /// True when the caller favorited this artist.
@@ -359,7 +359,7 @@ pub struct TrackView {
     /// embedded picture.
     pub cover_available: bool,
     /// The owning album's `art_missing`: true when the server knows its
-    /// cover routes answer 404. False means ask.
+    /// cover routes answer "no art". False means ask.
     pub art_missing: bool,
     /// True when the caller favorited this track.
     pub favorite: bool,

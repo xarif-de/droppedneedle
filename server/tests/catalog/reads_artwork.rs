@@ -262,7 +262,7 @@ async fn archive_failures_are_remembered_for_as_long_as_they_mean() {
             assert_eq!(status, StatusCode::ACCEPTED, "{name}: still warming");
         } else {
             assert!(
-                matches!(status, StatusCode::NOT_FOUND | StatusCode::ACCEPTED),
+                matches!(status, StatusCode::NO_CONTENT | StatusCode::ACCEPTED),
                 "{name}: no cover to serve, got {status}"
             );
         }
@@ -467,11 +467,11 @@ async fn assert_mosaic(rig: &Rig, case: &str, size: u32, quadrants: [[u8; 3]; 4]
 #[cfg(unix)]
 #[tokio::test]
 async fn an_unlinked_artists_picture_is_drawn_from_their_covers() {
-    // No album with art (the rig's album has none): 404, and the page shows
+    // No album with art (the rig's album has none): 204, and the page shows
     // its placeholder.
     let rig = self::rig(None).await;
     let (status, _, _) = get(rig.app(true), "/api/v3/library/artists/a1/artwork").await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "no covers");
+    assert_eq!(status, StatusCode::NO_CONTENT, "no covers");
 
     // One album with art: that cover as the album shows it.
     let files = ScratchDir::new("reads-artwork-mosaic-one");
@@ -933,7 +933,7 @@ async fn a_cover_the_archive_lacks_is_flagged_on_the_library_views() {
                 None,
             )
             .await;
-        (status == StatusCode::NOT_FOUND).then_some(())
+        (status == StatusCode::NO_CONTENT).then_some(())
     })
     .await;
     assert_eq!(art_missing("/api/v3/library/albums/al1").await, true);
