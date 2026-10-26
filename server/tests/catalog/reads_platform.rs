@@ -201,7 +201,8 @@ async fn release_group_cover_answers() {
     assert_eq!(body, PNG_BYTES, "a tag that does not match");
 
     let (status, headers, body) = get(app(), "/api/v3/covers/release-group/unknown", &[]).await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "miss");
+    assert_eq!(status, StatusCode::NO_CONTENT, "miss");
+    assert_eq!(header(&headers, "x-cover-state"), Some("missing"), "miss");
     assert_eq!(header(&headers, "content-type"), None, "miss");
     assert_eq!(header(&headers, "cache-control"), Some("no-store"), "miss");
     assert!(body.is_empty(), "miss");
