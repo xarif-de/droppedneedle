@@ -56,7 +56,7 @@ fn known_missing(deps: &LibraryDeps) -> KnownMissing<'_> {
     deps.covers.known_missing()
 }
 
-/// The albums, by id, whose cover the web UI would ask for and get a 404:
+/// The albums, by id, whose cover the web UI would ask for and get none:
 /// no art of their own, and either no release group, or one whose cover
 /// the cover cache knows is missing and that no live copy with art of its
 /// own is identified as. Each album is `(id, own art, release group)`.
@@ -133,8 +133,8 @@ async fn track_albums_missing_art(
     .await
 }
 
-/// The artists, by id, whose picture the web UI would ask for and get a
-/// 404: a linked artist whose picture the cover cache knows is missing, or
+/// The artists, by id, whose picture the web UI would ask for and get
+/// none: a linked artist whose picture the cover cache knows is missing, or
 /// an unlinked one with no album art for the library artist route to draw.
 async fn artists_missing_art(
     deps: &LibraryDeps,
