@@ -1,6 +1,7 @@
 <script lang="ts">
 	import '../../auth.css';
 	import { goto } from '$app/navigation';
+	import { page } from '$app/state';
 	import { authStore } from '$lib/stores/authStore.svelte';
 	import { ApiError } from '$lib/api/client';
 	import { getAuthProvidersQuery } from '$lib/queries/auth/AuthProvidersQuery.svelte';
@@ -46,6 +47,14 @@
 		if (!providers.local && providers.plex) activeTab = 'plex';
 		else if (!providers.local && providers.jellyfin) activeTab = 'jellyfin';
 		else if (!providers.local && providers.oidc) activeTab = 'oidc';
+		// xarif build: single sign-on is the only way in from the internet (the
+		// password routes are refused at the reverse proxy), so with OIDC set up
+		// the page goes straight to the identity provider. `?local` keeps the
+		// form, for the break-glass admin reached without the proxy.
+		if (providers.oidc && !page.url.searchParams.has('local')) {
+			activeTab = 'oidc';
+			void handleOidcLogin();
+		}
 	});
 
 	let username = $state('');
