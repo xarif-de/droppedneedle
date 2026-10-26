@@ -76,7 +76,7 @@ tests:
   - name: user-agent-topic-is-in-the-binary
     timeout: 60s
     steps:
-      # Topic user-agent-v2.6.1-form: MusicBrainz drops the `DroppedNeedle/` User-Agent.
+      # Topic musicbrainz-user-agent-form: MusicBrainz drops the `DroppedNeedle/` User-Agent.
       # The format string's literal pieces land in the binary as plain bytes: the topic's
       # prefix must be there and the dropped form's tail must not, or a sync lost it.
       - run:

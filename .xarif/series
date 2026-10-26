@@ -1,8 +1,8 @@
 # Patch topics in stacking order: <topic> base=<upstream sha> pr=<user-fork branch>|local [guard=<table>.<column>,…]
 # Each topic is the ref refs/xarif/patch/<topic> (.xarif/pr.sh get/save); fork-sync rebases them onto the target in this order.
-# pr=local: our own policy (rates, SSO-only login, the User-Agent id slot), never sent upstream.
+# pr=local: our own policy (rates, SSO-only login, the User-Agent id slot of musicbrainz-user-agent-form), never sent upstream.
 joined-cover-fetch-test-margin base=34e5f3cd2fdbae0d2f4b7eb96ba6a22ba173b38c pr=joined-cover-fetch-test-margin
-user-agent-v2.6.1-form base=34e5f3cd2fdbae0d2f4b7eb96ba6a22ba173b38c pr=local
+musicbrainz-user-agent-form base=34e5f3cd2fdbae0d2f4b7eb96ba6a22ba173b38c pr=local
 metabrainz-rates base=34e5f3cd2fdbae0d2f4b7eb96ba6a22ba173b38c pr=local
 oidc-callback-reads-exchange-answer base=34e5f3cd2fdbae0d2f4b7eb96ba6a22ba173b38c pr=oidc-callback-reads-exchange-answer
 login-redirects-to-sso base=34e5f3cd2fdbae0d2f4b7eb96ba6a22ba173b38c pr=local
