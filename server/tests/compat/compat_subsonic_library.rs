@@ -1325,6 +1325,39 @@ pub(crate) fn assert_quadrants(body: &[u8], side: u32, quadrants: [[u8; 3]; 4]) 
     }
 }
 
+/// Podcasts and internet radio are not served, yet a signed-in client
+/// that asks gets an empty list, not an unknown method; without
+/// credentials the answer is still the sign-in error over HTTP 200.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn podcasts_and_radio_are_empty_lists() {
+    let rig = CompatApp::start("compat-sub-podcasts").await;
+    let client = Client::player(&rig);
+    for (endpoint, key, list) in [
+        ("getPodcasts", "podcasts", "channel"),
+        ("getNewestPodcasts", "newestPodcasts", "episode"),
+        (
+            "getInternetRadioStations",
+            "internetRadioStations",
+            "internetRadioStation",
+        ),
+    ] {
+        let answer = client.ok(endpoint, &[]).await;
+        assert_eq!(
+            answer[key][list],
+            serde_json::json!([]),
+            "{endpoint}: {answer}"
+        );
+        let xml = client.get(endpoint, &[]).await;
+        assert_eq!(xml.status, StatusCode::OK, "{endpoint}");
+        assert!(xml.text().contains("status=\"ok\""), "{endpoint}");
+        let anonymous = unsigned(&rig, "GET", endpoint, &[]).await;
+        assert_code(&anonymous, 10, endpoint);
+    }
+    let anonymous = unsigned(&rig, "GET", "getCoverArt", &[("id", "al-nope")]).await;
+    assert_code(&anonymous, 10, "getCoverArt");
+    rig.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn binary_endpoints_render_errors_as_text() {
     use base64::Engine as _;
