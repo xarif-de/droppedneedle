@@ -5,7 +5,7 @@
 	import { authStore } from '$lib/stores/authStore.svelte';
 	import { ApiError } from '$lib/api/client';
 	import { createOidcExchangeMutation } from '$lib/queries/auth/AuthMutations.svelte';
-	import { toAuthUser } from '$lib/queries/auth/types';
+	import { toAuthUser, type SessionUserLike } from '$lib/queries/auth/types';
 	import { onMount } from 'svelte';
 	import { Music } from 'lucide-svelte';
 	import Button from '$lib/ui/Button.svelte';
@@ -22,7 +22,13 @@
 		}
 		try {
 			const data = await oidcExchange.mutateAsync({ code });
-			authStore.setUser(toAuthUser(data.user));
+			// The exchange answers the user object itself, not `{ user }`
+			// (server/auth/src/routes/federated.rs, pinned by
+			// server/tests/server/auth_federated.rs). Reading `data.user` threw,
+			// and the catch below reported a sign-in that had succeeded as
+			// "Could not reach the server".
+			const body = data as unknown as { user?: SessionUserLike } & SessionUserLike;
+			authStore.setUser(toAuthUser(body.user ?? body));
 			// hard navigation on purpose: the exchange call just set the session
 			// cookie, and a soft goto() can outrun it and bounce the first
 			// sign-in back to /login
