@@ -1,0 +1,43 @@
+# xarif fork of DroppedNeedle/DroppedNeedle, line v3 — how it works: XARIF.md.
+# Functions: git.xarif.de/base/dagger-modules (docs/ci.md, docs/fork.md).
+image:
+  source: .                       # upstream Dockerfile, unchanged
+  tests: .xarif/image-tests.yaml
+  build-args: [PLUGIN_PYTHON=0]   # python3 only runs Python plugins (upstream Dockerfile); we run none
+  publish:
+    branches: []                  # only the fork's release tags v*-xarif.N publish
+    release-build-args: ["COMMIT_TAG=${CI_REF_NAME}"]   # the version check and the MusicBrainz User-Agent name the release
+fork:
+  upstream: https://github.com/DroppedNeedle/DroppedNeedle
+  upstream-branch: v3             # v3 (Rust) lives here; the default branch main is v2 (Python)
+  track: branch                   # v3 has no Releases yet: switch to release with v3.0.0 (XARIF.md)
+  version: 3.0.0                  # server/Cargo.toml [workspace.package] version
+  quarantine: 24h
+  interval: 72h                   # upstream lands ~50 commits a day; one move per 3 days bounds suite runs and conflicts
+  branch: xarif
+  infra-paths: [.forgejo/, .xarif/, dagger-ci.yaml, renovate.json, .gitlab-mirror.yaml, .github-mirror.yaml, XARIF.md]
+  migrations: '(^|/)migrations/[^/]+\.sql$'
+  suites:                         # upstream .github/workflows/v3-ci.yml and frontend-ci.yml, replayed
+    - name: server                # jobs Tests, Clippy, Format; Licenses/Audit = cargo-deny (deny: on for server/Cargo.toml)
+      image: rust:1.89.0-bookworm@sha256:948f9b08a66e7fe01b03a98ef1c7568292e07ec2e4fe90d88c07bb14563c84ff
+      workdir: server             # rustup follows rust-toolchain.toml, also when upstream moves it
+      steps:
+        - apt-get update -qq && apt-get install -y -qq --no-install-recommends cmake   # opusic-sys builds a bundled C library
+        - rustup component add clippy rustfmt
+        - cargo fmt --check
+        - cargo clippy --workspace --all-targets -- -D warnings
+        - cargo clippy --workspace --lib --bins -- -D warnings
+        - cargo test --workspace
+    - name: frontend              # jobs Lint, Format & Type Check, Tests
+      image: node:22-bookworm@sha256:63538dfe497cc29dfafdda25ada09b46db68a3f4cc205abf1f5d6bf0913f3384
+      workdir: frontend           # .github/node-version: 22; pnpm from package.json packageManager
+      caches: [/root/.local/share/pnpm/store, /root/.cache/ms-playwright]
+      steps:
+        - corepack enable && corepack install
+        - pnpm install --frozen-lockfile
+        - pnpm run lint
+        - pnpm run format:check
+        - pnpm run check
+        - pnpm exec vitest run --project server
+        - pnpm exec playwright install --with-deps chromium
+        - pnpm exec vitest run --project client
