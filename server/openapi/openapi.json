@@ -4056,6 +4056,9 @@
           "202": {
             "description": "Image is warming; poll again"
           },
+          "204": {
+            "description": "No image for this artist"
+          },
           "304": {
             "description": "Image unchanged"
           },
@@ -4071,16 +4074,6 @@
           },
           "401": {
             "description": "Not authenticated",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "No image for this artist",
             "content": {
               "application/json": {
                 "schema": {
@@ -4183,6 +4176,9 @@
           "202": {
             "description": "Cover is warming; poll again"
           },
+          "204": {
+            "description": "No art for this release group"
+          },
           "304": {
             "description": "Cover unchanged"
           },
@@ -4198,16 +4194,6 @@
           },
           "401": {
             "description": "Not authenticated",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "No art for this release group",
             "content": {
               "application/json": {
                 "schema": {
@@ -4260,6 +4246,9 @@
           "202": {
             "description": "Cover is warming; poll again"
           },
+          "204": {
+            "description": "No art for this release"
+          },
           "304": {
             "description": "Cover unchanged"
           },
@@ -4275,16 +4264,6 @@
           },
           "401": {
             "description": "Not authenticated",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "No art for this release",
             "content": {
               "application/json": {
                 "schema": {
@@ -11841,6 +11820,9 @@
           "200": {
             "description": "Image bytes"
           },
+          "204": {
+            "description": "The album has no local art"
+          },
           "304": {
             "description": "Image unchanged"
           },
@@ -11856,16 +11838,6 @@
           },
           "401": {
             "description": "Not authenticated",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "The album has no local art",
             "content": {
               "application/json": {
                 "schema": {
@@ -13092,6 +13064,9 @@
           "200": {
             "description": "Image bytes"
           },
+          "204": {
+            "description": "None of the artist's albums has art"
+          },
           "304": {
             "description": "Image unchanged"
           },
@@ -13107,16 +13082,6 @@
           },
           "401": {
             "description": "Not authenticated",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "None of the artist's albums has art",
             "content": {
               "application/json": {
                 "schema": {
