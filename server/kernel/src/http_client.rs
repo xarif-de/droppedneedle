@@ -54,10 +54,13 @@ impl HttpSettings {
     /// an application name, version and contact address. musicbrainz.org's
     /// edge drops connections whose User-Agent starts with `DroppedNeedle/`,
     /// so the name is `DroppedNeedleApp`, as v2 sends it since 2.6.1.
+    ///
+    /// xarif build: v2.6.1's id slot names this installation (`xarif.de`),
+    /// and the version is the image's tag (COMMIT_TAG) when the build has one.
     pub fn user_agent(&self) -> String {
         format!(
-            "DroppedNeedleApp/{} ({}; https://www.droppedneedle.com)",
-            env!("CARGO_PKG_VERSION"),
+            "DroppedNeedleApp/{} (xarif.de; {}; https://www.droppedneedle.com)",
+            option_env!("COMMIT_TAG").unwrap_or(env!("CARGO_PKG_VERSION")),
             self.contact_email
         )
     }
