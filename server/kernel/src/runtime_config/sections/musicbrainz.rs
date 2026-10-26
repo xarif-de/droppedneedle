@@ -19,9 +19,11 @@ pub const BRAINZMASH_ENDPOINT: &str = "https://api.brainzmash.cc/ws/2";
 /// Forced BrainzMash throughput (v2 `_BRAINZMASH_RATE_LIMIT`). The kernel
 /// cannot read the providers' rate table; a gate test holds this and
 /// [`OFFICIAL_MB_RATE_LIMIT`] equal to its rows.
-pub const BRAINZMASH_RATE_LIMIT: f64 = 10.0;
+/// xarif build: 4, as the providers' rate table holds it.
+pub const BRAINZMASH_RATE_LIMIT: f64 = 4.0;
 /// Official-host ceilings (never raised).
-pub const OFFICIAL_MB_RATE_LIMIT: f64 = 1.0;
+/// xarif build: 0.5, as the providers' rate table holds it.
+pub const OFFICIAL_MB_RATE_LIMIT: f64 = 0.5;
 /// Widest allowed off-official throughput (0 = Unlimited sentinel).
 pub const MAX_MB_RATE_LIMIT: f64 = 500.0;
 
