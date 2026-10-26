@@ -21,11 +21,8 @@ fork:
     - name: server                # jobs Tests, Clippy, Format; Licenses/Audit = cargo-deny (deny: on for server/Cargo.toml)
       image: rust:1.89.0-bookworm@sha256:948f9b08a66e7fe01b03a98ef1c7568292e07ec2e4fe90d88c07bb14563c84ff
       workdir: server             # rustup follows rust-toolchain.toml, also when upstream moves it
-      env:
-        # Upstream's CI runs on 4 CPUs. The runner's dind sees the node's 16 under an 8-CPU quota,
-        # and with 16 test threads acquire_drop_import::a_cut_off_upload_survives_a_sweep_that_cannot_read_its_jobs
-        # times out on its pool (PoolTimedOut; 3 of 3 runs at 16 threads, 0 of 2 at 2 or 4, 2026-10-26).
-        RUST_TEST_THREADS: "4"
+      # tests on 4 threads: the module's default test-threads (base/dagger-modules 92c5325); 16
+      # threads under the runner's 8-CPU quota time out an upstream test (PoolTimedOut)
       steps:
         - apt-get update -qq && apt-get install -y -qq --no-install-recommends cmake   # opusic-sys builds a bundled C library
         - rustup component add clippy rustfmt

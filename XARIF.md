@@ -11,7 +11,7 @@ upstream ships it, the fork drops it again.
 
 | Where | What |
 |---|---|
-| [git.xarif.de/docker/droppedneedle](https://git.xarif.de/docker/droppedneedle) | working repository (default branch `xarif`; `main` holds the build from before the fork) |
+| [git.xarif.de/docker/droppedneedle](https://git.xarif.de/docker/droppedneedle) | working repository (default branch `xarif`; the build from before the fork: tag `pre-fork/main`) |
 | `registry.gitlab.com/xarif/docker/droppedneedle:<tag>` | container image (linux/amd64), deployed by kubernetes/droppedneedle |
 
 ## Branches and tags
@@ -21,7 +21,7 @@ upstream ships it, the fork drops it again.
 | `xarif` | default branch: an upstream v3 commit + every patch topic + this infra layer. Changes only through pull requests. |
 | `refs/xarif/patch/<topic>` | one change, shaped like an upstream pull request (no xarif files). Not a branch: a branch push would run the upstream's own workflows on our runner. A `patch/*` branch is refused and never used |
 | `sync/next` | the next candidate, written by the bot `fork-bot` |
-| `v3.0.0-dev.<n>-xarif.<m>` | a fork release: `<n>` is the upstream commit's position on `v3`, so later commits get higher numbers; all of them sort before upstream's `v3.0.0` |
+| `v3.0.0-dev.<n>-xarif.<m>` | a fork release: `<n>` is the upstream commit's position on `v3` (7 digits, e.g. `0001900`; the first release still has `1857`), so later commits get higher numbers; all of them sort before upstream's `v3.0.0` |
 
 ## How a release happens
 
