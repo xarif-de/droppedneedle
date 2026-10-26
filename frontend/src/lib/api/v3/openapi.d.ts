@@ -10128,7 +10128,7 @@ export interface components {
         AlbumView: {
             /**
              * @description True when the server knows the cover routes the web UI would ask
-             *     answer 404: no art of its own, and no release group, or one whose
+             *     answer "no art": no art of its own, and no release group, or one whose
              *     cover is known missing with no other copy's art standing in. False
              *     means ask.
              */
@@ -10931,7 +10931,7 @@ export interface components {
             appearance_track_count: number;
             /**
              * @description True when the server knows the picture route the web UI would ask
-             *     answers 404: a linked artist's picture is known missing, or an
+             *     answers "no art": a linked artist's picture is known missing, or an
              *     unlinked artist has no album art to draw from. False means ask.
              */
             art_missing: boolean;
@@ -23067,7 +23067,7 @@ export interface components {
             album_title: string;
             /**
              * @description The owning album's `art_missing`: true when the server knows its
-             *     cover routes answer 404. False means ask.
+             *     cover routes answer "no art". False means ask.
              */
             art_missing: boolean;
             /** @description Local track-artist id, when credited. */
@@ -27220,6 +27220,13 @@ export interface operations {
                 };
                 content?: never;
             };
+            /** @description No image for this artist */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
             /** @description Image unchanged */
             304: {
                 headers: {
@@ -27238,15 +27245,6 @@ export interface operations {
             };
             /** @description Not authenticated */
             401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description No image for this artist */
-            404: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -27317,6 +27315,13 @@ export interface operations {
                 };
                 content?: never;
             };
+            /** @description No art for this release group */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
             /** @description Cover unchanged */
             304: {
                 headers: {
@@ -27335,15 +27340,6 @@ export interface operations {
             };
             /** @description Not authenticated */
             401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description No art for this release group */
-            404: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -27382,6 +27378,13 @@ export interface operations {
                 };
                 content?: never;
             };
+            /** @description No art for this release */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
             /** @description Cover unchanged */
             304: {
                 headers: {
@@ -27400,15 +27403,6 @@ export interface operations {
             };
             /** @description Not authenticated */
             401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description No art for this release */
-            404: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -32598,6 +32592,13 @@ export interface operations {
                 };
                 content?: never;
             };
+            /** @description The album has no local art */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
             /** @description Image unchanged */
             304: {
                 headers: {
@@ -32616,15 +32617,6 @@ export interface operations {
             };
             /** @description Not authenticated */
             401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description The album has no local art */
-            404: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -33472,6 +33464,13 @@ export interface operations {
                 };
                 content?: never;
             };
+            /** @description None of the artist's albums has art */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
             /** @description Image unchanged */
             304: {
                 headers: {
@@ -33490,15 +33489,6 @@ export interface operations {
             };
             /** @description Not authenticated */
             401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description None of the artist's albums has art */
-            404: {
                 headers: {
                     [name: string]: unknown;
                 };

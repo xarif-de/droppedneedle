@@ -50,6 +50,8 @@
 //! | getScanStatus/startScan | scanStatus | yes | startScan admin-only -> 50 |
 //! | getTopSongs | topSongs | yes | exact artist-name match else 70 |
 //! | getSimilarSongs[2] | similarSongs[2] | yes | takes an artist id |
+//! | getPodcasts/getNewestPodcasts | podcasts/newestPodcasts | yes | always empty: no podcasts here |
+//! | getInternetRadioStations | internetRadioStations | yes | always empty: no radio here |
 //!
 //! # Quirks, with their sources
 //!
@@ -268,6 +270,13 @@ pub static ENDPOINTS: &[Endpoint] = &[
     }),
     Endpoint::envelope("getlyrics", |c| Box::pin(library::lyrics(c))),
     Endpoint::envelope("getgenres", |c| Box::pin(library::genres(c))),
+    Endpoint::envelope("getpodcasts", |c| Box::pin(browse::podcasts(c))),
+    Endpoint::envelope("getnewestpodcasts", |c| {
+        Box::pin(browse::newest_podcasts(c))
+    }),
+    Endpoint::envelope("getinternetradiostations", |c| {
+        Box::pin(browse::internet_radio_stations(c))
+    }),
     Endpoint::envelope("getsongsbygenre", |c| Box::pin(library::songs_by_genre(c))),
     Endpoint::envelope("getuser", |c| Box::pin(library::user(c))),
     Endpoint::envelope("getscanstatus", |c| Box::pin(library::scan_status(c))),
