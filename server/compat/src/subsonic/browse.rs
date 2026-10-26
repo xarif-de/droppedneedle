@@ -85,6 +85,25 @@ pub async fn license(_ctx: &Ctx<'_>) -> Result<Outcome, SubsonicError> {
     Outcome::keyed("license", SLicense { valid: true })
 }
 
+/// Podcasts: none on this server. An empty list rather than an unknown
+/// method, so clients that ask on start show an empty section.
+pub async fn podcasts(_ctx: &Ctx<'_>) -> Result<Outcome, SubsonicError> {
+    Outcome::keyed("podcasts", Wrap("channel", Vec::<()>::new()))
+}
+
+/// Newest podcast episodes: none, as for [`podcasts`].
+pub async fn newest_podcasts(_ctx: &Ctx<'_>) -> Result<Outcome, SubsonicError> {
+    Outcome::keyed("newestPodcasts", Wrap("episode", Vec::<()>::new()))
+}
+
+/// Internet radio stations: none on this server, an empty list.
+pub async fn internet_radio_stations(_ctx: &Ctx<'_>) -> Result<Outcome, SubsonicError> {
+    Outcome::keyed(
+        "internetRadioStations",
+        Wrap("internetRadioStation", Vec::<()>::new()),
+    )
+}
+
 /// Advertised OpenSubsonic extensions, all v1. Public (no auth).
 /// The set is owned by `compat::shared::extensions`: every served
 /// extension.
