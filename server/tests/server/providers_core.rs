@@ -114,8 +114,9 @@ fn the_rate_table_is_dated_and_builds_the_limiters() {
     unique.dedup();
     assert_eq!(unique.len(), sources.len(), "no row twice");
     // MusicBrainz's documented rule is hard: one a second, no burst.
+    // xarif build: held at one every two seconds (rates.rs).
     let musicbrainz = set.limiter("musicbrainz").unwrap();
-    assert_eq!(musicbrainz.policy(), RatePolicy::new(1.0, 1));
+    assert_eq!(musicbrainz.policy(), RatePolicy::new(0.5, 1));
 }
 
 /// Expected outcome of one row: the error (or success) and how many

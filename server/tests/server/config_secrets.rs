@@ -426,10 +426,12 @@ fn musicbrainz_official_clamp_and_mirror_rules() {
         ..Default::default()
     };
     let saved = store.save_blocking(settings).unwrap();
-    assert_eq!(saved.rate_limit, 1.0);
+    // xarif build: the official ceiling is the rate table's 0.5.
+    let official = droppedneedle_kernel::runtime_config::sections::OFFICIAL_MB_RATE_LIMIT;
+    assert_eq!(saved.rate_limit, official);
     assert!(saved.clamped_to_official_limits);
     let reread: MusicBrainzSettings = store.get().unwrap();
-    assert_eq!(reread.rate_limit, 1.0);
+    assert_eq!(reread.rate_limit, official);
     assert!(!reread.clamped_to_official_limits);
     let settings = MusicBrainzSettings {
         source_mode: droppedneedle_kernel::runtime_config::sections::MbSourceMode::Mirror,
