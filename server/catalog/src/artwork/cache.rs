@@ -20,7 +20,7 @@
 //! when the cache loads and at most hourly after that. The index also
 //! keeps which key records hold an image and which a fresh "no art"
 //! marker, so a library view can tell, without touching the disk, that a
-//! cover route would answer 404. Every file operation runs on a blocking thread,
+//! cover route would answer that it has no art. Every file operation runs on a blocking thread,
 //! and writes go through a temporary file and a rename so a crash never
 //! leaves a half-written image behind.
 
