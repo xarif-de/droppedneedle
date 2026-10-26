@@ -52,10 +52,16 @@ impl Default for HttpSettings {
 impl HttpSettings {
     /// The User-Agent every outbound request carries. MusicBrainz asks for
     /// an application name, version and contact address.
+    ///
+    /// xarif build: the v2.6.1 form (`DroppedNeedleApp/<version> (<id>;
+    /// <contact>; <url>)`). musicbrainz.org drops connections whose
+    /// User-Agent starts with `DroppedNeedle/` since 2026-08-24, the form v3
+    /// went back to; v2.6.1 replaced it for exactly that reason. The id
+    /// slot names this installation; the contact is CONTACT_EMAIL.
     pub fn user_agent(&self) -> String {
         format!(
-            "DroppedNeedle/{} ( {} ; +https://github.com/DroppedNeedle/DroppedNeedle )",
-            env!("CARGO_PKG_VERSION"),
+            "DroppedNeedleApp/{} (xarif.de; {}; https://www.droppedneedle.com)",
+            option_env!("COMMIT_TAG").unwrap_or(env!("CARGO_PKG_VERSION")),
             self.contact_email
         )
     }
@@ -283,7 +289,7 @@ mod tests {
 
         let (head, status) = one_request(factory.no_redirect().clone(), redirect).await;
         assert_eq!(status, 302, "the no-redirect client hands back the 3xx");
-        assert!(head.contains("user-agent: droppedneedle/"));
+        assert!(head.contains("user-agent: droppedneedleapp/"));
         assert!(head.contains("ops@example.org"));
 
         let ok: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";

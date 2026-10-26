@@ -317,6 +317,23 @@ fn routing_recognizes_v2_set_minus_wma() {
     assert!(format_for_path(Path::new("a.txt")).is_err());
 }
 
+/// A tag item lofty cannot parse (a release date holding a web
+/// address) is dropped on read, so the file is still catalogued; a save
+/// still refuses it and leaves the file as it was.
+#[test]
+fn an_unparsable_tag_item_does_not_hide_the_file() {
+    let frames = vec![
+        ("TIT2", latin1(&["Probe"])),
+        ("TDRL", latin1(&["www.example.com"])),
+    ];
+    let (_dir, path) = raw_id3_mp3("unparsable-item", 3, &frames);
+    let (tag, _) = tags::read_tags(&path).unwrap();
+    assert_eq!(tag.title, "Probe");
+    let before = std::fs::read(&path).unwrap();
+    assert!(tags::save_tags(&path, &[TagEdit::set_title("New")]).is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
 #[test]
 fn wma_is_unrecognized_on_every_entry() {
     let path = fixture("management_full.wma");
@@ -1363,19 +1380,22 @@ fn save_pure_v23_stays_v23() {
 }
 
 #[test]
-fn save_refuses_fixture_with_empty_values() {
+fn save_drops_the_empty_values_of_a_fixture() {
     // flac_no_tags.flac is not tag-free: it carries empty TITLE/ARTIST/
-    // ALBUM values, which lofty would drop on save.
-    let (refusal, before, after) = save_refused(
-        "flac_no_tags.flac",
-        "no-tags",
-        &[TagEdit::set_title("Fresh Title")],
+    // ALBUM values, which read as absent and go with the save.
+    let (_scratch, path) = temp_copy("flac_no_tags.flac", "no-tags");
+    let fields = tags::read_fields(&path).unwrap();
+    for field in [TagField::Title, TagField::Artist, TagField::Album] {
+        assert!(!fields.contains_key(&field), "{field:?}");
+    }
+    assert_eq!(tags::save::tags_kept(&path).unwrap().refusal, None);
+    tags::save_tags(&path, &[TagEdit::set_title("Fresh Title")]).unwrap();
+    assert_eq!(
+        vorbis_values(&path, "TITLE"),
+        vec!["Fresh Title".to_owned()]
     );
-    assert!(
-        matches!(refusal, Refusal::EmptyVorbisValue { .. }),
-        "{refusal:?}"
-    );
-    assert_eq!(before, after);
+    assert!(vorbis_values(&path, "ARTIST").is_empty());
+    assert!(vorbis_values(&path, "ALBUM").is_empty());
 }
 
 #[test]
@@ -2127,20 +2147,36 @@ fn id3_raw_frames_scrub_and_restore() {
     assert_eq!(restored.get("id3:WOAR"), Some(&vec![link]));
 }
 
+/// An empty comment reads as absent, so a save drops it and keeps every
+/// other comment, and a replay of the read document (what an undo
+/// writes) saves cleanly.
 #[test]
-fn save_refuses_empty_vorbis_values() {
+fn save_drops_empty_vorbis_values() {
     let (_scratch, path) = temp_copy("management_full.flac", "empty-vorbis");
-    flac_inject_pairs(&path, &[("ZZZ_EMPTY_TEST", "")]);
-    let before = std::fs::read(&path).unwrap();
-    let refusal = match tags::save_tags(&path, &[TagEdit::set_title("WRAP TITLE")]) {
-        Err(TagsError::SaveRefused { refusal, .. }) => refusal,
-        other => panic!("expected EmptyVorbisValue, got {other:?}"),
-    };
-    assert!(
-        matches!(refusal, Refusal::EmptyVorbisValue { .. }),
-        "{refusal:?}"
+    flac_inject_pairs(&path, &[("ZZZ_EMPTY_TEST", ""), ("LYRICS", "")]);
+    let before = tags::save::read_document(&path).unwrap();
+    assert!(!before.native.contains_key("vorbis:ZZZ_EMPTY_TEST"));
+    assert!(!before.values.contains_key(&TagField::Lyrics));
+    let pairs_before: Vec<(String, String)> = vorbis_pairs(&path)
+        .into_iter()
+        .filter(|(key, value)| !value.is_empty() && key != "TITLE")
+        .collect();
+    assert_eq!(tags::save::tags_kept(&path).unwrap().refusal, None);
+    tags::save_tags(&path, &[TagEdit::set_title("WRAP TITLE")]).unwrap();
+    assert!(vorbis_key_values(&path, "ZZZ_EMPTY_TEST").is_empty());
+    assert!(vorbis_key_values(&path, "LYRICS").is_empty());
+    assert_eq!(
+        vorbis_key_values(&path, "TITLE"),
+        vec!["WRAP TITLE".to_owned()]
     );
-    assert_eq!(before, std::fs::read(&path).unwrap());
+    let pairs_after: Vec<(String, String)> = vorbis_pairs(&path)
+        .into_iter()
+        .filter(|(key, _)| key != "TITLE")
+        .collect();
+    assert_eq!(pairs_after, pairs_before);
+    let title = before.values[&TagField::Title].clone();
+    tags::save_tags(&path, &[TagEdit::new(TagField::Title, title.clone())]).unwrap();
+    assert_eq!(vorbis_key_values(&path, "TITLE"), title);
 }
 
 #[test]
@@ -3889,6 +3925,30 @@ fn frames_kept_only_once_are_refused_before_saving() {
         ));
         assert_eq!(std::fs::read(&path).unwrap(), before, "{id}");
     }
+}
+
+/// Zero padding between an MP3's ID3v2 tag and its first frame, outside
+/// the tag's size, keeps the file readable and writable, pictures included.
+#[test]
+fn mp3_with_padding_after_the_tag_is_saved() {
+    let (_scratch, path) = temp_copy("management_full.mp3", "padded");
+    let bytes = std::fs::read(&path).unwrap();
+    assert_eq!(&bytes[..3], b"ID3");
+    let size = bytes[6..10]
+        .iter()
+        .fold(0usize, |size, byte| (size << 7) | usize::from(*byte & 0x7F));
+    let end = 10 + size;
+    let mut padded = bytes[..end].to_vec();
+    padded.extend(std::iter::repeat_n(0u8, 1044));
+    padded.extend_from_slice(&bytes[end..]);
+    std::fs::write(&path, padded).unwrap();
+    let pictures = tags::save::read_document(&path).unwrap().pictures;
+    assert_eq!(tags::save::tags_kept(&path).unwrap().refusal, None);
+    tags::save_tags(&path, &[TagEdit::set_title("Padded")]).unwrap();
+    let after = tags::save::read_document(&path).unwrap();
+    assert_eq!(after.values[&TagField::Title], vec!["Padded".to_owned()]);
+    assert_eq!(after.pictures, pictures);
+    assert!(std::fs::read(&path).unwrap().ends_with(&bytes[end..]));
 }
 
 /// A v2.3 tag saved as v2.4 (it holds a `TDRC`) keeps its chapters
