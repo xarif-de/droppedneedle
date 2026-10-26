@@ -4018,6 +4018,9 @@
           "202": {
             "description": "Image is warming; poll again"
           },
+          "204": {
+            "description": "No image for this artist"
+          },
           "304": {
             "description": "Image unchanged"
           },
@@ -4033,16 +4036,6 @@
           },
           "401": {
             "description": "Not authenticated",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "No image for this artist",
             "content": {
               "application/json": {
                 "schema": {
@@ -4145,6 +4138,9 @@
           "202": {
             "description": "Cover is warming; poll again"
           },
+          "204": {
+            "description": "No art for this release group"
+          },
           "304": {
             "description": "Cover unchanged"
           },
@@ -4160,16 +4156,6 @@
           },
           "401": {
             "description": "Not authenticated",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "No art for this release group",
             "content": {
               "application/json": {
                 "schema": {
@@ -4222,6 +4208,9 @@
           "202": {
             "description": "Cover is warming; poll again"
           },
+          "204": {
+            "description": "No art for this release"
+          },
           "304": {
             "description": "Cover unchanged"
           },
@@ -4237,16 +4226,6 @@
           },
           "401": {
             "description": "Not authenticated",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "No art for this release",
             "content": {
               "application/json": {
                 "schema": {
@@ -11567,6 +11546,9 @@
           "200": {
             "description": "Image bytes"
           },
+          "204": {
+            "description": "The album has no local art"
+          },
           "304": {
             "description": "Image unchanged"
           },
@@ -11582,16 +11564,6 @@
           },
           "401": {
             "description": "Not authenticated",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "The album has no local art",
             "content": {
               "application/json": {
                 "schema": {
@@ -12828,6 +12800,9 @@
           "200": {
             "description": "Image bytes"
           },
+          "204": {
+            "description": "None of the artist's albums has art"
+          },
           "304": {
             "description": "Image unchanged"
           },
@@ -12843,16 +12818,6 @@
           },
           "401": {
             "description": "Not authenticated",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "None of the artist's albums has art",
             "content": {
               "application/json": {
                 "schema": {
@@ -34968,7 +34933,7 @@
         "properties": {
           "art_missing": {
             "type": "boolean",
-            "description": "True when the server knows the cover routes the web UI would ask\nanswer 404: no art of its own, and no release group, or one whose\ncover is known missing with no other copy's art standing in. False\nmeans ask."
+            "description": "True when the server knows the cover routes the web UI would ask\nanswer \"no art\": no art of its own, and no release group, or one whose\ncover is known missing with no other copy's art standing in. False\nmeans ask."
           },
           "artist_id": {
             "type": "string",
@@ -36643,7 +36608,7 @@
           },
           "art_missing": {
             "type": "boolean",
-            "description": "True when the server knows the picture route the web UI would ask\nanswers 404: a linked artist's picture is known missing, or an\nunlinked artist has no album art to draw from. False means ask."
+            "description": "True when the server knows the picture route the web UI would ask\nanswers \"no art\": a linked artist's picture is known missing, or an\nunlinked artist has no album art to draw from. False means ask."
           },
           "artist_mbid": {
             "type": [
@@ -63795,7 +63760,7 @@
           },
           "art_missing": {
             "type": "boolean",
-            "description": "The owning album's `art_missing`: true when the server knows its\ncover routes answer 404. False means ask."
+            "description": "The owning album's `art_missing`: true when the server knows its\ncover routes answer \"no art\". False means ask."
           },
           "artist_id": {
             "type": [
