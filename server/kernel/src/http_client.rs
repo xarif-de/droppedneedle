@@ -55,10 +55,17 @@ impl HttpSettings {
     /// edge drops connections whose User-Agent starts with `DroppedNeedle/`,
     /// so the name is `DroppedNeedleApp`. The version keeps v2's leading `v`,
     /// the form MetaBrainz's gateway matches (their reply, 2026-11-02).
+    ///
+    /// xarif build: v2.6.1's id slot names this installation (`xarif.de`),
+    /// and the version is the image's tag (`COMMIT_TAG`, `v3.0.0-dev.…`, so
+    /// the leading `v` stays), which the image sets at run time, not at build.
     pub fn user_agent(&self) -> String {
+        let tag = std::env::var("COMMIT_TAG")
+            .ok()
+            .filter(|tag| tag.starts_with('v'))
+            .unwrap_or_else(|| concat!("v", env!("CARGO_PKG_VERSION")).to_owned());
         format!(
-            "DroppedNeedleApp/v{} ({}; https://www.droppedneedle.com)",
-            env!("CARGO_PKG_VERSION"),
+            "DroppedNeedleApp/{tag} (xarif.de; {}; https://www.droppedneedle.com)",
             self.contact_email
         )
     }
