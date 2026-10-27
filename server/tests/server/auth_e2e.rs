@@ -211,7 +211,10 @@ impl E2e {
                 ),
             ),
             crate::common::bundles::idle_host(p, library.core.clone()),
-            droppedneedle::bootstrap::Outbound::live().plex_tv,
+            droppedneedle_media::MediaSetup::remotes(
+                p,
+                droppedneedle::bootstrap::Outbound::live().plex_tv,
+            ),
             None,
             &providers,
             Arc::new(droppedneedle_acquire::requests::mix::MixGrantHooks::new(
@@ -235,7 +238,7 @@ impl E2e {
         let jobs = droppedneedle::bootstrap::jobs::JobsSetup::build(
             p,
             self.runtime.checkpoint().clone(),
-            droppedneedle_media::remotes::presence_feed::MediaJobs::for_tests(p.events.clone()),
+            media.jobs(p),
             None,
             droppedneedle::bootstrap::jobs::ScansEnded::default(),
         );
@@ -264,11 +267,6 @@ impl E2e {
         let settings =
             droppedneedle::settings::wiring::SettingsSetup::for_tests(Arc::clone(&p.ids))
                 .expect("test settings bundle builds")
-                .with_impact_buckets(Arc::new(
-                    droppedneedle::settings::services::SqliteImpactBuckets {
-                        pool: p.db.sqlx().clone(),
-                    },
-                ))
                 .with_library_catalog(Arc::new(
                     droppedneedle::settings::library_catalog::SqliteLibraryPolicyCatalog {
                         pool: p.db.sqlx().clone(),
@@ -281,7 +279,7 @@ impl E2e {
             reads,
             media,
             acquire,
-            library,
+            droppedneedle_library::wiring::LibraryServices::build(&library),
             compat,
             admin,
             settings,
@@ -1184,7 +1182,7 @@ const EXCEPTIONS: &[(&str, &str, Exception, &str)] = &[
     ),
     (
         "POST",
-        "/api/v3/import/items/{item_id}/match",
+        "/api/v3/held/{entry_id}/match",
         Exception::Body(item_match_body),
         "an empty object fails to decode before the handler runs",
     ),

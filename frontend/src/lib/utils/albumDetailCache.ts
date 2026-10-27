@@ -1,7 +1,7 @@
 import { userStorageSegment } from '$lib/queries/userKeySegment';
 import { CACHE_KEYS, CACHE_TTL } from '$lib/constants';
 import { authStore } from '$lib/stores/authStore.svelte';
-import { getNavidromeFolderScopeRevision } from '$lib/utils/navidromeLibraryCache';
+import { navidromeFolderScope } from '$lib/queries/remotes/RemoteQueries.svelte';
 import type {
 	AlbumBasicInfo,
 	AlbumTracksInfo,
@@ -10,11 +10,9 @@ import type {
 	SimilarAlbumsResponse,
 	YouTubeLink,
 	YouTubeTrackLink,
-	JellyfinAlbumMatch,
-	LocalAlbumMatch,
-	NavidromeAlbumMatch,
-	PlexAlbumMatch
+	LocalAlbumMatch
 } from '$lib/types';
+import type { RemoteMatch } from '$lib/queries/remotes/types';
 import { musicBrainzSourceKey } from '$lib/queries/musicbrainz/sourceScope.svelte';
 import { clearLocalStorageNamespace, createLocalStorageCache } from '$lib/utils/localStorageCache';
 
@@ -41,10 +39,10 @@ type AlbumYouTubeCachePayload = {
 };
 
 type AlbumSourceMatchCachePayload = {
-	jellyfin: JellyfinAlbumMatch | null;
+	jellyfin: RemoteMatch | null;
 	local: LocalAlbumMatch | null;
-	navidrome: NavidromeAlbumMatch | null;
-	plex: PlexAlbumMatch | null;
+	navidrome: RemoteMatch | null;
+	plex: RemoteMatch | null;
 };
 
 export const albumBasicCache = createLocalStorageCache<AlbumBasicInfo>(
@@ -84,11 +82,7 @@ export const albumSourceMatchCache = createLocalStorageCache<AlbumSourceMatchCac
 );
 
 export function albumSourceMatchCacheKey(albumId: string): string {
-	return [
-		userStorageSegment(authStore.user?.id),
-		getNavidromeFolderScopeRevision(authStore.user?.id ?? ''),
-		albumId
-	]
+	return [userStorageSegment(authStore.user?.id), navidromeFolderScope(authStore.user?.id), albumId]
 		.map(encodeURIComponent)
 		.join(':');
 }

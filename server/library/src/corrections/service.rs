@@ -17,9 +17,9 @@ use super::models::{
 use super::reset;
 use super::retag_pairs;
 use super::token::{self, TokenFault};
-use crate::clock::{now_ms, now_unix};
+use crate::clock::LibraryClock as _;
 use crate::settings::LibrarySettings;
-use crate::wiring::LibrarySetup;
+use droppedneedle_auth::Admin;
 use droppedneedle_kernel::db::{Db, Lane, savepoint};
 
 /// Catalog corrections over the library's store. Preview tokens are signed
@@ -28,14 +28,16 @@ use droppedneedle_kernel::db::{Db, Lane, savepoint};
 pub struct Corrections {
     db: Db,
     signer: LibrarySettings,
+    clock: std::sync::Arc<dyn droppedneedle_kernel::clock::Clock>,
 }
 
 impl Corrections {
-    pub fn new(setup: &LibrarySetup) -> Self {
-        Self {
-            db: setup.db.clone(),
-            signer: setup.settings.clone(),
-        }
+    pub fn new(
+        db: Db,
+        signer: LibrarySettings,
+        clock: std::sync::Arc<dyn droppedneedle_kernel::clock::Clock>,
+    ) -> Self {
+        Self { db, signer, clock }
     }
 
     /// What a split, merge, move or reset would do, and its token.
@@ -44,7 +46,7 @@ impl Corrections {
         request: &MembershipRequest,
         actor: &str,
     ) -> Result<Previewed<MembershipOutcome>, CorrectionError> {
-        let now = now_unix();
+        let now = self.clock.now_secs();
         self.db
             .write_blocking(Lane::Foreground, "corrections.preview_membership", |tx| {
                 rolled_back(tx, || {
@@ -63,7 +65,7 @@ impl Corrections {
         request: &MembershipRequest,
         meta: &ApplyMeta,
     ) -> Result<Applied, CorrectionError> {
-        let now = now_unix();
+        let now = self.clock.now_secs();
         self.db
             .write_blocking(Lane::Foreground, "corrections.apply_membership", |tx| {
                 if let Some(done) = replay(tx, meta.idempotency_key.as_deref())? {
@@ -112,38 +114,44 @@ impl Corrections {
             })
     }
 
-    /// What an artist merge would do, and its token.
+    /// What an administrator's artist merge would do, and its token.
     pub fn preview_artist_merge(
         &self,
         request: &ArtistMergeRequest,
-        actor: &str,
+        admin: &Admin,
     ) -> Result<Previewed<ArtistMergeOutcome>, CorrectionError> {
-        let now = now_unix();
+        let now = self.clock.now_secs();
         self.db
             .write_blocking(Lane::Foreground, "corrections.preview_artist_merge", |tx| {
                 rolled_back(tx, || {
-                    let run = artists::merge(tx, request, now)?;
+                    let run = artists::merge(tx, admin, request, now)?;
                     Ok(Previewed {
-                        token: token::issue(&self.signer, actor, &run.material, now as i64),
+                        token: token::issue(
+                            &self.signer,
+                            admin.user_id(),
+                            &run.material,
+                            now as i64,
+                        ),
                         outcome: run.outcome,
                     })
                 })
             })
     }
 
-    /// Apply a previewed artist merge.
+    /// Apply an administrator's previewed artist merge.
     pub fn apply_artist_merge(
         &self,
         request: &ArtistMergeRequest,
         meta: &ApplyMeta,
+        admin: &Admin,
     ) -> Result<Applied, CorrectionError> {
-        let now = now_unix();
+        let now = self.clock.now_secs();
         self.db
             .write_blocking(Lane::Foreground, "corrections.apply_artist_merge", |tx| {
                 if let Some(done) = replay(tx, meta.idempotency_key.as_deref())? {
                     return Ok(done);
                 }
-                let run = artists::merge(tx, request, now)?;
+                let run = artists::merge(tx, admin, request, now)?;
                 self.check_token(meta, &run.material, now)?;
                 let mut applied = Applied {
                     kind: "merge_artist".to_owned(),
@@ -160,7 +168,7 @@ impl Corrections {
                         kind: "merge_artist",
                         album_id: None,
                         artist_id: Some(&run.outcome.surviving_artist_id),
-                        before: serde_json::json!({ "artist_ids": all }),
+                        before: serde_json::json!({ "artist_ids": all, "basis": run.basis }),
                         reason: "MANUAL_ARTIST_MERGE",
                         meta,
                         now,
@@ -182,7 +190,7 @@ impl Corrections {
 
     /// Join a pair; returns the album that stays.
     pub fn join_retag_pair(&self, request: &PairJoinRequest) -> Result<String, CorrectionError> {
-        let now = now_unix();
+        let now = self.clock.now_secs();
         self.db
             .write_blocking(Lane::Foreground, "corrections.join_retag_pair", |tx| {
                 retag_pairs::join(tx, request, now)
@@ -191,7 +199,7 @@ impl Corrections {
 
     /// Mark a pair as two albums. False when it was already.
     pub fn dismiss_retag_pair(&self, old: &str, new: &str) -> Result<bool, CorrectionError> {
-        let now_ms = now_ms() as i64;
+        let now_ms = self.clock.now_ms();
         self.db
             .write_blocking(Lane::Foreground, "corrections.dismiss_retag_pair", |tx| {
                 retag_pairs::dismiss(tx, old, new, now_ms)

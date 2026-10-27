@@ -2041,188 +2041,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v3/downloads/held": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Held files the viewer may act on, newest first; one album's with
-         *     `release_group_mbid`. `GET /api/v3/downloads/held`.
-         */
-        get: operations["list_held_handler"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v3/downloads/held/management/{source_task_id}/discard": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Delete every file of a download that waits on the library. Admin only.
-         *     `POST /api/v3/downloads/held/management/{source_task_id}/discard`.
-         */
-        post: operations["discard_local_handler"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v3/downloads/held/management/{source_task_id}/retry": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Import every file of a download that waits on the library (a taken
-         *     destination, an old copy that could not be recycled). Admin only.
-         *     `POST /api/v3/downloads/held/management/{source_task_id}/retry`.
-         */
-        post: operations["retry_local_handler"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v3/downloads/held/reverify": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Re-check AcoustID holds in bulk (at most 25 checks a call; other holds
-         *     answer `skipped`). `POST /api/v3/downloads/held/reverify`.
-         */
-        post: operations["reverify_bulk_handler"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v3/downloads/held/verdict/{source_task_id}/discard": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Delete every file a download's checks held and clear its wrong-product
-         *     verdict. `POST /api/v3/downloads/held/verdict/{source_task_id}/discard`.
-         */
-        post: operations["discard_verdict_handler"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v3/downloads/held/{held_id}/audio": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Play a held file for the review, with byte ranges so the player can
-         *     seek. `GET /api/v3/downloads/held/{held_id}/audio`.
-         */
-        get: operations["held_audio_handler"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v3/downloads/held/{held_id}/discard": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Delete a held file; the album's automatic retry resumes.
-         *     `POST /api/v3/downloads/held/{held_id}/discard`.
-         */
-        post: operations["discard_held_handler"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v3/downloads/held/{held_id}/import": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Import a held file as it is, into the album's chosen edition. For an
-         *     upgrade, the library's copy is replaced only by a better file and goes
-         *     to the recycle bin. `POST /api/v3/downloads/held/{held_id}/import`.
-         */
-        post: operations["import_held_handler"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v3/downloads/held/{held_id}/reverify": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Fingerprint an AcoustID-held file again and import it when AcoustID
-         *     now agrees. `POST /api/v3/downloads/held/{held_id}/reverify`.
-         */
-        post: operations["reverify_held_handler"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/v3/downloads/quarantine": {
         parameters: {
             query?: never;
@@ -2820,6 +2638,167 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v3/held": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Entries waiting for your decision, newest first, with when each
+         *     expires. `GET /api/v3/held`.
+         */
+        get: operations["list_handler"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v3/held/files/{file_id}/audio": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Play a held file, with byte ranges so the player can seek.
+         *     `GET /api/v3/held/files/{file_id}/audio`.
+         */
+        get: operations["audio_handler"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v3/held/recheck": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Re-check AcoustID holds across entries (at most 25 checks a call).
+         *     `POST /api/v3/held/recheck`.
+         */
+        post: operations["recheck_all_handler"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v3/held/{entry_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** One entry with its held files. `GET /api/v3/held/{entry_id}`. */
+        get: operations["get_handler"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v3/held/{entry_id}/discard": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Delete an entry's held files (all, or those named). For a download, the
+         *     album's automatic retry resumes. `POST /api/v3/held/{entry_id}/discard`.
+         */
+        post: operations["discard_handler"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v3/held/{entry_id}/import": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Import an entry's held files (all, or those named), skipping the check
+         *     that held each. A file no better than your copy stays held until "Use
+         *     this file"; a lower-quality version replaces yours only by "Use this
+         *     version", and yours goes to the recycle bin.
+         *     `POST /api/v3/held/{entry_id}/import`.
+         */
+        post: operations["import_handler"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v3/held/{entry_id}/match": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Import an entry's held files as the album a curator picked: the app
+         *     pairs them with its tracks. `POST /api/v3/held/{entry_id}/match`.
+         */
+        post: operations["match_handler"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v3/held/{entry_id}/recheck": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Ask AcoustID again about an entry's files it heard as another recording
+         *     or could not confirm; files it now confirms are imported.
+         *     `POST /api/v3/held/{entry_id}/recheck`.
+         */
+        post: operations["recheck_handler"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v3/home": {
         parameters: {
             query?: never;
@@ -2919,46 +2898,6 @@ export interface paths {
         get: operations["your_top_albums"];
         put?: never;
         post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v3/import/items/{item_id}/discard": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Throw a review item's files away.
-         *     `POST /api/v3/import/items/{item_id}/discard`.
-         */
-        post: operations["discard_item_handler"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v3/import/items/{item_id}/match": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Import a review item as the album you picked.
-         *     `POST /api/v3/import/items/{item_id}/match`.
-         */
-        post: operations["match_item_handler"];
         delete?: never;
         options?: never;
         head?: never;
@@ -3844,7 +3783,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Artist reconciliation progress and open group counts. */
+        /** Automatic artist merges so far and open group counts. */
         get: operations["artist_reconciliation"];
         put?: never;
         post?: never;
@@ -6993,7 +6932,11 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** The remote album behind a MusicBrainz id. */
+        /**
+         * The caller's copy of an album on one source.
+         * @description Found by MusicBrainz id, or on Plex and Navidrome by title and artist
+         *     when no album there carries the id.
+         */
         get: operations["remotes_match_album"];
         put?: never;
         post?: never;
@@ -8128,26 +8071,6 @@ export interface paths {
         get: operations["get_policy_summary"];
         put?: never;
         post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v3/settings/download-clients/policy/impact": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Impact preview of an unsaved policy body against persisted rows.
-         *     Needs the database; unwired states answer 503.
-         */
-        post: operations["post_policy_impact"];
         delete?: never;
         options?: never;
         head?: never;
@@ -10738,8 +10661,7 @@ export interface components {
         ArtistDuplicateGroupSummary: {
             /**
              * Format: int64
-             * @description Credits, favorites, playlist entries, plays, and client ids a merge
-             *     would move.
+             * @description Credits, favorites and plays a merge would move.
              */
             affected_reference_count: number;
             display_name: string;
@@ -10747,6 +10669,7 @@ export interface components {
             id: string;
             member_count: number;
             members: components["schemas"]["ArtistReconciliationMember"][];
+            merge_basis?: null | components["schemas"]["ArtistMergeBasis"];
             provider_mbids: string[];
             /** @description Why the group is listed and what to do about it. */
             reason: components["schemas"]["ReasonView"];
@@ -10903,6 +10826,11 @@ export interface components {
             source_artist_ids: string[];
             surviving_artist_id: string;
         };
+        /**
+         * @description What an automatic artist merge rested on.
+         * @enum {string}
+         */
+        ArtistMergeBasis: "musicbrainz_proof" | "same_name";
         /** @description An artist merge to preview. */
         ArtistMergePreviewBody: {
             /**
@@ -10972,15 +10900,11 @@ export interface components {
             /** Format: int64 */
             album_credit_count: number;
             /** Format: int64 */
-            compatibility_id_count: number;
-            /** Format: int64 */
             favorite_count: number;
             /** Format: int64 */
             history_count: number;
             id: string;
             name: string;
-            /** Format: int64 */
-            playlist_count: number;
             /** Format: int64 */
             primary_album_count: number;
             /** Format: int64 */
@@ -10992,7 +10916,7 @@ export interface components {
             /** Format: int64 */
             track_credit_count: number;
         };
-        /** @description Where the artist reconciliation pass stands. */
+        /** @description Automatic merges so far and open duplicate groups by state. */
         ArtistReconciliationProgress: {
             ambiguous_credit_structure_count: number;
             /**
@@ -11000,17 +10924,10 @@ export interface components {
              * @description Artist records merged automatically so far.
              */
             automatically_resolved_count: number;
-            /** Format: int64 */
-            completed_count: number;
-            /** Format: int64 */
-            expected_count: number;
             /** @description Groups that need an administrator's judgement. */
             genuine_review_count: number;
-            operation_job_id?: string | null;
             provider_conflict_count: number;
             same_name_only_count: number;
-            /** @description The newest reconciliation job's state, or `idle`. */
-            state: string;
             waiting_for_identity_count: number;
         };
         /**
@@ -12304,6 +12221,64 @@ export interface components {
             field: string;
             message: string;
         };
+        /** @description A run's counters, one per column of the runs table. */
+        Counters: {
+            /**
+             * Format: int64
+             * @description Files changed since the last scan.
+             */
+            changed_count: number;
+            /**
+             * Format: int64
+             * @description Files the walk found.
+             */
+            discovered_count: number;
+            /**
+             * Format: int64
+             * @description Files that could not be read or written.
+             */
+            errored_count: number;
+            /**
+             * Format: int64
+             * @description Files a policy leaves out.
+             */
+            excluded_count: number;
+            /**
+             * Format: int64
+             * @description Albums offered for identification.
+             */
+            identification_enqueued_count: number;
+            /**
+             * Format: int64
+             * @description Files written to the catalog.
+             */
+            indexed_count: number;
+            /**
+             * Format: int64
+             * @description Files the index phase looked at.
+             */
+            inspected_count: number;
+            /**
+             * Format: int64
+             * @description Catalog files the walk no longer found.
+             */
+            missing_count: number;
+            /**
+             * Format: int64
+             * @description Files new to the catalog.
+             */
+            new_count: number;
+            /**
+             * Format: int64
+             * @description Files the run will look at.
+             */
+            total_count: number;
+            /**
+             * Format: int64
+             * @description Files unchanged since the last scan.
+             */
+            unchanged_count: number;
+        };
         /**
          * @description Cover-upload body. Base64 JSON instead of multipart: the app has no
          *     multipart feature and the frontend regenerates against this contract.
@@ -13382,10 +13357,6 @@ export interface components {
         DropImportJobsResponse: {
             jobs: components["schemas"]["DropImportJobResponse"][];
         };
-        /** @description The album a person picked for a review item. */
-        DropImportMatchRequest: {
-            release_group_mbid: string;
-        };
         /** @description `drop_import_updated`: one of the user's drop-import jobs moved. */
         DropImportUpdated: {
             /** @description Id for de-duplication. */
@@ -13969,6 +13940,16 @@ export interface components {
          * @enum {string}
          */
         EnrichmentSource: "listenbrainz" | "lastfm" | "none";
+        /**
+         * @description Where an entry's files came from.
+         * @enum {string}
+         */
+        EntryOrigin: "download" | "upload";
+        /**
+         * @description Where an entry is in its life.
+         * @enum {string}
+         */
+        EntryState: "held" | "placing" | "resolved" | "expired";
         /** @description The `error` object inside every error response. */
         ErrorBody: {
             /** @description SCREAMING_SNAKE machine code. */
@@ -14134,6 +14115,13 @@ export interface components {
              */
             retry_delay_seconds: number;
         };
+        /**
+         * @description Why a scan skipped or failed a path, or why a run ended early. The
+         *     `WALK_E*` codes name the operating system's error for a folder the scan
+         *     could not read.
+         * @enum {string}
+         */
+        FailureCode: "ROOT_UNAVAILABLE" | "ROOT_PERMISSION_DENIED" | "WALK_TIMEOUT" | "WALKER_UNAVAILABLE" | "PROBE_UNAVAILABLE" | "WALK_SUPERSEDED" | "WALK_ERROR" | "WALK_EPERM" | "WALK_ENOENT" | "WALK_EIO" | "WALK_EACCES" | "WALK_ENOTDIR" | "WALK_EISDIR" | "WALK_EINVAL" | "WALK_ENFILE" | "WALK_EMFILE" | "WALK_ENOSPC" | "WALK_EROFS" | "WALK_ENAMETOOLONG" | "WALK_ELOOP" | "WALK_EUNKNOWN" | "SYMLINK_ESCAPE_OUT" | "NON_REGULAR_FILE" | "WALK_NAME_ENCODING" | "NFC_TWIN_COLLISION" | "TAG_READ_DEFERRED" | "TAG_READ_FAILED" | "MTIME_SKEW" | "SUPERSEDED_POLICY_CHANGED" | "UNEXPECTED_WORKER_FAILURE" | "MASS_MISSING_GUARD" | "CATALOG_COMMIT_FAILED" | "RUN_END_PENDING";
         /** @description Per-kind counts. */
         FavoriteCounts: {
             /** @description Favorited albums. */
@@ -14609,42 +14597,68 @@ export interface components {
             /** @description Service state, `ok` when serving. */
             status: string;
         };
-        /** @description What an import or discard did. */
+        /** @description What an action did. */
         HeldActionResponse: {
-            /** @description Where the imported file now lives. */
-            final_path?: string | null;
-            /**
-             * @description A note when the outcome needs one (an upgrade's file that was no
-             *     better than the library's copy).
-             */
+            /** @description Files the library already held, so nothing was added. */
+            already_owned: number;
+            /** @description Files deleted. */
+            discarded: number;
+            /** @description Files now in the library. */
+            imported: number;
+            /** @description Why the first file still held stays, when one does. */
             message?: string | null;
-            /** @description `imported` or `discarded`. */
-            status: string;
+            /** @description Files still held. */
+            still_held: number;
         };
-        /** @description One file of a bulk re-check. */
-        HeldBulkReverifyItem: {
-            final_path?: string | null;
-            /** Format: int64 */
-            held_id: number;
-            /** @description Why a file was skipped or failed. */
-            message?: string | null;
-            release_group_mbid?: string | null;
-            /** @description `imported`, `still_held`, `skipped` or `error`. */
-            status: string;
-        };
-        /** @description Bulk re-check: these held ids, in order, or every held file. */
-        HeldBulkReverifyRequest: {
-            held_ids?: number[] | null;
-        };
-        /** @description A bulk re-check's results. */
-        HeldBulkReverifyResponse: {
-            results: components["schemas"]["HeldBulkReverifyItem"][];
-        };
-        /** @description One held file. */
-        HeldImportResponse: {
+        /** @description One entry of the held list: one download or upload, with its files. */
+        HeldEntryResponse: {
             album_title?: string | null;
             artist_name?: string | null;
-            /** Format: double */
+            /**
+             * Format: int64
+             * @description When it was made, in milliseconds.
+             */
+            created_at: number;
+            /**
+             * Format: int64
+             * @description The upload's drop import item.
+             */
+            drop_item_id?: number | null;
+            /**
+             * Format: int64
+             * @description When its held files are removed, in milliseconds.
+             */
+            expires_at: number;
+            files: components["schemas"]["HeldFileResponse"][];
+            /** Format: int64 */
+            id: number;
+            /**
+             * Format: int64
+             * @description When DroppedNeedle next retries the files offering Retry by itself,
+             *     in milliseconds. `None` when no file offers Retry, or when the next
+             *     try is at the held loop's next pass (within five minutes).
+             */
+            next_retry_at?: number | null;
+            origin: components["schemas"]["EntryOrigin"];
+            /** @description The song, for a track download. */
+            recording_mbid?: string | null;
+            release_group_mbid?: string | null;
+            /** @description `held` while it waits, `placing` while an action runs on it. */
+            state: components["schemas"]["EntryState"];
+        };
+        /**
+         * @description What a person can do with one held file, besides listening and
+         *     discarding, which every file offers.
+         * @enum {string}
+         */
+        HeldFileAction: "import" | "retry" | "use_this_version" | "use_this_file" | "recheck" | "get_from_album";
+        /** @description One held file. */
+        HeldFileResponse: {
+            actions: components["schemas"]["HeldFileAction"][];
+            /**
+             * Format: int64
+             * @description When it was held, in milliseconds.
+             */
             created_at: number;
             /** Format: int64 */
             disc_number?: number | null;
@@ -14654,7 +14668,7 @@ export interface components {
             /** Format: double */
             evidence_score?: number | null;
             /**
-             * @description What the rejecting check saw: the title and artist AcoustID heard
+             * @description What the check that held it saw: the title and artist AcoustID heard
              *     or the file's tags name, and AcoustID's score.
              */
             evidence_title?: string | null;
@@ -14663,58 +14677,66 @@ export interface components {
             file_format?: string | null;
             /** Format: int64 */
             id: number;
-            /** Format: double */
-            management_next_retry_at?: number | null;
-            /** Format: int64 */
-            management_retry_count: number;
-            /**
-             * @description `user`, `upgrade`, ... An upgrade's file replaces the library's
-             *     copy only when it is better.
-             */
-            origin: string;
-            original_filename?: string | null;
+            /** @description Its name (and folder) as it came. */
+            original_name: string;
             reason: components["schemas"]["Reason"];
             /** @description What the person can do about it. */
             reason_action: string;
             /** @description Specifics: which file, which marker. */
             reason_detail?: string | null;
             /**
-             * @description `library` when our side held the file and it can be retried as it
-             *     is; `hold` when a person decides.
+             * @description `library` when our side held it and it is retried as it is; `hold`
+             *     when a person decides.
              */
             reason_kind: components["schemas"]["ReasonKind"];
             /** @description The reason as one plain sentence. */
             reason_text: string;
             recording_mbid?: string | null;
-            release_group_mbid?: string | null;
             release_mbid?: string | null;
             release_track_mbid?: string | null;
-            /** @description `soulseek`, `usenet` or `plugin:<key>`. */
+            /** @description `soulseek`, `usenet`, `plugin:<key>` or `upload`. */
             source: string;
             source_task_id?: string | null;
             /** Format: int64 */
             track_number?: number | null;
             track_title?: string | null;
-            /** Format: int64 */
-            year?: number | null;
         };
-        /** @description Held files, newest first. */
+        /** @description The files an action takes; every held file of the entry when left out. */
+        HeldFilesRequest: {
+            file_ids?: number[] | null;
+        };
+        /** @description Entries waiting for a decision, newest first. */
         HeldListResponse: {
-            items: components["schemas"]["HeldImportResponse"][];
+            entries: components["schemas"]["HeldEntryResponse"][];
         };
-        /** @description What a fingerprint re-check did. */
-        HeldReverifyResponse: {
-            final_path?: string | null;
-            /** @description `imported` when AcoustID now agrees, else `still_held`. */
-            status: string;
+        /** @description The album a curator picked, and the files it takes (all when left out). */
+        HeldMatchRequest: {
+            file_ids?: number[] | null;
+            release_group_mbid: string;
         };
-        /** @description A per-download held action's outcome. */
-        HeldUnitResponse: {
-            /** @description Files acted on. */
-            files: number;
-            /** @description `imported` or `discarded`. */
-            status: string;
+        /** @description Bulk re-check: these entries, in order, or every entry. */
+        HeldRecheckAllRequest: {
+            entry_ids?: number[] | null;
         };
+        /** @description A bulk re-check's results. */
+        HeldRecheckAllResponse: {
+            results: components["schemas"]["HeldRecheckItem"][];
+        };
+        /** @description One file of a bulk re-check. */
+        HeldRecheckItem: {
+            /** Format: int64 */
+            entry_id: number;
+            /** Format: int64 */
+            file_id: number;
+            /** @description Why it failed. */
+            message?: string | null;
+            status: components["schemas"]["HeldRecheckStatus"];
+        };
+        /**
+         * @description How one file of a bulk re-check went.
+         * @enum {string}
+         */
+        HeldRecheckStatus: "imported" | "still_held" | "error";
         /** @description One listening-history entry. */
         HistoryEntry: {
             /** @description Track album. */
@@ -19002,44 +19024,6 @@ export interface components {
             };
         };
         /**
-         * @description Admin preview of an unsaved policy against persisted state:
-         *     persisted-state bucket counts only.
-         */
-        PolicyImpactResponse: {
-            /**
-             * Format: int64
-             * @description Rows awaiting review.
-             */
-            awaiting_review: number;
-            /**
-             * Format: int64
-             * @description Held reviews.
-             */
-            held_reviews: number;
-            /** @description Whether a down-level image would preserve acquisition behavior. */
-            legacy_representable: boolean;
-            /**
-             * Format: int64
-             * @description Manual search jobs that would re-resolve.
-             */
-            manual_search_jobs: number;
-            /**
-             * Format: int64
-             * @description Queued rows with no attempts yet.
-             */
-            queued_without_attempts: number;
-            /**
-             * Format: int64
-             * @description Remote-queued zero-byte rows.
-             */
-            remote_queued_zero_byte: number;
-            /**
-             * Format: int64
-             * @description Transferring rows (immutable under the new policy).
-             */
-            transferring_immutable: number;
-        };
-        /**
          * @description Which kind of scope a policy-tree node stands for.
          * @enum {string}
          */
@@ -19745,7 +19729,7 @@ export interface components {
          * @description One reason, stored and sent by its snake_case spelling.
          * @enum {string}
          */
-        Reason: "weak_match" | "no_artist_evidence" | "mostly_unmatched" | "tag_mismatch" | "fingerprint_mismatch" | "fingerprint_unconfirmed" | "album_version_only" | "no_release" | "no_tracks" | "version_lower_quality" | "no_better_than_yours" | "no_album_match" | "album_not_found" | "tags_disagree" | "not_chosen_edition" | "samples" | "too_many_files" | "interrupted" | "import_failed" | "held_by_earlier_version" | "target_occupied" | "upgrade_blocked" | "library_changed" | "library_unavailable" | "naming_script_failed" | "library_folder_missing" | "local_fault" | "files_missing" | "files_unlisted" | "outside_downloads_folder" | "size_mismatch" | "corrupt" | "no_audio" | "sample" | "wrong_edition" | "not_pinned_edition" | "wrong_album" | "quality_rejected" | "not_an_upgrade" | "wrong_track" | "stalled" | "queue_timeout" | "never_started" | "deadline" | "source_failed" | "no_source" | "download_failed" | "album_lookup_unavailable" | "recording_unknown" | "no_album_for_recording" | "no_album_folder" | "no_album_release" | "album_releases_exhausted" | "track_not_found" | "no_download_source" | "settings_unreadable" | "journal_unreadable" | "musicbrainz_unavailable" | "held_for_review" | "tracks_missing" | "already_owned" | "cancelled" | "moved_on";
+        Reason: "weak_match" | "no_artist_evidence" | "mostly_unmatched" | "tag_mismatch" | "fingerprint_mismatch" | "fingerprint_unconfirmed" | "album_version_only" | "no_release" | "no_tracks" | "version_lower_quality" | "no_better_than_yours" | "owned_elsewhere" | "owned_on_album" | "no_album_match" | "album_not_found" | "tags_disagree" | "not_chosen_edition" | "samples" | "too_many_files" | "interrupted" | "import_failed" | "held_by_earlier_version" | "target_occupied" | "upgrade_blocked" | "library_changed" | "library_unavailable" | "naming_script_failed" | "library_folder_missing" | "local_fault" | "files_missing" | "files_unlisted" | "outside_downloads_folder" | "size_mismatch" | "corrupt" | "no_audio" | "sample" | "wrong_edition" | "not_pinned_edition" | "wrong_album" | "quality_rejected" | "not_an_upgrade" | "wrong_track" | "stalled" | "queue_timeout" | "never_started" | "deadline" | "source_failed" | "no_source" | "download_failed" | "album_lookup_unavailable" | "recording_unknown" | "no_album_for_recording" | "no_album_folder" | "no_album_release" | "album_releases_exhausted" | "track_not_found" | "no_download_source" | "settings_unreadable" | "journal_unreadable" | "musicbrainz_unavailable" | "held_for_review" | "tracks_missing" | "already_owned" | "cancelled" | "moved_on";
         /** @description How many reviews one reason holds. */
         ReasonCount: {
             /** Format: int64 */
@@ -21259,7 +21243,8 @@ export interface components {
          */
         ScanKindBody: "incremental" | "rescan_files" | "policy_reconcile";
         /**
-         * @description Worker phase. Spelling matches v2 `ScanPhase` exactly.
+         * @description A run's phase as the API reports it and the runs table stores it:
+         *     `queued` before the run starts, then the phase it is in or reached.
          * @enum {string}
          */
         ScanPhase: "queued" | "discovering" | "indexing" | "reconciling";
@@ -21285,7 +21270,7 @@ export interface components {
             /** @description What to do about it. */
             action: string;
             /** @description Stable machine code, for example `TAG_READ_FAILED`. */
-            failure_code: string;
+            failure_code: components["schemas"]["FailureCode"];
             /** @description Technical detail for diagnostics; not meant for display. */
             failure_detail: string;
             /** @description What happened, in plain words. */
@@ -21353,9 +21338,7 @@ export interface components {
              */
             coalesced_request_count: number;
             /** @description Progress counters. */
-            counters: {
-                [key: string]: number;
-            };
+            counters: components["schemas"]["Counters"];
             /**
              * Format: int64
              * @description Event revision.
@@ -21400,8 +21383,7 @@ export interface components {
              * @description Terminal time, when terminal.
              */
             terminal_at?: number | null;
-            /** @description Terminal code, when terminal. */
-            terminal_code?: string | null;
+            terminal_code?: null | components["schemas"]["FailureCode"];
             /** @description What the terminal code means, in plain words. */
             terminal_message?: string | null;
             /** @description What triggered the run. */
@@ -21429,7 +21411,7 @@ export interface components {
             root_id: string;
         };
         /**
-         * @description Durable run state. Spelling matches v2 `ScanState` exactly.
+         * @description A run's state, as the API reports it and the runs table stores it.
          * @enum {string}
          */
         ScanState: "queued" | "discovering" | "indexing" | "reconciling" | "pausing" | "paused" | "stopping" | "completed" | "cancelled" | "superseded_policy_changed" | "failed";
@@ -23275,8 +23257,8 @@ export interface components {
              * @description Epoch seconds when the next check is due, when scheduled.
              */
             next_check_at?: number | null;
-            /** @description Watch state: `watching`, `stopped` or `fulfilled`. */
-            state: string;
+            /** @description Watch state. */
+            state: components["schemas"]["WatchState"];
             /** @description Owner id (admins see every row). */
             user_id?: string | null;
             /** @description Owner display name (admins only; the "watched for" chip). */
@@ -23386,6 +23368,12 @@ export interface components {
              */
             watch_partial_albums: boolean;
         };
+        /**
+         * @description A wanted watch's state. The `wanted_watches.state` CHECK lists exactly
+         *     these values.
+         * @enum {string}
+         */
+        WatchState: "watching" | "stopped" | "fulfilled";
         /**
          * @description WAV tag policy.
          * @enum {string}
@@ -28223,224 +28211,6 @@ export interface operations {
             };
         };
     };
-    list_held_handler: {
-        parameters: {
-            query?: {
-                /** @description Only this album's held files. */
-                release_group_mbid?: string;
-            };
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HeldListResponse"];
-                };
-            };
-        };
-    };
-    discard_local_handler: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Download task id */
-                source_task_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HeldUnitResponse"];
-                };
-            };
-        };
-    };
-    retry_local_handler: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Download task id */
-                source_task_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HeldUnitResponse"];
-                };
-            };
-        };
-    };
-    reverify_bulk_handler: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["HeldBulkReverifyRequest"];
-            };
-        };
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HeldBulkReverifyResponse"];
-                };
-            };
-        };
-    };
-    discard_verdict_handler: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Download task id */
-                source_task_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HeldUnitResponse"];
-                };
-            };
-        };
-    };
-    held_audio_handler: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Held file id */
-                held_id: number;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description The held file */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/octet-stream": unknown;
-                };
-            };
-            /** @description The requested byte range */
-            206: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/octet-stream": unknown;
-                };
-            };
-            /** @description The range lies outside the file */
-            416: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-        };
-    };
-    discard_held_handler: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Held file id */
-                held_id: number;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HeldActionResponse"];
-                };
-            };
-        };
-    };
-    import_held_handler: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Held file id */
-                held_id: number;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HeldActionResponse"];
-                };
-            };
-        };
-    };
-    reverify_held_handler: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Held file id */
-                held_id: number;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HeldReverifyResponse"];
-                };
-            };
-        };
-    };
     list_quarantine_handler: {
         parameters: {
             query?: {
@@ -29350,6 +29120,222 @@ export interface operations {
             };
         };
     };
+    list_handler: {
+        parameters: {
+            query?: {
+                /** @description Only this album's entries. */
+                release_group_mbid?: string;
+                /** @description Only entries holding files of this download. */
+                task_id?: string;
+                /** @description Admins: every user's entries. */
+                all?: boolean;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HeldListResponse"];
+                };
+            };
+        };
+    };
+    audio_handler: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Held file id */
+                file_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The held file */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/octet-stream": unknown;
+                };
+            };
+            /** @description The requested byte range */
+            206: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/octet-stream": unknown;
+                };
+            };
+            /** @description The range lies outside the file */
+            416: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    recheck_all_handler: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["HeldRecheckAllRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HeldRecheckAllResponse"];
+                };
+            };
+        };
+    };
+    get_handler: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Held entry id */
+                entry_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HeldEntryResponse"];
+                };
+            };
+        };
+    };
+    discard_handler: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Held entry id */
+                entry_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["HeldFilesRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HeldActionResponse"];
+                };
+            };
+        };
+    };
+    import_handler: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Held entry id */
+                entry_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["HeldFilesRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HeldActionResponse"];
+                };
+            };
+        };
+    };
+    match_handler: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Held entry id */
+                entry_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["HeldMatchRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HeldActionResponse"];
+                };
+            };
+        };
+    };
+    recheck_handler: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Held entry id */
+                entry_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["HeldFilesRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HeldActionResponse"];
+                };
+            };
+        };
+    };
     get_home: {
         parameters: {
             query?: never;
@@ -29629,54 +29615,6 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-        };
-    };
-    discard_item_handler: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Import item id */
-                item_id: number;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["DropImportItemResponse"];
-                };
-            };
-        };
-    };
-    match_item_handler: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Import item id */
-                item_id: number;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["DropImportMatchRequest"];
-            };
-        };
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["DropImportItemResponse"];
                 };
             };
         };
@@ -42468,6 +42406,10 @@ export interface operations {
             query: {
                 /** @description MusicBrainz release or release-group id. */
                 mbid: string;
+                /** @description Album title. */
+                title?: string;
+                /** @description Album artist. */
+                artist?: string;
             };
             header?: never;
             path: {
@@ -44206,39 +44148,6 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["PolicySummaryResponse"];
-                };
-            };
-        };
-    };
-    post_policy_impact: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["DownloadPolicy"];
-            };
-        };
-        responses: {
-            /** @description Impact preview */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["PolicyImpactResponse"];
-                };
-            };
-            /** @description Bucket counts are unwired */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
         };
@@ -46955,6 +46864,8 @@ export interface operations {
                 format?: string;
                 /** @description Client bitrate cap in kbps (0 or unset means uncapped) */
                 max_bitrate?: number;
+                /** @description Seek offset in seconds for a transcode */
+                start_seconds?: number;
                 /** @description Ask a transcode landing for its estimated Content-Length */
                 estimate_content_length?: boolean;
             };
@@ -47050,7 +46961,16 @@ export interface operations {
     };
     stream_head: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Requested output codec: mp3, opus, or raw */
+                format?: string;
+                /** @description Client bitrate cap in kbps (0 or unset means uncapped) */
+                max_bitrate?: number;
+                /** @description Seek offset in seconds for a transcode */
+                start_seconds?: number;
+                /** @description Ask a transcode landing for its estimated Content-Length */
+                estimate_content_length?: boolean;
+            };
             header?: never;
             path: {
                 /** @description Audio source: local, jellyfin, navidrome, plex, or plugin */

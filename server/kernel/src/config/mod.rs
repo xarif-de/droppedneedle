@@ -304,15 +304,15 @@ fn parse_bind_host(raw: Option<&str>) -> Result<BindHost, ConfigError> {
         .map_err(|_| ConfigError::InvalidBindHost(text.to_owned()))
 }
 
-/// Map v2's `LOG_LEVEL` names onto a tracing filter. `CRITICAL` has no
-/// tracing level of its own and maps to `error`.
 /// Audio decoders log a line per damaged frame or odd tag at info and warn
-/// (symphonia's "count1 overrun, malformed bitstream", "invalid language
-/// code"; lofty's duration estimates): tens of thousands of lines an hour
-/// while a library is analysed, none a person can act on. `LOG_LEVEL` keeps
-/// them at error; `RUST_LOG` replaces the whole filter as before.
+/// (symphonia's "count1 overrun, malformed bitstream" and "invalid language
+/// code", lofty's bitrate and duration estimates): tens of thousands of lines
+/// an hour while a library is analysed, none a person can act on. `LOG_LEVEL` keeps them at error;
+/// `RUST_LOG` replaces the whole filter as before.
 const QUIET_DECODERS: &str = "symphonia=error,lofty=error";
 
+/// Map v2's `LOG_LEVEL` names onto a tracing filter. `CRITICAL` has no
+/// tracing level of its own and maps to `error`.
 fn log_filter_for(raw: Option<&str>) -> Result<String, ConfigError> {
     let Some(text) = raw else {
         return Ok(format!("info,{QUIET_DECODERS}"));
@@ -524,11 +524,6 @@ mod tests {
             assert!(load(&[bad]).is_err(), "{bad:?} should fail");
         }
     }
-}
-
-#[cfg(test)]
-mod quiet_decoder_tests {
-    use super::*;
 
     #[test]
     fn log_level_keeps_audio_decoders_at_error() {

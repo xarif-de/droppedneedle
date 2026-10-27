@@ -368,7 +368,11 @@ async fn library_round_trip_cas_and_paths() {
         .await
         .expect("saves");
     assert_eq!(saved.settings.acoustid_api_key.expose(), SECRET_MASK);
-    assert!(effects.calls().is_empty(), "a save clears no cache");
+    assert_eq!(
+        effects.calls(),
+        [Effect::RefreshLibraryRoots],
+        "a save takes the roots in and clears no cache"
+    );
     let stored = service.store.get_raw::<TypedLibrary>().expect("raw reads");
     assert_eq!(stored.acoustid_api_key.expose(), "acoustid-secret");
 
@@ -1058,6 +1062,25 @@ async fn serve_stub() -> String {
             .expect("stub serves");
     });
     base
+}
+
+/// A server address that does not parse names no server: the media
+/// server checks say they could not connect, never that the server has
+/// no such item.
+#[tokio::test]
+async fn unparseable_server_address_cannot_connect() {
+    let probes = LiveProbes::new(
+        reqwest::Client::new(),
+        &droppedneedle_providers::Providers::closed(),
+    );
+    let address = "http://not a host";
+    for message in [
+        probes.jellyfin(address, "key").await.message,
+        probes.navidrome(address, "ada", "pw").await.message,
+        probes.plex(address, "token").await.message,
+    ] {
+        assert!(message.starts_with("Could not connect"), "{message}");
+    }
 }
 
 /// Every live probe passes against the stub and fails honestly: bad

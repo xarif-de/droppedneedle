@@ -19,8 +19,9 @@ use super::reasons;
 use super::reidentify::evaluation;
 use super::store::{self, NewReidentification};
 use super::{choice, decisions, hand_match, history, reviews};
-use crate::clock::now_unix;
+use crate::clock::LibraryClock as _;
 use crate::identify::models::LocalAlbumFacts;
+use crate::identify::providers::RELEASE_UNREADABLE;
 use crate::identify::queue::queue_retry;
 use crate::identify::service::IdentifyService;
 use crate::identify::sources::EditionQuery;
@@ -29,7 +30,6 @@ use crate::identity::reads::album_identity_row;
 use crate::jobs::{self, OperationKind};
 use crate::matching::model::Release;
 use crate::scan::watcher::WorkWakeups;
-use crate::wiring::LibrarySetup;
 use droppedneedle_kernel::db::{Db, Lane, savepoint};
 use droppedneedle_kernel::ids::IdGenerator;
 use droppedneedle_kernel::runtime_config::Live;
@@ -51,17 +51,27 @@ pub struct Operations {
     ids: Arc<dyn IdGenerator>,
     management: Live<LibraryManagement>,
     wakeups: WorkWakeups,
+    clock: Arc<dyn droppedneedle_kernel::clock::Clock>,
 }
 
 impl Operations {
-    pub fn new(setup: &LibrarySetup) -> Self {
+    pub fn new(
+        db: Db,
+        store: Arc<SqliteIdentifyStore>,
+        identify: Arc<IdentifyService>,
+        ids: Arc<dyn IdGenerator>,
+        management: Live<LibraryManagement>,
+        wakeups: WorkWakeups,
+        clock: Arc<dyn droppedneedle_kernel::clock::Clock>,
+    ) -> Self {
         Self {
-            db: setup.db.clone(),
-            store: setup.identify_store.clone(),
-            identify: setup.identify.clone(),
-            ids: setup.ids.clone(),
-            management: setup.settings.management.clone(),
-            wakeups: setup.wakeups.clone(),
+            db,
+            store,
+            identify,
+            ids,
+            management,
+            wakeups,
+            clock,
         }
     }
 
@@ -73,6 +83,18 @@ impl Operations {
         self.db.read_blocking("operations.edition_status", |conn| {
             Ok::<_, OperationError>(super::status::edition_status(conn, album_id)?)
         })
+    }
+
+    /// The live automatic-edition undo for one album: the revisions to
+    /// echo. Blocking.
+    pub fn automatic_edition_undo(
+        &self,
+        album_id: &str,
+    ) -> Result<Option<(i64, i64)>, OperationError> {
+        self.db
+            .read_blocking("operations.automatic_edition_undo", |conn| {
+                Ok::<_, OperationError>(decisions::live_automatic_edition_undo(conn, album_id)?)
+            })
     }
 
     /// One page of the albums whose match waits for a person. Blocking.
@@ -113,7 +135,7 @@ impl Operations {
                     control,
                     expected_row_revision,
                     idempotency_key,
-                    now_unix(),
+                    self.clock.now_secs(),
                 )
             })?;
         if let Some(kind) = OperationKind::parse(&job.kind) {
@@ -168,7 +190,7 @@ impl Operations {
     ) -> Result<reviews::ReviewRow, OperationError> {
         self.db
             .write_blocking(Lane::Foreground, "operations.settle_review", |tx| {
-                reviews::settle(tx, review_id, action, actor, now_unix())
+                reviews::settle(tx, review_id, action, actor, self.clock.now_secs())
             })?;
         self.review(review_id)
     }
@@ -201,10 +223,11 @@ impl Operations {
                     "pending",
                     crate::identify::models::ReviewState::Dismissed,
                     actor,
+                    self.clock.now_secs(),
                 )? {
                     return Err(OperationError::Conflict(reasons::REVIEW_SETTLED));
                 }
-                store::create_reidentification(tx, &self.management, &new, now_unix())
+                store::create_reidentification(tx, &self.management, &new, self.clock.now_secs())
             })?;
         jobs::wake(&self.wakeups, OperationKind::ExplicitReidentification);
         Ok(job)
@@ -252,7 +275,7 @@ impl Operations {
                                     tx,
                                     &self.management,
                                     &new,
-                                    now_unix(),
+                                    self.clock.now_secs(),
                                 )
                                 .map(|_| ()),
                             )
@@ -334,7 +357,7 @@ impl Operations {
                                 &item.review_id,
                                 reviews::ReviewAction::Exclude,
                                 actor,
-                                now_unix(),
+                                self.clock.now_secs(),
                             )
                         },
                     ) {
@@ -384,10 +407,19 @@ impl Operations {
             .await?;
         let (ops, album, actor) = (self.clone(), album_id.to_owned(), actor.map(str::to_owned));
         tokio::task::spawn_blocking(move || {
-            ops.db
-                .write_blocking(Lane::Foreground, "operations.choose_edition", |tx| {
-                    choice::choose(tx, &album, &candidate, actor.as_deref(), now_unix())
-                })
+            let chosen =
+                ops.db
+                    .write_blocking(Lane::Foreground, "operations.choose_edition", |tx| {
+                        choice::choose(
+                            tx,
+                            &album,
+                            &candidate,
+                            actor.as_deref(),
+                            ops.clock.now_secs(),
+                        )
+                    })?;
+            ops.store.link_after_command(&album);
+            Ok::<_, OperationError>(chosen)
         })
         .await
         .map_err(|error| OperationError::Store(error.to_string()))?
@@ -438,7 +470,14 @@ impl Operations {
         tokio::task::spawn_blocking(move || {
             ops.db
                 .write_blocking(Lane::Foreground, "operations.custom_edition", |tx| {
-                    decisions::custom_edition(tx, &album, &candidate, &guard, &actor, now_unix())
+                    decisions::custom_edition(
+                        tx,
+                        &album,
+                        &candidate,
+                        &guard,
+                        &actor,
+                        ops.clock.now_secs(),
+                    )
                 })
         })
         .await
@@ -459,7 +498,7 @@ impl Operations {
                     album_id,
                     expected_identity_revision,
                     actor,
-                    now_unix(),
+                    self.clock.now_secs(),
                 )
             })
     }
@@ -505,6 +544,9 @@ impl Operations {
                     .failure_code
                     .unwrap_or_else(|| "musicbrainz_unavailable".to_owned()),
             ));
+        }
+        if recall.failure_code.as_deref() == Some(RELEASE_UNREADABLE) {
+            return Err(OperationError::Conflict(reasons::EDITION_UNREADABLE));
         }
         if recall.releases.is_empty() {
             return Err(OperationError::NotFound(reasons::EDITION_NOT_FOUND));
@@ -701,8 +743,8 @@ impl Operations {
                         &asked,
                         &release,
                         &candidate,
-                        now_unix(),
-                        crate::clock::now_ms() as i64,
+                        ops.clock.now_secs(),
+                        ops.clock.now_ms(),
                     )
                 })
         })
@@ -719,7 +761,7 @@ impl Operations {
     ) -> Result<(), OperationError> {
         self.db
             .write_blocking(Lane::Foreground, "operations.unmatch_file", |tx| {
-                hand_match::unmatch_file(tx, album_id, track_id, actor, now_unix())
+                hand_match::unmatch_file(tx, album_id, track_id, actor, self.clock.now_secs())
             })
     }
 
@@ -736,7 +778,7 @@ impl Operations {
         }
         self.db
             .write_blocking(Lane::Foreground, "operations.hand_back", |tx| {
-                choice::hand_back(tx, album_id, actor, now_unix())
+                choice::hand_back(tx, album_id, actor, self.clock.now_secs())
             })
     }
 
@@ -748,7 +790,7 @@ impl Operations {
         caller_user_id: &str,
     ) -> Result<Vec<history::HistoryEntry>, OperationError> {
         self.db.read_blocking("operations.album_history", |conn| {
-            history::album_history(conn, album_id, caller_user_id, now_unix())?
+            history::album_history(conn, album_id, caller_user_id, self.clock.now_secs())?
                 .ok_or(OperationError::NotFound(reasons::ALBUM_NOT_FOUND))
         })
     }
@@ -761,7 +803,7 @@ impl Operations {
         self.db.write_blocking(
             Lane::Foreground,
             "operations.undo_fold",
-            |tx| match undo_fold(tx, fold_id, Some(actor), now_unix())? {
+            |tx| match undo_fold(tx, fold_id, Some(actor), self.clock.now_secs())? {
                 FoldUndo::Restored => Ok(()),
                 FoldUndo::Stale => Err(OperationError::Conflict(reasons::FOLD_STALE)),
                 FoldUndo::Unknown => Err(OperationError::NotFound(reasons::FOLD_NOT_FOUND)),
@@ -776,7 +818,7 @@ impl Operations {
 
         self.db
             .write_blocking(Lane::Foreground, "operations.undo_artist_repair", |tx| {
-                match undo_artist_from_tracks(tx, repair_id, actor, now_unix())? {
+                match undo_artist_from_tracks(tx, repair_id, actor, self.clock.now_secs())? {
                     ArtistRepairUndo::Restored => Ok(()),
                     ArtistRepairUndo::Stale => {
                         Err(OperationError::Conflict(reasons::ARTIST_REPAIR_STALE))
@@ -792,15 +834,17 @@ impl Operations {
     pub fn confirm_match(&self, album_id: &str, actor: &str) -> Result<(), OperationError> {
         self.db
             .write_blocking(Lane::Foreground, "operations.confirm_match", |tx| {
-                choice::confirm(tx, album_id, actor, now_unix())
-            })
+                choice::confirm(tx, album_id, actor, self.clock.now_secs())
+            })?;
+        self.store.link_after_command(album_id);
+        Ok(())
     }
 
     /// Take back the album's last edition change. Blocking.
     pub fn undo_edition_choice(&self, album_id: &str, actor: &str) -> Result<(), OperationError> {
         self.db
             .write_blocking(Lane::Foreground, "operations.undo_edition_choice", |tx| {
-                choice::undo(tx, album_id, actor, now_unix())
+                choice::undo(tx, album_id, actor, self.clock.now_secs())
             })
     }
 
@@ -811,7 +855,7 @@ impl Operations {
     pub async fn remap_next(&self) -> Result<bool, OperationError> {
         use choice::RemapOrigin;
 
-        let now = now_unix();
+        let now = self.clock.now_secs();
         let Some(pending) = self.db.read_blocking("operations.next_remap", |conn| {
             Ok::<_, OperationError>(choice::next_remap(conn, now)?)
         })?
@@ -829,7 +873,7 @@ impl Operations {
         let place_only = pending.origin == RemapOrigin::PlaceOnly;
         self.db
             .write_blocking(Lane::Background, "operations.remap", |tx| {
-                let now = now_unix();
+                let now = self.clock.now_secs();
                 // A person may have chosen again, or handed the album back,
                 // while MusicBrainz was asked: then this remap is stale.
                 if !choice::remap_still_wanted(tx, &pending)? {
@@ -867,6 +911,13 @@ impl Operations {
                     }
                     Err(OperationError::Unavailable(_)) => {
                         choice::retry_remap(tx, &pending, reasons::MUSICBRAINZ_UNAVAILABLE, now)?
+                    }
+                    // A release whose answer does not read says nothing
+                    // about the choice: it is kept and asked for again.
+                    Err(OperationError::Conflict(reason))
+                        if reason.code == reasons::EDITION_UNREADABLE.code =>
+                    {
+                        choice::retry_remap(tx, &pending, reason.code, now)?
                     }
                     // The album's files are out of reach for now (a scan may
                     // be moving them): never a reason to drop the choice.
@@ -936,7 +987,7 @@ impl Operations {
                     expected_album_revision,
                     expected_identity_revision,
                     user_id,
-                    now_unix(),
+                    self.clock.now_secs(),
                 )
             },
         )
@@ -1019,7 +1070,7 @@ impl Operations {
                 Ok::<_, OperationError>(jobs::recover_at_start(
                     tx,
                     OperationKind::ExplicitReidentification,
-                    now_unix(),
+                    self.clock.now_secs(),
                 )?)
             })
     }
@@ -1031,7 +1082,7 @@ impl Operations {
     pub fn run_next(&self, worker: &str) -> Result<Option<OperationJob>, OperationError> {
         self.db
             .write_blocking(Lane::Background, "operations.run_next", |tx| {
-                let now = now_unix();
+                let now = self.clock.now_secs();
                 let claimed =
                     jobs::claim(tx, OperationKind::ExplicitReidentification, worker, now)?;
                 let Some(job) = claimed else {
@@ -1066,7 +1117,7 @@ impl Operations {
                     tx,
                     &snap.local_album_id,
                     job.requested_by_user_id.as_deref(),
-                    crate::clock::now_ms() as i64,
+                    self.clock.now_ms(),
                 )?;
                 Ok(store::hand_over(tx, &job.id, worker, now)?)
             })
@@ -1108,17 +1159,4 @@ fn parse_release(raw: &str) -> Result<String, OperationError> {
     uuid::Uuid::parse_str(raw.trim())
         .map(|id| id.hyphenated().to_string())
         .map_err(|_| OperationError::Invalid(reasons::RELEASE_MBID_INVALID))
-}
-
-/// The live automatic-edition undo for one album: the revisions to echo.
-/// Blocking.
-pub fn automatic_edition_undo(
-    setup: &LibrarySetup,
-    album_id: &str,
-) -> Result<Option<(i64, i64)>, OperationError> {
-    setup
-        .db
-        .read_blocking("operations.automatic_edition_undo", |conn| {
-            Ok::<_, OperationError>(decisions::live_automatic_edition_undo(conn, album_id)?)
-        })
 }

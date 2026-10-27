@@ -11,7 +11,7 @@ use droppedneedle_kernel::jobs::{
 };
 use tokio::runtime::Handle;
 
-use super::clock::{now_ms, now_unix, today_day};
+use super::clock::LibraryClock as _;
 use super::publish::PublishError;
 use super::publish::expiry::{self, ExpiryPass, ExpiryReport};
 use super::publish::paths::{Root, Sandbox};
@@ -20,11 +20,13 @@ use super::scan::ScanStoreError;
 use super::scan::coordinator::{ResolverSource as _, ScanRequestError};
 use super::scan::models::EffectivePolicy;
 use super::scan::supervisor::SupervisorInputs;
-use super::scan::supervisor::{startup_recovery, supervise_once, supervise_once_with_shutdown};
+use super::scan::supervisor::{
+    request_dirty_scopes, startup_recovery, supervise_once, supervise_once_with_shutdown,
+};
 use super::scan::watcher::{
     WatcherAction, WatcherSettings, WatcherState, clear_pending, watcher_request,
 };
-use super::wiring::LibrarySetup;
+use super::wiring::{LibraryServices, LibrarySetup};
 
 /// The library's always-on loops on the supervisor.
 pub const SCAN_JOB: &str = "library-scan";
@@ -119,7 +121,8 @@ impl LibrarySetup {
             root_paths: self.root_dirs.clone(),
             schedule: {
                 let schedule = self.settings.schedule.clone();
-                Arc::new(move || super::settings::schedule(&schedule))
+                let zone = self.settings.schedule_zone.clone();
+                Arc::new(move || super::settings::schedule(&schedule, &zone))
             },
             inclusion_rules: {
                 let registry = self.registry.clone();
@@ -127,7 +130,10 @@ impl LibrarySetup {
             },
             dirty: self.dirty.clone(),
             wakeups: self.wakeups.clone(),
-            now_unix: Arc::new(now_unix),
+            now_unix: {
+                let clock = Arc::clone(&self.clock);
+                Arc::new(move || clock.now_secs())
+            },
         }
     }
 
@@ -141,6 +147,14 @@ impl LibrarySetup {
     pub async fn scan_startup_recovery(&self) {
         self.refresh_registry();
         startup_recovery(&self.coordinator, &self.supervisor_inputs()).await;
+    }
+
+    /// The saved library roots changed: swap them in and ask now for the
+    /// scans that new or changed roots need, so a folder added anywhere is
+    /// scanned without waiting for the scan loop's next pass. Blocking.
+    pub fn roots_saved(&self) {
+        self.refresh_registry();
+        request_dirty_scopes(&self.coordinator, &self.supervisor_inputs());
     }
 
     /// One supervisor iteration. Returns true when a run was driven.
@@ -185,7 +199,7 @@ impl LibrarySetup {
             &registry,
             &(self.root_dirs)(),
             &self.pool,
-            now_unix(),
+            self.clock.now_secs(),
             stop,
         )
         .await;
@@ -274,9 +288,10 @@ impl LibrarySetup {
             if self.identification_paused() || !self.settings.identification_readable() {
                 break;
             }
-            let claimed = self
-                .identify_store
-                .claim(now_ms(), super::identify::queue::LEASE_SECONDS * 1000);
+            let claimed = self.identify_store.claim(
+                self.clock.now_ms_u64(),
+                super::identify::queue::LEASE_SECONDS * 1000,
+            );
             let job = match claimed {
                 Ok(Some(job)) => job,
                 Ok(None) => {
@@ -291,7 +306,9 @@ impl LibrarySetup {
                     break;
                 }
             };
-            let attempt = self.identify.run_claimed(job.clone(), now_ms());
+            let attempt = self
+                .identify
+                .run_claimed(job.clone(), self.clock.now_ms_u64());
             tokio::select! {
                 biased;
                 () = stop.cancelled() => break,
@@ -374,7 +391,7 @@ impl LibrarySetup {
             album_id = job.local_album_id,
             "identify attempt stopped on a store error"
         );
-        let now = now_ms();
+        let now = self.clock.now_ms_u64();
         match &error {
             StoreError::Closed => return,
             StoreError::Busy(_) => {
@@ -462,15 +479,10 @@ impl LibrarySetup {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let registry = self.live_registry();
         // Reconcile-on-reopen (and the retry of held bundles) can resume
-        // renames; a no-op tick takes no guards and bumps no revisions.
+        // renames.
         let session = cell.session(&registry);
         let reopen = cell.needs_refresh(&session);
         let retry = !reopen && cell.has_held()?;
-        let _guards = if reopen || retry {
-            self.publish_guards(&registry)
-        } else {
-            Vec::new()
-        };
         cell.refresh_to(session, &self.root_dirs)?;
         if retry {
             cell.retry_held()?;
@@ -481,7 +493,7 @@ impl LibrarySetup {
         // long.
         let purged = match cell.cell.as_ref() {
             Some(_) => {
-                let purged = snapshots::purge_expired(&self.db, today_day())?;
+                let purged = snapshots::purge_expired(&self.db, self.clock.today_day())?;
                 // Generated files a preview planned (covers, lyrics) wait in
                 // the blob store until their job is done with them.
                 self.db
@@ -611,9 +623,10 @@ impl LibrarySetup {
 /// the one [`LEFTOVERS_JOB`] look. Called from inside the runtime, after
 /// startup recovery.
 pub(crate) fn start_loops(
-    setup: &LibrarySetup,
+    services: &LibraryServices,
     supervisor: &Supervisor,
 ) -> Result<(), AlreadyRunning> {
+    let setup = &services.setup;
     let handle = Handle::current();
     let mut scans = setup.wakeups.subscribe("scan");
     // The first turn runs at once: startup recovery, then any work queued.
@@ -644,9 +657,9 @@ pub(crate) fn start_loops(
         identify_tick(setup.clone(), handle),
     )?;
     super::contrib::worker::start_upkeep(supervisor, setup.contrib_worker.clone())?;
-    super::operations::start(setup, supervisor)?;
-    super::management::start(setup, supervisor)?;
-    super::repairs::start(setup, supervisor)?;
+    super::operations::start(setup, services.operations.clone(), supervisor)?;
+    super::management::start(services.management.clone(), supervisor)?;
+    super::repairs::start(services.repair_worker(), supervisor)?;
     let leftovers = setup.clone();
     supervisor.one_shot(LEFTOVERS_JOB, move |ctx| leftover_pass(leftovers, ctx))?;
     let publish = setup.clone();

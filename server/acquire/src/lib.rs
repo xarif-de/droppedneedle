@@ -3,7 +3,7 @@
 //! Seven areas plus a unification layer:
 //!
 //! - [`requests`] serves the user-facing ask/approval/wanted surface.
-//! - [`downloads`] owns the durable task journal, manifests, watchdog
+//! - [`downloads`] owns the durable task journal, task plans, watchdog
 //!   math, recovery classification, and quarantine.
 //! - [`slskd`] and [`usenet`] own the source clients and indexers, which
 //!   all fail with one [`client_error::ClientError`].
@@ -12,9 +12,13 @@
 //! - [`follows`] owns the follows, their auto-download approvals and the
 //!   follow poll's cursors.
 //! - [`drop_import`] takes uploaded music into the library.
+//! - [`held`] keeps every file waiting for a person's decision in one
+//!   list, whichever door it came through.
 //! - [`imports`] serves Lidarr/Spotify import plus the health smoke.
 //! - [`landing`] verifies a finished download, matches it to the
 //!   requested release, and publishes it into the library or holds it.
+//! - [`intake`] places matched files in the library, the same way for
+//!   every door they come through (a download, an upload, a held file).
 //! - [`target`] works out what a task fetches (its edition, tracklist and
 //!   wanted tracks; a single track is fetched as part of its album), with
 //!   [`edition`] answering which edition the library has chosen.
@@ -39,8 +43,11 @@ pub mod drop_import;
 pub mod edition;
 pub mod flows;
 pub mod follows;
+pub mod held;
 pub mod imports;
+pub mod intake;
 pub mod landing;
+pub mod library_ready;
 pub mod library_removal;
 pub mod plugin_events;
 pub mod plugin_source;
@@ -63,5 +70,9 @@ pub use wiring::AcquireSetup;
 /// Every `sql.rs` of this crate, one line each, for the schema test.
 #[cfg(any(test, feature = "test-support"))]
 pub fn statement_files() -> Vec<droppedneedle_kernel::db::statement::StatementFile> {
-    vec![downloads::sql::registered(), requests::sql::registered()]
+    vec![
+        downloads::sql::registered(),
+        held::sql::registered(),
+        requests::sql::registered(),
+    ]
 }

@@ -6,20 +6,18 @@ use std::collections::BTreeMap;
 use super::groups::{self, build};
 use super::models::{Group, GroupDetail, GroupPage, GroupState, Progress, ReconcileError};
 use super::{reasons, store};
-use crate::clock::now_unix;
-use crate::wiring::LibrarySetup;
+use crate::clock::LibraryClock as _;
 use droppedneedle_kernel::db::{Db, Lane};
 
 #[derive(Clone)]
 pub struct Reconcile {
     db: Db,
+    clock: std::sync::Arc<dyn droppedneedle_kernel::clock::Clock>,
 }
 
 impl Reconcile {
-    pub fn new(setup: &LibrarySetup) -> Self {
-        Self {
-            db: setup.db.clone(),
-        }
+    pub fn new(db: Db, clock: std::sync::Arc<dyn droppedneedle_kernel::clock::Clock>) -> Self {
+        Self { db, clock }
     }
 
     fn groups(&self) -> Result<Vec<Group>, ReconcileError> {
@@ -34,26 +32,21 @@ impl Reconcile {
             .ok_or(ReconcileError::NotFound(reasons::GROUP_NOT_FOUND))
     }
 
-    /// Where the reconciliation pass stands, with open groups by state.
+    /// How many records were merged automatically, with open groups by
+    /// state.
     pub fn progress(&self) -> Result<Progress, ReconcileError> {
-        let (job, merged) = self
+        let merged = self
             .db
             .read_blocking("reconcile.progress", store::progress)?;
         let groups = self.groups()?;
         let count = |state: GroupState| groups.iter().filter(|g| g.state == state).count();
         Ok(Progress {
-            state: job
-                .as_ref()
-                .map_or_else(|| "idle".to_owned(), |job| job.state.clone()),
-            completed_count: job.as_ref().map_or(0, |job| job.completed_count),
-            expected_count: job.as_ref().map_or(0, |job| job.expected_count),
             automatically_resolved_count: merged,
             waiting_for_identity_count: count(GroupState::WaitingForIdentity),
             genuine_review_count: groups.iter().filter(|g| g.state.needs_review()).count(),
             provider_conflict_count: count(GroupState::ProviderConflict),
             ambiguous_credit_structure_count: count(GroupState::AmbiguousCreditStructure),
             same_name_only_count: count(GroupState::SameNameOnly),
-            operation_job_id: job.map(|job| job.id),
         })
     }
 
@@ -92,7 +85,7 @@ impl Reconcile {
         if expected.len() != ids.len() || ids.iter().any(|id| !expected.contains_key(id)) {
             return Err(ReconcileError::Conflict(reasons::GROUP_STALE));
         }
-        let now = now_unix();
+        let now = self.clock.now_secs();
         self.db
             .write_blocking(Lane::Foreground, "reconcile.dismiss", |tx| {
                 store::dismiss(tx, &ids, expected, actor_user_id, now)

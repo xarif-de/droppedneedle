@@ -51,13 +51,12 @@ impl Default for HttpSettings {
 
 impl HttpSettings {
     /// The User-Agent every outbound request carries. MusicBrainz asks for
-    /// an application name, version and contact address.
+    /// an application name, version and contact address. musicbrainz.org's
+    /// edge drops connections whose User-Agent starts with `DroppedNeedle/`,
+    /// so the name is `DroppedNeedleApp`, as v2 sends it since 2.6.1.
     ///
-    /// xarif build: the v2.6.1 form (`DroppedNeedleApp/<version> (<id>;
-    /// <contact>; <url>)`). musicbrainz.org drops connections whose
-    /// User-Agent starts with `DroppedNeedle/` since 2026-08-24, the form v3
-    /// went back to; v2.6.1 replaced it for exactly that reason. The id
-    /// slot names this installation; the contact is CONTACT_EMAIL.
+    /// xarif build: v2.6.1's id slot names this installation (`xarif.de`),
+    /// and the version is the image's tag (COMMIT_TAG) when the build has one.
     pub fn user_agent(&self) -> String {
         format!(
             "DroppedNeedleApp/{} (xarif.de; {}; https://www.droppedneedle.com)",

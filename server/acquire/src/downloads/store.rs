@@ -16,6 +16,7 @@ use std::cell::RefCell;
 
 use rusqlite::{Connection, OptionalExtension, Row};
 
+use super::plan::TaskPlan;
 use super::source_tag::SourceTag;
 use super::sql;
 use super::state::{AttemptState, TaskStatus};
@@ -33,6 +34,14 @@ pub enum StoreError {
     /// Out of a terminal status, or finalizing into a non-terminal one.
     #[error("invalid download transition: {0}")]
     InvalidTransition(String),
+    /// A task's stored plan does not decode, or a plan does not encode.
+    #[error("download plan of task {task_id}: {detail}")]
+    Plan {
+        /// The task the plan belongs to.
+        task_id: String,
+        /// What serde said.
+        detail: String,
+    },
 }
 
 impl From<rusqlite::Error> for StoreError {
@@ -245,6 +254,8 @@ pub struct AttemptRow {
     pub error_code: Option<String>,
     /// Optimistic-concurrency revision; every transition bumps it.
     pub row_revision: i64,
+    /// Whether the client handle was journaled with the attempt.
+    pub handle_journaled: bool,
 }
 
 impl AttemptRow {
@@ -267,6 +278,7 @@ impl AttemptRow {
             lease_expires_at: row.get("lease_expires_at")?,
             error_code: row.get("error_code")?,
             row_revision: row.get("row_revision")?,
+            handle_journaled: !row.get::<_, String>("handle_json")?.is_empty(),
         })
     }
 }
@@ -315,6 +327,17 @@ pub struct RetryAnchor {
     pub updated_at: f64,
 }
 
+/// What starting a reimport did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReimportStart {
+    /// The task is processing and its attempt's files are kept for it.
+    Begun,
+    /// The task is missing, or not failed or partial.
+    NotReimportable,
+    /// Cleanup took the attempt's files first.
+    FilesGone,
+}
+
 /// The download journal over one SQLite connection.
 ///
 /// A write that settles a task also settles the requests linked to it, in
@@ -326,6 +349,12 @@ pub struct DownloadStore<'conn> {
 }
 
 impl<'conn> DownloadStore<'conn> {
+    /// The connection the store runs on, for the held list's rows in the
+    /// same transaction.
+    pub(crate) fn conn(&self) -> &'conn Connection {
+        self.conn
+    }
+
     /// Borrow a connection as a download journal.
     pub fn new(conn: &'conn Connection) -> Self {
         Self {
@@ -502,6 +531,42 @@ impl<'conn> DownloadStore<'conn> {
         })
     }
 
+    /// One task's plan. A task with no row reads as the empty plan; a
+    /// stored plan that does not decode is an error, never an empty plan.
+    pub fn task_plan(&self, task_id: &str) -> Result<TaskPlan, StoreError> {
+        let stored: Option<String> = self
+            .conn
+            .query_row(sql::TASK_PLAN.text(), rusqlite::params![task_id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        let Some(json) = stored else {
+            return Ok(TaskPlan::default());
+        };
+        TaskPlan::decode(&json).map_err(|error| StoreError::Plan {
+            task_id: task_id.to_owned(),
+            detail: error.to_string(),
+        })
+    }
+
+    /// Replace one task's plan.
+    pub fn set_task_plan(
+        &self,
+        task_id: &str,
+        plan: &TaskPlan,
+        now: f64,
+    ) -> Result<(), StoreError> {
+        let json = plan.encode().map_err(|error| StoreError::Plan {
+            task_id: task_id.to_owned(),
+            detail: error.to_string(),
+        })?;
+        self.conn.execute(
+            sql::SET_TASK_PLAN.text(),
+            rusqlite::params![json, now, task_id],
+        )?;
+        Ok(())
+    }
+
     /// Fetch one task row, if it exists.
     pub fn get_task(&self, task_id: &str) -> Result<Option<TaskRow>, StoreError> {
         Ok(self
@@ -611,17 +676,61 @@ impl<'conn> DownloadStore<'conn> {
         )?)
     }
 
-    /// Start a reimport: a failed or short-landed task goes back to
-    /// `processing` with its error and completion cleared, so the import
-    /// can run against the files already on disk. This is the one write
-    /// out of a terminal status; `transition_task` still refuses all
-    /// others. Answers false when the task is missing or not terminal
-    /// failed or partial.
-    pub fn begin_reimport(&self, task_id: &str, now: f64) -> Result<bool, StoreError> {
-        let changed = self
-            .conn
+    /// Start a reimport: the attempt whose files it reads (`attempt_id`)
+    /// is taken back from cleanup, then a failed or
+    /// short-landed task goes back to `processing` with its error and
+    /// completion cleared, so the import can run against the files already
+    /// on disk. This is the one write out of a terminal status;
+    /// `transition_task` still refuses all others. Both moves compare and
+    /// set in one transaction, so cleanup and a reimport never both act
+    /// on one attempt.
+    pub fn begin_reimport(
+        &self,
+        task_id: &str,
+        attempt_id: &str,
+        now: f64,
+    ) -> Result<ReimportStart, StoreError> {
+        let reimportable = self
+            .get_task(task_id)?
+            .is_some_and(|task| matches!(task.status, TaskStatus::Failed | TaskStatus::Partial));
+        if !reimportable {
+            return Ok(ReimportStart::NotReimportable);
+        }
+        let claimed = self.conn.execute(
+            sql::CLAIM_REIMPORT.text(),
+            rusqlite::params![now, attempt_id],
+        )?;
+        if claimed == 0 {
+            return Ok(ReimportStart::FilesGone);
+        }
+        self.conn
             .execute(sql::BEGIN_REIMPORT.text(), rusqlite::params![now, task_id])?;
-        Ok(changed > 0)
+        Ok(ReimportStart::Begun)
+    }
+
+    /// Hand one task's kept files to cleanup (discard): the task was
+    /// stopped or its album removed.
+    pub fn release_task_kept(&self, task_id: &str, now: f64) -> Result<(), StoreError> {
+        self.conn.execute(
+            sql::RELEASE_TASK_KEPT.text(),
+            rusqlite::params![now, task_id],
+        )?;
+        Ok(())
+    }
+
+    /// Hand kept files to cleanup (discard): those of cancelled or removed
+    /// tasks, and those kept since before `kept_before` whose task is not
+    /// running. Answers each moved attempt as (attempt id, task id).
+    pub fn release_kept(
+        &self,
+        now: f64,
+        kept_before: f64,
+    ) -> Result<Vec<(String, String)>, StoreError> {
+        self.rows(
+            sql::RELEASE_KEPT.text(),
+            rusqlite::params![now, kept_before],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
     }
 
     /// Claim an idempotency key. Returns true on first claim; a repeat
@@ -851,9 +960,10 @@ impl<'conn> DownloadStore<'conn> {
         Ok(u64::try_from(count).unwrap_or(0))
     }
 
-    /// True when any non-terminal journal row still references this job.
-    /// The orphan reconciler treats "any row" as owned; only a clean
-    /// lookup with zero rows lets a folder be considered debris.
+    /// True when any journal row other than a completed one still
+    /// references this job, kept files included. The orphan reconciler
+    /// treats "any row" as owned; only a clean lookup with zero rows lets
+    /// a folder be considered debris.
     pub fn has_cleanup_debt(
         &self,
         source: &str,
@@ -1009,81 +1119,9 @@ impl<'conn> DownloadStore<'conn> {
         Ok(removed as i64)
     }
 
-    /// Insert a held-import row.
-    #[allow(clippy::too_many_arguments)]
-    pub fn insert_held(
-        &self,
-        user_id: &str,
-        held_path: &str,
-        reason: &str,
-        source_task_id: Option<&str>,
-        release_group_mbid: Option<&str>,
-        now: f64,
-    ) -> Result<i64, StoreError> {
-        self.conn.execute(
-            sql::INSERT_HELD.text(),
-            rusqlite::params![
-                user_id,
-                held_path,
-                reason,
-                source_task_id,
-                release_group_mbid,
-                now,
-            ],
-        )?;
-        Ok(self.conn.last_insert_rowid())
-    }
-
     /// Every distinct reason spelling the journal stores.
     pub fn stored_reason_spellings(&self) -> Result<Vec<String>, StoreError> {
         self.rows(sql::STORED_REASONS.text(), [], |row| row.get(0))
-    }
-
-    /// True when the task left a track held for review. Auto-retry pauses
-    /// while this holds: re-downloading a held track would loop, and
-    /// discarding the held track clears the gate.
-    pub fn has_unresolved_held_for_task(&self, source_task_id: &str) -> Result<bool, StoreError> {
-        let count: i64 = self.conn.query_row(
-            sql::UNRESOLVED_HELD_FOR_TASK.text(),
-            rusqlite::params![source_task_id],
-            |row| row.get(0),
-        )?;
-        Ok(count > 0)
-    }
-
-    /// Due library-hold units: `(task_id, user_id)` pairs whose held
-    /// rows of the Library kind have a retry time at or before now,
-    /// oldest first.
-    pub fn list_due_held_units(
-        &self,
-        now: f64,
-        limit: i64,
-    ) -> Result<Vec<(String, String)>, StoreError> {
-        self.rows(
-            sql::DUE_HELD_UNITS.text(),
-            rusqlite::params![now, limit],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-        )
-    }
-
-    /// Schedule the next library retry for held rows. Only `held` rows
-    /// of the Library kind move; anything else keeps its values.
-    pub fn schedule_held_retry(
-        &self,
-        held_ids: &[i64],
-        retry_count: i64,
-        next_retry_at: Option<f64>,
-    ) -> Result<(), StoreError> {
-        if held_ids.is_empty() {
-            return Ok(());
-        }
-        let text = sql::schedule_held_retry(ListLen::new(held_ids.len()));
-        let mut params: Vec<rusqlite::types::Value> =
-            vec![retry_count.into(), next_retry_at.into()];
-        params.extend(held_ids.iter().map(|id| (*id).into()));
-        self.conn
-            .execute(&text, rusqlite::params_from_iter(params))?;
-        Ok(())
     }
 
     /// Retryable tasks: the newest task per target (album, or track plus

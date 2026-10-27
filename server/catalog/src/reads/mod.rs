@@ -47,6 +47,9 @@ pub struct ReadsSetup {
 
 /// What the reads take from the other areas, built before them.
 pub struct ReadsPorts {
+    /// The app's connection resolver, for the Jellyfin reads discover
+    /// makes.
+    pub remotes: Arc<droppedneedle_media::remotes::connections::ConnectionResolver>,
     /// Collections over the database, with acquisition's approvals.
     pub collections: collections::CollectionsState,
     /// Artist and album pages, and the MusicBrainz half of unified search.
@@ -109,6 +112,7 @@ impl ReadsSetup {
         let (db, settings, ids) = (&platform.db, &*platform.settings, platform.ids.clone());
         let pool = db.sqlx();
         let ReadsPorts {
+            remotes,
             collections,
             catalog,
             artwork,
@@ -130,6 +134,7 @@ impl ReadsSetup {
                 batch_requests,
                 download_readiness,
                 warm: cover_warm,
+                remotes,
             },
             settings,
         );
@@ -143,7 +148,12 @@ impl ReadsSetup {
             ids,
             clock,
         );
-        let library = library_deps(db, settings, enrichment.as_ref(), library_files);
+        let library = library_deps(
+            catalog.local().clone(),
+            settings,
+            enrichment.as_ref(),
+            library_files,
+        );
         let search_enrichment: Arc<dyn search::ports::EnrichmentPort> = match &enrichment {
             Some(pair) => pair.search.clone(),
             None => Arc::new(search::ports::UnconfiguredEnrichment),
@@ -168,18 +178,17 @@ impl ReadsSetup {
     }
 }
 
-/// The library reads: the local catalog over the request pool, and tags
+/// The library reads: the one local catalog, and tags
 /// and lyrics read from the files first. Without the
 /// provider pair lyrics fall back to the empty port (404s); with it,
 /// catalog tracks resolve through live LRCLIB while the lyrics setting
 /// (read per call) is on, and read as absent while it is off.
 fn library_deps(
-    db: &droppedneedle_kernel::db::Db,
+    catalog: library::store::LocalCatalog,
     settings: &droppedneedle_kernel::runtime_config::ConfigStore,
     enrichment: Option<&enrichment::live::ProductionEnrichment>,
     files: droppedneedle_media::stream::local_files::LibraryFiles,
 ) -> library::LibraryDeps {
-    let catalog = library::store::LocalCatalog::new(db.clone());
     let provider_lyrics: Arc<dyn library::stores::LyricsPort> = match enrichment {
         Some(pair) => Arc::new(
             enrichment::ProviderLyrics::new(

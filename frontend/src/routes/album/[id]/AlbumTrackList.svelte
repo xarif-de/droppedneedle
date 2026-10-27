@@ -3,15 +3,10 @@
 		AlbumBasicInfo,
 		YouTubeTrackLink,
 		YouTubeQuotaStatus,
-		JellyfinAlbumMatch,
-		JellyfinTrackInfo,
 		LocalAlbumMatch,
-		LocalTrackInfo,
-		NavidromeAlbumMatch,
-		NavidromeTrackInfo,
-		PlexAlbumMatch,
-		PlexTrackInfo
+		LocalTrackInfo
 	} from '$lib/types';
+	import type { RemoteMatch, RemoteTrack } from '$lib/queries/remotes/types';
 	import type { MenuItem } from '$lib/components/ContextMenu.svelte';
 	import type { RenderedTrackSection } from './albumTrackResolvers';
 	import type { EditionTrackRow } from './albumEdition';
@@ -35,10 +30,10 @@
 	import IconButton from '$lib/ui/IconButton.svelte';
 	import RatingStars from '$lib/ui/RatingStars.svelte';
 	import { SvelteSet } from 'svelte/reactivity';
-	import type { LibraryFileMeta, DownloadTask, HeldImport } from '$lib/types';
+	import type { LibraryFileMeta, DownloadTask, HeldFileInEntry } from '$lib/types';
 	import TrackRequestButton from '$lib/components/downloads/TrackRequestButton.svelte';
 	import TrackDownloadStatus from '$lib/components/downloads/TrackDownloadStatus.svelte';
-	import HeldTrackReview from '$lib/components/downloads/HeldTrackReview.svelte';
+	import HeldFileRow from '$lib/components/downloads/HeldFileRow.svelte';
 	import { integrationStore } from '$lib/stores/integration';
 	import { authStore } from '$lib/stores/authStore.svelte';
 	import { requestUpgradeTrack } from '$lib/queries/downloads/UpgradeQueries.svelte';
@@ -48,18 +43,18 @@
 		album: AlbumBasicInfo;
 		renderedTrackSections: RenderedTrackSection[];
 		trackLinkMap: Map<string, YouTubeTrackLink>;
-		jellyfinMatch: JellyfinAlbumMatch | null;
+		jellyfinMatch: RemoteMatch | null;
 		localMatch: LocalAlbumMatch | null;
-		navidromeMatch: NavidromeAlbumMatch | null;
-		plexMatch: PlexAlbumMatch | null;
-		jellyfinTrackMap: Map<string, JellyfinTrackInfo>;
+		navidromeMatch: RemoteMatch | null;
+		plexMatch: RemoteMatch | null;
+		jellyfinTrackMap: Map<string, RemoteTrack>;
 		localTrackMap: Map<string, LocalTrackInfo>;
-		navidromeTrackMap: Map<string, NavidromeTrackInfo>;
-		plexTrackMap: Map<string, PlexTrackInfo>;
-		jellyfinTracks: JellyfinTrackInfo[];
+		navidromeTrackMap: Map<string, RemoteTrack>;
+		plexTrackMap: Map<string, RemoteTrack>;
+		jellyfinTracks: RemoteTrack[];
 		localTracks: LocalTrackInfo[];
-		navidromeTracks: NavidromeTrackInfo[];
-		plexTracks: PlexTrackInfo[];
+		navidromeTracks: RemoteTrack[];
+		plexTracks: RemoteTrack[];
 		trackLinks: YouTubeTrackLink[];
 		youtubeEnabled: boolean;
 		youtubeApiConfigured: boolean;
@@ -69,8 +64,8 @@
 		plexEnabled: boolean;
 		libraryTracksByRecording?: Map<string, LibraryFileMeta>;
 		libraryTracksByPosition?: Map<string, LibraryFileMeta>;
-		heldByRecording?: Map<string, HeldImport>;
-		heldByPosition?: Map<string, HeldImport>;
+		heldByRecording?: Map<string, HeldFileInEntry>;
+		heldByPosition?: Map<string, HeldFileInEntry>;
 		trackDownloadTasks?: Map<string, DownloadTask>;
 		/** The current edition's plan by disc and position; it decides which file holds a track. */
 		editionRows?: Map<string, EditionTrackRow> | null;
@@ -91,9 +86,9 @@
 		getTrackContextMenuItems: (
 			track: { position: number; disc_number?: number | null; title: string },
 			resolvedLocal: LocalTrackInfo | null,
-			resolvedJellyfin: JellyfinTrackInfo | null,
-			resolvedNavidrome: NavidromeTrackInfo | null,
-			resolvedPlex: PlexTrackInfo | null
+			resolvedJellyfin: RemoteTrack | null,
+			resolvedNavidrome: RemoteTrack | null,
+			resolvedPlex: RemoteTrack | null
 		) => MenuItem[];
 	}
 
@@ -338,9 +333,7 @@
 										size="xs"
 										onclick={() => toggleHeld(row.globalIndex)}
 										aria-expanded={heldOpen.has(row.globalIndex)}
-										title={heldMeta.reason_kind === 'library'
-											? 'Waiting on the library'
-											: "Downloaded but couldn't verify - review it"}
+										title={heldMeta.file.reason_text}
 									>
 										<TriangleAlert class="size-3.5 text-warning" aria-hidden="true" /> held
 									</Button>
@@ -529,7 +522,12 @@
 				{#if heldMeta && heldOpen.has(row.globalIndex)}
 					<li class="list-row p-0">
 						<div class="w-full px-3 pb-3 sm:px-4">
-							<HeldTrackReview held={heldMeta} />
+							<HeldFileRow
+								entry={heldMeta.entry}
+								file={heldMeta.file}
+								showTitle={false}
+								showExpiry
+							/>
 						</div>
 					</li>
 				{/if}

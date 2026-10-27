@@ -6171,372 +6171,6 @@
         ]
       }
     },
-    "/api/v3/downloads/held": {
-      "get": {
-        "tags": [
-          "downloads"
-        ],
-        "summary": "Held files the viewer may act on, newest first; one album's with\n`release_group_mbid`. `GET /api/v3/downloads/held`.",
-        "operationId": "list_held_handler",
-        "parameters": [
-          {
-            "name": "release_group_mbid",
-            "in": "query",
-            "description": "Only this album's held files.",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HeldListResponse"
-                }
-              }
-            }
-          }
-        },
-        "security": [
-          {
-            "session": [
-              "user"
-            ]
-          }
-        ]
-      }
-    },
-    "/api/v3/downloads/held/management/{source_task_id}/discard": {
-      "post": {
-        "tags": [
-          "downloads"
-        ],
-        "summary": "Delete every file of a download that waits on the library. Admin only.\n`POST /api/v3/downloads/held/management/{source_task_id}/discard`.",
-        "operationId": "discard_local_handler",
-        "parameters": [
-          {
-            "name": "source_task_id",
-            "in": "path",
-            "description": "Download task id",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HeldUnitResponse"
-                }
-              }
-            }
-          }
-        },
-        "security": [
-          {
-            "session": [
-              "admin"
-            ]
-          }
-        ]
-      }
-    },
-    "/api/v3/downloads/held/management/{source_task_id}/retry": {
-      "post": {
-        "tags": [
-          "downloads"
-        ],
-        "summary": "Import every file of a download that waits on the library (a taken\ndestination, an old copy that could not be recycled). Admin only.\n`POST /api/v3/downloads/held/management/{source_task_id}/retry`.",
-        "operationId": "retry_local_handler",
-        "parameters": [
-          {
-            "name": "source_task_id",
-            "in": "path",
-            "description": "Download task id",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HeldUnitResponse"
-                }
-              }
-            }
-          }
-        },
-        "security": [
-          {
-            "session": [
-              "admin"
-            ]
-          }
-        ]
-      }
-    },
-    "/api/v3/downloads/held/reverify": {
-      "post": {
-        "tags": [
-          "downloads"
-        ],
-        "summary": "Re-check AcoustID holds in bulk (at most 25 checks a call; other holds\nanswer `skipped`). `POST /api/v3/downloads/held/reverify`.",
-        "operationId": "reverify_bulk_handler",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/HeldBulkReverifyRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HeldBulkReverifyResponse"
-                }
-              }
-            }
-          }
-        },
-        "security": [
-          {
-            "session": [
-              "user"
-            ]
-          }
-        ]
-      }
-    },
-    "/api/v3/downloads/held/verdict/{source_task_id}/discard": {
-      "post": {
-        "tags": [
-          "downloads"
-        ],
-        "summary": "Delete every file a download's checks held and clear its wrong-product\nverdict. `POST /api/v3/downloads/held/verdict/{source_task_id}/discard`.",
-        "operationId": "discard_verdict_handler",
-        "parameters": [
-          {
-            "name": "source_task_id",
-            "in": "path",
-            "description": "Download task id",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HeldUnitResponse"
-                }
-              }
-            }
-          }
-        },
-        "security": [
-          {
-            "session": [
-              "user"
-            ]
-          }
-        ]
-      }
-    },
-    "/api/v3/downloads/held/{held_id}/audio": {
-      "get": {
-        "tags": [
-          "downloads"
-        ],
-        "summary": "Play a held file for the review, with byte ranges so the player can\nseek. `GET /api/v3/downloads/held/{held_id}/audio`.",
-        "operationId": "held_audio_handler",
-        "parameters": [
-          {
-            "name": "held_id",
-            "in": "path",
-            "description": "Held file id",
-            "required": true,
-            "schema": {
-              "type": "integer",
-              "format": "int64"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "The held file",
-            "content": {
-              "application/octet-stream": {}
-            }
-          },
-          "206": {
-            "description": "The requested byte range",
-            "content": {
-              "application/octet-stream": {}
-            }
-          },
-          "416": {
-            "description": "The range lies outside the file",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            }
-          }
-        },
-        "security": [
-          {
-            "session": [
-              "user"
-            ]
-          }
-        ]
-      }
-    },
-    "/api/v3/downloads/held/{held_id}/discard": {
-      "post": {
-        "tags": [
-          "downloads"
-        ],
-        "summary": "Delete a held file; the album's automatic retry resumes.\n`POST /api/v3/downloads/held/{held_id}/discard`.",
-        "operationId": "discard_held_handler",
-        "parameters": [
-          {
-            "name": "held_id",
-            "in": "path",
-            "description": "Held file id",
-            "required": true,
-            "schema": {
-              "type": "integer",
-              "format": "int64"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HeldActionResponse"
-                }
-              }
-            }
-          }
-        },
-        "security": [
-          {
-            "session": [
-              "user"
-            ]
-          }
-        ]
-      }
-    },
-    "/api/v3/downloads/held/{held_id}/import": {
-      "post": {
-        "tags": [
-          "downloads"
-        ],
-        "summary": "Import a held file as it is, into the album's chosen edition. For an\nupgrade, the library's copy is replaced only by a better file and goes\nto the recycle bin. `POST /api/v3/downloads/held/{held_id}/import`.",
-        "operationId": "import_held_handler",
-        "parameters": [
-          {
-            "name": "held_id",
-            "in": "path",
-            "description": "Held file id",
-            "required": true,
-            "schema": {
-              "type": "integer",
-              "format": "int64"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HeldActionResponse"
-                }
-              }
-            }
-          }
-        },
-        "security": [
-          {
-            "session": [
-              "user"
-            ]
-          }
-        ]
-      }
-    },
-    "/api/v3/downloads/held/{held_id}/reverify": {
-      "post": {
-        "tags": [
-          "downloads"
-        ],
-        "summary": "Fingerprint an AcoustID-held file again and import it when AcoustID\nnow agrees. `POST /api/v3/downloads/held/{held_id}/reverify`.",
-        "operationId": "reverify_held_handler",
-        "parameters": [
-          {
-            "name": "held_id",
-            "in": "path",
-            "description": "Held file id",
-            "required": true,
-            "schema": {
-              "type": "integer",
-              "format": "int64"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HeldReverifyResponse"
-                }
-              }
-            }
-          }
-        },
-        "security": [
-          {
-            "session": [
-              "user"
-            ]
-          }
-        ]
-      }
-    },
     "/api/v3/downloads/quarantine": {
       "get": {
         "tags": [
@@ -7992,6 +7626,393 @@
         ]
       }
     },
+    "/api/v3/held": {
+      "get": {
+        "tags": [
+          "held"
+        ],
+        "summary": "Entries waiting for your decision, newest first, with when each\nexpires. `GET /api/v3/held`.",
+        "operationId": "list_handler",
+        "parameters": [
+          {
+            "name": "release_group_mbid",
+            "in": "query",
+            "description": "Only this album's entries.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "task_id",
+            "in": "query",
+            "description": "Only entries holding files of this download.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "all",
+            "in": "query",
+            "description": "Admins: every user's entries.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HeldListResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "session": [
+              "user"
+            ]
+          }
+        ]
+      }
+    },
+    "/api/v3/held/files/{file_id}/audio": {
+      "get": {
+        "tags": [
+          "held"
+        ],
+        "summary": "Play a held file, with byte ranges so the player can seek.\n`GET /api/v3/held/files/{file_id}/audio`.",
+        "operationId": "audio_handler",
+        "parameters": [
+          {
+            "name": "file_id",
+            "in": "path",
+            "description": "Held file id",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The held file",
+            "content": {
+              "application/octet-stream": {}
+            }
+          },
+          "206": {
+            "description": "The requested byte range",
+            "content": {
+              "application/octet-stream": {}
+            }
+          },
+          "416": {
+            "description": "The range lies outside the file",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "session": [
+              "user"
+            ]
+          }
+        ]
+      }
+    },
+    "/api/v3/held/recheck": {
+      "post": {
+        "tags": [
+          "held"
+        ],
+        "summary": "Re-check AcoustID holds across entries (at most 25 checks a call).\n`POST /api/v3/held/recheck`.",
+        "operationId": "recheck_all_handler",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HeldRecheckAllRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HeldRecheckAllResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "session": [
+              "user"
+            ]
+          }
+        ]
+      }
+    },
+    "/api/v3/held/{entry_id}": {
+      "get": {
+        "tags": [
+          "held"
+        ],
+        "summary": "One entry with its held files. `GET /api/v3/held/{entry_id}`.",
+        "operationId": "get_handler",
+        "parameters": [
+          {
+            "name": "entry_id",
+            "in": "path",
+            "description": "Held entry id",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HeldEntryResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "session": [
+              "user"
+            ]
+          }
+        ]
+      }
+    },
+    "/api/v3/held/{entry_id}/discard": {
+      "post": {
+        "tags": [
+          "held"
+        ],
+        "summary": "Delete an entry's held files (all, or those named). For a download, the\nalbum's automatic retry resumes. `POST /api/v3/held/{entry_id}/discard`.",
+        "operationId": "discard_handler",
+        "parameters": [
+          {
+            "name": "entry_id",
+            "in": "path",
+            "description": "Held entry id",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HeldFilesRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HeldActionResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "session": [
+              "user"
+            ]
+          }
+        ]
+      }
+    },
+    "/api/v3/held/{entry_id}/import": {
+      "post": {
+        "tags": [
+          "held"
+        ],
+        "summary": "Import an entry's held files (all, or those named), skipping the check\nthat held each. A file no better than your copy stays held until \"Use\nthis file\"; a lower-quality version replaces yours only by \"Use this\nversion\", and yours goes to the recycle bin.\n`POST /api/v3/held/{entry_id}/import`.",
+        "operationId": "import_handler",
+        "parameters": [
+          {
+            "name": "entry_id",
+            "in": "path",
+            "description": "Held entry id",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HeldFilesRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HeldActionResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "session": [
+              "user"
+            ]
+          }
+        ]
+      }
+    },
+    "/api/v3/held/{entry_id}/match": {
+      "post": {
+        "tags": [
+          "held"
+        ],
+        "summary": "Import an entry's held files as the album a curator picked: the app\npairs them with its tracks. `POST /api/v3/held/{entry_id}/match`.",
+        "operationId": "match_handler",
+        "parameters": [
+          {
+            "name": "entry_id",
+            "in": "path",
+            "description": "Held entry id",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HeldMatchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HeldActionResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "session": [
+              "curator"
+            ]
+          }
+        ]
+      }
+    },
+    "/api/v3/held/{entry_id}/recheck": {
+      "post": {
+        "tags": [
+          "held"
+        ],
+        "summary": "Ask AcoustID again about an entry's files it heard as another recording\nor could not confirm; files it now confirms are imported.\n`POST /api/v3/held/{entry_id}/recheck`.",
+        "operationId": "recheck_handler",
+        "parameters": [
+          {
+            "name": "entry_id",
+            "in": "path",
+            "description": "Held entry id",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HeldFilesRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HeldActionResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "session": [
+              "user"
+            ]
+          }
+        ]
+      }
+    },
     "/api/v3/home": {
       "get": {
         "tags": [
@@ -8456,96 +8477,6 @@
           {
             "session": [
               "user"
-            ]
-          }
-        ]
-      }
-    },
-    "/api/v3/import/items/{item_id}/discard": {
-      "post": {
-        "tags": [
-          "imports"
-        ],
-        "summary": "Throw a review item's files away.\n`POST /api/v3/import/items/{item_id}/discard`.",
-        "operationId": "discard_item_handler",
-        "parameters": [
-          {
-            "name": "item_id",
-            "in": "path",
-            "description": "Import item id",
-            "required": true,
-            "schema": {
-              "type": "integer",
-              "format": "int64"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DropImportItemResponse"
-                }
-              }
-            }
-          }
-        },
-        "security": [
-          {
-            "session": [
-              "curator"
-            ]
-          }
-        ]
-      }
-    },
-    "/api/v3/import/items/{item_id}/match": {
-      "post": {
-        "tags": [
-          "imports"
-        ],
-        "summary": "Import a review item as the album you picked.\n`POST /api/v3/import/items/{item_id}/match`.",
-        "operationId": "match_item_handler",
-        "parameters": [
-          {
-            "name": "item_id",
-            "in": "path",
-            "description": "Import item id",
-            "required": true,
-            "schema": {
-              "type": "integer",
-              "format": "int64"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/DropImportMatchRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DropImportItemResponse"
-                }
-              }
-            }
-          }
-        },
-        "security": [
-          {
-            "session": [
-              "curator"
             ]
           }
         ]
@@ -12754,7 +12685,7 @@
         "tags": [
           "library management"
         ],
-        "summary": "Artist reconciliation progress and open group counts.",
+        "summary": "Automatic artist merges so far and open group counts.",
         "operationId": "artist_reconciliation",
         "responses": {
           "200": {
@@ -26885,7 +26816,8 @@
         "tags": [
           "remotes"
         ],
-        "summary": "The remote album behind a MusicBrainz id.",
+        "summary": "The caller's copy of an album on one source.",
+        "description": "Found by MusicBrainz id, or on Plex and Navidrome by title and artist\nwhen no album there carries the id.",
         "operationId": "remotes_match_album",
         "parameters": [
           {
@@ -26902,6 +26834,24 @@
             "in": "query",
             "description": "MusicBrainz release or release-group id.",
             "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "title",
+            "in": "query",
+            "description": "Album title.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "artist",
+            "in": "query",
+            "description": "Album artist.",
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -29914,54 +29864,6 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/PolicySummaryResponse"
-                }
-              }
-            }
-          }
-        },
-        "security": [
-          {
-            "session": [
-              "admin"
-            ]
-          }
-        ]
-      }
-    },
-    "/api/v3/settings/download-clients/policy/impact": {
-      "post": {
-        "tags": [
-          "settings"
-        ],
-        "summary": "Impact preview of an unsaved policy body against persisted rows.\nNeeds the database; unwired states answer 503.",
-        "operationId": "post_policy_impact",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/DownloadPolicy"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Impact preview",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/PolicyImpactResponse"
-                }
-              }
-            }
-          },
-          "503": {
-            "description": "Bucket counts are unwired",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
                 }
               }
             }
@@ -33971,6 +33873,16 @@
             }
           },
           {
+            "name": "start_seconds",
+            "in": "query",
+            "description": "Seek offset in seconds for a transcode",
+            "required": false,
+            "schema": {
+              "type": "number",
+              "format": "double"
+            }
+          },
+          {
             "name": "estimate_content_length",
             "in": "query",
             "description": "Ask a transcode landing for its estimated Content-Length",
@@ -34089,6 +34001,44 @@
             "required": true,
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "name": "format",
+            "in": "query",
+            "description": "Requested output codec: mp3, opus, or raw",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "max_bitrate",
+            "in": "query",
+            "description": "Client bitrate cap in kbps (0 or unset means uncapped)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "start_seconds",
+            "in": "query",
+            "description": "Seek offset in seconds for a transcode",
+            "required": false,
+            "schema": {
+              "type": "number",
+              "format": "double"
+            }
+          },
+          {
+            "name": "estimate_content_length",
+            "in": "query",
+            "description": "Ask a transcode landing for its estimated Content-Length",
+            "required": false,
+            "schema": {
+              "type": "boolean"
             }
           }
         ],
@@ -37361,7 +37311,7 @@
           "affected_reference_count": {
             "type": "integer",
             "format": "int64",
-            "description": "Credits, favorites, playlist entries, plays, and client ids a merge\nwould move."
+            "description": "Credits, favorites and plays a merge would move."
           },
           "display_name": {
             "type": "string"
@@ -37379,6 +37329,17 @@
             "items": {
               "$ref": "#/components/schemas/ArtistReconciliationMember"
             }
+          },
+          "merge_basis": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ArtistMergeBasis",
+                "description": "What that merge rested on."
+              }
+            ]
           },
           "provider_mbids": {
             "type": "array",
@@ -37819,6 +37780,14 @@
           }
         }
       },
+      "ArtistMergeBasis": {
+        "type": "string",
+        "description": "What an automatic artist merge rested on.",
+        "enum": [
+          "musicbrainz_proof",
+          "same_name"
+        ]
+      },
       "ArtistMergePreviewBody": {
         "type": "object",
         "description": "An artist merge to preview.",
@@ -37962,9 +37931,7 @@
           "track_credit_count",
           "primary_album_count",
           "favorite_count",
-          "playlist_count",
           "history_count",
-          "compatibility_id_count",
           "proven_credit_count",
           "active_credit_count"
         ],
@@ -37974,10 +37941,6 @@
             "format": "int64"
           },
           "album_credit_count": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "compatibility_id_count": {
             "type": "integer",
             "format": "int64"
           },
@@ -37994,10 +37957,6 @@
           },
           "name": {
             "type": "string"
-          },
-          "playlist_count": {
-            "type": "integer",
-            "format": "int64"
           },
           "primary_album_count": {
             "type": "integer",
@@ -38031,11 +37990,8 @@
       },
       "ArtistReconciliationProgress": {
         "type": "object",
-        "description": "Where the artist reconciliation pass stands.",
+        "description": "Automatic merges so far and open duplicate groups by state.",
         "required": [
-          "state",
-          "completed_count",
-          "expected_count",
           "automatically_resolved_count",
           "waiting_for_identity_count",
           "genuine_review_count",
@@ -38053,24 +38009,10 @@
             "format": "int64",
             "description": "Artist records merged automatically so far."
           },
-          "completed_count": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "expected_count": {
-            "type": "integer",
-            "format": "int64"
-          },
           "genuine_review_count": {
             "type": "integer",
             "description": "Groups that need an administrator's judgement.",
             "minimum": 0
-          },
-          "operation_job_id": {
-            "type": [
-              "string",
-              "null"
-            ]
           },
           "provider_conflict_count": {
             "type": "integer",
@@ -38079,10 +38021,6 @@
           "same_name_only_count": {
             "type": "integer",
             "minimum": 0
-          },
-          "state": {
-            "type": "string",
-            "description": "The newest reconciliation job's state, or `idle`."
           },
           "waiting_for_identity_count": {
             "type": "integer",
@@ -40788,6 +40726,80 @@
           }
         }
       },
+      "Counters": {
+        "type": "object",
+        "description": "A run's counters, one per column of the runs table.",
+        "required": [
+          "total_count",
+          "discovered_count",
+          "inspected_count",
+          "new_count",
+          "changed_count",
+          "indexed_count",
+          "unchanged_count",
+          "excluded_count",
+          "missing_count",
+          "errored_count",
+          "identification_enqueued_count"
+        ],
+        "properties": {
+          "changed_count": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Files changed since the last scan."
+          },
+          "discovered_count": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Files the walk found."
+          },
+          "errored_count": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Files that could not be read or written."
+          },
+          "excluded_count": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Files a policy leaves out."
+          },
+          "identification_enqueued_count": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Albums offered for identification."
+          },
+          "indexed_count": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Files written to the catalog."
+          },
+          "inspected_count": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Files the index phase looked at."
+          },
+          "missing_count": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Catalog files the walk no longer found."
+          },
+          "new_count": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Files new to the catalog."
+          },
+          "total_count": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Files the run will look at."
+          },
+          "unchanged_count": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Files unchanged since the last scan."
+          }
+        }
+      },
       "CoverUploadBody": {
         "type": "object",
         "description": "Cover-upload body. Base64 JSON instead of multipart: the app has no\nmultipart feature and the frontend regenerates against this contract.",
@@ -43361,18 +43373,6 @@
           }
         }
       },
-      "DropImportMatchRequest": {
-        "type": "object",
-        "description": "The album a person picked for a review item.",
-        "required": [
-          "release_group_mbid"
-        ],
-        "properties": {
-          "release_group_mbid": {
-            "type": "string"
-          }
-        }
-      },
       "DropImportUpdated": {
         "type": "object",
         "description": "`drop_import_updated`: one of the user's drop-import jobs moved.",
@@ -44690,6 +44690,24 @@
           "none"
         ]
       },
+      "EntryOrigin": {
+        "type": "string",
+        "description": "Where an entry's files came from.",
+        "enum": [
+          "download",
+          "upload"
+        ]
+      },
+      "EntryState": {
+        "type": "string",
+        "description": "Where an entry is in its life.",
+        "enum": [
+          "held",
+          "placing",
+          "resolved",
+          "expired"
+        ]
+      },
       "ErrorBody": {
         "type": "object",
         "description": "The `error` object inside every error response.",
@@ -44967,6 +44985,45 @@
             "default": 30
           }
         }
+      },
+      "FailureCode": {
+        "type": "string",
+        "description": "Why a scan skipped or failed a path, or why a run ended early. The\n`WALK_E*` codes name the operating system's error for a folder the scan\ncould not read.",
+        "enum": [
+          "ROOT_UNAVAILABLE",
+          "ROOT_PERMISSION_DENIED",
+          "WALK_TIMEOUT",
+          "WALKER_UNAVAILABLE",
+          "PROBE_UNAVAILABLE",
+          "WALK_SUPERSEDED",
+          "WALK_ERROR",
+          "WALK_EPERM",
+          "WALK_ENOENT",
+          "WALK_EIO",
+          "WALK_EACCES",
+          "WALK_ENOTDIR",
+          "WALK_EISDIR",
+          "WALK_EINVAL",
+          "WALK_ENFILE",
+          "WALK_EMFILE",
+          "WALK_ENOSPC",
+          "WALK_EROFS",
+          "WALK_ENAMETOOLONG",
+          "WALK_ELOOP",
+          "WALK_EUNKNOWN",
+          "SYMLINK_ESCAPE_OUT",
+          "NON_REGULAR_FILE",
+          "WALK_NAME_ENCODING",
+          "NFC_TWIN_COLLISION",
+          "TAG_READ_DEFERRED",
+          "TAG_READ_FAILED",
+          "MTIME_SKEW",
+          "SUPERSEDED_POLICY_CHANGED",
+          "UNEXPECTED_WORKER_FAILURE",
+          "MASS_MISSING_GUARD",
+          "CATALOG_COMMIT_FAILED",
+          "RUN_END_PENDING"
+        ]
       },
       "FavoriteCounts": {
         "type": "object",
@@ -45959,112 +46016,53 @@
       },
       "HeldActionResponse": {
         "type": "object",
-        "description": "What an import or discard did.",
+        "description": "What an action did.",
         "required": [
-          "status"
+          "imported",
+          "already_owned",
+          "discarded",
+          "still_held"
         ],
         "properties": {
-          "final_path": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Where the imported file now lives."
-          },
-          "message": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "A note when the outcome needs one (an upgrade's file that was no\nbetter than the library's copy)."
-          },
-          "status": {
-            "type": "string",
-            "description": "`imported` or `discarded`."
-          }
-        }
-      },
-      "HeldBulkReverifyItem": {
-        "type": "object",
-        "description": "One file of a bulk re-check.",
-        "required": [
-          "held_id",
-          "status"
-        ],
-        "properties": {
-          "final_path": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "held_id": {
+          "already_owned": {
             "type": "integer",
-            "format": "int64"
+            "description": "Files the library already held, so nothing was added.",
+            "minimum": 0
+          },
+          "discarded": {
+            "type": "integer",
+            "description": "Files deleted.",
+            "minimum": 0
+          },
+          "imported": {
+            "type": "integer",
+            "description": "Files now in the library.",
+            "minimum": 0
           },
           "message": {
             "type": [
               "string",
               "null"
             ],
-            "description": "Why a file was skipped or failed."
+            "description": "Why the first file still held stays, when one does."
           },
-          "release_group_mbid": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "status": {
-            "type": "string",
-            "description": "`imported`, `still_held`, `skipped` or `error`."
+          "still_held": {
+            "type": "integer",
+            "description": "Files still held.",
+            "minimum": 0
           }
         }
       },
-      "HeldBulkReverifyRequest": {
+      "HeldEntryResponse": {
         "type": "object",
-        "description": "Bulk re-check: these held ids, in order, or every held file.",
-        "properties": {
-          "held_ids": {
-            "type": [
-              "array",
-              "null"
-            ],
-            "items": {
-              "type": "integer",
-              "format": "int64"
-            }
-          }
-        }
-      },
-      "HeldBulkReverifyResponse": {
-        "type": "object",
-        "description": "A bulk re-check's results.",
-        "required": [
-          "results"
-        ],
-        "properties": {
-          "results": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/HeldBulkReverifyItem"
-            }
-          }
-        }
-      },
-      "HeldImportResponse": {
-        "type": "object",
-        "description": "One held file.",
+        "description": "One entry of the held list: one download or upload, with its files.",
         "required": [
           "id",
-          "reason",
-          "reason_text",
-          "reason_action",
-          "reason_kind",
-          "source",
           "origin",
+          "state",
           "created_at",
-          "management_retry_count"
+          "expires_at",
+          "files"
         ],
         "properties": {
           "album_title": {
@@ -46080,8 +46078,100 @@
             ]
           },
           "created_at": {
-            "type": "number",
-            "format": "double"
+            "type": "integer",
+            "format": "int64",
+            "description": "When it was made, in milliseconds."
+          },
+          "drop_item_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The upload's drop import item."
+          },
+          "expires_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When its held files are removed, in milliseconds."
+          },
+          "files": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HeldFileResponse"
+            }
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "next_retry_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When DroppedNeedle next retries the files offering Retry by itself,\nin milliseconds. `None` when no file offers Retry, or when the next\ntry is at the held loop's next pass (within five minutes)."
+          },
+          "origin": {
+            "$ref": "#/components/schemas/EntryOrigin"
+          },
+          "recording_mbid": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The song, for a track download."
+          },
+          "release_group_mbid": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "$ref": "#/components/schemas/EntryState",
+            "description": "`held` while it waits, `placing` while an action runs on it."
+          }
+        }
+      },
+      "HeldFileAction": {
+        "type": "string",
+        "description": "What a person can do with one held file, besides listening and\ndiscarding, which every file offers.",
+        "enum": [
+          "import",
+          "retry",
+          "use_this_version",
+          "use_this_file",
+          "recheck",
+          "get_from_album"
+        ]
+      },
+      "HeldFileResponse": {
+        "type": "object",
+        "description": "One held file.",
+        "required": [
+          "id",
+          "original_name",
+          "source",
+          "reason",
+          "reason_text",
+          "reason_action",
+          "reason_kind",
+          "actions",
+          "created_at"
+        ],
+        "properties": {
+          "actions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HeldFileAction"
+            }
+          },
+          "created_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When it was held, in milliseconds."
           },
           "disc_number": {
             "type": [
@@ -46115,7 +46205,7 @@
               "string",
               "null"
             ],
-            "description": "What the rejecting check saw: the title and artist AcoustID heard\nor the file's tags name, and AcoustID's score."
+            "description": "What the check that held it saw: the title and artist AcoustID heard\nor the file's tags name, and AcoustID's score."
           },
           "expected_duration_seconds": {
             "type": [
@@ -46134,26 +46224,9 @@
             "type": "integer",
             "format": "int64"
           },
-          "management_next_retry_at": {
-            "type": [
-              "number",
-              "null"
-            ],
-            "format": "double"
-          },
-          "management_retry_count": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "origin": {
+          "original_name": {
             "type": "string",
-            "description": "`user`, `upgrade`, ... An upgrade's file replaces the library's\ncopy only when it is better."
-          },
-          "original_filename": {
-            "type": [
-              "string",
-              "null"
-            ]
+            "description": "Its name (and folder) as it came."
           },
           "reason": {
             "$ref": "#/components/schemas/Reason"
@@ -46171,19 +46244,13 @@
           },
           "reason_kind": {
             "$ref": "#/components/schemas/ReasonKind",
-            "description": "`library` when our side held the file and it can be retried as it\nis; `hold` when a person decides."
+            "description": "`library` when our side held it and it is retried as it is; `hold`\nwhen a person decides."
           },
           "reason_text": {
             "type": "string",
             "description": "The reason as one plain sentence."
           },
           "recording_mbid": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "release_group_mbid": {
             "type": [
               "string",
               "null"
@@ -46203,7 +46270,7 @@
           },
           "source": {
             "type": "string",
-            "description": "`soulseek`, `usenet` or `plugin:<key>`."
+            "description": "`soulseek`, `usenet`, `plugin:<key>` or `upload`."
           },
           "source_task_id": {
             "type": [
@@ -46223,68 +46290,130 @@
               "string",
               "null"
             ]
-          },
-          "year": {
+          }
+        }
+      },
+      "HeldFilesRequest": {
+        "type": "object",
+        "description": "The files an action takes; every held file of the entry when left out.",
+        "properties": {
+          "file_ids": {
             "type": [
-              "integer",
+              "array",
               "null"
             ],
-            "format": "int64"
+            "items": {
+              "type": "integer",
+              "format": "int64"
+            }
           }
         }
       },
       "HeldListResponse": {
         "type": "object",
-        "description": "Held files, newest first.",
+        "description": "Entries waiting for a decision, newest first.",
         "required": [
-          "items"
+          "entries"
         ],
         "properties": {
-          "items": {
+          "entries": {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/HeldImportResponse"
+              "$ref": "#/components/schemas/HeldEntryResponse"
             }
           }
         }
       },
-      "HeldReverifyResponse": {
+      "HeldMatchRequest": {
         "type": "object",
-        "description": "What a fingerprint re-check did.",
+        "description": "The album a curator picked, and the files it takes (all when left out).",
         "required": [
-          "status"
+          "release_group_mbid"
         ],
         "properties": {
-          "final_path": {
+          "file_ids": {
             "type": [
-              "string",
+              "array",
               "null"
-            ]
+            ],
+            "items": {
+              "type": "integer",
+              "format": "int64"
+            }
           },
-          "status": {
-            "type": "string",
-            "description": "`imported` when AcoustID now agrees, else `still_held`."
+          "release_group_mbid": {
+            "type": "string"
           }
         }
       },
-      "HeldUnitResponse": {
+      "HeldRecheckAllRequest": {
         "type": "object",
-        "description": "A per-download held action's outcome.",
-        "required": [
-          "status",
-          "files"
-        ],
+        "description": "Bulk re-check: these entries, in order, or every entry.",
         "properties": {
-          "files": {
-            "type": "integer",
-            "description": "Files acted on.",
-            "minimum": 0
-          },
-          "status": {
-            "type": "string",
-            "description": "`imported` or `discarded`."
+          "entry_ids": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "integer",
+              "format": "int64"
+            }
           }
         }
+      },
+      "HeldRecheckAllResponse": {
+        "type": "object",
+        "description": "A bulk re-check's results.",
+        "required": [
+          "results"
+        ],
+        "properties": {
+          "results": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HeldRecheckItem"
+            }
+          }
+        }
+      },
+      "HeldRecheckItem": {
+        "type": "object",
+        "description": "One file of a bulk re-check.",
+        "required": [
+          "entry_id",
+          "file_id",
+          "status"
+        ],
+        "properties": {
+          "entry_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "file_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "message": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why it failed."
+          },
+          "status": {
+            "$ref": "#/components/schemas/HeldRecheckStatus"
+          }
+        }
+      },
+      "HeldRecheckStatus": {
+        "type": "string",
+        "description": "How one file of a bulk re-check went.",
+        "enum": [
+          "imported",
+          "still_held",
+          "error"
+        ]
       },
       "HistoryEntry": {
         "type": "object",
@@ -55717,55 +55846,6 @@
           }
         }
       },
-      "PolicyImpactResponse": {
-        "type": "object",
-        "description": "Admin preview of an unsaved policy against persisted state:\npersisted-state bucket counts only.",
-        "required": [
-          "manual_search_jobs",
-          "queued_without_attempts",
-          "awaiting_review",
-          "remote_queued_zero_byte",
-          "transferring_immutable",
-          "held_reviews",
-          "legacy_representable"
-        ],
-        "properties": {
-          "awaiting_review": {
-            "type": "integer",
-            "format": "int64",
-            "description": "Rows awaiting review."
-          },
-          "held_reviews": {
-            "type": "integer",
-            "format": "int64",
-            "description": "Held reviews."
-          },
-          "legacy_representable": {
-            "type": "boolean",
-            "description": "Whether a down-level image would preserve acquisition behavior."
-          },
-          "manual_search_jobs": {
-            "type": "integer",
-            "format": "int64",
-            "description": "Manual search jobs that would re-resolve."
-          },
-          "queued_without_attempts": {
-            "type": "integer",
-            "format": "int64",
-            "description": "Queued rows with no attempts yet."
-          },
-          "remote_queued_zero_byte": {
-            "type": "integer",
-            "format": "int64",
-            "description": "Remote-queued zero-byte rows."
-          },
-          "transferring_immutable": {
-            "type": "integer",
-            "format": "int64",
-            "description": "Transferring rows (immutable under the new policy)."
-          }
-        }
-      },
       "PolicyNodeKind": {
         "type": "string",
         "description": "Which kind of scope a policy-tree node stands for.",
@@ -57280,6 +57360,8 @@
           "no_tracks",
           "version_lower_quality",
           "no_better_than_yours",
+          "owned_elsewhere",
+          "owned_on_album",
           "no_album_match",
           "album_not_found",
           "tags_disagree",
@@ -60815,7 +60897,7 @@
       },
       "ScanPhase": {
         "type": "string",
-        "description": "Worker phase. Spelling matches v2 `ScanPhase` exactly.",
+        "description": "A run's phase as the API reports it and the runs table stores it:\n`queued` before the run starts, then the phase it is in or reached.",
         "enum": [
           "queued",
           "discovering",
@@ -60895,7 +60977,7 @@
             "description": "What to do about it."
           },
           "failure_code": {
-            "type": "string",
+            "$ref": "#/components/schemas/FailureCode",
             "description": "Stable machine code, for example `TAG_READ_FAILED`."
           },
           "failure_detail": {
@@ -61070,15 +61152,8 @@
             "description": "Requests folded into this run."
           },
           "counters": {
-            "type": "object",
-            "description": "Progress counters.",
-            "additionalProperties": {
-              "type": "integer",
-              "format": "int64"
-            },
-            "propertyNames": {
-              "type": "string"
-            }
+            "$ref": "#/components/schemas/Counters",
+            "description": "Progress counters."
           },
           "event_revision": {
             "type": "integer",
@@ -61170,11 +61245,15 @@
             "description": "Terminal time, when terminal."
           },
           "terminal_code": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Terminal code, when terminal."
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/FailureCode",
+                "description": "Terminal code, when terminal."
+              }
+            ]
           },
           "terminal_message": {
             "type": [
@@ -61243,7 +61322,7 @@
       },
       "ScanState": {
         "type": "string",
-        "description": "Durable run state. Spelling matches v2 `ScanState` exactly.",
+        "description": "A run's state, as the API reports it and the runs table stores it.",
         "enum": [
           "queued",
           "discovering",
@@ -65644,8 +65723,8 @@
             "minimum": 0
           },
           "state": {
-            "type": "string",
-            "description": "Watch state: `watching`, `stopped` or `fulfilled`."
+            "$ref": "#/components/schemas/WatchState",
+            "description": "Watch state."
           },
           "user_id": {
             "type": [
@@ -65863,6 +65942,15 @@
             "default": true
           }
         }
+      },
+      "WatchState": {
+        "type": "string",
+        "description": "A wanted watch's state. The `wanted_watches.state` CHECK lists exactly\nthese values.",
+        "enum": [
+          "watching",
+          "stopped",
+          "fulfilled"
+        ]
       },
       "WavTagPolicy": {
         "type": "string",

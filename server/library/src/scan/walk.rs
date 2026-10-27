@@ -19,11 +19,10 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use unicode_normalization::UnicodeNormalization;
 
-use super::fs::FsCoordinator;
 use super::fs::is_management_artifact;
 use super::models::{
-    EffectivePolicy, ScanFailureRecord, ScanInventoryItem, ScanPhase, ScanRun, ScanScope,
-    ScanState, ScopeDiscoveryState, Verdict, failure_codes,
+    EffectivePolicy, Event, FailureCode, Phase, RunState, ScanFailureRecord, ScanInventoryItem,
+    ScanPhase, ScanRun, ScanScope, ScopeDiscoveryState, Verdict,
 };
 use super::pool::BlockingPool;
 use super::revision::{exact_stat_revision, mtime_ns_from_metadata};
@@ -32,6 +31,7 @@ use super::seams::Checkpoint;
 use super::sqlite_store::SqliteScanStore;
 use super::stop::RunStop;
 use super::store::{ClassifyInput, ScanStoreError};
+use crate::clock::LibraryClock as _;
 
 /// Bounded discovery queue (v2 `INVENTORY_QUEUE_SIZE`).
 pub const INVENTORY_QUEUE_SIZE: usize = 256;
@@ -158,10 +158,23 @@ fn errno_name(errno: i32) -> &'static str {
     }
 }
 
-fn walk_error_code(error: &std::io::Error) -> String {
+fn walk_error_code(error: &std::io::Error) -> FailureCode {
     match error.raw_os_error() {
-        Some(errno) => format!("WALK_{}", errno_name(errno)),
-        None => failure_codes::WALK_ERROR.to_owned(),
+        Some(1) => FailureCode::WalkEperm,
+        Some(2) => FailureCode::WalkEnoent,
+        Some(5) => FailureCode::WalkEio,
+        Some(13) => FailureCode::WalkEacces,
+        Some(20) => FailureCode::WalkEnotdir,
+        Some(21) => FailureCode::WalkEisdir,
+        Some(22) => FailureCode::WalkEinval,
+        Some(23) => FailureCode::WalkEnfile,
+        Some(24) => FailureCode::WalkEmfile,
+        Some(28) => FailureCode::WalkEnospc,
+        Some(30) => FailureCode::WalkErofs,
+        Some(36) => FailureCode::WalkEnametoolong,
+        Some(40) => FailureCode::WalkEloop,
+        Some(_) => FailureCode::WalkEunknown,
+        None => FailureCode::WalkError,
     }
 }
 
@@ -229,14 +242,14 @@ struct DiscoveredFile {
 #[derive(Debug, Clone)]
 struct WalkErrorInfo {
     path: PathBuf,
-    code: String,
+    code: FailureCode,
     detail: String,
 }
 
 #[derive(Debug, Clone)]
 enum WalkMessage {
     File(DiscoveredFile),
-    Skips(Vec<(String, String)>),
+    Skips(Vec<(String, FailureCode)>),
     WalkError(WalkErrorInfo),
     /// A folder on another filesystem than the folder above it, as its
     /// inventory key.
@@ -265,20 +278,10 @@ fn send_with_stop(
     }
 }
 
-type Clock = Arc<dyn Fn() -> f64 + Send + Sync>;
-
-fn system_clock() -> f64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0)
-}
-
 /// One-walk bounded-queue inventory scanner (v2 `LibraryInventoryScanner`).
 pub struct InventoryScanner {
     store: Arc<SqliteScanStore>,
     pool: BlockingPool,
-    fs: Option<FsCoordinator>,
     walk_deadline: Duration,
     max_detached_walkers: usize,
     detached: Arc<Mutex<HashMap<u64, Instant>>>,
@@ -286,15 +289,18 @@ pub struct InventoryScanner {
     detached_reap_multiplier: f64,
     pending_probes: Arc<AtomicUsize>,
     probe_max_workers: usize,
-    clock: Clock,
+    clock: Arc<dyn droppedneedle_kernel::clock::Clock>,
 }
 
 impl InventoryScanner {
-    pub fn new(store: Arc<SqliteScanStore>, pool: BlockingPool) -> Self {
+    pub fn new(
+        store: Arc<SqliteScanStore>,
+        pool: BlockingPool,
+        clock: Arc<dyn droppedneedle_kernel::clock::Clock>,
+    ) -> Self {
         Self {
             store,
             pool,
-            fs: None,
             walk_deadline: Duration::from_secs_f64(DEFAULT_WALK_DEADLINE_SECS),
             max_detached_walkers: DEFAULT_MAX_DETACHED_WALKERS,
             detached: Arc::new(Mutex::new(HashMap::new())),
@@ -302,13 +308,8 @@ impl InventoryScanner {
             detached_reap_multiplier: DETACHED_WALKER_REAP_MULTIPLIER,
             pending_probes: Arc::new(AtomicUsize::new(0)),
             probe_max_workers: 1,
-            clock: Arc::new(system_clock),
+            clock,
         }
-    }
-
-    pub fn with_filesystem(mut self, fs: FsCoordinator) -> Self {
-        self.fs = Some(fs);
-        self
     }
 
     fn reap_stale_detached_walkers(&self) -> usize {
@@ -382,7 +383,7 @@ impl InventoryScanner {
         run_id: &str,
         scope: &ScanScope,
         relative_path: String,
-        failure_code: &str,
+        failure_code: FailureCode,
         failure_detail: String,
     ) -> Result<(), ScanStoreError> {
         self.store.record_failures(
@@ -391,8 +392,8 @@ impl InventoryScanner {
             &[ScanFailureRecord {
                 root_id: scope.root_id.clone(),
                 relative_path,
-                failure_code: failure_code.to_owned(),
-                recorded_at: (self.clock)(),
+                failure_code,
+                recorded_at: self.clock.now_secs(),
                 failure_detail,
                 phase: ScanPhase::Discovering,
             }],
@@ -404,17 +405,15 @@ impl InventoryScanner {
     fn fail_run(
         &self,
         run_id: &str,
-        expected_state: ScanState,
         expected_revision: u64,
-        code: &str,
+        code: FailureCode,
     ) -> Result<ScanRun, ScanStoreError> {
         match self.store.transition(
             &RunStop::never(),
             run_id,
-            expected_state,
             expected_revision,
-            ScanState::Failed,
-            (self.clock)(),
+            Event::Fail,
+            self.clock.now_secs(),
             Some(code),
         ) {
             Err(ScanStoreError::StaleRevision { .. }) => Ok(self.store.get_run(run_id)?.0),
@@ -516,7 +515,7 @@ impl InventoryScanner {
                     &run.id,
                     scope,
                     scope.relative_path.clone(),
-                    failure_codes::ROOT_UNAVAILABLE,
+                    FailureCode::RootUnavailable,
                     "The library root has no configured path.".to_owned(),
                 )?;
                 self.store.complete_scope_discovery(
@@ -525,7 +524,7 @@ impl InventoryScanner {
                     &scope.root_id,
                     &scope.relative_path,
                     ScopeDiscoveryState::Unavailable,
-                    Some(failure_codes::ROOT_UNAVAILABLE),
+                    Some(FailureCode::RootUnavailable),
                 )?;
                 unavailable_scopes += 1;
                 continue;
@@ -542,7 +541,7 @@ impl InventoryScanner {
                         &run.id,
                         scope,
                         scope.relative_path.clone(),
-                        failure_codes::PROBE_UNAVAILABLE,
+                        FailureCode::ProbeUnavailable,
                         "A previous root probe never completed; scanning is paused until the filesystem responds or the service restarts.".to_owned(),
                     )?;
                     self.store.complete_scope_discovery(
@@ -551,13 +550,12 @@ impl InventoryScanner {
                         &scope.root_id,
                         &scope.relative_path,
                         ScopeDiscoveryState::Unavailable,
-                        Some(failure_codes::PROBE_UNAVAILABLE),
+                        Some(FailureCode::ProbeUnavailable),
                     )?;
                     return self.fail_run(
                         &run.id,
-                        current.state,
                         current.row_revision,
-                        failure_codes::PROBE_UNAVAILABLE,
+                        FailureCode::ProbeUnavailable,
                     );
                 }
                 Err(ProbeOutcome::Wedged) => {
@@ -567,7 +565,7 @@ impl InventoryScanner {
                         &run.id,
                         scope,
                         scope.relative_path.clone(),
-                        failure_codes::WALK_TIMEOUT,
+                        FailureCode::WalkTimeout,
                         format!(
                             "The library root probe exceeded {:.1}s.",
                             self.walk_deadline.as_secs_f64()
@@ -579,14 +577,9 @@ impl InventoryScanner {
                         &scope.root_id,
                         &scope.relative_path,
                         ScopeDiscoveryState::Unavailable,
-                        Some(failure_codes::WALK_TIMEOUT),
+                        Some(FailureCode::WalkTimeout),
                     )?;
-                    return self.fail_run(
-                        &run.id,
-                        current.state,
-                        current.row_revision,
-                        failure_codes::WALK_TIMEOUT,
-                    );
+                    return self.fail_run(&run.id, current.row_revision, FailureCode::WalkTimeout);
                 }
                 Ok(false) => {
                     self.record_failure(
@@ -594,7 +587,7 @@ impl InventoryScanner {
                         &run.id,
                         scope,
                         scope.relative_path.clone(),
-                        failure_codes::ROOT_UNAVAILABLE,
+                        FailureCode::RootUnavailable,
                         format!("The library root path is missing: {}", scope.relative_path),
                     )?;
                     self.store.complete_scope_discovery(
@@ -603,7 +596,7 @@ impl InventoryScanner {
                         &scope.root_id,
                         &scope.relative_path,
                         ScopeDiscoveryState::Unavailable,
-                        Some(failure_codes::ROOT_UNAVAILABLE),
+                        Some(FailureCode::RootUnavailable),
                     )?;
                     unavailable_scopes += 1;
                     continue;
@@ -611,7 +604,6 @@ impl InventoryScanner {
                 Ok(true) => {}
             }
             let mut restarts = 0u32;
-            let mut superseded_scope = false;
             let (completed, walk_failure_code) = loop {
                 let generation = self.store.scope_discovery_generation(
                     stop,
@@ -619,7 +611,8 @@ impl InventoryScanner {
                     &scope.root_id,
                     &scope.relative_path,
                 )?;
-                let filesystem_revision = self.fs.as_ref().map(|fs| fs.revision(&scope.root_id));
+                self.store
+                    .begin_scope_walk(stop, &run.id, &scope.root_id, &scope.relative_path)?;
                 let (next, completed, code) = self
                     .walk_scope(
                         &current, scope, &root, &selected, resolver, checkpoint, generation, stop,
@@ -629,16 +622,16 @@ impl InventoryScanner {
                 // GH-444: a transient mid-walk stall must not fail the whole
                 // run. Re-walk boundedly (worst case 3 walks + 2 sleeps);
                 // only the exact WALK_TIMEOUT code retries.
-                if !completed && code.as_deref() == Some(failure_codes::WALK_TIMEOUT) {
+                if !completed && code == Some(FailureCode::WalkTimeout) {
                     current = self.store.reread_run(stop, &run.id)?.0;
                     if restarts < 2
-                        && current.state == ScanState::Discovering
+                        && current.state == RunState::Running(Phase::Discovering)
                         && checkpoint.check(&run.id, &scope.policy_revision)
                     {
                         restarts += 1;
                         tokio::time::sleep(self.walk_deadline).await;
                         current = self.store.reread_run(stop, &run.id)?.0;
-                        if current.state != ScanState::Discovering
+                        if current.state != RunState::Running(Phase::Discovering)
                             || !checkpoint.check(&run.id, &scope.policy_revision)
                         {
                             break (false, code);
@@ -655,60 +648,17 @@ impl InventoryScanner {
                         continue;
                     }
                 }
-                if !completed || self.fs.is_none() {
-                    break (completed, code);
-                }
-                let Some(fs) = self.fs.as_ref() else {
-                    break (completed, code);
-                };
-                let _lease = fs.read(&scope.root_id).await;
-                if fs.revision(&scope.root_id) == filesystem_revision.unwrap_or(0) {
-                    // Only a clean, un-degraded walk records
-                    // the fence; a partially-read scope keeps the
-                    // reconciler conservative.
-                    if code.is_none() && !superseded_scope {
-                        fs.record_scan_revision(&run.id, &scope.root_id);
-                    }
-                    break (true, code);
-                }
-                restarts += 1;
-                if restarts >= 3 {
-                    // Sustained concurrent publication would
-                    // otherwise re-walk this scope forever.
-                    tracing::warn!(run_id = %run.id, restarts, "library_scan event=walk_superseded");
-                    superseded_scope = true;
-                    break (true, code);
-                }
-                drop(_lease);
-                self.store.restart_scope_discovery(
-                    stop,
-                    &run.id,
-                    &scope.root_id,
-                    &scope.relative_path,
-                )?;
-                current = self.store.reread_run(stop, &run.id)?.0;
-                self.store.cleanup_stale_inventory(stop, &run.id)?;
+                break (completed, code);
             };
             if !completed {
                 current = self.store.reread_run(stop, &run.id)?.0;
-                if current.state == ScanState::Discovering {
-                    let code = walk_failure_code
-                        .clone()
-                        .unwrap_or_else(|| failure_codes::ROOT_PERMISSION_DENIED.to_owned());
-                    current = self.fail_run(&run.id, current.state, current.row_revision, &code)?;
+                if current.state == RunState::Running(Phase::Discovering) {
+                    let code = walk_failure_code.unwrap_or(FailureCode::RootPermissionDenied);
+                    current = self.fail_run(&run.id, current.row_revision, code)?;
                 }
                 return Ok(current);
             }
-            if superseded_scope {
-                self.store.complete_scope_discovery(
-                    stop,
-                    &run.id,
-                    &scope.root_id,
-                    &scope.relative_path,
-                    ScopeDiscoveryState::PartiallyRead,
-                    Some(failure_codes::WALK_SUPERSEDED),
-                )?;
-            } else if let Some(code) = &walk_failure_code {
+            if let Some(code) = walk_failure_code {
                 self.store.complete_scope_discovery(
                     stop,
                     &run.id,
@@ -732,12 +682,7 @@ impl InventoryScanner {
             // GH-296: every scope proved unreachable, so the run fails
             // instead of completing silently green.
             tracing::warn!(run_id = %run.id, count = unavailable_scopes, "library_scan event=all_scopes_unavailable");
-            return self.fail_run(
-                &run.id,
-                current.state,
-                current.row_revision,
-                failure_codes::ROOT_UNAVAILABLE,
-            );
+            return self.fail_run(&run.id, current.row_revision, FailureCode::RootUnavailable);
         }
         Ok(current)
     }
@@ -754,7 +699,7 @@ impl InventoryScanner {
         checkpoint: &C,
         generation: u64,
         stop: &RunStop,
-    ) -> Result<(ScanRun, bool, Option<String>), ScanStoreError> {
+    ) -> Result<(ScanRun, bool, Option<FailureCode>), ScanStoreError> {
         let (sender, mut receiver) = mpsc::channel::<WalkMessage>(INVENTORY_QUEUE_SIZE);
         let stopped = Arc::new(AtomicBool::new(false));
         let _stop_guard = StopGuard(Arc::clone(&stopped));
@@ -790,9 +735,9 @@ impl InventoryScanner {
         // A checkpoint-false exit is pause/stop/supersede,
         // not a filesystem error.
         let mut control_exit = false;
-        let mut walk_failure_code: Option<String> = None;
+        let mut walk_failure_code: Option<FailureCode> = None;
         // First degraded code becomes the scope diagnostic.
-        let mut degraded_code: Option<String> = None;
+        let mut degraded_code: Option<FailureCode> = None;
         let mut stale_cleanup_pending = true;
         let mut last_checkpoint = Instant::now();
         let mut last_log = Instant::now();
@@ -810,13 +755,13 @@ impl InventoryScanner {
                     // it delivered is not the whole scope, so reconcile
                     // must not read the gap as missing files.
                     completed = false;
-                    walk_failure_code = Some(failure_codes::WALK_ERROR.to_owned());
+                    walk_failure_code = Some(FailureCode::WalkError);
                     self.record_failure(
                         stop,
                         &run.id,
                         scope,
                         scope.relative_path.clone(),
-                        failure_codes::WALK_ERROR,
+                        FailureCode::WalkError,
                         "The directory walk stopped unexpectedly.".to_owned(),
                     )?;
                     break;
@@ -827,7 +772,7 @@ impl InventoryScanner {
                     {
                         completed = false;
                         stopped.store(true, Ordering::Relaxed);
-                        walk_failure_code = Some(failure_codes::WALK_TIMEOUT.to_owned());
+                        walk_failure_code = Some(FailureCode::WalkTimeout);
                         let last = heartbeat.last_directory();
                         tracing::warn!(run_id = %run.id, "library_scan event=walk_timeout");
                         self.record_failure(
@@ -839,7 +784,7 @@ impl InventoryScanner {
                             } else {
                                 relativize(Path::new(&last), root)
                             },
-                            failure_codes::WALK_TIMEOUT,
+                            FailureCode::WalkTimeout,
                             format!(
                                 "The directory walk made no delivered progress for {:.1}s.",
                                 self.walk_deadline.as_secs_f64()
@@ -854,13 +799,13 @@ impl InventoryScanner {
                         if let Some(handle) = producer.take()
                             && !self.detach_walker(handle)
                         {
-                            walk_failure_code = Some(failure_codes::WALKER_UNAVAILABLE.to_owned());
+                            walk_failure_code = Some(FailureCode::WalkerUnavailable);
                             self.record_failure(
                                 stop,
                                 &run.id,
                                 scope,
                                 scope.relative_path.clone(),
-                                failure_codes::WALKER_UNAVAILABLE,
+                                FailureCode::WalkerUnavailable,
                                 "Too many wedged directory walks are still in flight; the walk was not started.".to_owned(),
                             )?;
                         }
@@ -888,11 +833,11 @@ impl InventoryScanner {
                 _ if discard_remaining => continue,
                 WalkMessage::Skips(skips) => {
                     for (relative_path, failure_code) in skips {
-                        let failure_detail = match failure_code.as_str() {
-                            failure_codes::SYMLINK_ESCAPE_OUT => {
+                        let failure_detail = match failure_code {
+                            FailureCode::SymlinkEscapeOut => {
                                 "A symbolic link resolves outside its library root; it was not followed."
                             }
-                            failure_codes::NON_REGULAR_FILE => {
+                            FailureCode::NonRegularFile => {
                                 "The path is not a regular file (FIFO, socket, or device node); it was skipped without reading tags."
                             }
                             _ => "A filename is not valid UTF-8; the file was skipped.",
@@ -903,7 +848,7 @@ impl InventoryScanner {
                             &run.id,
                             scope,
                             relative_path,
-                            &failure_code,
+                            failure_code,
                             failure_detail,
                         )?;
                     }
@@ -911,7 +856,7 @@ impl InventoryScanner {
                 WalkMessage::WalkError(error) => {
                     // GH-296: record the row but keep consuming.
                     if degraded_code.is_none() {
-                        degraded_code = Some(error.code.clone());
+                        degraded_code = Some(error.code);
                     }
                     tracing::warn!(run_id = %run.id, path = %relativize(&error.path, root), "library_scan event=walk_error");
                     self.record_failure(
@@ -919,7 +864,7 @@ impl InventoryScanner {
                         &run.id,
                         scope,
                         relativize(&error.path, root),
-                        &error.code,
+                        error.code,
                         error.detail,
                     )?;
                 }
@@ -939,7 +884,7 @@ impl InventoryScanner {
                             text_safe_posix(
                                 file.resolved.strip_prefix(root).unwrap_or(&file.resolved),
                             ),
-                            failure_codes::NFC_TWIN_COLLISION,
+                            FailureCode::NfcTwinCollision,
                             "Two on-disk names normalize to the same inventory key; the first file won and this twin was skipped.".to_owned(),
                         )?;
                         continue;
@@ -963,7 +908,7 @@ impl InventoryScanner {
                         if persisted {
                             discovered += batch.len();
                         } else if degraded_code.is_none() {
-                            degraded_code = Some(failure_codes::WALK_ERROR.to_owned());
+                            degraded_code = Some(FailureCode::WalkError);
                         }
                         batch.clear();
                         if stale_cleanup_pending {
@@ -1008,7 +953,7 @@ impl InventoryScanner {
             )?;
             row_revision = revision;
             if !persisted && degraded_code.is_none() {
-                degraded_code = Some(failure_codes::WALK_ERROR.to_owned());
+                degraded_code = Some(FailureCode::WalkError);
             }
             if stale_cleanup_pending {
                 self.store.cleanup_stale_inventory(stop, &run.id)?;
@@ -1022,11 +967,7 @@ impl InventoryScanner {
             let scope_error = if control_exit && walk_failure_code.is_none() {
                 None
             } else {
-                Some(
-                    walk_failure_code
-                        .clone()
-                        .unwrap_or_else(|| failure_codes::ROOT_PERMISSION_DENIED.to_owned()),
-                )
+                Some(walk_failure_code.unwrap_or(FailureCode::RootPermissionDenied))
             };
             self.store.complete_scope_discovery(
                 stop,
@@ -1034,9 +975,9 @@ impl InventoryScanner {
                 &scope.root_id,
                 &scope.relative_path,
                 ScopeDiscoveryState::PartiallyRead,
-                scope_error.as_deref(),
+                scope_error,
             )?;
-        } else if let Some(code) = &degraded_code {
+        } else if let Some(code) = degraded_code {
             // The walk finished, but some paths were unreadable.
             self.store.complete_scope_discovery(
                 stop,
@@ -1125,7 +1066,7 @@ impl InventoryScanner {
             run_id,
             build_items()?,
             row_revision,
-            (self.clock)(),
+            self.clock.now_secs(),
             generation,
         ) {
             Ok((revision, refused)) => Ok((revision, refused == 0)),
@@ -1136,7 +1077,7 @@ impl InventoryScanner {
                     run_id,
                     build_items()?,
                     fresh,
-                    (self.clock)(),
+                    self.clock.now_secs(),
                     generation,
                 ) {
                     Ok((revision, refused)) => Ok((revision, refused == 0)),
@@ -1147,7 +1088,7 @@ impl InventoryScanner {
                             run_id,
                             scope,
                             scope.relative_path.clone(),
-                            failure_codes::WALK_ERROR,
+                            FailureCode::WalkError,
                             format!("The inventory page failed to persist: {error}"),
                         )?;
                         Ok((fresh, false))
@@ -1277,7 +1218,7 @@ fn produce_inventory(
                 continue;
             }
         };
-        let mut skips: Vec<(String, String)> = Vec::new();
+        let mut skips: Vec<(String, FailureCode)> = Vec::new();
         let mut inspected: Vec<Result<DiscoveredFile, WalkErrorInfo>> = Vec::new();
         for entry in entries {
             let entry = match entry {
@@ -1323,7 +1264,7 @@ fn produce_inventory(
                     .strip_prefix(root)
                     .map(text_safe_posix)
                     .unwrap_or_else(|_| text_safe_posix(&path));
-                skips.push((relative, failure_codes::WALK_NAME_ENCODING.to_owned()));
+                skips.push((relative, FailureCode::WalkNameEncoding));
                 continue;
             }
             // In-root file symlinks resolve onto their target's own path;
@@ -1340,7 +1281,7 @@ fn produce_inventory(
                                 .strip_prefix(root)
                                 .map(text_safe_posix)
                                 .unwrap_or_else(|_| text_safe_posix(&path));
-                            skips.push((relative, failure_codes::SYMLINK_ESCAPE_OUT.to_owned()));
+                            skips.push((relative, FailureCode::SymlinkEscapeOut));
                             continue;
                         }
                     },
@@ -1382,7 +1323,7 @@ fn produce_inventory(
                     .strip_prefix(root)
                     .map(text_safe_posix)
                     .unwrap_or_else(|_| text_safe_posix(&path));
-                skips.push((relative, failure_codes::NON_REGULAR_FILE.to_owned()));
+                skips.push((relative, FailureCode::NonRegularFile));
                 continue;
             }
             let mtime_ns = mtime_ns_from_metadata(&meta);

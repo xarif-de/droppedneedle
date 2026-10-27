@@ -27,28 +27,26 @@
 
 use std::collections::HashSet;
 use std::sync::RwLock;
-use std::time::Duration;
 
 use super::adapter::{
-    AdapterError, AlbumBrowse, ArtistBrowse, RemotePage, TrackBrowse, checked_url, read_api_body,
-    read_image, request_id,
+    AdapterError, AlbumBrowse, ArtistBrowse, RemoteHttp, RemotePage, TrackBrowse, request_id,
 };
-use super::connections::{PlexServerTokens, ServerSettings};
+use super::connections::{
+    ConnectionResolver, PlexServerTokens, ResolvedConnection, ServerSettings,
+};
 use super::models::{
     AlbumView, ArtistIndexEntry, ArtistView, DiscoveryHubView, DiscoveryView, FavoritesView,
-    HistoryEntry, HistoryPage, HubView, InfoView, LyricsView, MatchView, PlaylistDetail,
-    PlaylistSummary, SearchResults, SessionView, SessionsView, SourceName, StatsView, TrackView,
+    HistoryEntry, HistoryPage, HubView, InfoView, LyricsView, PlaylistDetail, PlaylistSummary,
+    SearchResults, SessionView, SessionsView, SourceName, StatsView, TrackView,
 };
 use super::plex_models::{Container, Envelope, Metadata};
+use super::warmup::{INDEX_MAX_PAGES, INDEX_PAGE, IndexedAlbum, indexed};
 use droppedneedle_auth::federated::FederatedError;
 use droppedneedle_auth::federated::plex::PlexServerIdentity;
 use droppedneedle_auth::federated::settings::InstallIds;
 use droppedneedle_kernel::runtime_config::Live;
 use droppedneedle_kernel::runtime_config::secret_sections::PlexConnection;
 use droppedneedle_providers::plextv::Resource;
-
-/// Request timeout per upstream call, matching the v2 repository.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Query pairs, owned.
 type Params = Vec<(String, String)>;
@@ -64,7 +62,7 @@ fn params(pairs: &[(&str, &str)]) -> Params {
 /// adapter resolves every `artist`-typed section instead of answering empty
 /// (v2 answered empty; a pinned id behaves exactly like v2).
 pub struct PlexAdapter {
-    client: reqwest::Client,
+    http: RemoteHttp,
     base_url: RwLock<String>,
     token: String,
     client_id: String,
@@ -96,6 +94,8 @@ struct AlbumFilters<'a> {
 impl PlexAdapter {
     /// Build a client for one server. Empty URL or token reads as
     /// unconfigured. `section_ids` pins music libraries; empty auto-resolves.
+    /// Kept for the adapter tests; the app builds clients through
+    /// [`ConnectionResolver::client`](super::connections::ConnectionResolver::client).
     pub fn new(
         client: reqwest::Client,
         base_url: String,
@@ -103,8 +103,25 @@ impl PlexAdapter {
         client_id: String,
         section_ids: Vec<String>,
     ) -> Self {
+        Self::over(
+            RemoteHttp::new(client, SourceName::Plex, None),
+            base_url,
+            token,
+            client_id,
+            section_ids,
+        )
+    }
+
+    /// The same, over a configured HTTP layer.
+    pub(crate) fn over(
+        http: RemoteHttp,
+        base_url: String,
+        token: String,
+        client_id: String,
+        section_ids: Vec<String>,
+    ) -> Self {
         Self {
-            client,
+            http,
             base_url: RwLock::new(base_url.trim_end_matches('/').to_owned()),
             token,
             client_id,
@@ -117,10 +134,9 @@ impl PlexAdapter {
         !self.base_url().is_empty() && !self.token.is_empty()
     }
 
-    /// The address a path on this server is sent to, or `None` when
-    /// joining it would not land on that path of this server.
-    fn checked_url(&self, path: &str) -> Option<reqwest::Url> {
-        checked_url(&self.base_url(), path)
+    /// The address a path on this server is sent to.
+    fn url(&self, path: &str) -> Result<reqwest::Url, AdapterError> {
+        RemoteHttp::url(&self.base_url(), path)
     }
 
     /// Current base URL; an https upgrade rewrites it in place.
@@ -159,29 +175,18 @@ impl PlexAdapter {
         plex_tv: &str,
         machine_id: &str,
     ) -> Result<Option<String>, AdapterError> {
-        let response = self
-            .client
-            .get(format!("{}/resources", plex_tv.trim_end_matches('/')))
+        let request = self
+            .http
+            .client()
+            .get(RemoteHttp::url(
+                plex_tv.trim_end_matches('/'),
+                "/resources",
+            )?)
             .query(&[("includeHttps", "1"), ("includeRelay", "1")])
-            .headers(self.headers())
-            .timeout(REQUEST_TIMEOUT)
-            .send()
-            .await
-            .map_err(|cause| AdapterError::Transport(trim_cause(cause)))?;
-        let status = response.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            return Err(AdapterError::Auth);
-        }
-        if !status.is_success() {
-            return Err(AdapterError::Api(format!(
-                "GET /resources failed ({status})"
-            )));
-        }
-        let bytes = read_api_body(SourceName::Plex, "/resources", response).await?;
+            .headers(self.headers());
         // Lenient per device: client devices without a token still list.
-        let devices: Vec<serde_json::Value> = serde_json::from_slice(&bytes).map_err(|_| {
-            AdapterError::Api("Plex returned an unreadable /resources payload".to_owned())
-        })?;
+        let devices: Vec<serde_json::Value> =
+            self.http.send("/resources", request).await?.json().await?;
         Ok(devices
             .into_iter()
             .filter_map(|device| serde_json::from_value::<Resource>(device).ok())
@@ -730,7 +735,7 @@ impl PlexAdapter {
                 progress_ms: track.view_offset.unwrap_or(0),
                 duration_ms: track.duration.unwrap_or(0),
                 is_paused: player.state.as_deref() == Some("paused"),
-                image_url: (!art.is_empty()).then(|| format!("/api/v3/remotes/plex/images/{art}")),
+                image_url: image_url(&art),
             });
         }
         Ok(SessionsView {
@@ -790,7 +795,7 @@ impl PlexAdapter {
         self.require_configured()?;
         let id = request_id(id)?;
         let size = size.to_string();
-        self.get_bytes(
+        self.image(
             &format!("/library/metadata/{id}/thumb"),
             &params(&[("width", &size), ("height", &size)]),
             false,
@@ -806,14 +811,16 @@ impl PlexAdapter {
     pub fn audio_request(&self, part_key: &str) -> Result<reqwest::Request, AdapterError> {
         self.require_configured()?;
         let key = validated_part_key(part_key)?;
-        let url = self
-            .checked_url(&key)
-            .ok_or_else(|| AdapterError::Unsupported("Invalid Plex part key".to_owned()))?;
-        self.client
+        let url = self.url(&key).map_err(|error| match error {
+            AdapterError::NotFound => AdapterError::Unsupported("Invalid Plex part key".to_owned()),
+            other => other,
+        })?;
+        self.http
+            .client()
             .get(url)
             .headers(self.headers())
             .build()
-            .map_err(|cause| AdapterError::Transport(trim_cause(cause)))
+            .map_err(super::adapter::transport)
     }
 
     /// Playback-state report via `/:/timeline` (v2 `now_playing`): `state`
@@ -862,7 +869,7 @@ impl PlexAdapter {
             .unwrap_or_else(|| format!("/playlists/{id}/composite"));
         let composite = validated_cover_path(&composite)?;
         let size = size.to_string();
-        self.get_bytes(
+        self.image(
             composite,
             &params(&[("width", &size), ("height", &size)]),
             true,
@@ -871,28 +878,76 @@ impl PlexAdapter {
         .await
     }
 
-    /// Resolve an MBID by searching for it per section and comparing
-    /// `mbid://` guids.
-    pub async fn match_album(&self, mbid: &str) -> Result<MatchView, AdapterError> {
+    /// The first album in the per-section search for `mbid` whose `mbid://`
+    /// guid carries it.
+    pub async fn mbid_search(&self, mbid: &str) -> Result<Option<String>, AdapterError> {
         let results = self.search(mbid, 50).await?;
-        let Some(album) = results.albums.iter().find(|album| {
-            album.release_mbid.as_deref() == Some(mbid)
-                || album.release_group_mbid.as_deref() == Some(mbid)
-        }) else {
-            return Ok(MatchView {
-                source: SourceName::Plex,
-                found: false,
-                remote_album_id: None,
-                tracks: Vec::new(),
-            });
+        Ok(results
+            .albums
+            .into_iter()
+            .find(|album| {
+                album.release_mbid.as_deref() == Some(mbid)
+                    || album.release_group_mbid.as_deref() == Some(mbid)
+            })
+            .map(|album| album.id))
+    }
+
+    /// Every album with an `mbid://` guid, section by section, at most `cap`
+    /// entries, each recording its section.
+    pub async fn album_index(&self, cap: usize) -> Result<Vec<IndexedAlbum>, AdapterError> {
+        let size = INDEX_PAGE.to_string();
+        let mut index = Vec::new();
+        let mut pages = 0;
+        for section in self.resolve_sections().await? {
+            let mut offset = 0;
+            while index.len() < cap && pages < INDEX_MAX_PAGES {
+                pages += 1;
+                let start = offset.to_string();
+                // List answers leave out the `Guid` children unless asked
+                // for them with `includeGuids=1`, as python-plexapi does. Not
+                // verified against a live server: none was reachable here.
+                let container = self
+                    .request(
+                        &format!("/library/sections/{section}/all"),
+                        &params(&[
+                            ("type", "9"),
+                            ("X-Plex-Container-Start", &start),
+                            ("X-Plex-Container-Size", &size),
+                            ("sort", "titleSort"),
+                            ("includeGuids", "1"),
+                        ]),
+                    )
+                    .await?;
+                for album in &container.metadata {
+                    let (Some(mbid), Ok(id)) = (album.mbid(), album.rating_key()) else {
+                        continue;
+                    };
+                    if let Some(entry) = indexed(&mbid, id, Some(&section)) {
+                        index.push(entry);
+                    }
+                }
+                offset += INDEX_PAGE;
+                let total = container.total_size.unwrap_or(0);
+                if (container.metadata.len() as i64) < INDEX_PAGE || offset >= total {
+                    break;
+                }
+            }
+        }
+        index.truncate(cap);
+        Ok(index)
+    }
+
+    /// Whether an album listed under section `scope` is inside the pinned
+    /// sections, or any music section when nothing is pinned.
+    pub async fn holds(&self, scope: Option<&str>) -> Result<bool, AdapterError> {
+        let Some(section) = scope else {
+            return Ok(false);
         };
-        let tracks = self.album_tracks(&album.id).await?;
-        Ok(MatchView {
-            source: SourceName::Plex,
-            found: true,
-            remote_album_id: Some(album.id.clone()),
-            tracks,
-        })
+        Ok(self
+            .resolve_sections()
+            .await?
+            .iter()
+            .any(|key| key == section))
     }
 
     fn require_configured(&self) -> Result<(), AdapterError> {
@@ -919,7 +974,13 @@ impl PlexAdapter {
         // or the server's own list, and are held to the same plain-id rule.
         Ok(sections
             .into_iter()
-            .filter(|section| request_id(section).is_ok())
+            .filter(|section| {
+                let plain = request_id(section).is_ok();
+                if !plain {
+                    tracing::warn!("skipping a Plex music section whose id is not a plain id");
+                }
+                plain
+            })
             .collect())
     }
 
@@ -1118,38 +1179,22 @@ impl PlexAdapter {
         if !self.is_configured() {
             return Err(AdapterError::NotConfigured);
         }
-        let url = self.checked_url(endpoint).ok_or(AdapterError::NotFound)?;
-        let response = self
-            .client
+        let url = self.url(endpoint)?;
+        let request = self
+            .http
+            .client()
             .get(url.clone())
             .query(pairs)
-            .headers(self.headers())
-            .timeout(REQUEST_TIMEOUT)
-            .send()
-            .await
-            .map_err(|cause| AdapterError::Transport(trim_cause(cause)))?;
-        self.maybe_upgrade_base(url.as_str(), response.url());
-        let status = response.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            return Err(AdapterError::Auth);
-        }
-        if !status.is_success() {
-            return Err(AdapterError::Api(format!(
-                "GET {endpoint} failed ({status})"
-            )));
-        }
-        let bytes = read_api_body(SourceName::Plex, endpoint, response).await?;
-        let envelope: Envelope = serde_json::from_slice(&bytes).map_err(|error| {
-            AdapterError::Api(format!(
-                "Plex returned an unreadable {endpoint} payload: {error}"
-            ))
-        })?;
+            .headers(self.headers());
+        let answer = self.http.send(endpoint, request).await?;
+        self.maybe_upgrade_base(url.as_str(), answer.url());
+        let envelope: Envelope = answer.json().await?;
         Ok(envelope.container)
     }
 
     /// GET image bytes (thumbs, composites), read under the image size
     /// cap. A missing content type falls back to `fallback_content_type`.
-    async fn get_bytes(
+    async fn image(
         &self,
         endpoint: &str,
         pairs: &[(String, String)],
@@ -1166,33 +1211,17 @@ impl PlexAdapter {
                 reqwest::header::HeaderValue::from_static("image/*"),
             );
         }
-        let url = self.checked_url(endpoint).ok_or(AdapterError::NotFound)?;
-        let response = self
-            .client
-            .get(url)
+        let request = self
+            .http
+            .client()
+            .get(self.url(endpoint)?)
             .query(pairs)
-            .headers(headers)
-            .timeout(REQUEST_TIMEOUT)
-            .send()
+            .headers(headers);
+        self.http
+            .send(endpoint, request)
+            .await?
+            .image(fallback_content_type)
             .await
-            .map_err(|cause| AdapterError::Transport(trim_cause(cause)))?;
-        let status = response.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            return Err(AdapterError::Auth);
-        }
-        if !status.is_success() {
-            return Err(AdapterError::Api(format!(
-                "GET {endpoint} failed ({status})"
-            )));
-        }
-        let content_type = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or(fallback_content_type)
-            .to_owned();
-        let bytes = read_image(SourceName::Plex, endpoint, response).await?;
-        Ok((bytes, content_type))
     }
 
     /// Persist an http->https base upgrade when the redirect swapped only
@@ -1224,6 +1253,15 @@ fn album_views<'a>(
     rows.map(album_view).collect()
 }
 
+/// The image address the browser asks for. Only an id the image route
+/// would accept gets one, so a server's id cannot steer the browser to
+/// another path of the app.
+fn image_url(id: &str) -> Option<String> {
+    request_id(id)
+        .ok()
+        .map(|id| format!("/api/v3/remotes/plex/images/{id}"))
+}
+
 fn track_views<'a>(
     rows: impl Iterator<Item = &'a Metadata>,
 ) -> Result<Vec<TrackView>, AdapterError> {
@@ -1234,9 +1272,7 @@ fn album_view(album: &Metadata) -> Result<AlbumView, AdapterError> {
     let id = album.rating_key()?.to_owned();
     Ok(AlbumView {
         source: SourceName::Plex,
-        image_url: album
-            .has_thumb()
-            .then(|| format!("/api/v3/remotes/plex/images/{id}")),
+        image_url: album.has_thumb().then(|| image_url(&id)).flatten(),
         title: album.title.clone().unwrap_or_else(|| "Unknown".to_owned()),
         artist_name: album.parent_title.clone().unwrap_or_default(),
         artist_id: non_empty(album.parent_rating_key.as_deref()),
@@ -1258,9 +1294,7 @@ fn artist_view(artist: &Metadata) -> Result<ArtistView, AdapterError> {
     let id = artist.rating_key()?.to_owned();
     Ok(ArtistView {
         source: SourceName::Plex,
-        image_url: artist
-            .has_thumb()
-            .then(|| format!("/api/v3/remotes/plex/images/{id}")),
+        image_url: artist.has_thumb().then(|| image_url(&id)).flatten(),
         name: artist.title.clone().unwrap_or_else(|| "Unknown".to_owned()),
         album_count: None,
         artist_mbid: artist.mbid(),
@@ -1273,9 +1307,7 @@ fn track_view(track: &Metadata) -> Result<TrackView, AdapterError> {
     let parent = non_empty(track.parent_rating_key.as_deref());
     Ok(TrackView {
         source: SourceName::Plex,
-        image_url: parent
-            .as_ref()
-            .map(|parent| format!("/api/v3/remotes/plex/images/{parent}")),
+        image_url: parent.as_deref().and_then(image_url),
         title: track.title.clone().unwrap_or_else(|| "Unknown".to_owned()),
         album_name: track.parent_title.clone().unwrap_or_default(),
         album_id: parent,
@@ -1297,7 +1329,9 @@ fn playlist_summary(playlist: &Metadata) -> Result<PlaylistSummary, AdapterError
     let id = playlist.rating_key()?.to_owned();
     Ok(PlaylistSummary {
         source: SourceName::Plex,
-        image_url: Some(format!("/api/v3/remotes/plex/covers/playlists/{id}")),
+        image_url: request_id(&id)
+            .ok()
+            .map(|id| format!("/api/v3/remotes/plex/covers/playlists/{id}")),
         name: playlist.title.clone().unwrap_or_default(),
         track_count: playlist.leaf_count.unwrap_or(0),
         duration_secs: playlist.duration.map(|ms| ms / 1000).unwrap_or(0),
@@ -1405,12 +1439,6 @@ fn non_empty(value: Option<&str>) -> Option<String> {
     value.filter(|text| !text.is_empty()).map(str::to_owned)
 }
 
-/// Transport cause for logs and errors. The URL is stripped first: it can
-/// carry credentials (Subsonic `u`/`t`/`s`, Plex and Jellyfin tokens).
-fn trim_cause(cause: reqwest::Error) -> String {
-    cause.without_url().to_string().chars().take(200).collect()
-}
-
 /// The production [`PlexServerTokens`]: probe the admin's server with the
 /// account token, then read the server's token from plex.tv.
 #[derive(Debug, Clone)]
@@ -1433,13 +1461,18 @@ impl PlexServerTokens for PlexTokenProbe {
         auth_token: &'a str,
     ) -> super::adapter::BoxFuture<'a, Result<Option<String>, AdapterError>> {
         Box::pin(async move {
-            let probe = PlexAdapter::new(
-                self.http.clone(),
-                server.base_url.clone(),
-                auth_token.to_owned(),
-                server.client_id.clone(),
-                Vec::new(),
+            let handle = ConnectionResolver::unsaved_client(
+                &self.http,
+                ResolvedConnection {
+                    client_id: server.client_id.clone(),
+                    ..ResolvedConnection::unsaved(
+                        SourceName::Plex,
+                        server.base_url.clone(),
+                        auth_token.to_owned(),
+                    )
+                },
             );
+            let probe = handle.plex("server token lookup")?;
             let Some(machine_id) = probe.machine_identifier().await? else {
                 return Ok(None);
             };
@@ -1486,13 +1519,18 @@ impl PlexServerIdentity for ConfiguredPlexServer {
             if section.plex_url.trim().is_empty() {
                 return Ok(None);
             }
-            let server = PlexAdapter::new(
-                self.http.clone(),
-                section.plex_url.clone(),
-                section.plex_token.expose().to_owned(),
-                self.ids.plex_client_id(),
-                Vec::new(),
+            let handle = ConnectionResolver::unsaved_client(
+                &self.http,
+                ResolvedConnection {
+                    client_id: self.ids.plex_client_id(),
+                    ..ResolvedConnection::unsaved(
+                        SourceName::Plex,
+                        section.plex_url.clone(),
+                        section.plex_token.expose().to_owned(),
+                    )
+                },
             );
+            let server = handle.plex("machine id").map_err(|_| unreadable())?;
             match server.machine_identifier().await {
                 Ok(Some(machine_id)) => Ok(Some(machine_id)),
                 Ok(None) => {
@@ -1564,4 +1602,20 @@ fn validated_part_key(raw: &str) -> Result<String, AdapterError> {
         ));
     }
     Ok(key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::image_url;
+
+    #[test]
+    fn image_addresses_need_a_plain_id() {
+        for hostile in ["../../settings", "123?size=1", "123/../x", ""] {
+            assert_eq!(image_url(hostile), None, "{hostile:?}");
+        }
+        assert_eq!(
+            image_url("123").as_deref(),
+            Some("/api/v3/remotes/plex/images/123")
+        );
+    }
 }

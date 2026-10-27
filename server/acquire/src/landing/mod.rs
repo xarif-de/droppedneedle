@@ -45,17 +45,21 @@ use self::confine::{Place, place};
 use self::decision::{Decision, Outcome, check_files, decide};
 use self::hold::HoldItem;
 use self::matching::{FilePlan, FoundRelease, MatchSummary, find};
-use self::ports::{ImportFailure, ImportFile, ImportRequest, LandingLibrary};
+use self::ports::LandingLibrary;
 use self::probe::{LandedFile, Landing};
 use self::specs::{Check, Disposition, QualityPolicy, Rejection, Target, Verdict};
 use super::downloads::journal::Journal;
-use super::downloads::landing_rows::{HeldFile, ImportDecisionRow};
-use super::downloads::manifest::DownloadManifest;
+use super::downloads::landing_rows::ImportDecisionRow;
+use super::downloads::plan::{PlannedAlbum, TaskPlan};
+use super::downloads::sources::SourceHandle;
 use super::downloads::store::{StoreError, TaskDetails, TaskRow};
+use crate::held::store::{
+    EntryOrigin, FileState, GroupKey, HeldRoot, HeldRows, NewEntry, NewFile, Pairing as HeldPairing,
+};
+use crate::intake;
 use crate::reason::Reason;
 use droppedneedle_kernel::runtime_config::Live;
 use droppedneedle_kernel::runtime_config::sections::DownloadPolicy;
-use droppedneedle_library::import::ImportJoin;
 
 /// The rejection a landing answers when its task records cannot be read.
 fn journal_unreadable() -> Rejection {
@@ -131,20 +135,6 @@ pub struct LandingReport {
     pub local_only: bool,
 }
 
-/// What "Replace tracks you have in another version" made of a landing.
-#[derive(Default)]
-struct Versions {
-    /// Release tracks (by index) handled here, never by the upgrade loop.
-    handled: HashSet<usize>,
-    /// Handled tracks whose file was dropped: they count as owned.
-    dropped: HashSet<usize>,
-    /// Files whose old version they replace, which goes to the recycle bin
-    /// in the same publish.
-    replace: Vec<(usize, String)>,
-    /// `(release track, old track)` for every file imported to replace one.
-    replaced: Vec<(String, String)>,
-}
-
 /// The landing service the worker calls.
 pub struct LandingService {
     journal: Arc<Journal>,
@@ -218,7 +208,6 @@ impl LandingService {
         &self,
         task: &TaskRow,
         attempt_id: Option<&str>,
-        manifest: Option<&DownloadManifest>,
         landed: Landed,
         patient: bool,
     ) -> LandingReport {
@@ -248,18 +237,34 @@ impl LandingService {
                 return self.reject_unprobed(task, attempt_id, rejection).await;
             }
         };
-        // Details that do not read are never taken as empty: that would
-        // drop the task's edition pin. The landing waits instead.
-        let details = match self.journal.read_task_details(&task.id).await {
-            Ok(details) => details,
+        // Details or a plan that do not read are never taken as empty: that
+        // would drop the task's edition pin or the copy it joins. The
+        // landing waits instead.
+        let records = {
+            let task_id = task.id.clone();
+            let attempt = attempt_id.map(str::to_owned);
+            self.journal
+                .read("downloads.landing.records", move |store| {
+                    let details = store.task_details(&task_id)?;
+                    let plan = store.task_plan(&task_id)?;
+                    let handle = match &attempt {
+                        Some(attempt) => store.attempt_handle_json(attempt)?,
+                        None => None,
+                    };
+                    Ok((details, plan, handle))
+                })
+                .await
+        };
+        let (details, plan, handle) = match records {
+            Ok(records) => records,
             Err(error) => {
-                tracing::warn!(task_id = %task.id, %error, "task details unreadable");
+                tracing::warn!(task_id = %task.id, %error, "task records unreadable");
                 return self
                     .reject_unprobed(task, attempt_id, journal_unreadable())
                     .await;
             }
         };
-        let mut target = target_for(task, &details, manifest);
+        let mut target = target_for(task, &details, &plan);
         target.wait_for_files = patient;
         // The album's chosen edition (manual identity, pin, best fit) is
         // the only acceptable release: matching, the missing positions and
@@ -302,7 +307,7 @@ impl LandingService {
         let landing = match probed {
             Ok(landing) => Landing {
                 downloads_folders: folders,
-                remote_names: remote_names(manifest),
+                remote_names: remote_names(&task.id, handle.as_deref()),
                 ..landing
             },
             Err(error) => {
@@ -392,25 +397,24 @@ impl LandingService {
             return;
         };
         let (user_id, task_id) = (task.user_id.clone(), task.id.clone());
-        let now = self.journal.db().now_unix_f64();
+        let clock = self.journal.db().clock().clone();
         let discarded = self
             .journal
-            .run("downloads.album_version_discard", move |store| {
-                let rows = store.held_for_recording(
-                    Reason::AlbumVersionOnly,
-                    &user_id,
-                    &recording,
-                    &task_id,
-                )?;
-                let ids: Vec<i64> = rows.iter().map(|row| row.id).collect();
-                store.resolve_held(&ids, "discarded", now)?;
-                Ok(rows)
+            .db()
+            .write_background("downloads.album_version_discard", move |tx| {
+                let rows = HeldRows::new(tx);
+                let files = rows.album_version_files(&user_id, &recording, &task_id)?;
+                let now = clock.now_ms();
+                for file in &files {
+                    rows.resolve(file.entry_id, &[file.id], FileState::Discarded, now)?;
+                }
+                Ok::<_, droppedneedle_kernel::db::DbError>(files)
             })
             .await;
         match discarded {
-            Ok(rows) => {
-                for row in rows {
-                    super::downloads::held::remove_held_copy(Path::new(&row.held_path)).await;
+            Ok(files) => {
+                for file in files {
+                    super::held::remove_copy(&self.held_dir, &file.path).await;
                 }
             }
             Err(error) => {
@@ -499,9 +503,10 @@ impl LandingService {
         }))
     }
 
-    /// Carry out an import plan: fingerprint, publish, hold what must be
-    /// held, and work out what is still missing. `heard` is what AcoustID
-    /// already said about the paired files, when it was asked.
+    /// Carry out an import plan through the one intake: place the files,
+    /// hold what must be held, and work out what is still missing. `heard`
+    /// is what AcoustID already said about the paired files, when it was
+    /// asked.
     #[allow(clippy::too_many_arguments)]
     async fn act(
         &self,
@@ -511,182 +516,118 @@ impl LandingService {
         matched: &MatchSummary,
         heard: Option<HashMap<String, Vec<String>>>,
         mut decision: Decision,
-        mut plan: FilePlan,
+        plan: FilePlan,
         library: &Arc<dyn LandingLibrary>,
     ) -> Acted {
         let Some(found) = matched.best() else {
             return Acted::decided(decision, 0);
         };
-        let mut held: Vec<Held<'_>> = Vec::new();
-        for (file, track) in &plan.held {
-            let detail = found
-                .scored
-                .pair_for(*file)
-                .and_then(|pair| specs::artist_conflict(target, landing, found, pair))
-                .unwrap_or_else(|| {
-                    "the file's tags name a different track than the release has here".to_owned()
-                });
-            held.push(Held {
-                file: &landing.audio[*file],
+        let held: Vec<intake::Hold> = plan
+            .held
+            .iter()
+            .map(|(file, track)| intake::Hold {
+                file: *file,
                 track: Some(*track),
-                code: Reason::TagMismatch,
-                detail,
-            });
-        }
-        let mut replaces: HashMap<usize, Vec<String>> = HashMap::new();
-        let versions = self
-            .replace_versions(target, found, landing, &mut plan, &mut held, library)
-            .await;
-        for (file, old) in &versions.replace {
-            replaces.insert(*file, vec![old.clone()]);
-        }
-        // An upgrade replaces the library's copy of a track only when the
-        // new file is strictly better (v2 replace-on-import). Equal or
-        // worse leaves the library alone and the file is dropped.
-        let upgrade = target.origin == "upgrade";
-        // The albums the replaced copies sit on, with their release.
-        let mut replaced_on: Vec<(String, String)> = Vec::new();
-        if upgrade || !target.album_wanted.is_empty() {
-            for file in &plan.owned {
-                let Some(track) = found.scored.pair_for(*file).map(|pair| pair.track) else {
-                    continue;
-                };
-                if versions.handled.contains(&track) {
-                    continue;
-                }
-                let release_track = &found.release.tracks[track];
-                // "Get missing tracks" upgrades only the owned tracks it
-                // asked for (those below the cutoff).
-                if !upgrade
-                    && !target
-                        .album_wanted
-                        .contains(&(release_track.disc.max(1), release_track.position))
-                {
-                    continue;
-                }
-                let copies = library
-                    .owned_copies(
-                        &found.release.release_group_id,
-                        target.planned_album_id(),
-                        &found.release.id,
-                        &release_track.id,
-                        &release_track.recording_id,
-                    )
-                    .await;
-                let tier = landing.audio[*file].tier();
-                if !copies.is_empty() && copies.iter().all(|copy| quality::beats(tier, copy.tier)) {
-                    for copy in &copies {
-                        let on = (copy.album_id.clone(), copy.release_mbid.clone());
-                        if !replaced_on.contains(&on) {
-                            replaced_on.push(on);
-                        }
-                    }
-                    replaces.insert(
-                        *file,
-                        copies.into_iter().map(|copy| copy.track_id).collect(),
-                    );
-                    plan.import.push((*file, track));
-                }
-            }
-        }
-        // The files join the copy they were fetched for, else the one album
-        // every replaced copy sat on.
-        let join = match (&target.planned_album, replaced_on.as_slice()) {
-            (Some(planned), _) => Some(ImportJoin {
-                album_id: planned.album_id.clone(),
-                release_mbid: planned.release_mbid.clone(),
-                replaced: versions.replaced.clone(),
-            }),
-            (None, [(album_id, release_mbid)]) if !release_mbid.is_empty() => Some(ImportJoin {
-                album_id: album_id.clone(),
-                release_mbid: release_mbid.clone(),
-                replaced: Vec::new(),
-            }),
-            _ => None,
+                reason: Reason::TagMismatch,
+                detail: found
+                    .scored
+                    .pair_for(*file)
+                    .and_then(|pair| specs::artist_conflict(target, landing, found, pair))
+                    .unwrap_or_else(|| {
+                        "the file's tags name a different track than the release has here"
+                            .to_owned()
+                    }),
+            })
+            .collect();
+        let pairing = intake::Pairing {
+            import: plan.import.clone(),
+            owned: plan
+                .owned
+                .iter()
+                .filter_map(|file| Some((*file, found.scored.pair_for(*file)?.track)))
+                .collect(),
+            held,
+            // Files the release does not list are left out of a download.
+            extras: Vec::new(),
         };
-        let heard_check = self
-            .fingerprint_check(landing, found, heard, &mut plan, &mut held, library)
-            .await;
-        decision.checks.extend(heard_check);
-
-        // Each file's old copies go in the same publish as the file: the
-        // library takes them to the recycle bin only once the file is in,
-        // and a file it holds keeps them where they are.
-        let mut imported_tracks: Vec<usize> = Vec::new();
-        let mut imported_sources = Vec::new();
-        if !plan.import.is_empty() {
-            let request = ImportRequest {
-                staging: None,
-                task_id: task.id.clone(),
-                origin: self::ports::ImportOrigin::Download,
-                extras: Vec::new(),
+        let upgrade = target.origin == "upgrade";
+        let batch = intake::IntakeBatch {
+            files: landing
+                .audio
+                .iter()
+                .map(|file| intake::IntakeFile {
+                    file: file.clone(),
+                    held_for: None,
+                })
+                .collect(),
+            target: intake::Target {
                 release: found.release.clone(),
-                join: join.clone(),
-                files: plan
-                    .import
-                    .iter()
-                    .map(|(file, track)| ImportFile {
-                        path: landing.audio[*file].path.clone(),
-                        track: *track,
-                        replaces: replaces.remove(file).unwrap_or_default(),
-                    })
-                    .collect(),
-                actor: task.user_id.clone(),
-            };
-            match library.import(request).await {
-                Ok(receipt) => {
-                    let skipped: HashMap<usize, String> = receipt.skipped.into_iter().collect();
-                    let blocked: HashMap<usize, String> = receipt.blocked.into_iter().collect();
-                    for (index, (file, track)) in plan.import.iter().enumerate() {
-                        let refused = match (skipped.get(&index), blocked.get(&index)) {
-                            (Some(detail), _) => Some((Reason::TargetOccupied, detail)),
-                            (None, Some(detail)) => Some((Reason::UpgradeBlocked, detail)),
-                            (None, None) => None,
-                        };
-                        match refused {
-                            Some((code, detail)) => held.push(Held {
-                                file: &landing.audio[*file],
-                                track: Some(*track),
-                                code,
-                                detail: detail.clone(),
-                            }),
-                            None => {
-                                imported_tracks.push(*track);
-                                imported_sources.push(landing.audio[*file].path.clone());
-                            }
-                        }
-                    }
-                    tracing::info!(
-                        task_id = %task.id,
-                        bundle = %receipt.bundle_id,
-                        album = %receipt.album_id,
-                        files = imported_tracks.len(),
-                        "download imported into the library"
-                    );
-                }
-                Err(failure @ (ImportFailure::LocalFault(_) | ImportFailure::NamingScript(_))) => {
-                    let detail = failure.detail().to_owned();
-                    decision.outcome = Outcome::Reject(match failure {
-                        ImportFailure::NamingScript(_) => Rejection {
-                            code: Reason::NamingScriptFailed,
-                            ..local_fault(detail)
-                        },
-                        _ => local_fault(detail),
-                    });
-                    return Acted::decided(decision, 0);
-                }
-                Err(ImportFailure::Occupied(detail)) => {
-                    // The library changed between the import's own checks
-                    // and the publish, which put everything back. The next
+                join: target.planned_album.clone(),
+                asked: target.album_wanted.clone(),
+            },
+            origin: intake::Origin::Download {
+                task_id: task.id.clone(),
+                upgrade,
+                staging: None,
+                downloads_folders: Some(landing.downloads_folders.clone()),
+            },
+            gate: intake::Gate::Automatic,
+            owner: task.user_id.clone(),
+        };
+        let placed = match intake::place(library.as_ref(), &batch, pairing, heard).await {
+            Ok(placed) => placed,
+            Err(deferred) => {
+                decision.outcome = Outcome::Reject(match deferred.reason {
+                    // The library changed under the import twice; the next
                     // pass decides file by file again.
-                    decision.outcome = Outcome::Reject(Rejection {
+                    Reason::LibraryChanged => Rejection {
                         code: Reason::LibraryChanged,
                         disposition: Disposition::Temporary,
                         quarantine: None,
-                        detail,
-                    });
-                    return Acted::decided(decision, 0);
+                        detail: deferred.detail,
+                    },
+                    code => Rejection {
+                        code,
+                        ..local_fault(deferred.detail)
+                    },
+                });
+                return Acted::decided(decision, 0);
+            }
+        };
+        decision.checks.extend(placed.fingerprint.clone());
+
+        let held: Vec<Held<'_>> = placed
+            .held
+            .iter()
+            .filter_map(|file| match &placed.outcomes[*file] {
+                intake::Outcome::Held {
+                    track,
+                    reason,
+                    detail,
+                } => Some(Held {
+                    file: &landing.audio[*file],
+                    track: *track,
+                    code: *reason,
+                    detail: detail.clone(),
+                }),
+                _ => None,
+            })
+            .collect();
+        let mut imported_tracks: Vec<usize> = Vec::new();
+        let mut imported_sources = Vec::new();
+        let mut owned_tracks: HashSet<usize> = HashSet::new();
+        for (file, outcome) in placed.outcomes.iter().enumerate() {
+            match outcome {
+                intake::Outcome::Imported {
+                    track: Some(track), ..
+                } => {
+                    imported_tracks.push(*track);
+                    imported_sources.push(landing.audio[file].path.clone());
                 }
+                intake::Outcome::AlreadyOwned { track } => {
+                    owned_tracks.insert(*track);
+                }
+                _ => {}
             }
         }
         let first_hold = held.first().map(|item| (item.code, item.detail.clone()));
@@ -717,7 +658,7 @@ impl LandingService {
                 .filter(|(index, track)| {
                     !covered.contains(index)
                         && !matched.owns(track)
-                        && !versions.dropped.contains(index)
+                        && !owned_tracks.contains(index)
                 })
                 .map(|(index, _)| index)
                 .collect()
@@ -749,7 +690,7 @@ impl LandingService {
         } else {
             any_local && missing.is_empty()
         };
-        let anything_landed = !imported_tracks.is_empty() || (!upgrade && !plan.owned.is_empty());
+        let anything_landed = !imported_tracks.is_empty() || (!upgrade && !owned_tracks.is_empty());
         decision.outcome = if anything_landed {
             Outcome::Import(FilePlan {
                 complete: requested_landed,
@@ -778,164 +719,6 @@ impl LandingService {
             local_only,
             imported_sources,
         }
-    }
-
-    /// "Replace tracks you have in another version": each landed file on a
-    /// release track the planned copy holds in another version (the
-    /// manifest's `replace` list) replaces that version, whether the plan
-    /// put it under `import` or `owned`. Only while the matched release is
-    /// the planned one and the copy still names it. The old track must be
-    /// on the copy, on no track of the release, its album not held, and
-    /// not an alias: an indexed one goes to the recycle bin when the new
-    /// file is as good or better, and a missing one (its file already
-    /// gone) is simply replaced. A worse file is held and the old one
-    /// stays. Otherwise nothing is replaced and the file is dropped as an
-    /// owned one is.
-    async fn replace_versions<'a>(
-        &self,
-        target: &Target,
-        found: &FoundRelease,
-        landing: &'a Landing,
-        plan: &mut FilePlan,
-        held: &mut Vec<Held<'a>>,
-        library: &Arc<dyn LandingLibrary>,
-    ) -> Versions {
-        let mut versions = Versions::default();
-        let Some(planned) = target.planned_album.as_ref().filter(|planned| {
-            !planned.replace.is_empty() && found.release.answers_to(&planned.release_mbid)
-        }) else {
-            return versions;
-        };
-        for version in &planned.replace {
-            let Some(track) = found
-                .release
-                .tracks
-                .iter()
-                .position(|track| track.id.eq_ignore_ascii_case(&version.release_track_mbid))
-            else {
-                continue;
-            };
-            let file = match plan.import.iter().position(|(_, on)| *on == track) {
-                Some(at) => plan.import.remove(at).0,
-                None => match plan.owned.iter().position(|file| {
-                    found.scored.pair_for(*file).map(|pair| pair.track) == Some(track)
-                }) {
-                    Some(at) => plan.owned.remove(at),
-                    None => continue,
-                },
-            };
-            versions.handled.insert(track);
-            let old = library
-                .version_row(&version.local_track_id, planned, &found.release)
-                .await
-                .filter(|row| {
-                    row.on_planned
-                        && !row.alias
-                        && !row.on_release
-                        && !row.held
-                        && matches!(row.availability.as_str(), "indexed" | "missing")
-                });
-            let Some(old) = old else {
-                plan.owned.push(file);
-                versions.dropped.insert(track);
-                continue;
-            };
-            if quality::beats(old.tier, landing.audio[file].tier()) {
-                held.push(Held {
-                    file: &landing.audio[file],
-                    track: Some(track),
-                    code: Reason::VersionLowerQuality,
-                    detail: format!(
-                        "the new file is {}, your version is {}",
-                        landing.audio[file].tier(),
-                        old.tier
-                    ),
-                });
-                continue;
-            }
-            if old.availability == "indexed" {
-                versions
-                    .replace
-                    .push((file, version.local_track_id.clone()));
-            }
-            versions.replaced.push((
-                found.release.tracks[track].id.clone(),
-                version.local_track_id.clone(),
-            ));
-            plan.import.push((file, track));
-        }
-        versions
-    }
-
-    /// AcoustID check on the files about to import (v2
-    /// `_fingerprint_disagrees`): a file whose audio AcoustID confidently
-    /// names other recordings, and whose length does not vouch for the
-    /// track, is held on its own. Off without an AcoustID key. `known` is
-    /// an answer already looked up for every paired file.
-    async fn fingerprint_check<'a>(
-        &self,
-        landing: &'a Landing,
-        found: &FoundRelease,
-        known: Option<HashMap<String, Vec<String>>>,
-        plan: &mut FilePlan,
-        held: &mut Vec<Held<'a>>,
-        library: &Arc<dyn LandingLibrary>,
-    ) -> Option<Check> {
-        if plan.import.is_empty() {
-            return None;
-        }
-        let heard = match known {
-            Some(heard) => heard,
-            None => {
-                let files: Vec<(String, PathBuf)> = plan
-                    .import
-                    .iter()
-                    .map(|(file, _)| (file.to_string(), landing.audio[*file].path.clone()))
-                    .collect();
-                library.fingerprints(files).await
-            }
-        };
-        if heard.is_empty() {
-            return None;
-        }
-        let mut kept = Vec::with_capacity(plan.import.len());
-        let mut disagreed = 0;
-        for (file, track) in plan.import.drain(..) {
-            let release_track = &found.release.tracks[track];
-            let disagrees = specs::fingerprint_disagrees(
-                heard
-                    .get(&file.to_string())
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[]),
-                &release_track.recording_id,
-                landing.audio[file].header.duration_seconds,
-                release_track.length_ms.map(|ms| ms as f64 / 1000.0),
-            );
-            if disagrees {
-                disagreed += 1;
-                held.push(Held {
-                    file: &landing.audio[file],
-                    track: Some(track),
-                    code: Reason::FingerprintMismatch,
-                    detail: "AcoustID identified a different recording".to_owned(),
-                });
-            } else {
-                kept.push((file, track));
-            }
-        }
-        plan.import = kept;
-        Some(Check {
-            spec: "fingerprint_agrees",
-            verdict: if disagreed == 0 {
-                Verdict::Accept { note: None }
-            } else {
-                Verdict::Accept {
-                    note: Some(format!(
-                        "{disagreed} file(s) held: AcoustID heard another recording"
-                    )),
-                }
-            },
-        })
     }
 
     /// v2's wrong-product verdict: an album whose files all failed on
@@ -975,7 +758,8 @@ impl LandingService {
         }
     }
 
-    /// Hold files, each with the release track it was paired to.
+    /// Hold files, each with the release track it was paired to, in the
+    /// download's entry of the held list.
     async fn hold(
         &self,
         task: &TaskRow,
@@ -992,7 +776,7 @@ impl LandingService {
             .iter()
             .map(|item| {
                 let paired = found.zip(item.track);
-                self.hold_item(
+                hold_item(
                     task,
                     target,
                     item.file,
@@ -1003,74 +787,31 @@ impl LandingService {
                 )
             })
             .collect();
-        let now = self.journal.db().now_unix_f64();
-        hold::hold(&self.journal, &self.held_dir, items, now).await
-    }
-
-    /// The held row for one file, with the release track it was paired
-    /// to when there is one. The file is named by its path inside the
-    /// download, so two discs' `01.flac` stay apart.
-    #[allow(clippy::too_many_arguments)]
-    fn hold_item(
-        &self,
-        task: &TaskRow,
-        target: &Target,
-        file: &LandedFile,
-        paired: Option<(&FoundRelease, usize)>,
-        root: &Path,
-        code: Reason,
-        detail: &str,
-    ) -> HoldItem {
-        let track = paired.map(|(found, index)| (&found.release, &found.release.tracks[index]));
-        let tag = &file.tag;
-        let relative = file
-            .path
-            .strip_prefix(root)
-            .map(|path| path.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| file.file_name());
-        HoldItem {
-            source: file.path.clone(),
-            row: HeldFile {
-                user_id: task.user_id.clone(),
-                held_path: String::new(),
-                original_filename: relative,
-                reason: code,
-                reason_detail: Some(detail.to_owned()),
-                source: task.source.clone(),
-                source_task_id: task.id.clone(),
-                origin: task.origin.clone(),
-                release_group_mbid: non_empty(&target.release_group_mbid),
-                release_mbid: track
-                    .map(|(release, _)| release.id.clone())
-                    .or_else(|| target.release_mbid.clone()),
-                release_track_mbid: track.map(|(_, track)| track.id.clone()),
-                recording_mbid: track
-                    .map(|(_, track)| track.recording_id.clone())
-                    .or_else(|| tag.musicbrainz_recording_id.clone()),
-                track_number: Some(i64::from(
-                    track.map_or(tag.track_number, |(_, track)| track.position),
-                ))
-                .filter(|number| *number > 0),
-                disc_number: Some(i64::from(
-                    track.map_or(tag.disc_number.max(1), |(_, track)| track.disc.max(1)),
-                )),
-                track_title: track
-                    .map(|(_, track)| track.title.clone())
-                    .or_else(|| non_empty(&tag.title)),
-                artist_name: non_empty(&target.artist_name),
-                artist_mbid: None,
-                album_title: non_empty(&target.album_title),
-                year: target.year.map(i64::from),
-                file_format: Some(file.format.as_str().to_owned()),
-                duration_seconds: file.header.duration_seconds,
-                expected_duration_seconds: track
-                    .and_then(|(_, track)| track.length_ms)
-                    .map(|ms| ms as f64 / 1000.0),
-                evidence_title: non_empty(&tag.title),
-                evidence_artist: non_empty(&tag.artist),
-                evidence_score: None,
-            },
-        }
+        let entry = NewEntry {
+            user_id: task.user_id.clone(),
+            origin: EntryOrigin::Download,
+            key: GroupKey::for_download(
+                &task.download_type,
+                task.recording_mbid.as_deref(),
+                Some(target.release_group_mbid.as_str()),
+                &task.id,
+            ),
+            release_group_mbid: non_empty(&target.release_group_mbid),
+            recording_mbid: (task.download_type == "track")
+                .then(|| task.recording_mbid.clone())
+                .flatten(),
+            drop_item_id: None,
+            artist_name: non_empty(&target.artist_name),
+            album_title: non_empty(&target.album_title),
+        };
+        hold::hold(
+            self.journal.db(),
+            &self.held_dir,
+            &landing.downloads_folders,
+            &entry,
+            items,
+        )
+        .await
     }
 
     /// Record the decision, then remove imported sources, and report.
@@ -1141,12 +882,8 @@ impl LandingService {
         }
         // Only after the decision is durable: a restart in between then
         // still finds the files, sees them in the library, and lands again.
-        if !imported_sources.is_empty()
-            && let Err(error) =
-                tokio::task::spawn_blocking(move || remove_sources(&imported_sources)).await
-        {
-            tracing::warn!(%error, "imported source cleanup did not run");
-        }
+        intake::dispose::remove_downloaded(imported_sources, landing.downloads_folders.clone())
+            .await;
         tracing::info!(
             task_id = %task.id,
             outcome,
@@ -1163,12 +900,8 @@ impl LandingService {
     }
 }
 
-/// What the task asked for, from its row, details, and manifest.
-pub fn target_for(
-    task: &TaskRow,
-    details: &TaskDetails,
-    manifest: Option<&DownloadManifest>,
-) -> Target {
+/// What the task asked for, from its row, details, and plan.
+pub fn target_for(task: &TaskRow, details: &TaskDetails, plan: &TaskPlan) -> Target {
     Target {
         artist_name: task.artist_name.clone(),
         album_title: task.album_title.clone(),
@@ -1176,7 +909,7 @@ pub fn target_for(
         release_mbid: details
             .release_mbid
             .clone()
-            .or_else(|| manifest.and_then(|manifest| manifest.release_mbid.clone()))
+            .or_else(|| plan.release_mbid.clone())
             .map(|mbid| mbid.trim().to_ascii_lowercase())
             .filter(|mbid| !mbid.is_empty()),
         year: details.year,
@@ -1189,46 +922,44 @@ pub fn target_for(
             .map(str::to_ascii_lowercase),
         track_title: details.track_title.clone(),
         origin: task.origin.clone(),
-        hold_on_wrong_track: manifest.is_some_and(|manifest| manifest.hold_on_wrong_track),
-        album_version: task.download_type == "track"
-            && manifest.is_some_and(|manifest| manifest.album_version),
-        album_positions: manifest
-            .and_then(|manifest| manifest.track_album.as_ref())
-            .map(|album| {
-                (
-                    album.release_mbid.to_ascii_lowercase(),
-                    album.wanted.clone(),
-                )
-            }),
+        album_version: task.download_type == "track" && plan.album_version,
+        album_positions: plan.track_album.as_ref().map(|album| {
+            (
+                plan.release_mbid
+                    .as_deref()
+                    .unwrap_or_default()
+                    .to_ascii_lowercase(),
+                album.wanted.clone(),
+            )
+        }),
         expected_sizes: HashMap::new(),
         wait_for_files: false,
-        album_wanted: manifest
-            .map(|manifest| {
-                manifest
-                    .album_wanted
-                    .iter()
-                    .map(|at| (at.disc.max(1), at.track))
-                    .collect()
-            })
-            .unwrap_or_default(),
-        // Only while the manifest's release is the one asked for.
-        planned_album: manifest.and_then(|manifest| {
-            let planned = manifest.planned_album.clone()?;
-            let asked = details
-                .release_mbid
-                .as_deref()
-                .or(manifest.release_mbid.as_deref())?
-                .trim();
-            let same = [
-                Some(planned.release_mbid.as_str()),
-                manifest.release_mbid.as_deref(),
-            ]
-            .into_iter()
-            .flatten()
-            .any(|held| held.trim().eq_ignore_ascii_case(asked));
-            same.then_some(planned)
-        }),
+        album_wanted: plan
+            .album_wanted
+            .iter()
+            .map(|at| (at.disc.max(1), at.track))
+            .collect(),
+        planned_album: planned_album(details, plan),
     }
+}
+
+/// The copy the download joins, only while the plan's release is the one
+/// asked for.
+fn planned_album(details: &TaskDetails, plan: &TaskPlan) -> Option<PlannedAlbum> {
+    let planned = plan.planned_album.clone()?;
+    let asked = details
+        .release_mbid
+        .as_deref()
+        .or(plan.release_mbid.as_deref())?
+        .trim();
+    let same = [
+        Some(planned.release_mbid.as_str()),
+        plan.release_mbid.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|held| held.trim().eq_ignore_ascii_case(asked));
+    same.then_some(planned)
 }
 
 /// The reported paths as they sit inside the client's downloads folders,
@@ -1285,25 +1016,24 @@ fn confine(landed: Landed, libraries: &[PathBuf]) -> Result<Vec<Reported>, Rejec
     Ok(kept)
 }
 
-/// The file names the client reported for this attempt, as it named them.
-fn remote_names(manifest: Option<&DownloadManifest>) -> Vec<String> {
-    let Some(manifest) = manifest else {
+/// The file names the client reported for this attempt, as it named them
+/// in the attempt's journaled handle.
+fn remote_names(task_id: &str, handle: Option<&str>) -> Vec<String> {
+    let Some(json) = handle.filter(|json| !json.is_empty()) else {
         return Vec::new();
     };
-    let mut names: Vec<String> = manifest
-        .target_files
-        .iter()
-        .map(|file| file.filename.clone())
-        .chain(
-            manifest
-                .handle
-                .iter()
-                .flat_map(|handle| handle.filenames.iter().cloned()),
-        )
-        .collect();
-    names.sort();
-    names.dedup();
-    names
+    match serde_json::from_str::<SourceHandle>(json) {
+        Ok(handle) => {
+            let mut names = handle.filenames;
+            names.sort();
+            names.dedup();
+            names
+        }
+        Err(error) => {
+            tracing::warn!(task_id, %error, "attempt handle does not decode; no remote names");
+            Vec::new()
+        }
+    }
 }
 
 /// AcoustID's answer for every paired file, asked only when the files are
@@ -1402,27 +1132,62 @@ fn non_empty(value: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
 
-/// Remove imported source files (the library holds them now), then the
-/// folder they leave empty. Best effort: a leftover is the orphan sweep's.
-fn remove_sources(paths: &[PathBuf]) {
-    let mut parents: Vec<&Path> = Vec::new();
-    for path in paths {
-        if let Err(error) = std::fs::remove_file(path)
-            && error.kind() != std::io::ErrorKind::NotFound
-        {
-            tracing::info!(file = %path.display(), %error, "imported source file kept");
-        }
-        if let Some(parent) = path.parent()
-            && !parents.contains(&parent)
-        {
-            parents.push(parent);
-        }
-    }
-    for parent in parents {
-        // Succeeds only once the folder is empty; a folder still holding
-        // other files (held ones, extras) is meant to stay.
-        if std::fs::remove_dir(parent).is_err() {
-            tracing::debug!(dir = %parent.display(), "download folder kept: not empty");
-        }
+/// The held file for one landed file, with the release track it was
+/// paired to when there is one. The file is named by its path inside the
+/// download, so two discs' `01.flac` stay apart.
+fn hold_item(
+    task: &TaskRow,
+    target: &Target,
+    file: &LandedFile,
+    paired: Option<(&FoundRelease, usize)>,
+    root: &Path,
+    code: Reason,
+    detail: &str,
+) -> HoldItem {
+    let track = paired.map(|(found, index)| (&found.release, &found.release.tracks[index]));
+    let tag = &file.tag;
+    let relative = file
+        .path
+        .strip_prefix(root)
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| file.file_name());
+    HoldItem {
+        source: file.path.clone(),
+        file: NewFile {
+            root: HeldRoot::Held,
+            path: String::new(),
+            original_name: relative,
+            pairing: HeldPairing {
+                release_mbid: track
+                    .map(|(release, _)| release.id.clone())
+                    .or_else(|| target.release_mbid.clone()),
+                release_track_mbid: track.map(|(_, track)| track.id.clone()),
+                recording_mbid: track
+                    .map(|(_, track)| track.recording_id.clone())
+                    .or_else(|| tag.musicbrainz_recording_id.clone()),
+                disc_number: Some(i64::from(
+                    track.map_or(tag.disc_number.max(1), |(_, track)| track.disc.max(1)),
+                )),
+                track_number: Some(i64::from(
+                    track.map_or(tag.track_number, |(_, track)| track.position),
+                ))
+                .filter(|number| *number > 0),
+                track_title: track
+                    .map(|(_, track)| track.title.clone())
+                    .or_else(|| non_empty(&tag.title)),
+                expected_duration_seconds: track
+                    .and_then(|(_, track)| track.length_ms)
+                    .map(|ms| ms as f64 / 1000.0),
+            },
+            file_format: Some(file.format.as_str().to_owned()),
+            duration_seconds: file.header.duration_seconds,
+            evidence_title: non_empty(&tag.title),
+            evidence_artist: non_empty(&tag.artist),
+            evidence_score: None,
+            source: task.source.clone(),
+            source_task_id: Some(task.id.clone()),
+            reason: code,
+            reason_detail: Some(detail.to_owned()).filter(|detail| !detail.is_empty()),
+        },
     }
 }

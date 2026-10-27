@@ -17,24 +17,28 @@
 //!   query spelled `""`.
 //! - Album sort names map `name`/`date_added`/`year` to Subsonic list types
 //!   with client-side reversal for descending name and ascending recency.
+//! - Verified against a throwaway Navidrome 0.62.0 (2026-10-26), two
+//!   libraries, a `cover.png` in one album folder: the hub, album list,
+//!   album and tracks, album and playlist covers, `getMusicFolders` and a
+//!   saved folder narrowing albums, tracks and hub, and a ranged stream
+//!   with HEAD all worked. Song cover ids are `dc-<album id>:1_0` (colon
+//!   included). An album with no art still answers its own placeholder
+//!   image (200, `image/webp`), and an unknown cover id answers a Subsonic
+//!   error as JSON with HTTP 200, which the image route treats as missing.
 //!
 //! Payloads decode into the typed shapes in [`super::navidrome_models`]; a
 //! payload missing an item id is an upstream error, not an empty item.
 
-use std::time::Duration;
-
 use super::adapter::{
-    AdapterError, AlbumBrowse, ArtistBrowse, RemotePage, TrackBrowse, read_api_body, read_image,
+    AdapterError, AlbumBrowse, ArtistBrowse, RemoteHttp, RemotePage, TrackBrowse, request_id,
 };
 use super::models::{
     AlbumView, ArtistIndexEntry, ArtistView, FavoritesView, HistoryPage, HubView, InfoView,
-    LyricLine, LyricsView, MatchView, PlaylistDetail, PlaylistSummary, SearchResults, SessionView,
+    LyricLine, LyricsView, PlaylistDetail, PlaylistSummary, SearchResults, SessionView,
     SessionsView, SourceName, StatsView, TrackView,
 };
 use super::navidrome_models::{Album, Artist, Body, Envelope, Playlist, Song};
-
-/// Request timeout per upstream call, matching the v2 repository.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+use super::warmup::{INDEX_MAX_PAGES, INDEX_PAGE, IndexedAlbum, indexed};
 
 /// Subsonic API version pinned by the v2 repository.
 const SUBSONIC_VERSION: &str = "1.16.1";
@@ -58,7 +62,7 @@ fn params(pairs: &[(&str, &str)]) -> Params {
 /// Navidrome browse client. Built per request from the caller's resolved
 /// connection plus their folder scope; holds no cache.
 pub struct NavidromeAdapter {
-    client: reqwest::Client,
+    http: RemoteHttp,
     base_url: String,
     username: String,
     password: String,
@@ -77,15 +81,32 @@ impl std::fmt::Debug for NavidromeAdapter {
 
 impl NavidromeAdapter {
     /// Build a client for one server. Empty URL, username, or password reads
-    /// as unconfigured. The folder scope defaults to all folders.
+    /// as unconfigured. The folder scope defaults to all folders. Kept for
+    /// the adapter tests; the app builds clients through
+    /// [`ConnectionResolver::client`](super::connections::ConnectionResolver::client).
     pub fn new(
         client: reqwest::Client,
         base_url: String,
         username: String,
         password: String,
     ) -> Self {
+        Self::over(
+            RemoteHttp::new(client, SourceName::Navidrome, None),
+            base_url,
+            username,
+            password,
+        )
+    }
+
+    /// The same, over a configured HTTP layer.
+    pub(crate) fn over(
+        http: RemoteHttp,
+        base_url: String,
+        username: String,
+        password: String,
+    ) -> Self {
         Self {
-            client,
+            http,
             base_url: base_url.trim_end_matches('/').to_owned(),
             username,
             password,
@@ -739,7 +760,7 @@ impl NavidromeAdapter {
     ) -> Result<(Vec<u8>, String), AdapterError> {
         self.require_configured()?;
         let size = size.to_string();
-        self.get_bytes(
+        self.image(
             "/rest/getCoverArt",
             &params(&[("id", id), ("size", &size)]),
             "image/jpeg",
@@ -754,11 +775,12 @@ impl NavidromeAdapter {
         self.require_configured()?;
         let mut query = auth_params(&self.username, &self.password);
         query.extend(params(&[("id", id)]));
-        self.client
-            .get(format!("{}/rest/stream", self.base_url))
+        self.http
+            .client()
+            .get(RemoteHttp::url(&self.base_url, "/rest/stream")?)
             .query(&query)
             .build()
-            .map_err(|cause| AdapterError::Transport(trim_cause(cause)))
+            .map_err(super::adapter::transport)
     }
 
     /// Now-playing report via `/rest/scrobble` with `submission=false`
@@ -801,12 +823,12 @@ impl NavidromeAdapter {
         self.image_bytes(&cover_art, size).await
     }
 
-    /// Resolve an MBID by searching for it and comparing `musicBrainzId`,
-    /// the v2 album-match rule.
-    pub async fn match_album(&self, mbid: &str) -> Result<MatchView, AdapterError> {
+    /// The first `search3` album carrying `mbid` as its `musicBrainzId`,
+    /// inside the folder scope.
+    pub async fn mbid_search(&self, mbid: &str) -> Result<Option<String>, AdapterError> {
         self.require_configured()?;
         if self.scope_is_empty() {
-            return Ok(no_match());
+            return Ok(None);
         }
         let pairs = params(&[
             ("query", mbid),
@@ -819,20 +841,66 @@ impl NavidromeAdapter {
             .await?
             .search_result3
             .unwrap_or_default();
-        let Some(album) = result
+        Ok(result
             .album
             .iter()
             .find(|album| album.music_brainz_id.as_deref() == Some(mbid))
-        else {
-            return Ok(no_match());
-        };
-        let tracks = self.album_tracks(&album.id).await?;
-        Ok(MatchView {
-            source: SourceName::Navidrome,
-            found: true,
-            remote_album_id: Some(album.id.clone()),
-            tracks,
-        })
+            .map(|album| album.id.clone()))
+    }
+
+    /// Every album that carries a `musicBrainzId`, listed folder by folder
+    /// with `getAlbumList2` so each entry records its folder, at most `cap`
+    /// entries.
+    pub async fn album_index(&self, cap: usize) -> Result<Vec<IndexedAlbum>, AdapterError> {
+        let mut index = Vec::new();
+        let mut pages = 0;
+        for (folder, _) in self.music_folders().await? {
+            let lister = self.in_folder(&folder);
+            let mut offset = 0;
+            while index.len() < cap && pages < INDEX_MAX_PAGES {
+                pages += 1;
+                let page = lister
+                    .album_list("alphabeticalByName", INDEX_PAGE, offset, None, None)
+                    .await?;
+                for album in &page {
+                    if let Some(entry) = album
+                        .music_brainz_id
+                        .as_deref()
+                        .and_then(|mbid| indexed(mbid, &album.id, Some(&folder)))
+                    {
+                        index.push(entry);
+                    }
+                }
+                if (page.len() as i64) < INDEX_PAGE {
+                    break;
+                }
+                offset += INDEX_PAGE;
+            }
+        }
+        index.truncate(cap);
+        Ok(index)
+    }
+
+    /// The same account scoped to one folder.
+    fn in_folder(&self, folder: &str) -> Self {
+        Self {
+            http: self.http.clone(),
+            base_url: self.base_url.clone(),
+            username: self.username.clone(),
+            password: self.password.clone(),
+            folder_ids: Some(vec![folder.to_owned()]),
+        }
+    }
+
+    /// Whether an album listed under folder `scope` is inside the folder
+    /// scope. An album with no recorded folder is inside only the
+    /// all-folders scope.
+    pub fn holds(&self, scope: Option<&str>) -> bool {
+        match (&self.folder_ids, scope) {
+            (None, _) => true,
+            (Some(ids), Some(folder)) => ids.iter().any(|id| id == folder),
+            (Some(_), None) => false,
+        }
     }
 
     fn require_configured(&self) -> Result<(), AdapterError> {
@@ -869,10 +937,14 @@ impl NavidromeAdapter {
 
     /// `getAlbum`, unscoped. None is absence.
     async fn get_album(&self, id: &str) -> Result<Option<Album>, AdapterError> {
-        let body = self
+        match self
             .unscoped_request("/rest/getAlbum", &params(&[("id", id)]))
-            .await?;
-        Ok(body.album)
+            .await
+        {
+            Ok(body) => Ok(body.album),
+            Err(AdapterError::NotFound) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     /// Scoped `getAlbumList2` with the genre/year parameter rules.
@@ -952,6 +1024,7 @@ impl NavidromeAdapter {
                 tracing::debug!(endpoint, %detail, "navidrome declined the call");
                 Ok(None)
             }
+            Err(AdapterError::NotFound) => Ok(None),
             Err(other) => Err(other),
         }
     }
@@ -983,34 +1056,21 @@ impl NavidromeAdapter {
         }
         let mut query = auth_params(&self.username, &self.password);
         query.extend(pairs.iter().cloned());
-        let response = self
-            .client
-            .get(format!("{}{endpoint}", self.base_url))
-            .query(&query)
-            .timeout(REQUEST_TIMEOUT)
-            .send()
-            .await
-            .map_err(|cause| AdapterError::Transport(trim_cause(cause)))?;
-        let status = response.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            return Err(AdapterError::Auth);
-        }
-        if !status.is_success() {
-            return Err(AdapterError::Api(format!(
-                "GET {endpoint} failed ({status})"
-            )));
-        }
-        let bytes = read_api_body(SourceName::Navidrome, endpoint, response).await?;
-        let envelope: Envelope = serde_json::from_slice(&bytes).map_err(|error| {
-            AdapterError::Api(format!(
-                "Navidrome returned an unreadable {endpoint} payload: {error}"
-            ))
-        })?;
+        let request = self
+            .http
+            .client()
+            .get(RemoteHttp::url(&self.base_url, endpoint)?)
+            .query(&query);
+        let envelope: Envelope = self.http.send(endpoint, request).await?.json().await?;
         let body = envelope.response;
         if body.status != "ok" {
             let error = body.error.unwrap_or_default();
             if error.code == 40 || error.code == 41 {
                 return Err(AdapterError::Auth);
+            }
+            // Subsonic API error 70: "The requested data was not found."
+            if error.code == 70 {
+                return Err(AdapterError::NotFound);
             }
             return Err(AdapterError::Api(format!(
                 "Subsonic error {}: {}",
@@ -1027,7 +1087,7 @@ impl NavidromeAdapter {
     /// Cover-art bytes, read under the image size cap. Auth rides the same
     /// token params; a missing content type falls back to
     /// `fallback_content_type`.
-    async fn get_bytes(
+    async fn image(
         &self,
         endpoint: &str,
         pairs: &[(String, String)],
@@ -1038,31 +1098,16 @@ impl NavidromeAdapter {
         }
         let mut query = auth_params(&self.username, &self.password);
         query.extend(pairs.iter().cloned());
-        let response = self
-            .client
-            .get(format!("{}{endpoint}", self.base_url))
-            .query(&query)
-            .timeout(REQUEST_TIMEOUT)
-            .send()
+        let request = self
+            .http
+            .client()
+            .get(RemoteHttp::url(&self.base_url, endpoint)?)
+            .query(&query);
+        self.http
+            .send(endpoint, request)
+            .await?
+            .image(fallback_content_type)
             .await
-            .map_err(|cause| AdapterError::Transport(trim_cause(cause)))?;
-        let status = response.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            return Err(AdapterError::Auth);
-        }
-        if !status.is_success() {
-            return Err(AdapterError::Api(format!(
-                "GET {endpoint} failed ({status})"
-            )));
-        }
-        let content_type = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or(fallback_content_type)
-            .to_owned();
-        let bytes = read_image(SourceName::Navidrome, endpoint, response).await?;
-        Ok((bytes, content_type))
     }
 }
 
@@ -1113,10 +1158,14 @@ fn known_name(name: &str) -> bool {
     !name.is_empty() && name != "Unknown"
 }
 
+/// The image address the browser asks for. Only a plain id gets one, so a
+/// server's id cannot steer the browser to another path of the app. A
+/// colon is allowed besides: song cover ids are `dc-<album id>:<disc>_<stamp>`,
+/// and the id goes to Navidrome as a query value, never a path.
 fn cover_url(cover_art: Option<&str>) -> Option<String> {
-    cover_art
-        .filter(|cover| !cover.is_empty())
-        .map(|cover| format!("/api/v3/remotes/navidrome/images/{cover}"))
+    let cover = cover_art?;
+    request_id(&cover.replace(':', "_")).ok()?;
+    Some(format!("/api/v3/remotes/navidrome/images/{cover}"))
 }
 
 fn songs(list: Option<super::navidrome_models::Songs>) -> Vec<TrackView> {
@@ -1186,7 +1235,9 @@ fn playlist_summary(playlist: &Playlist) -> PlaylistSummary {
     PlaylistSummary {
         source: SourceName::Navidrome,
         image_url: has_cover
-            .then(|| format!("/api/v3/remotes/navidrome/covers/playlists/{}", playlist.id)),
+            .then(|| request_id(&playlist.id).ok())
+            .flatten()
+            .map(|id| format!("/api/v3/remotes/navidrome/covers/playlists/{id}")),
         id: playlist.id.clone(),
         name: playlist.name.clone().unwrap_or_default(),
         track_count: playlist.song_count.unwrap_or(0),
@@ -1233,15 +1284,6 @@ fn zero_stats() -> StatsView {
     }
 }
 
-fn no_match() -> MatchView {
-    MatchView {
-        source: SourceName::Navidrome,
-        found: false,
-        remote_album_id: None,
-        tracks: Vec::new(),
-    }
-}
-
 fn non_empty(value: Option<&str>) -> Option<String> {
     value.filter(|text| !text.is_empty()).map(str::to_owned)
 }
@@ -1250,8 +1292,18 @@ fn hex_bytes(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// Transport cause for logs and errors. The URL is stripped first: it can
-/// carry credentials (Subsonic `u`/`t`/`s`, Plex and Jellyfin tokens).
-fn trim_cause(cause: reqwest::Error) -> String {
-    cause.without_url().to_string().chars().take(200).collect()
+#[cfg(test)]
+mod tests {
+    use super::cover_url;
+
+    #[test]
+    fn image_addresses_need_a_plain_id() {
+        for hostile in ["../../settings", "al-1?size=1", "al-1/../x", "", "a:/b"] {
+            assert_eq!(cover_url(Some(hostile)), None, "{hostile:?}");
+        }
+        assert_eq!(
+            cover_url(Some("al-1_2")).as_deref(),
+            Some("/api/v3/remotes/navidrome/images/al-1_2")
+        );
+    }
 }

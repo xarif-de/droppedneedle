@@ -62,32 +62,33 @@ fn parse_policy(raw: Option<&str>) -> Result<EffectivePolicy, LibraryError> {
 }
 
 pub(super) fn run_view(run: &ScanRun) -> ScanRunView {
-    let terminal = run
-        .terminal_code
-        .as_deref()
-        .map(crate::scan::reasons::scan_reason);
+    let terminal = run.terminal_code.map(crate::scan::reasons::scan_reason);
     ScanRunView {
         id: run.id.clone(),
         kind: run.kind,
         trigger: snake(&run.trigger),
-        state: run.state,
-        phase: run.phase,
+        state: run.state.scan_state(),
+        phase: run.state.phase(),
         aggregate_scope: run.aggregate_scope.clone(),
-        counters: run.counters.clone(),
+        counters: run.counters,
         queued_at: run.queued_at,
         started_at: run.started_at,
         updated_at: run.updated_at,
         terminal_at: run.terminal_at,
-        terminal_code: run.terminal_code.clone(),
+        terminal_code: run.terminal_code,
         terminal_message: terminal.as_ref().map(|reason| reason.message.to_owned()),
         terminal_action: terminal.as_ref().map(|reason| reason.action.to_owned()),
         requested_by_user_id: run.requested_by_user_id.clone(),
-        resume_phase: run.resume_phase,
-        requested_control: snake(&run.requested_control),
+        resume_phase: run.state.resume_phase(),
+        requested_control: run.state.requested_control().as_str().to_owned(),
         coalesced_request_count: run.coalesced_request_count,
         row_revision: run.row_revision,
         event_revision: run.event_revision,
-        phase_timings: run.phase_timings.clone(),
+        phase_timings: run
+            .phase_timings
+            .iter()
+            .map(|(phase, seconds)| (phase.scan_phase().as_str().to_owned(), *seconds))
+            .collect(),
     }
 }
 
@@ -272,12 +273,9 @@ pub async fn list_runs(
     State(state): State<LibrarySetup>,
     User(caller): User,
 ) -> Result<Json<ScanRunsResponse>, ApiError> {
-    let (current, history) = blocking(move || {
-        let current = state.coordinator.current_runs()?;
-        Ok::<_, crate::scan::ScanStoreError>((current, state.coordinator.history(20)?))
-    })
-    .await?
-    .map_err(|error| LibraryError::from(crate::scans::store_error(error)))?;
+    let (current, history) = blocking(move || state.recent_scan_runs(20))
+        .await?
+        .map_err(LibraryError::from)?;
     let view = |run: &ScanRun| caller_run_view(&caller, run);
     Ok(Json(ScanRunsResponse {
         current: current.iter().map(view).collect(),

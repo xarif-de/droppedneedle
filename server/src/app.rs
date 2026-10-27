@@ -203,7 +203,7 @@ fn mount(m: Mount<'_>) -> Mount<'_> {
             |state| state.jobs.playlist_sync(),
         )
         .area(droppedneedle_library::wiring::routes(), |state| {
-            state.library.clone()
+            state.library_services.clone()
         })
         .area(reads::library::routes(), |state| {
             state.reads.library.clone()
@@ -250,6 +250,9 @@ fn mount(m: Mount<'_>) -> Mount<'_> {
             droppedneedle_acquire::drop_import::http::routes(),
             |state| state.acquire.drops.clone(),
         )
+        .area(droppedneedle_acquire::held::http::routes(), |state| {
+            state.acquire.held.clone()
+        })
         .area(
             droppedneedle_acquire::imports::handlers::routes(),
             |state| state.acquire.imports.clone(),

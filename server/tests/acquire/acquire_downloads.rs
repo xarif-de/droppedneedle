@@ -1,21 +1,25 @@
 //! Durability tests for the downloads module.
 //!
 //! Each test pins one crash-safety behavior against a scratch database
-//! and throwaway directories: restarts resume without a duplicate fetch,
-//! manifest-absent restarts come up clean, failover hands work over only
-//! past the lease, and orphan/quarantine sweeps fail closed. Nothing here
-//! touches the real library.
+//! and throwaway directories: startup recovery classifies tasks from
+//! their rows, failover hands work over only past the lease, and
+//! orphan/quarantine sweeps fail closed. Nothing here touches the real
+//! library.
 
 use droppedneedle_acquire::downloads;
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 
 use droppedneedle_acquire::db::AcquireDb;
 use droppedneedle_acquire::downloads::journal::Journal;
+use droppedneedle_acquire::held::store::{
+    EntryOrigin, GroupKey, HeldRoot, HeldRows, NewEntry, NewFile,
+};
 use droppedneedle_acquire::reason::Reason;
-use droppedneedle_acquire::worker::{DownloadWorker, FixedSource, WorkerConfig};
+use droppedneedle_acquire::worker::{
+    DownloadWorker, FixedSource, WorkerConfig, run_startup_recovery,
+};
 use droppedneedle_providers::health::ServiceHealth;
 
 use crate::common::bundles::quiet_ticks;
@@ -24,15 +28,13 @@ fn mount_gone() -> TaskOutcome<'static> {
     TaskOutcome::new(Reason::DownloadFailed, "mount gone")
 }
 use downloads::quarantine::QuarantineReason;
-use downloads::recovery::{
-    FAILOVER_CLAIM_LIMIT, FAILOVER_LEASE_SECONDS, StartupAction, StartupCtx,
-};
+use downloads::recovery::{FAILOVER_CLAIM_LIMIT, FAILOVER_LEASE_SECONDS, StartupAction};
 use downloads::state::{AttemptState, can_transition};
-use downloads::store::{NewTask, TaskOutcome};
+use downloads::store::{NewTask, ReimportStart, TaskOutcome};
 use downloads::{
-    DownloadManifest, DownloadStore, ExpectedFile, ManifestCodec, OrphanDecision, OrphanEvidence,
-    OrphanPolicy, PollSample, QuarantineDir, RetryPolicy, TaskStatus, Watchdog, WatchdogConfig,
-    WatchdogOutcome, canonical_soulseek_identity, classify_startup, is_terminal, plan_retry,
+    DownloadStore, OrphanDecision, OrphanEvidence, OrphanPolicy, PollSample, QuarantineDir,
+    RetryPolicy, TaskStatus, Watchdog, WatchdogConfig, WatchdogOutcome,
+    canonical_soulseek_identity, classify_startup, is_terminal, plan_retry,
 };
 use rusqlite::Connection;
 
@@ -66,142 +68,120 @@ fn new_task(id: &str) -> NewTask {
     }
 }
 
-fn manifest(task_id: &str) -> DownloadManifest {
-    DownloadManifest {
-        task_id: task_id.to_string(),
-        release_group_mbid: "rg-1".to_string(),
-        artist_name: "artist".to_string(),
-        album_title: "album".to_string(),
-        target_files: vec![ExpectedFile {
-            filename: "01.flac".to_string(),
-            size: 10,
-            duration: Some(180.0),
-        }],
-        source_username: Some("peer".to_string()),
-        handle: None,
-        expected_tracks: vec![],
-        release_mbid: None,
-        artist_mbid: None,
-        year: None,
-        is_track: false,
-        hold_on_wrong_track: false,
-        album_version: false,
-        origin: "user".to_string(),
-        requested_by_user_id: None,
-        attempt_id: Some("a1".to_string()),
-        track_album: None,
-        album_wanted: Vec::new(),
-        planned_album: None,
+// Startup recovery reads rows only. Queued tasks re-dispatch; a task
+// that was landing (processing with an acquiring, in-use, preserved or
+// cleanup-pending attempt) resumes its landing and is never fetched
+// again; a downloading or processing task resumes polling while a live
+// attempt journaled its client handle, and restarts clean under its keys
+// otherwise. Settled tasks are left alone.
+#[tokio::test]
+async fn startup_recovery_follows_the_task_rows() {
+    use StartupAction::{Noop, Redispatch, RestartClean, ResumeLanding, ResumePoll};
+    const HANDLE: &str =
+        r#"{"source":"soulseek","username":"peer","filenames":["a.flac"],"job_name":""}"#;
+    let attempts: [(&str, Option<(AttemptState, &str)>); 10] = [
+        ("none", None),
+        ("acquiring", Some((AttemptState::Acquiring, HANDLE))),
+        ("acquiring-bare", Some((AttemptState::Acquiring, ""))),
+        ("in-use", Some((AttemptState::InUse, HANDLE))),
+        ("in-use-bare", Some((AttemptState::InUse, ""))),
+        ("preserved", Some((AttemptState::Preserved, HANDLE))),
+        ("cleanup", Some((AttemptState::CleanupPending, HANDLE))),
+        ("removed", Some((AttemptState::WorkspaceRemoved, HANDLE))),
+        ("complete", Some((AttemptState::Complete, HANDLE))),
+        ("attention", Some((AttemptState::NeedsAttention, HANDLE))),
+    ];
+    let expected: [(TaskStatus, [StartupAction; 10]); 4] = [
+        (TaskStatus::Queued, [Redispatch; 10]),
+        (
+            TaskStatus::Downloading,
+            [
+                RestartClean,
+                ResumePoll,
+                RestartClean,
+                ResumePoll,
+                RestartClean,
+                RestartClean,
+                RestartClean,
+                RestartClean,
+                RestartClean,
+                RestartClean,
+            ],
+        ),
+        (
+            TaskStatus::Processing,
+            [
+                RestartClean,
+                ResumeLanding,
+                ResumeLanding,
+                ResumeLanding,
+                ResumeLanding,
+                ResumeLanding,
+                ResumeLanding,
+                RestartClean,
+                RestartClean,
+                RestartClean,
+            ],
+        ),
+        (TaskStatus::Failed, [Noop; 10]),
+    ];
+    let db = AcquireDb::scratch().unwrap();
+    db.add_user("u1", "brief", "user").await.unwrap();
+    let journal = Journal::new(db, quiet_ticks());
+    let mut cases = Vec::new();
+    for (status, actions) in expected {
+        for ((attempt, row), action) in attempts.iter().zip(actions) {
+            let id = format!("{}-{attempt}", status.as_str());
+            let (task_id, row) = (id.clone(), *row);
+            journal
+                .run("test.seed", move |store| {
+                    store.insert_task(&new_task(&task_id), 1.0)?;
+                    if status != TaskStatus::Queued {
+                        store.transition_task(&task_id, status, 1.0, None)?;
+                    }
+                    if let Some((state, handle)) = row {
+                        store.insert_attempt(
+                            &format!("{task_id}-a0"),
+                            &task_id,
+                            "soulseek",
+                            0,
+                            "",
+                            handle,
+                            state,
+                            1.0,
+                        )?;
+                    }
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            cases.push((id, status, action));
+        }
     }
-}
+    for (id, status, action) in &cases {
+        let rows = journal.read_attempts(id).await.unwrap();
+        assert_eq!(classify_startup(*status, &rows), *action, "{id}");
+    }
 
-#[test]
-fn restart_mid_download_resumes_without_duplicate_fetch() {
-    let dir = scratch_dir("resume");
-    let conn = scratch_store(&dir);
-    let store = DownloadStore::new(&conn);
-    let now = 1_700_000_000.0;
-
-    store.insert_task(&new_task("t1"), now).unwrap();
-    store
-        .transition_task("t1", TaskStatus::Downloading, now, None)
-        .unwrap();
-    // First enqueue claims the key; the crash happens after the fetch.
-    assert!(
-        store
-            .claim_key("enqueue:t1:0", "t1", "enqueue", now)
-            .unwrap()
-    );
-    ManifestCodec
-        .write(&dir.join("staging"), &manifest("t1"))
-        .unwrap();
-    store
-        .insert_attempt(
-            "a1",
-            "t1",
-            "soulseek",
-            0,
-            "",
-            "{}",
-            AttemptState::InUse,
-            now,
-        )
-        .unwrap();
-
-    // Simulate the restart: a fresh store over the same database.
-    let store = DownloadStore::new(&conn);
-    assert!(
-        !store
-            .claim_key("enqueue:t1:0", "t1", "enqueue", now + 1.0)
-            .unwrap()
-    );
-
-    let task = store.get_task("t1").unwrap().unwrap();
-    assert_eq!(task.status, TaskStatus::Downloading);
-    let action = classify_startup(StartupCtx {
-        status: task.status,
-        manifest_present: ManifestCodec::path(&dir.join("staging"), "t1").exists(),
-        manifest_matches_attempt: Some(true),
-    });
-    assert_eq!(action, StartupAction::ResumePoll);
-}
-
-#[test]
-fn manifest_absent_restart_starts_clean() {
-    let dir = scratch_dir("clean");
-    let conn = scratch_store(&dir);
-    let store = DownloadStore::new(&conn);
-    let now = 1_700_000_000.0;
-
-    // The crash landed before the manifest was ever written.
-    store.insert_task(&new_task("t1"), now).unwrap();
-    store
-        .transition_task("t1", TaskStatus::Downloading, now, None)
-        .unwrap();
-
-    let task = store.get_task("t1").unwrap().unwrap();
-    let action = classify_startup(StartupCtx {
-        status: task.status,
-        manifest_present: ManifestCodec::path(&dir.join("staging"), "t1").exists(),
-        manifest_matches_attempt: None,
-    });
-    assert_eq!(action, StartupAction::RestartClean);
-
-    // A queued task that never started re-dispatches instead of failing.
-    store.insert_task(&new_task("t2"), now).unwrap();
-    let queued = store.get_task("t2").unwrap().unwrap();
-    let action = classify_startup(StartupCtx {
-        status: queued.status,
-        manifest_present: false,
-        manifest_matches_attempt: None,
-    });
-    assert_eq!(action, StartupAction::Redispatch);
-}
-
-#[test]
-fn candidate_mismatch_restart_starts_clean() {
-    let dir = scratch_dir("mismatch");
-    let conn = scratch_store(&dir);
-    let store = DownloadStore::new(&conn);
-    let now = 1_700_000_000.0;
-
-    // The prior candidate was made cleanup-eligible, then the process died
-    // before the next enqueue replaced its manifest.
-    store.insert_task(&new_task("t1"), now).unwrap();
-    store
-        .transition_task("t1", TaskStatus::Processing, now, None)
-        .unwrap();
-    ManifestCodec
-        .write(&dir.join("staging"), &manifest("t1"))
-        .unwrap();
-
-    let task = store.get_task("t1").unwrap().unwrap();
-    let action = classify_startup(StartupCtx {
-        status: task.status,
-        manifest_present: true,
-        manifest_matches_attempt: Some(false),
-    });
-    assert_eq!(action, StartupAction::RestartClean);
+    let report = run_startup_recovery(&journal).await.unwrap();
+    let count = |wanted: &[StartupAction]| {
+        cases
+            .iter()
+            .filter(|(_, _, action)| wanted.contains(action))
+            .count()
+    };
+    assert_eq!(report.redispatched, count(&[Redispatch]));
+    assert_eq!(report.resumed, count(&[ResumeLanding, ResumePoll]));
+    assert_eq!(report.restarted, count(&[RestartClean]));
+    for (id, status, action) in &cases {
+        let now = journal.read_task(id).await.unwrap().unwrap().status;
+        let after = if *action == RestartClean {
+            TaskStatus::Queued
+        } else {
+            *status
+        };
+        assert_eq!(now, after, "{id}");
+    }
 }
 
 #[test]
@@ -385,19 +365,35 @@ fn auto_retry_sweep_honors_backoff_newest_wins_and_held_gate() {
     let ids: Vec<&str> = retryable.iter().map(|task| task.id.as_str()).collect();
     assert_eq!(ids, vec!["orig-r1"]);
 
-    // A held track pauses auto-retry for its task.
-    store
-        .insert_held(
-            "u1",
-            "/held/01.flac",
-            "verify_failed",
-            Some("orig-r1"),
-            Some("rg-retry"),
-            now,
+    // A held track pauses auto-retry for its task, while its entry is open.
+    let held = HeldRows::new(&conn);
+    let (entry, _) = held
+        .hold(
+            &NewEntry {
+                user_id: "u1".to_owned(),
+                origin: EntryOrigin::Download,
+                key: GroupKey::Album("rg-retry".to_owned()),
+                release_group_mbid: Some("rg-retry".to_owned()),
+                recording_mbid: None,
+                drop_item_id: None,
+                artist_name: None,
+                album_title: None,
+            },
+            &[NewFile {
+                source_task_id: Some("orig-r1".to_owned()),
+                ..NewFile::new(HeldRoot::Held, "01.flac", Reason::WeakMatch, "soulseek")
+            }],
+            1,
         )
         .unwrap();
-    assert!(store.has_unresolved_held_for_task("orig-r1").unwrap());
-    assert!(!store.has_unresolved_held_for_task("orig").unwrap());
+    assert!(held.task_holds("orig-r1").unwrap());
+    assert!(!held.task_holds("orig").unwrap());
+    held.release(entry, 2).unwrap();
+    assert!(held.claim(entry).unwrap());
+    assert!(
+        held.task_holds("orig-r1").unwrap(),
+        "an entry being acted on is open"
+    );
 
     // Retry spawns keep the original terminal and carry the generation.
     let spawn = plan_retry("orig-r1", TaskStatus::Failed, "retry", 1).unwrap();
@@ -407,51 +403,6 @@ fn auto_retry_sweep_honors_backoff_newest_wins_and_held_gate() {
     let upgrade_spawn = plan_retry("up", TaskStatus::Failed, "upgrade", 0).unwrap();
     assert_eq!(upgrade_spawn.origin, "upgrade");
     assert!(plan_retry("live", TaskStatus::Downloading, "user", 0).is_none());
-}
-
-#[test]
-fn library_held_retry_sweep_fires_only_when_due() {
-    let dir = scratch_dir("held");
-    let conn = scratch_store(&dir);
-    let store = DownloadStore::new(&conn);
-    let now = 1_700_000_000.0;
-
-    let due = store
-        .insert_held(
-            "u1",
-            "/held/a.flac",
-            "target_occupied",
-            Some("t1"),
-            None,
-            now,
-        )
-        .unwrap();
-    let waiting = store
-        .insert_held(
-            "u1",
-            "/held/b.flac",
-            "target_occupied",
-            Some("t2"),
-            None,
-            now,
-        )
-        .unwrap();
-    let other = store
-        .insert_held("u1", "/held/c.flac", "verify_failed", Some("t3"), None, now)
-        .unwrap();
-    store
-        .schedule_held_retry(&[due], 1, Some(now - 5.0))
-        .unwrap();
-    store
-        .schedule_held_retry(&[waiting], 1, Some(now + 3600.0))
-        .unwrap();
-    // Reasons a person decides on never take a scheduled retry.
-    store
-        .schedule_held_retry(&[other], 1, Some(now - 5.0))
-        .unwrap();
-
-    let units = store.list_due_held_units(now, 10).unwrap();
-    assert_eq!(units, vec![("t1".to_string(), "u1".to_string())]);
 }
 
 #[test]
@@ -741,14 +692,7 @@ fn terminal_tasks_reject_outgoing_transitions() {
         TaskStatus::Failed,
         TaskStatus::Cancelled,
     ] {
-        assert_eq!(
-            classify_startup(StartupCtx {
-                status,
-                manifest_present: true,
-                manifest_matches_attempt: Some(true),
-            }),
-            StartupAction::Noop
-        );
+        assert_eq!(classify_startup(status, &[]), StartupAction::Noop);
     }
 }
 
@@ -787,19 +731,6 @@ fn quarantine_hold_rejects_escaping_stamps() {
     assert!(suspect.exists());
     let held = sandbox.hold_file(&suspect, "20240101T000000").unwrap();
     assert!(held.starts_with(dir.join("quarantine")));
-}
-
-#[test]
-fn manifest_paths_reject_escape() {
-    let staging = PathBuf::from("/tmp/staging");
-    assert!(ManifestCodec::checked_path(&staging, "../evil").is_none());
-    assert!(ManifestCodec::checked_path(&staging, "a/b").is_none());
-    assert!(ManifestCodec::checked_path(&staging, "").is_none());
-    let hex = "0123456789abcdef0123456789abcdef";
-    assert_eq!(
-        ManifestCodec::checked_path(&staging, hex),
-        Some(staging.join(hex).join("manifest.json"))
-    );
 }
 
 // Reimport needs a failed or partial task whose attempt still names its
@@ -854,17 +785,134 @@ fn reimport_starts_tasks_whose_files_remain() {
     assert!(!store.is_reimportable("live").unwrap());
     assert!(!store.is_reimportable("missing").unwrap());
 
-    assert!(store.begin_reimport("kept", now).unwrap());
+    assert_eq!(
+        store.begin_reimport("kept", "kept-a0", now).unwrap(),
+        ReimportStart::Begun
+    );
     let row = store.get_task("kept").unwrap().unwrap();
     assert_eq!(row.status, TaskStatus::Processing);
     assert!(row.error_message.is_none());
     assert!(row.completed_at.is_none());
-    assert!(
-        !store.begin_reimport("kept", now).unwrap(),
+    assert_eq!(
+        store.begin_reimport("kept", "kept-a0", now).unwrap(),
+        ReimportStart::NotReimportable,
         "already running"
     );
-    assert!(!store.begin_reimport("live", now).unwrap());
-    assert!(!store.begin_reimport("missing", now).unwrap());
+    assert_eq!(
+        store.begin_reimport("live", "live-a0", now).unwrap(),
+        ReimportStart::NotReimportable
+    );
+    assert_eq!(
+        store.begin_reimport("missing", "missing-a0", now).unwrap(),
+        ReimportStart::NotReimportable
+    );
+}
+
+// Files kept for "Retry import" go to cleanup after 90 days, or at once
+// when their task is stopped. A reimport and cleanup each take the
+// attempt by compare and set, so neither works on files the other has:
+// a reimport that started keeps them past the 90 days, a reimport takes
+// back files cleanup has not leased yet, and files cleanup has leased are
+// never reimported.
+#[test]
+fn kept_files_go_to_cleanup_without_racing_a_reimport() {
+    let dir = scratch_dir("kept-files");
+    let conn = scratch_store(&dir);
+    let store = DownloadStore::new(&conn);
+    let now = 100.0 * 86_400.0;
+    let kept_before = now - 90.0 * 86_400.0;
+    let handle = r#"{"source":"soulseek","username":"peer","filenames":["a.flac"],"job_name":""}"#;
+    for (id, state) in [
+        ("young", AttemptState::Preserved),
+        ("old", AttemptState::Preserved),
+        ("reimported", AttemptState::Preserved),
+        ("stopped", AttemptState::Preserved),
+        ("leased", AttemptState::CleanupPending),
+        ("taken", AttemptState::CleanupPending),
+    ] {
+        store.insert_task(&new_task(id), 1.0).unwrap();
+        store
+            .insert_attempt(
+                &format!("{id}-a0"),
+                id,
+                "soulseek",
+                0,
+                "",
+                handle,
+                state,
+                1.0,
+            )
+            .unwrap();
+        store
+            .transition_task(id, TaskStatus::Failed, 1.0, Some(mount_gone()))
+            .unwrap();
+    }
+    conn.execute(
+        "UPDATE download_attempts SET completed_at = ?1 WHERE task_id = 'young'",
+        [now - 89.0 * 86_400.0],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE download_attempts SET lease_owner = 'cleaner', lease_expires_at = ?1 \
+         WHERE task_id = 'leased'",
+        [now + 60.0],
+    )
+    .unwrap();
+    let state = |task: &str| {
+        let id = format!("{task}-a0");
+        store.get_attempt(&id).unwrap().unwrap().state
+    };
+
+    // A reimport that started first keeps its files past the 90 days.
+    assert_eq!(
+        store
+            .begin_reimport("reimported", "reimported-a0", now)
+            .unwrap(),
+        ReimportStart::Begun
+    );
+    conn.execute(
+        "UPDATE download_attempts SET completed_at = 1.0, updated_at = 1.0 \
+         WHERE task_id = 'reimported'",
+        [],
+    )
+    .unwrap();
+    // A reimport takes back files cleanup has not leased yet.
+    assert_eq!(
+        store.begin_reimport("taken", "taken-a0", now).unwrap(),
+        ReimportStart::Begun
+    );
+    assert_eq!(state("taken"), AttemptState::Preserved);
+    // Stopping a failed task hands its kept files to cleanup at once.
+    let stopped = store.get_task("stopped").unwrap().unwrap();
+    store.stop_task(&stopped, now).unwrap();
+    assert_eq!(state("stopped"), AttemptState::CleanupPending);
+
+    let released = store.release_kept(now, kept_before).unwrap();
+    assert_eq!(released, vec![("old-a0".to_owned(), "old".to_owned())]);
+    assert_eq!(state("young"), AttemptState::Preserved);
+    assert_eq!(state("reimported"), AttemptState::Preserved);
+    assert_eq!(state("old"), AttemptState::CleanupPending);
+    let old = store.get_attempt("old-a0").unwrap().unwrap();
+    assert_eq!(old.disposition, "discard");
+
+    // Files cleanup has leased are not reimported.
+    let claimed = store
+        .claim_cleanup_attempts("cleaner", now, 10, 60.0)
+        .unwrap();
+    assert!(claimed.iter().any(|attempt| attempt.id == "old-a0"));
+    for task in ["old", "leased"] {
+        assert_eq!(
+            store
+                .begin_reimport(task, &format!("{task}-a0"), now)
+                .unwrap(),
+            ReimportStart::FilesGone,
+            "{task}"
+        );
+        assert_eq!(
+            store.get_task(task).unwrap().unwrap().status,
+            TaskStatus::Failed
+        );
+    }
 }
 
 // A download whose temporary files keep failing to clear shows on service
@@ -899,10 +947,7 @@ async fn failing_cleanup_shows_on_service_health_until_it_clears() {
     let worker = Arc::new(DownloadWorker::fixed(
         journal,
         vec![crate::as_source(source.clone())],
-        WorkerConfig {
-            staging_root: staging,
-            ..WorkerConfig::default()
-        },
+        WorkerConfig::default(),
         droppedneedle_kernel::events::EventHub::new(),
         health.clone(),
     ));
@@ -938,4 +983,725 @@ async fn failing_cleanup_shows_on_service_health_until_it_clears() {
     due_now().await.unwrap();
     worker.run_once(4).await;
     assert!(health.current(Instant::now()).is_empty());
+}
+
+const HELD_GROUP: &str = "6d0b7a1e-0000-4000-8000-0000000000a1";
+const HELD_RELEASE: &str = "6d0b7a1e-0000-4000-8000-0000000000a2";
+
+const LIVE_GROUP: &str = "6d0b7a1e-0000-4000-8000-0000000000a3";
+const LIVE_RELEASE: &str = "6d0b7a1e-0000-4000-8000-0000000000a4";
+const DELUXE_RELEASE: &str = "6d0b7a1e-0000-4000-8000-0000000000a5";
+const REMASTER_RELEASE: &str = "6d0b7a1e-0000-4000-8000-0000000000a6";
+const MYSTERONS: &str = "6d0b7a1e-0000-4000-8000-0000000000c0";
+const SOUR_TIMES: &str = "6d0b7a1e-0000-4000-8000-0000000000c1";
+
+/// MusicBrainz as a fixed set of releases.
+struct Releases(Vec<droppedneedle_library::matching::Release>);
+
+impl droppedneedle_library::identify::sources::ReleaseSource for Releases {
+    fn search<'a>(
+        &'a self,
+        _title: &'a str,
+        _artist: &'a str,
+    ) -> futures_util::future::BoxFuture<
+        'a,
+        Result<
+            Vec<droppedneedle_library::identify::sources::ReleaseHit>,
+            droppedneedle_library::identify::sources::SourceError,
+        >,
+    > {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn release<'a>(
+        &'a self,
+        mbid: &'a str,
+    ) -> futures_util::future::BoxFuture<
+        'a,
+        Result<
+            Option<droppedneedle_library::matching::Release>,
+            droppedneedle_library::identify::sources::SourceError,
+        >,
+    > {
+        let found = self
+            .0
+            .iter()
+            .find(|release| release.answers_to(mbid))
+            .cloned();
+        Box::pin(async move { Ok(found) })
+    }
+
+    fn canonical_recording<'a>(
+        &'a self,
+        _mbid: &'a str,
+    ) -> futures_util::future::BoxFuture<
+        'a,
+        Result<Option<String>, droppedneedle_library::identify::sources::SourceError>,
+    > {
+        Box::pin(async { Ok(None) })
+    }
+}
+
+/// Portishead's "Dummy" with two tracks.
+fn held_release() -> droppedneedle_library::matching::Release {
+    portishead(
+        HELD_RELEASE,
+        HELD_GROUP,
+        "Dummy",
+        &[(MYSTERONS, "Mysterons"), (SOUR_TIMES, "Sour Times")],
+    )
+}
+
+/// A Portishead album with the tracks `(recording, title)`; each track's
+/// id is made from the release's, so no two releases share one.
+fn portishead(
+    id: &str,
+    group: &str,
+    title: &str,
+    tracks: &[(&str, &str)],
+) -> droppedneedle_library::matching::Release {
+    use droppedneedle_library::matching::{CreditedArtist, Release, ReleaseMedium, ReleaseTrack};
+    Release {
+        id: id.to_owned(),
+        release_group_id: group.to_owned(),
+        title: title.to_owned(),
+        artists: vec![CreditedArtist {
+            id: "8f6bd1e4-fbe1-4f50-aa9b-94c450ec0f11".to_owned(),
+            name: "Portishead".to_owned(),
+            sort_name: Some("Portishead".to_owned()),
+            join: String::new(),
+        }],
+        status: Some("Official".to_owned()),
+        media: vec![ReleaseMedium {
+            position: 1,
+            format: Some("CD".to_owned()),
+            title: None,
+            track_count: tracks.len() as u32,
+        }],
+        tracks: tracks
+            .iter()
+            .enumerate()
+            .map(|(index, (recording, title))| ReleaseTrack {
+                isrcs: Vec::new(),
+                genres: Vec::new(),
+                id: format!("{}b{}{index}", &id[..id.len() - 3], &id[id.len() - 1..]),
+                recording_id: (*recording).to_owned(),
+                title: (*title).to_owned(),
+                artists: Vec::new(),
+                disc: 1,
+                position: index as u32 + 1,
+                absolute_position: index as u32 + 1,
+                length_ms: None,
+            })
+            .collect(),
+        ..Release::default()
+    }
+}
+
+/// A held copy in `dir`: a library fixture tagged as track `track`.
+fn held_copy(dir: &std::path::Path, name: &str, fixture: &str, title: &str, track: u32) {
+    use droppedneedle_library::tags::TagField;
+    use droppedneedle_library::tags::save::{TagEdit, save_tags};
+    std::fs::create_dir_all(dir).expect("held dir");
+    let path = dir.join(name);
+    let source = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/library")
+        .join(fixture);
+    std::fs::copy(source, &path).expect("copy fixture");
+    let edits = vec![
+        TagEdit::new(TagField::Title, vec![title.to_owned()]),
+        TagEdit::new(TagField::Artist, vec!["Portishead".to_owned()]),
+        TagEdit::new(TagField::AlbumArtist, vec!["Portishead".to_owned()]),
+        TagEdit::new(TagField::Album, vec!["Dummy".to_owned()]),
+        TagEdit::new(TagField::TrackNumber, vec![track.to_string()]),
+    ];
+    save_tags(&path, &edits).expect("tags save");
+}
+
+/// Hold the files `(path, track, reason)` in a new download entry of
+/// u-ada's under `key`, in `state`. Answers the entry.
+async fn seed_held(
+    db: &AcquireDb,
+    key: &str,
+    state: &str,
+    files: Vec<(&str, droppedneedle_library::matching::ReleaseTrack, Reason)>,
+) -> i64 {
+    seed_held_on(db, key, HELD_GROUP, HELD_RELEASE, state, files).await
+}
+
+/// [`seed_held`] for an entry about album `group` whose files are paired
+/// to tracks of `release`.
+async fn seed_held_on(
+    db: &AcquireDb,
+    key: &str,
+    group: &'static str,
+    release: &'static str,
+    state: &str,
+    files: Vec<(&str, droppedneedle_library::matching::ReleaseTrack, Reason)>,
+) -> i64 {
+    let (key, state) = (key.to_owned(), state.to_owned());
+    let files: Vec<(String, String, String, u32, &'static str)> = files
+        .into_iter()
+        .map(|(path, track, reason)| {
+            (
+                path.to_owned(),
+                track.id,
+                track.recording_id,
+                track.position,
+                reason.code(),
+            )
+        })
+        .collect();
+    db.write("test.held", move |tx| {
+        tx.execute(
+            "INSERT INTO acquire_held_entries (user_id, origin, group_key, \
+             release_group_mbid, state, created_at, expires_at) VALUES ('u-ada', \
+             'download', ?1, ?2, ?3, 1, 9999999999999)",
+            rusqlite::params![key, group, state],
+        )?;
+        let entry = tx.last_insert_rowid();
+        for (path, track, recording, position, reason) in &files {
+            tx.execute(
+                "INSERT INTO acquire_held_files (entry_id, root, path, original_name, \
+                 release_mbid, release_track_mbid, recording_mbid, disc_number, \
+                 track_number, reason, source, state, created_at) VALUES (?1, 'held', ?2, \
+                 ?2, ?3, ?4, ?5, 1, ?6, ?7, 'soulseek', 'held', 1)",
+                rusqlite::params![entry, path, release, track, recording, position, reason],
+            )?;
+        }
+        Ok(entry)
+    })
+    .await
+    .expect("held rows")
+}
+
+/// An entry's state, tries and next try.
+async fn retry_of(db: &AcquireDb, entry: i64) -> (String, i64, Option<i64>) {
+    sqlx::query_as("SELECT state, retry_tries, retry_at FROM acquire_held_entries WHERE id = ?1")
+        .bind(entry)
+        .fetch_one(db.pool())
+        .await
+        .expect("entry")
+}
+
+/// A held file's state and reason, by its path.
+async fn held_file(db: &AcquireDb, path: &str) -> (String, String) {
+    sqlx::query_as("SELECT state, reason FROM acquire_held_files WHERE path = ?1")
+        .bind(path)
+        .fetch_one(db.pool())
+        .await
+        .expect("held file")
+}
+
+/// A file held because its place in the library was taken is retried by
+/// itself, exactly as its owner pressing Retry: at the first pass, then 5
+/// and 15 minutes later while the place stays taken, and it goes in at the
+/// pass after the place is freed. A file a person decides on, in the same
+/// entry, is never touched, and an entry a person is acting on is skipped.
+const MINUTE: i64 = 60_000;
+
+/// The held list over a real library on a scratch database, with
+/// MusicBrainz as `releases` and the clock in the test's hands.
+struct HeldRig {
+    clock: Arc<droppedneedle_kernel::clock::ManualClock>,
+    db: AcquireDb,
+    acquire: droppedneedle_acquire::AcquireSetup,
+    music: std::path::PathBuf,
+    held_dir: std::path::PathBuf,
+    _platform: droppedneedle_kernel::platform::Platform,
+    _scratch: AcquireDb,
+}
+
+impl HeldRig {
+    async fn new(releases: Vec<droppedneedle_library::matching::Release>) -> Self {
+        use droppedneedle_kernel::clock::ManualClock;
+        use droppedneedle_kernel::runtime_config::{ConfigStore, Crypto};
+
+        let scratch = AcquireDb::scratch().expect("scratch db");
+        let clock = Arc::new(ManualClock::at(1_800_000_000_000));
+        let db = AcquireDb::new(scratch.db().clone(), clock.clone());
+        db.add_user("u-ada", "Ada", "user").await.expect("user");
+        let dir = scratch.path().parent().expect("scratch dir").to_path_buf();
+        let config = Arc::new(
+            ConfigStore::scratch(&dir, Crypto::from_key_bytes(&[7u8; 32]).expect("key"))
+                .expect("config"),
+        );
+        let platform = crate::common::TestPlatform::on(db.db(), &dir)
+            .settings(config)
+            .build()
+            .await;
+        let (library, _) = crate::common::library::library_at(&platform);
+        let music = dir.join("music");
+        std::fs::create_dir_all(&music).expect("music root");
+        library
+            .add_root(
+                Some("music".to_owned()),
+                music.to_string_lossy().into_owned(),
+                droppedneedle_library::scan::EffectivePolicy::Automatic,
+            )
+            .expect("root adds");
+        let landing = droppedneedle_acquire::landing::library::LibraryLanding::new(
+            library.clone(),
+            crate::common::library::every_priority(Arc::new(Releases(releases))),
+            db.pool().clone(),
+        );
+        let acquire = droppedneedle_acquire::AcquireSetup::for_tests(
+            db.clone(),
+            Arc::new(droppedneedle_kernel::ids::UuidGenerator),
+            droppedneedle_kernel::events::EventHub::new(),
+            Some(Arc::new(landing)),
+        )
+        .expect("acquire bundle");
+        let held_dir = acquire.held.folders().held.clone();
+        Self {
+            clock,
+            db,
+            acquire,
+            music,
+            held_dir,
+            _platform: platform,
+            _scratch: scratch,
+        }
+    }
+}
+
+#[tokio::test]
+async fn held_files_the_library_could_not_take_are_retried_by_themselves() {
+    use droppedneedle_kernel::clock::Clock as _;
+
+    let rig = HeldRig::new(vec![held_release()]).await;
+    let tracks = held_release().tracks;
+    let (clock, db, acquire, music, held_dir) =
+        (&rig.clock, &rig.db, &rig.acquire, &rig.music, &rig.held_dir);
+    held_copy(held_dir, "taken.flac", "flac_full_01.flac", "Mysterons", 1);
+    held_copy(held_dir, "weak.flac", "flac_full_02.flac", "Sour Times", 2);
+    held_copy(held_dir, "free.flac", "flac_full_02.flac", "Sour Times", 2);
+    held_copy(
+        held_dir,
+        "claimed.flac",
+        "flac_full_02.flac",
+        "Sour Times",
+        2,
+    );
+    let album = music.join("Portishead/Dummy");
+    std::fs::create_dir_all(&album).expect("album folder");
+    let taken = album.join("0101 Mysterons.flac");
+    std::fs::write(&taken, b"someone else's file").expect("stray file");
+
+    let waiting = seed_held(
+        db,
+        &format!("album:{HELD_GROUP}"),
+        "held",
+        vec![
+            ("taken.flac", tracks[0].clone(), Reason::TargetOccupied),
+            ("weak.flac", tracks[1].clone(), Reason::WeakMatch),
+        ],
+    )
+    .await;
+    let claimed = seed_held(
+        db,
+        "task:t-claimed",
+        "placing",
+        vec![("claimed.flac", tracks[1].clone(), Reason::TargetOccupied)],
+    )
+    .await;
+    let fresh = seed_held(
+        db,
+        "task:t-fresh",
+        "held",
+        vec![("free.flac", tracks[1].clone(), Reason::TargetOccupied)],
+    )
+    .await;
+
+    let start = clock.now_ms();
+    acquire.held.tend().await;
+    assert_eq!(
+        held_file(db, "free.flac").await.0,
+        "imported",
+        "a fresh hold whose place is free goes in at the first pass"
+    );
+    assert!(album.join("0102 Sour Times.flac").is_file());
+    assert_eq!(retry_of(db, fresh).await, ("resolved".to_owned(), 0, None));
+    assert_eq!(
+        retry_of(db, waiting).await,
+        ("held".to_owned(), 1, Some(start + 5 * MINUTE)),
+        "a place still taken waits five minutes"
+    );
+    assert_eq!(
+        held_file(db, "taken.flac").await,
+        ("held".to_owned(), "target_occupied".to_owned())
+    );
+    assert_eq!(
+        std::fs::read(&taken).expect("stray file"),
+        b"someone else's file",
+        "the file in the way is never overwritten"
+    );
+    assert_eq!(
+        held_file(db, "weak.flac").await,
+        ("held".to_owned(), "weak_match".to_owned()),
+        "a file a person decides on is not retried"
+    );
+    assert!(held_dir.join("weak.flac").is_file());
+    assert_eq!(
+        retry_of(db, claimed).await,
+        ("placing".to_owned(), 0, None),
+        "an entry a person is acting on is skipped"
+    );
+    assert!(held_dir.join("claimed.flac").is_file());
+
+    acquire.held.tend().await;
+    assert_eq!(
+        retry_of(db, waiting).await,
+        ("held".to_owned(), 1, Some(start + 5 * MINUTE)),
+        "nothing is retried before its time"
+    );
+
+    clock.advance(5 * MINUTE);
+    acquire.held.tend().await;
+    assert_eq!(
+        retry_of(db, waiting).await,
+        ("held".to_owned(), 2, Some(start + 20 * MINUTE)),
+        "the next gap is fifteen minutes"
+    );
+
+    std::fs::remove_file(&taken).expect("place freed");
+    clock.advance(15 * MINUTE);
+    acquire.held.tend().await;
+    assert_eq!(held_file(db, "taken.flac").await.0, "imported");
+    assert!(taken.is_file(), "the held file took its place");
+    assert!(!held_dir.join("taken.flac").exists());
+    assert_eq!(
+        retry_of(db, waiting).await,
+        ("held".to_owned(), 0, None),
+        "with nothing left to retry the entry waits for its person"
+    );
+    assert_eq!(
+        held_file(db, "weak.flac").await,
+        ("held".to_owned(), "weak_match".to_owned())
+    );
+}
+
+/// A download a curator matched to another album, then held because its
+/// place there was taken, is retried onto that album: never back onto the
+/// album it was downloaded for, though the same recording is on both.
+#[tokio::test]
+async fn a_matched_download_is_retried_onto_its_match() {
+    let dummy = held_release();
+    let live = portishead(
+        LIVE_RELEASE,
+        LIVE_GROUP,
+        "Roseland",
+        &[(MYSTERONS, "Mysterons")],
+    );
+    let rig = HeldRig::new(vec![dummy.clone(), live.clone()]).await;
+    let dummy_dir = rig.music.join("Portishead/Dummy");
+
+    // The library holds its copy of Dummy, so Dummy has a chosen edition.
+    held_copy(
+        &rig.held_dir,
+        "sour.flac",
+        "flac_full_02.flac",
+        "Sour Times",
+        2,
+    );
+    seed_held(
+        &rig.db,
+        "task:t-sour",
+        "held",
+        vec![("sour.flac", dummy.tracks[1].clone(), Reason::TargetOccupied)],
+    )
+    .await;
+    rig.acquire.held.tend().await;
+    assert!(dummy_dir.join("0102 Sour Times.flac").is_file());
+
+    held_copy(
+        &rig.held_dir,
+        "matched.flac",
+        "flac_full_01.flac",
+        "Mysterons",
+        1,
+    );
+    let taken = rig.music.join("Portishead/Roseland/0101 Mysterons.flac");
+    std::fs::create_dir_all(taken.parent().expect("album folder")).expect("album folder");
+    std::fs::write(&taken, b"someone else's file").expect("stray file");
+    seed_held_on(
+        &rig.db,
+        &format!("album:{HELD_GROUP}"),
+        HELD_GROUP,
+        LIVE_RELEASE,
+        "held",
+        vec![(
+            "matched.flac",
+            live.tracks[0].clone(),
+            Reason::TargetOccupied,
+        )],
+    )
+    .await;
+
+    rig.acquire.held.tend().await;
+    assert!(
+        !dummy_dir.join("0101 Mysterons.flac").exists(),
+        "never placed on the album the curator matched it away from"
+    );
+    assert_eq!(
+        held_file(&rig.db, "matched.flac").await,
+        ("held".to_owned(), "target_occupied".to_owned())
+    );
+
+    std::fs::remove_file(&taken).expect("place freed");
+    rig.clock.advance(5 * MINUTE);
+    rig.acquire.held.tend().await;
+    assert_eq!(held_file(&rig.db, "matched.flac").await.0, "imported");
+    assert!(taken.is_file(), "placed on the album it was matched to");
+    assert!(!dummy_dir.join("0101 Mysterons.flac").exists());
+}
+
+/// A file held because its place was taken, whose track the library has
+/// meanwhile got on another copy of the album (it holds two copies, neither
+/// of the file's edition), is never placed beside it by the retry: it waits
+/// for a person, its held copy kept, and is not retried again.
+#[tokio::test]
+async fn a_retry_never_adds_a_second_copy_by_itself() {
+    let dummy = held_release();
+    let deluxe = portishead(
+        DELUXE_RELEASE,
+        HELD_GROUP,
+        "Dummy Deluxe",
+        &[(MYSTERONS, "Mysterons")],
+    );
+    let remaster = portishead(
+        REMASTER_RELEASE,
+        HELD_GROUP,
+        "Dummy Remaster",
+        &[(SOUR_TIMES, "Sour Times")],
+    );
+    let rig = HeldRig::new(vec![dummy.clone(), deluxe.clone(), remaster.clone()]).await;
+    let taken = rig.music.join("Portishead/Dummy/0101 Mysterons.flac");
+    std::fs::create_dir_all(taken.parent().expect("album folder")).expect("album folder");
+    std::fs::write(&taken, b"someone else's file").expect("stray file");
+    held_copy(
+        &rig.held_dir,
+        "taken.flac",
+        "flac_full_01.flac",
+        "Mysterons",
+        1,
+    );
+    let entry = seed_held_on(
+        &rig.db,
+        "task:t-taken",
+        "",
+        HELD_RELEASE,
+        "held",
+        vec![(
+            "taken.flac",
+            dummy.tracks[0].clone(),
+            Reason::TargetOccupied,
+        )],
+    )
+    .await;
+    rig.acquire.held.tend().await;
+    assert_eq!(retry_of(&rig.db, entry).await.1, 1);
+
+    // The library gets the track on its Deluxe copy, and another track on
+    // a Remaster copy.
+    held_copy(
+        &rig.held_dir,
+        "deluxe.flac",
+        "flac_full_01.flac",
+        "Mysterons",
+        1,
+    );
+    held_copy(
+        &rig.held_dir,
+        "remaster.flac",
+        "flac_full_02.flac",
+        "Sour Times",
+        1,
+    );
+    for (key, release, file, track) in [
+        (
+            "task:t-deluxe",
+            DELUXE_RELEASE,
+            "deluxe.flac",
+            &deluxe.tracks[0],
+        ),
+        (
+            "task:t-remaster",
+            REMASTER_RELEASE,
+            "remaster.flac",
+            &remaster.tracks[0],
+        ),
+    ] {
+        seed_held_on(
+            &rig.db,
+            key,
+            "",
+            release,
+            "held",
+            vec![(file, track.clone(), Reason::TargetOccupied)],
+        )
+        .await;
+    }
+    rig.acquire.held.tend().await;
+    assert!(
+        rig.music
+            .join("Portishead/Dummy Deluxe/0101 Mysterons.flac")
+            .is_file()
+    );
+    assert!(
+        rig.music
+            .join("Portishead/Dummy Remaster/0101 Sour Times.flac")
+            .is_file()
+    );
+
+    std::fs::remove_file(&taken).expect("place freed");
+    rig.clock.advance(5 * MINUTE);
+    rig.acquire.held.tend().await;
+    assert!(!taken.exists(), "no second copy");
+    assert_eq!(
+        held_file(&rig.db, "taken.flac").await,
+        ("held".to_owned(), "owned_elsewhere".to_owned()),
+        "a person decides"
+    );
+    assert!(
+        rig.held_dir.join("taken.flac").is_file(),
+        "its copy is kept"
+    );
+    assert_eq!(
+        retry_of(&rig.db, entry).await,
+        ("held".to_owned(), 0, None),
+        "no further retry"
+    );
+}
+
+/// A file held because its place was taken, whose track has since got a
+/// lower-quality copy on the same album, is never swapped in by the retry:
+/// the library's copy stays, nothing goes to the recycle bin, and the file
+/// waits for a person.
+#[tokio::test]
+async fn a_retry_never_replaces_a_library_copy_by_itself() {
+    let dummy = held_release();
+    let rig = HeldRig::new(vec![dummy.clone()]).await;
+    let album = rig.music.join("Portishead/Dummy");
+    held_copy(&rig.held_dir, "low.mp3", "mp3_full_01.mp3", "Mysterons", 1);
+    seed_held(
+        &rig.db,
+        "task:t-low",
+        "held",
+        vec![("low.mp3", dummy.tracks[0].clone(), Reason::TargetOccupied)],
+    )
+    .await;
+    rig.acquire.held.tend().await;
+    let yours = album.join("0101 Mysterons.mp3");
+    assert!(yours.is_file(), "the album has its lower-quality copy");
+
+    held_copy(
+        &rig.held_dir,
+        "better.flac",
+        "flac_full_01.flac",
+        "Mysterons",
+        1,
+    );
+    let entry = seed_held(
+        &rig.db,
+        "task:t-better",
+        "held",
+        vec![(
+            "better.flac",
+            dummy.tracks[0].clone(),
+            Reason::TargetOccupied,
+        )],
+    )
+    .await;
+    rig.acquire.held.tend().await;
+    assert!(yours.is_file(), "the library's copy stays");
+    assert!(!album.join("0101 Mysterons.flac").exists());
+    assert!(
+        std::fs::read_dir(rig.music.join(".recycle"))
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(true),
+        "nothing went to the recycle bin"
+    );
+    assert_eq!(
+        held_file(&rig.db, "better.flac").await,
+        ("held".to_owned(), "owned_on_album".to_owned()),
+        "a person decides"
+    );
+    assert!(rig.held_dir.join("better.flac").is_file());
+    assert_eq!(
+        retry_of(&rig.db, entry).await,
+        ("held".to_owned(), 0, None),
+        "no further retry"
+    );
+}
+
+/// A pass that finds the database busy, or no library set up yet, spends
+/// no try: the entry waits for the next pass as it was, never left claimed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_busy_database_or_no_library_spends_no_retry() {
+    use droppedneedle_kernel::db::{DbConfig, DbError, Lane, LaneLimits, open_runtime};
+
+    let dir = scratch_dir("held-retry-busy");
+    let path = dir.join("app.db");
+    crate::common::migrated_db(&path);
+    let runtime = open_runtime(&DbConfig::new(&path).with_lane_limits(LaneLimits {
+        foreground_wait: std::time::Duration::from_millis(200),
+        watch_tick: std::time::Duration::from_millis(10),
+        ..LaneLimits::default()
+    }))
+    .await
+    .expect("runtime opens");
+    let db = AcquireDb::new(
+        runtime.db().clone(),
+        Arc::new(droppedneedle_kernel::clock::SystemClock),
+    );
+    db.add_user("u-ada", "Ada", "user").await.expect("user");
+    let acquire = droppedneedle_acquire::AcquireSetup::for_tests(
+        db.clone(),
+        Arc::new(droppedneedle_kernel::ids::UuidGenerator),
+        droppedneedle_kernel::events::EventHub::new(),
+        None,
+    )
+    .expect("acquire bundle");
+    let track = held_release().tracks[0].clone();
+    let entry = seed_held(
+        &db,
+        "task:t-busy",
+        "held",
+        vec![("taken.flac", track, Reason::TargetOccupied)],
+    )
+    .await;
+
+    let (entered, inside) = std::sync::mpsc::channel();
+    let (let_go, release) = std::sync::mpsc::channel::<()>();
+    let writer = {
+        let db = runtime.db().clone();
+        std::thread::spawn(move || {
+            let _ = db.write_blocking(Lane::Foreground, "test.hold", |_| {
+                let _ = entered.send(());
+                let _ = release.recv();
+                Ok::<_, DbError>(())
+            });
+        })
+    };
+    inside
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the writer is held");
+    acquire.held.tend().await;
+    drop(let_go);
+    writer.join().expect("writer joins");
+    assert_eq!(
+        retry_of(&db, entry).await,
+        ("held".to_owned(), 0, None),
+        "a busy database spends no try"
+    );
+
+    acquire.held.tend().await;
+    assert_eq!(
+        retry_of(&db, entry).await,
+        ("held".to_owned(), 0, None),
+        "no library set up spends no try"
+    );
+    drop(acquire);
+    runtime.shutdown().await;
 }

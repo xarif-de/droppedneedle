@@ -31,6 +31,8 @@ pub enum Reason {
     NoTracks,
     VersionLowerQuality,
     NoBetterThanYours,
+    OwnedElsewhere,
+    OwnedOnAlbum,
     NoAlbumMatch,
     AlbumNotFound,
     TagsDisagree,
@@ -107,7 +109,7 @@ pub enum ReasonKind {
 
 impl Reason {
     /// Every reason, in declaration order.
-    pub const ALL: [Reason; 63] = [
+    pub const ALL: [Reason; 65] = [
         Self::WeakMatch,
         Self::NoArtistEvidence,
         Self::MostlyUnmatched,
@@ -119,6 +121,8 @@ impl Reason {
         Self::NoTracks,
         Self::VersionLowerQuality,
         Self::NoBetterThanYours,
+        Self::OwnedElsewhere,
+        Self::OwnedOnAlbum,
         Self::NoAlbumMatch,
         Self::AlbumNotFound,
         Self::TagsDisagree,
@@ -187,6 +191,8 @@ impl Reason {
             Self::NoTracks => "no_tracks",
             Self::VersionLowerQuality => "version_lower_quality",
             Self::NoBetterThanYours => "no_better_than_yours",
+            Self::OwnedElsewhere => "owned_elsewhere",
+            Self::OwnedOnAlbum => "owned_on_album",
             Self::NoAlbumMatch => "no_album_match",
             Self::AlbumNotFound => "album_not_found",
             Self::TagsDisagree => "tags_disagree",
@@ -285,6 +291,8 @@ impl Reason {
             Self::NoBetterThanYours => {
                 "Your copy is as good or better, so it stayed. The held file is still here."
             }
+            Self::OwnedElsewhere => "You already have this track on another copy of this album.",
+            Self::OwnedOnAlbum => "You now have this track on this album.",
             Self::NoAlbumMatch => "DroppedNeedle couldn't work out which album this is.",
             Self::AlbumNotFound => {
                 "MusicBrainz has no release of the album you picked that these files can be matched to."
@@ -421,10 +429,16 @@ impl Reason {
             }
             Self::NoTracks => "Review the held files, or let DroppedNeedle try another source.",
             Self::VersionLowerQuality => {
-                "Nothing to do. Discard the held file once you have heard it."
+                "Discard it, or choose Use this version to make it your copy; yours goes to the recycle bin."
             }
             Self::NoBetterThanYours => {
                 "Discard it, or choose Use this file to replace yours; yours goes to the recycle bin."
+            }
+            Self::OwnedElsewhere => {
+                "Discard it, or choose Import to keep a second copy here; yours stays as it is."
+            }
+            Self::OwnedOnAlbum => {
+                "Discard it, or choose Import: it replaces yours only if it is better, and yours then goes to the recycle bin."
             }
             Self::NoAlbumMatch => "Pick the album by hand with Match, or discard the folder.",
             Self::AlbumNotFound => "Check that you picked the right album, then try Match again.",
@@ -455,7 +469,7 @@ impl Reason {
                 "Fix the import naming script in Settings, Library, then try again."
             }
             Self::LibraryFolderMissing => {
-                "Check the library folder in Settings, Library. The import goes ahead once it is back."
+                "Check the library folder in Settings, Library, and that the server can write to it. Downloads go ahead by themselves once it is back."
             }
             Self::LocalFault => "Check free space and folder permissions, then retry import.",
             Self::FilesMissing => {
@@ -546,6 +560,8 @@ impl Reason {
             | Self::NoTracks
             | Self::VersionLowerQuality
             | Self::NoBetterThanYours
+            | Self::OwnedElsewhere
+            | Self::OwnedOnAlbum
             | Self::NoAlbumMatch
             | Self::AlbumNotFound
             | Self::TagsDisagree
@@ -633,6 +649,8 @@ impl Reason {
             Self::FingerprintUnconfirmed
             | Self::VersionLowerQuality
             | Self::NoBetterThanYours
+            | Self::OwnedElsewhere
+            | Self::OwnedOnAlbum
             | Self::NoAlbumMatch
             | Self::AlbumNotFound
             | Self::TagsDisagree
@@ -676,6 +694,27 @@ impl Reason {
 impl std::fmt::Display for Reason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.code())
+    }
+}
+
+/// What is wrong with the library folder a download waits for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FolderProblem {
+    Missing,
+    NotWritable,
+    NotAnswering,
+}
+
+/// The sentence of a download that waits for its library folder.
+pub fn library_folder_wait(folder: Option<&std::path::Path>, problem: FolderProblem) -> String {
+    let problem = match problem {
+        FolderProblem::Missing => "isn't there",
+        FolderProblem::NotWritable => "can't be written to",
+        FolderProblem::NotAnswering => "isn't answering",
+    };
+    match folder {
+        Some(folder) => format!("Waiting: library folder {} {problem}.", folder.display()),
+        None => format!("Waiting: the library folder {problem}."),
     }
 }
 
@@ -745,6 +784,9 @@ mod tests {
         Waited,
         /// Every source refused at enqueue: settled, nothing blocklisted.
         Unserved,
+        /// Held after a person's import or match, never by a landing:
+        /// nothing is said against a source.
+        PersonHeld,
         /// No landing or worker path produces it; the answer chosen.
         NotProduced(bool),
     }
@@ -755,7 +797,7 @@ mod tests {
                 Before::Held { local } => !local,
                 Before::Rejected(disposition) => disposition == Disposition::Permanent,
                 Before::FailedOver { blocklisted } => blocklisted,
-                Before::Waited | Before::Unserved => false,
+                Before::Waited | Before::Unserved | Before::PersonHeld => false,
                 Before::NotProduced(answer) => answer,
             }
         }
@@ -767,7 +809,7 @@ mod tests {
     /// sources disagreed: none do.
     #[test]
     fn against_source_keeps_what_each_outcome_did_before() {
-        use Before::{FailedOver, Held, NotProduced, Rejected, Unserved, Waited};
+        use Before::{FailedOver, Held, NotProduced, PersonHeld, Rejected, Unserved, Waited};
         use Disposition::{LocalFault, Permanent, Temporary};
         let table: &[(Reason, Before)] = &[
             (Reason::WeakMatch, Held { local: false }),
@@ -802,6 +844,7 @@ mod tests {
             (Reason::SettingsUnreadable, Rejected(Temporary)),
             (Reason::LibraryChanged, Rejected(Temporary)),
             (Reason::NamingScriptFailed, Rejected(LocalFault)),
+            (Reason::LibraryFolderMissing, Rejected(LocalFault)),
             (Reason::LocalFault, Rejected(LocalFault)),
             (Reason::OutsideDownloadsFolder, Rejected(LocalFault)),
             (Reason::Stalled, FailedOver { blocklisted: true }),
@@ -825,8 +868,10 @@ mod tests {
             (Reason::TrackNotFound, Unserved),
             // Uploads have no source; the queue's own states and the
             // reasons no code produces yet say nothing against one.
-            (Reason::FingerprintUnconfirmed, NotProduced(false)),
-            (Reason::NoBetterThanYours, NotProduced(false)),
+            (Reason::FingerprintUnconfirmed, PersonHeld),
+            (Reason::NoBetterThanYours, PersonHeld),
+            (Reason::OwnedElsewhere, PersonHeld),
+            (Reason::OwnedOnAlbum, PersonHeld),
             (Reason::NoAlbumMatch, NotProduced(false)),
             (Reason::AlbumNotFound, NotProduced(false)),
             (Reason::TagsDisagree, NotProduced(false)),
@@ -835,7 +880,6 @@ mod tests {
             (Reason::Interrupted, NotProduced(false)),
             (Reason::ImportFailed, NotProduced(false)),
             (Reason::LibraryUnavailable, NotProduced(false)),
-            (Reason::LibraryFolderMissing, NotProduced(false)),
             (Reason::NoDownloadSource, NotProduced(false)),
             (Reason::HeldForReview, NotProduced(false)),
             (Reason::AlreadyOwned, NotProduced(false)),

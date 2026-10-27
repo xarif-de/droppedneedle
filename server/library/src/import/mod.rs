@@ -65,21 +65,21 @@ pub mod naming;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, UNIX_EPOCH};
 
 use droppedneedle_kernel::db::Lane;
 
-use super::clock::{now_ms, today_day};
+use super::clock::LibraryClock as _;
 use super::matching::Release;
+use super::publish::PublishError;
+use super::publish::import_staging::{copy_in, remove_staging, staging_rel, staging_settled};
 use super::publish::paths::{ResolvedRoot, left_out};
 use super::publish::planner::{
-    AlbumJoin, Capability, FileFingerprint, JoinedTrack, PlanBundle, PlanItem, PlanKind,
-    ReleaseIdentity, Removal, RemoveItem, SealRecheck, SealedPreview,
+    AlbumJoin, Capability, JoinedTrack, PlanBundle, PlanItem, PlanKind, ReleaseIdentity, Removal,
+    RemoveItem, SealRecheck, SealedPreview,
 };
 use super::publish::publisher::{JoinedAlbum, joined_album};
 use super::publish::remove::{self, Probe, Refusal, Target};
 use super::publish::snapshots::sha256_hex;
-use super::publish::{HIDDEN_PREFIX, PublishError};
 use super::scan::models::EffectivePolicy;
 use super::scan::roots::{LibraryRoot, RootRegistry};
 use super::wiring::LibrarySetup;
@@ -190,6 +190,8 @@ pub enum ImportError {
     Occupied(String),
     /// The import naming script gave no usable path for a file.
     NamingScript(String),
+    /// The library folder the files go to is not there (the folder).
+    FolderMissing(String),
 }
 
 /// One planned file.
@@ -222,11 +224,24 @@ impl LibrarySetup {
 
     /// Import a verified download as one staged bundle. With `join`, the
     /// files join the library album they were fetched for (see the module
-    /// doc). Blocking: callers run it off the async runtime.
+    /// doc). Each source is opened by its path. Blocking: callers run it
+    /// off the async runtime.
     pub fn import_download_joined(
         &self,
         import: &DownloadImport,
         join: Option<ImportJoin>,
+    ) -> Result<ImportedAlbum, ImportError> {
+        self.import_download_from(import, join, &|path| std::fs::File::open(path))
+    }
+
+    /// [`Self::import_download_joined`], with every source opened by
+    /// `open_source` for its copy into staging (a download's files are opened
+    /// beneath its client's folder, never through a link).
+    pub fn import_download_from(
+        &self,
+        import: &DownloadImport,
+        join: Option<ImportJoin>,
+        open_source: &dyn Fn(&Path) -> std::io::Result<std::fs::File>,
     ) -> Result<ImportedAlbum, ImportError> {
         let fault = |message: String| ImportError::LocalFault(message);
         if import.files.is_empty() && import.extras.is_empty() {
@@ -397,7 +412,6 @@ impl LibrarySetup {
             .publish
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let _guards = self.publish_guards(&registry);
         cell.refresh(&registry, &self.root_dirs)
             .map_err(|error| fault(error.to_string()))?;
         let open = cell.open().map_err(|error| fault(error.to_string()))?;
@@ -410,6 +424,7 @@ impl LibrarySetup {
                         root = root.id,
                         "a landing stopped: the library folder is not there"
                     );
+                    return ImportError::FolderMissing(root.path.display().to_string());
                 }
                 fault(error.to_string())
             })?;
@@ -574,7 +589,7 @@ impl LibrarySetup {
                     "FILE_RECYCLED",
                     import.actor.as_deref(),
                     None,
-                    UNIX_EPOCH + Duration::from_millis(now_ms()),
+                    self.clock.now_system(),
                 ) {
                     Ok(removal) => {
                         claimed_tracks.extend(targets.iter().map(|target| target.track_id.clone()));
@@ -642,7 +657,9 @@ impl LibrarySetup {
                     .sandbox
                     .resolve_no_symlink(&root.id, &placement.staged_rel)
                     .map_err(|error| fault(error.to_string()))?;
-                let fingerprint = copy_in(&placement.source, &staged)
+                let source = open_source(&placement.source)
+                    .map_err(|error| fault(format!("copy into the library failed: {error}")))?;
+                let fingerprint = copy_in(source, &staged)
                     .map_err(|error| fault(format!("copy into the library failed: {error}")))?;
                 let track = &placement.track;
                 items.push(PlanItem {
@@ -721,10 +738,15 @@ impl LibrarySetup {
                 naming_revision: PINNED_REVISION,
                 policy_revision: bundle.policy_revision,
                 settings_revision: PINNED_REVISION,
-                today_day: today_day(),
+                today_day: self.clock.today_day(),
                 token_hash: token_hash.clone(),
             };
-            let sealed = SealedPreview::seal(bundle, token_hash, PINNED_REVISION, today_day() + 1);
+            let sealed = SealedPreview::seal(
+                bundle,
+                token_hash,
+                PINNED_REVISION,
+                self.clock.today_day() + 1,
+            );
             open.publisher
                 .publish(&sealed, &live, &BTreeMap::new())
                 .map_err(|error| match error {
@@ -766,6 +788,9 @@ impl LibrarySetup {
             })
             .map_err(|error| fault(format!("the catalog could not be read: {error}")))?
             .ok_or_else(|| fault("imported track is not in the catalog".to_owned()))?;
+        // The commit sealed the match; its artist proofs and links follow
+        // in their own write, so they can never fail the publish.
+        self.identify_store.link_after_command(&album_id);
         let paths = bundle
             .items
             .iter()
@@ -965,32 +990,6 @@ fn blocked_reason(refusal: &Refusal) -> String {
     }
 }
 
-/// The hidden folder, relative to its library root, that an import
-/// staged under `name` copies its files into. Publish journal rows name
-/// it as their source, which is how a download task's writes are found.
-pub(crate) fn staging_rel(name: &str) -> String {
-    format!("{HIDDEN_PREFIX}import/{}", safe_name(name))
-}
-
-/// A task id as one folder name.
-fn safe_name(task_id: &str) -> String {
-    let cleaned: String = task_id
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '-' {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if cleaned.is_empty() {
-        "_".to_owned()
-    } else {
-        cleaned
-    }
-}
-
 /// Name of the file in a task's import folder that says where each staged
 /// copy came from, so a commit resumed after a crash keeps provenance.
 const PROVENANCE_FILE: &str = "provenance.json";
@@ -1134,26 +1133,6 @@ pub(crate) fn recovered_provenance(staged: &Path, bundle_id: &str, track_id: &st
     }
 }
 
-/// Whether every publish that took files from the staging folder
-/// `task_dir` is over, the question `Management::download_publish_settled`
-/// asks for a download task: cleaned up, undone, committed with only its
-/// own cleanup left, or closed by an administrator after needing
-/// attention.
-fn staging_settled(conn: &rusqlite::Connection, task_dir: &str) -> rusqlite::Result<bool> {
-    let folder = format!("{task_dir}/");
-    let unsettled: bool = conn.query_row(
-        "SELECT EXISTS (SELECT 1 FROM library_publish_journal \
-         WHERE bundle_id IN (SELECT bundle_id FROM library_publish_journal \
-         WHERE substr(source_rel, 1, length(?1)) = ?1) \
-         AND state NOT IN ('cleaned', 'compensated', 'cleanup_pending') \
-         AND NOT (state = 'needs_attention' AND bundle_id IN \
-         (SELECT bundle_id FROM library_publish_resolutions)))",
-        rusqlite::params![folder],
-        |row| row.get(0),
-    )?;
-    Ok(!unsettled)
-}
-
 /// Whether the library holds an indexed album of release group `group`
 /// (its sealed identity, else its files' own tags), as the landing reads
 /// what is already owned. An empty group is held by nothing.
@@ -1212,73 +1191,4 @@ fn copy_folder(
     };
     let one = folders.all(|folder| folder == first);
     Ok((one && first.0 == root_id && !first.1.is_empty()).then_some(first.1))
-}
-
-/// Copy one landed file into the hidden import folder, synced, hashing
-/// the bytes as they stream through.
-fn copy_in(source: &Path, staged: &Path) -> std::io::Result<FileFingerprint> {
-    use sha2::Digest as _;
-    use std::io::{Read as _, Write as _};
-    if let Some(parent) = staged.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut reader = std::fs::File::open(source)?;
-    let mut writer = std::fs::File::create(staged)?;
-    let mut hasher = sha2::Sha256::new();
-    let mut buffer = vec![0u8; 256 * 1024];
-    let mut size = 0u64;
-    loop {
-        let read = reader.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-        writer.write_all(&buffer[..read])?;
-        size += read as u64;
-    }
-    writer.sync_all()?;
-    let sha256 = hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
-    Ok(FileFingerprint { size, sha256 })
-}
-
-/// Remove import folders a stopped process left behind, once no publish
-/// is waiting on recovery (an unsettled bundle may still name one of
-/// their copies). Blocking.
-pub(crate) fn sweep_import_leftovers(roots: &[PathBuf], journal_settled: bool) {
-    if !journal_settled {
-        return;
-    }
-    for root in roots {
-        let dir = root.join(format!("{HIDDEN_PREFIX}import"));
-        match std::fs::symlink_metadata(&dir) {
-            Ok(meta) if meta.is_dir() => {
-                if let Err(error) = std::fs::remove_dir_all(&dir) {
-                    tracing::warn!(dir = %dir.display(), %error, "import leftovers not removed");
-                } else {
-                    tracing::info!(dir = %dir.display(), "removed import leftovers");
-                }
-            }
-            Ok(_) | Err(_) => {}
-        }
-    }
-}
-
-/// Remove the hidden import folder (and its parent when empty). The
-/// publisher already removed the copies it published; anything left is a
-/// copy of a failed import.
-fn remove_staging(dir: &Path) {
-    if let Err(error) = std::fs::remove_dir_all(dir)
-        && error.kind() != std::io::ErrorKind::NotFound
-    {
-        tracing::warn!(dir = %dir.display(), %error, "import staging folder not removed");
-    }
-    if let Some(parent) = dir.parent()
-        && std::fs::remove_dir(parent).is_err()
-    {
-        tracing::debug!("import staging parent kept: other imports use it");
-    }
 }

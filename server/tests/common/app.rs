@@ -16,7 +16,7 @@ use axum::{
 };
 use droppedneedle::{AppState, bootstrap, middleware::request_scope};
 use droppedneedle_kernel::config::AppConfig;
-use droppedneedle_library::scan::models::failure_codes;
+use droppedneedle_library::scan::models::FailureCode;
 use droppedneedle_testkit::{
     remotes::{MockServer, serve_plex},
     slskd::MockSlskd,
@@ -324,7 +324,7 @@ impl TestApp {
 
     /// [`TestApp::call`], asked again while the app answers busy: see
     /// [`super::through_busy`].
-    async fn call_through_busy(
+    pub async fn call_through_busy(
         &self,
         method: &str,
         uri: &str,
@@ -365,7 +365,7 @@ impl TestApp {
         let headers = [("authorization", admin.as_str())];
         let before = self.finished_scans(&headers).await;
         let (status, body) = self
-            .call(
+            .call_through_busy(
                 "POST",
                 "/api/v3/library/roots",
                 &headers,
@@ -432,7 +432,7 @@ impl TestApp {
                 .query_row(
                     "SELECT EXISTS(SELECT 1 FROM library_scan_failures \
                      WHERE run_id = ?1 AND failure_code = ?2)",
-                    [run, failure_codes::RUN_END_PENDING],
+                    [run, FailureCode::RunEndPending.as_str()],
                     |row| row.get(0),
                 )
                 .expect("end passes read");

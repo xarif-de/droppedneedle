@@ -10,20 +10,15 @@ import type {
 	YouTubeTrackLink,
 	YouTubeLink,
 	YouTubeQuotaStatus,
-	JellyfinAlbumMatch,
-	JellyfinTrackInfo,
 	LocalAlbumMatch,
 	LocalTrackInfo,
-	NavidromeAlbumMatch,
-	NavidromeTrackInfo,
-	PlexAlbumMatch,
-	PlexTrackInfo,
 	LastFmAlbumEnrichment,
 	LibraryAlbumStatus,
 	LibraryFileMeta,
 	DownloadTask,
-	HeldImport
+	HeldFileInEntry
 } from '$lib/types';
+import type { RemoteMatch, RemoteTrack } from '$lib/queries/remotes/types';
 import { libraryStore } from '$lib/stores/library';
 import { integrationStore } from '$lib/stores/integration';
 import { ApiError } from '$lib/api/client';
@@ -41,10 +36,8 @@ import {
 import { hydrateDetailCacheEntry } from '$lib/utils/detailCacheHydration';
 import { compareDiscTrack, getDiscTrackKey } from '$lib/player/queueHelpers';
 import type { QueueItem } from '$lib/player/types';
-import { launchJellyfinPlayback } from '$lib/player/launchJellyfinPlayback';
+import { launchRemotePlayback } from '$lib/player/launchRemotePlayback';
 import { launchLocalPlayback } from '$lib/player/launchLocalPlayback';
-import { launchNavidromePlayback } from '$lib/player/launchNavidromePlayback';
-import { launchPlexPlayback } from '$lib/player/launchPlexPlayback';
 import type { MenuItem } from '$lib/components/ContextMenu.svelte';
 import {
 	fetchAlbumBasic,
@@ -52,10 +45,8 @@ import {
 	fetchDiscovery,
 	fetchYouTubeAlbumLink,
 	fetchYouTubeTrackLinks,
-	fetchJellyfinMatch,
 	fetchLocalMatch,
-	fetchNavidromeMatch,
-	fetchPlexMatch,
+	fetchRemoteMatch,
 	fetchLastFm,
 	refreshAlbum
 } from './albumFetchers';
@@ -75,7 +66,7 @@ import {
 } from '$lib/queries/albums/EditionQueries.svelte';
 import { editionTrackRows, unmatchedFiles } from './albumEdition';
 import { getAlbumDownloadsQuery } from '$lib/queries/downloads/DownloadQueries.svelte';
-import { getHeldImportsQuery } from '$lib/queries/downloads/HeldQueries.svelte';
+import { getHeldEntriesQuery } from '$lib/queries/downloads/HeldQueries.svelte';
 import { isActiveDownloadStatus } from '$lib/queries/downloads/downloadStatus';
 import { authStore } from '$lib/stores/authStore.svelte';
 import { removeLibraryTrack } from '$lib/queries/library/LibraryMutations.svelte';
@@ -108,10 +99,10 @@ export function createAlbumPageState(albumIdGetter: () => string) {
 	let trackLinks = $state<YouTubeTrackLink[]>([]);
 	let albumLink = $state<YouTubeLink | null>(null);
 	let quota = $state<YouTubeQuotaStatus | null>(null);
-	let jellyfinMatch = $state<JellyfinAlbumMatch | null>(null);
+	let jellyfinMatch = $state<RemoteMatch | null>(null);
 	let localMatch = $state<LocalAlbumMatch | null>(null);
-	let navidromeMatch = $state<NavidromeAlbumMatch | null>(null);
-	let plexMatch = $state<PlexAlbumMatch | null>(null);
+	let navidromeMatch = $state<RemoteMatch | null>(null);
+	let plexMatch = $state<RemoteMatch | null>(null);
 	let loadingJellyfin = $state(false);
 	let loadingLocal = $state(false);
 	let loadingNavidrome = $state(false);
@@ -227,33 +218,47 @@ export function createAlbumPageState(albumIdGetter: () => string) {
 	});
 	// tracks this album downloaded but couldn't auto-verify (held for "import anyway"),
 	// keyed both ways so a track row can find its held candidate the same way owned files match
-	const heldImportsQuery = getHeldImportsQuery(albumIdGetter, () => downloadClientConfigured);
-	const headerManagementHeld = $derived.by(() => {
+	const heldQuery = getHeldEntriesQuery(
+		() => ({ releaseGroupMbid: albumIdGetter() }),
+		() => downloadClientConfigured && !!albumIdGetter()
+	);
+	const heldFiles = $derived(
+		(heldQuery.data?.entries ?? []).flatMap((entry) =>
+			entry.files.map((file): HeldFileInEntry => ({ entry, file }))
+		)
+	);
+	const headerHeldFiles = $derived.by(() => {
 		if (!headerDownloadTask) return [];
-		return (heldImportsQuery.data?.items ?? []).filter(
-			(item) => item.source_task_id === headerDownloadTask?.id && item.reason_kind === 'library'
-		);
+		return heldFiles
+			.filter((held) => held.file.source_task_id === headerDownloadTask?.id)
+			.map((held) => held.file);
 	});
 	const heldByRecording = $derived.by(() => {
-		const m = new SvelteMap<string, HeldImport>();
-		for (const h of heldImportsQuery.data?.items ?? []) {
-			if (h.recording_mbid) m.set(h.recording_mbid, h);
+		const m = new SvelteMap<string, HeldFileInEntry>();
+		for (const held of heldFiles) {
+			if (held.file.recording_mbid) m.set(held.file.recording_mbid, held);
 		}
 		return m;
 	});
 	const heldByPosition = $derived.by(() => {
-		const m = new SvelteMap<string, HeldImport>();
-		for (const h of heldImportsQuery.data?.items ?? []) {
-			m.set(getDiscTrackKey({ disc_number: h.disc_number, track_number: h.track_number }), h);
+		const m = new SvelteMap<string, HeldFileInEntry>();
+		for (const held of heldFiles) {
+			m.set(
+				getDiscTrackKey({
+					disc_number: held.file.disc_number,
+					track_number: held.file.track_number
+				}),
+				held
+			);
 		}
 		return m;
 	});
-	// A held track resolving ("import anyway" / discard) shrinks the held set. Refetch
+	// A held file resolving (import or discard) shrinks the held set. Refetch
 	// library status + source matches so a newly-owned track's play button appears in place,
 	// without a manual refresh (mirrors the settled-download effect above).
 	let lastHeldItemCount = -1;
 	$effect(() => {
-		const count = heldImportsQuery.data?.items?.length ?? 0;
+		const count = heldFiles.length;
 		untrack(() => {
 			if (lastHeldItemCount !== -1 && count < lastHeldItemCount) {
 				void libraryStatusQuery.refetch();
@@ -531,7 +536,7 @@ export function createAlbumPageState(albumIdGetter: () => string) {
 			if (integrations.jellyfin)
 				void doFetchSourceMatch(
 					signal,
-					() => fetchJellyfinMatch(albumId, signal),
+					() => fetchRemoteMatch('jellyfin', albumId, {}, signal),
 					(v) => (jellyfinMatch = v),
 					(v) => (loadingJellyfin = v),
 					'Jellyfin',
@@ -563,7 +568,8 @@ export function createAlbumPageState(albumIdGetter: () => string) {
 				void doFetchSourceMatch(
 					signal,
 					() =>
-						fetchNavidromeMatch(
+						fetchRemoteMatch(
+							'navidrome',
 							albumId,
 							{ albumTitle: album?.title, artistName: album?.artist_name },
 							signal
@@ -578,7 +584,8 @@ export function createAlbumPageState(albumIdGetter: () => string) {
 				void doFetchSourceMatch(
 					signal,
 					() =>
-						fetchPlexMatch(
+						fetchRemoteMatch(
+							'plex',
 							albumId,
 							{ albumTitle: album?.title, artistName: album?.artist_name },
 							signal
@@ -799,9 +806,9 @@ export function createAlbumPageState(albumIdGetter: () => string) {
 	function getTrackContextMenuItems(
 		track: { position: number; disc_number?: number | null; title: string },
 		resolvedLocal: LocalTrackInfo | null,
-		resolvedJellyfin: JellyfinTrackInfo | null,
-		resolvedNavidrome: NavidromeTrackInfo | null = null,
-		resolvedPlex: PlexTrackInfo | null = null
+		resolvedJellyfin: RemoteTrack | null,
+		resolvedNavidrome: RemoteTrack | null = null,
+		resolvedPlex: RemoteTrack | null = null
 	): MenuItem[] {
 		if (!album) return [];
 		return getTrackContextMenuItemsImpl(
@@ -905,7 +912,7 @@ export function createAlbumPageState(albumIdGetter: () => string) {
 
 	const jellyfinCallbacks: SourceCallbacks = buildSourceCallbacks(
 		() => jellyfinMatch,
-		launchJellyfinPlayback,
+		launchRemotePlayback,
 		'jellyfin',
 		albumGetter,
 		tracksGetters,
@@ -923,7 +930,7 @@ export function createAlbumPageState(albumIdGetter: () => string) {
 	);
 	const navidromeCallbacks: SourceCallbacks = buildSourceCallbacks(
 		() => navidromeMatch,
-		launchNavidromePlayback,
+		launchRemotePlayback,
 		'navidrome',
 		albumGetter,
 		tracksGetters,
@@ -932,7 +939,7 @@ export function createAlbumPageState(albumIdGetter: () => string) {
 	);
 	const plexCallbacks: SourceCallbacks = buildSourceCallbacks(
 		() => plexMatch,
-		launchPlexPlayback,
+		launchRemotePlayback,
 		'plex',
 		albumGetter,
 		tracksGetters,
@@ -1124,8 +1131,8 @@ export function createAlbumPageState(albumIdGetter: () => string) {
 		get headerDownloadTask() {
 			return headerDownloadTask;
 		},
-		get headerManagementHeld() {
-			return headerManagementHeld;
+		get headerHeldFiles() {
+			return headerHeldFiles;
 		},
 		get trackDownloadTasks() {
 			return trackDownloadTasks;

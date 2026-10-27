@@ -5,13 +5,16 @@
 //! scans on wall-clock guesses: every tick anchors on the latest
 //! filesystem terminal run, and only fires when the interval fully elapsed.
 //!
-//! Timezone note: v2 resolves IANA names through zoneinfo. Without a tz
-//! database this port supports `UTC` and numeric offsets (`+HH:MM`,
-//! `-HHMM`, `UTC+HH:MM`) for daily schedules; anything else answers "not
-//! due" instead of guessing. Interval frequencies are timezone-free and
-//! ported exactly, including the absolute-seconds DST note.
+//! Daily schedules run at the set time in the server's time zone, read
+//! from the system zone database. Interval frequencies are time-zone free
+//! and ported exactly, including the absolute-seconds DST note.
 
 use std::collections::HashMap;
+
+use droppedneedle_kernel::runtime_config::sections::ScanFrequency;
+use jiff::Timestamp;
+use jiff::civil::Date;
+use jiff::tz::TimeZone;
 
 use super::models::{Disposition, EffectivePolicy, ScanKind, ScanRequest, ScanScope, ScanTrigger};
 use super::roots::RootRegistry;
@@ -19,88 +22,59 @@ use super::roots::RootRegistry;
 /// Schedule settings for automatic scans.
 #[derive(Debug, Clone)]
 pub struct ScheduleSettings {
-    pub frequency: String,
+    pub frequency: ScanFrequency,
     pub daily_time: String,
-    pub timezone_name: String,
+    /// The zone a daily time is read in.
+    pub zone: TimeZone,
 }
 
 impl ScheduleSettings {
-    pub fn new(frequency: &str, daily_time: &str, timezone_name: &str) -> Self {
+    pub fn new(frequency: ScanFrequency, daily_time: &str, zone: TimeZone) -> Self {
         Self {
-            frequency: frequency.to_owned(),
+            frequency,
             daily_time: daily_time.to_owned(),
-            timezone_name: timezone_name.to_owned(),
+            zone,
         }
     }
 
     pub fn manual() -> Self {
-        Self::new("manual", "03:00", "UTC")
+        Self::new(ScanFrequency::Manual, "03:00", TimeZone::UTC)
     }
 }
 
-fn interval_seconds(frequency: &str) -> Option<f64> {
+/// The rolling gap of an interval frequency; `None` for `manual` and
+/// `daily`.
+fn interval_seconds(frequency: ScanFrequency) -> Option<f64> {
     match frequency {
-        "5min" => Some(300.0),
-        "10min" => Some(600.0),
-        "30min" => Some(1_800.0),
-        "1hr" => Some(3_600.0),
-        "6hr" => Some(21_600.0),
-        "12hr" => Some(43_200.0),
-        "24hr" => Some(86_400.0),
-        "3d" => Some(259_200.0),
-        "7d" => Some(604_800.0),
-        _ => None,
+        ScanFrequency::Min5 => Some(300.0),
+        ScanFrequency::Min10 => Some(600.0),
+        ScanFrequency::Min30 => Some(1_800.0),
+        ScanFrequency::Hr1 => Some(3_600.0),
+        ScanFrequency::Hr6 => Some(21_600.0),
+        ScanFrequency::Hr12 => Some(43_200.0),
+        ScanFrequency::Hr24 => Some(86_400.0),
+        ScanFrequency::Days3 => Some(259_200.0),
+        ScanFrequency::Days7 => Some(604_800.0),
+        ScanFrequency::Manual | ScanFrequency::Daily => None,
     }
-}
-
-/// Parse a supported timezone name to a fixed UTC offset in seconds.
-/// `UTC`/`Z` is zero; numeric forms carry their offset. IANA names are
-/// not resolvable here and return `None` (documented limitation above).
-pub fn utc_offset_seconds(timezone_name: &str) -> Option<i64> {
-    let name = timezone_name.trim();
-    if name.eq_ignore_ascii_case("utc")
-        || name.eq_ignore_ascii_case("z")
-        || name.eq_ignore_ascii_case("etc/utc")
-    {
-        return Some(0);
-    }
-    let stripped = name
-        .strip_prefix("UTC")
-        .or_else(|| name.strip_prefix("utc"))
-        .unwrap_or(name);
-    let (sign, digits) = match stripped.strip_prefix('+') {
-        Some(rest) => (1i64, rest),
-        None => match stripped.strip_prefix('-') {
-            Some(rest) => (-1i64, rest),
-            None => return None,
-        },
-    };
-    let compact: String = digits.chars().filter(|c| *c != ':').collect();
-    if compact.len() != 4 || !compact.chars().all(|c| c.is_ascii_digit()) {
-        return None;
-    }
-    let hours: i64 = compact[0..2].parse().ok()?;
-    let minutes: i64 = compact[2..4].parse().ok()?;
-    if hours > 23 || minutes > 59 {
-        return None;
-    }
-    Some(sign * (hours * 3_600 + minutes * 60))
 }
 
 /// Seconds until the next automatic scan is due, anchored on the latest
-/// terminal run (v2 `seconds_until_due`). `None` means manual, unknown
-/// frequency, or an unresolvable timezone: never due.
+/// terminal run (v2 `seconds_until_due`). `None` means manual: never due.
+/// A daily time is read in `zone`. On a day a clock change skips it, the
+/// scan runs as far after the change as the time was past it (02:30 for a
+/// lost 01:30); on a day the time comes twice, it runs the first time.
 pub fn seconds_until_due(
-    frequency: &str,
+    frequency: ScanFrequency,
     daily_time: &str,
     terminal_at: Option<f64>,
     now: f64,
-    timezone_name: &str,
+    zone: &TimeZone,
 ) -> Option<f64> {
-    if frequency == "manual" {
+    if frequency == ScanFrequency::Manual {
         return None;
     }
-    if frequency != "daily" {
+    if frequency != ScanFrequency::Daily {
         let interval = interval_seconds(frequency)?;
         let Some(terminal) = terminal_at else {
             return Some(0.0);
@@ -109,35 +83,31 @@ pub fn seconds_until_due(
         // DST transitions (v2 schedule-service note).
         return Some((terminal + interval - now).max(0.0));
     }
-    let offset = utc_offset_seconds(timezone_name)? as f64;
     let (hour, minute) = parse_daily_time(daily_time);
-    let local_now = now + offset;
-    let day_index = (local_now / 86_400.0).floor();
-    let day_start = day_index * 86_400.0;
-    match terminal_at {
-        None => {
-            let today = day_start + (hour * 3_600 + minute * 60) as f64;
-            Some(if local_now < today {
-                today - local_now
-            } else {
-                0.0
-            })
-        }
-        Some(terminal) => {
-            let terminal_day = ((terminal + offset) / 86_400.0).floor();
-            let candidate = (terminal_day + 1.0) * 86_400.0 + (hour * 3_600 + minute * 60) as f64;
-            Some((candidate - local_now).max(0.0))
-        }
-    }
+    let local_day = |at: f64| {
+        Timestamp::from_millisecond((at * 1_000.0) as i64)
+            .ok()
+            .map(|instant| instant.to_zoned(zone.clone()).date())
+    };
+    let run_on = |day: Date| {
+        zone.to_zoned(day.at(hour, minute, 0, 0))
+            .ok()
+            .map(|run| run.timestamp().as_millisecond() as f64 / 1_000.0)
+    };
+    let due = match terminal_at {
+        None => run_on(local_day(now)?)?,
+        Some(terminal) => run_on(local_day(terminal)?.tomorrow().ok()?)?,
+    };
+    Some((due - now).max(0.0))
 }
 
-fn parse_daily_time(daily_time: &str) -> (i64, i64) {
+fn parse_daily_time(daily_time: &str) -> (i8, i8) {
     // v2 falls back to 03:00 on any parse failure.
     daily_time
         .split_once(':')
         .and_then(|(hour, minute)| {
-            let hour: i64 = hour.parse().ok()?;
-            let minute: i64 = minute.parse().ok()?;
+            let hour: i8 = hour.parse().ok()?;
+            let minute: i8 = minute.parse().ok()?;
             if (0..=23).contains(&hour) && (0..=59).contains(&minute) {
                 Some((hour, minute))
             } else {
@@ -217,15 +187,15 @@ pub fn tick<F>(
 where
     F: FnOnce(ScanRequest) -> Result<Disposition, String>,
 {
-    if settings.frequency == "manual" {
+    if settings.frequency == ScanFrequency::Manual {
         return false;
     }
     let remaining = seconds_until_due(
-        &settings.frequency,
+        settings.frequency,
         &settings.daily_time,
         terminal_at,
         now,
-        &settings.timezone_name,
+        &settings.zone,
     );
     match remaining {
         None => return false,
@@ -268,24 +238,32 @@ mod tests {
     #[test]
     fn interval_math_anchors_on_terminal() {
         assert_eq!(
-            seconds_until_due("manual", "03:00", None, 100.0, "UTC"),
+            seconds_until_due(ScanFrequency::Manual, "03:00", None, 100.0, &TimeZone::UTC),
             None
         );
         assert_eq!(
-            seconds_until_due("1hr", "03:00", None, 100.0, "UTC"),
+            seconds_until_due(ScanFrequency::Hr1, "03:00", None, 100.0, &TimeZone::UTC),
             Some(0.0)
         );
         assert_eq!(
-            seconds_until_due("1hr", "03:00", Some(0.0), 100.0, "UTC"),
+            seconds_until_due(
+                ScanFrequency::Hr1,
+                "03:00",
+                Some(0.0),
+                100.0,
+                &TimeZone::UTC
+            ),
             Some(3_500.0)
         );
         assert_eq!(
-            seconds_until_due("1hr", "03:00", Some(0.0), 10_000.0, "UTC"),
+            seconds_until_due(
+                ScanFrequency::Hr1,
+                "03:00",
+                Some(0.0),
+                10_000.0,
+                &TimeZone::UTC
+            ),
             Some(0.0)
-        );
-        assert_eq!(
-            seconds_until_due("bogus", "03:00", None, 100.0, "UTC"),
-            None
         );
     }
 
@@ -294,33 +272,31 @@ mod tests {
         // 2024-01-01T00:00:00Z, target 03:00, no terminal yet.
         let monday = 1_704_067_200.0;
         assert_eq!(
-            seconds_until_due("daily", "03:00", None, monday, "UTC"),
+            seconds_until_due(ScanFrequency::Daily, "03:00", None, monday, &TimeZone::UTC),
             Some(10_800.0)
         );
         // Past today's target with no terminal: due now.
         assert_eq!(
-            seconds_until_due("daily", "03:00", None, monday + 20_000.0, "UTC"),
+            seconds_until_due(
+                ScanFrequency::Daily,
+                "03:00",
+                None,
+                monday + 20_000.0,
+                &TimeZone::UTC
+            ),
             Some(0.0)
         );
         // Terminal Monday noon: next due Tuesday 03:00.
         assert_eq!(
             seconds_until_due(
-                "daily",
+                ScanFrequency::Daily,
                 "03:00",
                 Some(monday + 43_200.0),
                 monday + 43_200.0,
-                "UTC"
+                &TimeZone::UTC
             ),
             Some(54_000.0)
         );
-        // Unknown timezone never fires.
-        assert_eq!(
-            seconds_until_due("daily", "03:00", None, monday, "America/New_York"),
-            None
-        );
-        // Numeric offsets resolve.
-        assert_eq!(utc_offset_seconds("UTC+02:00"), Some(7_200));
-        assert_eq!(utc_offset_seconds("-0530"), Some(-19_800));
     }
 
     #[test]
@@ -340,7 +316,7 @@ mod tests {
 
     #[test]
     fn tick_fires_only_when_due() {
-        let settings = ScheduleSettings::new("1hr", "03:00", "UTC");
+        let settings = ScheduleSettings::new(ScanFrequency::Hr1, "03:00", TimeZone::UTC);
         let fired = tick(
             |_| Ok(Disposition::Started),
             &registry(),

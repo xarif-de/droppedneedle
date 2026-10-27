@@ -1,6 +1,6 @@
 //! The statements of the download journal (`download_tasks`,
 //! `download_attempts`, `download_idempotency_keys`, `download_quarantine`)
-//! and of the queue and held-file reads built on it.
+//! and of the queue reads built on it.
 
 use droppedneedle_kernel::db::statement::ListLen;
 
@@ -42,6 +42,11 @@ droppedneedle_kernel::sql! {
     /// The optional detail columns of one task (`?1`).
     pub(super) TASK_DETAILS = "SELECT release_mbid, artist_mbid, year, track_title \
              FROM download_tasks WHERE id = ?1";
+    /// One task's stored plan (`?1`).
+    pub(super) TASK_PLAN = "SELECT plan_json FROM download_tasks WHERE id = ?1";
+    /// Replace one task's plan.
+    pub(super) SET_TASK_PLAN = "UPDATE download_tasks SET plan_json = ?1, updated_at = ?2 \
+             WHERE id = ?3";
     /// Tasks in any of the given statuses.
     family TASKS_IN = tasks_in;
     /// Move a live task to a status. Terminal rows never move: the guard is
@@ -66,6 +71,38 @@ droppedneedle_kernel::sql! {
                AND EXISTS (SELECT 1 FROM download_attempts a WHERE a.task_id = t.id \
                  AND a.handle_json != '' \
                  AND a.state IN ('preserved', 'cleanup_pending')))";
+    /// Take a reimport's attempt (`?2`) back from cleanup: kept files
+    /// stay kept while the reimport reads them. Nothing when cleanup holds
+    /// its lease or moved it on.
+    pub(super) CLAIM_REIMPORT = "UPDATE download_attempts \
+             SET state = 'preserved', disposition = 'preserve', \
+                 lease_owner = NULL, lease_expires_at = NULL, \
+                 updated_at = ?1, row_revision = row_revision + 1 \
+             WHERE id = ?2 \
+               AND state IN ('preserved', 'cleanup_pending') \
+               AND (lease_owner IS NULL OR lease_expires_at IS NULL \
+                    OR lease_expires_at <= ?1)";
+    /// Hand kept files to cleanup: those of a cancelled or removed task,
+    /// and those kept since before `?2` whose task is not running. Each
+    /// moved attempt as (id, task id).
+    pub(super) RELEASE_KEPT = "UPDATE download_attempts \
+             SET state = 'cleanup_pending', disposition = 'discard', \
+                 lease_owner = NULL, lease_expires_at = NULL, next_retry_at = ?1, \
+                 updated_at = ?1, row_revision = row_revision + 1 \
+             WHERE state = 'preserved' \
+               AND (NOT EXISTS (SELECT 1 FROM download_tasks t \
+                      WHERE t.id = download_attempts.task_id AND t.status != 'cancelled') \
+                    OR (COALESCE(completed_at, updated_at) < ?2 \
+                        AND NOT EXISTS (SELECT 1 FROM download_tasks t \
+                          WHERE t.id = download_attempts.task_id \
+                            AND t.status IN ('queued', 'downloading', 'processing')))) \
+             RETURNING id, task_id";
+    /// Hand one task's (`?2`) kept files to cleanup.
+    pub(super) RELEASE_TASK_KEPT = "UPDATE download_attempts \
+             SET state = 'cleanup_pending', disposition = 'discard', \
+                 lease_owner = NULL, lease_expires_at = NULL, next_retry_at = ?1, \
+                 updated_at = ?1, row_revision = row_revision + 1 \
+             WHERE task_id = ?2 AND state = 'preserved'";
     /// A failed or partial task back to processing for a reimport.
     pub(super) BEGIN_REIMPORT = "UPDATE download_tasks SET status = 'processing', \
              error_message = NULL, outcome_code = NULL, completed_at = NULL, last_polled_at = ?1, \
@@ -134,10 +171,10 @@ droppedneedle_kernel::sql! {
              WHERE state = 'needs_attention' \
                 OR (state IN ('cleanup_pending', 'workspace_removed') \
                     AND cleanup_failures >= 3)";
-    /// Live cleanup debt for one client job.
+    /// Live cleanup debt for one client job; kept files count.
     pub(super) CLEANUP_DEBT = "SELECT COUNT(*) FROM download_attempts \
              WHERE source = ?1 AND task_id = ?2 AND job_name = ?3 \
-               AND state NOT IN ('complete', 'preserved')";
+               AND state != 'complete'";
     /// Cancel a live task.
     pub(super) CANCEL_TASK = "UPDATE download_tasks \
              SET status = 'cancelled', last_polled_at = ?1, completed_at = ?1, \
@@ -215,8 +252,6 @@ droppedneedle_kernel::sql! {
              ORDER BY created_at DESC, rowid DESC LIMIT ?4 OFFSET ?5";
     /// Attempt counts and cleanup summaries per task.
     family ATTEMPT_FACTS = attempt_facts;
-    /// Tasks that left a file in the held list.
-    family HELD_FACTS = held_facts;
     /// The newest import decision per task.
     family DECISION_FACTS = decision_facts;
     /// The admins' activity revision.
@@ -230,9 +265,6 @@ droppedneedle_kernel::sql! {
              COALESCE(SUM(status IN ('queued', 'downloading', 'processing')), 0), \
              COALESCE(SUM(status = 'failed'), 0) \
              FROM download_tasks WHERE (?1 IS NULL OR user_id = ?1)";
-    /// Held files for a viewer (`?1`, NULL for all).
-    pub(super) HELD_COUNT = "SELECT COUNT(*) FROM held_imports \
-             WHERE status = 'held' AND (?1 IS NULL OR user_id = ?1)";
     /// The 20 albums that landed most recently for a viewer (`?1`).
     pub(super) LANDED_ALBUMS = "SELECT release_group_mbid FROM download_tasks \
              WHERE status IN ('completed', 'partial') AND release_group_mbid != '' \
@@ -269,60 +301,12 @@ droppedneedle_kernel::sql! {
     pub(super) LAST_LANDING_OF_ATTEMPT = DECISION_ROW + " WHERE task_id = ?1 \
              AND attempt_id IS ?2 AND outcome != 'deferred' \
              ORDER BY decided_at DESC, id DESC LIMIT 1";
-    /// Every distinct reason spelling stored on open holds, decisions,
-    /// task outcomes and drop items.
-    pub(super) STORED_REASONS = "SELECT reason FROM held_imports WHERE status = 'held' \
-             UNION SELECT reason_code FROM download_import_decisions \
+    /// Every distinct reason spelling stored on decisions, task outcomes
+    /// and drop items.
+    pub(super) STORED_REASONS = "SELECT reason_code FROM download_import_decisions \
                WHERE reason_code IS NOT NULL \
              UNION SELECT outcome_code FROM download_tasks WHERE outcome_code IS NOT NULL \
              UNION SELECT reason_code FROM drop_import_items WHERE reason_code IS NOT NULL";
-    /// A new held-import row.
-    pub(super) INSERT_HELD = "INSERT INTO held_imports \
-             (user_id, held_path, reason, source_task_id, release_group_mbid, \
-              status, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, 'held', ?6)";
-    /// Whether a task (`?1`) still has a file held for review.
-    pub(super) UNRESOLVED_HELD_FOR_TASK = "SELECT COUNT(*) FROM held_imports \
-             WHERE source_task_id = ?1 AND status = 'held'";
-    /// The stored spellings of every reason of the Library kind: holds
-    /// our side caused, which can be retried as they are.
-    pub(super) fragment LIBRARY_REASONS = "('target_occupied', 'upgrade_blocked', \
-             'library_changed', 'library_unavailable', 'naming_script_failed', \
-             'library_folder_missing', 'local_fault')";
-    /// `(task_id, user_id)` library holds due at `?1`, oldest first, at
-    /// most `?2`.
-    pub(super) DUE_HELD_UNITS = "SELECT source_task_id, user_id FROM held_imports \
-             WHERE status = 'held' AND source_task_id IS NOT NULL \
-               AND reason IN " + LIBRARY_REASONS + " \
-               AND management_next_retry_at IS NOT NULL \
-               AND management_next_retry_at <= ?1 \
-             GROUP BY source_task_id, user_id \
-             ORDER BY MIN(management_next_retry_at), MIN(id) LIMIT ?2";
-    /// Schedule the next management retry of held rows.
-    family SCHEDULE_HELD_RETRY = schedule_held_retry;
-    /// Every held-file column, for `HeldRow::from_row`.
-    pub(super) fragment HELD_ROW = "SELECT id, user_id, release_group_mbid, release_mbid, \
-             release_track_mbid, recording_mbid, track_number, disc_number, track_title, \
-             artist_name, album_title, year, held_path, original_filename, file_format, \
-             duration_seconds, expected_duration_seconds, reason, \
-             reason_detail, evidence_title, evidence_artist, evidence_score, source, \
-             source_task_id, origin, management_retry_count, management_next_retry_at, \
-             created_at FROM held_imports";
-    /// Held files for a viewer (`?1`), album (`?2`) and download (`?3`),
-    /// each NULL for any, newest first.
-    pub(super) HELD_LIST = HELD_ROW + " WHERE status = 'held' \
-             AND (?1 IS NULL OR user_id = ?1) \
-             AND (?2 IS NULL OR lower(release_group_mbid) = lower(?2)) \
-             AND (?3 IS NULL OR source_task_id = ?3) \
-             ORDER BY created_at DESC, id DESC";
-    /// One held file (`?1`) still waiting for a decision.
-    pub(super) HELD_BY_ID = HELD_ROW + " WHERE id = ?1 AND status = 'held'";
-    /// Files still held for reason `?1` by owner `?2`'s other track
-    /// downloads (not `?4`) of recording `?3`.
-    pub(super) HELD_FOR_RECORDING = HELD_ROW + " WHERE status = 'held' AND reason = ?1 \
-             AND source_task_id IN (SELECT id FROM download_tasks \
-               WHERE user_id = ?2 AND download_type = 'track' \
-                 AND recording_mbid = ?3 AND id != ?4)";
 }
 
 /// `?, ?, ...` for a list of `len` values.
@@ -333,17 +317,6 @@ fn marks(len: ListLen) -> String {
 /// Tasks in any of `statuses` statuses.
 pub(super) fn tasks_in(statuses: ListLen) -> String {
     format!("{TASK_ROW} WHERE status IN ({})", marks(statuses))
-}
-
-/// Set the retry count and time (the first two values) on the held
-/// library rows among a list of ids.
-pub(super) fn schedule_held_retry(ids: ListLen) -> String {
-    format!(
-        "UPDATE held_imports SET management_retry_count = ?, \
-         management_next_retry_at = ? WHERE id IN ({}) \
-         AND status = 'held' AND reason IN {LIBRARY_REASONS}",
-        marks(ids)
-    )
 }
 
 /// Per task: attempts that reached a client, and v2's cleanup summary.
@@ -363,15 +336,6 @@ pub(super) fn attempt_facts(tasks: ListLen) -> String {
     )
 }
 
-/// Tasks among the list that left a file in the held list.
-pub(super) fn held_facts(tasks: ListLen) -> String {
-    format!(
-        "SELECT DISTINCT source_task_id FROM held_imports \
-         WHERE status = 'held' AND source_task_id IN ({})",
-        marks(tasks)
-    )
-}
-
 /// The newest import decision of each task in the list.
 pub(super) fn decision_facts(tasks: ListLen) -> String {
     format!(
@@ -383,24 +347,4 @@ pub(super) fn decision_facts(tasks: ListLen) -> String {
            ORDER BY n.decided_at DESC, n.id DESC LIMIT 1)",
         marks(tasks)
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::reason::{Reason, ReasonKind};
-
-    #[test]
-    fn library_reasons_list_exactly_the_library_kind() {
-        let listed = Reason::ALL
-            .into_iter()
-            .filter(|reason| reason.kind() == ReasonKind::Library)
-            .map(|reason| format!("'{}'", reason.code()))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let text = super::LIBRARY_REASONS
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
-        assert_eq!(text, format!("({listed})"));
-    }
 }

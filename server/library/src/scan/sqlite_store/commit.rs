@@ -41,7 +41,7 @@ use crate::corrections::continuation::{Scope, continue_tracks};
 use crate::corrections::placement::place_scanned;
 use crate::corrections::release_join::join_replaced;
 use crate::corrections::retag_merge::{JoinCause, MergeOutcome, album_has_record, merge_retagged};
-use crate::identify::artist_links::mark_stale;
+use crate::identify::artist_links::{mark_stale, placeholder};
 use crate::identify::queue::offer_again;
 use crate::identify::sqlite::{
     chosen_matches_differ, match_chosen, offer_album, release_chosen, retarget_references,
@@ -55,6 +55,7 @@ use crate::scan::naming::{
     album_grouping_key, album_name_key, grouping_directory, parse_names_for_row,
 };
 use crate::scan::store::{EditionFill, IndexWindow, WindowOutcome};
+use crate::tags::{AudioArtistCredit, AudioTag};
 use droppedneedle_kernel::db::savepoint;
 
 pub(super) use crate::scan::naming::{UNKNOWN_ARTIST, UNKNOWN_ARTIST_ID, stable_id};
@@ -104,25 +105,55 @@ struct Place<'a> {
     directory: &'a str,
 }
 
-/// A track this run walked past: a scope of the run whose discovery
-/// completed covers its path, and the walk did not see the file.
-macro_rules! walked_past {
+/// Journal row `j` keeps scope `s` from judging its track: it is still
+/// open, or it moved after the scope's walk began. The states listed are
+/// the publisher's terminal ones (`JournalState::is_terminal`).
+macro_rules! fenced_by {
     () => {
-        "(EXISTS (SELECT 1 FROM library_scan_run_scopes s WHERE s.run_id = ?1 \
-          AND s.root_id = t.root_id AND s.discovery_state = 'completed' \
-          AND (s.relative_path = '.' OR t.relative_path = s.relative_path \
-            OR substr(t.relative_path, 1, length(s.relative_path) + 1) = s.relative_path || '/')) \
-        AND NOT EXISTS (SELECT 1 FROM library_scan_inventory i WHERE i.run_id = ?1 \
-          AND i.root_id = t.root_id AND i.relative_path = t.relative_path))"
+        "(j.state NOT IN ('cleaned', 'compensated', 'needs_attention') \
+          OR j.fence_revision > s.walk_revision)"
     };
 }
+pub(super) use fenced_by;
+
+/// The one rule for "this run walked past the track" (aliased `t`; the
+/// run id is the parameter `$run`): the walk did not see the file, and a
+/// scope of the run covering its path finished its walk with a recorded
+/// walk revision, while no library write naming the track is still open
+/// or moved after that walk began. A write names a track by its journal
+/// row's `track_id`, or, for a removal or a replaced file, by the row's
+/// replacement. The journal probe runs last: it is the rarest to match.
+macro_rules! walked_past {
+    ($run:literal) => {
+        concat!(
+            "(NOT EXISTS (SELECT 1 FROM library_scan_inventory i WHERE i.run_id = ",
+            $run,
+            " AND i.root_id = t.root_id AND i.relative_path = t.relative_path) \
+             AND EXISTS (SELECT 1 FROM library_scan_run_scopes s WHERE s.run_id = ",
+            $run,
+            " AND s.root_id = t.root_id AND s.discovery_state = 'completed' \
+              AND s.walk_revision IS NOT NULL \
+              AND (s.relative_path = '.' OR t.relative_path = s.relative_path \
+                OR substr(t.relative_path, 1, length(s.relative_path) + 1) = s.relative_path || '/') \
+              AND NOT EXISTS (SELECT 1 FROM library_publish_journal j \
+                WHERE j.track_id = t.id AND ",
+            $crate::scan::sqlite_store::commit::fenced_by!(),
+            ") AND NOT EXISTS (SELECT 1 FROM library_publish_replacements r \
+                JOIN library_publish_journal j ON j.id = r.journal_id \
+                WHERE r.replaced_track_id = t.id AND ",
+            $crate::scan::sqlite_store::commit::fenced_by!(),
+            ")))"
+        )
+    };
+}
+pub(super) use walked_past;
 
 /// A track still counts as present unless it is missing or this run
 /// walked its folder to the end without seeing it, and did not hold back a
 /// folder covering it.
 const TRACK_PRESENT: &str = concat!(
     "(t.availability = 'indexed' AND NOT (",
-    walked_past!(),
+    walked_past!("?1"),
     " AND NOT ",
     held_back!("?1", "t"),
     "))"
@@ -292,7 +323,7 @@ struct TrackKey<'a> {
 
 /// A track this run walked past, whether or not the mass-missing guard
 /// held its scope back.
-pub(super) const WALKED_PAST: &str = walked_past!();
+pub(super) const WALKED_PAST: &str = walked_past!("?1");
 
 /// A track is gone when it is already marked missing, or when this run
 /// walked its folder to the end without seeing the file. A folder the
@@ -300,7 +331,7 @@ pub(super) const WALKED_PAST: &str = walked_past!();
 /// scope or a mount found empty, does not count as walked.
 pub(super) const TRACK_GONE: &str = concat!(
     "(t.availability = 'missing' OR (t.availability = 'indexed' AND ",
-    walked_past!(),
+    walked_past!("?1"),
     " AND NOT ",
     held_back!("?1", "t"),
     "))"
@@ -801,6 +832,172 @@ pub(crate) struct Adopted<'a> {
     pub album_id: Option<&'a str>,
 }
 
+/// A file's tag revision: a digest of its tag values, each under its name
+/// in a fixed order. Pending contributions, previews and edition decisions
+/// compare it to see a tag change. An absent value (no text, zero, an
+/// empty list, an unset flag) adds nothing, so a field added here later
+/// moves only the revisions of files that carry it. Edition hints are kept
+/// beside the row and left out, so reading them is never a tag change.
+fn tag_revision(tag: &AudioTag) -> String {
+    let AudioTag {
+        title,
+        artist,
+        album,
+        track_number,
+        album_artist,
+        disc_number,
+        year,
+        genre,
+        musicbrainz_release_group_id,
+        musicbrainz_release_id,
+        musicbrainz_recording_id,
+        musicbrainz_release_track_id,
+        musicbrainz_artist_id,
+        musicbrainz_album_artist_id,
+        acoustid_id,
+        compilation,
+        release_type,
+        title_sort,
+        artist_sort,
+        album_sort,
+        album_artist_sort,
+        disc_subtitle,
+        original_release_date,
+        replaygain_track_gain,
+        replaygain_album_gain,
+        replaygain_track_peak,
+        replaygain_album_peak,
+        genres,
+        artists,
+        album_artists,
+        musicbrainz_artist_ids,
+        musicbrainz_album_artist_ids,
+        artists_listed,
+        album_artists_listed,
+        edition: _,
+    } = tag;
+    let mut fields = TagFields::default();
+    fields.text("title", title);
+    fields.text("artist", artist);
+    fields.text("album", album);
+    fields.number("track_number", *track_number);
+    fields.optional("album_artist", album_artist);
+    fields.number("disc_number", *disc_number);
+    if let Some(year) = year {
+        fields.put("year", &year.to_le_bytes());
+    }
+    fields.optional("genre", genre);
+    fields.optional("musicbrainz_release_group_id", musicbrainz_release_group_id);
+    fields.optional("musicbrainz_release_id", musicbrainz_release_id);
+    fields.optional("musicbrainz_recording_id", musicbrainz_recording_id);
+    fields.optional("musicbrainz_release_track_id", musicbrainz_release_track_id);
+    fields.optional("musicbrainz_artist_id", musicbrainz_artist_id);
+    fields.optional("musicbrainz_album_artist_id", musicbrainz_album_artist_id);
+    fields.optional("acoustid_id", acoustid_id);
+    fields.flag("compilation", *compilation);
+    fields.optional("release_type", release_type);
+    fields.optional("title_sort", title_sort);
+    fields.optional("artist_sort", artist_sort);
+    fields.optional("album_sort", album_sort);
+    fields.optional("album_artist_sort", album_artist_sort);
+    fields.optional("disc_subtitle", disc_subtitle);
+    fields.optional("original_release_date", original_release_date);
+    fields.real("replaygain_track_gain", *replaygain_track_gain);
+    fields.real("replaygain_album_gain", *replaygain_album_gain);
+    fields.real("replaygain_track_peak", *replaygain_track_peak);
+    fields.real("replaygain_album_peak", *replaygain_album_peak);
+    fields.texts("genres", genres);
+    fields.credits("artists", artists);
+    fields.credits("album_artists", album_artists);
+    fields.texts("musicbrainz_artist_ids", musicbrainz_artist_ids);
+    fields.texts("musicbrainz_album_artist_ids", musicbrainz_album_artist_ids);
+    fields.flag("artists_listed", *artists_listed);
+    fields.flag("album_artists_listed", *album_artists_listed);
+    Sha256::digest(&fields.0)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Named, length-prefixed values, the input of a tag revision.
+#[derive(Default)]
+struct TagFields(Vec<u8>);
+
+impl TagFields {
+    fn put(&mut self, name: &str, value: &[u8]) {
+        self.0.extend_from_slice(name.as_bytes());
+        self.0.push(0);
+        self.0
+            .extend_from_slice(&(value.len() as u64).to_le_bytes());
+        self.0.extend_from_slice(value);
+    }
+
+    fn text(&mut self, name: &str, value: &str) {
+        if !value.is_empty() {
+            self.put(name, value.as_bytes());
+        }
+    }
+
+    fn optional(&mut self, name: &str, value: &Option<String>) {
+        if let Some(value) = value {
+            self.put(name, value.as_bytes());
+        }
+    }
+
+    fn number(&mut self, name: &str, value: u32) {
+        if value != 0 {
+            self.put(name, &value.to_le_bytes());
+        }
+    }
+
+    fn real(&mut self, name: &str, value: Option<f64>) {
+        if let Some(value) = value {
+            self.put(name, &value.to_bits().to_le_bytes());
+        }
+    }
+
+    fn flag(&mut self, name: &str, value: bool) {
+        if value {
+            self.put(name, &[1]);
+        }
+    }
+
+    fn texts(&mut self, name: &str, values: &[String]) {
+        if values.is_empty() {
+            return;
+        }
+        let mut list = TagFields::default();
+        for value in values {
+            list.put("", value.as_bytes());
+        }
+        self.put(name, &list.0);
+    }
+
+    fn credits(&mut self, name: &str, credits: &[AudioArtistCredit]) {
+        if credits.is_empty() {
+            return;
+        }
+        let mut list = TagFields::default();
+        for credit in credits {
+            let AudioArtistCredit {
+                name,
+                credited_name,
+                sort_name,
+                musicbrainz_artist_id,
+                join_phrase,
+            } = credit;
+            let mut one = TagFields::default();
+            one.text("name", name);
+            one.optional("credited_name", credited_name);
+            one.optional("sort_name", sort_name);
+            one.optional("musicbrainz_artist_id", musicbrainz_artist_id);
+            one.text("join_phrase", join_phrase);
+            list.put("", &one.0);
+        }
+        self.put(name, &list.0);
+    }
+}
+
 /// Write one file's catalog rows.
 fn write_item(
     tx: &Connection,
@@ -1057,23 +1254,11 @@ fn write_item(
             }
         }
     };
-    // Edition hints are kept beside the row and left out of the revision,
-    // so reading them for the first time does not count as a tag change.
-    // Drafts and sealed decisions compare this digest, so the text hashed
-    // for unchanged tags must never change (see `EditionTags`'s `Debug`).
-    let tag_revision = {
-        let mut revised = tag.clone();
-        revised.edition = Default::default();
-        let digest = Sha256::digest(format!("{revised:?}").as_bytes());
-        digest
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>()
-    };
+    let tag_revision = tag_revision(tag);
     let file_format = crate::tags::format_for_path(std::path::Path::new(&item.relative_path))
         .map(|format| format.as_str().to_owned())
         .unwrap_or_else(|_| "unknown".to_owned());
-    let policy = policy_to_str(item.effective_policy);
+    let policy = item.effective_policy.as_str();
     tx.prepare_cached(
         "INSERT INTO local_tracks (id, local_album_id, root_id, file_path, relative_path, \
          path_hash, file_size_bytes, file_mtime_ns, stat_revision, stat_revision_kind, \
@@ -1931,7 +2116,7 @@ pub(super) fn owe_end_passes(tx: &Connection, run_id: &str, now: f64) -> rusqlit
         .execute(params![
             run_id,
             END_PASSES[0].name,
-            failure_codes::RUN_END_PENDING,
+            FailureCode::RunEndPending,
             now
         ])?;
     Ok(())
@@ -2514,7 +2699,7 @@ fn mark_window(
     window: &IndexWindow,
     indexed: &[(String, String, String)],
     failed: &[(String, String, &'static str)],
-    extra_counters: &[(&'static str, i64)],
+    extra_counters: &[(Counter, i64)],
 ) -> rusqlite::Result<()> {
     let mut mark_indexed = tx.prepare_cached(
         "UPDATE library_scan_inventory SET processing_state = 'indexed', local_track_id = ?4 \
@@ -2548,13 +2733,16 @@ fn mark_window(
         window.through.1
     ])?;
     let mut summed: HashMap<&'static str, i64> = HashMap::new();
-    let window_counters = window.counters.iter().map(|(_, name, delta)| (name, delta));
-    for (name, delta) in
-        window_counters.chain(extra_counters.iter().map(|(name, delta)| (name, delta)))
-    {
-        if let Some(column) = counter_column(name) {
-            *summed.entry(column).or_insert(0) += delta;
-        }
+    let window_counters = window
+        .counters
+        .iter()
+        .map(|(_, counter, delta)| (counter, delta));
+    for (counter, delta) in window_counters.chain(
+        extra_counters
+            .iter()
+            .map(|(counter, delta)| (counter, delta)),
+    ) {
+        *summed.entry(counter.column()).or_insert(0) += delta;
     }
     for (column, delta) in summed {
         if delta != 0 {
@@ -2663,7 +2851,7 @@ fn write_window(
         .iter()
         .map(|(root, path, state)| (root.clone(), path.clone(), *state))
         .collect();
-    let mut adjust: Vec<(&'static str, i64)> = Vec::new();
+    let mut adjust: Vec<(Counter, i64)> = Vec::new();
     let mut offered: Vec<String> = Vec::new();
     // Albums with a changed file the app has a record of: automatic
     // management looks at them soon, to see who changed it.
@@ -2687,7 +2875,7 @@ fn write_window(
                 other_music: replaced,
                 new_copy,
             }) => {
-                let changed_on_record = item.verdict_counter == counter_names::CHANGED
+                let changed_on_record = item.verdict_counter == Counter::Changed.column()
                     && takeover::has_record(tx, &track_id)?;
                 // Other music on the album of a track the app wrote: the
                 // album's files changed, as when the file itself changed.
@@ -2721,9 +2909,9 @@ fn write_window(
             }
             Err(error) if isolate => {
                 // The coordinator counted this file as indexed; it was not.
-                adjust.push((counter_names::INDEXED, -1));
-                adjust.push((item.verdict_counter, -1));
-                adjust.push((counter_names::ERRORED, 1));
+                adjust.push((Counter::Indexed, -1));
+                adjust.extend(Counter::parse(item.verdict_counter).map(|verdict| (verdict, -1)));
+                adjust.push((Counter::Errored, 1));
                 failed.push((item.root_id.clone(), item.relative_path.clone(), "failed"));
                 outcome.failed.push((
                     item.root_id.clone(),
@@ -2777,10 +2965,7 @@ fn write_window(
             outcome.enqueued += 1;
         }
     }
-    adjust.push((
-        counter_names::IDENTIFICATION_ENQUEUED,
-        outcome.enqueued as i64,
-    ));
+    adjust.push((Counter::IdentificationEnqueued, outcome.enqueued as i64));
     // Every file the catalog did not take is on the run's failure list
     // with the window that gave it up, so a stop cannot lose the row.
     outcome.failed.extend(window.refused.iter().cloned());
@@ -2790,9 +2975,9 @@ fn write_window(
             window.run_id,
             root,
             path,
-            failure_codes::CATALOG_COMMIT_FAILED,
+            FailureCode::CatalogCommitFailed,
             format!("The catalog could not store this file: {error}"),
-            phase_to_str(ScanPhase::Indexing),
+            ScanPhase::Indexing.as_str(),
             window.now,
         ])?;
     }
@@ -2981,11 +3166,11 @@ pub(super) fn give_up_window(window: &IndexWindow) -> Option<IndexWindow> {
         row.1.clone(),
         "the catalog write ran past its time budget".to_owned(),
     ));
-    given_up.counters.extend([
-        (row.clone(), counter_names::INDEXED, -1),
-        (row.clone(), item.verdict_counter, -1),
-        (row, counter_names::ERRORED, 1),
-    ]);
+    given_up.counters.push((row.clone(), Counter::Indexed, -1));
+    if let Some(verdict) = Counter::parse(item.verdict_counter) {
+        given_up.counters.push((row.clone(), verdict, -1));
+    }
+    given_up.counters.push((row, Counter::Errored, 1));
     Some(given_up)
 }
 
@@ -3089,16 +3274,9 @@ pub(crate) fn automatic_album_for(
         )?;
         return Ok(Some((revived, false)));
     }
-    // An artist already known by this name keeps its row; else the same
-    // stable id a scan would give it.
-    let known: Option<String> = tx
-        .query_row(
-            "SELECT id FROM local_artists WHERE folded_name = ?1 \
-             AND retired_into_artist_id IS NULL ORDER BY created_at, id LIMIT 1",
-            params![fold_text(&stored.album_artist)],
-            |row| row.get(0),
-        )
-        .optional()?;
+    // No artist id: the stored one is only the file's first album artist
+    // id, which for a joined credit names one artist of it. The next scan
+    // writes the ids the file holds.
     let credit = Credit {
         name: stored.album_artist.clone(),
         sort_name: stored.album_artist_sort.clone(),
@@ -3106,10 +3284,7 @@ pub(crate) fn automatic_album_for(
         join_phrase: String::new(),
         mbid: None,
     };
-    let artist_id = match known {
-        Some(id) => id,
-        None => upsert_artist(tx, &credit, now)?,
-    };
+    let artist_id = album_artist_row(tx, track_id, &credit, now)?;
     tx.execute(
         "INSERT INTO local_albums (id, root_id, grouping_key, title, title_folded, \
          album_artist_name, album_artist_name_folded, album_artist_id, album_artist_sort_name, \
@@ -3137,6 +3312,40 @@ pub(crate) fn automatic_album_for(
         params![album_id, artist_id, stored.album_artist],
     )?;
     Ok(Some((album_id, true)))
+}
+
+/// The row a reset album's credit, which carries no id, lands on, as a
+/// scan of the track's file would key it ([`artists::resolve`]): the row
+/// of a credit of the track holding an id under the same folded name, else
+/// the name row.
+fn album_artist_row(
+    tx: &Connection,
+    track_id: &str,
+    credit: &Credit,
+    now: f64,
+) -> rusqlite::Result<String> {
+    let folded = fold_text(&credit.name);
+    let shared = tx
+        .prepare_cached(
+            "SELECT c.local_artist_id, c.artist_mbid, c.credited_name \
+             FROM local_track_artists c JOIN local_artists a ON a.id = c.local_artist_id \
+             WHERE c.local_track_id = ?1 AND c.artist_mbid IS NOT NULL \
+             AND a.retired_into_artist_id IS NULL ORDER BY c.position",
+        )?
+        .query_map(params![track_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .find(|(_, mbid, name)| !placeholder(mbid) && fold_text(name) == folded);
+    match shared {
+        Some((row, _, _)) => Ok(row),
+        None => upsert_artist(tx, credit, now),
+    }
 }
 
 /// The track id a file imported to `(root, relative path)` will get: the

@@ -19,7 +19,9 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokio::sync::Semaphore;
 
+use droppedneedle_kernel::platform::Platform;
 use droppedneedle_kernel::runtime_config::crypto::{Crypto, CryptoError};
 use droppedneedle_kernel::runtime_config::secret_sections::{
     JellyfinConnection, NavidromeConnection, PlexConnection,
@@ -27,8 +29,11 @@ use droppedneedle_kernel::runtime_config::secret_sections::{
 use droppedneedle_kernel::runtime_config::sections::InternalState;
 use droppedneedle_kernel::runtime_config::{ConfigStore, Live};
 
-use super::adapter::{AdapterError, BoxFuture};
+use super::adapter::{AdapterError, BoxFuture, RemoteHandle, RemoteHttp, USER_READS_PER_SOURCE};
+use super::jellyfin::JellyfinAdapter;
 use super::models::SourceName;
+use super::navidrome::NavidromeAdapter;
+use super::plex::PlexAdapter;
 
 // ---------------------------------------------------------------------------
 // Rows
@@ -206,85 +211,6 @@ impl ConnectionStore for SqliteConnectionStore {
                 })
                 .collect())
         })
-    }
-}
-
-/// In-memory rows for tests.
-#[cfg(any(test, feature = "test-support"))]
-#[derive(Debug, Default)]
-pub struct MemoryConnectionStore {
-    inner: std::sync::Mutex<std::collections::BTreeMap<(String, String), ConnectionRow>>,
-}
-
-#[cfg(any(test, feature = "test-support"))]
-impl MemoryConnectionStore {
-    /// Empty store.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    fn guard(
-        &self,
-    ) -> std::sync::MutexGuard<'_, std::collections::BTreeMap<(String, String), ConnectionRow>>
-    {
-        match self.inner.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        }
-    }
-}
-
-#[cfg(any(test, feature = "test-support"))]
-impl ConnectionStore for MemoryConnectionStore {
-    fn get<'a>(
-        &'a self,
-        user_id: &'a str,
-        service: &'a str,
-    ) -> BoxFuture<'a, Result<Option<ConnectionRow>, String>> {
-        let row = self
-            .guard()
-            .get(&(user_id.to_owned(), service.to_owned()))
-            .cloned();
-        Box::pin(async move { Ok(row) })
-    }
-
-    fn upsert<'a>(
-        &'a self,
-        user_id: &'a str,
-        service: &'a str,
-        data: String,
-    ) -> BoxFuture<'a, Result<(), String>> {
-        self.guard().insert(
-            (user_id.to_owned(), service.to_owned()),
-            ConnectionRow {
-                service: service.to_owned(),
-                enabled: true,
-                data,
-            },
-        );
-        Box::pin(async { Ok(()) })
-    }
-
-    fn delete<'a>(
-        &'a self,
-        user_id: &'a str,
-        service: &'a str,
-    ) -> BoxFuture<'a, Result<bool, String>> {
-        let removed = self
-            .guard()
-            .remove(&(user_id.to_owned(), service.to_owned()))
-            .is_some();
-        Box::pin(async move { Ok(removed) })
-    }
-
-    fn list<'a>(&'a self, user_id: &'a str) -> BoxFuture<'a, Result<Vec<ConnectionRow>, String>> {
-        let rows = self
-            .guard()
-            .iter()
-            .filter(|((owner, _), _)| owner == user_id)
-            .map(|(_, row)| row.clone())
-            .collect();
-        Box::pin(async move { Ok(rows) })
     }
 }
 
@@ -515,14 +441,7 @@ pub struct ServerSettings {
     pub section_ids: Vec<String>,
 }
 
-/// Admin server settings, read fresh on every call.
-pub trait ServerConfig: Send + Sync {
-    /// The server for one source. `Ok(None)` when it is disabled or has no
-    /// URL; `Err` carries a log-only cause when the settings cannot be read.
-    fn server(&self, source: SourceName) -> Result<Option<ServerSettings>, String>;
-}
-
-/// Server settings, read live on every call.
+/// The admin's server settings, read live on every call.
 #[derive(Clone)]
 pub struct ConfigServers {
     jellyfin: Live<JellyfinConnection>,
@@ -543,8 +462,11 @@ impl ConfigServers {
     }
 }
 
-impl ServerConfig for ConfigServers {
-    fn server(&self, source: SourceName) -> Result<Option<ServerSettings>, String> {
+impl ConfigServers {
+    /// The server for one source. `Ok(None)` when it is disabled or has no
+    /// URL; `Err` carries a log-only cause when the settings cannot be read
+    /// ([`Live::read`] logs it once per revision).
+    pub fn server(&self, source: SourceName) -> Result<Option<ServerSettings>, String> {
         let shared = |username: String, credential: String, user_id: String| {
             (!credential.is_empty()).then_some(SharedCredential {
                 username,
@@ -613,39 +535,6 @@ impl ServerConfig for ConfigServers {
     }
 }
 
-/// No servers configured: every source reads as not configured.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct NoServers;
-
-impl ServerConfig for NoServers {
-    fn server(&self, _source: SourceName) -> Result<Option<ServerSettings>, String> {
-        Ok(None)
-    }
-}
-
-/// Fixed servers for tests.
-#[cfg(any(test, feature = "test-support"))]
-#[derive(Debug, Clone, Default)]
-pub struct FixedServers {
-    servers: std::collections::HashMap<&'static str, ServerSettings>,
-}
-
-#[cfg(any(test, feature = "test-support"))]
-impl FixedServers {
-    /// Add one server.
-    pub fn with(mut self, source: SourceName, settings: ServerSettings) -> Self {
-        self.servers.insert(source.as_str(), settings);
-        self
-    }
-}
-
-#[cfg(any(test, feature = "test-support"))]
-impl ServerConfig for FixedServers {
-    fn server(&self, source: SourceName) -> Result<Option<ServerSettings>, String> {
-        Ok(self.servers.get(source.as_str()).cloned())
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Resolution
 // ---------------------------------------------------------------------------
@@ -673,6 +562,25 @@ pub struct ResolvedConnection {
     pub user_id: String,
     /// Pinned Plex music section ids.
     pub section_ids: Vec<String>,
+}
+
+impl ResolvedConnection {
+    /// Values not stored anywhere yet (a settings check, a login being
+    /// checked, a server probe), with no account behind them.
+    pub fn unsaved(source: SourceName, base_url: String, credential: String) -> Self {
+        Self {
+            source,
+            base_url,
+            username: String::new(),
+            credential,
+            account_mode: String::new(),
+            account_label: String::new(),
+            cache_scope: String::new(),
+            client_id: String::new(),
+            user_id: String::new(),
+            section_ids: Vec::new(),
+        }
+    }
 }
 
 impl std::fmt::Debug for ResolvedConnection {
@@ -749,12 +657,66 @@ pub trait PlexServerTokens: Send + Sync {
     ) -> BoxFuture<'a, Result<Option<String>, AdapterError>>;
 }
 
-/// Resolves a caller's connection for one source, and stores their links.
+/// Whose reads a client serves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reads {
+    /// A person waits on them: they share the source's bound of
+    /// [`USER_READS_PER_SOURCE`].
+    User,
+    /// Background work or an audio stream: not counted.
+    Background,
+}
+
+/// Resolves a caller's connection for one source, stores their links, and
+/// builds the source clients.
 pub struct ConnectionResolver {
     rows: Arc<dyn ConnectionStore>,
     coder: Arc<CredentialCoder>,
-    servers: Arc<dyn ServerConfig>,
+    servers: Arc<ConfigServers>,
     plex_tokens: Option<Arc<dyn PlexServerTokens>>,
+    /// One bound per source on the reads people trigger, in
+    /// [`source_slot`] order.
+    user_reads: [Arc<Semaphore>; 3],
+}
+
+/// A source's place in [`ConnectionResolver::user_reads`].
+fn source_slot(source: SourceName) -> usize {
+    match source {
+        SourceName::Jellyfin => 0,
+        SourceName::Navidrome => 1,
+        SourceName::Plex => 2,
+    }
+}
+
+/// Build the client for `connection`, its calls held to `bound` when
+/// there is one.
+fn build_client(
+    http: &reqwest::Client,
+    connection: ResolvedConnection,
+    bound: Option<Arc<Semaphore>>,
+) -> RemoteHandle {
+    let http = RemoteHttp::new(http.clone(), connection.source, bound);
+    match connection.source {
+        SourceName::Jellyfin => RemoteHandle::Jellyfin(JellyfinAdapter::over(
+            http,
+            connection.base_url,
+            connection.credential,
+            connection.user_id,
+        )),
+        SourceName::Navidrome => RemoteHandle::Navidrome(NavidromeAdapter::over(
+            http,
+            connection.base_url,
+            connection.username,
+            connection.credential,
+        )),
+        SourceName::Plex => RemoteHandle::Plex(PlexAdapter::over(
+            http,
+            connection.base_url,
+            connection.credential,
+            connection.client_id,
+            connection.section_ids,
+        )),
+    }
 }
 
 impl std::fmt::Debug for ConnectionResolver {
@@ -769,14 +731,50 @@ impl ConnectionResolver {
     pub fn new(
         rows: Arc<dyn ConnectionStore>,
         coder: Arc<CredentialCoder>,
-        servers: Arc<dyn ServerConfig>,
+        servers: Arc<ConfigServers>,
     ) -> Self {
         Self {
             rows,
             coder,
             servers,
             plex_tokens: None,
+            user_reads: std::array::from_fn(|_| Arc::new(Semaphore::new(USER_READS_PER_SOURCE))),
         }
+    }
+
+    /// The resolver over `platform`: the link rows in its database, sealed
+    /// with its key, over the admin's server settings.
+    pub fn over(platform: &Platform) -> Self {
+        Self::new(
+            Arc::new(SqliteConnectionStore::new(
+                platform.db.clone(),
+                platform.clock.clone(),
+            )),
+            Arc::new(CredentialCoder::new(platform.crypto.clone())),
+            Arc::new(ConfigServers::new(&platform.settings)),
+        )
+    }
+
+    /// The client for `connection`, over `http`. This and
+    /// [`Self::unsaved_client`] are the one place source clients are
+    /// built. A person's reads wait for a place in the source's bound.
+    pub fn client(
+        &self,
+        http: &reqwest::Client,
+        connection: ResolvedConnection,
+        reads: Reads,
+    ) -> RemoteHandle {
+        let bound = match reads {
+            Reads::User => Some(Arc::clone(&self.user_reads[source_slot(connection.source)])),
+            Reads::Background => None,
+        };
+        build_client(http, connection, bound)
+    }
+
+    /// The client for values not stored yet (see
+    /// [`ResolvedConnection::unsaved`]), outside any bound.
+    pub fn unsaved_client(http: &reqwest::Client, connection: ResolvedConnection) -> RemoteHandle {
+        build_client(http, connection, None)
     }
 
     /// Look up and store missing Plex server tokens through `probe`.
@@ -1121,104 +1119,5 @@ impl droppedneedle_auth::federated::MediaLinkStore for SignInLinks {
                 username: profile.username.clone(),
             },
         ))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn resolver(servers: FixedServers) -> (ConnectionResolver, Arc<MemoryConnectionStore>) {
-        let rows = Arc::new(MemoryConnectionStore::new());
-        let crypto = Crypto::from_key_bytes(&[3u8; 32]).expect("test key");
-        let resolver = ConnectionResolver::new(
-            rows.clone(),
-            Arc::new(CredentialCoder::new(Arc::new(crypto))),
-            Arc::new(servers),
-        );
-        (resolver, rows)
-    }
-
-    fn navidrome_server(shared: bool) -> ServerSettings {
-        ServerSettings {
-            base_url: "http://navidrome.test".to_owned(),
-            shared: shared.then(|| SharedCredential {
-                username: "admin".to_owned(),
-                credential: "admin-pass".to_owned(),
-                user_id: String::new(),
-            }),
-            client_id: String::new(),
-            section_ids: Vec::new(),
-        }
-    }
-
-    /// A user with no link of their own uses the admin's server account;
-    /// once they link, their own account wins, sealed at rest.
-    #[tokio::test]
-    async fn own_link_wins_over_the_shared_admin_account() {
-        let (resolver, rows) =
-            resolver(FixedServers::default().with(SourceName::Navidrome, navidrome_server(true)));
-        let shared = resolver
-            .resolve("ada", SourceName::Navidrome)
-            .await
-            .expect("shared resolves");
-        assert_eq!(shared.account_mode, "shared");
-        assert_eq!(shared.credential, "admin-pass");
-
-        resolver
-            .save_link(
-                "ada",
-                &UserLink::Navidrome {
-                    username: "ada".to_owned(),
-                    password: "s3cret".to_owned(),
-                },
-            )
-            .await
-            .expect("link saves");
-        let row = rows
-            .get("ada", "navidrome")
-            .await
-            .expect("row reads")
-            .expect("row exists");
-        assert!(row.data.starts_with("v3:"), "sealed at rest");
-        assert!(!row.data.contains("s3cret"));
-
-        let own = resolver
-            .resolve("ada", SourceName::Navidrome)
-            .await
-            .expect("own resolves");
-        assert_eq!(own.account_mode, "linked");
-        assert_eq!(own.credential, "s3cret");
-
-        // A link that no longer opens falls back to the shared account.
-        rows.upsert("bea", "navidrome", "v3:garbage".to_owned())
-            .await
-            .expect("row writes");
-        let fallback = resolver
-            .resolve("bea", SourceName::Navidrome)
-            .await
-            .expect("stale link falls back");
-        assert_eq!(fallback.account_mode, "shared");
-    }
-
-    /// A disabled or missing admin server hides every link: the URL is the
-    /// admin's, so nothing resolves without it.
-    #[tokio::test]
-    async fn links_need_the_admin_server() {
-        let (resolver, _) = resolver(FixedServers::default());
-        resolver
-            .save_link(
-                "ada",
-                &UserLink::Navidrome {
-                    username: "ada".to_owned(),
-                    password: "s3cret".to_owned(),
-                },
-            )
-            .await
-            .expect("link saves");
-        assert!(matches!(
-            resolver.resolve("ada", SourceName::Navidrome).await,
-            Err(ResolveError::NotConfigured)
-        ));
     }
 }

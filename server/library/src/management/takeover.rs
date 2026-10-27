@@ -18,11 +18,10 @@ use rusqlite::{Connection, OptionalExtension as _, Transaction, params};
 use super::models::{ManagementError, PlannedItem};
 use super::reasons::ItemReason;
 use crate::catalog_revision::bump_catalog;
-use crate::clock::now_unix;
+use crate::clock::LibraryClock as _;
 use crate::operations::decisions::{CatalogAction, record_action};
 use crate::publish::record::changed_since_written;
 pub use crate::publish::record::record_sql;
-use crate::publish::snapshots::sha256_hex;
 use crate::wiring::LibrarySetup;
 use droppedneedle_kernel::db::Lane;
 
@@ -561,8 +560,8 @@ pub(crate) fn hand_back(
             let sha256 = sandbox
                 .resolve_no_symlink(&root_id, &relative_path)
                 .ok()
-                .and_then(|path| crate::publish::paths::read_regular_file(&path).ok())
-                .map(|bytes| sha256_hex(&bytes));
+                .and_then(|path| crate::publish::paths::hash_regular_file(&path).ok())
+                .map(|hashed| hashed.sha256);
             if sha256.is_none() {
                 tracing::warn!(
                     track_id,
@@ -575,7 +574,7 @@ pub(crate) fn hand_back(
     if !hashed.is_empty() && hashed.iter().all(|(.., sha256)| sha256.is_none()) {
         return Err(unreadable());
     }
-    let now = now_unix();
+    let now = setup.clock.now_secs();
     // A person's request writes on the foreground lane, the worker's turn
     // through a hand-back of every album on the background lane.
     let lane = if actor.is_some() {

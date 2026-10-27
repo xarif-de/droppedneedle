@@ -151,45 +151,60 @@ impl FolderStore for SqliteFolderStore {
     }
 }
 
-/// In-memory folder preferences for tests.
-#[cfg(any(test, feature = "test-support"))]
-#[derive(Debug, Default)]
-pub struct MemoryFolderStore {
-    inner: std::sync::Mutex<std::collections::HashMap<String, FolderPreference>>,
+/// How long a fetched folder list is reused. A grid of covers or a few
+/// pages of browsing then share one `getMusicFolders` call, and a folder
+/// added or removed on the server shows within a minute. The preference
+/// screen always reads the server afresh.
+pub const FOLDER_LIST_TTL_MS: i64 = 60_000;
+
+/// The folders each user's Navidrome server exposed, as last fetched,
+/// keyed by user and server identity.
+#[derive(Default)]
+pub struct FolderListCache {
+    entries: std::sync::Mutex<std::collections::HashMap<(String, String), CachedFolders>>,
 }
 
-#[cfg(any(test, feature = "test-support"))]
-impl MemoryFolderStore {
-    /// Empty store.
-    pub fn new() -> Self {
-        Self::default()
-    }
+struct CachedFolders {
+    fetched_at_ms: i64,
+    folders: Vec<(String, String)>,
 }
 
-#[cfg(any(test, feature = "test-support"))]
-impl FolderStore for MemoryFolderStore {
-    fn get<'a>(&'a self, user_id: &'a str) -> BoxFuture<'a, Result<FolderPreference, String>> {
-        let preference = self
-            .inner
-            .lock()
-            .map(|guard| guard.get(user_id).cloned().unwrap_or_default())
-            .map_err(|_| "folder store lock poisoned".to_owned());
-        Box::pin(async move { preference })
+impl FolderListCache {
+    /// The list fetched for `user_id` from the server at `identity`, while
+    /// it is fresh at `now_ms`.
+    pub fn get(&self, user_id: &str, identity: &str, now_ms: i64) -> Option<Vec<(String, String)>> {
+        let entries = self.lock();
+        let key = (user_id.to_owned(), identity.to_owned());
+        entries
+            .get(&key)
+            .filter(|cached| now_ms - cached.fetched_at_ms < FOLDER_LIST_TTL_MS)
+            .map(|cached| cached.folders.clone())
     }
 
-    fn set<'a>(
-        &'a self,
-        user_id: &'a str,
-        preference: FolderPreference,
-    ) -> BoxFuture<'a, Result<(), String>> {
-        let stored = self
-            .inner
+    /// Keep a list just fetched, dropping entries that have gone stale.
+    pub fn put(&self, user_id: &str, identity: &str, now_ms: i64, folders: Vec<(String, String)>) {
+        let mut entries = self.lock();
+        entries.retain(|_, cached| now_ms - cached.fetched_at_ms < FOLDER_LIST_TTL_MS);
+        entries.insert(
+            (user_id.to_owned(), identity.to_owned()),
+            CachedFolders {
+                fetched_at_ms: now_ms,
+                folders,
+            },
+        );
+    }
+
+    /// Drop every list kept for `user_id`.
+    pub fn forget(&self, user_id: &str) {
+        self.lock().retain(|(user, _), _| user != user_id);
+    }
+
+    fn lock(
+        &self,
+    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<(String, String), CachedFolders>> {
+        self.entries
             .lock()
-            .map(|mut guard| {
-                guard.insert(user_id.to_owned(), preference);
-            })
-            .map_err(|_| "folder store lock poisoned".to_owned());
-        Box::pin(async move { stored })
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 

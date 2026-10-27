@@ -2,8 +2,9 @@
 //! folder whose tags match a release is published into the library (as a
 //! drop, under the naming template, its bonus track alongside) and
 //! resolves the open request for that album; the folder nothing
-//! identifies waits for review with a reason and an action, and
-//! discarding it removes its files. A second drop with a better copy of
+//! identifies waits in the held list with a reason, its job folder kept
+//! while it does, and discarding it removes its files and then the job
+//! folder. A second drop with a better copy of
 //! a track replaces the library's file, which goes to the recycle bin. Real
 //! landing port, publisher and catalog over one scratch database;
 //! MusicBrainz is a scripted release source.
@@ -14,8 +15,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use droppedneedle_acquire::db::AcquireDb;
+use droppedneedle_acquire::downloads::queue_rows::Viewer as HeldViewer;
 use droppedneedle_acquire::drop_import::Viewer;
 use droppedneedle_acquire::drop_import::store::JobRecord;
+use droppedneedle_acquire::held::store::Entry;
 use droppedneedle_acquire::landing::library::LibraryLanding;
 use droppedneedle_acquire::landing::ports::LandingLibrary;
 use droppedneedle_acquire::reason::Reason;
@@ -35,6 +38,33 @@ use crate::common::auth::AuthRig;
 use crate::common::library::{every_priority, library_at};
 
 const GROUP: &str = "7d0b7a1e-0000-4000-8000-000000000001";
+
+/// The open entry of the held list holding a drop item's files, and where
+/// those files are.
+async fn entry_of(
+    acquire: &droppedneedle_acquire::AcquireSetup,
+    user_id: &str,
+    item_id: i64,
+) -> (Entry, Vec<PathBuf>) {
+    let viewer = HeldViewer {
+        user_id: user_id.to_owned(),
+        admin: false,
+    };
+    let entry = acquire
+        .held
+        .list(&viewer, None, None, false)
+        .await
+        .expect("held list")
+        .into_iter()
+        .find(|entry| entry.drop_item_id == Some(item_id))
+        .unwrap_or_else(|| panic!("item {item_id} waits in the held list"));
+    let paths = entry
+        .files
+        .iter()
+        .filter_map(|file| acquire.held.folders().locate(file.root, &file.path))
+        .collect();
+    (entry, paths)
+}
 const RELEASE: &str = "7d0b7a1e-0000-4000-8000-000000000002";
 
 /// MusicBrainz knowing one release; every search returns it.
@@ -303,15 +333,33 @@ async fn dropped_album_lands_and_the_unknown_folder_waits_for_review() {
     assert_eq!(odd.status, "needs_review");
     assert_eq!(odd.reason_code, Some(Reason::NoAlbumMatch));
     assert!(odd.detail.is_some());
-    let staged: Vec<PathBuf> = odd.staging_paths.iter().map(PathBuf::from).collect();
+    let (entry, staged) = entry_of(&acquire, &curator.user_id, odd.id).await;
+    assert_eq!(staged.len(), 1);
     assert!(staged.iter().all(|path| path.is_file()));
-    let discarded = acquire
-        .drops
-        .discard_item(&curator, odd.id)
+    assert!(entry.expires_at > entry.created_at);
+    // The job's folder stays while a file of it waits for a decision.
+    let job_dir = PathBuf::from(&job.staging_dir);
+    acquire.drops.sweep_stale().await;
+    assert!(job_dir.is_dir(), "a folder with a waiting upload was swept");
+    let held_viewer = HeldViewer {
+        user_id: curator.user_id.clone(),
+        admin: false,
+    };
+    acquire
+        .held
+        .discard(&held_viewer, entry.id, None)
         .await
         .expect("discard");
-    assert_eq!(discarded.status, "discarded");
+    let now = acquire.drops.get_job(&curator, &job.id).await.expect("job");
+    let odd = now
+        .items
+        .iter()
+        .find(|item| item.id == odd.id)
+        .expect("review item");
+    assert_eq!(odd.status, "discarded");
     assert!(staged.iter().all(|path| !path.exists()));
+    acquire.drops.sweep_stale().await;
+    assert!(!job_dir.exists(), "the job folder goes once nothing waits");
 
     // A better file tagged as another song never replaces the owned copy.
     let job = drop_zip(
@@ -352,6 +400,47 @@ async fn dropped_album_lands_and_the_unknown_folder_waits_for_review() {
     );
     assert!(shelf.join("0101 Mysterons.flac").is_file());
     assert!(!shelf.join("0101 Mysterons.mp3").exists(), "recycled");
+}
+
+/// An unidentified upload whose discs hold files of the same name waits as
+/// one entry with every file: CD1/01.flac and CD2/01.flac are two files,
+/// both kept on disk.
+#[tokio::test]
+async fn same_named_files_on_two_discs_both_wait() {
+    let (db, library, dir, _auth) = bundles().await;
+    let work = dir.join("work");
+    std::fs::create_dir_all(&work).expect("work dir");
+    let first = tagged(&work, "flac_full_01.flac", "Nothing Alike", "Glory Box", 1);
+    let second = tagged(&work, "flac_full_02.flac", "Nothing Alike", "Roads", 1);
+    let acquire = acquire_over(
+        &db,
+        Arc::new(LibraryLanding::new(
+            library.clone(),
+            every_priority(Arc::new(OneRelease(release(&["Mysterons"], &[None])))),
+            db.pool().clone(),
+        )),
+    );
+    let curator = Viewer {
+        user_id: "u-curator".to_owned(),
+        admin: false,
+    };
+    let job = drop_zip(
+        &acquire,
+        &curator,
+        "upload-discs",
+        &[("Odds/CD1/01.flac", &first), ("Odds/CD2/01.flac", &second)],
+    )
+    .await;
+    assert_eq!(job.items.len(), 1, "{:?}", job.items);
+    assert_eq!(job.items[0].status, "needs_review");
+    let (entry, staged) = entry_of(&acquire, &curator.user_id, job.items[0].id).await;
+    assert_eq!(entry.files.len(), 2, "{:?}", entry.files);
+    assert!(staged.iter().all(|path| path.is_file()));
+    acquire.drops.sweep_stale().await;
+    assert!(
+        staged.iter().all(|path| path.is_file()),
+        "a waiting file was swept"
+    );
 }
 
 /// A better copy whose library copy can't go to the recycle bin (the
@@ -406,16 +495,18 @@ async fn an_upgrade_the_bin_cannot_take_keeps_the_upload() {
     let kept = job
         .items
         .iter()
-        .find(|item| {
-            item.reason_code == Some(Reason::UpgradeBlocked) && !item.staging_paths.is_empty()
-        })
+        .find(|item| item.reason_code == Some(Reason::UpgradeBlocked))
         .unwrap_or_else(|| panic!("a review item keeps the upload: {:?}", job.items));
     assert_eq!(kept.status, "needs_review", "{:?}", kept.detail);
-    for path in &kept.staging_paths {
+    let (entry, staged) = entry_of(&acquire, &curator.user_id, kept.id).await;
+    assert_eq!(entry.files[0].reason, Reason::UpgradeBlocked);
+    assert_eq!(staged.len(), 1);
+    for path in &staged {
         assert_eq!(
             std::fs::read(path).expect("the upload is on disk"),
             mysterons,
-            "{path}"
+            "{}",
+            path.display()
         );
     }
 }
@@ -557,15 +648,22 @@ async fn a_hand_match_finds_the_edition_in_a_large_group() {
             item.detail
         );
 
+        let (entry, _) = entry_of(&acquire, &curator.user_id, item.id).await;
+        let held_viewer = HeldViewer {
+            user_id: curator.user_id.clone(),
+            admin: false,
+        };
         let matched = acquire
-            .drops
-            .match_item(&curator, item.id, &group(case))
+            .held
+            .match_album(&held_viewer, entry.id, &group(case), None, &curator.user_id)
             .await
             .expect("matched by hand");
+        assert_eq!(matched.imported, 3, "case {case}: {matched:?}");
+        let now = acquire.drops.get_job(&curator, &job.id).await.expect("job");
         assert_eq!(
-            matched.status, "imported",
+            now.items[0].status, "imported",
             "case {case}: {:?}",
-            matched.detail
+            now.items[0].detail
         );
         let releases: Vec<String> = sqlx::query_scalar(
             "SELECT DISTINCT release_mbid FROM local_album_external_identities \
@@ -577,6 +675,227 @@ async fn a_hand_match_finds_the_edition_in_a_large_group() {
         .expect("identities");
         assert_eq!(releases, vec![release_id(case, 130)], "case {case}");
     }
+}
+
+/// A curator's Match the library puts off (here its folder is gone)
+/// leaves an upload's file as it was: still held for the reason a person
+/// decides on, still paired to the album the app guessed, so the held
+/// loop's automatic retry never places it there once the folder is back.
+#[tokio::test]
+async fn a_deferred_upload_match_leaves_its_files_as_they_were() {
+    const GUESS_GROUP: &str = "9d0b7a1e-0000-4000-8000-000000000001";
+    const GUESS: &str = "9d0b7a1e-0000-4000-8000-000000000002";
+    let mut picked = release(&["Numb"], &[None]);
+    picked.title = "Rough Mixes".to_owned();
+    let mut guess = release(&["Numb"], &[None]);
+    guess.id = GUESS.to_owned();
+    guess.release_group_id = GUESS_GROUP.to_owned();
+    guess.tracks[0].id = "9d0b7a1e-0000-4000-8000-000000000003".to_owned();
+    let guessed_track = guess.tracks[0].clone();
+    let (db, library, dir, _auth) = bundles().await;
+    let pool = db.pool().clone();
+    let acquire = acquire_over(
+        &db,
+        Arc::new(LibraryLanding::new(
+            library.clone(),
+            every_priority(Arc::new(LargeGroups(vec![picked, guess]))),
+            pool,
+        )),
+    );
+    let curator = Viewer {
+        user_id: "u-curator".to_owned(),
+        admin: false,
+    };
+    let work = dir.join("work");
+    std::fs::create_dir_all(&work).expect("work dir");
+    let bytes = tagged(&work, "flac_full_01.flac", "Odds", "Numb", 1);
+    let job = drop_zip(&acquire, &curator, "odds", &[("Odds/01 Numb.flac", &bytes)]).await;
+    let item = &job.items[0];
+    assert_eq!(item.status, "needs_review", "{:?}", item.detail);
+    let (entry, _) = entry_of(&acquire, &curator.user_id, item.id).await;
+    let file_id = entry.files[0].id;
+    // AcoustID heard another recording; the app's guess was another album.
+    let (release, track, recording) = (
+        GUESS.to_owned(),
+        guessed_track.id.clone(),
+        guessed_track.recording_id.clone(),
+    );
+    acquire
+        .db
+        .write("test.guess", move |tx| {
+            tx.execute(
+                "UPDATE acquire_held_files SET reason = 'fingerprint_mismatch', \
+                 release_mbid = ?2, release_track_mbid = ?3, recording_mbid = ?4, \
+                 disc_number = 1, track_number = 1 WHERE id = ?1",
+                rusqlite::params![file_id, release, track, recording],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("held as heard");
+
+    let music = dir.join("music");
+    std::fs::remove_dir(&music).expect("library folder gone");
+    let held_viewer = HeldViewer {
+        user_id: curator.user_id.clone(),
+        admin: false,
+    };
+    let matched = acquire
+        .held
+        .match_album(&held_viewer, entry.id, GROUP, None, &curator.user_id)
+        .await;
+    assert!(matched.is_err(), "the person is told: {matched:?}");
+    let held = || async {
+        sqlx::query_as::<_, (String, String, Option<String>)>(
+            "SELECT state, reason, release_mbid FROM acquire_held_files WHERE id = ?1",
+        )
+        .bind(file_id)
+        .fetch_one(acquire.db.pool())
+        .await
+        .expect("held file")
+    };
+    let as_it_was = (
+        "held".to_owned(),
+        "fingerprint_mismatch".to_owned(),
+        Some(GUESS.to_owned()),
+    );
+    assert_eq!(held().await, as_it_was);
+    let now = acquire.drops.get_job(&curator, &job.id).await.expect("job");
+    assert_eq!(now.items[0].status, "needs_review");
+
+    std::fs::create_dir_all(&music).expect("library folder back");
+    acquire.held.tend().await;
+    assert_eq!(held().await, as_it_was, "nothing retried it");
+    assert!(
+        files_under(&music).is_empty(),
+        "nothing reached the library"
+    );
+}
+
+/// A bonus track of an upload a curator matched, which the library could
+/// not take because its place was taken, loses the pairing the app had
+/// guessed for it: the held loop's retry never places it on that album.
+#[tokio::test]
+async fn a_matched_uploads_bonus_track_is_not_retried_onto_the_old_guess() {
+    const GUESS_GROUP: &str = "9d0b7a1e-0000-4000-8000-000000000011";
+    const GUESS: &str = "9d0b7a1e-0000-4000-8000-000000000012";
+    let picked = release(&["Mysterons", "Sour Times"], &[None, None]);
+    let mut guess = release(&["Hidden Track"], &[None]);
+    guess.id = GUESS.to_owned();
+    guess.release_group_id = GUESS_GROUP.to_owned();
+    guess.title = "Guess".to_owned();
+    guess.tracks[0].id = "9d0b7a1e-0000-4000-8000-000000000013".to_owned();
+    guess.tracks[0].recording_id = "9d0b7a1e-0000-4000-8000-000000000014".to_owned();
+    let guessed = guess.tracks[0].clone();
+    let (db, library, dir, _auth) = bundles().await;
+    let pool = db.pool().clone();
+    let acquire = acquire_over(
+        &db,
+        Arc::new(LibraryLanding::new(
+            library.clone(),
+            every_priority(Arc::new(LargeGroups(vec![picked, guess]))),
+            pool,
+        )),
+    );
+    let curator = Viewer {
+        user_id: "u-curator".to_owned(),
+        admin: false,
+    };
+    let work = dir.join("work");
+    std::fs::create_dir_all(&work).expect("work dir");
+    let mysterons = tagged(&work, "flac_full_01.flac", "Odds", "Mysterons", 1);
+    let sour_times = tagged(&work, "flac_full_02.flac", "Odds", "Sour Times", 2);
+    let hidden = tagged(&work, "flac_full_01.flac", "Odds", "Hidden Track", 3);
+    let job = drop_zip(
+        &acquire,
+        &curator,
+        "odds",
+        &[
+            ("Odds/01 Mysterons.flac", &mysterons),
+            ("Odds/02 Sour Times.flac", &sour_times),
+            ("Odds/03 Hidden Track.flac", &hidden),
+        ],
+    )
+    .await;
+    let item = &job.items[0];
+    assert_eq!(item.status, "needs_review", "{:?}", item.detail);
+    let (entry, _) = entry_of(&acquire, &curator.user_id, item.id).await;
+    let file_id = entry
+        .files
+        .iter()
+        .find(|file| file.original_name.contains("Hidden Track"))
+        .expect("bonus track held")
+        .id;
+    // The app had guessed the bonus track was another album's.
+    let (track, recording) = (guessed.id.clone(), guessed.recording_id.clone());
+    acquire
+        .db
+        .write("test.guess", move |tx| {
+            tx.execute(
+                "UPDATE acquire_held_files SET release_mbid = ?2, release_track_mbid = ?3, \
+                 recording_mbid = ?4, disc_number = 1, track_number = 1 WHERE id = ?1",
+                rusqlite::params![file_id, GUESS, track, recording],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("guessed pairing");
+
+    let music = dir.join("music");
+    let taken = music.join("Portishead/Dummy/0103 Hidden Track.flac");
+    std::fs::create_dir_all(taken.parent().expect("album folder")).expect("album folder");
+    std::fs::write(&taken, b"someone else's file").expect("stray file");
+    let held_viewer = HeldViewer {
+        user_id: curator.user_id.clone(),
+        admin: false,
+    };
+    let matched = acquire
+        .held
+        .match_album(&held_viewer, entry.id, GROUP, None, &curator.user_id)
+        .await
+        .expect("matched by hand");
+    assert_eq!(matched.imported, 2, "{matched:?}");
+    let held = || async {
+        sqlx::query_as::<_, (String, String, Option<String>)>(
+            "SELECT state, reason, release_mbid FROM acquire_held_files WHERE id = ?1",
+        )
+        .bind(file_id)
+        .fetch_one(acquire.db.pool())
+        .await
+        .expect("held file")
+    };
+    assert_eq!(
+        held().await,
+        ("held".to_owned(), "target_occupied".to_owned(), None),
+        "the Match left it unpaired"
+    );
+
+    std::fs::remove_file(&taken).expect("place freed");
+    acquire.held.tend().await;
+    assert_eq!(
+        held().await,
+        ("held".to_owned(), "target_occupied".to_owned(), None),
+        "nothing retried it"
+    );
+    assert!(
+        !files_under(&music)
+            .iter()
+            .any(|path| path.to_string_lossy().contains("Guess")),
+        "nothing went onto the guessed album"
+    );
+}
+
+fn files_under(dir: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            found.extend(files_under(&path));
+        } else {
+            found.push(path);
+        }
+    }
+    found
 }
 
 /// Upload one zip of `entries` and wait for its job to settle.

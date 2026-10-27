@@ -14,6 +14,7 @@ use std::time::Duration;
 use crate::common::library::TestSql as _;
 use crate::common::library::library_at;
 use crate::common::{ScratchDir, TestPlatform, config_store, migrated_db};
+use droppedneedle_kernel::clock::SystemClock;
 use droppedneedle_kernel::db::{Budget, Db, LaneLimits};
 use droppedneedle_kernel::jobs::CancellationToken;
 use droppedneedle_library::identify::models::RecallResult;
@@ -21,13 +22,13 @@ use droppedneedle_library::identify::providers::FakeProviders;
 use droppedneedle_library::identify::service::{IdentifyDeps, IdentifyService};
 use droppedneedle_library::identify::sqlite::SqliteIdentifyStore;
 use droppedneedle_library::repairs::hygiene;
-use droppedneedle_library::scan::RunStop;
 use droppedneedle_library::scan::ScanFailureRecord;
 use droppedneedle_library::scan::{
-    BlockingPool, EffectivePolicy, LibraryRoot, LibraryScanCoordinator, NullTagReader,
-    RootRegistry, RootSeamError, ScanControl, ScanKind, ScanRequest, ScanRun, ScanScope, ScanState,
-    ScanTrigger, ScannedTags, SqliteScanStore, StaticResolver, StreamRootSeam, TagReadError,
-    TagReader, WorkWakeups, counter_names, failure_codes,
+    BlockingPool, Counter, EffectivePolicy, Event, FailureCode, LibraryRoot,
+    LibraryScanCoordinator, NullTagReader, Phase, RootRegistry, RootSeamError, RunState, ScanKind,
+    ScanPhase, ScanRequest, ScanRun, ScanScope, ScanState, ScanStoreError, ScanTrigger,
+    ScannedTags, SqliteScanStore, StaticResolver, StreamRootSeam, TagReadError, TagReader,
+    WorkWakeups,
 };
 use droppedneedle_library::wiring::LibrarySetup;
 use sha2::{Digest, Sha256};
@@ -45,8 +46,8 @@ fn plant(root: &Path, relative: &str, fixture_name: &str) -> PathBuf {
     dest
 }
 
-fn count(run: &ScanRun, name: &str) -> i64 {
-    run.counters.get(name).copied().unwrap_or(0)
+fn count(run: &ScanRun, counter: Counter) -> i64 {
+    run.counters.get(counter)
 }
 
 /// Relative path to (size, mtime, sha256) for every file under `root`.
@@ -145,8 +146,8 @@ async fn scan_catalogs_tags_without_touching_files() {
     let library = bundle(&scratch).await;
 
     let run = scan(&library).await;
-    assert_eq!(run.state, ScanState::Completed);
-    assert_eq!(count(&run, counter_names::INDEXED), 3);
+    assert_eq!(run.state.scan_state(), ScanState::Completed);
+    assert_eq!(count(&run, Counter::Indexed), 3);
     let tag = droppedneedle_library::tags::read::read_tag_only(
         &tagged,
         droppedneedle_library::tags::AudioFormat::Flac,
@@ -180,11 +181,11 @@ async fn scan_catalogs_tags_without_touching_files() {
     );
     let jobs = query(&library, "SELECT COUNT(*) FROM library_identify_jobs");
     assert_eq!(jobs, albums, "one identify job per catalog album");
-    assert_eq!(count(&run, counter_names::IDENTIFICATION_ENQUEUED), jobs);
+    assert_eq!(count(&run, Counter::IdentificationEnqueued), jobs);
 
     let again = scan(&library).await;
-    assert_eq!(count(&again, counter_names::NEW), 0);
-    assert_eq!(count(&again, counter_names::UNCHANGED), 3);
+    assert_eq!(count(&again, Counter::New), 0);
+    assert_eq!(count(&again, Counter::Unchanged), 3);
     assert_eq!(
         query(&library, "SELECT COUNT(*) FROM library_identify_jobs"),
         jobs,
@@ -198,14 +199,14 @@ async fn scan_catalogs_tags_without_touching_files() {
 /// did not change keeps the revision scans have always stored for it.
 #[tokio::test]
 async fn unchanged_tags_keep_their_revision() {
-    const STORED: &str = "21bef2cfb5b590d4380c105e0bbf0b228b7b75bbaa1ac88e28417a79fa3f612a";
+    const STORED: &str = "2b6fee3851ee5022e3d48c722ca55b1be2fc7ccede88c843fc387c8618cfe51f";
     let scratch = ScratchDir::new("scan-revision");
     let music = scratch.join("music");
     plant(&music, "Album/01.flac", "management_full.flac");
     let library = bundle(&scratch).await;
 
     let run = scan(&library).await;
-    assert_eq!(run.state, ScanState::Completed);
+    assert_eq!(run.state.scan_state(), ScanState::Completed);
     assert_eq!(
         query(
             &library,
@@ -217,6 +218,71 @@ async fn unchanged_tags_keep_their_revision() {
         1,
         "the tag revision of an unchanged file changed"
     );
+}
+
+/// A daily scan runs at the set time in the server's time zone (`TZ`), on
+/// both sides of a daylight-saving change, and not a minute before.
+#[tokio::test]
+async fn daily_scans_run_at_local_time_across_a_clock_change() {
+    use droppedneedle_kernel::clock::ManualClock;
+    use droppedneedle_kernel::config::AppConfig;
+    use droppedneedle_kernel::runtime_config::sections::{LibraryScanSchedule, ScanFrequency};
+    // London moves from GMT to BST at 01:00 UTC on Sunday 30 March 2025.
+    const SATURDAY_0300_GMT: i64 = 1_743_217_200_000;
+    const SUNDAY_0300_BST: i64 = 1_743_300_000_000;
+    let scratch = ScratchDir::new("scan-daily-zone");
+    std::fs::create_dir_all(scratch.join("music")).expect("music folder");
+    migrated_db(&scratch.join("app.db"));
+    let db = Db::open_for_tests(&scratch.join("app.db")).expect("database opens");
+    let clock = ManualClock::at(SATURDAY_0300_GMT - 15 * 3_600_000);
+    let mut config = AppConfig::with_root(0, &scratch);
+    config.timezone = Some("Europe/London".to_owned());
+    let platform = TestPlatform::on(&db, &scratch)
+        .settings(config_store(&scratch))
+        .clock(Arc::new(clock.clone()))
+        .config(config)
+        .build()
+        .await;
+    platform
+        .settings
+        .save_blocking(LibraryScanSchedule {
+            scan_frequency: ScanFrequency::Daily,
+            daily_scan_time: "03:00".to_owned(),
+        })
+        .expect("schedule saves");
+    let (library, _) = library_at(&platform);
+    library
+        .add_root(
+            Some("music".to_owned()),
+            scratch.join("music").to_string_lossy().into_owned(),
+            EffectivePolicy::Automatic,
+        )
+        .expect("root adds");
+    let settle = || async {
+        for _ in 0..50 {
+            library.supervisor_tick().await;
+            if library.coordinator.current().is_empty() {
+                break;
+            }
+        }
+    };
+    // The new folder's first scan ends on Friday at noon.
+    settle().await;
+    let automatic = || {
+        query(
+            &library,
+            "SELECT COUNT(*) FROM library_scan_runs WHERE trigger = 'automatic'",
+        )
+    };
+    for (due, day) in [(SATURDAY_0300_GMT, "Saturday"), (SUNDAY_0300_BST, "Sunday")] {
+        let before = automatic();
+        clock.set(due - 60_000);
+        settle().await;
+        assert_eq!(automatic(), before, "{day}: no scan before 03:00");
+        clock.set(due);
+        settle().await;
+        assert_eq!(automatic(), before + 1, "{day}: one scan at 03:00");
+    }
 }
 
 /// One file scanned, then its row put back the way an upgrade carries it:
@@ -313,9 +379,9 @@ async fn a_carried_file_gets_its_edition_hints_from_its_tags() {
     let db = library.scan_store.db();
 
     let run = scan(&library).await;
-    assert_eq!(run.state, ScanState::Completed);
-    assert_eq!(count(&run, counter_names::UNCHANGED), 1);
-    assert_eq!(count(&run, counter_names::CHANGED), 0);
+    assert_eq!(run.state.scan_state(), ScanState::Completed);
+    assert_eq!(count(&run, Counter::Unchanged), 1);
+    assert_eq!(count(&run, Counter::Changed), 0);
     assert_eq!(
         query(
             &library,
@@ -364,11 +430,11 @@ async fn vanished_files_are_marked_missing_and_mass_loss_is_held_back() {
         plant(&music, &format!("Album/{n:02}.flac"), "flac_full_01.flac");
     }
     let library = bundle(&scratch).await;
-    assert_eq!(count(&scan(&library).await, counter_names::INDEXED), 30);
+    assert_eq!(count(&scan(&library).await, Counter::Indexed), 30);
 
     std::fs::remove_file(music.join("Album/00.flac")).expect("remove one");
     let run = scan(&library).await;
-    assert_eq!(count(&run, counter_names::MISSING), 1);
+    assert_eq!(count(&run, Counter::Missing), 1);
     assert_eq!(
         query(
             &library,
@@ -382,14 +448,14 @@ async fn vanished_files_are_marked_missing_and_mass_loss_is_held_back() {
         std::fs::remove_file(music.join(format!("Album/{n:02}.flac"))).expect("remove");
     }
     let run = scan(&library).await;
-    assert_eq!(count(&run, counter_names::MISSING), 0);
+    assert_eq!(count(&run, Counter::Missing), 0);
     assert!(
         library
             .scan_store
             .failures(&run.id)
             .unwrap()
             .iter()
-            .any(|failure| failure.failure_code == failure_codes::MASS_MISSING_GUARD)
+            .any(|failure| failure.failure_code == FailureCode::MassMissingGuard)
     );
     assert_eq!(
         query(
@@ -441,7 +507,7 @@ async fn a_held_back_folder_is_held_until_a_scan_finds_it_again() {
     }
     plant(&music, "Other/01.flac", "flac_full_01.flac");
     let library = bundle(&scratch).await;
-    assert_eq!(count(&scan(&library).await, counter_names::INDEXED), 31);
+    assert_eq!(count(&scan(&library).await, Counter::Indexed), 31);
     let held = |library: &LibrarySetup| {
         (
             query(library, "SELECT COUNT(*) FROM library_scan_held_scopes"),
@@ -481,7 +547,7 @@ async fn a_held_back_folder_is_held_until_a_scan_finds_it_again() {
         "a hold keeps its start"
     );
     let narrow = scan_folder(&library, "Other").await;
-    assert_eq!(narrow.state, ScanState::Completed);
+    assert_eq!(narrow.state.scan_state(), ScanState::Completed);
     assert_eq!(
         held(&library),
         (1, 1),
@@ -590,10 +656,11 @@ fn coordinator_on<T: TagReader + 'static>(
         "rev-1",
     );
     let coordinator = LibraryScanCoordinator::new(
-        Arc::new(SqliteScanStore::new(db)),
+        Arc::new(SqliteScanStore::new(db, Arc::new(SystemClock))),
         BlockingPool::new(4),
         tags,
         Arc::new(StaticResolver::new(registry)),
+        Arc::new(SystemClock),
     )
     .with_wakeups(WorkWakeups::new());
     let paths = HashMap::from([("music".to_owned(), root.to_owned())]);
@@ -639,13 +706,17 @@ async fn shutdown_mid_index_resumes_without_double_counting() {
     );
     drop(resume);
     let (run, _, _) = coordinator.snapshot(&requested.run_id).expect("run");
-    assert_eq!(run.state, ScanState::Indexing, "the run stays resumable");
+    assert_eq!(
+        run.state.scan_state(),
+        ScanState::Indexing,
+        "the run stays resumable"
+    );
 
     let run = coordinator.run_once(&paths).await.expect("resumed");
-    assert_eq!(run.state, ScanState::Completed);
-    assert_eq!(count(&run, counter_names::TOTAL), 600);
-    assert_eq!(count(&run, counter_names::INSPECTED), 600);
-    assert_eq!(count(&run, counter_names::INDEXED), 600);
+    assert_eq!(run.state.scan_state(), ScanState::Completed);
+    assert_eq!(count(&run, Counter::Total), 600);
+    assert_eq!(count(&run, Counter::Inspected), 600);
+    assert_eq!(count(&run, Counter::Indexed), 600);
     assert_eq!(
         coordinator
             .store()
@@ -682,6 +753,120 @@ impl TagReader for HoldOnRead {
     }
 }
 
+/// Tag reader that holds every read while its gate is shut.
+#[derive(Default)]
+struct GatedReader {
+    /// Whether the gate is open, and how many reads wait at it.
+    state: std::sync::Mutex<(bool, usize)>,
+    turned: std::sync::Condvar,
+}
+
+impl GatedReader {
+    fn set(&self, open: bool) {
+        self.state.lock().expect("gate").0 = open;
+        self.turned.notify_all();
+    }
+
+    /// Wait until a read is held at the shut gate.
+    async fn held(self: &Arc<Self>) {
+        let gate = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            let state = gate.state.lock().expect("gate");
+            let (state, timeout) = gate
+                .turned
+                .wait_timeout_while(state, Duration::from_secs(30), |(_, waiting)| *waiting == 0)
+                .expect("gate");
+            assert!(
+                !timeout.timed_out() && state.1 > 0,
+                "no read reached the gate"
+            );
+        })
+        .await
+        .expect("waits");
+    }
+}
+
+impl TagReader for GatedReader {
+    fn read_tags(&self, _path: &Path) -> Result<ScannedTags, TagReadError> {
+        let mut state = self.state.lock().expect("gate");
+        state.1 += 1;
+        self.turned.notify_all();
+        let mut state = self
+            .turned
+            .wait_while(state, |(open, _)| !*open)
+            .expect("gate");
+        state.1 -= 1;
+        Ok(ScannedTags::default())
+    }
+}
+
+/// A pause, a resume and a stop asked of a running scan each answer what
+/// the run does now and settle where the worker can stop: the paused run
+/// picks up in the phase it left, the stopped one keeps the time it spent
+/// in each phase it reached, and an ended run refuses another pause.
+#[tokio::test]
+async fn pause_resume_and_stop_settle_where_the_worker_stops() {
+    let scratch = ScratchDir::new("scan-controls");
+    let root = scratch.join("music");
+    std::fs::create_dir_all(&root).expect("root");
+    for n in 0..20 {
+        std::fs::write(root.join(format!("t{n:02}.flac")), b"junk").expect("plant");
+    }
+    let gate = Arc::new(GatedReader::default());
+    let (coordinator, paths) = coordinator(&root, Arc::clone(&gate));
+    let id = coordinator
+        .request_run(&request(&root))
+        .expect("requested")
+        .run_id;
+    let indexing = RunState::Running(Phase::Indexing);
+
+    // Paused while the worker is held inside a tag read.
+    let (paused, ()) = tokio::join!(coordinator.run_once(&paths), async {
+        gate.held().await;
+        let (run, _, _) = coordinator.snapshot(&id).expect("run");
+        assert_eq!(run.state, indexing);
+        let (run, _) = coordinator
+            .control(&id, Event::Pause, run.row_revision)
+            .expect("pause is taken");
+        assert_eq!(run.state, RunState::Pausing(Phase::Indexing));
+        gate.set(true);
+    });
+    let paused = paused.expect("the drive settles");
+    assert_eq!(paused.state, RunState::Paused(Phase::Indexing));
+    assert_eq!(paused.state.resume_phase(), Some(ScanPhase::Indexing));
+
+    // Resumed, then stopped while held again.
+    gate.set(false);
+    let (run, _) = coordinator
+        .control(&id, Event::Resume, paused.row_revision)
+        .expect("resume is taken");
+    assert_eq!(run.state, indexing);
+    let (stopped, ()) = tokio::join!(coordinator.run_once(&paths), async {
+        gate.held().await;
+        let (run, _, _) = coordinator.snapshot(&id).expect("run");
+        assert_eq!(run.state, indexing);
+        let (run, _) = coordinator
+            .control(&id, Event::Stop, run.row_revision)
+            .expect("stop is taken");
+        assert_eq!(run.state, RunState::Stopping(Phase::Indexing));
+        gate.set(true);
+    });
+    let stopped = stopped.expect("the drive settles");
+    assert_eq!(stopped.state.scan_state(), ScanState::Cancelled);
+    for phase in [Phase::Discovering, Phase::Indexing] {
+        assert!(
+            stopped.phase_timings.contains_key(&phase),
+            "time kept for {phase:?}: {:?}",
+            stopped.phase_timings
+        );
+    }
+    let refused = coordinator.control(&id, Event::Pause, stopped.row_revision);
+    assert!(
+        matches!(refused, Err(ScanStoreError::InvalidControl { .. })),
+        "{refused:?}"
+    );
+}
+
 /// New music shows as a scan goes: each window that writes catalog rows
 /// moves the catalog revision in its own transaction, open tabs hear of it
 /// while the scan is still running, and the move outlives a shutdown that
@@ -714,7 +899,7 @@ async fn a_scan_moves_the_catalog_revision_as_it_goes() {
     let mut listener = hub.subscribe("listener");
     let supervisor = droppedneedle_kernel::jobs::Supervisor::start(
         db.clone(),
-        Arc::new(droppedneedle_kernel::clock::SystemClock),
+        Arc::new(SystemClock),
         CancellationToken::new(),
     )
     .await
@@ -741,7 +926,7 @@ async fn a_scan_moves_the_catalog_revision_as_it_goes() {
             .expect("the second window's first read is reached");
         let (run, _, _) = coordinator.snapshot(&requested.run_id).expect("run");
         assert_eq!(
-            count(&run, counter_names::INDEXED),
+            count(&run, Counter::Indexed),
             256,
             "held after the first window"
         );
@@ -771,7 +956,11 @@ async fn a_scan_moves_the_catalog_revision_as_it_goes() {
     let (drive, moved) = tokio::join!(coordinator.run_once_with_shutdown(&paths, &signal), held);
     assert!(drive.is_none(), "shutdown abandons the drive");
     let (run, _, _) = coordinator.snapshot(&requested.run_id).expect("run");
-    assert_eq!(run.state, ScanState::Indexing, "the run never ended");
+    assert_eq!(
+        run.state.scan_state(),
+        ScanState::Indexing,
+        "the run never ended"
+    );
     drop(coordinator);
 
     // A closed lane ends the event loop, with the supervisor never stopped.
@@ -810,15 +999,7 @@ async fn a_run_owing_its_end_passes_still_counts_as_scanning() {
     let (run, _, _) = coordinator.snapshot(&requested.run_id).expect("run");
     coordinator
         .store()
-        .transition(
-            &RunStop::never(),
-            &run.id,
-            run.state,
-            run.row_revision,
-            ScanState::Cancelled,
-            1.0,
-            None,
-        )
+        .request_control(&run.id, Event::Stop, run.row_revision, 1.0)
         .expect("ended without its passes");
     let current = coordinator.current();
     assert_eq!(current.len(), 1, "the run owing passes counts");
@@ -845,7 +1026,7 @@ async fn a_run_whose_end_passes_fail_still_ends() {
     let (coordinator, paths) = coordinator(&root, Arc::new(NullTagReader::new()));
     coordinator.request_run(&request(&root)).expect("requested");
     let first = coordinator.run_once(&paths).await.expect("driven");
-    assert_eq!(first.state, ScanState::Completed);
+    assert_eq!(first.state.scan_state(), ScanState::Completed);
     for n in 0..25 {
         std::fs::remove_file(root.join(format!("t{n:04}.flac"))).expect("remove");
     }
@@ -859,9 +1040,9 @@ async fn a_run_whose_end_passes_fail_still_ends() {
         .expect("trigger");
     let requested = coordinator.request_run(&request(&root)).expect("requested");
     let ended = coordinator.run_once(&paths).await.expect("driven");
-    assert_eq!(ended.state, ScanState::Completed);
+    assert_eq!(ended.state.scan_state(), ScanState::Completed);
     let (stored, _, _) = coordinator.snapshot(&requested.run_id).expect("run");
-    assert_eq!(stored.state, ScanState::Completed);
+    assert_eq!(stored.state.scan_state(), ScanState::Completed);
     let failures = coordinator
         .store()
         .failures(&requested.run_id)
@@ -869,7 +1050,7 @@ async fn a_run_whose_end_passes_fail_still_ends() {
     assert!(
         failures
             .iter()
-            .any(|failure| failure.failure_code == failure_codes::MASS_MISSING_GUARD),
+            .any(|failure| failure.failure_code == FailureCode::MassMissingGuard),
         "the guard held the scope back"
     );
     assert!(
@@ -901,11 +1082,11 @@ async fn a_refused_inventory_row_costs_that_file_only() {
         .expect("trigger");
     coordinator.request_run(&request(&root)).expect("requested");
     let run = coordinator.run_once(&paths).await.expect("driven");
-    assert_eq!(run.state, ScanState::Completed);
-    assert_eq!(count(&run, counter_names::INDEXED), 9);
+    assert_eq!(run.state.scan_state(), ScanState::Completed);
+    assert_eq!(count(&run, Counter::Indexed), 9);
     let failures = coordinator.store().failures(&run.id).unwrap();
     assert!(failures.iter().any(|failure| {
-        failure.failure_code == failure_codes::WALK_ERROR
+        failure.failure_code == FailureCode::WalkError
             && failure.relative_path == "t0003.flac"
             && failure.failure_detail.contains("refused for the test")
     }));
@@ -977,35 +1158,27 @@ async fn window_with_bad_files(
 async fn a_refused_and_a_slow_file_cost_those_files_only() {
     let (clean, _, clean_tracks) = window_with_bad_files("scan-window-clean", 8, false).await;
     let (run, failures, tracks) = window_with_bad_files("scan-window-bad", 8, true).await;
-    assert_eq!(run.state, ScanState::Completed);
+    assert_eq!(run.state.scan_state(), ScanState::Completed);
     assert_eq!((clean_tracks, tracks), (8, 6));
     let mut refused: Vec<&str> = failures
         .iter()
-        .filter(|failure| failure.failure_code == failure_codes::CATALOG_COMMIT_FAILED)
+        .filter(|failure| failure.failure_code == FailureCode::CatalogCommitFailed)
         .map(|failure| failure.relative_path.as_str())
         .collect();
     refused.sort_unstable();
     assert_eq!(refused, ["t0002.flac", "t0005.flac"]);
     // Untagged, each file is an album of its own, so the two files that
     // did not land take their identification offers with them.
-    let moved = |name: &str| match name {
-        name if name == counter_names::INDEXED
-            || name == counter_names::NEW
-            || name == counter_names::IDENTIFICATION_ENQUEUED =>
-        {
-            -2
-        }
-        name if name == counter_names::ERRORED => 2,
+    let moved = |counter| match counter {
+        Counter::Indexed | Counter::New | Counter::IdentificationEnqueued => -2,
+        Counter::Errored => 2,
         _ => 0,
     };
-    let mut names: Vec<&String> = clean.counters.keys().chain(run.counters.keys()).collect();
-    names.sort_unstable();
-    names.dedup();
-    for name in names {
+    for counter in Counter::ALL {
         assert_eq!(
-            count(&run, name),
-            count(&clean, name) + moved(name),
-            "counter {name}"
+            count(&run, counter),
+            count(&clean, counter) + moved(counter),
+            "counter {counter:?}"
         );
     }
 }
@@ -1033,7 +1206,7 @@ async fn a_request_write_during_indexing_is_answered_quickly() {
             run.terminal_at.is_none(),
             "the scan ended before it was probed"
         );
-        if count(&run, counter_names::INDEXED) > 0 {
+        if count(&run, Counter::Indexed) > 0 {
             break;
         }
         tokio::task::yield_now().await;
@@ -1055,7 +1228,7 @@ async fn a_request_write_during_indexing_is_answered_quickly() {
     answer.expect("a foreground write is answered");
     assert!(waited < Duration::from_secs(1), "it waited {waited:?}");
     let ended = driver.await.expect("drive").expect("driven");
-    assert_eq!(ended.state, ScanState::Completed);
+    assert_eq!(ended.state.scan_state(), ScanState::Completed);
 }
 
 /// Symlinks never lead out of a root: the walk audits them and the stream
@@ -1076,13 +1249,13 @@ async fn symlinks_never_escape_a_root() {
     let (coordinator, paths) = coordinator(&root, Arc::new(NullTagReader::new()));
     coordinator.request_run(&request(&root)).expect("requested");
     let run = coordinator.run_once(&paths).await.expect("driven");
-    assert_eq!(count(&run, counter_names::INDEXED), 1);
+    assert_eq!(count(&run, Counter::Indexed), 1);
     let escapes: Vec<String> = coordinator
         .store()
         .failures(&run.id)
         .unwrap()
         .into_iter()
-        .filter(|failure| failure.failure_code == failure_codes::SYMLINK_ESCAPE_OUT)
+        .filter(|failure| failure.failure_code == FailureCode::SymlinkEscapeOut)
         .map(|failure| failure.relative_path)
         .collect();
     assert_eq!(escapes, vec!["escape.flac".to_owned()]);
@@ -1302,6 +1475,7 @@ impl RegroupRig {
         migrated_db(&db);
         let store = Arc::new(SqliteScanStore::new(
             droppedneedle_kernel::db::Db::open_for_tests(&db).expect("database opens"),
+            Arc::new(SystemClock),
         ));
         let reader = Arc::new(RetagReader {
             albums: std::sync::Mutex::default(),
@@ -1326,6 +1500,7 @@ impl RegroupRig {
             BlockingPool::new(4),
             Arc::clone(&reader),
             Arc::new(StaticResolver::new(registry)),
+            Arc::new(SystemClock),
         )
         .with_wakeups(WorkWakeups::new());
         Self {
@@ -1369,7 +1544,10 @@ impl RegroupRig {
     }
 
     async fn scan(&self) {
-        assert_eq!(self.scan_to_its_end().await.state, ScanState::Completed);
+        assert_eq!(
+            self.scan_to_its_end().await.state.scan_state(),
+            ScanState::Completed
+        );
     }
 
     async fn scan_to_its_end(&self) -> ScanRun {
@@ -1698,14 +1876,13 @@ async fn a_folded_v2_split_comes_back_on_undo() {
     use droppedneedle_library::http::history::album_history_view;
     use droppedneedle_library::identity::FOLD_REASON;
     use droppedneedle_library::operations::models::OperationError;
-    use droppedneedle_library::operations::service::Operations;
 
     const SPLIT_GROUP: &str = "1d1b2a6e-8e1a-4c4f-9b7e-0f4f8c3b2a10";
     const TAGGED_GROUP: &str = "2e2c3b7f-9f2b-4d5a-8c8f-1a5a9d4c3b21";
     let dir = ScratchDir::new("fold-undo");
     std::fs::create_dir_all(dir.join("music")).expect("music folder");
     let library = bundle(&dir).await;
-    let ops = Operations::new(&library);
+    let ops = crate::common::library::operations(&library);
     let path = dir.join("app.db");
     let mut conn = droppedneedle_kernel::db::open_connection(&path).expect("connection opens");
     let mut seed = String::from(
@@ -1938,11 +2115,11 @@ async fn stopped_scan_offers_the_half_retagged_album() {
             .pop()
             .expect("the scan is running");
         coordinator
-            .control(&run.id, ScanControl::Stop, false, run.row_revision)
+            .control(&run.id, Event::Stop, run.row_revision)
             .expect("stop is taken");
     });
     let run = rig.scan_to_its_end().await;
-    assert_eq!(run.state, ScanState::Cancelled);
+    assert_eq!(run.state.scan_state(), ScanState::Cancelled);
 
     let new_row = rig.album_of("a/t000.flac");
     assert_ne!(new_row, album);
@@ -2012,6 +2189,7 @@ fn matched(release: &str, source: &str) -> Option<(String, String)> {
 async fn identify_now(rig: &RegroupRig, album: &str) -> String {
     let store = Arc::new(SqliteIdentifyStore::new(
         droppedneedle_kernel::db::Db::open_for_tests(&rig.db()).expect("identify store opens"),
+        Arc::new(SystemClock),
     ));
     let service = IdentifyService::new(IdentifyDeps {
         store: store.clone(),
@@ -2464,7 +2642,7 @@ async fn run_cancelled_while_queued_is_not_ended_again_at_startup() {
         .pop()
         .expect("the run is waiting");
     rig.coordinator
-        .control(&run.id, ScanControl::Stop, false, run.row_revision)
+        .control(&run.id, Event::Stop, run.row_revision)
         .expect("stop is taken");
     let stamp = "SELECT CAST(terminal_at * 1000 AS INTEGER) + row_revision \
                  FROM library_scan_runs WHERE state = 'cancelled'";
@@ -2981,7 +3159,7 @@ impl RegroupRig {
                 .pop()
                 .expect("the scan is running");
             coordinator
-                .control(&run.id, ScanControl::Stop, false, run.row_revision)
+                .control(&run.id, Event::Stop, run.row_revision)
                 .expect("stop is taken");
         });
     }
@@ -3120,7 +3298,10 @@ async fn retag_across_a_cancelled_scan_is_joined_at_the_next() {
         let after = rig.after.clone();
         rig.tag(&files, &after);
         rig.stop_before(SECOND_WINDOW);
-        assert_eq!(rig.scan_to_its_end().await.state, ScanState::Cancelled);
+        assert_eq!(
+            rig.scan_to_its_end().await.state.scan_state(),
+            ScanState::Cancelled
+        );
         let new_row = rig.album_of("a/t000.flac");
         assert_ne!(new_row, album, "{name}");
         assert_eq!(
@@ -4261,7 +4442,6 @@ async fn returned_track_is_off_the_record() {
 /// of: there is nothing left to join.
 #[tokio::test]
 async fn hand_merge_removes_an_open_pair() {
-    use droppedneedle_library::corrections::Corrections;
     use droppedneedle_library::corrections::models::{
         ApplyMeta, MembershipKind, MembershipRequest,
     };
@@ -4288,7 +4468,7 @@ async fn hand_merge_removes_an_open_pair() {
         ))
         .expect("pair recorded");
 
-    let corrections = Corrections::new(&library);
+    let corrections = crate::common::library::services(&library).corrections;
     let request = MembershipRequest {
         kind: MembershipKind::Merge,
         album_id: None,
@@ -4316,6 +4496,156 @@ async fn hand_merge_removes_an_open_pair() {
         query(&library, "SELECT COUNT(*) FROM library_retag_pairs"),
         0
     );
+}
+
+/// A reset grouping that makes a new album credits it to the row a scan
+/// of the file keys, the name row, not an older row of the same name that
+/// is linked to another artist. Nobody's favourite moves.
+#[tokio::test]
+async fn a_reset_album_is_credited_as_a_scan_keys_it() {
+    let scratch = ScratchDir::new("scan-reset-artist");
+    let music = scratch.join("music");
+    // Credited "Radiohead" with no album artist id and no listed artists.
+    plant(&music, "a/01.flac", "flac_full_01.flac");
+    let library = bundle(&scratch).await;
+    scan(&library).await;
+    let store = &library.scan_store;
+    let track = store.track_at("music", "a/01.flac").unwrap().expect("a/01");
+    let album = store.album_for_track(&track).unwrap().expect("album");
+    let db = droppedneedle_kernel::db::open_connection(&scratch.join("app.db")).expect("db opens");
+    let name_row: String = db
+        .query_row(
+            "SELECT local_artist_id FROM local_album_artists WHERE local_album_id = ?1",
+            [&album],
+            |row| row.get(0),
+        )
+        .expect("album credit");
+    // An older live row of the same name, linked to another artist; the
+    // track is held on its album by hand, and the album's key moved on, so
+    // a reset makes a new album.
+    store
+        .db()
+        .run_sql(&format!(
+            "INSERT INTO local_artists (id, display_name, sort_name, folded_name, \
+             normalized_name, kind, created_at, updated_at) \
+             SELECT 'twin', display_name, sort_name, folded_name, normalized_name, kind, \
+             created_at - 1, updated_at FROM local_artists WHERE id = '{name_row}'; \
+             INSERT INTO local_artist_external_identities (local_artist_id, provider, \
+             provider_artist_id, decision_source, selected_at) \
+             VALUES ('twin', 'musicbrainz', 'cccccccc-0000-4000-8000-00000000000c', 'manual', 1); \
+             INSERT INTO library_user_favorites (user_id, item_kind, item_id, created_at) \
+             VALUES ('listener', 'artist', 'twin', 0), ('listener', 'artist', '{name_row}', 0); \
+             UPDATE local_tracks SET membership_locked = 1, membership_source = 'manual' \
+             WHERE id = '{track}'; \
+             UPDATE local_albums SET grouping_key = 'moved-on' WHERE id = '{album}';"
+        ))
+        .expect("seeds");
+
+    reset_grouping(&library, &album, &track);
+    let reset = store.album_for_track(&track).unwrap().expect("reset album");
+    assert_ne!(reset, album, "the reset made a new album");
+    let credited: (String, String) = db
+        .query_row(
+            "SELECT a.album_artist_id, c.local_artist_id FROM local_albums a \
+             JOIN local_album_artists c ON c.local_album_id = a.id WHERE a.id = ?1",
+            [&reset],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("reset album credit");
+    assert_eq!(credited, (name_row.clone(), name_row.clone()));
+    for artist in ["twin", name_row.as_str()] {
+        assert_eq!(
+            query(
+                &library,
+                &format!(
+                    "SELECT COUNT(*) FROM library_user_favorites \
+                     WHERE item_kind = 'artist' AND item_id = '{artist}'"
+                )
+            ),
+            1,
+            "{artist} keeps its favourite"
+        );
+    }
+}
+
+/// A reset album's credit carries no artist id: the stored album artist id
+/// is only the file's first one, so for "A & B" it would name A alone. The
+/// album stays on the "A & B" name row, not on A's row, and the next scan
+/// writes the ids the file holds.
+#[tokio::test]
+async fn a_reset_album_credit_carries_no_artist_id() {
+    const ID_A: &str = "aaaaaaaa-1111-4111-8111-00000000000a";
+    let scratch = ScratchDir::new("scan-reset-joined");
+    let music = scratch.join("music");
+    plant(&music, "a/01.flac", "flac_full_01.flac");
+    let library = bundle(&scratch).await;
+    scan(&library).await;
+    let store = &library.scan_store;
+    let track = store.track_at("music", "a/01.flac").unwrap().expect("a/01");
+    let album = store.album_for_track(&track).unwrap().expect("album");
+    // The file names "A & B" with ids for A and B; the column keeps A's.
+    // A has a row of its own, linked by a person.
+    store
+        .db()
+        .run_sql(&format!(
+            "UPDATE local_tracks SET album_artist_name = 'A & B', \
+             embedded_album_artist_mbid = '{ID_A}', membership_locked = 1, \
+             membership_source = 'manual' WHERE id = '{track}'; \
+             INSERT INTO local_artists (id, display_name, folded_name, normalized_name, kind, \
+             created_at, updated_at) VALUES ('ar-a', 'A', 'a', 'a', 'person', 0, 0); \
+             INSERT INTO local_artist_external_identities (local_artist_id, provider, \
+             provider_artist_id, decision_source, selected_at) \
+             VALUES ('ar-a', 'musicbrainz', '{ID_A}', 'manual', 1); \
+             UPDATE local_albums SET grouping_key = 'moved-on' WHERE id = '{album}';"
+        ))
+        .expect("seeds");
+    reset_grouping(&library, &album, &track);
+    let reset = store.album_for_track(&track).unwrap().expect("reset album");
+    assert_ne!(reset, album, "the reset made a new album");
+    let db = droppedneedle_kernel::db::open_connection(&scratch.join("app.db")).expect("db opens");
+    let credited: (String, String, Option<String>) = db
+        .query_row(
+            "SELECT c.local_artist_id, r.display_name, c.artist_mbid \
+             FROM local_album_artists c JOIN local_artists r ON r.id = c.local_artist_id \
+             WHERE c.local_album_id = ?1",
+            [&reset],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("reset album credit");
+    assert_ne!(credited.0, "ar-a", "not filed under A alone");
+    assert_eq!(credited.1, "A & B");
+    assert_eq!(credited.2, None, "no id on the album credit");
+}
+
+/// Reset `track` on `album` back to automatic grouping, as an admin.
+fn reset_grouping(library: &LibrarySetup, album: &str, track: &str) {
+    use droppedneedle_library::corrections::models::{
+        ApplyMeta, MembershipKind, MembershipRequest,
+    };
+    let corrections = crate::common::library::services(library).corrections;
+    let request = MembershipRequest {
+        kind: MembershipKind::Reset,
+        album_id: Some(album.to_owned()),
+        track_ids: vec![track.to_owned()],
+        expected_album_revisions: BTreeMap::new(),
+        target_album_id: None,
+        title: None,
+        album_artist_name: None,
+        identity_choice: Default::default(),
+    };
+    let preview = corrections
+        .preview_membership(&request, "admin")
+        .expect("previewed");
+    corrections
+        .apply_membership(
+            &request,
+            &ApplyMeta {
+                preview_token: preview.token,
+                idempotency_key: None,
+                actor: "admin".to_owned(),
+            },
+        )
+        .expect("reset");
 }
 
 // ---------------------------------------------------------------------------
@@ -4720,6 +5050,7 @@ async fn a_store_error_holds_the_continuation_not_the_seal() {
     );
     let identify = SqliteIdentifyStore::new(
         droppedneedle_kernel::db::Db::open_for_tests(&rig.db()).expect("identify store opens"),
+        Arc::new(SystemClock),
     );
     assert!(
         identify
@@ -4920,7 +5251,7 @@ impl RegroupRig {
         self.coordinator.request_run(&request).expect("requested");
         let paths = HashMap::from([("music".to_owned(), self.root.clone())]);
         let run = self.coordinator.run_once(&paths).await.expect("scan runs");
-        assert_eq!(run.state, ScanState::Completed);
+        assert_eq!(run.state.scan_state(), ScanState::Completed);
     }
 
     fn open_pairs(&self) -> i64 {
@@ -5499,6 +5830,7 @@ async fn a_join_waits_for_the_rest_of_the_old_album() {
     let new = rig.album_of("b/t000.flac");
     let identify = SqliteIdentifyStore::new(
         droppedneedle_kernel::db::Db::open_for_tests(&rig.db()).expect("identify store opens"),
+        Arc::new(SystemClock),
     );
     assert!(
         identify
@@ -5554,7 +5886,6 @@ async fn a_join_waits_for_the_rest_of_the_old_album() {
 /// by the app: each pair is recorded once for a person, who merges one.
 #[tokio::test]
 async fn an_album_replaced_on_two_albums_is_left_to_a_person() {
-    use droppedneedle_library::corrections::Corrections;
     use droppedneedle_library::corrections::models::PairJoinRequest;
 
     let (mut rig, old, old_rows) = mapped_album("join-split", 2).await;
@@ -5602,7 +5933,7 @@ async fn an_album_replaced_on_two_albums_is_left_to_a_person() {
         .build()
         .await;
     let (library, _) = library_at(&platform);
-    let corrections = Corrections::new(&library);
+    let corrections = crate::common::library::services(&library).corrections;
     let listed = corrections.retag_pairs().expect("pairs listed");
     assert_eq!(listed.total, 2);
     let revision = |album: &str| {
@@ -5727,6 +6058,7 @@ impl RegroupRig {
     fn store_release(&self, release: &droppedneedle_library::matching::Release) {
         SqliteIdentifyStore::new(
             droppedneedle_kernel::db::Db::open_for_tests(&self.db()).expect("identify store opens"),
+            Arc::new(SystemClock),
         )
         .save_release(release, droppedneedle_kernel::db::Lane::Background)
         .unwrap();
@@ -6275,6 +6607,7 @@ impl ArtistRig {
         migrated_db(&db);
         let store = Arc::new(SqliteScanStore::new(
             droppedneedle_kernel::db::Db::open_for_tests(&db).expect("database opens"),
+            Arc::new(SystemClock),
         ));
         let registry = RootRegistry::new(
             vec![LibraryRoot::new(
@@ -6290,6 +6623,7 @@ impl ArtistRig {
             BlockingPool::new(2),
             Arc::new(droppedneedle_library::adapters::LoftyTagReader),
             Arc::new(StaticResolver::new(registry)),
+            Arc::new(SystemClock),
         )
         .with_wakeups(WorkWakeups::new());
         Self {
@@ -6374,7 +6708,7 @@ impl ArtistRig {
             .expect("requested");
         let paths = HashMap::from([("music".to_owned(), self.root.clone())]);
         let run = self.coordinator.run_once(&paths).await.expect("scan runs");
-        assert_eq!(run.state, ScanState::Completed);
+        assert_eq!(run.state.scan_state(), ScanState::Completed);
     }
 
     fn run(&self, sql: &str) {
@@ -6511,6 +6845,7 @@ impl ArtistRig {
         let store = SqliteIdentifyStore::new(
             droppedneedle_kernel::db::Db::open_for_tests(&self.scratch.join("app.db"))
                 .expect("store opens"),
+            Arc::new(SystemClock),
         );
         store
             .save_release(
@@ -6545,6 +6880,7 @@ impl ArtistRig {
         SqliteIdentifyStore::new(
             droppedneedle_kernel::db::Db::open_for_tests(&self.scratch.join("app.db"))
                 .expect("store opens"),
+            Arc::new(SystemClock),
         )
         .sweep_artist_links()
         .expect("sweep runs");
@@ -6716,6 +7052,67 @@ async fn a_group_marked_distinct_is_not_merged() {
     assert_eq!(rig.retired_into(left), Some(survivor.clone()));
     assert_eq!(rig.retired_into(right), Some(survivor));
     assert_eq!(rig.merges(), 1);
+}
+
+/// MusicBrainz's `[unknown]` artist, which stands for no one artist.
+const UNKNOWN_MBID: &str = "125ec42a-7229-4250-afc5-e057484327fe";
+
+/// Two differently named artists whose files both carry MusicBrainz's
+/// `[unknown]` id keep a row each after the scan and its run end, and
+/// neither credit stores the id: a special-purpose id is never proof.
+#[tokio::test]
+async fn a_placeholder_artist_id_keeps_two_artists_apart() {
+    let rig = ArtistRig::new("artist-placeholder");
+    rig.put(
+        "A/01.flac",
+        "Album A",
+        listed(&["Oh"], &[UNKNOWN_MBID]),
+        listed(&["Oh"], &[UNKNOWN_MBID]),
+    );
+    rig.put(
+        "B/01.flac",
+        "Album B",
+        listed(&["En"], &[UNKNOWN_MBID]),
+        listed(&["En"], &[UNKNOWN_MBID]),
+    );
+    rig.scan().await;
+    let oh = rig.track_artist("A/01.flac", 0);
+    let en = rig.track_artist("B/01.flac", 0);
+    assert_ne!(oh, en);
+    assert_eq!(rig.name(&oh), "Oh");
+    assert_eq!(rig.name(&en), "En");
+    assert_eq!(rig.retired_into(&oh), None);
+    assert_eq!(rig.retired_into(&en), None);
+    assert_eq!(
+        rig.count(&format!(
+            "SELECT (SELECT COUNT(*) FROM local_track_artists WHERE artist_mbid = '{UNKNOWN_MBID}') \
+             + (SELECT COUNT(*) FROM local_album_artists WHERE artist_mbid = '{UNKNOWN_MBID}')"
+        )),
+        0
+    );
+}
+
+/// Rows whose credits already store the `[unknown]` id, as files scanned
+/// before it was dropped left them, stay apart at the run end.
+#[tokio::test]
+async fn rows_holding_a_placeholder_id_are_not_merged() {
+    let rig = ArtistRig::new("artist-placeholder-stored");
+    rig.put("A/01.flac", "Album A", plain(&["Oh"]), plain(&["Oh"]));
+    rig.put("B/01.flac", "Album B", plain(&["En"]), plain(&["En"]));
+    rig.scan().await;
+    let oh = rig.track_artist("A/01.flac", 0);
+    let en = rig.track_artist("B/01.flac", 0);
+    assert_ne!(oh, en);
+    rig.run(&format!(
+        "UPDATE local_track_artists SET artist_mbid = '{UNKNOWN_MBID}' \
+         WHERE local_artist_id IN ('{oh}', '{en}'); \
+         UPDATE local_album_artists SET artist_mbid = '{UNKNOWN_MBID}' \
+         WHERE local_artist_id IN ('{oh}', '{en}');"
+    ));
+    rig.scan().await;
+    assert_eq!(rig.retired_into(&oh), None);
+    assert_eq!(rig.retired_into(&en), None);
+    assert_eq!(rig.merges(), 0);
 }
 
 /// A merge the store refuses is rolled back with one warning and the run
@@ -8062,7 +8459,10 @@ async fn big_retag(
     }
     if stop {
         rig.stop_before(LAST_FILE);
-        assert_eq!(rig.scan_to_its_end().await.state, ScanState::Cancelled);
+        assert_eq!(
+            rig.scan_to_its_end().await.state.scan_state(),
+            ScanState::Cancelled
+        );
     } else {
         rig.scan().await;
     }

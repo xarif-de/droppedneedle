@@ -12,20 +12,24 @@ use droppedneedle_kernel::clock::Clock;
 
 use super::adapter::{
     AdapterError, AlbumBrowse, ArtistBrowse, ImportSink, RemoteHandle, TrackBrowse, album_page,
-    artist_page, track_page,
+    artist_page, track_page, unsupported,
 };
-use super::connections::{ConnectionResolver, LinkSummary, ResolveError, SaveError, UserLink};
-use super::folders::{FolderSaveError, FolderStore, checked_preference, resolve_scope};
+use super::connections::{
+    ConnectionResolver, LinkSummary, Reads, ResolveError, ResolvedConnection, SaveError, UserLink,
+};
+use super::folders::{
+    FolderListCache, FolderSaveError, FolderStore, checked_preference, resolve_scope,
+};
 use super::jellyfin::{JellyfinAdapter, MixSeed};
 use super::models::{
     AlbumPage, AlbumView, AnalyticsView, ArtistIndexEntry, ArtistPage, ArtistView,
     ConnectionStatus, DiscoveryView, FavoritesView, FilterFacetsView, FolderResolutionView,
-    HistoryPage, HubView, ImportResult, InfoView, LyricsView, MatchView, MusicFolderView,
-    PlaylistCollection, PlaylistDetail, SearchResults, SessionsView, SourceName, StatsView,
-    TrackPage, TrackView,
+    HistoryPage, HubView, ImportResult, InfoView, LyricsView, MatchQuery, MatchView,
+    MusicFolderView, PlaylistCollection, PlaylistDetail, SearchResults, SessionsView, SourceName,
+    StatsView, TrackPage, TrackView,
 };
-use super::navidrome::NavidromeAdapter;
-use super::plex::PlexAdapter;
+use super::warmup::MbidIndex;
+use droppedneedle_kernel::db::fold::fold_text;
 
 /// Every way a remotes call can fail. Detail strings are log-only unless
 /// the variant says otherwise.
@@ -120,6 +124,26 @@ pub struct AccountLogin {
     pub password: String,
 }
 
+/// Albums one name search reads, as in v2.
+const NAME_SEARCH_LIMIT: i64 = 50;
+/// The folded compilation credit the name step never matches on: a title
+/// like "Greatest Hits" under it names no one album.
+const VARIOUS_ARTISTS: &str = "various artists";
+
+/// A query value with something in it.
+fn present(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+/// The album's tracks, when it has any.
+async fn playable(
+    handle: &RemoteHandle,
+    id: String,
+) -> Result<Option<(String, Vec<TrackView>)>, AdapterError> {
+    let tracks = handle.album_tracks(&id).await?;
+    Ok((!tracks.is_empty()).then_some((id, tracks)))
+}
+
 /// Plex listening analytics over the history feed.
 pub const ANALYTICS_MAX_ENTRIES: i64 = 5_000;
 const ANALYTICS_BATCH: i64 = 500;
@@ -132,26 +156,32 @@ pub struct RemotesService {
     http: reqwest::Client,
     resolver: Arc<ConnectionResolver>,
     folders: Arc<dyn FolderStore>,
+    folder_lists: Arc<FolderListCache>,
     imports: Arc<dyn ImportSink>,
+    index: MbidIndex,
     clock: Arc<dyn Clock>,
 }
 
 impl RemotesService {
     /// Build the service over the shared HTTP client, the connection
-    /// resolver, the folder preferences, the playlist import target and
-    /// the clock listening analytics count back from.
+    /// resolver, the folder preferences, the playlist import target, the
+    /// MBID index the warmups fill and the clock listening analytics count
+    /// back from.
     pub fn new(
         http: reqwest::Client,
         resolver: Arc<ConnectionResolver>,
         folders: Arc<dyn FolderStore>,
         imports: Arc<dyn ImportSink>,
+        index: MbidIndex,
         clock: Arc<dyn Clock>,
     ) -> Self {
         Self {
             http,
             resolver,
             folders,
+            folder_lists: Arc::default(),
             imports,
+            index,
             clock,
         }
     }
@@ -161,56 +191,85 @@ impl RemotesService {
         &self.resolver
     }
 
+    /// The MBID index the match reads.
+    pub fn index(&self) -> &MbidIndex {
+        &self.index
+    }
+
     // -- handles -----------------------------------------------------------
 
     /// The caller's handle for one source, folder-scoped for Navidrome.
+    /// The folder list comes from the cache while it is fresh.
     pub async fn handle(&self, user_id: &str, source: SourceName) -> RemotesResult<RemoteHandle> {
+        let handle = self.unscoped(user_id, source, Reads::User).await?;
+        let RemoteHandle::Navidrome(adapter) = handle else {
+            return Ok(handle);
+        };
+        let preference = self
+            .folders
+            .get(user_id)
+            .await
+            .map_err(RemotesFailure::Internal)?;
+        let identity = adapter.server_identity();
+        let cached = self
+            .folder_lists
+            .get(user_id, &identity, self.clock.now_ms());
+        let fetched = match cached {
+            Some(folders) => Ok(folders),
+            None => adapter.music_folders().await.inspect(|folders| {
+                self.folder_lists
+                    .put(user_id, &identity, self.clock.now_ms(), folders.clone());
+            }),
+        };
+        let folders = match fetched {
+            Ok(folders) => Some(folders),
+            Err(AdapterError::Auth) => {
+                return Err(RemotesFailure::AuthFailed(SourceName::Navidrome));
+            }
+            Err(error) => {
+                tracing::warn!(%error, "navidrome folders unavailable; using the stored scope");
+                None
+            }
+        };
+        let resolution = resolve_scope(&preference, folders.as_deref(), &identity);
+        Ok(RemoteHandle::Navidrome(
+            adapter.with_folders(resolution.scope.folder_ids),
+        ))
+    }
+
+    /// The caller's handle for one source, with no folder scope.
+    async fn unscoped(
+        &self,
+        user_id: &str,
+        source: SourceName,
+        reads: Reads,
+    ) -> RemotesResult<RemoteHandle> {
         let resolved = self
             .resolver
             .resolve(user_id, source)
             .await
             .map_err(|error| resolve_failure(source, error))?;
-        Ok(match source {
-            SourceName::Jellyfin => RemoteHandle::Jellyfin(JellyfinAdapter::new(
-                self.http.clone(),
-                resolved.base_url,
-                resolved.credential,
-                resolved.user_id,
-            )),
-            SourceName::Navidrome => {
-                let adapter = NavidromeAdapter::new(
-                    self.http.clone(),
-                    resolved.base_url,
-                    resolved.username,
-                    resolved.credential,
-                );
-                let preference = self
-                    .folders
-                    .get(user_id)
-                    .await
-                    .map_err(RemotesFailure::Internal)?;
-                let identity = adapter.server_identity();
-                let folders = match adapter.music_folders().await {
-                    Ok(folders) => Some(folders),
-                    Err(AdapterError::Auth) => {
-                        return Err(RemotesFailure::AuthFailed(SourceName::Navidrome));
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, "navidrome folders unavailable; using the stored scope");
-                        None
-                    }
-                };
-                let resolution = resolve_scope(&preference, folders.as_deref(), &identity);
-                RemoteHandle::Navidrome(adapter.with_folders(resolution.scope.folder_ids))
-            }
-            SourceName::Plex => RemoteHandle::Plex(PlexAdapter::new(
-                self.http.clone(),
-                resolved.base_url,
-                resolved.credential,
-                resolved.client_id,
-                resolved.section_ids,
-            )),
-        })
+        Ok(self.resolver.client(&self.http, resolved, reads))
+    }
+
+    /// Run one adapter call that addresses an item by id. It skips the
+    /// folder scope, as the stream reader does: the scope is a view filter
+    /// for browse lists, and the id came from one of them.
+    async fn call_by_id<T, F, Fut>(
+        &self,
+        user_id: &str,
+        source: SourceName,
+        reads: Reads,
+        call: F,
+    ) -> RemotesResult<T>
+    where
+        F: FnOnce(RemoteHandle) -> Fut,
+        Fut: Future<Output = Result<T, AdapterError>>,
+    {
+        let handle = self.unscoped(user_id, source, reads).await?;
+        call(handle)
+            .await
+            .map_err(|error| adapter_failure(source, error))
     }
 
     /// Resolve a handle and run one adapter call on it.
@@ -225,33 +284,24 @@ impl RemotesService {
             .map_err(|error| adapter_failure(source, error))
     }
 
-    async fn jellyfin(&self, user_id: &str) -> RemotesResult<JellyfinAdapter> {
-        match self.handle(user_id, SourceName::Jellyfin).await? {
-            RemoteHandle::Jellyfin(adapter) => Ok(adapter),
-            _ => Err(RemotesFailure::Internal(
-                "jellyfin resolved another source".to_owned(),
-            )),
+    /// [`Self::call`] for `what` only `wanted` has. Any other source
+    /// answers `Unsupported` before anything is resolved.
+    async fn call_only<T, F, Fut>(
+        &self,
+        user_id: &str,
+        source: SourceName,
+        wanted: SourceName,
+        what: &str,
+        call: F,
+    ) -> RemotesResult<T>
+    where
+        F: FnOnce(RemoteHandle) -> Fut,
+        Fut: Future<Output = Result<T, AdapterError>>,
+    {
+        if source != wanted {
+            return Err(adapter_failure(source, unsupported(source, what)));
         }
-    }
-
-    async fn plex(&self, user_id: &str) -> RemotesResult<PlexAdapter> {
-        match self.handle(user_id, SourceName::Plex).await? {
-            RemoteHandle::Plex(adapter) => Ok(adapter),
-            _ => Err(RemotesFailure::Internal(
-                "plex resolved another source".to_owned(),
-            )),
-        }
-    }
-
-    fn only(source: SourceName, wanted: SourceName, what: &str) -> RemotesResult<()> {
-        if source == wanted {
-            Ok(())
-        } else {
-            Err(RemotesFailure::Unsupported(format!(
-                "{} has no {what}",
-                source.display()
-            )))
-        }
+        self.call(user_id, source, call).await
     }
 
     // -- browse ------------------------------------------------------------
@@ -295,7 +345,7 @@ impl RemotesService {
         source: SourceName,
         id: String,
     ) -> RemotesResult<AlbumView> {
-        self.call(user_id, source, move |handle| async move {
+        self.call_by_id(user_id, source, Reads::User, move |handle| async move {
             handle.album_detail(&id).await
         })
         .await?
@@ -310,7 +360,7 @@ impl RemotesService {
         id: String,
     ) -> RemotesResult<TrackPage> {
         let items = self
-            .call(user_id, source, move |handle| async move {
+            .call_by_id(user_id, source, Reads::User, move |handle| async move {
                 handle.album_tracks(&id).await
             })
             .await?;
@@ -476,12 +526,15 @@ impl RemotesService {
 
     /// Plex mood labels.
     pub async fn moods(&self, user_id: &str, source: SourceName) -> RemotesResult<Vec<String>> {
-        Self::only(source, SourceName::Plex, "mood labels")?;
-        self.plex(user_id)
-            .await?
-            .moods()
-            .await
-            .map_err(|error| adapter_failure(source, error))
+        let what = "mood labels";
+        self.call_only(
+            user_id,
+            source,
+            SourceName::Plex,
+            what,
+            |handle| async move { handle.plex(what)?.moods().await },
+        )
+        .await
     }
 
     /// Jellyfin filter facets (years, tags, studios).
@@ -490,12 +543,15 @@ impl RemotesService {
         user_id: &str,
         source: SourceName,
     ) -> RemotesResult<FilterFacetsView> {
-        Self::only(source, SourceName::Jellyfin, "filter facets")?;
-        self.jellyfin(user_id)
-            .await?
-            .filter_facets()
-            .await
-            .map_err(|error| adapter_failure(source, error))
+        let what = "filter facets";
+        self.call_only(
+            user_id,
+            source,
+            SourceName::Jellyfin,
+            what,
+            |handle| async move { handle.jellyfin(what)?.filter_facets().await },
+        )
+        .await
     }
 
     /// Most-played albums (Jellyfin play counts).
@@ -505,12 +561,15 @@ impl RemotesService {
         source: SourceName,
         limit: i64,
     ) -> RemotesResult<Vec<AlbumView>> {
-        Self::only(source, SourceName::Jellyfin, "play counts")?;
-        self.jellyfin(user_id)
-            .await?
-            .most_played_albums(limit)
-            .await
-            .map_err(|error| adapter_failure(source, error))
+        let what = "play counts";
+        self.call_only(
+            user_id,
+            source,
+            SourceName::Jellyfin,
+            what,
+            |handle| async move { handle.jellyfin(what)?.most_played_albums(limit).await },
+        )
+        .await
     }
 
     /// Most-played artists (Jellyfin play counts).
@@ -520,12 +579,15 @@ impl RemotesService {
         source: SourceName,
         limit: i64,
     ) -> RemotesResult<Vec<ArtistView>> {
-        Self::only(source, SourceName::Jellyfin, "play counts")?;
-        self.jellyfin(user_id)
-            .await?
-            .most_played_artists(limit)
-            .await
-            .map_err(|error| adapter_failure(source, error))
+        let what = "play counts";
+        self.call_only(
+            user_id,
+            source,
+            SourceName::Jellyfin,
+            what,
+            |handle| async move { handle.jellyfin(what)?.most_played_artists(limit).await },
+        )
+        .await
     }
 
     // -- playlists ---------------------------------------------------------
@@ -692,12 +754,15 @@ impl RemotesService {
         source: SourceName,
         count: i64,
     ) -> RemotesResult<DiscoveryView> {
-        Self::only(source, SourceName::Plex, "discovery shelves")?;
-        self.plex(user_id)
-            .await?
-            .discovery(count)
-            .await
-            .map_err(|error| adapter_failure(source, error))
+        let what = "discovery shelves";
+        self.call_only(
+            user_id,
+            source,
+            SourceName::Plex,
+            what,
+            |handle| async move { handle.plex(what)?.discovery(count).await },
+        )
+        .await
     }
 
     /// Jellyfin instant mix.
@@ -708,13 +773,16 @@ impl RemotesService {
         seed: MixSeed,
         limit: i64,
     ) -> RemotesResult<TrackPage> {
-        Self::only(source, SourceName::Jellyfin, "instant-mix endpoint")?;
+        let what = "instant-mix endpoint";
         let items = self
-            .jellyfin(user_id)
-            .await?
-            .mix(&seed, limit)
-            .await
-            .map_err(|error| adapter_failure(source, error))?;
+            .call_only(
+                user_id,
+                source,
+                SourceName::Jellyfin,
+                what,
+                |handle| async move { handle.jellyfin(what)?.mix(&seed, limit).await },
+            )
+            .await?;
         Ok(capped_page(items, limit))
     }
 
@@ -750,8 +818,14 @@ impl RemotesService {
         source: SourceName,
     ) -> RemotesResult<AnalyticsView> {
         let now_unix = self.clock.now_unix();
-        Self::only(source, SourceName::Plex, "listening analytics")?;
-        let plex = self.plex(user_id).await?;
+        let what = "listening analytics";
+        if source != SourceName::Plex {
+            return Err(adapter_failure(source, unsupported(source, what)));
+        }
+        let handle = self.handle(user_id, source).await?;
+        let plex = handle
+            .plex(what)
+            .map_err(|error| adapter_failure(source, error))?;
         let mut entries = Vec::new();
         let mut offset = 0;
         let mut total_available = 0;
@@ -779,7 +853,9 @@ impl RemotesService {
         ))
     }
 
-    /// Image bytes for one item.
+    /// Image bytes for one item. Images stay outside the per-source read
+    /// bound: a grid asks for dozens at once, and a click must not queue
+    /// behind them. Each is read under the image size cap.
     pub async fn image(
         &self,
         user_id: &str,
@@ -787,13 +863,16 @@ impl RemotesService {
         id: String,
         size: i64,
     ) -> RemotesResult<(Vec<u8>, String)> {
-        self.call(user_id, source, move |handle| async move {
-            handle.image_bytes(&id, size).await
-        })
+        self.call_by_id(
+            user_id,
+            source,
+            Reads::Background,
+            move |handle| async move { handle.image_bytes(&id, size).await },
+        )
         .await
     }
 
-    /// Playlist cover bytes.
+    /// Playlist cover bytes, outside the read bound as images are.
     pub async fn playlist_cover(
         &self,
         user_id: &str,
@@ -801,28 +880,115 @@ impl RemotesService {
         id: String,
         size: i64,
     ) -> RemotesResult<(Vec<u8>, String)> {
-        self.call(user_id, source, move |handle| async move {
-            handle.playlist_cover_bytes(&id, size).await
-        })
+        self.call_by_id(
+            user_id,
+            source,
+            Reads::Background,
+            move |handle| async move { handle.playlist_cover_bytes(&id, size).await },
+        )
         .await
     }
 
-    /// The remote album behind a MusicBrainz id.
+    /// The caller's copy of an album on one source.
+    ///
+    /// A remote album matches when it carries the album's release or
+    /// release-group id, from the index or the server's MBID search, taking
+    /// the first in the server's order. Otherwise, on Plex and Navidrome
+    /// only, it matches by name: when the query has a title and an artist
+    /// that is not Various Artists, and exactly one album in the title
+    /// search's answer has that title and album artist once folded. Two or
+    /// more mean no match, since a wrong match plays the wrong album. Every
+    /// candidate counts only when the caller's own connection can open it.
     pub async fn match_album(
         &self,
         user_id: &str,
         source: SourceName,
-        mbid: String,
+        query: MatchQuery,
     ) -> RemotesResult<MatchView> {
-        if mbid.trim().is_empty() {
+        let mbid = query.mbid.trim();
+        if mbid.is_empty() {
             return Err(RemotesFailure::InvalidInput(
                 "Match mbid must not be empty".to_owned(),
             ));
         }
-        self.call(user_id, source, move |handle| async move {
-            handle.match_album(&mbid).await
+        let handle = self.handle(user_id, source).await?;
+        // The index is used only for the server it was read from: after the
+        // admin points the source elsewhere, its ids name other albums.
+        let server = self
+            .resolver
+            .server(source)
+            .map_err(|error| resolve_failure(source, error))?
+            .map(|server| server.base_url)
+            .unwrap_or_default();
+        let found = self
+            .find_album(&handle, source, &server, mbid, &query)
+            .await
+            .map_err(|error| adapter_failure(source, error))?;
+        Ok(match found {
+            Some((id, tracks)) => MatchView {
+                source,
+                found: true,
+                remote_album_id: Some(id),
+                tracks,
+            },
+            None => MatchView {
+                source,
+                found: false,
+                remote_album_id: None,
+                tracks: Vec::new(),
+            },
         })
-        .await
+    }
+
+    async fn find_album(
+        &self,
+        handle: &RemoteHandle,
+        source: SourceName,
+        server: &str,
+        mbid: &str,
+        query: &MatchQuery,
+    ) -> Result<Option<(String, Vec<TrackView>)>, AdapterError> {
+        for album in self.index.lookup(source, server, mbid) {
+            if !handle.holds(album.scope.as_deref()).await? {
+                continue;
+            }
+            match handle.album_tracks(&album.id).await {
+                Ok(tracks) if !tracks.is_empty() => return Ok(Some((album.id, tracks))),
+                // The server no longer has it: the next pass drops it. Any
+                // other failure stops the match, so an outage never falls
+                // through to a guess by name.
+                Ok(_) | Err(AdapterError::NotFound) => {
+                    tracing::debug!(source = source.as_str(), "indexed album is gone");
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if let Some(id) = handle.mbid_search(mbid).await?
+            && let Some(found) = playable(handle, id).await?
+        {
+            return Ok(Some(found));
+        }
+        if source == SourceName::Jellyfin {
+            return Ok(None);
+        }
+        let (Some(title), Some(artist)) = (
+            present(query.title.as_deref()),
+            present(query.artist.as_deref()),
+        ) else {
+            return Ok(None);
+        };
+        let (title_key, artist_key) = (fold_text(title), fold_text(artist));
+        if artist_key == VARIOUS_ARTISTS {
+            return Ok(None);
+        }
+        let results = handle.search(title, NAME_SEARCH_LIMIT).await?;
+        let mut named = results.albums.into_iter().filter(|album| {
+            fold_text(&album.title) == title_key && fold_text(&album.artist_name) == artist_key
+        });
+        match (named.next(), named.next()) {
+            (Some(album), None) => playable(handle, album.id).await,
+            _ => Ok(None),
+        }
     }
 
     // -- connections -------------------------------------------------------
@@ -897,13 +1063,19 @@ impl RemotesService {
         }
         let link = match source {
             SourceName::Navidrome => {
-                let adapter = NavidromeAdapter::new(
-                    self.http.clone(),
-                    server.base_url.clone(),
-                    login.username.clone(),
-                    login.password.clone(),
+                let handle = self.resolver.client(
+                    &self.http,
+                    ResolvedConnection {
+                        username: login.username.clone(),
+                        ..ResolvedConnection::unsaved(
+                            SourceName::Navidrome,
+                            server.base_url.clone(),
+                            login.password.clone(),
+                        )
+                    },
+                    Reads::User,
                 );
-                adapter.validate_connection().await.map_err(|error| {
+                handle.validate_connection().await.map_err(|error| {
                     rejected_login(SourceName::Navidrome, error, "username or password")
                 })?;
                 UserLink::Navidrome {
@@ -974,7 +1146,12 @@ impl RemotesService {
             .get(user_id)
             .await
             .map_err(RemotesFailure::Internal)?;
-        let adapter = self.navidrome_unscoped(user_id).await?;
+        let handle = self
+            .unscoped(user_id, SourceName::Navidrome, Reads::User)
+            .await?;
+        let adapter = handle
+            .navidrome("music folders")
+            .map_err(|error| adapter_failure(SourceName::Navidrome, error))?;
         let identity = adapter.server_identity();
         let resolution = match adapter.music_folders().await {
             Ok(folders) => resolve_scope(&preference, Some(&folders), &identity),
@@ -1003,7 +1180,12 @@ impl RemotesService {
         mode: &str,
         selected_folder_ids: &[String],
     ) -> RemotesResult<FolderResolutionView> {
-        let adapter = self.navidrome_unscoped(user_id).await?;
+        let handle = self
+            .unscoped(user_id, SourceName::Navidrome, Reads::User)
+            .await?;
+        let adapter = handle
+            .navidrome("music folders")
+            .map_err(|error| adapter_failure(SourceName::Navidrome, error))?;
         let identity = adapter.server_identity();
         let folders = adapter
             .music_folders()
@@ -1021,21 +1203,8 @@ impl RemotesService {
             .set(user_id, preference)
             .await
             .map_err(RemotesFailure::Internal)?;
+        self.folder_lists.forget(user_id);
         self.folders(user_id).await
-    }
-
-    async fn navidrome_unscoped(&self, user_id: &str) -> RemotesResult<NavidromeAdapter> {
-        let resolved = self
-            .resolver
-            .resolve(user_id, SourceName::Navidrome)
-            .await
-            .map_err(|error| resolve_failure(SourceName::Navidrome, error))?;
-        Ok(NavidromeAdapter::new(
-            self.http.clone(),
-            resolved.base_url,
-            resolved.username,
-            resolved.credential,
-        ))
     }
 }
 

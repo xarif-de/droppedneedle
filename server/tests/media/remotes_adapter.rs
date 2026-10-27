@@ -13,31 +13,28 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use droppedneedle_auth::users::roles::{Role, SessionKind};
-use droppedneedle_kernel::runtime_config::crypto::Crypto;
+use droppedneedle_catalog::reads::collections::remote_import::PlaylistImportSink;
+use droppedneedle_kernel::platform::Platform;
+use droppedneedle_kernel::runtime_config::Secret;
+use droppedneedle_kernel::runtime_config::secret_sections::{
+    JellyfinConnection, NavidromeConnection, PlexConnection,
+};
 use droppedneedle_testkit::remotes::{
-    JELLYFIN_KEY, MATCH_MBID, NAVIDROME_USER, PLEX_TOKEN, serve_jellyfin, serve_navidrome,
-    serve_plex,
+    JELLYFIN_KEY, MATCH_MBID, MockAlbum, MockOptions, NAVIDROME_USER, PLEX_TOKEN, serve_jellyfin,
+    serve_navidrome, serve_navidrome_with, serve_plex, serve_plex_with,
 };
-use remotes::adapter::{
-    AdapterError, AlbumBrowse, ArtistBrowse, MemoryImportSink, RemoteHandle, TrackBrowse,
-};
-use remotes::connections::{
-    ConnectionResolver, CredentialCoder, FixedServers, MemoryConnectionStore, ServerSettings,
-    SharedCredential, SqliteConnectionStore, UserLink,
-};
-use remotes::folders::{FolderPreference, MemoryFolderStore, resolve_scope};
+use remotes::adapter::{AdapterError, AlbumBrowse, ArtistBrowse, RemoteHandle, TrackBrowse};
+use remotes::connections::{ConnectionResolver, ResolveError, UserLink};
+use remotes::folders::{FolderPreference, SqliteFolderStore, resolve_scope};
 use remotes::handlers::{self as remotes_handlers, RemotesDeps};
 use remotes::jellyfin::JellyfinAdapter;
 use remotes::models::SourceName;
 use remotes::navidrome::NavidromeAdapter;
 use remotes::plex::PlexAdapter;
 use remotes::service::RemotesService;
+use remotes::warmup::{MbidIndex, Warmups};
 use serde_json::Value;
 use tower::ServiceExt as _;
-
-fn test_crypto() -> Crypto {
-    Crypto::from_key_bytes(&[9u8; 32]).expect("test key builds")
-}
 
 fn http_client() -> reqwest::Client {
     reqwest::Client::new()
@@ -46,35 +43,123 @@ fn http_client() -> reqwest::Client {
 /// The signed-in caller of the route tests.
 const USER_ID: &str = "user-ada";
 
-/// Route deps over memory rows and the given admin servers.
-fn deps_for(servers: FixedServers) -> RemotesDeps {
-    let resolver = Arc::new(ConnectionResolver::new(
-        Arc::new(MemoryConnectionStore::new()),
-        Arc::new(CredentialCoder::new(Arc::new(test_crypto()))),
-        Arc::new(servers),
-    ));
-    RemotesDeps {
-        service: RemotesService::new(
-            http_client(),
-            resolver,
-            Arc::new(MemoryFolderStore::new()),
-            Arc::new(MemoryImportSink::new()),
-            Arc::new(droppedneedle_kernel::clock::SystemClock),
-        ),
-    }
+/// The remotes stores the app builds, on a scratch copy of the migrated
+/// database holding the signed-in user's row. Admin servers are saved
+/// settings sections, read live as in the app.
+struct Rig {
+    platform: Platform,
+    runtime: droppedneedle_kernel::db::DbRuntime,
+    index: MbidIndex,
+    _dir: crate::common::ScratchDir,
 }
 
-/// One admin server with a shared credential.
-fn server(base_url: &str, username: &str, credential: &str, user_id: &str) -> ServerSettings {
-    ServerSettings {
-        base_url: base_url.to_owned(),
-        shared: Some(SharedCredential {
-            username: username.to_owned(),
-            credential: credential.to_owned(),
-            user_id: user_id.to_owned(),
-        }),
-        client_id: String::new(),
-        section_ids: Vec::new(),
+impl Rig {
+    async fn open(tag: &str) -> Self {
+        let dir = crate::common::ScratchDir::new(tag);
+        let runtime = crate::common::scratch_runtime(&dir.join("app.db")).await;
+        runtime
+            .db()
+            .write(droppedneedle_kernel::db::Lane::Foreground, "seed", |tx| {
+                tx.execute(
+                    "INSERT INTO auth_users (id, username, display_name, role, created_at) \
+                     VALUES (?1, 'ada', 'Ada', 'user', '2026-01-01T00:00:00Z')",
+                    [USER_ID],
+                )?;
+                Ok::<_, droppedneedle_kernel::db::DbError>(())
+            })
+            .await
+            .expect("user seeds");
+        let platform = crate::common::TestPlatform::on(runtime.db(), &dir)
+            .build()
+            .await;
+        Self {
+            platform,
+            runtime,
+            index: MbidIndex::default(),
+            _dir: dir,
+        }
+    }
+
+    /// Save the admin's Jellyfin server with its API key and user.
+    async fn jellyfin(&self, base_url: &str, api_key: &str, user_id: &str) {
+        self.platform
+            .settings
+            .save_secret(JellyfinConnection {
+                jellyfin_url: base_url.to_owned(),
+                api_key: Secret::new(api_key),
+                user_id: user_id.to_owned(),
+                enabled: true,
+                ..JellyfinConnection::default()
+            })
+            .await
+            .expect("jellyfin saves");
+    }
+
+    /// Save the admin's Navidrome server; an empty username shares no
+    /// account.
+    async fn navidrome(&self, base_url: &str, username: &str, password: &str) {
+        self.platform
+            .settings
+            .save_secret(NavidromeConnection {
+                navidrome_url: base_url.to_owned(),
+                username: username.to_owned(),
+                password: Secret::new(password),
+                enabled: true,
+                ..NavidromeConnection::default()
+            })
+            .await
+            .expect("navidrome saves");
+    }
+
+    /// Save the admin's Plex server; an empty token shares no account.
+    async fn plex(&self, base_url: &str, token: &str) {
+        self.platform
+            .settings
+            .save_secret(PlexConnection {
+                plex_url: base_url.to_owned(),
+                plex_token: Secret::new(token),
+                enabled: true,
+                ..PlexConnection::default()
+            })
+            .await
+            .expect("plex saves");
+    }
+
+    fn resolver(&self) -> ConnectionResolver {
+        crate::common::bundles::remotes_resolver(&self.platform)
+    }
+
+    /// One warmup pass for `source`, filling the index the routes read.
+    async fn warm(&self, source: SourceName) {
+        Warmups::new(http_client(), Arc::new(self.resolver()), self.index.clone())
+            .pass(source)
+            .await
+            .expect("warmup passes");
+    }
+
+    fn folders(&self) -> SqliteFolderStore {
+        SqliteFolderStore::new(self.platform.db.clone(), self.platform.clock.clone())
+    }
+
+    /// Route deps over the real stores, imports landing in the user's
+    /// playlists.
+    fn deps(&self) -> RemotesDeps {
+        RemotesDeps {
+            service: RemotesService::new(
+                http_client(),
+                Arc::new(self.resolver()),
+                Arc::new(self.folders()),
+                Arc::new(PlaylistImportSink::new(
+                    crate::common::bundles::collections_at(&self.platform).wired(),
+                )),
+                self.index.clone(),
+                self.platform.clock.clone(),
+            ),
+        }
+    }
+
+    fn app(&self) -> Router {
+        authed_app(self.deps())
     }
 }
 
@@ -569,63 +654,108 @@ async fn upstream_forbidden_maps_to_auth_on_every_source() {
 // Connection store
 // ---------------------------------------------------------------------------
 
+/// A user with no link of their own uses the admin's server account;
+/// once they link, their own account wins, sealed at rest. A link that no
+/// longer opens falls back to the shared account.
+#[tokio::test]
+async fn own_link_wins_over_the_shared_admin_account() {
+    use remotes::connections::ConnectionStore as _;
+
+    let rig = Rig::open("remotes-own-link").await;
+    rig.navidrome("http://navidrome.test", "admin", "admin-pass")
+        .await;
+    let resolver = rig.resolver();
+    let shared = resolver
+        .resolve(USER_ID, SourceName::Navidrome)
+        .await
+        .expect("shared resolves");
+    assert_eq!(shared.account_mode, "shared");
+    assert_eq!(shared.credential, "admin-pass");
+
+    resolver
+        .save_link(
+            USER_ID,
+            &UserLink::Navidrome {
+                username: "ada".to_owned(),
+                password: "s3cret".to_owned(),
+            },
+        )
+        .await
+        .expect("link saves");
+    let rows = remotes::connections::SqliteConnectionStore::new(
+        rig.platform.db.clone(),
+        rig.platform.clock.clone(),
+    );
+    let row = rows
+        .get(USER_ID, "navidrome")
+        .await
+        .expect("row reads")
+        .expect("row exists");
+    assert!(row.data.starts_with("v3:"), "sealed at rest");
+    assert!(!row.data.contains("s3cret"));
+
+    let own = resolver
+        .resolve(USER_ID, SourceName::Navidrome)
+        .await
+        .expect("own resolves");
+    assert_eq!(own.account_mode, "linked");
+    assert_eq!(own.credential, "s3cret");
+
+    rows.upsert(USER_ID, "navidrome", "v3:garbage".to_owned())
+        .await
+        .expect("row writes");
+    let fallback = resolver
+        .resolve(USER_ID, SourceName::Navidrome)
+        .await
+        .expect("stale link falls back");
+    assert_eq!(fallback.account_mode, "shared");
+}
+
+/// A disabled or missing admin server hides every link: the URL is the
+/// admin's, so nothing resolves without it.
+#[tokio::test]
+async fn links_need_the_admin_server() {
+    let rig = Rig::open("remotes-no-server").await;
+    let resolver = rig.resolver();
+    resolver
+        .save_link(
+            USER_ID,
+            &UserLink::Navidrome {
+                username: "ada".to_owned(),
+                password: "s3cret".to_owned(),
+            },
+        )
+        .await
+        .expect("link saves");
+    assert!(matches!(
+        resolver.resolve(USER_ID, SourceName::Navidrome).await,
+        Err(ResolveError::NotConfigured)
+    ));
+}
+
 /// A linked account and a folder preference are SQLite rows: they survive
 /// closing and reopening the database, and the credential is sealed at
 /// rest.
 #[tokio::test]
 async fn linked_connections_survive_a_restart() {
     use droppedneedle_kernel::db::{DbConfig, open_runtime};
-    use remotes::folders::{FolderStore as _, SqliteFolderStore};
+    use remotes::folders::FolderStore as _;
 
-    let dir = crate::common::ScratchDir::new("remotes-durable");
-    let db = dir.join("library.db");
-    let servers = || {
-        FixedServers::default().with(
-            SourceName::Navidrome,
-            ServerSettings {
-                base_url: "http://navidrome.test".to_owned(),
-                shared: None,
-                client_id: String::new(),
-                section_ids: Vec::new(),
+    let rig = Rig::open("remotes-durable").await;
+    rig.navidrome("http://navidrome.test", "", "").await;
+    rig.resolver()
+        .save_link(
+            USER_ID,
+            &UserLink::Navidrome {
+                username: "ada".to_owned(),
+                password: "s3cret".to_owned(),
             },
         )
-    };
-    let coder = || Arc::new(CredentialCoder::new(Arc::new(test_crypto())));
-    {
-        let runtime = crate::common::scratch_runtime(&db).await;
-        runtime
-            .db()
-            .write(droppedneedle_kernel::db::Lane::Foreground, "seed", |tx| {
-                tx.execute(
-                    "INSERT INTO auth_users (id, username, display_name, role, created_at) \
-                     VALUES ('user-ada', 'ada', 'Ada', 'user', '2026-01-01T00:00:00Z')",
-                    [],
-                )?;
-                Ok::<_, droppedneedle_kernel::db::DbError>(())
-            })
-            .await
-            .expect("user seeds");
-        let rows = SqliteConnectionStore::new(
-            runtime.db().clone(),
-            Arc::new(droppedneedle_kernel::clock::SystemClock),
-        );
-        let resolver = ConnectionResolver::new(Arc::new(rows), coder(), Arc::new(servers()));
-        resolver
-            .save_link(
-                "user-ada",
-                &UserLink::Navidrome {
-                    username: "ada".to_owned(),
-                    password: "s3cret".to_owned(),
-                },
-            )
-            .await
-            .expect("link saves");
-        SqliteFolderStore::new(
-            runtime.db().clone(),
-            Arc::new(droppedneedle_kernel::clock::SystemClock),
-        )
+        .await
+        .expect("link saves");
+    rig.folders()
         .set(
-            "user-ada",
+            USER_ID,
             FolderPreference {
                 mode: "selected".to_owned(),
                 selected_folder_ids: vec!["folder-1".to_owned()],
@@ -634,36 +764,43 @@ async fn linked_connections_survive_a_restart() {
         )
         .await
         .expect("preference saves");
-        let stored: String = sqlx::query_scalar(
-            "SELECT connection_data FROM user_connections WHERE user_id = 'user-ada'",
-        )
-        .fetch_one(runtime.db().sqlx())
+    let stored: String = sqlx::query_scalar(
+        "SELECT connection_data FROM user_connections WHERE user_id = 'user-ada'",
+    )
+    .fetch_one(rig.runtime.db().sqlx())
+    .await
+    .expect("row reads");
+    assert!(!stored.contains("s3cret"), "sealed at rest");
+
+    let Rig {
+        platform,
+        runtime,
+        _dir: dir,
+        ..
+    } = rig;
+    drop(platform);
+    runtime.shutdown().await;
+    let runtime = open_runtime(&DbConfig::new(&dir.join("app.db")))
         .await
-        .expect("row reads");
-        assert!(!stored.contains("s3cret"), "sealed at rest");
-        runtime.shutdown().await;
-    }
-    let runtime = open_runtime(&DbConfig::new(&db)).await.expect("db reopens");
-    let rows = SqliteConnectionStore::new(
-        runtime.db().clone(),
-        Arc::new(droppedneedle_kernel::clock::SystemClock),
-    );
-    let resolver = ConnectionResolver::new(Arc::new(rows), coder(), Arc::new(servers()));
-    let resolved = resolver
-        .resolve("user-ada", SourceName::Navidrome)
+        .expect("db reopens");
+    let platform = crate::common::TestPlatform::on(runtime.db(), &dir)
+        .build()
+        .await;
+    let rig = Rig {
+        platform,
+        runtime,
+        index: MbidIndex::default(),
+        _dir: dir,
+    };
+    let resolved = rig
+        .resolver()
+        .resolve(USER_ID, SourceName::Navidrome)
         .await
         .expect("link resolves after restart");
     assert_eq!(resolved.account_mode, "linked");
     assert_eq!(resolved.credential, "s3cret");
-    let preference = SqliteFolderStore::new(
-        runtime.db().clone(),
-        Arc::new(droppedneedle_kernel::clock::SystemClock),
-    )
-    .get("user-ada")
-    .await
-    .expect("preference reads");
+    let preference = rig.folders().get(USER_ID).await.expect("preference reads");
     assert_eq!(preference.selected_folder_ids, vec!["folder-1".to_owned()]);
-    runtime.shutdown().await;
 }
 
 /// A Plex link saved without a server token (v2 rows from the login flow)
@@ -671,31 +808,30 @@ async fn linked_connections_survive_a_restart() {
 /// stores it, and browses with it.
 #[tokio::test]
 async fn plex_links_without_a_server_token_look_one_up_and_keep_it() {
+    use droppedneedle_kernel::runtime_config::sections::InternalState;
     use droppedneedle_testkit::remotes::PLEX_ACCOUNT_TOKEN;
     use remotes::plex::PlexTokenProbe;
 
     let mock = serve_plex().await.expect("mock serves");
-    let servers = FixedServers::default().with(
-        SourceName::Plex,
-        ServerSettings {
-            base_url: mock.base_url.clone(),
-            shared: None,
-            client_id: "client-1".to_owned(),
-            section_ids: Vec::new(),
-        },
-    );
-    let resolver = ConnectionResolver::new(
-        Arc::new(MemoryConnectionStore::new()),
-        Arc::new(CredentialCoder::new(Arc::new(test_crypto()))),
-        Arc::new(servers),
-    )
-    .with_plex_tokens(Arc::new(PlexTokenProbe::with_plex_tv(
-        http_client(),
-        format!("{}/api/v2", mock.base_url),
-    )));
+    let rig = Rig::open("remotes-plex-token").await;
+    rig.plex(&mock.base_url, "").await;
+    rig.platform
+        .settings
+        .save(InternalState {
+            plex_client_id: Some("client-1".to_owned()),
+            ..InternalState::default()
+        })
+        .await
+        .expect("client id saves");
+    let resolver = rig
+        .resolver()
+        .with_plex_tokens(Arc::new(PlexTokenProbe::with_plex_tv(
+            http_client(),
+            format!("{}/api/v2", mock.base_url),
+        )));
     resolver
         .save_link(
-            "ada",
+            USER_ID,
             &UserLink::Plex {
                 auth_token: PLEX_ACCOUNT_TOKEN.to_owned(),
                 server_access_token: String::new(),
@@ -707,13 +843,13 @@ async fn plex_links_without_a_server_token_look_one_up_and_keep_it() {
         .expect("link saves");
 
     let resolved = resolver
-        .resolve("ada", SourceName::Plex)
+        .resolve(USER_ID, SourceName::Plex)
         .await
         .expect("link resolves");
     assert_eq!(resolved.account_mode, "linked");
     assert_eq!(resolved.credential, PLEX_TOKEN);
     let stored = resolver
-        .link("ada", SourceName::Plex)
+        .link(USER_ID, SourceName::Plex)
         .await
         .expect("link reads");
     assert!(
@@ -761,30 +897,26 @@ async fn folders_fail_closed_on_server_change_or_outage() {
 /// A plain user with no links of their own, on an instance where the admin
 /// configured all three servers with shared credentials (the v2 shared
 /// mode). Every route below runs through the admin's accounts.
-async fn connected_testbed() -> Router {
+async fn connected_testbed() -> (Router, Rig) {
     // Mocks leak for the life of the test process; routes need their URLs
     // after this helper returns, so the servers stay up detached.
     let jellyfin = Box::leak(Box::new(serve_jellyfin().await.expect("mock serves")));
     let navidrome = Box::leak(Box::new(serve_navidrome().await.expect("mock serves")));
     let plex = Box::leak(Box::new(serve_plex().await.expect("mock serves")));
-    let servers = FixedServers::default()
-        .with(
-            SourceName::Jellyfin,
-            server(&jellyfin.base_url, "", JELLYFIN_KEY, "jf-user-1"),
-        )
-        .with(
-            SourceName::Navidrome,
-            server(&navidrome.base_url, NAVIDROME_USER, "nd-pass", ""),
-        )
-        .with(SourceName::Plex, server(&plex.base_url, "", PLEX_TOKEN, ""));
-    authed_app(deps_for(servers))
+    let rig = Rig::open("remotes-routes").await;
+    rig.jellyfin(&jellyfin.base_url, JELLYFIN_KEY, "jf-user-1")
+        .await;
+    rig.navidrome(&navidrome.base_url, NAVIDROME_USER, "nd-pass")
+        .await;
+    rig.plex(&plex.base_url, PLEX_TOKEN).await;
+    (rig.app(), rig)
 }
 
 #[tokio::test]
 async fn routes_reject_anonymous_callers_with_challenge() {
-    let deps = deps_for(FixedServers::default());
+    let rig = Rig::open("remotes-anonymous").await;
     let response = remotes_handlers::routes()
-        .with_state(deps)
+        .with_state(rig.deps())
         .into_router()
         .oneshot(
             Request::get("/api/v3/remotes/plex/hub")
@@ -810,7 +942,7 @@ async fn routes_reject_anonymous_callers_with_challenge() {
 
 #[tokio::test]
 async fn routes_reject_unknown_sources_and_bad_queries_in_envelope() {
-    let app = connected_testbed().await;
+    let (app, _rig) = connected_testbed().await;
     let (status, body) = get_json(app.clone(), "/api/v3/remotes/emby/hub").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(error_code(&body), "INVALID_INPUT");
@@ -826,7 +958,8 @@ async fn routes_reject_unknown_sources_and_bad_queries_in_envelope() {
 
 #[tokio::test]
 async fn routes_report_unconfigured_sources() {
-    let app = authed_app(deps_for(FixedServers::default()));
+    let rig = Rig::open("remotes-unconfigured").await;
+    let app = rig.app();
     let (status, body) = get_json(app, "/api/v3/remotes/plex/hub").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(error_code(&body), "REMOTE_NOT_CONFIGURED");
@@ -885,7 +1018,7 @@ async fn routes_answer_remote_unavailable_when_the_server_is_down() {
 
 #[tokio::test]
 async fn routes_browse_albums_reports_stats_totals() {
-    let app = connected_testbed().await;
+    let (app, _rig) = connected_testbed().await;
     for source in ["jellyfin", "navidrome", "plex"] {
         let (status, body) = get_json(
             app.clone(),
@@ -906,9 +1039,182 @@ async fn routes_browse_albums_reports_stats_totals() {
     }
 }
 
+/// The album match rule against the Plex and Navidrome mocks, whose search
+/// here cannot find an album by its MBID: an indexed album matches by MBID;
+/// one without an id matches by title and artist once folded; two albums
+/// sharing that title and artist match nothing; and an indexed album
+/// outside the caller's Navidrome folders does not match. On Jellyfin an
+/// MBID miss reads no album pages.
+#[tokio::test]
+async fn albums_match_by_index_then_by_name() {
+    const UNKNOWN: &str = "99999999-9999-9999-9999-999999999999";
+    const FAR_MBID: &str = "44444444-4444-4444-4444-444444444444";
+    let extra = |id: &str, title: &str, artist: &str, mbid: Option<&str>, folder: &str| MockAlbum {
+        id: id.to_owned(),
+        title: title.to_owned(),
+        artist: artist.to_owned(),
+        mbid: mbid.map(str::to_owned),
+        folder: folder.to_owned(),
+    };
+    let navidrome = serve_navidrome_with(MockOptions {
+        mbid_search: false,
+        extra_albums: vec![
+            extra("nd-al-8", "GLASS TIDES", "AURORA CURRENT", None, "folder-1"),
+            extra(
+                "nd-al-9",
+                "Far Shore",
+                "Boreal Static",
+                Some(FAR_MBID),
+                "folder-2",
+            ),
+        ],
+        ..MockOptions::default()
+    })
+    .await
+    .expect("mock serves");
+    let plex = serve_plex_with(MockOptions {
+        mbid_search: false,
+        extra_albums: vec![extra("px-al-8", "GLASS TIDES", "AURORA CURRENT", None, "1")],
+        ..MockOptions::default()
+    })
+    .await
+    .expect("mock serves");
+    let jellyfin = serve_jellyfin().await.expect("mock serves");
+    let rig = Rig::open("remotes-match").await;
+    rig.navidrome(&navidrome.base_url, NAVIDROME_USER, "nd-pass")
+        .await;
+    rig.plex(&plex.base_url, PLEX_TOKEN).await;
+    rig.jellyfin(&jellyfin.base_url, JELLYFIN_KEY, "jf-user-1")
+        .await;
+    for source in [
+        SourceName::Navidrome,
+        SourceName::Plex,
+        SourceName::Jellyfin,
+    ] {
+        rig.warm(source).await;
+    }
+    let app = rig.app();
+    let scoped = serde_json::json!({"mode": "selected", "selected_folder_ids": ["folder-1"]});
+    let (status, _) = put_json(app.clone(), "/api/v3/remotes/navidrome/folders", scoped).await;
+    assert_eq!(status, StatusCode::OK);
+    let album_pages = || {
+        jellyfin
+            .recorder
+            .snapshot()
+            .jellyfin_items_queries
+            .iter()
+            .filter(|query| {
+                query
+                    .iter()
+                    .any(|(key, value)| key == "includeItemTypes" && value == "MusicAlbum")
+            })
+            .count()
+    };
+    let pages_before = album_pages();
+
+    let by_name = format!("mbid={UNKNOWN}&title=paper%20satellites&artist=BOREAL%20STATIC");
+    let shared = format!("mbid={UNKNOWN}&title=Glass%20Tides&artist=Aurora%20Current");
+    let index = format!("mbid={MATCH_MBID}");
+    let far = format!("mbid={FAR_MBID}");
+    let unknown = format!("mbid={UNKNOWN}");
+    let rows: [(&str, &str, &str, Option<&str>); 8] = [
+        ("by index", "navidrome", &index, Some("nd-al-1")),
+        ("by index", "plex", &index, Some("px-al-1")),
+        (
+            "by title and artist",
+            "navidrome",
+            &by_name,
+            Some("nd-al-3"),
+        ),
+        ("by title and artist", "plex", &by_name, Some("px-al-3")),
+        ("two share title and artist", "navidrome", &shared, None),
+        ("two share title and artist", "plex", &shared, None),
+        ("indexed outside the folders", "navidrome", &far, None),
+        ("unknown id", "jellyfin", &unknown, None),
+    ];
+    let mut wrong = Vec::new();
+    for (case, source, query, want) in rows {
+        let (status, body) = get_json(
+            app.clone(),
+            &format!("/api/v3/remotes/{source}/match?{query}"),
+        )
+        .await;
+        let got = body
+            .get("remote_album_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let found = body.get("found").and_then(Value::as_bool);
+        if status != StatusCode::OK || got.as_deref() != want || found != Some(want.is_some()) {
+            wrong.push(format!("{source} {case}: {status} {body}"));
+        }
+    }
+    if album_pages() != pages_before {
+        wrong.push("jellyfin: an MBID miss read album pages".to_owned());
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// An index read from one Plex server is not used once the admin points
+/// Plex at another: the old ids would open other albums there.
+#[tokio::test]
+async fn an_index_from_another_server_is_not_used() {
+    let no_mbid_search = || MockOptions {
+        mbid_search: false,
+        ..MockOptions::default()
+    };
+    let first = serve_plex_with(no_mbid_search())
+        .await
+        .expect("mock serves");
+    let second = serve_plex_with(no_mbid_search())
+        .await
+        .expect("mock serves");
+    let rig = Rig::open("remotes-match-moved").await;
+    rig.plex(&first.base_url, PLEX_TOKEN).await;
+    rig.warm(SourceName::Plex).await;
+    let path = format!("/api/v3/remotes/plex/match?mbid={MATCH_MBID}");
+    let (_, body) = get_json(rig.app(), &path).await;
+    assert_eq!(body["remote_album_id"], "px-al-1", "{body}");
+
+    rig.plex(&second.base_url, PLEX_TOKEN).await;
+    let (status, body) = get_json(rig.app(), &path).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["found"], false, "{body}");
+}
+
+/// An indexed album the server fails to open stops the match with the
+/// outage instead of falling through to a same-name album without an id.
+#[tokio::test]
+async fn an_outage_on_an_indexed_album_is_not_guessed_past() {
+    const BROKEN_MBID: &str = "55555555-5555-5555-5555-555555555555";
+    let navidrome = serve_navidrome_with(MockOptions {
+        mbid_search: false,
+        extra_albums: vec![MockAlbum {
+            id: "nd-al-7".to_owned(),
+            title: "Broken Record".to_owned(),
+            artist: "Aurora Current".to_owned(),
+            mbid: Some(BROKEN_MBID.to_owned()),
+            folder: "folder-1".to_owned(),
+        }],
+        failing_albums: vec!["nd-al-7".to_owned()],
+    })
+    .await
+    .expect("mock serves");
+    let rig = Rig::open("remotes-match-outage").await;
+    rig.navidrome(&navidrome.base_url, NAVIDROME_USER, "nd-pass")
+        .await;
+    rig.warm(SourceName::Navidrome).await;
+    let (status, body) = get_json(
+        rig.app(),
+        &format!("/api/v3/remotes/navidrome/match?mbid={BROKEN_MBID}&title=Glass%20Tides&artist=Aurora%20Current"),
+    )
+    .await;
+    assert!(status.is_server_error(), "{status} {body}");
+    assert_eq!(error_code(&body), "REMOTE_UNAVAILABLE", "{body}");
+}
+
 #[tokio::test]
 async fn routes_import_playlists_idempotently() {
-    let app = connected_testbed().await;
+    let (app, _rig) = connected_testbed().await;
     for source in ["jellyfin", "navidrome", "plex"] {
         let id = match source {
             "jellyfin" => "jf-pl-1",
@@ -950,7 +1256,7 @@ async fn routes_import_playlists_idempotently() {
 /// `REMOTE_UNSUPPORTED` rather than an empty success.
 #[tokio::test]
 async fn routes_serve_optional_features_per_source() {
-    let app = connected_testbed().await;
+    let (app, _rig) = connected_testbed().await;
     let matched = format!("match?mbid={MATCH_MBID}");
     let cases = [
         ("navidrome", "info/artists/nd-ar-1", true),
@@ -993,9 +1299,66 @@ async fn routes_serve_optional_features_per_source() {
     }
 }
 
+/// A real Navidrome 0.62.0 gives each song a disc cover id with a colon
+/// in it (`dc-<album id>:1_0`). A track row still gets an image, and the
+/// image route serves it.
+#[tokio::test]
+async fn navidrome_track_rows_show_the_disc_cover() {
+    let (app, _rig) = connected_testbed().await;
+    let (status, body) = get_json(
+        app.clone(),
+        "/api/v3/remotes/navidrome/albums/nd-al-1/tracks",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let image = body["items"][0]["image_url"].as_str().unwrap_or_default();
+    assert_eq!(image, "/api/v3/remotes/navidrome/images/dc-nd-al-1:1_0");
+
+    let (status, _, bytes) = get_bytes(app, image).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(&bytes[..2], &[0xFF, 0xD8]);
+}
+
+/// Jellyfin art as a real 10.10.6 server holds it: a track whose album
+/// folder has the cover has no image of its own, and a playlist has one
+/// drawn from its members. A track row points at its album's cover, a
+/// playlist cover is the playlist's own, and an item with no image is
+/// absent (404), never a server failure.
+#[tokio::test]
+async fn jellyfin_art_follows_the_servers_image_tags() {
+    let (app, _rig) = connected_testbed().await;
+    let (status, body) = get_json(
+        app.clone(),
+        "/api/v3/remotes/jellyfin/albums/jf-al-1/tracks",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let dusk = body["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|track| track["id"] == "jf-t-2")
+        .unwrap_or_else(|| panic!("no jf-t-2 in {body}"));
+    assert_eq!(
+        dusk["image_url"],
+        "/api/v3/remotes/jellyfin/images/jf-al-1?tag=jf-al-1-tag"
+    );
+
+    let (status, _, bytes) = get_bytes(
+        app.clone(),
+        "/api/v3/remotes/jellyfin/covers/playlists/jf-pl-1",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(&bytes[..2], &[0xFF, 0xD8]);
+
+    let (status, body) = get_json(app.clone(), "/api/v3/remotes/jellyfin/images/jf-t-2").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+}
+
 #[tokio::test]
 async fn routes_serve_images_with_cache_contract() {
-    let app = connected_testbed().await;
+    let (app, _rig) = connected_testbed().await;
     let (status, headers, bytes) = get_bytes(
         app.clone(),
         "/api/v3/remotes/navidrome/images/nd-al-1?size=200",
@@ -1041,7 +1404,7 @@ async fn routes_serve_images_with_cache_contract() {
 /// unlinking falls back to the shared account.
 #[tokio::test]
 async fn routes_link_own_accounts_over_the_shared_admin_account() {
-    let app = connected_testbed().await;
+    let (app, _rig) = connected_testbed().await;
     let (status, body) = get_json(app.clone(), "/api/v3/remotes/navidrome/connection").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body.get("connected").and_then(Value::as_bool), Some(true));
@@ -1089,7 +1452,7 @@ async fn routes_link_own_accounts_over_the_shared_admin_account() {
 
 #[tokio::test]
 async fn routes_manage_folder_preferences() {
-    let app = connected_testbed().await;
+    let (app, _rig) = connected_testbed().await;
     let (status, body) = get_json(app.clone(), "/api/v3/remotes/navidrome/folders").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body.get("mode").and_then(Value::as_str), Some("all"));
@@ -1118,6 +1481,55 @@ async fn routes_manage_folder_preferences() {
     assert_eq!(error_code(&body), "CONFLICT");
 }
 
+/// A grid of covers between two browse pages costs one Navidrome folder
+/// lookup: the list is reused while fresh, and an image read by id skips
+/// the folder scope. Browse lists keep the saved scope.
+#[tokio::test]
+async fn navidrome_folders_are_fetched_once_across_browsing_and_images() {
+    let navidrome = serve_navidrome().await.expect("mock serves");
+    let rig = Rig::open("remotes-folder-cache").await;
+    rig.navidrome(&navidrome.base_url, NAVIDROME_USER, "nd-pass")
+        .await;
+    let app = rig.app();
+    let folder_calls = || {
+        navidrome
+            .recorder
+            .snapshot()
+            .navidrome_queries
+            .iter()
+            .filter(|(endpoint, _)| endpoint == "getMusicFolders")
+            .count()
+    };
+    let payload = serde_json::json!({"mode": "selected", "selected_folder_ids": ["folder-1"]});
+    let (status, _) = put_json(app.clone(), "/api/v3/remotes/navidrome/folders", payload).await;
+    assert_eq!(status, StatusCode::OK);
+    let before = folder_calls();
+
+    let (status, _) = get_json(app.clone(), "/api/v3/remotes/navidrome/albums").await;
+    assert_eq!(status, StatusCode::OK);
+    for _ in 0..5 {
+        let (status, _, _) = get_bytes(
+            app.clone(),
+            "/api/v3/remotes/navidrome/images/nd-al-1?size=200",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    let (status, _) = get_json(app.clone(), "/api/v3/remotes/navidrome/albums").await;
+    assert_eq!(status, StatusCode::OK);
+
+    assert_eq!(folder_calls() - before, 1);
+    let scoped = navidrome
+        .recorder
+        .snapshot()
+        .navidrome_folder_params
+        .get("getAlbumList2")
+        .and_then(|calls| calls.last())
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(scoped, vec!["folder-1".to_owned()]);
+}
+
 // ---------------------------------------------------------------------------
 // Presence
 // ---------------------------------------------------------------------------
@@ -1131,21 +1543,17 @@ async fn presence_poll_merges_a_remote_session() {
     use droppedneedle_media::remotes::presence_feed::MediaJobs;
 
     let plex = serve_plex().await.expect("mock serves");
-    let resolver = Arc::new(ConnectionResolver::new(
-        Arc::new(MemoryConnectionStore::new()),
-        Arc::new(CredentialCoder::new(Arc::new(test_crypto()))),
-        Arc::new(
-            FixedServers::default()
-                .with(SourceName::Plex, server(&plex.base_url, "", PLEX_TOKEN, "")),
-        ),
-    ));
+    let rig = Rig::open("remotes-presence").await;
+    rig.plex(&plex.base_url, PLEX_TOKEN).await;
     let registry = PresenceRegistry::new(droppedneedle_kernel::events::EventHub::new());
-    let media = MediaJobs {
-        presence: registry.clone(),
-        resolver: Some(resolver),
-        http: http_client(),
-        pool: None,
-    };
+    let media = MediaJobs::new(
+        registry.clone(),
+        Arc::new(rig.resolver()),
+        http_client(),
+        rig.platform.db.sqlx().clone(),
+        rig.platform.clock.clone(),
+        MbidIndex::default(),
+    );
     droppedneedle_kernel::jobs::presence::run_once(&media.feed(), &media.pollers())
         .await
         .expect("cycle polls");
@@ -1345,13 +1753,10 @@ async fn routes_refuse_image_answers_that_are_not_images() {
             Router::new().fallback(move || async move { ([(CONTENT_TYPE, content_type)], PAGE) }),
         )
         .await;
-        let servers = FixedServers::default()
-            .with(
-                SourceName::Jellyfin,
-                server(&base_url, "", JELLYFIN_KEY, "jf-user-1"),
-            )
-            .with(SourceName::Plex, server(&base_url, "", PLEX_TOKEN, ""));
-        let app = authed_app(deps_for(servers));
+        let rig = Rig::open("remotes-image-pages").await;
+        rig.jellyfin(&base_url, JELLYFIN_KEY, "jf-user-1").await;
+        rig.plex(&base_url, PLEX_TOKEN).await;
+        let app = rig.app();
         for source in ["jellyfin", "plex"] {
             let (status, headers, bytes) =
                 get_bytes(app.clone(), &format!("/api/v3/remotes/{source}/images/any")).await;

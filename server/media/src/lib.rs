@@ -31,21 +31,20 @@ use crate::playback::reports::{ReportQueue, run_report_worker};
 use crate::playback::sessions::SessionStore;
 use crate::playback::sqlite::PlaybackStore;
 use crate::remotes::adapter::ImportSink;
-use crate::remotes::connections::{
-    ConfigServers, ConnectionResolver, CredentialCoder, SqliteConnectionStore,
-};
+use crate::remotes::connections::ConnectionResolver;
 use crate::remotes::folders::SqliteFolderStore;
 use crate::remotes::handlers::RemotesDeps;
 use crate::remotes::plex::PlexTokenProbe;
+use crate::remotes::presence_feed::MediaJobs;
 use crate::remotes::reader::RemotesRemoteReader;
 use crate::remotes::service::RemotesService;
+use crate::remotes::warmup::{self, MbidIndex};
 use crate::stream::download::DownloadState;
 use crate::stream::gateway::Gateway;
+use crate::stream::leases::TranscodeGate;
 use crate::stream::local_files::LibraryFiles;
 use crate::stream::routes::StreamState;
-use crate::stream::transcode::{
-    FfmpegTranscoder, LocalTranscodeGate, OutFormat, StdFfmpegSpawner, TranscodeSettings,
-};
+use crate::stream::transcode::{FfmpegTranscoder, OutFormat, ProcessSpawner, TranscodeSettings};
 use droppedneedle_auth::users::UsersDeps;
 use droppedneedle_kernel::clock::Clock;
 use droppedneedle_kernel::config::AppConfig;
@@ -58,8 +57,7 @@ use droppedneedle_kernel::runtime_config::sections::{AudioFormat, ConnectApps};
 
 /// Production stream engine: gateway over stored-connection remote reads
 /// and ffmpeg transcodes behind the shared transcode gate.
-pub type MediaEngine =
-    Gateway<RemotesRemoteReader, FfmpegTranscoder<StdFfmpegSpawner, Arc<LocalTranscodeGate>>>;
+pub type MediaEngine = Gateway<RemotesRemoteReader, FfmpegTranscoder<ProcessSpawner>>;
 
 /// Everything `create_app` needs to mount the remote-source, stream and
 /// playback routes, built once.
@@ -83,7 +81,12 @@ pub struct MediaSetup {
 pub const MEDIA_WORKERS: &str = "media-workers";
 
 /// Every always-on media loop, by name.
-pub const LOOPS: &[&str] = &[MEDIA_WORKERS];
+pub const LOOPS: &[&str] = &[
+    MEDIA_WORKERS,
+    warmup::JELLYFIN_JOB,
+    warmup::NAVIDROME_JOB,
+    warmup::PLEX_JOB,
+];
 
 /// The media background drains: remote attribution and now-playing
 /// reports, one [`MEDIA_WORKERS`] job on the supervisor. Attribution ends
@@ -115,6 +118,17 @@ impl MediaWorkers {
 }
 
 impl MediaSetup {
+    /// The app's one connection resolver, over `platform`, looking up
+    /// missing Plex server tokens on the plex.tv root `plex_tv`. Every
+    /// remote read shares it, so they share its per-source read bound.
+    pub fn remotes(platform: &Platform, plex_tv: String) -> Arc<ConnectionResolver> {
+        Arc::new(
+            ConnectionResolver::over(platform).with_plex_tokens(Arc::new(
+                PlexTokenProbe::with_plex_tv(platform.http.shared().clone(), plex_tv),
+            )),
+        )
+    }
+
     /// Build the production bundle over `platform`. Its database backs the
     /// connection and folder rows, and the playback stores open their own
     /// connections on its file; its settings hand out live handles on the
@@ -125,7 +139,8 @@ impl MediaSetup {
     /// download ids (track ids) into files under the live library roots;
     /// `imports` is where remote playlist imports land; `plugins` hears
     /// accepted plays and serves `streaming_source` plugin streams;
-    /// `plex_tv` is the plex.tv root; `ffmpeg` is the program transcodes
+    /// `remotes` is the app's one connection resolver (see
+    /// [`MediaSetup::remotes`]); `ffmpeg` is the program transcodes
     /// run, and with none the server streams every file as it is;
     /// scrobbles and now-playing reports go through the one ListenBrainz
     /// client and the one Last.fm client of `providers`, and that
@@ -140,7 +155,7 @@ impl MediaSetup {
         library_roots: droppedneedle_library::scan::coordinator::SharedResolver,
         imports: Arc<dyn ImportSink>,
         plugins: Arc<droppedneedle_plugins::host::PluginHost>,
-        plex_tv: String,
+        remotes: Arc<ConnectionResolver>,
         ffmpeg: Option<PathBuf>,
         providers: &droppedneedle_providers::Providers,
         mix: Arc<dyn MixGrants>,
@@ -157,25 +172,13 @@ impl MediaSetup {
         crate::stream::plugin_url::sweep_stale_spools();
         let library = LibraryFiles::new(db.sqlx().clone(), library_roots);
         let download = DownloadState::new(Some(library.clone()), config.live());
-        let resolver = Arc::new(
-            ConnectionResolver::new(
-                Arc::new(SqliteConnectionStore::new(
-                    db.clone(),
-                    platform.clock.clone(),
-                )),
-                Arc::new(CredentialCoder::new(crypto.clone())),
-                Arc::new(ConfigServers::new(config)),
-            )
-            .with_plex_tokens(Arc::new(PlexTokenProbe::with_plex_tv(
-                http.clone(),
-                plex_tv,
-            ))),
-        );
+        let resolver = remotes;
         let service = RemotesService::new(
             http.clone(),
             resolver.clone(),
             Arc::new(SqliteFolderStore::new(db.clone(), platform.clock.clone())),
             imports,
+            MbidIndex::default(),
             platform.clock.clone(),
         );
         let remotes = RemotesDeps { service };
@@ -186,8 +189,8 @@ impl MediaSetup {
         // Without an ffmpeg every plan lands direct, so the spawner's path
         // is never run.
         let spawner =
-            StdFfmpegSpawner::with_path(ffmpeg.clone().unwrap_or_else(|| PathBuf::from("ffmpeg")));
-        let transcoder = FfmpegTranscoder::new(spawner, Arc::new(LocalTranscodeGate::new()));
+            ProcessSpawner::with_path(ffmpeg.clone().unwrap_or_else(|| PathBuf::from("ffmpeg")));
+        let transcoder = FfmpegTranscoder::new(spawner, Arc::new(TranscodeGate::new()));
         let gateway = Gateway::new(
             local_root(app_config),
             reader,
@@ -261,6 +264,20 @@ impl MediaSetup {
     /// register with the jobs table.
     pub fn scrobble_jobs(&self) -> Vec<(KindSpec, Arc<dyn JobHandler>)> {
         self.scrobble_jobs.clone()
+    }
+
+    /// What the jobs bundle reads from media: the presence registry the
+    /// playback routes write, the bundle's connection resolver and MBID
+    /// index, and the platform's outbound client, database and clock.
+    pub fn jobs(&self, platform: &Platform) -> MediaJobs {
+        MediaJobs::new(
+            self.playback.presence.clone(),
+            self.remotes.service.resolver().clone(),
+            platform.http.shared().clone(),
+            platform.db.sqlx().clone(),
+            platform.clock.clone(),
+            self.remotes.service.index().clone(),
+        )
     }
 }
 

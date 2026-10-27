@@ -6,7 +6,7 @@ use super::models::{
     AlbumIdentity, CandidateEvidence, EvidenceClass, LocalAlbumFacts, TrackEvidence,
 };
 use crate::matching::decide::{ACCEPT_ALBUM, ACCEPT_TRACK, REVIEW_CEILING};
-use crate::matching::score::LIBRARY_EXCLUDED;
+use crate::matching::score::{FINGERPRINT_OVERRULED, LIBRARY_EXCLUDED};
 use crate::matching::{EditionHints, LocalAlbum, LocalTrack, Release, ReleaseMatch};
 use droppedneedle_providers::musicbrainz::is_valid_mbid;
 
@@ -118,6 +118,51 @@ fn hints(facts: &LocalAlbumFacts) -> EditionHints {
     }
 }
 
+/// The barcode and catalog number keys more than half of the album's
+/// indexed files carry; the other hints are left empty. A value on half
+/// the files or fewer names no edition: it can be a stray copy.
+pub fn edition_ids(facts: &LocalAlbumFacts) -> EditionHints {
+    edition_ids_of(
+        facts
+            .tracks
+            .iter()
+            .map(|track| (track.barcode.as_deref(), track.catalog_number.as_deref())),
+    )
+}
+
+/// [`edition_ids`] over each indexed file's raw barcode and catalog number.
+pub fn edition_ids_of<'a>(
+    files: impl IntoIterator<Item = (Option<&'a str>, Option<&'a str>)>,
+) -> EditionHints {
+    let files: Vec<(Option<String>, Option<String>)> = files
+        .into_iter()
+        .map(|(barcode, catalog)| {
+            (
+                barcode.and_then(EditionHints::barcode_key),
+                catalog.and_then(EditionHints::catalog_key),
+            )
+        })
+        .collect();
+    let majority = |values: Vec<&String>| -> Option<String> {
+        let mut counts: Vec<(&String, usize)> = Vec::new();
+        for value in values {
+            match counts.iter_mut().find(|(seen, _)| *seen == value) {
+                Some((_, count)) => *count += 1,
+                None => counts.push((value, 1)),
+            }
+        }
+        counts
+            .into_iter()
+            .find(|(_, count)| count * 2 > files.len())
+            .map(|(value, _)| value.clone())
+    };
+    EditionHints {
+        barcode: majority(files.iter().filter_map(|file| file.0.as_ref()).collect()),
+        catalog_number: majority(files.iter().filter_map(|file| file.1.as_ref()).collect()),
+        ..EditionHints::default()
+    }
+}
+
 fn non_blank(value: Option<&str>) -> Option<String> {
     value
         .map(str::trim)
@@ -127,7 +172,8 @@ fn non_blank(value: Option<&str>) -> Option<String> {
 
 /// One candidate as a curator and the sealing code see it. Paired tracks
 /// within the track threshold are supported and carry the release's
-/// recording and release-track ids; a vetoed track is contradictory.
+/// recording and release-track ids; a vetoed track is contradictory. A
+/// file whose length overruled its fingerprint says so.
 pub fn candidate_evidence(
     local: &LocalAlbum,
     release: &Release,
@@ -151,6 +197,14 @@ pub fn candidate_evidence(
                 Some(pair) => {
                     let candidate = &release.tracks[pair.track];
                     let close = pair.distance <= ACCEPT_TRACK;
+                    let mut evidence_kinds = vec![if close {
+                        pair.support.code().to_owned()
+                    } else {
+                        "distant_pair".to_owned()
+                    }];
+                    if matched.overruled.contains(&index) {
+                        evidence_kinds.push(FINGERPRINT_OVERRULED.to_owned());
+                    }
                     TrackEvidence {
                         local_track_id: track.id.clone(),
                         classification: if close {
@@ -158,11 +212,7 @@ pub fn candidate_evidence(
                         } else {
                             EvidenceClass::Unknown
                         },
-                        evidence_kinds: vec![if close {
-                            pair.support.code().to_owned()
-                        } else {
-                            "distant_pair".to_owned()
-                        }],
+                        evidence_kinds,
                         recording_mbid: Some(candidate.recording_id.clone()),
                         release_track_mbid: Some(candidate.id.clone()),
                     }

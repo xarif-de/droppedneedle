@@ -8,6 +8,7 @@ use std::sync::Arc;
 use droppedneedle_providers::coverart::{DownloadSize, EntityKind};
 use droppedneedle_providers::executor::ScriptedWire;
 use droppedneedle_providers::geocoding::DEFAULT_CITY_COUNT;
+use droppedneedle_providers::lastfm::LastFmCredentials;
 use droppedneedle_providers::musicbrainz::{self, Criticality, MbSource};
 use droppedneedle_providers::{
     PayloadKind, ProviderEndpoints, ProviderError, Providers, RequestPriority,
@@ -41,6 +42,8 @@ enum Provider {
     AudioDbAlbumMbid,
     AudioDbArtistSearch,
     AudioDbAlbumSearch,
+    SkiddleArtists,
+    SkiddleEvents,
     DiscogsRelease(&'static str),
     DiscogsSearch,
     MusicBrainzRelease(&'static str, &'static [&'static str]),
@@ -53,6 +56,23 @@ enum Provider {
     MusicBrainzReleaseSearch(&'static str, &'static str),
     MusicBrainzRecordingSearch(&'static str),
     MusicBrainzBrowse(&'static str),
+    TicketmasterAttractions,
+    TicketmasterEvents,
+    LastFm(LastFmRead),
+}
+
+/// The Last.fm read a row's answer goes through.
+#[derive(Clone, Copy)]
+enum LastFmRead {
+    ArtistInfo,
+    AlbumInfo,
+    Similar,
+    ArtistTopTracks,
+    ArtistTopAlbums,
+    ArtistTopTags,
+    AlbumTopTags,
+    ChartTopArtists,
+    TagTopArtists,
 }
 
 /// The album the Deezer album search fixture names first, and its track list.
@@ -550,6 +570,132 @@ const ROWS: &[Row] = &[
         kind: PayloadKind::Decode,
         identity: "/release-groups/0/id",
     },
+    Row {
+        name: "lastfm artist.getInfo, artist name",
+        provider: Provider::LastFm(LastFmRead::ArtistInfo),
+        body: include_str!("../fixtures/lastfm/artist_getinfo.json"),
+        kind: PayloadKind::Decode,
+        identity: "/artist/name",
+    },
+    Row {
+        name: "lastfm album.getInfo, album title",
+        provider: Provider::LastFm(LastFmRead::AlbumInfo),
+        body: include_str!("../fixtures/lastfm/album_getinfo.json"),
+        kind: PayloadKind::Decode,
+        identity: "/album/name",
+    },
+    Row {
+        name: "lastfm artist.getSimilar, artist name",
+        provider: Provider::LastFm(LastFmRead::Similar),
+        body: include_str!("../fixtures/lastfm/artist_getsimilar.json"),
+        kind: PayloadKind::Decode,
+        identity: "/similarartists/artist/0/name",
+    },
+    Row {
+        name: "lastfm artist.getSimilar, list",
+        provider: Provider::LastFm(LastFmRead::Similar),
+        body: include_str!("../fixtures/lastfm/artist_getsimilar.json"),
+        kind: PayloadKind::Decode,
+        identity: "/similarartists",
+    },
+    Row {
+        name: "lastfm artist.getTopTracks, track name",
+        provider: Provider::LastFm(LastFmRead::ArtistTopTracks),
+        body: include_str!("../fixtures/lastfm/artist_gettoptracks.json"),
+        kind: PayloadKind::Decode,
+        identity: "/toptracks/track/0/name",
+    },
+    Row {
+        name: "lastfm artist.getTopAlbums, album name",
+        provider: Provider::LastFm(LastFmRead::ArtistTopAlbums),
+        body: include_str!("../fixtures/lastfm/artist_gettopalbums.json"),
+        kind: PayloadKind::Decode,
+        identity: "/topalbums/album/0/name",
+    },
+    Row {
+        name: "lastfm artist.getTopTags, tag name",
+        provider: Provider::LastFm(LastFmRead::ArtistTopTags),
+        body: include_str!("../fixtures/lastfm/artist_gettoptags.json"),
+        kind: PayloadKind::Decode,
+        identity: "/toptags/tag/0/name",
+    },
+    Row {
+        name: "lastfm album.getTopTags, tag name",
+        provider: Provider::LastFm(LastFmRead::AlbumTopTags),
+        body: include_str!("../fixtures/lastfm/album_gettoptags.json"),
+        kind: PayloadKind::Decode,
+        identity: "/toptags/tag/0/name",
+    },
+    Row {
+        name: "lastfm chart.getTopArtists, artist name",
+        provider: Provider::LastFm(LastFmRead::ChartTopArtists),
+        body: include_str!("../fixtures/lastfm/chart_gettopartists.json"),
+        kind: PayloadKind::Decode,
+        identity: "/artists/artist/0/name",
+    },
+    Row {
+        name: "lastfm tag.getTopArtists, artist name",
+        provider: Provider::LastFm(LastFmRead::TagTopArtists),
+        body: include_str!("../fixtures/lastfm/tag_gettopartists.json"),
+        kind: PayloadKind::Decode,
+        identity: "/topartists/artist/0/name",
+    },
+    Row {
+        name: "lastfm tag.getTopArtists, list",
+        provider: Provider::LastFm(LastFmRead::TagTopArtists),
+        body: include_str!("../fixtures/lastfm/tag_gettopartists.json"),
+        kind: PayloadKind::Decode,
+        identity: "/topartists",
+    },
+    Row {
+        name: "skiddle /artists/, act id",
+        provider: Provider::SkiddleArtists,
+        body: include_str!("../fixtures/skiddle/artists_search.json"),
+        kind: PayloadKind::Decode,
+        identity: "/results/0/id",
+    },
+    Row {
+        name: "skiddle /artists/, act name",
+        provider: Provider::SkiddleArtists,
+        body: include_str!("../fixtures/skiddle/artists_search.json"),
+        kind: PayloadKind::Decode,
+        identity: "/results/0/name",
+    },
+    Row {
+        name: "skiddle /events/search/, event id",
+        provider: Provider::SkiddleEvents,
+        body: include_str!("../fixtures/skiddle/events_for_artist.json"),
+        kind: PayloadKind::Decode,
+        identity: "/results/0/id",
+    },
+    Row {
+        name: "ticketmaster /attractions.json, act id",
+        provider: Provider::TicketmasterAttractions,
+        body: include_str!("../fixtures/ticketmaster/attractions_search_radiohead.json"),
+        kind: PayloadKind::Decode,
+        identity: "/_embedded/attractions/0/id",
+    },
+    Row {
+        name: "ticketmaster /attractions.json, act name",
+        provider: Provider::TicketmasterAttractions,
+        body: include_str!("../fixtures/ticketmaster/attractions_search_radiohead.json"),
+        kind: PayloadKind::Decode,
+        identity: "/_embedded/attractions/0/name",
+    },
+    Row {
+        name: "ticketmaster /events.json, event id",
+        provider: Provider::TicketmasterEvents,
+        body: include_str!("../fixtures/ticketmaster/events_fontaines_dc.json"),
+        kind: PayloadKind::Decode,
+        identity: "/_embedded/events/0/id",
+    },
+    Row {
+        name: "ticketmaster /events.json, attraction id",
+        provider: Provider::TicketmasterEvents,
+        body: include_str!("../fixtures/ticketmaster/events_fontaines_dc.json"),
+        kind: PayloadKind::Decode,
+        identity: "/_embedded/events/0/_embedded/attractions/0/id",
+    },
 ];
 
 /// Serves `body` from the provider's address and reads it through the
@@ -603,6 +749,48 @@ async fn read(provider: Provider, body: &str) -> Result<bool, ProviderError> {
                 .search_cities("Liverpool", DEFAULT_CITY_COUNT, PRIORITY)
                 .await?;
             Ok(!cities.is_empty())
+        }
+        Provider::TicketmasterAttractions => {
+            let wire = Arc::new(ScriptedWire::new());
+            wire.answer(
+                "http://fake/ticketmaster/attractions.json",
+                200,
+                &[],
+                body.as_bytes().to_vec(),
+            );
+            let providers = Providers::unpaced_at(
+                wire,
+                ProviderEndpoints {
+                    ticketmaster: "http://fake/ticketmaster".to_owned(),
+                    ..ProviderEndpoints::closed()
+                },
+            );
+            let found = providers
+                .ticketmaster
+                .search_attractions("k", "Radiohead", PRIORITY)
+                .await?;
+            Ok(!found.is_empty())
+        }
+        Provider::TicketmasterEvents => {
+            let wire = Arc::new(ScriptedWire::new());
+            wire.answer(
+                "http://fake/ticketmaster/events.json",
+                200,
+                &[],
+                body.as_bytes().to_vec(),
+            );
+            let providers = Providers::unpaced_at(
+                wire,
+                ProviderEndpoints {
+                    ticketmaster: "http://fake/ticketmaster".to_owned(),
+                    ..ProviderEndpoints::closed()
+                },
+            );
+            let page = providers
+                .ticketmaster
+                .events_page("k", "K8vZ9179LP7", 0, PRIORITY)
+                .await?;
+            Ok(!page.events.is_empty())
         }
         Provider::DeezerTrack => {
             let providers = deezer(&[("/search", body)]);
@@ -770,6 +958,48 @@ async fn read(provider: Provider, body: &str) -> Result<bool, ProviderError> {
                 .await?;
             Ok(album.is_some())
         }
+        Provider::SkiddleArtists => {
+            let wire = Arc::new(ScriptedWire::new());
+            wire.answer(
+                "http://fake/skiddle/artists/",
+                200,
+                &[],
+                body.as_bytes().to_vec(),
+            );
+            let providers = Providers::unpaced_at(
+                wire,
+                ProviderEndpoints {
+                    skiddle: "http://fake/skiddle".to_owned(),
+                    ..ProviderEndpoints::closed()
+                },
+            );
+            let acts = providers
+                .skiddle
+                .search_artists("k", "Orbital", PRIORITY)
+                .await?;
+            Ok(!acts.is_empty())
+        }
+        Provider::SkiddleEvents => {
+            let wire = Arc::new(ScriptedWire::new());
+            wire.answer(
+                "http://fake/skiddle/events/search/",
+                200,
+                &[],
+                body.as_bytes().to_vec(),
+            );
+            let providers = Providers::unpaced_at(
+                wire,
+                ProviderEndpoints {
+                    skiddle: "http://fake/skiddle".to_owned(),
+                    ..ProviderEndpoints::closed()
+                },
+            );
+            let events = providers
+                .skiddle
+                .events_for_artist("k", "123487626", PRIORITY)
+                .await?;
+            Ok(!events.is_empty())
+        }
         Provider::DiscogsRelease(release_id) => {
             let wire = Arc::new(ScriptedWire::new());
             wire.answer(
@@ -905,7 +1135,64 @@ async fn read(provider: Provider, body: &str) -> Result<bool, ProviderError> {
                 .await?;
             Ok(!page.items.is_empty())
         }
+        Provider::LastFm(read) => lastfm(read, body).await,
     }
+}
+
+/// Serves `body` from Last.fm's API root and reads it through `read`.
+async fn lastfm(read: LastFmRead, body: &str) -> Result<bool, ProviderError> {
+    let wire = Arc::new(ScriptedWire::new());
+    wire.answer("http://fake/lastfm/", 200, &[], body.as_bytes().to_vec());
+    let providers = Providers::unpaced_at(
+        wire,
+        ProviderEndpoints {
+            lastfm: "http://fake/lastfm/".to_owned(),
+            ..ProviderEndpoints::closed()
+        },
+    );
+    let client = &providers.lastfm;
+    let creds = LastFmCredentials {
+        api_key: "key".to_owned(),
+        ..LastFmCredentials::default()
+    };
+    Ok(match read {
+        LastFmRead::ArtistInfo => client
+            .artist_info(&creds, "Radiohead", None, PRIORITY)
+            .await?
+            .is_some_and(|artist| !artist.similar.is_empty() && !artist.tags.is_empty()),
+        LastFmRead::AlbumInfo => client
+            .album_info(&creds, "Radiohead", "OK Computer", None, PRIORITY)
+            .await?
+            .is_some_and(|album| album.tracks.len() == 12),
+        LastFmRead::Similar => !client
+            .similar_artists(&creds, "Radiohead", None, 3, PRIORITY)
+            .await?
+            .is_empty(),
+        LastFmRead::ArtistTopTracks => !client
+            .artist_top_tracks(&creds, "Radiohead", None, 3, PRIORITY)
+            .await?
+            .is_empty(),
+        LastFmRead::ArtistTopAlbums => !client
+            .artist_top_albums(&creds, "Radiohead", None, 3, PRIORITY)
+            .await?
+            .is_empty(),
+        LastFmRead::ArtistTopTags => !client
+            .artist_top_genres(&creds, "Radiohead", PRIORITY)
+            .await?
+            .is_empty(),
+        LastFmRead::AlbumTopTags => !client
+            .album_top_genres(&creds, "Radiohead", "OK Computer", PRIORITY)
+            .await?
+            .is_empty(),
+        LastFmRead::ChartTopArtists => !client
+            .chart_top_artists(&creds, 3, PRIORITY)
+            .await?
+            .is_empty(),
+        LastFmRead::TagTopArtists => !client
+            .tag_top_artists(&creds, "trip-hop", 1, PRIORITY)
+            .await?
+            .is_empty(),
+    })
 }
 
 /// Serves `body` from the archive's listing address for the entity and reads

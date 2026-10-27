@@ -12,13 +12,15 @@ use sqlx::SqlitePool;
 use super::ports::{
     ImportFailure, ImportReceipt, ImportRequest, LandingLibrary, OwnedCopy, OwnedTracks, VersionRow,
 };
-use crate::downloads::manifest::PlannedAlbum;
+use crate::downloads::plan::PlannedAlbum;
 use droppedneedle_library::identify::sources::{
     Prioritised, ReleaseHit, ReleaseSource, SourceError, group_editions,
 };
 use droppedneedle_library::import::{DownloadImport, ImportError, ImportSource};
 use droppedneedle_library::management::service::Management;
 use droppedneedle_library::matching::Release;
+use droppedneedle_library::publish::paths::{ResolvedRoot, left_out};
+use droppedneedle_library::scan::EffectivePolicy;
 use droppedneedle_library::wiring::LibrarySetup;
 use droppedneedle_providers::RequestPriority;
 
@@ -399,6 +401,26 @@ impl LandingLibrary for LibraryLanding {
             .collect()
     }
 
+    fn import_folder(&self) -> Option<PathBuf> {
+        let registry = self.library.live_registry();
+        let usable: Vec<_> = registry
+            .roots()
+            .iter()
+            .filter(|root| root.policy != EffectivePolicy::Excluded)
+            .collect();
+        let resolved: Vec<ResolvedRoot> = registry
+            .roots()
+            .iter()
+            .map(|root| ResolvedRoot::of(&root.id, &root.path))
+            .collect();
+        let left_out = left_out(&resolved);
+        usable
+            .iter()
+            .find(|root| root.policy == EffectivePolicy::Automatic && !left_out.contains(&root.id))
+            .or_else(|| usable.first())
+            .map(|root| root.path.clone())
+    }
+
     fn import(
         &self,
         request: ImportRequest,
@@ -423,12 +445,15 @@ impl LandingLibrary for LibraryLanding {
                 actor: Some(request.actor),
             };
             let join = request.join;
-            let done =
-                tokio::task::spawn_blocking(move || library.import_download_joined(&import, join))
-                    .await
-                    .map_err(|error| {
-                        ImportFailure::LocalFault(format!("import did not run: {error}"))
-                    })?;
+            let beneath = request.read_beneath;
+            let done = tokio::task::spawn_blocking(move || match beneath {
+                Some(folders) => library.import_download_from(&import, join, &|path| {
+                    super::confine::open_beneath(&folders, path)
+                }),
+                None => library.import_download_joined(&import, join),
+            })
+            .await
+            .map_err(|error| ImportFailure::LocalFault(format!("import did not run: {error}")))?;
             match done {
                 Ok(album) => Ok(ImportReceipt {
                     bundle_id: album.bundle_id,
@@ -441,6 +466,9 @@ impl LandingLibrary for LibraryLanding {
                 Err(ImportError::LocalFault(detail)) => Err(ImportFailure::LocalFault(detail)),
                 Err(ImportError::Occupied(detail)) => Err(ImportFailure::Occupied(detail)),
                 Err(ImportError::NamingScript(detail)) => Err(ImportFailure::NamingScript(detail)),
+                Err(ImportError::FolderMissing(folder)) => {
+                    Err(ImportFailure::FolderMissing(folder))
+                }
             }
         })
     }
@@ -453,6 +481,35 @@ impl LandingLibrary for LibraryLanding {
                 .await
                 .map_err(|error| format!("publish journal read did not run: {error}"))?
                 .map_err(|error| error.to_string())
+        })
+    }
+
+    fn placed_sources<'a>(
+        &'a self,
+        staging: &'a str,
+    ) -> BoxFuture<'a, Result<Option<HashSet<String>>, String>> {
+        Box::pin(async move {
+            if !self.publish_settled(staging).await? {
+                return Ok(None);
+            }
+            // An import stages under `<hidden prefix>import/<name>/` below
+            // the library root (the held list's names need no escaping) and
+            // records the hash of each file it copied in as the row's
+            // source hash.
+            let folder = format!(
+                "{}import/{staging}/",
+                droppedneedle_library::publish::HIDDEN_PREFIX
+            );
+            let hashes: Vec<String> = sqlx::query_scalar(
+                "SELECT DISTINCT source_sha256 FROM library_publish_journal \
+                 WHERE substr(source_rel, 1, length(?1)) = ?1 AND source_sha256 IS NOT NULL \
+                   AND state IN ('committed', 'cleanup_pending', 'cleaned')",
+            )
+            .bind(folder)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|error| format!("publish journal unreadable: {error}"))?;
+            Ok(Some(hashes.into_iter().collect()))
         })
     }
 }

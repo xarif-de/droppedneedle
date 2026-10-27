@@ -117,6 +117,11 @@ pub const EDITION_NOT_FOUND: Reason = reason(
     "MusicBrainz does not know this release.",
     "Check the release ID, or pick an edition from the list.",
 );
+pub const EDITION_UNREADABLE: Reason = reason(
+    "EDITION_UNREADABLE",
+    "MusicBrainz's answer for this release could not be read.",
+    "Try again later, or pick another edition.",
+);
 pub const EDITION_FITS_NO_FILE: Reason = reason(
     "EDITION_FITS_NO_FILE",
     "None of this album's files match a track on that edition, so it is probably another album.",
@@ -556,10 +561,20 @@ pub fn match_reason(code: &str) -> Reason {
             "Two different albums fit the files about equally well; this one fit slightly better.",
             "Compare the candidates and confirm the right one.",
         ),
+        "TAGGED_RELEASE_UNREADABLE" => reason(
+            "TAGGED_RELEASE_UNREADABLE",
+            "MusicBrainz's answer for the release your files name could not be read, so this edition is a best guess.",
+            "Confirm it or pick another edition.",
+        ),
         "NAMED_GROUP_DIFFERS" => reason(
             "NAMED_GROUP_DIFFERS",
             "Fits best, but the files' tags or earlier match name another album.",
             "Confirm it or pick another edition.",
+        ),
+        "AUDIO_DISAGREES" => reason(
+            "AUDIO_DISAGREES",
+            "Fits best, but some files' audio matches other tracks.",
+            "Check the tracklist and confirm it.",
         ),
         "WEAK_MATCH" => reason(
             "WEAK_MATCH",

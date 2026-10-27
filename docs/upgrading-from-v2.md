@@ -143,8 +143,13 @@ many. Nothing else in the v2 database is changed.
 - The original of every file Library Management changed. "Restore original"
   in v3 puts such a file back where it was and gives it back the tags it had
   before v2 first touched it.
-- Downloads held back for review, with their files. They land in
-  the `held` folder of your v3 cache.
+- Downloads held back for review, with their files and the reason
+  they were held. They land in the `held` folder of your v3 cache and
+  join the list of held files on the Downloads page, one entry per album.
+  v2's "waiting on the library" holds read as a file already in the way;
+  a reason v3 does not use reads as held by an earlier version. Held
+  files and uploads waiting for you are kept at least 90 days after the
+  upgrade.
 - MusicBrainz contributions you had in progress, with their verification
   and the return link MusicBrainz calls when you save the release.
 - YouTube links you found or set for albums and tracks.
@@ -162,10 +167,13 @@ Upgrading an existing v3 install does the same with any pins it holds.
 Albums that were waiting on a review question in v2 go back on v3's
 identify queue, so v3 asks again with its own candidates.
 
-Three passes run in the background after an upgrade: an album v2 matched only
+Four passes run in the background after an upgrade: an album v2 matched only
 to a release group is identified once more to find its edition, unless a
 person chose that group; an album matched by itself on a release outside
-the group all its files name is checked once more; and the artist MusicBrainz links v2 made stay in
+the group all its files name is checked once more; an album matched by
+itself on an edition whose barcode or catalog number differs from its
+files', with no MusicBrainz release ID in them, is checked once more after
+its files' edition tags are read; and the artist MusicBrainz links v2 made stay in
 place until each album's release details arrive and are checked. See
 [Your library](library.md#album-organization).
 

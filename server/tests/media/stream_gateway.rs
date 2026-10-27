@@ -16,7 +16,7 @@ use axum::body::Body;
 use axum::http::{HeaderMap, Method, Request, StatusCode};
 use droppedneedle_auth::users::roles::{Role, SessionKind};
 use gateway::{
-    AudioSource, OpenMedia, StreamEngine, StreamFault, StreamOpen, StreamState,
+    AudioSource, MediaBody, StreamEngine, StreamFault, StreamMedia, StreamOpen, StreamState,
     content_type_for_extension, stream_routes,
 };
 use serde_json::Value;
@@ -35,12 +35,43 @@ struct Seen {
     estimate_content_length: bool,
 }
 
+/// One scripted object, served from memory.
+#[derive(Debug, Clone)]
+struct Canned {
+    content_type: String,
+    transcoded: bool,
+    estimated_len: Option<u64>,
+    bytes: Vec<u8>,
+}
+
+impl Canned {
+    fn direct(content_type: &str, bytes: Vec<u8>) -> Self {
+        Self {
+            content_type: content_type.to_owned(),
+            transcoded: false,
+            estimated_len: None,
+            bytes,
+        }
+    }
+
+    fn media(self) -> StreamMedia {
+        StreamMedia {
+            content_type: self.content_type,
+            total_len: self.bytes.len() as u64,
+            transcoded: self.transcoded,
+            estimated_len: self.estimated_len,
+            body: MediaBody::Bytes(self.bytes),
+            lease: None,
+        }
+    }
+}
+
 /// Scripted per-key behavior. `LocalFile` resolves its content type through
 /// the real gateway helper, returning InvalidInput for unstreamable formats.
 #[derive(Debug, Clone)]
 enum Script {
     LocalFile { ext: String, len: usize },
-    Media(OpenMedia),
+    Media(Canned),
     Fault(StreamFault),
 }
 
@@ -67,7 +98,11 @@ impl FakeEngine {
 }
 
 impl StreamEngine for FakeEngine {
-    async fn open(&self, request: StreamOpen) -> Result<OpenMedia, StreamFault> {
+    async fn open_stream(
+        &self,
+        request: StreamOpen,
+        _head_only: bool,
+    ) -> Result<StreamMedia, StreamFault> {
         self.seen.lock().expect("seen unlocks").push(Seen {
             user_id: request.user_id.clone(),
             source: request.source,
@@ -79,19 +114,10 @@ impl StreamEngine for FakeEngine {
         let lookup = format!("{}/{}", request.source.as_str(), request.key);
         match self.scripts.get(&lookup) {
             None => Err(StreamFault::NotFound),
-            Some(Script::Media(media)) => Ok(media.clone()),
+            Some(Script::Media(media)) => Ok(media.clone().media()),
             Some(Script::Fault(fault)) => Err(fault.clone()),
             Some(Script::LocalFile { ext, len }) => match content_type_for_extension(ext) {
-                Some(content_type) => {
-                    let bytes = fixture_bytes(*len);
-                    Ok(OpenMedia {
-                        content_type: content_type.to_owned(),
-                        total_len: bytes.len() as u64,
-                        transcoded: false,
-                        estimated_len: None,
-                        bytes,
-                    })
-                }
+                Some(content_type) => Ok(Canned::direct(content_type, fixture_bytes(*len)).media()),
                 None => Err(StreamFault::InvalidInput {
                     message: format!("Unsupported audio format: {ext}"),
                 }),
@@ -197,7 +223,7 @@ async fn full_get_returns_exact_bytes_with_identity_headers() {
 }
 
 // ---------------------------------------------------------------------------
-// Range matrix: suffix/open/closed land 206; multi-range answers whole
+// Range matrix: suffix/open/closed land 206; multi-range answers 416
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -227,13 +253,15 @@ async fn ranges_return_exact_slices() {
 }
 
 #[tokio::test]
-async fn multi_range_answers_the_whole_object() {
+async fn multi_range_answers_416_like_every_stream_route() {
     let (_engine, router) = local_app(".mp3", 256);
-    let (status, headers, body) =
+    let (status, headers, _) =
         get(router, "/stream/local/song", &[("range", "bytes=0-1,5-6")]).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, fixture_bytes(256));
-    assert_eq!(header(&headers, "content-range"), None);
+    assert_eq!(status, StatusCode::RANGE_NOT_SATISFIABLE);
+    assert_eq!(
+        header(&headers, "content-range"),
+        Some("bytes */256".to_owned())
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -344,13 +372,7 @@ async fn scripted_remote_body_keeps_upstream_content_type() {
     let bytes = fixture_bytes(128);
     let engine = FakeEngine::with(vec![(
         "plex/part-7",
-        Script::Media(OpenMedia {
-            content_type: "audio/x-flac".to_owned(),
-            total_len: bytes.len() as u64,
-            transcoded: false,
-            estimated_len: None,
-            bytes: bytes.clone(),
-        }),
+        Script::Media(Canned::direct("audio/x-flac", bytes.clone())),
     )]);
     let (status, headers, body) = get(app(engine, true), "/stream/plex/part-7", &[]).await;
 
@@ -506,9 +528,8 @@ fn transcode_engine() -> Arc<FakeEngine> {
     let bytes = b"fake-transcoded-mp3-bytes".to_vec();
     FakeEngine::with(vec![(
         "local/song",
-        Script::Media(OpenMedia {
+        Script::Media(Canned {
             content_type: "audio/mpeg".to_owned(),
-            total_len: bytes.len() as u64,
             transcoded: true,
             estimated_len: Some(48_000),
             bytes,
@@ -603,13 +624,7 @@ async fn plex_part_key_with_slashes_routes_whole_key() {
     let bytes = fixture_bytes(48);
     let engine = FakeEngine::with(vec![(
         "plex/library/parts/7/file.mp3",
-        Script::Media(OpenMedia {
-            content_type: "audio/mpeg".to_owned(),
-            total_len: bytes.len() as u64,
-            transcoded: false,
-            estimated_len: None,
-            bytes: bytes.clone(),
-        }),
+        Script::Media(Canned::direct("audio/mpeg", bytes.clone())),
     )]);
     let (status, _, body) = get(
         app(Arc::clone(&engine), true),

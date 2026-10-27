@@ -418,16 +418,12 @@ impl AlbumRemovedJob {
         jobs: &droppedneedle_kernel::jobs::queue::JobQueue,
         removal_id: &str,
         removed: &AlbumRemoved,
+        removed_at: f64,
     ) -> Result<(), droppedneedle_kernel::jobs::queue::JobError> {
         let job = Self {
             release_group_mbid: removed.release_group_mbid.clone(),
             stop_wanted: removed.stop_wanted,
-            // The acquisition rows this is compared with are stamped from
-            // the system clock in unix seconds, so this is too.
-            removed_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|elapsed| elapsed.as_secs_f64())
-                .unwrap_or(0.0),
+            removed_at,
         };
         jobs.enqueue(tx, ALBUM_REMOVED, removal_id, &job)
             .map(|_| ())
@@ -1023,8 +1019,7 @@ impl SamePathSelf {
         let Some(wanted) = self.replaces_sha256.as_deref() else {
             return false;
         };
-        super::paths::read_regular_file(dest)
-            .is_ok_and(|bytes| super::snapshots::sha256_hex(&bytes) == wanted)
+        super::paths::holds(dest, wanted)
     }
 
     /// True when `path`, found at or folding onto `dest_root:dest_rel`, is
@@ -1054,10 +1049,7 @@ impl SamePathSelf {
         let Some(wanted) = self.sha256.as_deref() else {
             return false;
         };
-        let Ok(bytes) = super::paths::read_regular_file(dest) else {
-            return false;
-        };
-        super::snapshots::sha256_hex(&bytes) == wanted
+        super::paths::holds(dest, wanted)
     }
 }
 

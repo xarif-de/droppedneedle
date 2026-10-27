@@ -35,7 +35,6 @@ use crate::{
         effects::{Effects, LiveSaveEffects},
         library_catalog::SqliteLibraryPolicyCatalog,
         section_prefs::{SqliteLinkStatus, SqliteSectionPrefsStore},
-        services::SqliteImpactBuckets,
         wiring::SettingsSetup,
     },
     web::{WebError, WebUi},
@@ -73,16 +72,13 @@ use droppedneedle_kernel::{
     platform::Platform,
     runtime_config::crypto::CryptoError,
 };
-use droppedneedle_library::wiring::LibrarySetup;
+use droppedneedle_library::wiring::{LibraryServices, LibrarySetup};
 use droppedneedle_media::playback::listening::ListeningStore;
 use droppedneedle_media::{
     MediaSetup,
     remotes::{
-        connections::{
-            ConfigServers, ConnectionResolver, CredentialCoder, SignInLinks, SqliteConnectionStore,
-        },
+        connections::{ConnectionResolver, SignInLinks},
         plex::ConfiguredPlexServer,
-        presence_feed::MediaJobs,
     },
     stream::local_files::LibraryFiles,
 };
@@ -178,17 +174,10 @@ where
 
 /// The media links a Plex or Jellyfin sign-in saves, written to the
 /// per-user connections table (the rows the remotes routes read) in the
-/// platform's database.
+/// platform's database. It only stores links and reads no remote server.
 pub fn sign_in_links(platform: &Platform) -> MediaLinks {
     MediaLinks::new(Arc::new(SignInLinks::new(Arc::new(
-        ConnectionResolver::new(
-            Arc::new(SqliteConnectionStore::new(
-                platform.db.clone(),
-                platform.clock.clone(),
-            )),
-            Arc::new(CredentialCoder::new(platform.crypto.clone())),
-            Arc::new(ConfigServers::new(&platform.settings)),
-        ),
+        ConnectionResolver::over(platform),
     ))))
 }
 
@@ -288,13 +277,16 @@ pub async fn build_with(config: AppConfig, outbound: Outbound) -> Result<Built, 
     // The artist and album pages, with plugin purchase links and details.
     // The artwork service names artist images through it, and the library
     // plans covers through that service.
+    // The one local catalog: the catalog pages, the library reads,
+    // collections' ratings and the player apps all read through it.
+    let local = LocalCatalog::new(db.clone());
     let catalog = Catalog::new(
         Upstream::new(
             providers.clone(),
             Arc::new(LiveCatalogSettings::new(config_store)),
             auth.users.clone(),
         ),
-        LocalCatalog::new(db.clone()),
+        local.clone(),
     )
     .with_purchase_links(Arc::new(PluginPurchaseLinks(plugin_host.clone())))
     .with_details(Arc::new(PluginDetailsSource(plugin_host.clone())))
@@ -325,13 +317,14 @@ pub async fn build_with(config: AppConfig, outbound: Outbound) -> Result<Built, 
         library_ports(p, &providers, &auth, &artwork, &scans, library_core),
     )
     .map_err(stage("library setup"))?;
+    let library_services = LibraryServices::build(&library);
     let acquire = AcquireSetup::build(
         p,
         auth.users.clone(),
         acquire_stores,
         acquire_ports(
             p,
-            &library,
+            &library_services,
             &providers,
             mb_source,
             &plugin_host,
@@ -341,13 +334,17 @@ pub async fn build_with(config: AppConfig, outbound: Outbound) -> Result<Built, 
         queues.queue().clone(),
     )
     .map_err(stage("acquire setup"))?;
+    // The one connection resolver every remote read goes through, so the
+    // reads people trigger share one bound per source.
+    let remotes = MediaSetup::remotes(p, outbound.plex_tv.clone());
     let reads = ReadsSetup::build(
         p,
         auth.users.clone(),
         reads_inputs,
         Some(enrichment),
         ReadsPorts {
-            collections: CollectionsState::over(collections_db, collections),
+            remotes: remotes.clone(),
+            collections: CollectionsState::over(collections_db, collections, local),
             catalog,
             artwork,
             library_files: LibraryFiles::new(db.sqlx().clone(), library.root_source()),
@@ -373,7 +370,7 @@ pub async fn build_with(config: AppConfig, outbound: Outbound) -> Result<Built, 
         // Remote playlist imports land in the user's playlists.
         Arc::new(PlaylistImportSink::new(reads.collections.clone())),
         plugin_host.clone(),
-        outbound.plex_tv.clone(),
+        remotes,
         outbound.ffmpeg.clone(),
         &providers,
         mix_hooks.clone(),
@@ -439,12 +436,7 @@ pub async fn build_with(config: AppConfig, outbound: Outbound) -> Result<Built, 
     let jobs = JobsSetup::build(
         p,
         runtime.checkpoint().clone(),
-        MediaJobs {
-            presence: media.playback.presence.clone(),
-            resolver: Some(media.remotes.service.resolver().clone()),
-            http: http.shared().clone(),
-            pool: Some(db.sqlx().clone()),
-        },
+        media.jobs(p),
         concerts.sweep(),
         scans.clone(),
     )
@@ -477,13 +469,15 @@ pub async fn build_with(config: AppConfig, outbound: Outbound) -> Result<Built, 
     }
     .with_precache(jobs.precache_trigger());
     let download_worker = acquire.worker.clone();
+    let roots_library = library.clone();
     // Each section's declared effects run after every committed change to
     // it, whoever saved it; settings routes wait for them before answering.
     let (effects, effects_runner) = Effects::new(
         config_store.clone(),
         Arc::new(
             LiveSaveEffects::new(jobs.events_kick())
-                .with_download_wake(Arc::new(move || download_worker.wake())),
+                .with_download_wake(Arc::new(move || download_worker.wake()))
+                .with_library_roots(Arc::new(move || roots_library.roots_saved())),
         ),
     );
     if supervisor
@@ -512,9 +506,6 @@ pub async fn build_with(config: AppConfig, outbound: Outbound) -> Result<Built, 
             lastfm: auth.users.lastfm.clone(),
         }),
     )
-    .with_impact_buckets(Arc::new(SqliteImpactBuckets {
-        pool: db.sqlx().clone(),
-    }))
     .with_library_catalog(Arc::new(SqliteLibraryPolicyCatalog {
         pool: db.sqlx().clone(),
     }));
@@ -541,7 +532,7 @@ pub async fn build_with(config: AppConfig, outbound: Outbound) -> Result<Built, 
         reads,
         media,
         acquire,
-        library,
+        library_services,
         compat,
         admin,
         settings,
@@ -555,7 +546,7 @@ pub async fn build_with(config: AppConfig, outbound: Outbound) -> Result<Built, 
         .spawn_loops(supervisor)
         .map_err(|error| stage("acquire loops")(error.to_string()))?;
     state
-        .library
+        .library_services
         .start_loops(supervisor)
         .map_err(|error| stage("library loops")(error.to_string()))?;
     // `activity.changed` and `downloads.changed` for every open stream.
@@ -622,7 +613,7 @@ fn library_ports(
 /// usenet and hear acquisition events.
 fn acquire_ports(
     p: &Platform,
-    library: &LibrarySetup,
+    library: &LibraryServices,
     providers: &Arc<Providers>,
     mb_source: droppedneedle_providers::musicbrainz::LiveSource,
     plugin_host: &Arc<droppedneedle_plugins::host::PluginHost>,
@@ -631,14 +622,12 @@ fn acquire_ports(
     AcquirePorts {
         library: Arc::new(
             droppedneedle_acquire::landing::library::LibraryLanding::new(
-                library.clone(),
-                library.releases.clone(),
+                library.setup.clone(),
+                library.setup.releases.clone(),
                 p.db.sqlx().clone(),
             ),
         ),
-        edition_plans: Arc::new(droppedneedle_library::operations::service::Operations::new(
-            library,
-        )),
+        edition_plans: Arc::new(library.operations.clone()),
         album_lookup: Arc::new(droppedneedle_acquire::target::lookup::live_albums(
             providers,
             mb_source.clone(),

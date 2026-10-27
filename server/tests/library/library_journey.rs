@@ -11,7 +11,8 @@
 //! The tests on `bare_library` are component tests: they step a worker or a
 //! store by hand, on a library bundle with no app around it.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -46,8 +47,9 @@ struct Rig {
     contrib: ScriptedContrib,
     scan_store: SqliteScanStore,
     identify_store: SqliteIdentifyStore,
-    /// When the last identification job the journey accounted for ended.
-    settled_at: Cell<i64>,
+    /// Per album, when the last identification job the journey accounted
+    /// for ended.
+    settled_at: RefCell<HashMap<String, i64>>,
 }
 
 impl Rig {
@@ -61,12 +63,18 @@ impl Rig {
         let db = droppedneedle_kernel::db::Db::open_for_tests(&app.config.library_db_path)
             .expect("database opens");
         Self {
-            scan_store: SqliteScanStore::new(db.clone()),
-            identify_store: SqliteIdentifyStore::new(db),
+            scan_store: SqliteScanStore::new(
+                db.clone(),
+                std::sync::Arc::new(droppedneedle_kernel::clock::SystemClock),
+            ),
+            identify_store: SqliteIdentifyStore::new(
+                db,
+                std::sync::Arc::new(droppedneedle_kernel::clock::SystemClock),
+            ),
             app,
             identify,
             contrib,
-            settled_at: Cell::new(0),
+            settled_at: RefCell::default(),
         }
     }
 
@@ -139,20 +147,22 @@ impl Rig {
         assert_eq!(status, StatusCode::OK, "{body}");
     }
 
-    /// Wait until the identification queue is idle, and check that exactly
-    /// `jobs` jobs ended since the journey last asked.
-    async fn identified(&self, jobs: i64) {
-        let since = self.settled_at.get();
+    /// Wait until the album has no identification job open, and check that
+    /// exactly `jobs` of its jobs ended since the journey last asked. Jobs
+    /// of other albums are not counted.
+    async fn identified(&self, album: &str, jobs: i64) {
+        let since = self.settled_at.borrow().get(album).copied().unwrap_or(0);
         let db = self.app.db();
         let (ended, latest) = self
             .app
-            .until("identification settles", || {
+            .until("the album's identification settles", || {
                 let (open, ended, latest): (i64, i64, i64) = db
                     .query_row(
                         "SELECT COALESCE(SUM(state IN ('queued', 'running')), 0), \
                          COALESCE(SUM(state NOT IN ('queued', 'running') AND updated_ms > ?1), 0), \
-                         COALESCE(MAX(updated_ms), 0) FROM library_identify_jobs",
-                        [since],
+                         COALESCE(MAX(updated_ms), 0) FROM library_identify_jobs \
+                         WHERE local_album_id = ?2",
+                        rusqlite::params![since, album],
                         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                     )
                     .expect("identify queue reads");
@@ -160,7 +170,27 @@ impl Rig {
             })
             .await;
         assert_eq!(ended, jobs, "identification jobs that ran");
-        self.settled_at.set(latest);
+        self.settled_at
+            .borrow_mut()
+            .insert(album.to_owned(), latest);
+    }
+
+    /// Wait until the album has no identification job open.
+    async fn identification_idle(&self, album: &str) {
+        let db = self.app.db();
+        self.app
+            .until("the album's identification is idle", || {
+                let open: i64 = db
+                    .query_row(
+                        "SELECT COUNT(*) FROM library_identify_jobs \
+                         WHERE local_album_id = ?1 AND state IN ('queued', 'running')",
+                        [album],
+                        |row| row.get(0),
+                    )
+                    .expect("identify queue reads");
+                async move { (open == 0).then_some(()) }
+            })
+            .await;
     }
 
     /// Wait until the app is done with the edition a person chose for the
@@ -422,7 +452,7 @@ async fn library_journey_scan_identify_review_organize_undo() {
 
     // The scan-enqueued job runs once. On a tie it still picks a best
     // guess (always pick) and files no review.
-    rig.identified(1).await;
+    rig.identified(album_key, 1).await;
     // Purity extends past identify: tag reads and probes wrote zero
     // media bytes too.
     assert_eq!(
@@ -482,7 +512,7 @@ async fn library_journey_scan_identify_review_organize_undo() {
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    rig.identified(1).await;
+    rig.identified(album_key, 1).await;
 
     // Curator approval seals a manual identity. The candidate names only
     // the release, so the app goes on to ask MusicBrainz for it. The script
@@ -552,7 +582,7 @@ async fn library_journey_scan_identify_review_organize_undo() {
     // queues the album for identification again; Undo checks the identity,
     // so that job ends first.
     app.scan_library().await;
-    rig.identified(1).await;
+    rig.identified(album_key, 1).await;
     {
         for track in [&track_a, &track_b] {
             assert_eq!(
@@ -624,7 +654,7 @@ async fn library_journey_retag_apply_baseline_restore() {
     assert_eq!(status, StatusCode::OK, "{body}");
     let album_id = body["album_id"].as_str().expect("album id").to_owned();
     let album_key = album_id.as_str();
-    rig.identified(1).await;
+    rig.identified(album_key, 1).await;
     file_edition_review(&rig.identify_store, album_key);
     let (status, body) = app
         .call(
@@ -845,7 +875,7 @@ async fn retag_preview_lists_the_tags_that_change() {
         .album_for_track(&track)
         .unwrap()
         .expect("album");
-    rig.identified(1).await;
+    rig.identified(&album, 1).await;
     rig.choose_first_edition(&album).await;
     rig.edition_settled(&album).await;
 
@@ -972,7 +1002,7 @@ async fn an_artist_renamed_by_a_managed_run_keeps_its_row() {
         .album_for_track(&track)
         .unwrap()
         .expect("album");
-    rig.identified(1).await;
+    rig.identified(&album, 1).await;
     rig.choose_first_edition(&album).await;
     rig.edition_settled(&album).await;
 
@@ -1145,7 +1175,7 @@ async fn manage_routes_limit_a_trusted_user_to_a_plain_retag() {
         .album_for_track(&track)
         .unwrap()
         .expect("album");
-    rig.identified(1).await;
+    rig.identified(&album, 1).await;
     rig.choose_first_edition(&album).await;
     let fields_before = read_fields(&file).expect("fields read");
 
@@ -1164,7 +1194,7 @@ async fn manage_routes_limit_a_trusted_user_to_a_plain_retag() {
         .unwrap()
         .expect("album");
     assert_ne!(other_album, album);
-    rig.identified(1).await;
+    rig.identified(&other_album, 1).await;
     rig.choose_first_edition(&other_album).await;
     for headers in [&tris_headers, &admin_headers] {
         let (status, body) = app
@@ -1821,7 +1851,7 @@ async fn an_edition_tag_write_planned_after_another_choice_writes_nothing() {
             &test_principal("admin", Role::Admin, "session-1", SessionKind::Standard),
         )
         .expect("tag write queued");
-    droppedneedle_library::operations::service::Operations::new(&managed.library)
+    crate::common::library::operations(&managed.library)
         .choose_edition(&album, other, Some("admin"))
         .await
         .expect("another edition chosen");
@@ -1854,6 +1884,66 @@ async fn an_edition_tag_write_planned_after_another_choice_writes_nothing() {
     assert!(applied.is_err(), "nothing can be written");
     while management_step(&managed.library).await {}
     assert_eq!(file_sha256(&file), before, "the file is as it was");
+}
+
+/// When a person's edition choice answers, the album's artist proofs and
+/// links are already written, with no sweep and no identification run.
+#[tokio::test]
+async fn an_edition_choice_links_its_artists_before_it_answers() {
+    use rusqlite::OptionalExtension as _;
+    const ARTIST: &str = "dddddddd-0000-4000-8000-00000000000d";
+    let (scratch, library, music) = bare_library("lib-choice-links").await;
+    plant(&music, "a/01.flac", "flac_full_01.flac");
+    add_music_root(&library, &music).await;
+    rescan(&library).await;
+    let track = library
+        .scan_store
+        .track_at("music", "a/01.flac")
+        .unwrap()
+        .expect("track indexed");
+    let album = library
+        .scan_store
+        .album_for_track(&track)
+        .unwrap()
+        .expect("album");
+    let mut recall = ambiguous_recall(&library.identify_store, &album);
+    for release in &mut recall.releases {
+        release.artists[0].id = ARTIST.to_owned();
+    }
+    scratch.identify.set_recall(recall);
+
+    crate::common::library::operations(&library)
+        .choose_edition(&album, REL_1, Some("admin"))
+        .await
+        .expect("edition chosen");
+
+    let db = droppedneedle_kernel::db::open_connection(&scratch.join("app.db")).expect("db opens");
+    let credited: String = db
+        .query_row(
+            "SELECT local_artist_id FROM local_album_artists WHERE local_album_id = ?1",
+            [&album],
+            |row| row.get(0),
+        )
+        .expect("album credit");
+    let proven: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM library_artist_credit_proofs \
+             WHERE subject_kind = 'album' AND subject_id = ?1 AND artist_mbid = ?2",
+            [&album, ARTIST],
+            |row| row.get(0),
+        )
+        .expect("proofs read");
+    assert_eq!(proven, 1, "the album credit is proven");
+    let link: Option<String> = db
+        .query_row(
+            "SELECT provider_artist_id FROM local_artist_external_identities \
+             WHERE local_artist_id = ?1 AND provider = 'musicbrainz'",
+            [&credited],
+            |row| row.get(0),
+        )
+        .optional()
+        .expect("link reads");
+    assert_eq!(link.as_deref(), Some(ARTIST), "the album artist is linked");
 }
 
 /// Library roots live in the settings, so a restart comes back with the
@@ -2064,7 +2154,17 @@ async fn library_journey_scan_controls_and_activity() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["state"], json!("running"));
-    rig.identified(1).await;
+    let track = rig
+        .scan_store
+        .track_at("music", "album-a/01.flac")
+        .unwrap()
+        .expect("track indexed");
+    let album = rig
+        .scan_store
+        .album_for_track(&track)
+        .unwrap()
+        .expect("album");
+    rig.identified(&album, 1).await;
     rig.stop().await;
 }
 
@@ -2083,6 +2183,110 @@ fn control_revision(activity: &Value) -> u64 {
     identification_card(activity).map_or(1, |card| {
         card["control_revision"].as_u64().expect("control revision")
     })
+}
+
+/// A run whose stored state the server does not know answers 500, never a
+/// state it made up.
+#[tokio::test]
+async fn a_run_in_an_unknown_state_is_not_read_as_another() {
+    let app = TestApp::start("lib-unknown-state").await;
+    let auth = app.login_admin().await;
+    // The database's own check is set aside to store a state no release
+    // wrote, as a damaged or foreign file could hold it.
+    app.db()
+        .execute_batch(
+            "PRAGMA ignore_check_constraints = ON;
+             INSERT INTO library_scan_runs (id, kind, trigger, state, phase, aggregate_scope,
+                 queued_at, updated_at, terminal_at) VALUES
+                 ('strange', 'incremental', 'manual', 'resting', 'queued', 'all', 1.0, 1.0, 1.0);",
+        )
+        .expect("row stored");
+    let (status, body) = app
+        .call(
+            "GET",
+            "/api/v3/library/scan/runs/strange",
+            &[("authorization", auth.as_str())],
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    app.stop().await;
+}
+
+/// A folder added on the settings page is scanned as soon as it is saved,
+/// and the scan covers that folder only.
+#[tokio::test]
+async fn a_folder_added_in_settings_is_scanned_at_once_and_alone() {
+    let app = TestApp::start("lib-settings-folder").await;
+    let auth = app.login_admin().await;
+    let headers = [("authorization", auth.as_str())];
+    let first = app.config.root_app_dir.join("first");
+    plant(&first, "a/01.flac", "management_full.flac");
+    app.add_library_folder("first", &first).await;
+    let second = app.config.root_app_dir.join("second");
+    plant(&second, "b/01.flac", "management_full.flac");
+    let runs = || async {
+        let (status, body) = app
+            .call("GET", "/api/v3/library/scan/runs", &headers, None)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let ids = |list: &str| -> Vec<String> {
+            body[list]
+                .as_array()
+                .expect("runs")
+                .iter()
+                .map(|run| run["id"].as_str().expect("id").to_owned())
+                .collect()
+        };
+        [ids("current"), ids("history")].concat()
+    };
+    let before = runs().await;
+
+    let (status, body) = app
+        .call(
+            "POST",
+            "/api/v3/settings/library/paths",
+            &headers,
+            Some(json!({"path": second.to_string_lossy()})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let root = body["library_roots"]
+        .as_array()
+        .expect("roots")
+        .iter()
+        .find(|root| root["path"] == json!(second.to_string_lossy()))
+        .unwrap_or_else(|| panic!("the new folder is saved: {body}"))["id"]
+        .as_str()
+        .expect("root id")
+        .to_owned();
+    // The scan is asked for before the route answers.
+    let new: Vec<String> = runs()
+        .await
+        .into_iter()
+        .filter(|run| !before.contains(run))
+        .collect();
+    assert_eq!(new.len(), 1, "one scan for the new folder: {new:?}");
+    app.scan_ended(&new[0]).await;
+    let (status, body) = app
+        .call(
+            "GET",
+            &format!("/api/v3/library/scan/runs/{}", new[0]),
+            &headers,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let scopes = body["scopes"].as_array().expect("scopes");
+    assert_eq!(scopes.len(), 1, "{body}");
+    assert_eq!(scopes[0]["root_id"], json!(root), "{body}");
+    let after: Vec<String> = runs()
+        .await
+        .into_iter()
+        .filter(|run| !before.contains(run))
+        .collect();
+    assert_eq!(after, new, "no other scan followed");
+    app.stop().await;
 }
 
 /// A library test's scratch folder, the MusicBrainz answers its library
@@ -2712,7 +2916,7 @@ async fn identification_survives_restarts() {
         .expect("queue reads");
     assert_eq!(waiting, 1, "queued job survives");
     rig.resume_identification(paused_at).await;
-    rig.identified(1).await;
+    rig.identified(&album, 1).await;
     rig.choose_first_edition(&album).await;
 
     let rig = rig.restart().await;
@@ -2736,7 +2940,7 @@ async fn approve_first_candidate(library: &LibrarySetup, identify: &FakeProvider
 
 /// A person chooses `rel-1` as the album's edition.
 async fn choose_first_edition(library: &LibrarySetup, album: &str) {
-    droppedneedle_library::operations::service::Operations::new(library)
+    crate::common::library::operations(library)
         .choose_edition(album, REL_1, Some("curator"))
         .await
         .expect("edition chosen");
@@ -3452,7 +3656,7 @@ async fn library_journey_undo_automatic_edition() {
 
     // The scan-queued attempt seals the exact edition automatically.
     rig.resume_identification(paused_at).await;
-    rig.identified(1).await;
+    rig.identified(&album, 1).await;
     let sealed = rig
         .identify_store
         .album_identity(&album)
@@ -3525,7 +3729,7 @@ async fn library_journey_undo_automatic_edition() {
         .await;
     assert_eq!(status, StatusCode::OK, "{job}");
     assert_eq!(job["kind"], json!("explicit_reidentification"));
-    rig.identified(1).await;
+    rig.identified(&album, 1).await;
     let db = app.db();
     let identity: (Option<String>, String) = db
         .query_row(
@@ -3731,7 +3935,7 @@ async fn artist_duplicate_groups_list_open_and_dismiss() {
             None,
         )
         .await;
-    assert_eq!(body["state"], "idle", "{body}");
+    assert_eq!(body["automatically_resolved_count"], 0, "{body}");
     assert_eq!(body["same_name_only_count"], 0, "{body}");
     let (status, _) = app.call("GET", &path, &headers, None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
@@ -3834,7 +4038,7 @@ async fn album_cleanup_survives_a_stop_after_the_removal() {
         .album_for_track(&track)
         .unwrap()
         .expect("album");
-    let held = rig.app.config.root_app_dir.join("held/01.flac");
+    let held = rig.app.config.cache_dir.join("held/01.flac");
     std::fs::create_dir_all(held.parent().expect("held folder")).expect("held folder");
     std::fs::write(&held, b"held").expect("held file");
     rig.scan_store
@@ -3849,13 +4053,16 @@ async fn album_cleanup_survives_a_stop_after_the_removal() {
              album_title, status, created_at, updated_at) \
              VALUES ('task-old', 'fan', 'rg-gone', 'Band', 'LP', 'failed', 1767225600.0, \
              1767225600.0); \
-             INSERT INTO held_imports (user_id, release_group_mbid, held_path, reason, \
-             created_at) VALUES ('fan', 'rg-gone', '{}', 'verify_failed', 1767225600.0); \
+             INSERT INTO acquire_held_entries (id, user_id, origin, group_key, \
+             release_group_mbid, state, created_at, expires_at) VALUES (1, 'fan', 'download', \
+             'album:rg-gone', 'rg-gone', 'held', 1767225600000, 9999999999999); \
+             INSERT INTO acquire_held_files (entry_id, root, path, original_name, source, \
+             reason, state, created_at) VALUES (1, 'held', '01.flac', '01.flac', 'soulseek', \
+             'weak_match', 'held', 1767225600000); \
              INSERT INTO wanted_watches (release_group_mbid_lower, release_group_mbid, \
              user_id, artist_name, album_title, kind, state, created_at, next_check_at) \
              VALUES ('rg-gone', 'rg-gone', 'fan', 'Band', 'LP', 'missing', 'watching', \
-             1767225600000, 1767225600000);",
-            held.display()
+             1767225600000, 1767225600000);"
         ))
         .expect("acquisition rows seeded");
 
@@ -3882,7 +4089,8 @@ async fn album_cleanup_survives_a_stop_after_the_removal() {
                     .query_i64(
                         "SELECT (SELECT status = 'cancelled' FROM download_tasks \
                          WHERE id = 'task-old') \
-                         AND (SELECT COUNT(*) FROM held_imports) = 0 \
+                         AND (SELECT COUNT(*) FROM acquire_held_files \
+                              WHERE state = 'held') = 0 \
                          AND (SELECT state = 'stopped' FROM wanted_watches) \
                          AND (SELECT COUNT(*) FROM durable_jobs \
                               WHERE kind = 'library.album_removed' AND state = 'done') = 1",
@@ -5223,7 +5431,7 @@ async fn a_library_folder_reached_through_a_symlink_takes_writes() {
              VALUES ('admin', 'Admin', 'admin', '2026-01-01T00:00:00Z')",
         )
         .expect("admin row");
-    droppedneedle_library::operations::service::Operations::new(&library)
+    crate::common::library::operations(&library)
         .confirm_match(&album, "admin")
         .expect("match confirmed");
     let mut settings = lm::initial_settings("");
@@ -5369,7 +5577,7 @@ async fn library_journey_choose_edition() {
         ..RecallResult::default()
     });
     rig.resume_identification(paused_at).await;
-    rig.identified(1).await;
+    rig.identified(&album, 1).await;
     let edition = format!("/api/v3/library/albums/{album}/edition");
     let (_, body) = app.call("GET", &edition, &headers, None).await;
     assert_eq!(body["state"], json!("confirmed"), "{body}");
@@ -5443,7 +5651,7 @@ async fn library_journey_choose_edition() {
         )
         .await;
     assert_eq!(status, StatusCode::OK);
-    rig.identified(1).await;
+    rig.identified(&album, 1).await;
     let kept = rig
         .identify_store
         .album_identity(&album)
@@ -5471,7 +5679,7 @@ async fn library_journey_choose_edition() {
     assert_eq!(status, StatusCode::OK);
     let (status, body) = app.call("DELETE", &edition, &headers, None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    rig.identified(1).await;
+    rig.identified(&album, 1).await;
     let back = rig
         .identify_store
         .album_identity(&album)
@@ -5852,7 +6060,7 @@ async fn identified_album(rig: &Rig, music: &Path, folder: &str) -> (String, Rel
         ..RecallResult::default()
     });
     let control = rig.resume_identification(paused_at).await;
-    rig.identified(1).await;
+    rig.identified(&album, 1).await;
     (album, fit, control)
 }
 
@@ -5928,7 +6136,7 @@ async fn edition_status_says_what_happens_next() {
     assert_eq!(body["identifying"], json!(true), "{body}");
     assert_eq!(status().await["identifying"], json!(true));
     rig.resume_identification(paused_at).await;
-    rig.identified(1).await;
+    rig.identified(&album, 1).await;
     assert_eq!(status().await["identifying"], json!(false));
     rig.stop().await;
 }
@@ -7288,8 +7496,11 @@ async fn the_management_loop_recovers_at_start_and_wakes_on_enqueue() {
     ))
     .expect("job held by a stopped process");
 
-    droppedneedle_library::management::start(&library, &platform.supervisor)
-        .expect("management loop starts");
+    droppedneedle_library::management::start(
+        droppedneedle_library::management::service::Management::new(&library),
+        &platform.supervisor,
+    )
+    .expect("management loop starts");
     settled(interrupted).await;
 
     let woken_at = library.wakeups.revision(MANAGEMENT_WAKEUP);
@@ -7319,7 +7530,6 @@ async fn the_management_loop_recovers_at_start_and_wakes_on_enqueue() {
 async fn the_repairs_loop_recovers_at_start_and_wakes_on_enqueue() {
     use droppedneedle_library::jobs::REPAIRS_WAKEUP;
     use droppedneedle_library::repairs::models::Purpose;
-    use droppedneedle_library::repairs::service::Repairs;
 
     let scratch = Scratch {
         dir: ScratchDir::new("lib-repairs-loop"),
@@ -7340,7 +7550,7 @@ async fn the_repairs_loop_recovers_at_start_and_wakes_on_enqueue() {
         .build()
         .await;
     let library = library_with(&platform, scratch.identify.clone(), None);
-    let repairs = Repairs::new(&library);
+    let repairs = crate::common::library::services(&library).repairs;
     // A recheck of an empty library: its report is ready once it runs.
     let check = |key: &str| {
         repairs
@@ -7394,8 +7604,11 @@ async fn the_repairs_loop_recovers_at_start_and_wakes_on_enqueue() {
     ))
     .expect("job held by a stopped process");
 
-    droppedneedle_library::repairs::start(&library, &platform.supervisor)
-        .expect("repairs loop starts");
+    droppedneedle_library::repairs::start(
+        crate::common::library::repair_worker(&library),
+        &platform.supervisor,
+    )
+    .expect("repairs loop starts");
     settled(interrupted).await;
 
     let woken_at = library.wakeups.revision(REPAIRS_WAKEUP);
@@ -7538,7 +7751,7 @@ async fn library_management_preview_apply_undo() {
     let reason = page.items[0].facts.reason.clone().expect("a reason");
     assert_eq!(reason.code, "UNCONFIRMED_MATCH");
     assert!(!reason.action.is_empty());
-    droppedneedle_library::operations::service::Operations::new(&library)
+    crate::common::library::operations(&library)
         .confirm_match(&album, "admin")
         .expect("match confirmed");
 
@@ -7724,7 +7937,7 @@ async fn library_journey_identity_repair_and_preparation() {
         ..RecallResult::default()
     });
     rig.resume_identification(paused_at).await;
-    rig.identified(1).await;
+    rig.identified(&album, 1).await;
 
     // Scan diagnostics: a redacted download, never a full path.
     let (status, body) = app
@@ -8167,7 +8380,7 @@ async fn library_management_tools_journey() {
              VALUES ('admin', 'Admin', 'admin', '2026-01-01T00:00:00Z')",
         )
         .expect("admin row");
-    droppedneedle_library::operations::service::Operations::new(&library)
+    crate::common::library::operations(&library)
         .confirm_match(&album, "admin")
         .expect("match confirmed");
     // No MusicBrainz credits are scripted here, so the profile writes none.
@@ -8648,7 +8861,7 @@ async fn library_management_tools_journey() {
         .identify
         .set_recall(ambiguous_recall(&library.identify_store, &second_album));
     library.identify_tick().await;
-    droppedneedle_library::operations::service::Operations::new(&library)
+    crate::common::library::operations(&library)
         .confirm_match(&second_album, "admin")
         .expect("second match confirmed");
     let settings_now = revision();
@@ -8712,7 +8925,7 @@ async fn library_management_tools_journey() {
         }
     };
     let stop = |job_id: &str| {
-        droppedneedle_library::operations::service::Operations::new(&library)
+        crate::common::library::operations(&library)
             .control(
                 job_id,
                 droppedneedle_library::operations::models::Control::Stop,
@@ -8887,7 +9100,7 @@ async fn library_management_custom_edition_journey() {
              VALUES ('admin', 'Admin', 'admin', '2026-01-01T00:00:00Z')",
         )
         .expect("admin row");
-    droppedneedle_library::operations::service::Operations::new(&library)
+    crate::common::library::operations(&library)
         .confirm_match(&album, "admin")
         .expect("match confirmed");
     library
@@ -9075,7 +9288,7 @@ async fn library_management_artwork_journey() {
              VALUES ('admin', 'Admin', 'admin', '2026-01-01T00:00:00Z')",
         )
         .expect("admin row");
-    droppedneedle_library::operations::service::Operations::new(&library)
+    crate::common::library::operations(&library)
         .confirm_match(&album, "admin")
         .expect("match confirmed");
     let mut settings = lm::initial_settings("");
@@ -9472,7 +9685,7 @@ impl ManagedLibrary {
         recall.releases.iter_mut().for_each(&edition);
         self.scratch.identify.set_recall(recall);
         assert_eq!(self.library.identify_tick().await, 1);
-        droppedneedle_library::operations::service::Operations::new(&self.library)
+        crate::common::library::operations(&self.library)
             .confirm_match(&album, "admin")
             .expect("match confirmed");
         (album, ids)
@@ -9911,7 +10124,7 @@ async fn management_leaves_a_folder_that_keeps_its_own_tags() {
             _ if current.contains("-0000-") => current.replacen("-0000-", "-0001-", 1),
             _ => current.replacen("-0001-", "-0000-", 1),
         };
-        droppedneedle_library::operations::service::Operations::new(&managed.library)
+        crate::common::library::operations(&managed.library)
             .choose_edition(&album, &other, Some("admin"))
             .await
             .expect("edition chosen");
@@ -10195,7 +10408,7 @@ async fn unmanaged_changes_do_not_take_the_album_over() {
         )
         .expect("edition");
     let other = if chosen == REL_1 { REL_2 } else { REL_1 };
-    droppedneedle_library::operations::service::Operations::new(&managed.library)
+    crate::common::library::operations(&managed.library)
         .choose_edition(&album, other, Some("admin"))
         .await
         .expect("edition chosen");
@@ -12003,7 +12216,7 @@ async fn a_persons_profile_run_takes_the_files_back() {
         )
         .expect("edition");
     let other = if chosen == REL_1 { REL_2 } else { REL_1 };
-    droppedneedle_library::operations::service::Operations::new(&managed.library)
+    crate::common::library::operations(&managed.library)
         .choose_edition(&album, other, Some("admin"))
         .await
         .expect("edition chosen");
@@ -12066,7 +12279,7 @@ async fn an_unmanaged_change_stays_accepted_through_every_write() {
     } else {
         chosen.replacen("-0001-", "-0000-", 1)
     };
-    droppedneedle_library::operations::service::Operations::new(&managed.library)
+    crate::common::library::operations(&managed.library)
         .choose_edition(&album, &other, Some("admin"))
         .await
         .expect("edition chosen");
@@ -12777,7 +12990,7 @@ async fn a_wide_preview_in_a_manual_folder_blocks_without_marking() {
     } else {
         chosen.replacen("-0001-", "-0000-", 1)
     };
-    droppedneedle_library::operations::service::Operations::new(&managed.library)
+    crate::common::library::operations(&managed.library)
         .choose_edition(&album, &edition, Some("admin"))
         .await
         .expect("edition chosen");
@@ -12846,7 +13059,7 @@ async fn an_undone_profile_run_gives_the_hand_edit_back() {
     } else {
         chosen.replacen("-0001-", "-0000-", 1)
     };
-    droppedneedle_library::operations::service::Operations::new(&managed.library)
+    crate::common::library::operations(&managed.library)
         .choose_edition(&album, &edition, Some("admin"))
         .await
         .expect("edition chosen");
@@ -13222,7 +13435,7 @@ async fn manage_preview_waits_while_the_chosen_edition_is_placed() {
     assert_eq!(status, StatusCode::OK, "{body}");
     let album = body["album_id"].as_str().expect("album id").to_owned();
     let album_key = album.as_str();
-    rig.identified(1).await;
+    rig.identified(album_key, 1).await;
     file_edition_review(&rig.identify_store, album_key);
     let (status, body) = app
         .call(
@@ -13803,7 +14016,7 @@ fn queue_remap_row(library: &LibrarySetup, album: &str, origin: &str) {
 async fn remap_once(library: &LibrarySetup, identify: &FakeProviders, recall: RecallResult) {
     identify.set_recall(recall);
     assert!(
-        droppedneedle_library::operations::service::Operations::new(library)
+        crate::common::library::operations(library)
             .remap_next()
             .await
             .expect("remap step"),
@@ -13918,6 +14131,35 @@ async fn placing_files_never_gives_the_edition_up() {
     assert!(
         tracks.iter().all(|track| placement(&db, track).0.is_none()),
         "nothing placed while MusicBrainz is away"
+    );
+}
+
+/// A person's edition whose MusicBrainz answer does not read is kept: the
+/// remap waits for another try instead of handing the album back to
+/// automatic best fit.
+#[tokio::test]
+async fn a_pinned_edition_that_does_not_read_keeps_the_choice() {
+    let (scratch, library, album, tracks) = chosen_album_at_rest("lib-pin-unreadable").await;
+    let db = scratch_db(&scratch);
+    let chosen = choice_row(&db, &album);
+    queue_remap_row(&library, &album, "album_pin");
+    remap_once(
+        &library,
+        &scratch.identify,
+        RecallResult {
+            failure_code: Some(
+                droppedneedle_library::identify::providers::RELEASE_UNREADABLE.to_owned(),
+            ),
+            ..RecallResult::default()
+        },
+    )
+    .await;
+    assert_eq!(remap_row(&db, &album), Some(("album_pin".to_owned(), 1)));
+    assert_eq!(choice_row(&db, &album), chosen, "the person's match stays");
+    assert_eq!(match_state(&db, &album), None);
+    assert!(
+        tracks.iter().all(|track| placement(&db, track).0.is_none()),
+        "nothing placed"
     );
 }
 
@@ -14107,7 +14349,7 @@ async fn an_approved_release_is_placed_and_its_undo_survives() {
         );
     }
 
-    droppedneedle_library::operations::service::Operations::new(&library)
+    crate::common::library::operations(&library)
         .undo_edition_choice(&album, "curator")
         .expect("the approval's undo still applies");
     let undone = choice_row(&db, &album);
@@ -14191,7 +14433,7 @@ async fn a_joined_album_gets_its_files_placed_and_stays_the_users() {
     assert_eq!(chosen.0, "manual");
 
     assert!(
-        droppedneedle_library::operations::service::Operations::new(&managed.library)
+        crate::common::library::operations(&managed.library)
             .remap_next()
             .await
             .expect("remap step"),
@@ -14896,8 +15138,8 @@ fn history_kinds(history: &Value) -> Vec<String> {
 /// An album's history as the route sends it to `caller`.
 fn album_history(library: &LibrarySetup, album: &str, caller: &str) -> Value {
     use droppedneedle_library::http::history::album_history_view;
-    use droppedneedle_library::operations::service::Operations;
-    let view = album_history_view(&Operations::new(library), album, caller).expect("history reads");
+    let view = album_history_view(&crate::common::library::operations(library), album, caller)
+        .expect("history reads");
     serde_json::to_value(view).expect("history serialises")
 }
 
@@ -15093,7 +15335,7 @@ async fn a_persons_match_joins_an_album_retagged_without_its_ids() {
     assert_eq!(retired_into(&db, &album), None);
     both.releases.push(sibling);
     providers.set_recall(both);
-    droppedneedle_library::operations::service::Operations::new(&library)
+    crate::common::library::operations(&library)
         .choose_edition(&own_row, REL_1, Some("curator"))
         .await
         .expect("edition chosen");
@@ -15734,7 +15976,7 @@ async fn a_retag_that_deleted_a_file_is_left_alone_while_its_folder_stays_held()
     assert_ne!(replacement, album);
     // The match is a weak one, so a person confirms it.
     managed.identify_as(&replacement, &album).await;
-    droppedneedle_library::operations::service::Operations::new(&managed.library)
+    crate::common::library::operations(&managed.library)
         .confirm_match(&replacement, "admin")
         .expect("match confirmed");
     managed.look(&replacement).await;
@@ -16025,7 +16267,7 @@ async fn a_best_guess_confirmed_after_its_folder_is_let_go_is_left_alone() {
             .contains(&(replacement.clone(), "UNCONFIRMED_MATCH".to_owned()))
     );
 
-    droppedneedle_library::operations::service::Operations::new(&managed.library)
+    crate::common::library::operations(&managed.library)
         .confirm_match(&replacement, "admin")
         .expect("match confirmed");
     managed.worker_looks().await;
@@ -16343,6 +16585,360 @@ async fn a_deleted_copy_leaves_its_history_with_the_copy_that_stays() {
     rescan(&library).await;
     assert_eq!(holdings(&db, &copy)[1], 1);
     assert_eq!(holdings(&db, &old[1])[1], 0);
+}
+
+/// A tag reader that holds the scan's first file read until the test lets
+/// it go, then reads the file as the app does.
+struct HoldFirstRead {
+    armed: std::sync::atomic::AtomicBool,
+    reached: std::sync::Mutex<std::sync::mpsc::Sender<()>>,
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl droppedneedle_library::scan::TagReader for HoldFirstRead {
+    fn read_tags(
+        &self,
+        path: &Path,
+    ) -> Result<droppedneedle_library::scan::ScannedTags, droppedneedle_library::scan::TagReadError>
+    {
+        if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            if let Ok(reached) = self.reached.lock() {
+                let _ = reached.send(());
+            }
+            if let Ok(release) = self.release.lock() {
+                let _ = release.recv_timeout(std::time::Duration::from_secs(60));
+            }
+        }
+        droppedneedle_library::scan::TagReader::read_tags(
+            &droppedneedle_library::adapters::LoftyTagReader,
+            path,
+        )
+    }
+}
+
+/// Scan `music` once, held in its index phase: once the walk is over and
+/// the first file read waits, `during` runs, then the scan finishes. A
+/// new file is planted first so the index phase has a file to read.
+async fn scan_held_while(
+    library: &LibrarySetup,
+    music: &Path,
+    during: impl FnOnce() + Send + 'static,
+) {
+    use droppedneedle_library::scan::{
+        BlockingPool, LibraryScanCoordinator, ScanKind, ScanRequest, ScanTrigger,
+    };
+    plant(music, "zz-new/01.flac", "flac_no_tags.flac");
+    let (reached_tx, reached) = std::sync::mpsc::channel();
+    let (release, release_rx) = std::sync::mpsc::channel();
+    let coordinator = Arc::new(LibraryScanCoordinator::new(
+        library.scan_store.clone(),
+        BlockingPool::new(4),
+        Arc::new(HoldFirstRead {
+            armed: std::sync::atomic::AtomicBool::new(true),
+            reached: std::sync::Mutex::new(reached_tx),
+            release: std::sync::Mutex::new(release_rx),
+        }),
+        library.registry.clone(),
+        Arc::new(droppedneedle_kernel::clock::SystemClock),
+    ));
+    let registry = library.live_registry();
+    coordinator
+        .request_run(&ScanRequest {
+            kind: ScanKind::Incremental,
+            trigger: ScanTrigger::Manual,
+            scopes: registry.scheduled_root_scopes(),
+            requested_by_user_id: None,
+            policy_revision: registry.policy_revision().to_owned(),
+        })
+        .expect("scan requested");
+    let paths = HashMap::from([("music".to_owned(), music.to_owned())]);
+    let driver = {
+        let coordinator = coordinator.clone();
+        tokio::spawn(async move {
+            while let Some(run) = coordinator.run_once(&paths).await {
+                if run.terminal_at.is_some() {
+                    break;
+                }
+            }
+            coordinator.run_once(&paths).await;
+        })
+    };
+    tokio::task::spawn_blocking(move || {
+        reached
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the scan's first read is reached after its walk");
+        during();
+        release.send(()).expect("released");
+    })
+    .await
+    .expect("the write runs");
+    tokio::time::timeout(std::time::Duration::from_secs(60), driver)
+        .await
+        .expect("the scan finishes")
+        .expect("the scan task");
+}
+
+/// `count` untagged files in `filler/`, scanned, so the scope holds
+/// plenty of tracks the walk sees and the mass-missing guard never holds
+/// it back.
+async fn plant_filler(library: &LibrarySetup, music: &Path, count: usize) {
+    for number in 1..=count {
+        plant(
+            music,
+            &format!("filler/{number:02}.flac"),
+            "flac_no_tags.flac",
+        );
+    }
+    rescan(library).await;
+}
+
+/// An album at rest with a second copy of its second track, both mapped
+/// to the one release track, and plenty of other tracks in the folder.
+/// Returns the library, the album, the original and the copy.
+async fn album_with_a_copy(tag: &str) -> (Scratch, LibrarySetup, PathBuf, String, String, String) {
+    let (scratch, library, music, album, old) = album_at_rest(tag, 3).await;
+    let db = scratch_db(&scratch);
+    scratch
+        .identify
+        .set_recall(fitting_release(&library, &album));
+    while library.identify_tick().await > 0 {}
+    let release_track = placement(&db, &old[1]).1.expect("original mapped");
+    std::fs::copy(
+        music.join("album/02.flac"),
+        music.join("album/02 copy.flac"),
+    )
+    .expect("copied");
+    plant_filler(&library, &music, 20).await;
+    let copy = indexed_at(&library, "album/02 copy.flac");
+    db.execute(
+        "INSERT INTO local_track_external_identities (local_track_id, provider, \
+         recording_mbid, release_track_mbid, decision_source, selected_at) VALUES \
+         (?1, 'musicbrainz', 'rec-copy', ?2, 'automatic', 1) \
+         ON CONFLICT (local_track_id, provider) DO UPDATE SET \
+         release_track_mbid = excluded.release_track_mbid",
+        rusqlite::params![copy, release_track],
+    )
+    .expect("both copies mapped");
+    let original = old[1].clone();
+    (scratch, library, music, album, original, copy)
+}
+
+/// Give `track` one play, one favourite and one playlist entry.
+fn give_history(db: &rusqlite::Connection, album: &str, track: &str) {
+    db.execute_batch(&format!(
+        "INSERT INTO library_play_history (id, user_id, local_track_id, local_album_id, \
+         track_name, artist_name, played_at) VALUES \
+         ('play-{track}', 'listener', '{track}', '{album}', 'Two', 'A', '2026-01-01T00:00:00Z'); \
+         INSERT INTO library_user_favorites (user_id, item_kind, item_id, created_at) \
+         VALUES ('listener', 'track', '{track}', 1); \
+         INSERT INTO playlists (id, name, created_at, updated_at) \
+         VALUES ('list-{track}', 'List', '', ''); \
+         INSERT INTO playlist_tracks (id, playlist_id, position, track_name, artist_name, \
+         album_name, album_id, track_source_id, library_file_id, source_type, created_at) \
+         VALUES ('entry-{track}', 'list-{track}', 0, 'Two', 'A', 'B', '{album}', '{track}', \
+         '{track}', 'local', '');"
+    ))
+    .expect("history given");
+}
+
+fn track_aliases(db: &rusqlite::Connection) -> i64 {
+    db.query_row("SELECT COUNT(*) FROM local_track_aliases", [], |row| {
+        row.get(0)
+    })
+    .expect("aliases read")
+}
+
+/// A download imported while a scan sits in its index phase, into a folder
+/// the walk already passed, is never judged gone by that scan: its tracks
+/// stay listed on their own album, and the next scan keeps them.
+#[tokio::test]
+async fn an_import_during_a_scan_is_not_judged_gone() {
+    use droppedneedle_library::import::{DownloadImport, ImportOrigin, ImportSource};
+
+    let (scratch, library, music, album, _) = album_at_rest("lib-fence-import", 3).await;
+    let db = scratch_db(&scratch);
+    scratch
+        .identify
+        .set_recall(fitting_release(&library, &album));
+    while library.identify_tick().await > 0 {}
+    plant_filler(&library, &music, 20).await;
+    let release = library
+        .identify_store
+        .release(REL_1, None)
+        .unwrap()
+        .expect("release stored");
+    let files: Vec<ImportSource> = [0usize, 1]
+        .iter()
+        .map(|&track| {
+            let source = scratch
+                .to_path_buf()
+                .join(format!("incoming/task/{track}.flac"));
+            std::fs::create_dir_all(source.parent().expect("parent")).expect("mkdir");
+            std::fs::copy(fixtures_dir().join("flac_full_02.flac"), &source)
+                .expect("download planted");
+            ImportSource {
+                path: source,
+                track,
+                replaces: Vec::new(),
+            }
+        })
+        .collect();
+    let imported = Arc::new(std::sync::Mutex::new(None));
+    {
+        let (library, imported) = (library.clone(), imported.clone());
+        scan_held_while(&library.clone(), &music, move || {
+            let done = library
+                .import_download(&DownloadImport {
+                    task_id: "task".to_owned(),
+                    origin: ImportOrigin::Download,
+                    staging: None,
+                    release,
+                    files,
+                    extras: Vec::new(),
+                    actor: None,
+                })
+                .expect("imported");
+            *imported.lock().expect("lock") = Some(done);
+        })
+        .await;
+    }
+    let imported = imported.lock().expect("lock").take().expect("import ran");
+    let tracks: Vec<(String, String)> = imported
+        .paths
+        .iter()
+        .map(|path| {
+            let relative = path
+                .strip_prefix(&music)
+                .expect("under the root")
+                .to_string_lossy()
+                .into_owned();
+            db.query_row(
+                "SELECT id, availability FROM local_tracks \
+                 WHERE root_id = 'music' AND relative_path = ?1",
+                [&relative],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("imported track row")
+        })
+        .collect();
+    for (track, availability) in &tracks {
+        assert_eq!(availability, "indexed", "imported track {track} is listed");
+        assert_eq!(
+            library
+                .scan_store
+                .album_for_track(track)
+                .unwrap()
+                .as_deref(),
+            Some(imported.album_id.as_str()),
+            "imported track {track} keeps its album"
+        );
+    }
+
+    rescan(&library).await;
+    for (track, _) in &tracks {
+        assert_eq!(
+            availability_of(&db, track),
+            "indexed",
+            "{track} after the next scan"
+        );
+        assert_eq!(
+            library
+                .scan_store
+                .album_for_track(track)
+                .unwrap()
+                .as_deref(),
+            Some(imported.album_id.as_str())
+        );
+    }
+}
+
+/// A person's rename of one of two copies of a release track, applied
+/// while a scan sits in its index phase, keeps the track: it is listed at
+/// its new path, keeps its plays, favourite and playlist entry, and no
+/// alias hands it to the other copy.
+#[tokio::test]
+async fn a_rename_during_a_scan_keeps_the_tracks_history() {
+    use droppedneedle_library::publish::planner::PlanKind;
+
+    let (scratch, library, music, album, original, copy) =
+        album_with_a_copy("lib-fence-rename").await;
+    let db = scratch_db(&scratch);
+    give_history(&db, &album, &original);
+    assert_eq!(holdings(&db, &original)[..3], [1, 1, 1]);
+    {
+        let (library, album) = (library.clone(), album.clone());
+        scan_held_while(&library.clone(), &music, move || {
+            publish_one(
+                &library,
+                PlanKind::Move,
+                &album,
+                "album/02.flac",
+                Some("moved/02.flac"),
+                &[],
+            );
+        })
+        .await;
+    }
+
+    let row = old_row(&db, &original);
+    assert_eq!(
+        (row.1.as_str(), row.2.as_str()),
+        ("moved/02.flac", "indexed"),
+        "the renamed track is listed at its new path"
+    );
+    assert_eq!(
+        holdings(&db, &original)[..3],
+        [1, 1, 1],
+        "its history stays"
+    );
+    assert_eq!(holdings(&db, &copy)[..3], [0, 0, 0]);
+    assert_eq!(track_aliases(&db), 0, "nothing hands it to the copy");
+}
+
+/// A removal of one copy of a release track, stopped after its file was
+/// set aside and before its commit, stays open while a scan walks past
+/// the empty path. Put back by recovery before the scan's end, the copy
+/// is not marked missing and keeps its favourite.
+#[tokio::test]
+async fn a_removal_open_across_a_walk_is_not_judged_gone() {
+    use droppedneedle_library::mutations::Mutations;
+    use droppedneedle_library::publish::CrashPoint;
+
+    let (scratch, library, music, album, original, copy) =
+        album_with_a_copy("lib-fence-removal").await;
+    add_admin(&library);
+    let db = scratch_db(&scratch);
+    give_history(&db, &album, &copy);
+    let home = music.join("album/02 copy.flac");
+
+    library.arm_publish_crash(Some(CrashPoint::BeforeCatalogCommit));
+    let answer = Mutations::new(&library).remove_track_now(&copy, true, "admin");
+    library.arm_publish_crash(None);
+    assert!(answer.is_err(), "the removal stopped before its commit");
+    assert!(!home.exists(), "its file is set aside");
+    {
+        let library = library.clone();
+        let copy = copy.clone();
+        scan_held_while(&library.clone(), &music, move || {
+            // The copy's row changed while the removal waited, so recovery
+            // puts its file back.
+            library
+                .scan_store
+                .db()
+                .run_sql(&format!(
+                    "UPDATE local_tracks SET stat_revision = 'changed' WHERE id = '{copy}'"
+                ))
+                .expect("row changes");
+            library.publish_tick().expect("recovery runs");
+        })
+        .await;
+    }
+
+    assert!(home.exists(), "recovery put the file back");
+    assert_eq!(availability_of(&db, &copy), "indexed", "the copy is listed");
+    assert_eq!(holdings(&db, &copy)[..3], [1, 1, 1], "its history stays");
+    assert_eq!(holdings(&db, &original)[..3], [0, 0, 0]);
+    assert_eq!(track_aliases(&db), 0);
 }
 
 /// A download that brings back a track whose file was deleted maps the
@@ -17771,7 +18367,6 @@ fn stray_second(release: &Release, other: &Release) -> Vec<String> {
 async fn a_track_id_from_another_edition_is_corrected() {
     use droppedneedle_library::management::models::SelectionKind;
     use droppedneedle_library::operations::plan::EditionPlan;
-    use droppedneedle_library::operations::service::Operations;
     use droppedneedle_library::tags::TagField;
 
     let managed = ManagedLibrary::start("lib-stray-track-id", |_| {}).await;
@@ -17813,7 +18408,7 @@ async fn a_track_id_from_another_edition_is_corrected() {
         .expect("identity");
     assert_eq!(identity.release_mbid.as_deref(), Some(r.id.as_str()));
 
-    let ops = Operations::new(library);
+    let ops = crate::common::library::operations(library);
     let notes = |plan: &EditionPlan| -> Vec<(String, &'static str, Option<&'static str>)> {
         let mut notes: Vec<_> = plan
             .files
@@ -17908,6 +18503,18 @@ async fn a_track_id_from_another_edition_is_corrected() {
     assert_eq!(file.note.map(|note| note.code), Some("TRACK_ID_ELSEWHERE"));
 }
 
+/// What the migration tool leaves after committing a v2 import. The
+/// one-time re-checks run only on such a database.
+fn carried_from_v2(db: &rusqlite::Connection) {
+    db.execute(
+        "INSERT INTO import_runs (id, instance_id, exported_at, exit_code, \
+         entity_counts, applied_at) VALUES ('import-1', 'v2-instance', \
+         '2026-01-01T00:00:00Z', 'OK', '{}', '2026-01-01T00:00:01Z')",
+        [],
+    )
+    .expect("import recorded");
+}
+
 /// After an upgrade, albums the old rule may have left on the wrong
 /// edition because one file's track id named another are identified once
 /// more, by themselves: an automatic identity on another edition (A)
@@ -17917,8 +18524,6 @@ async fn a_track_id_from_another_edition_is_corrected() {
 /// are left alone. It happens once.
 #[tokio::test]
 async fn albums_an_older_matcher_misplaced_are_looked_at_once() {
-    use droppedneedle_library::repairs::service::Repairs;
-
     let (scratch, library, music) = bare_library("lib-track-id-relook").await;
     let editions: Vec<(Release, Release)> = (1..=4)
         .map(|n| sibling_editions(n, &format!("Relook {n}")))
@@ -18057,8 +18662,9 @@ async fn albums_an_older_matcher_misplaced_are_looked_at_once() {
     };
     assert!(queued().is_empty());
 
-    let repairs = Repairs::new(&library);
-    droppedneedle_library::repairs::tick(&library, &repairs, "worker").await;
+    carried_from_v2(&db);
+    let repairs = crate::common::library::repair_worker(&library);
+    droppedneedle_library::repairs::tick(&repairs, "worker").await;
     assert_eq!(queued(), vec![a.clone()]);
     assert_eq!(library.identify_tick().await, 1);
 
@@ -18095,8 +18701,8 @@ async fn albums_an_older_matcher_misplaced_are_looked_at_once() {
     assert_eq!(undo, 1, "the replaced edition can be undone");
 
     // The next start looks no more.
-    let restarted = Repairs::new(&library);
-    droppedneedle_library::repairs::tick(&library, &restarted, "worker").await;
+    let restarted = crate::common::library::repair_worker(&library);
+    droppedneedle_library::repairs::tick(&restarted, "worker").await;
     assert!(queued().is_empty());
 }
 
@@ -18109,7 +18715,6 @@ async fn albums_an_older_matcher_misplaced_are_looked_at_once() {
 #[tokio::test]
 async fn albums_matched_to_a_group_only_get_an_edition_once() {
     use droppedneedle_library::operations::status::edition_status;
-    use droppedneedle_library::repairs::service::Repairs;
 
     use droppedneedle_library::tags::TagField;
     use droppedneedle_library::tags::save::{TagEdit, save_tags};
@@ -18214,8 +18819,25 @@ async fn albums_matched_to_a_group_only_get_an_edition_once() {
     };
     assert!(queued().is_empty());
 
-    let repairs = Repairs::new(&library);
-    droppedneedle_library::repairs::tick(&library, &repairs, "worker").await;
+    // A database no v2 import was committed into has nothing to re-check.
+    droppedneedle_library::repairs::tick(
+        &crate::common::library::repair_worker(&library),
+        "worker",
+    )
+    .await;
+    assert!(queued().is_empty());
+    let marked: bool = db
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM library_operation_jobs \
+             WHERE idempotency_key = 'group-only-edition:v1:backfill')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("marker reads");
+    assert!(!marked, "nothing is marked done");
+    carried_from_v2(&db);
+    let repairs = crate::common::library::repair_worker(&library);
+    droppedneedle_library::repairs::tick(&repairs, "worker").await;
     assert_eq!(queued(), vec![a.clone()]);
     assert_eq!(library.identify_tick().await, 1);
 
@@ -18250,8 +18872,8 @@ async fn albums_matched_to_a_group_only_get_an_edition_once() {
 
     // The next start looks no more, even at a group-only match.
     group_only(&a, "embedded");
-    let restarted = Repairs::new(&library);
-    droppedneedle_library::repairs::tick(&library, &restarted, "worker").await;
+    let restarted = crate::common::library::repair_worker(&library);
+    droppedneedle_library::repairs::tick(&restarted, "worker").await;
     assert!(queued().is_empty());
 }
 
@@ -18263,7 +18885,6 @@ async fn albums_matched_to_a_group_only_get_an_edition_once() {
 /// left alone. It happens once per database.
 #[tokio::test]
 async fn albums_confirmed_before_the_newer_rules_are_checked_once() {
-    use droppedneedle_library::repairs::service::Repairs;
     use droppedneedle_library::tags::TagField;
     use droppedneedle_library::tags::save::{TagEdit, save_tags};
 
@@ -18350,8 +18971,9 @@ async fn albums_confirmed_before_the_newer_rules_are_checked_once() {
     };
     assert!(queued().is_empty());
 
-    let repairs = Repairs::new(&library);
-    droppedneedle_library::repairs::tick(&library, &repairs, "worker").await;
+    carried_from_v2(&db);
+    let repairs = crate::common::library::repair_worker(&library);
+    droppedneedle_library::repairs::tick(&repairs, "worker").await;
     assert_eq!(queued(), vec![a.clone()]);
     assert_eq!(library.identify_tick().await, 1);
 
@@ -18378,9 +19000,219 @@ async fn albums_confirmed_before_the_newer_rules_are_checked_once() {
     // The next start looks no more.
     db.execute("DELETE FROM library_album_match_state", [])
         .expect("older confirmation planted");
-    let restarted = Repairs::new(&library);
-    droppedneedle_library::repairs::tick(&library, &restarted, "worker").await;
+    let restarted = crate::common::library::repair_worker(&library);
+    droppedneedle_library::repairs::tick(&restarted, "worker").await;
     assert!(queued().is_empty());
+}
+
+/// An album the app confirmed on a vinyl edition while its files' barcode,
+/// catalog number, media and country are the CD's, and no file carries a
+/// MusicBrainz release ID (A), is identified once more after the upgrade,
+/// but only once its files' edition tags have been read, and moves to the
+/// CD. The move can be undone, and the undone album is not moved again.
+/// The same files carrying the vinyl's release ID (B) keep the vinyl: the
+/// release ID outranks the barcode.
+#[tokio::test]
+async fn an_album_moves_to_the_edition_its_barcode_names_once() {
+    use droppedneedle_library::identify::models::IdentifyKind;
+    use droppedneedle_library::matching::ReleaseMedium;
+    use droppedneedle_library::operations::decisions::{
+        live_automatic_edition_undo, undo_automatic_edition,
+    };
+    use droppedneedle_library::tags::TagField;
+    use droppedneedle_library::tags::save::{TagEdit, save_tags};
+
+    let (scratch, library, music) = bare_library("lib-edition-ids").await;
+    let (mut vinyl, mut cd) = sibling_editions(4, "Astral Weeks");
+    for (release, media, country, barcode, catalog) in [
+        (&mut vinyl, "12\" Vinyl", "GB", "5012345678900", "WS 1768"),
+        (&mut cd, "CD", "US", "075992717625", "W2 1768"),
+    ] {
+        release.media = vec![ReleaseMedium {
+            position: 1,
+            format: Some(media.to_owned()),
+            title: None,
+            track_count: 3,
+        }];
+        release.country = Some(country.to_owned());
+        release.barcode = Some(barcode.to_owned());
+        release.catalog_numbers = vec![catalog.to_owned()];
+    }
+    for (folder, release_id) in [("album-a", ""), ("album-b", vinyl.id.as_str())] {
+        for (number, track) in vinyl.tracks.iter().enumerate() {
+            let file = plant(
+                &music,
+                &format!("{folder}/{:02}.flac", number + 1),
+                "flac_full_01.flac",
+            );
+            let tag = |field, value: &str| TagEdit::verbatim(field, vec![value.to_owned()]);
+            save_tags(
+                &file,
+                &[
+                    tag(TagField::Title, &track.title),
+                    tag(TagField::Album, "Astral Weeks"),
+                    tag(TagField::Artist, "Radiohead"),
+                    tag(TagField::AlbumArtist, "Radiohead"),
+                    tag(TagField::TrackNumber, &(number + 1).to_string()),
+                    tag(TagField::MusicBrainzRecordingId, &track.recording_id),
+                    tag(TagField::MusicBrainzReleaseGroupId, &vinyl.release_group_id),
+                    TagEdit::verbatim(
+                        TagField::MusicBrainzReleaseId,
+                        [release_id]
+                            .into_iter()
+                            .filter(|id| !id.is_empty())
+                            .map(str::to_owned)
+                            .collect(),
+                    ),
+                    TagEdit::verbatim(TagField::MusicBrainzReleaseTrackId, Vec::new()),
+                    tag(TagField::Media, "CD"),
+                    tag(TagField::ReleaseCountry, "US"),
+                    tag(TagField::Barcode, "075992717625"),
+                    tag(TagField::CatalogNumber, "W2 1768"),
+                ],
+            )
+            .expect("file tagged");
+        }
+    }
+    add_music_root(&library, &music).await;
+    let album = |folder: &str| {
+        let track = library
+            .scan_store
+            .track_at("music", &format!("{folder}/01.flac"))
+            .unwrap()
+            .expect("track indexed");
+        library
+            .scan_store
+            .album_for_track(&track)
+            .unwrap()
+            .expect("album")
+    };
+    let (a, b) = (album("album-a"), album("album-b"));
+    // What an older matcher left: both confirmed on the vinyl.
+    scratch.identify.set_recall(RecallResult {
+        releases: vec![vinyl.clone()],
+        ..RecallResult::default()
+    });
+    assert_eq!(library.identify_tick().await, 2);
+    scratch.identify.set_recall(RecallResult {
+        releases: vec![vinyl.clone(), cd.clone()],
+        ..RecallResult::default()
+    });
+    let release_of = |album: &str| {
+        library
+            .identify_store
+            .album_identity(album)
+            .unwrap()
+            .and_then(|identity| identity.release_mbid)
+    };
+    assert_eq!(release_of(&a), Some(vinyl.id.clone()));
+    assert_eq!(release_of(&b), Some(vinyl.id.clone()));
+
+    let mut db = droppedneedle_kernel::db::open_connection(&scratch.to_path_buf().join("app.db"))
+        .expect("db opens");
+    let queued = |db: &rusqlite::Connection| -> Vec<String> {
+        let mut stmt = db
+            .prepare(
+                "SELECT local_album_id FROM library_identify_jobs \
+                 WHERE state = 'queued' ORDER BY local_album_id",
+            )
+            .expect("queue reads");
+        stmt.query_map([], |row| row.get(0))
+            .expect("queue reads")
+            .collect::<Result<_, _>>()
+            .expect("queue reads")
+    };
+    let marked = |db: &rusqlite::Connection| -> bool {
+        db.query_row(
+            "SELECT EXISTS (SELECT 1 FROM library_operation_jobs \
+             WHERE idempotency_key = 'edition-ids:v1:backfill')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("marker reads")
+    };
+
+    carried_from_v2(&db);
+    // A file whose edition tags the scan has not read yet holds the pass.
+    let first_track = library
+        .scan_store
+        .track_at("music", "album-a/01.flac")
+        .unwrap()
+        .expect("track indexed");
+    let unread: (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = db
+        .query_row(
+            "DELETE FROM local_track_edition_tags WHERE local_track_id = ?1 \
+             RETURNING media, barcode, catalog_number, release_country",
+            [&first_track],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("edition tags unread");
+    droppedneedle_library::repairs::tick(
+        &crate::common::library::repair_worker(&library),
+        "worker",
+    )
+    .await;
+    assert!(queued(&db).is_empty());
+    assert!(!marked(&db), "the pass waits for the edition tags");
+
+    db.execute(
+        "INSERT INTO local_track_edition_tags (local_track_id, media, barcode, \
+         catalog_number, release_country) VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![first_track, unread.0, unread.1, unread.2, unread.3],
+    )
+    .expect("edition tags read");
+    droppedneedle_library::repairs::tick(
+        &crate::common::library::repair_worker(&library),
+        "worker",
+    )
+    .await;
+    assert_eq!(queued(&db), vec![a.clone()]);
+    assert!(marked(&db));
+    assert_eq!(library.identify_tick().await, 1);
+    assert_eq!(release_of(&a), Some(cd.id.clone()));
+    assert_eq!(release_of(&b), Some(vinyl.id.clone()));
+    assert_eq!(
+        library.identify_store.match_flag(&a).unwrap(),
+        None,
+        "the move is a confirmed edition"
+    );
+
+    // An administrator undoes it; identified again, it keeps the vinyl.
+    let (album_revision, identity_revision) = live_automatic_edition_undo(&db, &a)
+        .expect("undo reads")
+        .expect("the move can be undone");
+    let tx = db.transaction().expect("transaction opens");
+    undo_automatic_edition(&tx, &a, album_revision, identity_revision, "admin", 1.0)
+        .expect("undone");
+    tx.commit().expect("undo lands");
+    assert_eq!(release_of(&a), Some(vinyl.id.clone()));
+    library
+        .identify
+        .enqueue_album(
+            "again",
+            &a,
+            IdentifyKind::Automatic,
+            "rev-again",
+            None,
+            0,
+            droppedneedle_kernel::db::Lane::Background,
+        )
+        .expect("queued");
+    assert_eq!(library.identify_tick().await, 1);
+    assert_eq!(release_of(&a), Some(vinyl.id.clone()));
+
+    // The next start looks no more.
+    droppedneedle_library::repairs::tick(
+        &crate::common::library::repair_worker(&library),
+        "worker",
+    )
+    .await;
+    assert!(queued(&db).is_empty());
 }
 
 /// An album row an earlier version left on its own "Unknown Artist" row
@@ -18397,8 +19229,6 @@ async fn albums_confirmed_before_the_newer_rules_are_checked_once() {
 async fn an_album_left_on_the_placeholder_artist_takes_its_tracks_artist() {
     use droppedneedle_library::http::history::album_history_view;
     use droppedneedle_library::operations::models::OperationError;
-    use droppedneedle_library::operations::service::Operations;
-    use droppedneedle_library::repairs::service::Repairs;
     use droppedneedle_library::tags::TagField;
     use droppedneedle_library::tags::save::{TagEdit, save_tags};
 
@@ -18469,8 +19299,8 @@ async fn an_album_left_on_the_placeholder_artist_takes_its_tracks_artist() {
         .expect("lock set");
     };
     lock(true);
-    let locked = Repairs::new(&library);
-    droppedneedle_library::repairs::tick(&library, &locked, "worker").await;
+    let locked = crate::common::library::repair_worker(&library);
+    droppedneedle_library::repairs::tick(&locked, "worker").await;
     assert_eq!(
         read("SELECT album_artist_name FROM local_albums"),
         ["Unknown Artist"],
@@ -18478,8 +19308,8 @@ async fn an_album_left_on_the_placeholder_artist_takes_its_tracks_artist() {
     );
     lock(false);
 
-    let repairs = Repairs::new(&library);
-    droppedneedle_library::repairs::tick(&library, &repairs, "worker").await;
+    let repairs = crate::common::library::repair_worker(&library);
+    droppedneedle_library::repairs::tick(&repairs, "worker").await;
     assert_eq!(
         read("SELECT album_artist_name || ' ' || album_artist_id FROM local_albums"),
         [format!("Yes {}", yes.split(' ').next().expect("artist id"))]
@@ -18507,8 +19337,8 @@ async fn an_album_left_on_the_placeholder_artist_takes_its_tracks_artist() {
     );
 
     // The next start finds nothing to do.
-    let restarted = Repairs::new(&library);
-    droppedneedle_library::repairs::tick(&library, &restarted, "worker").await;
+    let restarted = crate::common::library::repair_worker(&library);
+    droppedneedle_library::repairs::tick(&restarted, "worker").await;
     assert_eq!(
         read(
             "SELECT CAST(COUNT(*) AS TEXT) FROM library_catalog_actions \
@@ -18525,7 +19355,7 @@ async fn an_album_left_on_the_placeholder_artist_takes_its_tracks_artist() {
     );
 
     // The album's history lists the change, with Undo while it applies.
-    let ops = Operations::new(&library);
+    let ops = crate::common::library::operations(&library);
     let history = || -> Value {
         let view = album_history_view(&ops, &album, "curator").expect("history reads");
         serde_json::to_value(view).expect("history serializes")["items"].clone()
@@ -20224,7 +21054,9 @@ async fn an_artist_whose_files_carry_a_merged_id_is_linked_and_kept() {
     assert_eq!(text(rows), [format!("{artist} {CURRENT}")]);
     assert_eq!(text(&revision), before, "the rescan changes nothing");
 
-    // A run that writes MusicBrainz's ids into First's files.
+    // A run that writes MusicBrainz's ids into First's files, once any
+    // identification the rescan queued for it has ended.
+    rig.identification_idle(&album).await;
     let retag =
         |rel_path: &str| json!({"root_id": "music", "rel_path": rel_path, "managed_updates": {}});
     let (status, body) = app
@@ -20272,7 +21104,6 @@ async fn an_artist_whose_files_carry_a_merged_id_is_linked_and_kept() {
 /// link is the app's own, which a person has no other way to correct.
 #[tokio::test]
 async fn a_custom_edition_passes_over_the_apps_artist_link() {
-    use droppedneedle_library::operations::service::Operations;
     const GROUP: &str = "1c2d3e4f-5a6b-4c7d-8e9f-0a1b2c3d4e5f";
     const OTHER_GROUP: &str = "2c3d4e5f-6a7b-4c8d-9e0f-1a2b3c4d5e6f";
     const OTHER: &str = "0f6e7a1c-2b3d-4e5f-8a9b-1c2d3e4f5a6b";
@@ -20320,7 +21151,7 @@ async fn a_custom_edition_passes_over_the_apps_artist_link() {
         ))
         .expect("link set");
     };
-    let operations = Operations::new(&managed.library);
+    let operations = crate::common::library::operations(&managed.library);
 
     link("manual");
     let refused = operations
@@ -20532,7 +21363,7 @@ impl ManagedLibrary {
         }
         self.scratch.identify.set_recall(recall);
         while self.library.identify_tick().await > 0 {}
-        droppedneedle_library::operations::service::Operations::new(&self.library)
+        crate::common::library::operations(&self.library)
             .confirm_match(album, "admin")
             .expect("match confirmed");
     }
@@ -20554,10 +21385,8 @@ impl ManagedLibrary {
 /// does not hold it again.
 #[tokio::test]
 async fn files_retagged_in_place_of_an_unmanaged_album_are_left_alone() {
-    use droppedneedle_library::corrections::Corrections;
     use droppedneedle_library::corrections::models::PairReason;
     use droppedneedle_library::mutations::Mutations;
-    use droppedneedle_library::operations::service::Operations;
 
     let managed = ManagedLibrary::start("lib-hands-off-replaced", |_| {}).await;
     let (album, old) = managed.add_album("first", 2).await;
@@ -20570,7 +21399,7 @@ async fn files_retagged_in_place_of_an_unmanaged_album_are_left_alone() {
         managed.recorded(&old[0]).is_some(),
         "the app wrote the files"
     );
-    Operations::new(&managed.library)
+    crate::common::library::operations(&managed.library)
         .leave_unmanaged(&album, managed.edition_revision(&album), "admin")
         .expect("left unmanaged");
     let db = managed.db();
@@ -20603,7 +21432,7 @@ async fn files_retagged_in_place_of_an_unmanaged_album_are_left_alone() {
         1,
         "parked"
     );
-    let corrections = Corrections::new(&managed.library);
+    let corrections = crate::common::library::services(&managed.library).corrections;
     let listed = corrections.retag_pairs().expect("pairs listed");
     let pairs: Vec<_> = listed
         .pairs
@@ -20675,9 +21504,7 @@ async fn files_retagged_in_place_of_an_unmanaged_album_are_left_alone() {
 /// edition with a review on the new album, and leaves it held.
 #[tokio::test]
 async fn a_custom_edition_replaced_by_hand_is_merged_by_a_person() {
-    use droppedneedle_library::corrections::Corrections;
     use droppedneedle_library::corrections::models::{PairJoinRequest, PairReason};
-    use droppedneedle_library::operations::service::Operations;
 
     let managed = ManagedLibrary::start("lib-hands-off-custom", |_| {}).await;
     // One file: the fixture's own track number would repeat on a second.
@@ -20699,7 +21526,7 @@ async fn a_custom_edition_replaced_by_hand_is_merged_by_a_person() {
         release.release_group_id = group.to_owned();
     }
     managed.scratch.identify.set_recall(recall);
-    Operations::new(&managed.library)
+    crate::common::library::operations(&managed.library)
         .seal_custom_edition(&album, REL_1, managed.edition_revision(&album), "admin")
         .await
         .expect("custom edition sealed");
@@ -20712,7 +21539,7 @@ async fn a_custom_edition_replaced_by_hand_is_merged_by_a_person() {
         managed.mark(&replacement).as_deref(),
         Some("replaced_hands_off")
     );
-    let corrections = Corrections::new(&managed.library);
+    let corrections = crate::common::library::services(&managed.library).corrections;
     let listed = corrections.retag_pairs().expect("pairs listed");
     assert_eq!(listed.pairs.len(), 1);
     let pair = &listed.pairs[0];
@@ -20841,7 +21668,7 @@ async fn hand_match_album(rig: &Rig, folder: &str) -> HandMatchAlbum {
         ..RecallResult::default()
     });
     rig.resume_identification(paused_at).await;
-    rig.identified(1).await;
+    rig.identified(&album, 1).await;
     let auth = app.login_admin().await;
     let (status, body) = app
         .call(

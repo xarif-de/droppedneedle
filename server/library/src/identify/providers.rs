@@ -24,7 +24,7 @@
 //! 5. List every edition of the release group the files fit best (unless
 //!    step 2 listed it) and
 //!    fetch the ones that could hold the files, best agreeing with the
-//!    tags' barcode, disc count, track count and media first, at most
+//!    tags' barcode and catalog number, disc count, track count and media first, at most
 //!    [`GROUP_FETCH`]. Search alone often misses the edition that fits.
 //! 6. Resolve file recording MBIDs no candidate carries, in case
 //!    MusicBrainz merged them: every one, up to one per file.
@@ -32,9 +32,18 @@
 //!    most of the prints point at.
 //!
 //! Every MusicBrainz call is identity-critical: an outage defers the job.
+//! A release MusicBrainz answers in a form asking again will not change
+//! (refused, or a document that does not read) is dropped from the
+//! candidates and not asked for again in the same recall. The result says
+//! so through its failure code ([`RELEASES_UNREADABLE`], or
+//! [`TAGGED_RELEASE_UNREADABLE`] when the refused one is the files'
+//! tagged release). When that leaves no candidate the job defers as for
+//! an outage, and the service defers too when what is left matches
+//! nothing: a source that refuses lookups is a setup problem, never
+//! evidence that the album is unmatched.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 use super::evidence::local_album;
 use super::models::{LocalAlbumFacts, RecallResult};
@@ -119,6 +128,24 @@ pub trait IdentifyProviders: Send + Sync {
     }
 }
 
+/// The failure code of an exact recall whose release MusicBrainz answers
+/// in a form that will not change by asking again: refused, or a document
+/// that does not decode.
+pub const RELEASE_UNREADABLE: &str = "release_unreadable";
+
+/// The failure code of a recall in which MusicBrainz refused, in a form
+/// asking again will not change, a release it was asked for. With no
+/// readable candidate left the recall defers; otherwise it goes on, and
+/// an attempt that would end matching nothing defers with this code.
+pub const RELEASES_UNREADABLE: &str = "releases_unreadable";
+
+/// The failure code of a recall that went on without the release the
+/// files' tags name, because MusicBrainz refused it. Nothing can be
+/// confirmed against the files' strongest edition evidence, so whatever
+/// the recall picks stays an unconfirmed guess. It also says, as
+/// [`RELEASES_UNREADABLE`] does, that a release was refused.
+pub const TAGGED_RELEASE_UNREADABLE: &str = "TAGGED_RELEASE_UNREADABLE";
+
 /// Recall result with the criticality each call ran under.
 #[derive(Debug, Clone, Default)]
 pub struct RecallOutcome {
@@ -144,22 +171,27 @@ impl<R: ReleaseSource, F: FingerprintSource> LiveProviders<R, F> {
         }
     }
 
-    /// Recall asking MusicBrainz at `priority`.
-    fn at(&self, priority: RequestPriority) -> Recall<'_, R, F> {
+    /// Recall for `album`, asking MusicBrainz at `priority`.
+    fn at<'a>(&'a self, album: &'a str, priority: RequestPriority) -> Recall<'a, R, F> {
         Recall {
+            album,
             releases: self.releases.at(priority),
             store: &self.store,
             audio: &self.audio,
+            refused: Mutex::new(HashSet::new()),
         }
     }
 }
 
 /// One recall's view of the providers: the release source at the
-/// caller's priority.
+/// caller's priority, and the releases MusicBrainz refused so far.
 struct Recall<'a, R, F> {
+    album: &'a str,
     releases: &'a R,
     store: &'a Arc<SqliteIdentifyStore>,
     audio: &'a F,
+    /// Release ids (lowercase) MusicBrainz refused in this recall.
+    refused: Mutex<HashSet<String>>,
 }
 
 impl<R: ReleaseSource, F: FingerprintSource> Recall<'_, R, F> {
@@ -171,8 +203,9 @@ impl<R: ReleaseSource, F: FingerprintSource> Recall<'_, R, F> {
         let local = local_album(facts, &HashMap::new());
         let mut named = named.map(|group| group.trim().to_ascii_lowercase());
         let mut releases: Vec<Release> = Vec::new();
-        if let Some(tagged) = local.tagged_release()
-            && let Some(release) = self.release(&tagged).await?
+        let tagged = local.tagged_release();
+        if let Some(tagged) = tagged.as_deref()
+            && let Some(release) = self.release(tagged, None).await?
         {
             // A release MusicBrainz moved leaves a stale group tag behind.
             if let Some(group) = named.as_mut()
@@ -203,8 +236,8 @@ impl<R: ReleaseSource, F: FingerprintSource> Recall<'_, R, F> {
         }
 
         let hits = self.search(facts, local.tracks.len()).await?;
-        for id in pick_hits(&hits, local.tracks.len(), &releases) {
-            if let Some(release) = self.release(&id).await? {
+        for hit in pick_hits(&hits, local.tracks.len(), &releases) {
+            if let Some(release) = self.release(&hit.id, Some(&hit.release_group_id)).await? {
                 push_new(&mut releases, release);
             }
         }
@@ -228,17 +261,36 @@ impl<R: ReleaseSource, F: FingerprintSource> Recall<'_, R, F> {
                 if releases.iter().any(|release| release.answers_to(&id)) {
                     continue;
                 }
-                if let Some(release) = self.release(&id).await? {
+                if let Some(release) = self.release(&id, None).await? {
                     push_new(&mut releases, release);
                 }
             }
             fingerprint_support = heard.recordings;
         }
+        if releases.is_empty() && self.refused_any() {
+            tracing::info!(
+                album = self.album,
+                "MusicBrainz refused every candidate release; identification waits"
+            );
+            return Ok(RecallResult {
+                provider_deferred: true,
+                failure_code: Some(RELEASES_UNREADABLE.to_owned()),
+                ..RecallResult::default()
+            });
+        }
+        let failure_code = if tagged.is_some_and(|tagged| self.was_refused(&tagged)) {
+            Some(TAGGED_RELEASE_UNREADABLE.to_owned())
+        } else if self.refused_any() {
+            Some(RELEASES_UNREADABLE.to_owned())
+        } else {
+            None
+        };
         Ok(RecallResult {
             releases,
             fingerprint_support,
             recording_aliases,
             named_group: named,
+            failure_code,
             ..RecallResult::default()
         })
     }
@@ -369,7 +421,7 @@ impl<R: ReleaseSource, F: FingerprintSource> Recall<'_, R, F> {
     /// per group): the edition that fits the files is often not among
     /// them. Of `editions`, the group's editions as the release index
     /// lists them, those big enough to hold the files are fetched, the
-    /// ones whose barcode, disc count, track count and format agree with
+    /// ones whose barcode, catalog number, disc count, track count and format agree with
     /// the files first, at most [`GROUP_FETCH`]. Returns the group each
     /// fetched release reports, lowercase.
     async fn fetch_editions(
@@ -399,6 +451,13 @@ impl<R: ReleaseSource, F: FingerprintSource> Recall<'_, R, F> {
                     .and_then(crate::matching::EditionHints::barcode_key)
                     .is_some_and(|key| key == wanted)
             });
+            let catalog = hints.catalog_number.as_deref().is_some_and(|wanted| {
+                edition
+                    .catalogue_number
+                    .as_deref()
+                    .and_then(crate::matching::EditionHints::catalog_key)
+                    .is_some_and(|key| key == wanted)
+            });
             let discs = hints
                 .total_discs
                 .is_some_and(|total| total == edition.disc_count);
@@ -410,7 +469,8 @@ impl<R: ReleaseSource, F: FingerprintSource> Recall<'_, R, F> {
                     .any(|format| format.to_lowercase().contains(&media))
             });
             (
-                !barcode,
+                !(barcode && catalog),
+                !(barcode || catalog),
                 !discs,
                 (edition.track_count as usize).abs_diff(files),
                 !media,
@@ -419,7 +479,10 @@ impl<R: ReleaseSource, F: FingerprintSource> Recall<'_, R, F> {
         });
         let mut groups = Vec::new();
         for edition in wanted.into_iter().take(GROUP_FETCH) {
-            if let Some(release) = self.release(&edition.release_mbid).await? {
+            if let Some(release) = self
+                .release(&edition.release_mbid, Some(&edition.release_group_mbid))
+                .await?
+            {
                 groups.push(release.release_group_id.to_ascii_lowercase());
                 push_new(releases, release);
             }
@@ -428,14 +491,45 @@ impl<R: ReleaseSource, F: FingerprintSource> Recall<'_, R, F> {
     }
 
     /// Recall for an exact release: that release alone, plus the merged
-    /// recording ids its files need. No search and no fingerprints.
+    /// recording ids its files need. No search and no fingerprints. An
+    /// answer asking again will not change (one that does not decode,
+    /// say) recalls nothing, with [`RELEASE_UNREADABLE`] as its failure
+    /// code.
     async fn recall_exact(
         &self,
         facts: &LocalAlbumFacts,
         release_mbid: &str,
     ) -> Result<RecallResult, SourceError> {
         let local = local_album(facts, &HashMap::new());
-        let releases: Vec<Release> = self.release(release_mbid).await?.into_iter().collect();
+        let answer = match fresh_release(self.store, release_mbid).await {
+            Ok(Some(stored)) => ReleaseAnswer::Found(Box::new(stored)),
+            Ok(None) => self.release_answer(release_mbid).await?,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    release_mbid,
+                    "stored release document unreadable; asking MusicBrainz"
+                );
+                self.release_answer(release_mbid).await?
+            }
+        };
+        let release = match answer {
+            ReleaseAnswer::Found(release) => *release,
+            ReleaseAnswer::Missing => return Ok(RecallResult::default()),
+            ReleaseAnswer::Refused(reason) => {
+                tracing::info!(
+                    album = self.album,
+                    release_mbid,
+                    reason,
+                    "MusicBrainz refused a release document"
+                );
+                return Ok(RecallResult {
+                    failure_code: Some(RELEASE_UNREADABLE.to_owned()),
+                    ..RecallResult::default()
+                });
+            }
+        };
+        let releases = vec![release];
         let recording_aliases = self.resolve_aliases(&local, &releases).await?;
         Ok(RecallResult {
             releases,
@@ -444,11 +538,27 @@ impl<R: ReleaseSource, F: FingerprintSource> Recall<'_, R, F> {
         })
     }
 
+    /// What MusicBrainz answers for release `mbid`; an error only when it
+    /// gave no answer this time.
+    async fn release_answer(&self, mbid: &str) -> Result<ReleaseAnswer, SourceError> {
+        self.releases
+            .release_answer(mbid)
+            .await
+            .map_err(|unanswered| unanswered.error)
+    }
+
     /// A release from the store when fresh, else from the source. The
     /// caller keeps what recall fetched, on its own lane. A store that
     /// cannot be read is logged and the source asked: it answers the same
-    /// document.
-    async fn release(&self, mbid: &str) -> Result<Option<Release>, SourceError> {
+    /// document. One MusicBrainz refuses is dropped (`None`) and not asked
+    /// for again in this recall; `group` is the release group the caller
+    /// knows it by, for the log. An error only when MusicBrainz gave no
+    /// answer this time.
+    async fn release(
+        &self,
+        mbid: &str,
+        group: Option<&str>,
+    ) -> Result<Option<Release>, SourceError> {
         match fresh_release(self.store, mbid).await {
             Ok(Some(stored)) => return Ok(Some(stored)),
             Ok(None) => {}
@@ -458,7 +568,39 @@ impl<R: ReleaseSource, F: FingerprintSource> Recall<'_, R, F> {
                 "stored release document unreadable; asking MusicBrainz"
             ),
         }
-        self.releases.release(mbid).await
+        if self.was_refused(mbid) {
+            return Ok(None);
+        }
+        match self.release_answer(mbid).await? {
+            ReleaseAnswer::Found(release) => Ok(Some(*release)),
+            ReleaseAnswer::Missing => Ok(None),
+            ReleaseAnswer::Refused(reason) => {
+                tracing::info!(
+                    album = self.album,
+                    release_mbid = mbid,
+                    release_group = group,
+                    reason,
+                    "MusicBrainz refused a candidate release; recall goes on without it"
+                );
+                self.refused_ids().insert(mbid.to_ascii_lowercase());
+                Ok(None)
+            }
+        }
+    }
+
+    /// The ids refused so far; a poisoned lock still holds them.
+    fn refused_ids(&self) -> std::sync::MutexGuard<'_, HashSet<String>> {
+        self.refused
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn was_refused(&self, mbid: &str) -> bool {
+        self.refused_ids().contains(&mbid.to_ascii_lowercase())
+    }
+
+    fn refused_any(&self) -> bool {
+        !self.refused_ids().is_empty()
     }
 
     /// Map file recording MBIDs that no candidate carries to the ids
@@ -492,7 +634,7 @@ impl<R: ReleaseSource, F: FingerprintSource> IdentifyProviders for LiveProviders
         let facts = facts.clone();
         let named_group = named_group.map(str::to_owned);
         Box::pin(async move {
-            let source = self.at(priority);
+            let source = self.at(&facts.local_album_id, priority);
             let result = match source.recall(&facts, named_group.as_deref()).await {
                 Ok(result) => result,
                 Err(SourceError(error)) => {
@@ -516,7 +658,7 @@ impl<R: ReleaseSource, F: FingerprintSource> IdentifyProviders for LiveProviders
         let facts = facts.clone();
         let release_mbid = release_mbid.to_owned();
         Box::pin(async move {
-            let source = self.at(priority);
+            let source = self.at(&facts.local_album_id, priority);
             let result = match source.recall_exact(&facts, &release_mbid).await {
                 Ok(result) => result,
                 Err(SourceError(error)) => {
@@ -643,7 +785,11 @@ fn without_trailing_bracket(title: &str) -> &str {
 
 /// The hits worth a tracklist fetch: big enough to hold the files, best
 /// search score first, then the closest track count.
-fn pick_hits(hits: &[ReleaseHit], local_tracks: usize, known: &[Release]) -> Vec<String> {
+fn pick_hits<'a>(
+    hits: &'a [ReleaseHit],
+    local_tracks: usize,
+    known: &[Release],
+) -> Vec<&'a ReleaseHit> {
     let mut ranked: Vec<&ReleaseHit> = hits
         .iter()
         .filter(|hit| {
@@ -677,7 +823,7 @@ fn pick_hits(hits: &[ReleaseHit], local_tracks: usize, known: &[Release]) -> Vec
             continue;
         }
         *taken += 1;
-        picked.push(hit.id.clone());
+        picked.push(hit);
     }
     picked
 }

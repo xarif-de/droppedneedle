@@ -4,22 +4,15 @@ import type {
 	SimilarAlbumsResponse,
 	YouTubeLink,
 	YouTubeTrackLink,
-	JellyfinAlbumMatch,
 	LocalAlbumMatch,
-	NavidromeAlbumMatch,
-	PlexAlbumMatch,
 	LastFmAlbumEnrichment
 } from '$lib/types';
+import type { RemoteMatch, RemoteSource } from '$lib/queries/remotes/types';
 import { api } from '$lib/api/client';
 import { YOUTUBE_ENDPOINTS } from '$lib/queries/youtube/endpoints';
 import { CATALOG_ENDPOINTS } from '$lib/queries/catalog/endpoints';
 import { compareDiscTrack } from '$lib/player/queueHelpers';
-import {
-	fetchJellyfinAlbumMatch,
-	fetchLocalAlbumMatch,
-	fetchNavidromeAlbumMatch,
-	fetchPlexAlbumMatch
-} from '$lib/queries/albumMatch';
+import { fetchLocalAlbumMatch, fetchRemoteAlbumMatch } from '$lib/queries/albumMatch';
 
 export { fetchAlbumTracks } from '$lib/queries/catalog/albumTracks';
 
@@ -66,13 +59,6 @@ export async function fetchYouTubeTrackLinks(
 	return data ? data.sort(compareDiscTrack) : [];
 }
 
-export async function fetchJellyfinMatch(
-	albumId: string,
-	signal?: AbortSignal
-): Promise<JellyfinAlbumMatch | null> {
-	return fetchJellyfinAlbumMatch(albumId, signal);
-}
-
 export async function fetchLocalMatch(
 	albumId: string,
 	signal?: AbortSignal
@@ -80,21 +66,18 @@ export async function fetchLocalMatch(
 	return fetchLocalAlbumMatch(albumId, signal);
 }
 
-export async function fetchNavidromeMatch(
+export async function fetchRemoteMatch(
+	source: RemoteSource,
 	albumId: string,
-	_opts: { albumTitle?: string; artistName?: string },
+	opts: { albumTitle?: string; artistName?: string },
 	signal?: AbortSignal
-): Promise<NavidromeAlbumMatch | null> {
-	// v3 matches by MusicBrainz id only; the title and artist hints are unused.
-	return fetchNavidromeAlbumMatch(albumId, signal);
-}
-
-export async function fetchPlexMatch(
-	albumId: string,
-	_opts: { albumTitle?: string; artistName?: string },
-	signal?: AbortSignal
-): Promise<PlexAlbumMatch | null> {
-	return fetchPlexAlbumMatch(albumId, signal);
+): Promise<RemoteMatch | null> {
+	return fetchRemoteAlbumMatch(
+		source,
+		albumId,
+		{ title: opts.albumTitle, artist: opts.artistName },
+		signal
+	);
 }
 
 export async function fetchLastFm(

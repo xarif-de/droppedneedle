@@ -199,68 +199,111 @@ async fn geocoding_refused_request_is_a_failure_not_absence() {
 // Skiddle
 // ---------------------------------------------------------------------------
 
-/// Live shape (`sk_byartist.json`, 2026-07-06): STRING `totalcount`,
-/// `'0'` cancelled flag, empty-string absences, float venue coordinates,
-/// mixed key casing (`eventname` vs `ticketUrl`).
+/// A recorded events answer for one act: two gigs with lineups, `cancelled`
+/// as the string `'0'`, and empty strings for absent ticket URLs and
+/// reschedule dates.
 #[tokio::test]
-async fn skiddle_events_decode_live_shape() {
+async fn skiddle_events_decode_recorded_answer() {
     let (wire, providers) = scripted();
-    json_answer(
-        &wire,
-        "skiddle/events/search/",
-        json!({
-            "error": 0, "totalcount": "4", "pagecount": 4,
-            "results": [{
-                "id": "41414028", "EventCode": "FEST",
-                "eventname": "Reading Festival",
-                "cancelled": "0", "cancellationDate": "",
-                "rescheduledDate": "",
-                "link": "https://www.skiddle.com/festivals/Reading/",
-                "ticketUrl": "",
-                "date": "2026-08-27",
-                "startdate": "2026-08-27T11:00:00+00:00",
-                "venue": {"id": 8138, "name": "Little John's Farm",
-                          "town": "Reading", "region": "Berkshire",
-                          "country": "GB",
-                          "latitude": 51.456062, "longitude": -0.991697},
-                "artists": [{"artistid": "123611539", "name": "Sombr"}],
-            }],
-        }),
+    wire.answer(
+        &url("skiddle/events/search/"),
+        200,
+        &[],
+        include_str!("../fixtures/skiddle/events_for_artist.json"),
     );
 
     let events = providers
         .skiddle
-        .events_for_artist("k", "123568993", USER)
+        .events_for_artist("k", "123487626", USER)
         .await
         .unwrap();
 
-    assert_eq!(events.len(), 1);
+    assert_eq!(events.len(), 2);
     let event = &events[0];
-    assert_eq!(event.eventname, "Reading Festival");
-    assert_eq!(event.date.as_deref(), Some("2026-08-27"));
-    assert_eq!(
-        event.startdate.as_deref(),
-        Some("2026-08-27T11:00:00+00:00")
-    );
+    assert_eq!(event.id, "42612509");
+    assert_eq!(event.date.as_deref(), Some("2026-10-30"));
     assert!(!event.is_cancelled());
     assert!(!event.is_rescheduled());
     assert_eq!(event.ticket_url.as_deref(), Some(""));
-    assert!(event.link.as_deref().unwrap().starts_with("https://"));
-    let venue = event.venue.as_ref().unwrap();
-    assert_eq!(venue.name.as_deref(), Some("Little John's Farm"));
-    assert_eq!(venue.town.as_deref(), Some("Reading"));
-    assert_eq!(venue.region.as_deref(), Some("Berkshire"));
-    assert_eq!(venue.country.as_deref(), Some("GB"));
-    assert!((venue.latitude.unwrap() - 51.456062).abs() < 1e-9);
-    assert!((venue.longitude.unwrap() - -0.991697).abs() < 1e-9);
-    assert_eq!(event.artists.len(), 1);
-    assert_eq!(event.artists[0].artistid.as_deref(), Some("123611539"));
-    assert_eq!(event.artists[0].name.as_deref(), Some("Sombr"));
+    assert_eq!(
+        event.venue.as_ref().and_then(|venue| venue.town.as_deref()),
+        Some("Whitstable")
+    );
+    assert_eq!(event.artists.len(), 3);
+    assert_eq!(event.artists[0].artistid.as_deref(), Some("123487626"));
     let calls = sent_to(&wire, "skiddle/events/search/");
     assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].query("a").as_deref(), Some("123568993"));
+    assert_eq!(calls[0].query("a").as_deref(), Some("123487626"));
     assert_eq!(calls[0].query("description").as_deref(), Some("1"));
     assert_eq!(calls[0].query("api_key").as_deref(), Some("k"));
+}
+
+/// An empty results list is no match. An answer without Skiddle's error code,
+/// or a success without its results, is a payload failure, not an empty list.
+#[tokio::test]
+async fn skiddle_answers_need_their_code_and_results() {
+    let (wire, providers) = scripted();
+    wire.answer(
+        &url("skiddle/artists/"),
+        200,
+        &[],
+        include_str!("../fixtures/skiddle/artists_no_match.json"),
+    );
+    assert!(
+        providers
+            .skiddle
+            .search_artists("k", "zzqxkvwnomatch", USER)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    for body in [json!({"results": []}), json!({"error": 0})] {
+        let (wire, providers) = scripted();
+        json_answer(&wire, "skiddle/artists/", body.clone());
+        assert!(
+            matches!(
+                providers.skiddle.search_artists("k", "x", USER).await,
+                Err(ProviderError::Payload {
+                    kind: PayloadKind::Contract,
+                    ..
+                })
+            ),
+            "{body}"
+        );
+    }
+}
+
+/// A key Skiddle does not know comes back as HTTP 400 with its error
+/// envelope. The status decides the failure, so the envelope is never decoded.
+#[tokio::test]
+async fn skiddle_bad_key_is_a_bad_request() {
+    let (wire, providers) = scripted();
+    wire.answer(
+        &url("skiddle/artists/"),
+        400,
+        &[],
+        include_str!("../fixtures/skiddle/artists_bad_key.json"),
+    );
+
+    assert!(matches!(
+        providers.skiddle.search_artists("k", "Orbital", USER).await,
+        Err(ProviderError::BadRequest { status: 400, .. })
+    ));
+}
+
+/// The key check reads only the error code of a recorded answer.
+#[tokio::test]
+async fn skiddle_key_check_accepts_a_recorded_answer() {
+    let (wire, providers) = scripted();
+    wire.answer(
+        &url("skiddle/events/search/"),
+        200,
+        &[],
+        include_str!("../fixtures/skiddle/events_key_check.json"),
+    );
+
+    providers.skiddle.check_key("k", USER).await.unwrap();
 }
 
 /// Skiddle's own failure envelope arrives on HTTP 200 with `error != 0`;
@@ -319,37 +362,19 @@ async fn skiddle_429_maps_to_rate_limited() {
 // Ticketmaster
 // ---------------------------------------------------------------------------
 
-/// Live shape (`tm_events.json`, 2026-07-06): local date, sale status, venue
-/// with STRING coordinates, festival lineup with per-act MBIDs.
+/// The recorded events answer for an act with 56 upcoming events: local and
+/// absolute start, sale status, a venue with string coordinates, and the
+/// MusicBrainz id of each lineup act.
 #[tokio::test]
-async fn ticketmaster_events_decode_live_shape() {
+async fn ticketmaster_events_decode_recorded_answer() {
     let (wire, providers) = scripted();
-    json_answer(
-        &wire,
-        "ticketmaster/events.json",
-        json!({
-            "_embedded": {"events": [{
-                "name": "Reading Festival 2026 - Friday",
-                "id": "1AdjZbVGklbLnsr",
-                "url": "https://www.ticketmaster.co.uk/event/1",
-                "dates": {"start": {"localDate": "2026-08-28",
-                                   "dateTime": "2026-08-28T11:00:00Z"},
-                          "status": {"code": "onsale"}},
-                "_embedded": {
-                    "venues": [{"name": "Richfield Avenue",
-                                "city": {"name": "Reading"},
-                                "state": {"name": "Berkshire"},
-                                "country": {"countryCode": "GB"},
-                                "location": {"latitude": "51.46368200",
-                                             "longitude": "-0.97305600"}}],
-                    "attractions": [
-                        {"name": "Fontaines D.C.", "id": "K8vZ9179LP7",
-                         "externalLinks": {"musicbrainz": [
-                             {"id": "FD87ACC7-E0A0-4A45-BC2A-D2AB5C10BE68  "}]}}],
-                }},
-            ]},
-            "page": {"size": 200, "totalElements": 1, "totalPages": 1, "number": 0},
-        }),
+    wire.answer(
+        &url("ticketmaster/events.json"),
+        200,
+        &[],
+        include_str!("../fixtures/ticketmaster/events_fontaines_dc.json")
+            .as_bytes()
+            .to_vec(),
     );
 
     let events = providers
@@ -358,44 +383,43 @@ async fn ticketmaster_events_decode_live_shape() {
         .await
         .unwrap();
 
-    assert_eq!(events.len(), 1);
+    assert_eq!(events.len(), 56);
     let event = &events[0];
-    assert_eq!(event.name, "Reading Festival 2026 - Friday");
+    assert_eq!(event.id, "ZG9rmIYnyZdk1k");
+    assert_eq!(event.name, "Fontaines D.C.");
     assert_eq!(
         event.url.as_deref(),
-        Some("https://www.ticketmaster.co.uk/event/1")
+        Some(
+            "https://www.ticketmaster.it/biglietti/fontaines-dc-casalecchio-di-reno-bologna-26-10-2026/event/h5qsmyc9wmts"
+        )
     );
     let dates = event.dates.as_ref().unwrap();
     assert_eq!(
         dates.start.as_ref().unwrap().local_date.as_deref(),
-        Some("2026-08-28")
+        Some("2026-10-26")
     );
     assert_eq!(
         dates.start.as_ref().unwrap().date_time.as_deref(),
-        Some("2026-08-28T11:00:00Z")
+        Some("2026-10-26T20:00:00Z")
     );
     assert_eq!(
         dates.status.as_ref().unwrap().code.as_deref(),
-        Some("onsale")
+        Some("offsale")
     );
     let inner = event.embedded.as_ref().unwrap();
     let venue = &inner.venues[0];
-    assert_eq!(venue.name.as_deref(), Some("Richfield Avenue"));
+    assert_eq!(venue.name.as_deref(), Some("Unipol Arena"));
     assert_eq!(
         venue.city.as_ref().unwrap().name.as_deref(),
-        Some("Reading")
-    );
-    assert_eq!(
-        venue.state.as_ref().unwrap().name.as_deref(),
-        Some("Berkshire")
+        Some("Casalecchio di Reno (Bologna)")
     );
     assert_eq!(
         venue.country.as_ref().unwrap().country_code.as_deref(),
-        Some("GB")
+        Some("IT")
     );
     let location = venue.location.as_ref().unwrap();
-    assert_eq!(location.latitude.as_deref(), Some("51.46368200"));
-    assert_eq!(location.longitude.as_deref(), Some("-0.97305600"));
+    assert_eq!(location.latitude.as_deref(), Some("44.485673"));
+    assert_eq!(location.longitude.as_deref(), Some("11.248983"));
     assert_eq!(
         inner.attractions[0].musicbrainz_ids(),
         ["fd87acc7-e0a0-4a45-bc2a-d2ab5c10be68"]
@@ -468,30 +492,85 @@ async fn ticketmaster_429_carries_retry_after_hint() {
     }
 }
 
-/// Required identity: an event without an id fails the decode instead of
-/// materializing as an empty event.
+/// Zero results are empty answers, not failures: the attractions search omits
+/// `_embedded`, and the events answer has no pages.
 #[tokio::test]
-async fn ticketmaster_missing_id_fails_decode() {
+async fn ticketmaster_zero_results_are_empty_answers() {
+    let (wire, providers) = scripted();
+    wire.answer(
+        &url("ticketmaster/attractions.json"),
+        200,
+        &[],
+        include_str!("../fixtures/ticketmaster/attractions_no_results.json")
+            .as_bytes()
+            .to_vec(),
+    );
+    wire.answer(
+        &url("ticketmaster/events.json"),
+        200,
+        &[],
+        include_str!("../fixtures/ticketmaster/events_radiohead_none.json")
+            .as_bytes()
+            .to_vec(),
+    );
+
+    let acts = providers
+        .ticketmaster
+        .search_attractions("k", "zzqxvnosuchact", USER)
+        .await
+        .unwrap();
+    let events = providers
+        .ticketmaster
+        .events_for_attraction("k", "K8vZ91713wV", USER)
+        .await
+        .unwrap();
+
+    assert!(acts.is_empty());
+    assert!(events.is_empty());
+}
+
+/// A MusicBrainz link with no id is supporting evidence: it is dropped and the
+/// act still reads. Padded and cased ids are trimmed and lowercased, and blank
+/// ids are skipped. The body is made up, since no recorded answer has a link
+/// without an id.
+#[tokio::test]
+async fn ticketmaster_link_without_an_id_is_dropped_and_the_act_reads() {
     let (wire, providers) = scripted();
     json_answer(
         &wire,
         "ticketmaster/events.json",
         json!({
-            "_embedded": {"events": [{"name": "Nameless"}]},
-            "page": {"totalPages": 1, "number": 0},
+            "_embedded": {"events": [{
+                "id": "e1",
+                "_embedded": {"attractions": [{
+                    "id": "K8vZ9179LP7",
+                    "name": "Fontaines D.C.",
+                    "externalLinks": {"musicbrainz": [
+                        {"id": "FD87ACC7-E0A0-4A45-BC2A-D2AB5C10BE68  "},
+                        {"url": "https://musicbrainz.org/artist/unlinked"},
+                        {"id": null},
+                        null,
+                        {"id": "   "}
+                    ]}
+                }]}
+            }]},
+            "page": {"totalPages": 1},
         }),
     );
 
-    assert!(matches!(
-        providers
-            .ticketmaster
-            .events_for_attraction("k", "A1", USER)
-            .await,
-        Err(ProviderError::Payload {
-            kind: PayloadKind::Decode,
-            ..
-        })
-    ));
+    let events = providers
+        .ticketmaster
+        .events_for_attraction("k", "K8vZ9179LP7", USER)
+        .await
+        .unwrap();
+
+    let act = &events[0].embedded.as_ref().unwrap().attractions[0];
+    assert_eq!(act.id, "K8vZ9179LP7");
+    assert_eq!(act.name, "Fontaines D.C.");
+    assert_eq!(
+        act.musicbrainz_ids(),
+        ["fd87acc7-e0a0-4a45-bc2a-d2ab5c10be68"]
+    );
 }
 
 // ---------------------------------------------------------------------------

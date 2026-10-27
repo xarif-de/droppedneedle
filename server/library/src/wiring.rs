@@ -5,7 +5,9 @@
 //! cell, plus the HTTP state (preview seals) and the background
 //! loops. `build` binds everything over the production provider
 //! clients, or over the provider ports a test gives in [`Endpoints`].
-//! [`routes`] lists the library's routes for the app to mount.
+//! [`LibraryServices`] builds the services over it once; it is the state
+//! of the routes [`routes`] lists for the app to mount, and it starts the
+//! background loops.
 //!
 //! Store durability: roots, scan state, identification, contributions,
 //! and the publish journal live in the application database.
@@ -14,19 +16,26 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use axum::extract::FromRef;
+
 use super::adapters::LoftyTagReader;
 use super::contrib::ContribProviders;
 use super::contrib::service::ContributionService;
 use super::contrib::worker::VerificationWorker;
+use super::corrections::service::Corrections;
 use super::identify::service::{IdentifyDeps, IdentifyService};
 use super::identify::sqlite::SqliteIdentifyStore;
 use super::manage::{PreviewEntry, PublishCell};
 use super::management::enrich::EnrichmentPort;
+use super::management::service::Management;
 use super::management::settings::service::LibraryManagementService;
+use super::mutations::Mutations;
+use super::operations::service::Operations;
+use super::reconcile::service::Reconcile;
+use super::repairs::service::{RepairWorker, Repairs};
 use super::scan::coordinator::{
     LibraryScanCoordinator, ResolverSource, ScanEventPublisher, SharedResolver,
 };
-use super::scan::fs::FsCoordinator;
 use super::scan::pool::BlockingPool;
 use super::scan::roots::RootRegistry;
 use super::scan::sqlite_store::SqliteScanStore;
@@ -67,7 +76,7 @@ type ProviderFactory =
     Box<dyn FnOnce(ProviderParts) -> Arc<dyn super::identify::providers::IdentifyProviders>>;
 
 /// Every library route, grouped by who may call it.
-pub fn routes() -> droppedneedle_kernel::mount::Routes<LibrarySetup> {
+pub fn routes() -> droppedneedle_kernel::mount::Routes<LibraryServices> {
     super::http::routes::library_routes()
 }
 
@@ -100,8 +109,8 @@ pub struct LibraryPorts {
 }
 
 /// The library's write side: the publish cell, the roots it opens over
-/// (with the dirty marks and wakeups a change to them sends the scan),
-/// the root leases and the recycle bins. Built once, before the plugin
+/// (with the dirty marks and wakeups a change to them sends the scan)
+/// and the recycle bins. Built once, before the plugin
 /// host, which adds plugin files through it, and handed to
 /// [`LibrarySetup::build`], so the library and the host hold one cell.
 #[derive(Clone)]
@@ -111,14 +120,14 @@ pub struct LibraryCore {
     pub(crate) library: Live<TypedLibrary>,
     pub(crate) registry: Arc<SharedResolver>,
     pub(crate) root_dirs: RootDirs,
-    /// Root leases: scans read, publishes write.
-    pub fs: FsCoordinator,
     pub(crate) dirty: DirtyScopes,
     pub(crate) wakeups: WorkWakeups,
     pub(crate) publish: Arc<std::sync::Mutex<PublishCell>>,
     pub(crate) placement: super::manage::RootPlacement,
     pub(crate) held_bundles: super::manage::HeldBundles,
     pub(crate) bins: super::publish::bin::BinSource,
+    /// Wall time: the kernel clock.
+    pub(crate) clock: Arc<dyn droppedneedle_kernel::clock::Clock>,
 }
 
 impl LibraryCore {
@@ -130,7 +139,8 @@ impl LibraryCore {
         queue: droppedneedle_kernel::jobs::queue::JobQueue,
         download_trees: super::publish::bin::DownloadTrees,
     ) -> Result<Self, String> {
-        let settings = LibrarySettings::new(&platform.settings);
+        let settings =
+            LibrarySettings::new(&platform.settings, platform.config.timezone.as_deref());
         // The roots load before anything can scan or stream: a restart
         // comes back with exactly the roots the settings hold.
         let registry: Arc<SharedResolver> = Arc::new(SharedResolver::new(
@@ -146,19 +156,24 @@ impl LibraryCore {
             settings.library.clone(),
             download_trees,
         );
-        let publish = PublishCell::new(platform.db.clone(), bins.clone(), queue);
+        let publish = PublishCell::new(
+            platform.db.clone(),
+            bins.clone(),
+            queue,
+            platform.clock.clone(),
+        );
         Ok(Self {
             ids: platform.ids.clone(),
             library: settings.library,
             registry,
             root_dirs,
-            fs: FsCoordinator::new(),
             dirty: DirtyScopes::new(),
             wakeups: WorkWakeups::new(),
             placement: publish.placement(),
             publish: Arc::new(std::sync::Mutex::new(publish)),
             held_bundles: super::manage::HeldBundles::new(platform.db.clone()),
             bins,
+            clock: platform.clock.clone(),
         })
     }
 
@@ -211,10 +226,6 @@ pub struct LibrarySetup {
     pub scan_store: Arc<SqliteScanStore>,
     /// Scan coordinator over the wired seams.
     pub coordinator: Arc<ScanCoordinator>,
-    /// Filesystem leases shared by scan (read) and publish (write).
-    /// Every publish holds the write guard across its refresh plus
-    /// its commit so scans never interleave with managed writes.
-    pub fs: FsCoordinator,
     /// Blocking pool shared by scan and the watcher.
     pub pool: BlockingPool,
     /// Dirty scope marks (Hook B).
@@ -336,6 +347,7 @@ impl LibrarySetup {
             .unwrap_or_else(|| ContribProviders {
                 discogs: Arc::new(super::adapters::LiveDiscogsContrib::new(
                     providers.discogs.clone(),
+                    platform.clock.clone(),
                 )),
                 musicbrainz: Arc::new(super::adapters::LiveMusicBrainzContrib::new(
                     mb_client(RequestPriority::UserInitiated),
@@ -388,8 +400,9 @@ impl LibrarySetup {
         import_acoustid: droppedneedle_providers::acoustid::AcoustIdClient,
     ) -> Result<Self, String> {
         let db = &platform.db;
-        let settings = LibrarySettings::new(&platform.settings);
-        let scan_store = Arc::new(SqliteScanStore::new(db.clone()));
+        let settings =
+            LibrarySettings::new(&platform.settings, platform.config.timezone.as_deref());
+        let scan_store = Arc::new(SqliteScanStore::new(db.clone(), platform.clock.clone()));
         let LibraryPorts {
             enrichment,
             scan_completed,
@@ -397,8 +410,7 @@ impl LibrarySetup {
         } = ports;
         let registry = core.registry.clone();
         let root_dirs = core.root_dirs.clone();
-        let fs = core.fs.clone();
-        let identify_store = Arc::new(SqliteIdentifyStore::new(db.clone()));
+        let identify_store = Arc::new(SqliteIdentifyStore::new(db.clone(), platform.clock.clone()));
         let pool = BlockingPool::new(4);
         let wakeups = core.wakeups.clone();
         let coordinator = Arc::new(
@@ -407,8 +419,8 @@ impl LibrarySetup {
                 pool.clone(),
                 Arc::new(LoftyTagReader),
                 registry.clone(),
+                platform.clock.clone(),
             )
-            .with_filesystem(fs.clone())
             .with_wakeups(wakeups.clone())
             .with_events(ScanEventPublisher::new(Arc::new(move |event| {
                 tracing::debug!(
@@ -445,6 +457,7 @@ impl LibrarySetup {
             Arc::new(super::adapters::IdentifyFollowUp::new(
                 identify_store.clone(),
             )),
+            platform.clock.clone(),
         );
         let fingerprints: Arc<dyn super::identify::sources::FingerprintSource> =
             Arc::new(super::identify::sources::AcoustIdFingerprints::new(
@@ -462,7 +475,6 @@ impl LibrarySetup {
             db: db.clone(),
             scan_store,
             coordinator,
-            fs,
             pool,
             dirty: core.dirty.clone(),
             wakeups,
@@ -475,7 +487,7 @@ impl LibrarySetup {
             publish: core.publish.clone(),
             placement: core.placement.clone(),
             held_bundles: core.held_bundles.clone(),
-            leftover_files: super::manage::LeftoverFiles::new(db.clone()),
+            leftover_files: super::manage::LeftoverFiles::new(db.clone(), platform.clock.clone()),
             previews: Arc::new(std::sync::Mutex::new(HashMap::new())),
             watcher_state: Arc::new(std::sync::Mutex::new(WatcherState::new())),
             root_dirs,
@@ -548,9 +560,6 @@ impl LibrarySetup {
         let setup = self.clone();
         let recovered = tokio::task::spawn_blocking(move || {
             let registry = setup.live_registry();
-            // Startup is uncontended, so the guards cost nothing; taken
-            // first so reconcile can never race a scan.
-            let _guards = setup.publish_guards(&registry);
             let mut cell = setup
                 .publish
                 .lock()
@@ -573,7 +582,7 @@ impl LibrarySetup {
                 true
             });
             let settled = cell.cell.is_some() && !held;
-            super::import::sweep_import_leftovers(&roots, settled);
+            super::publish::import_staging::sweep_import_leftovers(&roots, settled);
             recoveries
         })
         .await;
@@ -598,6 +607,62 @@ impl LibrarySetup {
                 .collect(),
         }
     }
+}
+
+/// The library's services, built once over the setup. This is the library
+/// router's state: a handler takes the service it calls as its state.
+#[derive(Clone)]
+pub struct LibraryServices {
+    /// Roots, scans, identification and publishing, which still live on
+    /// the setup.
+    pub setup: LibrarySetup,
+    pub operations: Operations,
+    pub repairs: Repairs,
+    pub corrections: Corrections,
+    pub reconcile: Reconcile,
+    pub management: Management,
+    pub mutations: Mutations,
+    pub contrib: Arc<ContributionService>,
+}
+
+impl LibraryServices {
+    /// Build every service once over `setup`.
+    pub fn build(setup: &LibrarySetup) -> Self {
+        let operations = operations(setup);
+        Self {
+            repairs: Repairs::new(
+                setup.db.clone(),
+                operations.clone(),
+                setup.ids.clone(),
+                setup.wakeups.clone(),
+                setup.clock.clone(),
+            ),
+            corrections: Corrections::new(
+                setup.db.clone(),
+                setup.settings.clone(),
+                setup.clock.clone(),
+            ),
+            reconcile: Reconcile::new(setup.db.clone(), setup.clock.clone()),
+            management: Management::new(setup),
+            mutations: Mutations::new(setup),
+            contrib: setup.contrib.clone(),
+            operations,
+            setup: setup.clone(),
+        }
+    }
+
+    /// A repairs worker that has followed nothing up yet. The repairs loop
+    /// builds one at start and keeps it.
+    pub fn repair_worker(&self) -> RepairWorker {
+        let setup = &self.setup;
+        RepairWorker::new(
+            &self.repairs,
+            setup.identify_store.clone(),
+            setup.identify.clone(),
+            setup.coordinator.clone(),
+            setup.settings.management.clone(),
+        )
+    }
 
     /// Start the library background loops on `supervisor`. Called after
     /// startup recovery, from inside the runtime.
@@ -608,3 +673,39 @@ impl LibrarySetup {
         super::loops::start_loops(self, supervisor)
     }
 }
+
+/// The operations service over the setup's identify store and service.
+pub(crate) fn operations(setup: &LibrarySetup) -> Operations {
+    Operations::new(
+        setup.db.clone(),
+        setup.identify_store.clone(),
+        setup.identify.clone(),
+        setup.ids.clone(),
+        setup.settings.management.clone(),
+        setup.wakeups.clone(),
+        setup.clock.clone(),
+    )
+}
+
+/// Each service is a sub-state of [`LibraryServices`], so a handler takes
+/// `State<Service>` for the one it calls.
+macro_rules! substate {
+    ($($field:ident: $service:ty),* $(,)?) => {
+        $(impl FromRef<LibraryServices> for $service {
+            fn from_ref(services: &LibraryServices) -> Self {
+                services.$field.clone()
+            }
+        })*
+    };
+}
+
+substate!(
+    setup: LibrarySetup,
+    operations: Operations,
+    repairs: Repairs,
+    corrections: Corrections,
+    reconcile: Reconcile,
+    management: Management,
+    mutations: Mutations,
+    contrib: Arc<ContributionService>,
+);

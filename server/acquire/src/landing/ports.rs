@@ -80,6 +80,10 @@ pub struct ImportRequest {
     /// Name of the hidden staging folder, when it must differ from the
     /// task id (a held file imported while its task may land again).
     pub staging: Option<String>,
+    /// The client's downloads folders (real paths) a download's files are
+    /// read beneath, never through a link below them. `None` for files in
+    /// the app's own folders, read by path.
+    pub read_beneath: Option<Vec<PathBuf>>,
     /// The matched release; files are tagged from it.
     pub release: Release,
     /// The library album the files were fetched for, which they join.
@@ -127,6 +131,9 @@ pub enum ImportFailure {
     /// The library's import naming script gave no usable path for a file.
     /// The download stays for a reimport once the script is fixed.
     NamingScript(String),
+    /// The library folder the files go to is not there (the folder). The
+    /// download waits until it is back.
+    FolderMissing(String),
 }
 
 impl ImportFailure {
@@ -134,7 +141,8 @@ impl ImportFailure {
         match self {
             ImportFailure::LocalFault(detail)
             | ImportFailure::Occupied(detail)
-            | ImportFailure::NamingScript(detail) => detail,
+            | ImportFailure::NamingScript(detail)
+            | ImportFailure::FolderMissing(detail) => detail,
         }
     }
 }
@@ -210,7 +218,7 @@ pub trait LandingLibrary: Send + Sync {
     fn version_row<'a>(
         &'a self,
         track_id: &'a str,
-        planned: &'a crate::downloads::manifest::PlannedAlbum,
+        planned: &'a crate::downloads::plan::PlannedAlbum,
         release: &'a Release,
     ) -> BoxFuture<'a, Option<VersionRow>>;
 
@@ -244,6 +252,15 @@ pub trait LandingLibrary: Send + Sync {
     /// The library root folders; landed paths inside them are refused.
     fn library_dirs(&self) -> Vec<PathBuf>;
 
+    /// The library folder a plain download goes to, which downloads wait
+    /// for ([`crate::library_ready`]): the first folder not set to
+    /// Excluded nor left out whose policy is Automatic, else the first not
+    /// set to Excluded. `None` when no folder takes imports. Blocking: it
+    /// resolves the folders.
+    fn import_folder(&self) -> Option<PathBuf> {
+        None
+    }
+
     /// Publish verified files into the library.
     fn import(&self, request: ImportRequest)
     -> BoxFuture<'_, Result<ImportReceipt, ImportFailure>>;
@@ -252,4 +269,15 @@ pub trait LandingLibrary: Send + Sync {
     /// library is over. An error means the publish journal could not be
     /// read, which is not an answer.
     fn publish_settled<'a>(&'a self, task_id: &'a str) -> BoxFuture<'a, Result<bool, String>>;
+
+    /// The content hashes (lower-case hex SHA-256) of the files that writes
+    /// staged under `staging` put into the library, once every write from
+    /// that staging folder is over; `None` while one still waits for
+    /// recovery. A file whose hash is listed is in the library, so a
+    /// person's import cut off by a restart never places it twice. An error
+    /// means the publish journal could not be read.
+    fn placed_sources<'a>(
+        &'a self,
+        staging: &'a str,
+    ) -> BoxFuture<'a, Result<Option<HashSet<String>>, String>>;
 }

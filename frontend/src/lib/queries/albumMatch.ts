@@ -1,19 +1,15 @@
 import { api, ApiError } from '$lib/api/client';
 import { v3 } from '$lib/api/v3/endpoint';
-import type {
-	JellyfinAlbumMatch,
-	LocalAlbumMatch,
-	LocalTrackInfo,
-	NavidromeAlbumMatch,
-	PlexAlbumMatch
-} from '$lib/types';
-import { toJellyfinTrack, toNavidromeTrack, toPlexTrack } from './remotes/remoteAdapters';
-import { remoteApi } from './remotes/remoteApi';
+import type { LocalAlbumMatch, LocalTrackInfo } from '$lib/types';
 import type { components } from '$lib/api/v3/openapi';
+import { remoteApi } from './remotes/remoteApi';
+import type { RemoteMatchHints } from './remotes/endpoints';
+import type { RemoteMatch, RemoteSource } from './remotes/types';
 
 // "Which copy of this MusicBrainz album does each source hold": the local
-// catalog and each remote source answer through v3, adapted into the match
-// shapes the album page, album cards and artist radio read.
+// catalog and each remote source answer through v3. The local answer is
+// adapted into the match shape the album page, album cards and artist radio
+// read; a remote answer is the contract's match view.
 
 const localMatchUrl = (mbid: string) =>
 	v3('/api/v3/library/albums/match/{mbid}', { path: { mbid }, query: { limit: 500 } });
@@ -63,38 +59,12 @@ export async function fetchLocalAlbumMatch(
 	}
 }
 
-export async function fetchJellyfinAlbumMatch(
+/** A remote source's copy of the album. Jellyfin matches on the MusicBrainz id alone. */
+export function fetchRemoteAlbumMatch(
+	source: RemoteSource,
 	mbid: string,
+	hints: RemoteMatchHints,
 	signal?: AbortSignal
-): Promise<JellyfinAlbumMatch> {
-	const match = await remoteApi.match('jellyfin', mbid, signal);
-	return {
-		found: match.found,
-		jellyfin_album_id: match.remote_album_id ?? null,
-		tracks: match.tracks.map(toJellyfinTrack)
-	};
-}
-
-export async function fetchNavidromeAlbumMatch(
-	mbid: string,
-	signal?: AbortSignal
-): Promise<NavidromeAlbumMatch> {
-	const match = await remoteApi.match('navidrome', mbid, signal);
-	return {
-		found: match.found,
-		navidrome_album_id: match.remote_album_id ?? null,
-		tracks: match.tracks.map(toNavidromeTrack)
-	};
-}
-
-export async function fetchPlexAlbumMatch(
-	mbid: string,
-	signal?: AbortSignal
-): Promise<PlexAlbumMatch> {
-	const match = await remoteApi.match('plex', mbid, signal);
-	return {
-		found: match.found,
-		plex_album_id: match.remote_album_id ?? null,
-		tracks: match.tracks.map(toPlexTrack)
-	};
+): Promise<RemoteMatch> {
+	return remoteApi.match(source, mbid, source === 'jellyfin' ? {} : hints, signal);
 }

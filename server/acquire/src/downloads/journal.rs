@@ -7,15 +7,12 @@ use std::sync::Arc;
 
 use droppedneedle_kernel::db::Lane;
 
-use super::held_rows::HeldRow;
 use super::quarantine::{Blocklist, QUARANTINE_TTL_SECONDS};
 use super::queue_rows::{ActivitySummary, ListFilter, QueueTask, TaskFacts, Viewer};
 use super::source_tag::SourceTag;
 use super::sources::SourceHandle;
 use super::state::TaskStatus;
-use super::store::{
-    AttemptRow, DownloadStore, QuarantineRow, RetryAnchor, StoreError, TaskDetails, TaskRow,
-};
+use super::store::{AttemptRow, DownloadStore, QuarantineRow, RetryAnchor, StoreError, TaskRow};
 use crate::db::AcquireDb;
 use crate::flows::seams::TickSink;
 use crate::requests::settle::announce_fulfilled;
@@ -130,15 +127,6 @@ impl Journal {
     pub async fn read_retryable(&self, max_retry_count: i64) -> Result<Vec<TaskRow>, StoreError> {
         self.read("downloads.retryable", move |store| {
             store.list_retryable(max_retry_count)
-        })
-        .await
-    }
-
-    /// One task's optional detail columns.
-    pub async fn read_task_details(&self, task_id: &str) -> Result<TaskDetails, StoreError> {
-        let task_id = task_id.to_owned();
-        self.read("downloads.task_details", move |store| {
-            store.task_details(&task_id)
         })
         .await
     }
@@ -364,27 +352,5 @@ impl Journal {
             store.newest_unsettled(&viewer)
         })
         .await
-    }
-
-    /// Held files the viewer may see, optionally for one album or download.
-    pub async fn read_held(
-        &self,
-        viewer: &Viewer,
-        release_group_mbid: Option<&str>,
-        source_task_id: Option<&str>,
-    ) -> Result<Vec<HeldRow>, StoreError> {
-        let viewer = viewer.clone();
-        let album = release_group_mbid.map(str::to_owned);
-        let task = source_task_id.map(str::to_owned);
-        self.read("downloads.held", move |store| {
-            store.list_held(&viewer, album.as_deref(), task.as_deref())
-        })
-        .await
-    }
-
-    /// One held file still waiting for a decision.
-    pub async fn read_held_row(&self, id: i64) -> Result<Option<HeldRow>, StoreError> {
-        self.read("downloads.held_row", move |store| store.get_held(id))
-            .await
     }
 }

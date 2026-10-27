@@ -104,9 +104,7 @@ pub fn acquire_at(
                 library.releases.clone(),
                 platform.db.sqlx().clone(),
             )),
-            edition_plans: Arc::new(droppedneedle_library::operations::service::Operations::new(
-                library,
-            )),
+            edition_plans: Arc::new(crate::common::library::operations(library)),
             album_lookup: Arc::new(droppedneedle_acquire::target::lookup::live_albums(
                 &providers,
                 mb_source.clone(),
@@ -167,6 +165,7 @@ pub fn reads_at(
         inputs,
         None,
         ReadsPorts {
+            remotes: Arc::new(remotes_resolver(platform)),
             collections,
             catalog,
             artwork,
@@ -183,19 +182,24 @@ pub fn reads_at(
 pub struct Collections {
     pub db: CollectionsDb,
     pub stores: Stores,
+    pub catalog: LocalCatalog,
 }
 
 /// The collections over the platform's database.
 pub fn collections_at(platform: &Platform) -> Collections {
     let db = CollectionsDb::new(platform.db.clone(), platform.clock.clone());
     let stores = Stores::new(&db);
-    Collections { db, stores }
+    Collections {
+        db,
+        stores,
+        catalog: LocalCatalog::new(platform.db.clone()),
+    }
 }
 
 impl Collections {
     /// The collections state over these stores.
     pub fn wired(&self) -> CollectionsState {
-        CollectionsState::over(self.db.clone(), self.stores.clone())
+        CollectionsState::over(self.db.clone(), self.stores.clone(), self.catalog.clone())
     }
 }
 
@@ -240,4 +244,36 @@ impl BatchRequests for NoBatchRequests {
 
 fn not_running() -> ProviderFailure {
     ProviderFailure::not_built("no download system in this rig")
+}
+
+/// The connection resolver the app builds: the per-user rows in the
+/// platform's database, sealed with its key, over the admin's server
+/// settings.
+pub fn remotes_resolver(
+    platform: &Platform,
+) -> droppedneedle_media::remotes::connections::ConnectionResolver {
+    use droppedneedle_media::remotes::connections::{
+        ConfigServers, ConnectionResolver, CredentialCoder, SqliteConnectionStore,
+    };
+    ConnectionResolver::new(
+        Arc::new(SqliteConnectionStore::new(
+            platform.db.clone(),
+            platform.clock.clone(),
+        )),
+        Arc::new(CredentialCoder::new(platform.crypto.clone())),
+        Arc::new(ConfigServers::new(&platform.settings)),
+    )
+}
+
+/// The jobs bundle's media inputs for a rig with no media bundle: a fresh
+/// presence registry over the platform's event hub and the app's resolver.
+pub fn media_jobs(platform: &Platform) -> droppedneedle_media::remotes::presence_feed::MediaJobs {
+    droppedneedle_media::remotes::presence_feed::MediaJobs::new(
+        droppedneedle_media::playback::presence::PresenceRegistry::new(platform.events.clone()),
+        Arc::new(remotes_resolver(platform)),
+        platform.http.shared().clone(),
+        platform.db.sqlx().clone(),
+        platform.clock.clone(),
+        droppedneedle_media::remotes::warmup::MbidIndex::default(),
+    )
 }

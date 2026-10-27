@@ -13,9 +13,8 @@ use rusqlite::{OptionalExtension as _, params};
 
 use super::models::ManagementError;
 use super::service::Management;
-use crate::clock::{now_ms, now_unix};
+use crate::clock::LibraryClock as _;
 use crate::publish::recovery::Leftover;
-use crate::publish::snapshots::sha256_hex;
 
 /// One write that needs an administrator.
 #[derive(Debug, Clone)]
@@ -108,7 +107,7 @@ impl Management {
     /// a state this does not know all answer no. No such write answers
     /// yes. Blocking.
     pub fn download_publish_settled(&self, task_id: &str) -> Result<bool, ManagementError> {
-        let folder = format!("{}/", crate::import::staging_rel(task_id));
+        let folder = format!("{}/", crate::publish::import_staging::staging_rel(task_id));
         self.setup
             .db
             .read_blocking("management.download_publish_settled", |conn| {
@@ -167,7 +166,7 @@ impl Management {
             for row in bundles.query_map(params![ATTENTION_LIST_MAX], attention_bundle)? {
                 diagnostics.needs_attention_bundles.push(row?);
             }
-            diagnostics.retrying_bundles = retrying_bundles(conn, now_ms() as i64)?;
+            diagnostics.retrying_bundles = retrying_bundles(conn, self.setup.clock.now_ms())?;
             Ok(diagnostics)
         })
         .map(|mut diagnostics| {
@@ -250,10 +249,10 @@ impl Management {
                 .resolve_no_symlink(root, rel)
                 .map_err(|_| "could not be checked")
                 .and_then(|path| {
-                    crate::publish::paths::read_regular_file(&path).map_err(|_| "is missing")
+                    crate::publish::paths::hash_regular_file(&path).map_err(|_| "is missing")
                 });
             match found {
-                Ok(bytes) if &sha256_hex(&bytes) == staged => {}
+                Ok(hashed) if &hashed.sha256 == staged => {}
                 Ok(_) => problems.push(format!("{rel} holds different bytes")),
                 Err(problem) => problems.push(format!("{rel} {problem}")),
             }
@@ -269,7 +268,7 @@ impl Management {
             conn.execute(
                 "INSERT OR IGNORE INTO library_publish_resolutions (bundle_id, resolved_by_user_id, \
                  verified_files, resolved_at) VALUES (?1, ?2, ?3, ?4)",
-                params![bundle_id, actor, verified, now_unix()],
+                params![bundle_id, actor, verified, self.setup.clock.now_secs()],
             )?;
             Ok::<_, ManagementError>(())
         })?;

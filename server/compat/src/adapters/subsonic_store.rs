@@ -30,7 +30,7 @@ use droppedneedle_catalog::reads::library::player::{
 };
 use droppedneedle_catalog::reads::library::stores::ArtistRecord;
 use droppedneedle_kernel::runtime_config::Crypto;
-use droppedneedle_library::scan::counter_names;
+use droppedneedle_library::scan::Counter;
 use droppedneedle_library::scan::models::{ScanKind, ScanRequest, ScanTrigger};
 use droppedneedle_library::wiring::LibrarySetup;
 
@@ -638,7 +638,7 @@ impl Store for SubsonicStore {
     async fn current_id(&self, kind: IdKind, id: &str) -> Result<Option<String>, CompatError> {
         match kind {
             IdKind::Album | IdKind::Artist | IdKind::Track => {
-                Ok(self.library.player.current_id(kind_name(kind), id).await?)
+                Ok(self.library.catalog.current_id(kind_name(kind), id).await?)
             }
             _ => Ok(Some(id.to_owned())),
         }
@@ -656,7 +656,7 @@ impl Store for SubsonicStore {
                 .map(|(_, id)| id.clone())
                 .collect::<Vec<_>>();
             if !ids.is_empty() {
-                existing.insert(kind, self.library.player.existing(kind, &ids).await?);
+                existing.insert(kind, self.library.catalog.existing(kind, &ids).await?);
             }
         }
         let mut missing = Vec::new();
@@ -1027,7 +1027,7 @@ impl Store for SubsonicStore {
         let count = if scanning {
             current
                 .iter()
-                .filter_map(|run| run.counters.get(counter_names::INSPECTED))
+                .map(|run| run.counters.get(Counter::Inspected))
                 .sum()
         } else {
             tracks
@@ -1103,7 +1103,7 @@ impl Store for SubsonicStore {
             ffmpeg_available: settings.ffmpeg_available,
             max_bitrate_kbps: settings.transcode_max_bitrate_kbps,
         };
-        let decision = advanced::decide(track, client, policy);
+        let decision = advanced::negotiate(track, client, policy);
         let mut answer = decision.answer;
         answer.transcode_params = decision.grant.and_then(|grant| {
             advanced::seal(

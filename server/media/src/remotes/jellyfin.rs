@@ -14,31 +14,29 @@
 //! - Playlist membership comes from `/Playlists/{id}/Items` filtered to
 //!   `Type == "Audio"`; most-played lists sort by `PlayCount` and drop
 //!   zero-play rows client-side.
+//! - Art (verified against Jellyfin 10.10.6, 2026-10-26): a track whose
+//!   album folder holds the cover has no Primary tag of its own, only
+//!   `AlbumPrimaryImageTag`; a playlist has a Primary image drawn from its
+//!   members; `/Items/{id}/Images/Primary` for an item without one is 404.
 //!
 //! Payloads decode into the typed shapes in [`super::jellyfin_models`]; a
 //! payload missing an item id is an upstream error, not an empty item.
 
-use std::collections::HashMap;
-use std::time::Duration;
-
 use serde::de::DeserializeOwned;
 
 use super::adapter::{
-    AdapterError, AlbumBrowse, ArtistBrowse, RemotePage, TrackBrowse, checked_url, read_api_body,
-    read_image, request_id,
+    AdapterError, AlbumBrowse, ArtistBrowse, RemoteHttp, RemotePage, TrackBrowse, request_id,
 };
 use super::jellyfin_models::{
-    AuthenticationResult, Item, ItemPage, Lyrics, NamedPage, PlaybackReport, QueryFilters,
-    SearchHints, Session, SystemInfo,
+    AuthenticatedUser, AuthenticationResult, Item, ItemPage, Lyrics, NamedPage, PlaybackReport,
+    QueryFilters, SearchHints, Session, SystemInfo,
 };
 use super::models::{
     AlbumView, ArtistIndexEntry, ArtistView, FavoritesView, FilterFacetsView, HistoryPage, HubView,
-    InfoView, LyricLine, LyricsView, MatchView, PlaylistDetail, PlaylistSummary, SearchResults,
-    SessionView, SessionsView, SourceName, StatsView, TrackView,
+    InfoView, LyricLine, LyricsView, PlaylistDetail, PlaylistSummary, SearchResults, SessionView,
+    SessionsView, SourceName, StatsView, TrackView,
 };
-
-/// Request timeout per upstream call, matching the v2 repository.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+use super::warmup::{INDEX_MAX_PAGES, IndexedAlbum, indexed};
 
 /// MBID index scan batch size, matching the v2 repository.
 const MBID_BATCH: i64 = 500;
@@ -49,7 +47,7 @@ const TICKS_PER_MS: i64 = 10_000;
 /// Jellyfin browse client. Built per request from the caller's resolved
 /// connection; holds no cache.
 pub struct JellyfinAdapter {
-    client: reqwest::Client,
+    http: RemoteHttp,
     base_url: String,
     api_key: String,
     user_id: String,
@@ -108,14 +106,31 @@ fn params(pairs: &[(&str, &str)]) -> Params {
 impl JellyfinAdapter {
     /// Build a client for one server. Empty base URL or key reads as
     /// unconfigured and every call fails with [`AdapterError::NotConfigured`].
+    /// Kept for the adapter tests; the app builds clients through
+    /// [`ConnectionResolver::client`](super::connections::ConnectionResolver::client).
     pub fn new(
         client: reqwest::Client,
         base_url: String,
         api_key: String,
         user_id: String,
     ) -> Self {
+        Self::over(
+            RemoteHttp::new(client, SourceName::Jellyfin, None),
+            base_url,
+            api_key,
+            user_id,
+        )
+    }
+
+    /// The same, over a configured HTTP layer.
+    pub(crate) fn over(
+        http: RemoteHttp,
+        base_url: String,
+        api_key: String,
+        user_id: String,
+    ) -> Self {
         Self {
-            client,
+            http,
             base_url: base_url.trim_end_matches('/').to_owned(),
             api_key,
             user_id,
@@ -140,13 +155,27 @@ impl JellyfinAdapter {
         ))
     }
 
-    /// Full MBID-to-item index over the album catalog, 500 rows per page.
-    /// `match_album` prefers the cheap search fallback and only scans when
-    /// search misses.
-    pub async fn mbid_index(&self) -> Result<HashMap<String, String>, AdapterError> {
-        let mut index = HashMap::new();
+    /// The server's users as `(id, name)`, for the admin's user picker.
+    pub async fn users(&self) -> Result<Vec<(String, String)>, AdapterError> {
+        let users: Option<Vec<AuthenticatedUser>> = self.get("/Users", &[]).await?;
+        Ok(users
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|user| !user.id.is_empty())
+            .map(|user| (user.id, user.name.unwrap_or_default()))
+            .collect())
+    }
+
+    /// Every album that carries a release-group or release id, 500 rows per
+    /// page, at most `cap` entries. Jellyfin has no folder scope here: the
+    /// caller's account is checked by reading the album with it.
+    pub async fn album_index(&self, cap: usize) -> Result<Vec<IndexedAlbum>, AdapterError> {
+        let mut index = Vec::new();
         let mut offset: i64 = 0;
-        loop {
+        for _ in 0..INDEX_MAX_PAGES {
+            if index.len() >= cap {
+                break;
+            }
             let mut query = params(&[
                 ("includeItemTypes", "MusicAlbum"),
                 ("recursive", "true"),
@@ -159,8 +188,11 @@ impl JellyfinAdapter {
             }
             for item in &page.items {
                 for key in ["MusicBrainzReleaseGroup", "MusicBrainzAlbum"] {
-                    if let Some(mbid) = item.provider(key) {
-                        index.insert(mbid, item.id.clone());
+                    if let Some(entry) = item
+                        .provider(key)
+                        .and_then(|mbid| indexed(&mbid, &item.id, None))
+                    {
+                        index.push(entry);
                     }
                 }
             }
@@ -169,6 +201,7 @@ impl JellyfinAdapter {
                 break;
             }
         }
+        index.truncate(cap);
         Ok(index)
     }
 
@@ -631,30 +664,15 @@ impl JellyfinAdapter {
         let header = format!(
             "MediaBrowser Client=\"DroppedNeedle\", Device=\"DroppedNeedle\", DeviceId=\"{device_id}\", Version=\"1.4.0\""
         );
-        let response = client
-            .post(format!("{base_url}/Users/AuthenticateByName"))
+        let endpoint = "/Users/AuthenticateByName";
+        let http = RemoteHttp::new(client.clone(), SourceName::Jellyfin, None);
+        let request = client
+            .post(RemoteHttp::url(base_url, endpoint)?)
             .header("Accept", "application/json")
             .header("Content-Type", "application/json")
             .header("Authorization", header)
-            .body(serde_json::json!({ "Username": username, "Pw": password }).to_string())
-            .timeout(REQUEST_TIMEOUT)
-            .send()
-            .await
-            .map_err(|cause| AdapterError::Transport(trim_cause(cause)))?;
-        if response.status() == reqwest::StatusCode::UNAUTHORIZED
-            || response.status() == reqwest::StatusCode::FORBIDDEN
-        {
-            return Err(AdapterError::Auth);
-        }
-        if !response.status().is_success() {
-            return Err(AdapterError::Api(format!(
-                "POST /Users/AuthenticateByName failed ({})",
-                response.status()
-            )));
-        }
-        let bytes =
-            read_api_body(SourceName::Jellyfin, "/Users/AuthenticateByName", response).await?;
-        let result: AuthenticationResult = decode("/Users/AuthenticateByName", &bytes)?;
+            .body(serde_json::json!({ "Username": username, "Pw": password }).to_string());
+        let result: AuthenticationResult = http.send(endpoint, request).await?.json().await?;
         if result.user.id.is_empty() || result.access_token.is_empty() {
             return Err(AdapterError::Api(
                 "Jellyfin returned incomplete auth data".to_owned(),
@@ -925,7 +943,7 @@ impl JellyfinAdapter {
         let id = request_id(id)?;
         let size = size.to_string();
         let query = params(&[("maxWidth", &size), ("maxHeight", &size), ("quality", "90")]);
-        self.get_bytes(&format!("/Items/{id}/Images/Primary"), &query, "image/jpeg")
+        self.image(&format!("/Items/{id}/Images/Primary"), &query, "image/jpeg")
             .await
     }
 
@@ -942,13 +960,19 @@ impl JellyfinAdapter {
         let invalid = || AdapterError::Unsupported("Invalid Jellyfin audio id".to_owned());
         let id = request_id(id).map_err(|_| invalid())?;
         let url =
-            checked_url(&self.base_url, &format!("/Audio/{id}/stream")).ok_or_else(invalid)?;
-        self.client
+            RemoteHttp::url(&self.base_url, &format!("/Audio/{id}/stream")).map_err(|error| {
+                match error {
+                    AdapterError::NotFound => invalid(),
+                    other => other,
+                }
+            })?;
+        self.http
+            .client()
             .get(url)
             .header("Authorization", self.auth_header())
             .query(&query)
             .build()
-            .map_err(|cause| AdapterError::Transport(trim_cause(cause)))
+            .map_err(super::adapter::transport)
     }
 
     /// Session report to `/Sessions/Playing`, `/Sessions/Playing/Progress`,
@@ -974,25 +998,20 @@ impl JellyfinAdapter {
         self.post_json(endpoint, body).await
     }
 
-    /// Playlist cover: the first Audio member's primary image, matching the
-    /// v2 playlist-image route which proxies a member item's image.
+    /// Playlist cover: the playlist's own primary image, which Jellyfin
+    /// draws from its members' art. A member track usually has no image of
+    /// its own, only its album's.
     pub async fn playlist_cover_bytes(
         &self,
         id: &str,
         size: i64,
     ) -> Result<(Vec<u8>, String), AdapterError> {
-        let detail = self
-            .playlist_detail(id)
-            .await?
-            .ok_or(AdapterError::NotFound)?;
-        let first = detail.tracks.first().ok_or(AdapterError::NotFound)?;
-        self.image_bytes(&first.id, size).await
+        self.image_bytes(id, size).await
     }
 
-    /// Resolve an MBID via the cheap `/Search/Hints` fallback first
-    /// (comparing `MusicBrainzReleaseGroup`/`MusicBrainzAlbum`), then the
-    /// full paged index scan when search misses.
-    pub async fn match_album(&self, mbid: &str) -> Result<MatchView, AdapterError> {
+    /// The first `/Search/Hints` album carrying `mbid` as its
+    /// `MusicBrainzReleaseGroup` or `MusicBrainzAlbum` id.
+    pub async fn mbid_search(&self, mbid: &str) -> Result<Option<String>, AdapterError> {
         self.require_configured()?;
         let query = params(&[
             ("searchTerm", mbid),
@@ -1001,29 +1020,13 @@ impl JellyfinAdapter {
             ("Fields", "ProviderIds"),
         ]);
         let hints = self.hints(&query).await?;
-        let hit = hints.iter().find(|hint| {
-            hint.provider("MusicBrainzReleaseGroup").as_deref() == Some(mbid)
-                || hint.provider("MusicBrainzAlbum").as_deref() == Some(mbid)
-        });
-        let album_id = match hit {
-            Some(hint) => Some(hint.id.clone()),
-            None => self.mbid_index().await?.get(mbid).cloned(),
-        };
-        let Some(album_id) = album_id else {
-            return Ok(MatchView {
-                source: SourceName::Jellyfin,
-                found: false,
-                remote_album_id: None,
-                tracks: Vec::new(),
-            });
-        };
-        let tracks = self.album_tracks(&album_id).await?;
-        Ok(MatchView {
-            source: SourceName::Jellyfin,
-            found: true,
-            remote_album_id: Some(album_id),
-            tracks,
-        })
+        Ok(hints
+            .iter()
+            .find(|hint| {
+                hint.provider("MusicBrainzReleaseGroup").as_deref() == Some(mbid)
+                    || hint.provider("MusicBrainzAlbum").as_deref() == Some(mbid)
+            })
+            .map(|hint| hint.id.clone()))
     }
 
     fn require_configured(&self) -> Result<(), AdapterError> {
@@ -1075,33 +1078,23 @@ impl JellyfinAdapter {
         if !self.user_id.is_empty() && !query.iter().any(|(key, _)| key == "userId") {
             query.push(("userId".to_owned(), self.user_id.clone()));
         }
-        let response = self
-            .client
-            .get(checked_url(&self.base_url, endpoint).ok_or(AdapterError::NotFound)?)
+        let request = self
+            .http
+            .client()
+            .get(RemoteHttp::url(&self.base_url, endpoint)?)
             .header("Accept", "application/json")
             .header("Authorization", self.auth_header())
-            .query(&query)
-            .timeout(REQUEST_TIMEOUT)
-            .send()
-            .await
-            .map_err(|cause| AdapterError::Transport(trim_cause(cause)))?;
-        let status = response.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            return Err(AdapterError::Auth);
-        }
+            .query(&query);
+        let answer = self.http.send(endpoint, request).await?;
+        let status = answer.status();
         if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::NO_CONTENT {
             return Ok(None);
         }
-        if !status.is_success() {
-            return Err(AdapterError::Api(format!(
-                "GET {endpoint} failed ({status})"
-            )));
-        }
-        let bytes = read_api_body(SourceName::Jellyfin, endpoint, response).await?;
+        let bytes = answer.body().await?;
         if bytes.is_empty() {
             return Ok(None);
         }
-        decode(endpoint, &bytes).map(Some)
+        super::adapter::decode(SourceName::Jellyfin, endpoint, &bytes).map(Some)
     }
 
     /// POST a JSON body, discarding the response. Used only for session
@@ -1110,32 +1103,20 @@ impl JellyfinAdapter {
         if !self.is_configured() {
             return Err(AdapterError::NotConfigured);
         }
-        let response = self
-            .client
-            .post(format!("{}{endpoint}", self.base_url))
+        let request = self
+            .http
+            .client()
+            .post(RemoteHttp::url(&self.base_url, endpoint)?)
             .header("Content-Type", "application/json")
             .header("Authorization", self.auth_header())
-            .body(body)
-            .timeout(REQUEST_TIMEOUT)
-            .send()
-            .await
-            .map_err(|cause| AdapterError::Transport(trim_cause(cause)))?;
-        let status = response.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            return Err(AdapterError::Auth);
-        }
-        if !status.is_success() {
-            return Err(AdapterError::Api(format!(
-                "POST {endpoint} failed ({status})"
-            )));
-        }
-        Ok(())
+            .body(body);
+        self.http.send(endpoint, request).await?.done()
     }
 
     /// GET image bytes, read under the image size cap. Any non-200 is an
     /// API error; a missing content type falls back to
     /// `fallback_content_type`.
-    async fn get_bytes(
+    async fn image(
         &self,
         endpoint: &str,
         query: &[(String, String)],
@@ -1144,47 +1125,22 @@ impl JellyfinAdapter {
         if !self.is_configured() {
             return Err(AdapterError::NotConfigured);
         }
-        let response = self
-            .client
-            .get(checked_url(&self.base_url, endpoint).ok_or(AdapterError::NotFound)?)
+        let request = self
+            .http
+            .client()
+            .get(RemoteHttp::url(&self.base_url, endpoint)?)
             .header("Authorization", self.auth_header())
-            .query(query)
-            .timeout(REQUEST_TIMEOUT)
-            .send()
+            .query(query);
+        self.http
+            .send(endpoint, request)
+            .await?
+            .image(fallback_content_type)
             .await
-            .map_err(|cause| AdapterError::Transport(trim_cause(cause)))?;
-        let status = response.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            return Err(AdapterError::Auth);
-        }
-        if !status.is_success() {
-            return Err(AdapterError::Api(format!(
-                "GET {endpoint} failed ({status})"
-            )));
-        }
-        let content_type = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or(fallback_content_type)
-            .to_owned();
-        let bytes = read_image(SourceName::Jellyfin, endpoint, response).await?;
-        Ok((bytes, content_type))
     }
 
     fn auth_header(&self) -> String {
         format!("MediaBrowser Token=\"{}\"", self.api_key)
     }
-}
-
-/// Decode one payload. A shape we cannot read (a missing id included) is
-/// an upstream contract error; the detail stays in the log.
-fn decode<T: DeserializeOwned>(endpoint: &str, bytes: &[u8]) -> Result<T, AdapterError> {
-    serde_json::from_slice(bytes).map_err(|error| {
-        AdapterError::Api(format!(
-            "Jellyfin returned an unreadable {endpoint} payload: {error}"
-        ))
-    })
 }
 
 fn page_of<T>(page: ItemPage, map: impl Fn(&Item) -> T) -> RemotePage<T> {
@@ -1235,9 +1191,18 @@ fn artist_view(item: &Item) -> ArtistView {
 }
 
 fn track_view(item: &Item) -> TrackView {
+    let album_art = item
+        .album_id
+        .as_deref()
+        .zip(item.album_primary_image_tag.as_deref())
+        .filter(|_| item.primary_tag().is_none());
+    let image_url = match album_art {
+        Some((album_id, tag)) => image_url_for(album_id, Some(tag)),
+        None => image_url_for(&item.id, item.primary_tag()),
+    };
     TrackView {
         source: SourceName::Jellyfin,
-        image_url: image_url_for(&item.id, item.primary_tag()),
+        image_url,
         id: item.id.clone(),
         title: item.name.clone().unwrap_or_else(|| "Unknown".to_owned()),
         album_name: item.album.clone().unwrap_or_default(),
@@ -1262,10 +1227,9 @@ fn track_view(item: &Item) -> TrackView {
 fn playlist_summary(item: &Item) -> PlaylistSummary {
     PlaylistSummary {
         source: SourceName::Jellyfin,
-        image_url: Some(format!(
-            "/api/v3/remotes/jellyfin/covers/playlists/{}",
-            item.id
-        )),
+        image_url: request_id(&item.id)
+            .ok()
+            .map(|id| format!("/api/v3/remotes/jellyfin/covers/playlists/{id}")),
         id: item.id.clone(),
         name: item.name.clone().unwrap_or_default(),
         track_count: item.child_count.unwrap_or(0),
@@ -1314,12 +1278,14 @@ fn genre_segment(name: &str) -> Option<String> {
     (!segment.is_empty() && !segment.contains('/')).then(|| segment.to_owned())
 }
 
+/// The image address the browser asks for. Only an id the image route
+/// would accept gets one, so a server's id cannot steer the browser to
+/// another path of the app. A tag of any other shape is left off: it only
+/// keys the browser's cache.
 fn image_url_for(id: &str, tag: Option<&str>) -> Option<String> {
-    if id.is_empty() {
-        return None;
-    }
+    let id = request_id(id).ok()?;
     let mut url = format!("/api/v3/remotes/jellyfin/images/{id}");
-    if let Some(tag) = tag {
+    if let Some(tag) = tag.and_then(|tag| request_id(tag).ok()) {
         url.push_str("?tag=");
         url.push_str(tag);
     }
@@ -1347,8 +1313,22 @@ fn bucket_index(mut artists: Vec<ArtistView>) -> Vec<ArtistIndexEntry> {
     buckets
 }
 
-/// Transport cause for logs and errors. The URL is stripped first: it can
-/// carry credentials (Subsonic `u`/`t`/`s`, Plex and Jellyfin tokens).
-fn trim_cause(cause: reqwest::Error) -> String {
-    cause.without_url().to_string().chars().take(200).collect()
+#[cfg(test)]
+mod tests {
+    use super::image_url_for;
+
+    #[test]
+    fn image_addresses_need_a_plain_id_and_tag() {
+        for hostile in ["../../settings", "al-1?size=1", "al-1/../x", ""] {
+            assert_eq!(image_url_for(hostile, None), None, "{hostile:?}");
+        }
+        assert_eq!(
+            image_url_for("al-1", Some("abc&x=../y")).as_deref(),
+            Some("/api/v3/remotes/jellyfin/images/al-1")
+        );
+        assert_eq!(
+            image_url_for("al-1", Some("abc123")).as_deref(),
+            Some("/api/v3/remotes/jellyfin/images/al-1?tag=abc123")
+        );
+    }
 }

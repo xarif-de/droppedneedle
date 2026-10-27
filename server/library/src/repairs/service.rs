@@ -21,7 +21,7 @@ use super::models::{
 use super::plays;
 use super::reasons;
 use super::store::{self, Phase, RepairSnapshot};
-use crate::clock::{now_ms, now_unix};
+use crate::clock::LibraryClock as _;
 use crate::identify::models::{IdentifyKind, LocalAlbumFacts, RecallResult};
 use crate::identify::service::IdentifyService;
 use crate::identify::sqlite::{SqliteIdentifyStore, album_input_revision};
@@ -33,8 +33,8 @@ use crate::operations::models::{
 use crate::operations::reidentify::evaluation;
 use crate::operations::service::{Operations, job_detail};
 use crate::scan::watcher::WorkWakeups;
-use crate::wiring::{LibrarySetup, ScanCoordinator};
-use droppedneedle_kernel::db::{Db, Lane};
+use crate::wiring::ScanCoordinator;
+use droppedneedle_kernel::db::{Db, DbError, Lane};
 use droppedneedle_kernel::ids::IdGenerator;
 use droppedneedle_kernel::jobs::CancellationToken;
 use droppedneedle_kernel::jobs::schedule::SplitMix64;
@@ -66,116 +66,55 @@ enum Checked {
     Deferred,
 }
 
-/// Identity repairs, identity preparations and catalog cleanup.
+/// Identity repairs, identity preparations and catalog cleanup: the
+/// requests the HTTP handlers make.
 #[derive(Clone)]
 pub struct Repairs {
     db: Db,
     ops: Operations,
-    store: Arc<SqliteIdentifyStore>,
-    identify: Arc<IdentifyService>,
     ids: Arc<dyn IdGenerator>,
-    coordinator: Arc<ScanCoordinator>,
-    hygiene_checked: Arc<AtomicBool>,
-    /// The scan run whose cleanup this worker already queued or skipped.
-    hygiene_scan: Arc<Mutex<Option<String>>>,
-    /// Identification results up to this time (ms) have had their cleanup
-    /// queued. Starts at the worker's start: earlier ones are covered by
-    /// the one-time cleanup.
-    hygiene_identified: Arc<Mutex<i64>>,
-    /// The latest ended scan when play filing was last queued or skipped.
-    /// `None` until the first look after a server start.
-    plays_scan: Arc<Mutex<Option<Option<String>>>>,
-    /// The latest ended scan when the one-time re-identifications were last
-    /// checked; `None` until the first look after a server start.
-    backfill_scan: Arc<Mutex<Option<Option<String>>>>,
-    management: Live<LibraryManagement>,
     wakeups: WorkWakeups,
-    /// The worker hands its job back between albums once this is
-    /// cancelled, so a stopping server never waits out a whole job.
-    shutdown: Option<CancellationToken>,
+    clock: Arc<dyn droppedneedle_kernel::clock::Clock>,
 }
 
 impl Repairs {
-    pub fn new(setup: &LibrarySetup) -> Self {
+    pub fn new(
+        db: Db,
+        ops: Operations,
+        ids: Arc<dyn IdGenerator>,
+        wakeups: WorkWakeups,
+        clock: Arc<dyn droppedneedle_kernel::clock::Clock>,
+    ) -> Self {
         Self {
-            db: setup.db.clone(),
-            ops: Operations::new(setup),
-            store: setup.identify_store.clone(),
-            identify: setup.identify.clone(),
-            ids: setup.ids.clone(),
-            coordinator: setup.coordinator.clone(),
-            hygiene_checked: Arc::new(AtomicBool::new(false)),
-            hygiene_scan: Arc::new(Mutex::new(None)),
-            hygiene_identified: Arc::new(Mutex::new(crate::clock::now_ms() as i64)),
-            plays_scan: Arc::new(Mutex::new(None)),
-            backfill_scan: Arc::new(Mutex::new(None)),
-            management: setup.settings.management.clone(),
-            wakeups: setup.wakeups.clone(),
-            shutdown: None,
+            db,
+            ops,
+            ids,
+            wakeups,
+            clock,
         }
     }
 
-    /// The same service, handing its job back between albums once
-    /// `shutdown` is cancelled.
-    pub fn stopping_with(&self, shutdown: CancellationToken) -> Self {
-        Self {
-            shutdown: Some(shutdown),
-            ..self.clone()
+    /// A repair job's report summary for the generic operation view, or
+    /// `None` when `job` is not a repair. Blocking.
+    pub fn summary_of(&self, job: &OperationJob) -> Result<Option<Summary>, OperationError> {
+        if OperationKind::parse(&job.kind) != Some(OperationKind::Repair) {
+            return Ok(None);
         }
+        self.db.read_blocking("repairs.summary", |conn| {
+            Ok::<_, OperationError>(store::snapshot(conn, &job.id)?.and_then(|snap| snap.summary))
+        })
     }
 
-    /// Whether the worker must hand its job back: a scan started, or the
-    /// server is stopping.
-    fn must_yield(&self) -> bool {
-        !self.coordinator.current().is_empty()
-            || self
-                .shutdown
-                .as_ref()
-                .is_some_and(CancellationToken::is_cancelled)
-    }
-
-    /// Queue a cleanup of albums identification just finished with (v2's
-    /// per-album hygiene after identification), at most 200 per job.
-    fn queue_hygiene_after_identification(&self) -> Result<(), OperationError> {
-        let mut seen = self
-            .hygiene_identified
-            .lock()
-            .map_err(|_| OperationError::Store("hygiene marker poisoned".to_owned()))?;
-        let after = *seen;
-        let (albums, newest) = self.db.read_blocking("repairs.identified_since", |conn| {
-            Ok::<_, OperationError>(store::identified_since(conn, after)?)
-        })?;
-        let Some(newest) = newest else {
-            return Ok(());
-        };
-        if albums.is_empty() {
-            *seen = newest;
-            return Ok(());
-        }
-        // A busy database leaves the marker where it was, so the next turn
-        // queues the cleanup again.
-        let queued =
-            self.db
-                .write_blocking(Lane::Background, "repairs.queue_hygiene_identified", |tx| {
-                    let new = NewRepair {
-                        job_id: self.ids.new_id(),
-                        purpose: Purpose::CatalogIdentityHygiene,
-                        requested_by_user_id: None,
-                        idempotency_key: format!(
-                            "catalog-identity-hygiene:v1:identified:{after}:{newest}"
-                        ),
-                        root_ids: Vec::new(),
-                        album_ids: albums,
-                        scan_run_id: None,
-                        source_matcher_version: None,
-                        target_matcher_version: HYGIENE_VERSION.to_owned(),
-                    };
-                    store::create(tx, &new, now_unix()).map(|_| ())
-                });
-        if settled(&queued) {
-            *seen = newest;
-        }
-        queued
+    /// A scan run's redacted diagnostic report: its file name and bytes.
+    /// The outer error is the database's, the inner one the report's.
+    /// Blocking.
+    pub fn scan_diagnostics(
+        &self,
+        run_id: &str,
+    ) -> Result<Result<(String, Vec<u8>), OperationError>, DbError> {
+        self.db.read_blocking("scan_diagnostics", |conn| {
+            Ok::<_, DbError>(super::diagnostics::export(conn, run_id))
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -207,7 +146,7 @@ impl Repairs {
         let job = self
             .db
             .write_blocking(Lane::Foreground, "repairs.create", |tx| {
-                store::create(tx, &new, now_unix())
+                store::create(tx, &new, self.clock.now_secs())
             })?;
         jobs::wake(&self.wakeups, OperationKind::Repair);
         Ok(job)
@@ -312,7 +251,13 @@ impl Repairs {
         let job = self
             .db
             .write_blocking(Lane::Foreground, "repairs.begin_apply", |tx| {
-                store::begin_apply(tx, job_id, purpose, expected_row_revision, now_unix())
+                store::begin_apply(
+                    tx,
+                    job_id,
+                    purpose,
+                    expected_row_revision,
+                    self.clock.now_secs(),
+                )
             })?;
         jobs::wake(&self.wakeups, OperationKind::Repair);
         Ok(job)
@@ -326,7 +271,7 @@ impl Repairs {
     ) -> Result<OperationJob, OperationError> {
         self.db
             .write_blocking(Lane::Foreground, "repairs.discard", |tx| {
-                store::discard(tx, job_id, expected_row_revision, now_unix())
+                store::discard(tx, job_id, expected_row_revision, self.clock.now_secs())
             })
     }
 
@@ -345,10 +290,140 @@ impl Repairs {
         self.ops
             .control(job_id, control, expected_row_revision, idempotency_key)
     }
+}
 
-    // -----------------------------------------------------------------------
-    // The worker.
-    // -----------------------------------------------------------------------
+/// The repairs worker the loop runs: it claims and works repair jobs and
+/// queues the cleanups, re-checks and play filings that follow scans and
+/// identifications. It remembers what it already followed up, so the loop
+/// keeps one for its whole life.
+#[derive(Clone)]
+pub struct RepairWorker {
+    db: Db,
+    store: Arc<SqliteIdentifyStore>,
+    identify: Arc<IdentifyService>,
+    ids: Arc<dyn IdGenerator>,
+    coordinator: Arc<ScanCoordinator>,
+    hygiene_checked: Arc<AtomicBool>,
+    /// The scan run whose cleanup this worker already queued or skipped.
+    hygiene_scan: Arc<Mutex<Option<String>>>,
+    /// Identification results up to this time (ms) have had their cleanup
+    /// queued. Starts at the worker's start: earlier ones are covered by
+    /// the one-time cleanup.
+    hygiene_identified: Arc<Mutex<i64>>,
+    /// The latest ended scan when play filing was last queued or skipped.
+    /// `None` until the first look after a server start.
+    plays_scan: Arc<Mutex<Option<Option<String>>>>,
+    /// The latest ended scan when the one-time re-identifications were last
+    /// checked; `None` until the first look after a server start.
+    backfill_scan: Arc<Mutex<Option<Option<String>>>>,
+    management: Live<LibraryManagement>,
+    wakeups: WorkWakeups,
+    /// The worker hands its job back between albums once this is
+    /// cancelled, so a stopping server never waits out a whole job.
+    shutdown: Option<CancellationToken>,
+    clock: Arc<dyn droppedneedle_kernel::clock::Clock>,
+}
+
+impl RepairWorker {
+    /// A worker for the jobs `repairs` queues, over the same database,
+    /// ids, wakeups and clock.
+    pub fn new(
+        repairs: &Repairs,
+        store: Arc<SqliteIdentifyStore>,
+        identify: Arc<IdentifyService>,
+        coordinator: Arc<ScanCoordinator>,
+        management: Live<LibraryManagement>,
+    ) -> Self {
+        Self {
+            db: repairs.db.clone(),
+            store,
+            identify,
+            ids: repairs.ids.clone(),
+            coordinator,
+            hygiene_checked: Arc::new(AtomicBool::new(false)),
+            hygiene_scan: Arc::new(Mutex::new(None)),
+            hygiene_identified: Arc::new(Mutex::new(repairs.clock.now_ms())),
+            plays_scan: Arc::new(Mutex::new(None)),
+            backfill_scan: Arc::new(Mutex::new(None)),
+            management,
+            wakeups: repairs.wakeups.clone(),
+            shutdown: None,
+            clock: repairs.clock.clone(),
+        }
+    }
+
+    /// Wakes the worker when a repair job is queued or resumed.
+    pub(super) fn wakeups(&self) -> &WorkWakeups {
+        &self.wakeups
+    }
+
+    /// Whether a scan is running; the worker claims nothing meanwhile.
+    pub(super) fn scanning(&self) -> bool {
+        !self.coordinator.current().is_empty()
+    }
+
+    /// The same service, handing its job back between albums once
+    /// `shutdown` is cancelled.
+    pub fn stopping_with(&self, shutdown: CancellationToken) -> Self {
+        Self {
+            shutdown: Some(shutdown),
+            ..self.clone()
+        }
+    }
+
+    /// Whether the worker must hand its job back: a scan started, or the
+    /// server is stopping.
+    fn must_yield(&self) -> bool {
+        !self.coordinator.current().is_empty()
+            || self
+                .shutdown
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
+    }
+
+    /// Queue a cleanup of albums identification just finished with (v2's
+    /// per-album hygiene after identification), at most 200 per job.
+    fn queue_hygiene_after_identification(&self) -> Result<(), OperationError> {
+        let mut seen = self
+            .hygiene_identified
+            .lock()
+            .map_err(|_| OperationError::Store("hygiene marker poisoned".to_owned()))?;
+        let after = *seen;
+        let (albums, newest) = self.db.read_blocking("repairs.identified_since", |conn| {
+            Ok::<_, OperationError>(store::identified_since(conn, after)?)
+        })?;
+        let Some(newest) = newest else {
+            return Ok(());
+        };
+        if albums.is_empty() {
+            *seen = newest;
+            return Ok(());
+        }
+        // A busy database leaves the marker where it was, so the next turn
+        // queues the cleanup again.
+        let queued =
+            self.db
+                .write_blocking(Lane::Background, "repairs.queue_hygiene_identified", |tx| {
+                    let new = NewRepair {
+                        job_id: self.ids.new_id(),
+                        purpose: Purpose::CatalogIdentityHygiene,
+                        requested_by_user_id: None,
+                        idempotency_key: format!(
+                            "catalog-identity-hygiene:v1:identified:{after}:{newest}"
+                        ),
+                        root_ids: Vec::new(),
+                        album_ids: albums,
+                        scan_run_id: None,
+                        source_matcher_version: None,
+                        target_matcher_version: HYGIENE_VERSION.to_owned(),
+                    };
+                    store::create(tx, &new, self.clock.now_secs()).map(|_| ())
+                });
+        if settled(&queued) {
+            *seen = newest;
+        }
+        queued
+    }
 
     /// Queue the one-time catalog cleanup when this database has albums
     /// it could apply to (imported groupings, empty shells, albums on the
@@ -376,7 +451,7 @@ impl Repairs {
                     source_matcher_version: None,
                     target_matcher_version: HYGIENE_VERSION.to_owned(),
                 };
-                store::create(tx, &new, now_unix()).map(|_| ())
+                store::create(tx, &new, self.clock.now_secs()).map(|_| ())
             });
         if settled(&queued) {
             self.hygiene_checked.store(true, Ordering::Relaxed);
@@ -391,13 +466,20 @@ impl Repairs {
     /// automatic match names a release group but no release (see
     /// [`store::group_only_backfill_albums`]), and every confirmed
     /// automatic match outside the release group its files name (see
-    /// [`store::older_confirmation_albums`]). Each set is looked at once
-    /// per server start and after each scan until it first holds an album,
-    /// so a library that arrives later (a v2 import, a first scan) still
-    /// gets it; then never again.
+    /// [`store::older_confirmation_albums`]), and every confirmed
+    /// automatic match on an edition other than the one its files'
+    /// barcode or catalog number names (see
+    /// [`store::edition_id_albums`]). Only a database a v2 import was
+    /// committed into has such albums; any other is never looked at. Each
+    /// set is looked at once per server start and after each scan until it
+    /// first holds an album, so a library that arrives later (a first scan
+    /// after the import) still gets it; then never again.
     fn queue_backfills_once(&self) -> Result<(), OperationError> {
-        let run = self.db.read_blocking("repairs.latest_ended_scan", |conn| {
-            Ok::<_, OperationError>(store::latest_ended_scan(conn)?)
+        let (run, carried) = self.db.read_blocking("repairs.latest_ended_scan", |conn| {
+            Ok::<_, OperationError>((
+                store::latest_ended_scan(conn)?,
+                store::carried_from_v2(conn)?,
+            ))
         })?;
         // A busy database leaves the run unseen, so the next turn queues
         // its albums again.
@@ -406,6 +488,10 @@ impl Repairs {
             .lock()
             .map_err(|_| OperationError::Store("backfill marker poisoned".to_owned()))?;
         if seen.as_ref() == Some(&run) {
+            return Ok(());
+        }
+        if !carried {
+            *seen = Some(run);
             return Ok(());
         }
         // Each pass runs on its own: one that fails leaves the other be.
@@ -432,6 +518,14 @@ impl Repairs {
                     store::OLDER_CONFIRMATIONS_BACKFILL_KEY,
                     store::older_confirmation_albums,
                     "queued confirmed albums outside the release group their files name",
+                ),
+            ),
+            (
+                store::EDITION_IDS_BACKFILL_KEY,
+                self.queue_backfill(
+                    store::EDITION_IDS_BACKFILL_KEY,
+                    store::edition_id_albums,
+                    "queued confirmed albums whose files' barcode or catalog number names another edition",
                 ),
             ),
         ];
@@ -486,7 +580,7 @@ impl Repairs {
                 IdentifyKind::Historical,
                 revision,
                 None,
-                now_ms(),
+                self.clock.now_ms_u64(),
                 Lane::Background,
             )?;
         }
@@ -497,7 +591,7 @@ impl Repairs {
                     tx,
                     &self.ids.new_id(),
                     key,
-                    now_unix(),
+                    self.clock.now_secs(),
                 )?)
             })
     }
@@ -538,7 +632,7 @@ impl Repairs {
                         source_matcher_version: None,
                         target_matcher_version: HYGIENE_VERSION.to_owned(),
                     };
-                    store::create(tx, &new, now_unix()).map(|_| ())
+                    store::create(tx, &new, self.clock.now_secs()).map(|_| ())
                 });
         if settled(&queued) {
             *seen = Some(run);
@@ -568,7 +662,7 @@ impl Repairs {
         let queued = self
             .db
             .write_blocking(Lane::Background, "repairs.queue_play_filing", |tx| {
-                plays::queue(tx, &self.ids.new_id(), after_scan, now_unix())?;
+                plays::queue(tx, &self.ids.new_id(), after_scan, self.clock.now_secs())?;
                 Ok::<_, OperationError>(())
             });
         if settled(&queued) {
@@ -591,7 +685,7 @@ impl Repairs {
             let left = self
                 .db
                 .write_blocking(Lane::Background, "repairs.file_plays", |tx| {
-                    let now = now_unix();
+                    let now = self.clock.now_secs();
                     if let Some(left) = halt(tx, job_id, worker, yielding, now)? {
                         return Ok::<_, OperationError>(Some(left));
                     }
@@ -669,7 +763,7 @@ impl Repairs {
                 Ok::<_, OperationError>(jobs::recover_at_start(
                     tx,
                     OperationKind::Repair,
-                    now_unix(),
+                    self.clock.now_secs(),
                 )?)
             })
     }
@@ -687,7 +781,12 @@ impl Repairs {
         let claimed = self
             .db
             .write_blocking(Lane::Background, "repairs.claim", |tx| {
-                Ok::<_, OperationError>(jobs::claim(tx, OperationKind::Repair, worker, now_unix())?)
+                Ok::<_, OperationError>(jobs::claim(
+                    tx,
+                    OperationKind::Repair,
+                    worker,
+                    self.clock.now_secs(),
+                )?)
             })?;
         let Some(job) = claimed else {
             return Ok(None);
@@ -708,7 +807,7 @@ impl Repairs {
         cause: String,
     ) -> Result<Option<OperationJob>, OperationError> {
         tracing::warn!(cause, job_id, "repair job waits: the database is busy");
-        let now = now_unix();
+        let now = self.clock.now_secs();
         let jitter = SplitMix64::new(SplitMix64::seed_from_time()).below_duration(BUSY_RETRY);
         let retry_at = now + (BUSY_RETRY + jitter).as_secs_f64();
         self.db
@@ -742,7 +841,7 @@ impl Repairs {
                         worker,
                         OperationState::Failed,
                         "MISSING_SNAPSHOT",
-                        now_unix(),
+                        self.clock.now_secs(),
                     )?)
                 },
             );
@@ -756,7 +855,7 @@ impl Repairs {
             let next = self
                 .db
                 .write_blocking(Lane::Background, "repairs.claim_album", |tx| {
-                    let now = now_unix();
+                    let now = self.clock.now_secs();
                     if let Some(left) = halt(tx, &job.id, worker, yielding, now)? {
                         return Ok::<_, OperationError>(Err(left));
                     }
@@ -776,7 +875,7 @@ impl Repairs {
                             if !jobs::holds(tx, &job.id, worker)? {
                                 return Ok(());
                             }
-                            let now = now_unix();
+                            let now = self.clock.now_secs();
                             let changed = hygiene::clean_album(tx, &album_id, &job.id, now)?;
                             let state = if changed.is_some() {
                                 WorkState::Succeeded
@@ -797,30 +896,36 @@ impl Repairs {
                         })?
                 }
                 (_, Phase::Apply) => {
-                    self.db
-                        .write_blocking(Lane::Background, "repairs.apply_album", |tx| {
-                            if !jobs::holds(tx, &job.id, worker)? {
-                                return Ok(());
-                            }
-                            apply_album(
-                                tx,
-                                &job.id,
-                                worker,
-                                ordinal,
-                                &album_id,
-                                actor.as_deref(),
-                                now_unix(),
-                            )
-                        })?
+                    let accepted =
+                        self.db
+                            .write_blocking(Lane::Background, "repairs.apply_album", |tx| {
+                                if !jobs::holds(tx, &job.id, worker)? {
+                                    return Ok(false);
+                                }
+                                apply_album(
+                                    tx,
+                                    &job.id,
+                                    worker,
+                                    ordinal,
+                                    &album_id,
+                                    actor.as_deref(),
+                                    self.clock.now_secs(),
+                                )
+                            })?;
+                    if accepted {
+                        self.store.link_after_command(&album_id);
+                    }
                 }
                 (purpose, Phase::DryRun) => match self.check(purpose, &album_id).await? {
                     Checked::Found(verdict, identity_revision) => {
-                        self.db
-                            .write_blocking(Lane::Background, "repairs.save_finding", |tx| {
+                        let accepted = self.db.write_blocking(
+                            Lane::Background,
+                            "repairs.save_finding",
+                            |tx| {
                                 if !jobs::holds(tx, &job.id, worker)? {
-                                    return Ok(());
+                                    return Ok(false);
                                 }
-                                let now = now_unix();
+                                let now = self.clock.now_secs();
                                 store::save_finding(
                                     tx,
                                     &job.id,
@@ -832,15 +937,18 @@ impl Repairs {
                                     now,
                                 )?;
                                 store::auto_accept(tx, &job.id, &album_id, &verdict, now)
-                                    .map(|_| ())
-                            })?
+                            },
+                        )?;
+                        if accepted {
+                            self.store.link_after_command(&album_id);
+                        }
                     }
                     Checked::Deferred => {
                         return self.db.write_blocking(
                             Lane::Background,
                             "repairs.provider_deferred",
                             |tx| {
-                                let now = now_unix();
+                                let now = self.clock.now_secs();
                                 jobs::release_until(
                                     tx,
                                     &job.id,
@@ -1074,14 +1182,4 @@ fn parse_cursor(raw: &str) -> Result<(f64, String), OperationError> {
         .and_then(|(at, id)| Some((at.parse::<f64>().ok()?, id.to_owned())))
         .filter(|(at, id)| at.is_finite() && !id.is_empty())
         .ok_or(OperationError::Invalid(reasons::CURSOR_INVALID))
-}
-
-/// A repair job's report summary, for the generic operation view. Blocking.
-pub fn repair_summary(
-    setup: &LibrarySetup,
-    job_id: &str,
-) -> Result<Option<Summary>, OperationError> {
-    setup.db.read_blocking("repairs.summary", |conn| {
-        Ok::<_, OperationError>(store::snapshot(conn, job_id)?.and_then(|snap| snap.summary))
-    })
 }

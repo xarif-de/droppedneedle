@@ -34,6 +34,7 @@ use super::flows::seams::ReleasePoll;
 use super::flows::seams::TickSink;
 use super::flows::stores::{AdminDirectory, LibraryPresence, UpgradeWorklist};
 use super::follows::Follows;
+use super::held::{HeldFolders, HeldService};
 use super::imports::handlers::{ImportsDeps, imports_legacy_callback_router};
 use super::imports::jobs::{SpotifyImportJobs, SpotifyImports};
 use super::imports::lidarr::LidarrClient;
@@ -107,6 +108,12 @@ pub struct SpotifyEndpoints {
 /// Health-probe refresh cadence.
 const PROBE_INTERVAL: Duration = Duration::from_secs(300);
 
+/// The held list's loop runs every five minutes, the first pass a minute
+/// after start: often enough for the first automatic retry, five minutes
+/// after a hold.
+const HELD_PRUNE_INTERVAL: Duration = Duration::from_secs(300);
+const HELD_PRUNE_DELAY: Duration = Duration::from_secs(60);
+
 /// Job name of the probe refresh loop.
 pub const PROBE_JOB: &str = "acquire-probe-refresh";
 
@@ -120,6 +127,7 @@ pub const ACQUIRE_LOOPS: &[&str] = &[
     UPGRADE_JOB,
     SYNC_JOB,
     PRUNE_JOB,
+    super::held::PRUNE_JOB,
     super::worker::DOWNLOAD_WORKER_JOB,
     PROBE_JOB,
     SOURCE_WATCH_JOB,
@@ -335,7 +343,15 @@ impl LiveClients {
         // does not read; nothing searches or downloads.
         let readable = settings.policy.is_some();
         let usenet_policy = usenet_policy_from(&settings.policy.clone().unwrap_or_default());
-        let slskd_repo = slskd_repository(http, &settings.slskd, &self.slskd_downloads);
+        // Without a readable policy nothing searches; the repository then
+        // only answers the probes.
+        let slskd_policy = settings
+            .policy
+            .as_ref()
+            .map(SlskdPolicy::from_saved)
+            .unwrap_or_default();
+        let slskd_repo =
+            slskd_repository(http, &settings.slskd, &self.slskd_downloads, slskd_policy);
         let sab_queue = sabnzbd_queue(http, &settings.sabnzbd, &usenet_policy);
         let newznab = Arc::new(newznab_indexer(http, &settings.indexers));
         let prowlarr = Arc::new(prowlarr_indexer(http, &settings.prowlarr));
@@ -438,8 +454,6 @@ pub struct AcquireSetup {
     source_notices: SourceNotices,
     /// Asks the probe loop for a pass now.
     probe_wake: Arc<watch::Sender<u64>>,
-    /// Per-task staging root (manifests, drop jobs, quarantine).
-    pub staging_root: PathBuf,
     /// Store-prune deps (request history and wanted rows).
     pub prune: Arc<PruneDeps>,
     /// Live event hub handle shared by the flows and the imports.
@@ -450,6 +464,8 @@ pub struct AcquireSetup {
     pub search_jobs: Arc<SearchJobs>,
     /// Drop import: uploaded music into the library.
     pub drops: Arc<DropImports>,
+    /// The held list: every file waiting for a person's decision.
+    pub held: Arc<HeldService>,
     /// Runs the Spotify import jobs; registered on the jobs table.
     pub spotify_import_jobs: Arc<SpotifyImportJobs>,
 }
@@ -486,14 +502,14 @@ pub struct FlowsBundle {
 fn drop_imports(
     db: &AcquireDb,
     landing: &LandingService,
-    staging_root: &Path,
+    folders: &HeldFolders,
     events: &EventHub,
     flows: &FlowsBundle,
 ) -> Arc<DropImports> {
     Arc::new(DropImports::new(
         DropStore::new(db.clone()),
         landing.library().cloned(),
-        staging_root.join("drop"),
+        folders.drop.clone(),
         events.clone(),
         flows.ticks.clone(),
         flows.ledger.clone(),
@@ -514,6 +530,8 @@ pub struct AcquireStores {
     /// Where flow outcomes go: plugin events, user notices and the flow
     /// log. The journal announces fulfilled requests on it.
     pub ticks: Arc<dyn TickSink>,
+    /// The two folders held copies live in.
+    pub folders: HeldFolders,
 }
 
 impl AcquireStores {
@@ -523,15 +541,20 @@ impl AcquireStores {
         Self::over(
             AcquireDb::new(platform.db.clone(), platform.clock.clone()),
             ticks,
+            HeldFolders {
+                held: platform.config.cache_dir.join("held"),
+                drop: platform.config.imports_dir().join("drop"),
+            },
         )
     }
 
-    fn over(db: AcquireDb, ticks: Arc<dyn TickSink>) -> Self {
+    fn over(db: AcquireDb, ticks: Arc<dyn TickSink>, folders: HeldFolders) -> Self {
         Self {
             journal: Arc::new(Journal::new(db.clone(), ticks.clone())),
             wanted: WantedStore::new(db.clone()),
             db,
             ticks,
+            folders,
         }
     }
 }
@@ -575,6 +598,8 @@ struct CorePorts {
     readiness: Option<AcquireReadiness>,
     release_poll: Arc<dyn ReleasePoll>,
     mix: Option<MixInputs>,
+    /// MusicBrainz reads the wanted watcher dates its watches with.
+    targets: Arc<Targets>,
 }
 
 /// The pieces shared by the production and test bundles.
@@ -591,7 +616,6 @@ struct Core {
 fn core(
     stores: &AcquireStores,
     ids: Arc<dyn IdGenerator>,
-    staging_root: &Path,
     settings: &ConfigStore,
     quota: Arc<QuotaLedger>,
     sources: SourceList,
@@ -600,12 +624,7 @@ fn core(
 ) -> Core {
     let db = &stores.db;
     let journal = stores.journal.clone();
-    let dispatch = Arc::new(DownloadDispatch::new(
-        journal.clone(),
-        ids,
-        staging_root.to_owned(),
-        settings.live(),
-    ));
+    let dispatch = Arc::new(DownloadDispatch::new(journal.clone(), ids, settings.live()));
     // Album intake as the Weekly Mix builder files it: everything but the
     // builder itself, which intake never reaches.
     let intake = RequestsState {
@@ -638,6 +657,7 @@ fn core(
         settings,
         ticks,
         ports.release_poll,
+        ports.targets,
     ));
     Core {
         requests,
@@ -678,18 +698,13 @@ impl AcquireSetup {
             stores.journal.clone(),
             Arc::new(Targets::new(
                 stores.journal.clone(),
-                staging_root.clone(),
                 Some(ports.album_lookup),
             )),
             Some(ports.plugins.clone()),
         ));
         let events = platform.events.clone();
         let search_quota = quota.clone();
-        let worker_settings = Arc::new(WorkerSettings::new(
-            &config_store,
-            clients.clone(),
-            staging_root.clone(),
-        ));
+        let worker_settings = Arc::new(WorkerSettings::new(&config_store, clients.clone()));
         let probe_cache = Arc::new(ProbeCache::new(clients.clone()));
         let readiness = SourceReadiness::new(
             SourceList::Live(worker_settings.clone()),
@@ -705,7 +720,6 @@ impl AcquireSetup {
         let core = core(
             &stores,
             ids.clone(),
-            &staging_root,
             &config_store,
             quota,
             SourceList::Live(worker_settings.clone()),
@@ -730,6 +744,7 @@ impl AcquireSetup {
                         playlists: collections.playlists.clone(),
                     }
                 }),
+                targets: clients.targets().clone(),
             },
             events.clone(),
         );
@@ -789,7 +804,7 @@ impl AcquireSetup {
             core.journal.clone(),
             Some(ports.library),
             config_store.live(),
-            config.cache_dir.join("held"),
+            stores.folders.held.clone(),
         ));
 
         // Worker over the live sources and tuning.
@@ -812,7 +827,13 @@ impl AcquireSetup {
             search_quota,
             events.clone(),
         ));
-        let drops = drop_imports(&db, &landing, &staging_root, &events, &core.flows);
+        let drops = drop_imports(&db, &landing, &stores.folders, &events, &core.flows);
+        let held = Arc::new(HeldService::new(
+            core.journal.clone(),
+            worker.clone(),
+            drops.clone(),
+            stores.folders.clone(),
+        ));
 
         Ok(Self {
             db,
@@ -828,12 +849,12 @@ impl AcquireSetup {
             readiness,
             source_notices,
             probe_wake: Arc::new(watch::Sender::new(0)),
-            staging_root,
             prune,
             events,
             landing,
             search_jobs,
             drops,
+            held,
             spotify_import_jobs,
         })
     }
@@ -852,16 +873,21 @@ impl AcquireSetup {
         use droppedneedle_catalog::reads::collections::store::PlaylistStore;
         use droppedneedle_kernel::runtime_config::crypto::Crypto;
 
+        // Under the scratch database's directory, so it goes with it.
+        let scratch = db
+            .path()
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| "scratch database has no directory".to_owned())?;
+        let staging_root = scratch.join("staging");
         let stores = AcquireStores::over(
             db.clone(),
             Arc::new(super::plugin_events::FlowTicks::new(None, events.clone())),
+            HeldFolders {
+                held: scratch.join("held"),
+                drop: staging_root.join("drop"),
+            },
         );
-        // Under the scratch database's directory, so it goes with it.
-        let staging_root = db
-            .path()
-            .parent()
-            .map(|dir| dir.join("staging"))
-            .ok_or_else(|| "scratch database has no directory".to_owned())?;
         let settings = super::settings::scratch_settings(&staging_root.join("settings"))?;
         let factory = droppedneedle_kernel::http_client::HttpClientFactory::new()
             .map_err(|error| error.to_string())?;
@@ -871,22 +897,13 @@ impl AcquireSetup {
             ClientLives::new(&settings),
             staging_root.clone(),
             stores.journal.clone(),
-            Arc::new(Targets::new(
-                stores.journal.clone(),
-                staging_root.clone(),
-                None,
-            )),
+            Arc::new(Targets::new(stores.journal.clone(), None)),
             None,
         ));
-        let worker_settings = Arc::new(WorkerSettings::new(
-            &settings,
-            clients.clone(),
-            staging_root.clone(),
-        ));
+        let worker_settings = Arc::new(WorkerSettings::new(&settings, clients.clone()));
         let core = core(
             &stores,
             ids.clone(),
-            &staging_root,
             &settings,
             Arc::new(QuotaLedger::unlimited(db.clone())),
             SourceList::Live(worker_settings.clone()),
@@ -896,6 +913,7 @@ impl AcquireSetup {
                 readiness: None,
                 release_poll: Arc::new(super::search::NoReleasePoll),
                 mix: None,
+                targets: clients.targets().clone(),
             },
             events.clone(),
         );
@@ -954,25 +972,17 @@ impl AcquireSetup {
             base_path: String::new(),
             trusted_proxies: Default::default(),
         };
-        let held_dir = db
-            .path()
-            .parent()
-            .map(|dir| dir.join("held"))
-            .ok_or_else(|| "scratch database has no directory".to_owned())?;
         let landing = Arc::new(LandingService::new(
             core.journal.clone(),
             library,
             settings.live(),
-            held_dir,
+            stores.folders.held.clone(),
         ));
         let worker = Arc::new(
             DownloadWorker::fixed(
                 core.journal.clone(),
                 Vec::new(),
-                WorkerConfig {
-                    staging_root: staging_root.clone(),
-                    ..WorkerConfig::default()
-                },
+                WorkerConfig::default(),
                 events.clone(),
                 Default::default(),
             )
@@ -985,7 +995,13 @@ impl AcquireSetup {
             Arc::new(QuotaLedger::unlimited(db.clone())),
             events.clone(),
         ));
-        let drops = drop_imports(&db, &landing, &staging_root, &events, &core.flows);
+        let drops = drop_imports(&db, &landing, &stores.folders, &events, &core.flows);
+        let held = Arc::new(HeldService::new(
+            core.journal.clone(),
+            worker.clone(),
+            drops.clone(),
+            stores.folders.clone(),
+        ));
         let prune = Arc::new(PruneDeps {
             settings: settings.live(),
             ledger: core.requests.store.clone(),
@@ -1009,17 +1025,17 @@ impl AcquireSetup {
                 plugins: None,
             },
             probe_wake: Arc::new(watch::Sender::new(0)),
-            staging_root,
             prune,
             events,
             landing,
             search_jobs,
             drops,
+            held,
             spotify_import_jobs,
         })
     }
 
-    /// The state the queue and held-import routes read
+    /// The state the queue and upgrade routes read
     /// ([`super::downloads::routes`]).
     pub fn downloads_routes(&self) -> super::downloads::DownloadsRoutes {
         super::downloads::DownloadsRoutes::new(
@@ -1047,7 +1063,8 @@ impl AcquireSetup {
     /// keys, and a request's cancel or dispatch reuses its key or relinks.
     pub async fn run_recovery(&self) -> Result<super::worker::RecoveryReport, RecoveryError> {
         self.drops.sweep_stale().await;
-        let report = run_startup_recovery(&self.journal, &self.staging_root)
+        self.held.recover().await;
+        let report = run_startup_recovery(&self.journal)
             .await
             .map_err(RecoveryError::Failed)?;
         let requests = super::requests::service::RequestsService::new(&self.requests)
@@ -1077,8 +1094,31 @@ impl AcquireSetup {
         spawn_sync_loop(supervisor, self.flows.sync_deps.clone())?;
         spawn_prune_loop(supervisor, self.prune.clone())?;
         super::worker::spawn_download_worker(self.worker.clone(), supervisor)?;
+        self.spawn_held_prune(supervisor)?;
         self.spawn_probe_loop(supervisor)?;
         self.spawn_source_watch(supervisor)
+    }
+
+    /// The held list's loop: a minute after start, then every five
+    /// minutes, it finishes actions a restart cut off, removes the held
+    /// copies of entries past their expiry and retries the files our side
+    /// could not take whose next try is due.
+    fn spawn_held_prune(&self, supervisor: &Supervisor) -> Result<(), AlreadyRunning> {
+        let held = self.held.clone();
+        supervisor.periodic(
+            super::held::PRUNE_JOB,
+            Schedule::new(HELD_PRUNE_INTERVAL).with_initial_delay(HELD_PRUNE_DELAY),
+            FnTick(move |ctx: TickCtx| {
+                let held = held.clone();
+                async move {
+                    tokio::select! {
+                        () = ctx.token().cancelled() => {}
+                        _ = held.tend() => {}
+                    }
+                    Ok(Next::Continue)
+                }
+            }),
+        )
     }
 
     /// Probe refresh: one pass now, then one on every wake and at least
@@ -1177,6 +1217,7 @@ fn flows_bundle(
     settings: &ConfigStore,
     ticks: Arc<dyn TickSink>,
     release_poll: Arc<dyn ReleasePoll>,
+    targets: Arc<Targets>,
 ) -> FlowsBundle {
     let watches = requests.wanted.clone();
     let ledger = requests.store.clone();
@@ -1191,6 +1232,7 @@ fn flows_bundle(
         sources,
         downloads: dispatch.clone(),
         library: library.clone(),
+        targets,
         ticks: ticks.clone(),
     });
     let follow_deps = Arc::new(FollowDeps {
@@ -1255,11 +1297,13 @@ fn utc_ymd(days: u64) -> String {
 }
 
 /// slskd repository, when the section configures one. The mount is
-/// `SLSKD_DOWNLOADS_PATH` plus the confined subpath from settings.
+/// `SLSKD_DOWNLOADS_PATH` plus the confined subpath from settings, and
+/// `policy` holds the saved quality band and recipe the picks follow.
 fn slskd_repository(
     http: &reqwest::Client,
     section: &SlskdConnection,
     downloads: &Path,
+    policy: SlskdPolicy,
 ) -> Option<Arc<SlskdRepository<ReqwestSlskdHttp>>> {
     if section.url.is_empty() || section.api_key.expose().is_empty() {
         return None;
@@ -1275,7 +1319,7 @@ fn slskd_repository(
         &section.url,
         section.api_key.expose(),
         mount,
-        SlskdPolicy::default(),
+        policy,
     );
     if !section.slskd_incomplete_mount.trim().is_empty() {
         repo = repo.with_incomplete_mount(PathBuf::from(section.slskd_incomplete_mount.trim()));
@@ -1410,12 +1454,11 @@ pub struct WorkerSettings {
     sabnzbd: Live<DownloadClients>,
     library: Live<TypedLibrary>,
     musicbrainz: Live<MusicBrainzSettings>,
-    staging_root: PathBuf,
 }
 
 impl WorkerSettings {
     /// Handles on `store`'s sections, with the sources `clients` build.
-    pub fn new(store: &ConfigStore, clients: Arc<LiveClients>, staging_root: PathBuf) -> Self {
+    pub fn new(store: &ConfigStore, clients: Arc<LiveClients>) -> Self {
         Self {
             clients,
             policy: store.live(),
@@ -1423,7 +1466,6 @@ impl WorkerSettings {
             sabnzbd: store.live(),
             library: store.live(),
             musicbrainz: store.live(),
-            staging_root,
         }
     }
 
@@ -1459,11 +1501,6 @@ impl WorkerSettings {
             && self.musicbrainz.read().is_some()
     }
 
-    /// Where landings stage files. Not a setting, so it never waits.
-    pub(crate) fn staging_root(&self) -> &Path {
-        &self.staging_root
-    }
-
     /// The worker tuning as saved right now, or `None` while a section it
     /// needs does not read. An unreadable SABnzbd section is an
     /// unconfigured one, as in the client set, so slskd keeps working.
@@ -1475,12 +1512,7 @@ impl WorkerSettings {
         let source_priority = self.source_priority.read()?;
         let sab = self.sabnzbd.read().unwrap_or_default();
         let sab_mount = sabnzbd_mount(&sab);
-        Some(worker_config(
-            &policy,
-            &source_priority,
-            &self.staging_root,
-            sab_mount,
-        ))
+        Some(worker_config(&policy, &source_priority, sab_mount))
     }
 }
 
@@ -1516,7 +1548,6 @@ pub fn recycle_guard(store: &ConfigStore, staging_root: PathBuf) -> DownloadTree
 fn worker_config(
     policy: &DownloadPolicy,
     source_priority: &SourcePriority,
-    staging_root: &Path,
     sab_mount: Option<PathBuf>,
 ) -> WorkerConfig {
     let mut source_order: Vec<SourceTag> = source_priority
@@ -1545,7 +1576,6 @@ fn worker_config(
             reap_threshold_seconds: 1800.0,
         },
         source_order,
-        staging_root: staging_root.to_owned(),
         orphan_roots,
         worker_id: "download-worker".to_owned(),
         review: crate::search_jobs::review::ReviewMode::from_setting(&policy.search_review),

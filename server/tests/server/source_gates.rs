@@ -467,6 +467,7 @@ const DROP_IMPORT_STEP: &str = "blocking file work, awaited by the drop import t
 const DROP_IMPORT: &str = "a drop import a request starts; it logs its own end";
 const MIX_REFRESH: &str = "a personal-mix refresh a request starts; it logs its own end";
 const SEARCH: &str = "an acquire search a request starts; it logs its own end";
+const LIBRARY_CHECK: &str = "the library folder check, bounded by a timeout; one that hangs is left to end and none starts beside it";
 const WORKER_CHILD: &str = "a landing or review the download worker waits for";
 const REQUEST: &str = "blocking file or store work, awaited by the request that runs it";
 const CATALOG_WARM: &str =
@@ -484,7 +485,7 @@ const LOOP_STEP: &str =
     "a blocking step awaited inside a supervised loop, its stop checked between steps";
 const JOB_STEP: &str = "blocking file and store work, awaited by the queued job that runs it, its stop checked between rows";
 const SCAN_WALK: &str = "scan walk tasks, owned and joined by the scan's drive";
-const TRANSCODE: &str = "ffmpeg's stderr reader and exit waiter, bound to one transcode";
+const TRANSCODE: &str = "ffmpeg's output pump and stderr reader, bound to one transcode";
 const PLUGIN_EVENTS: &str = "plugin event deliveries, each bounded by its call timeout";
 const PLUGIN_REPLACED: &str =
     "stops a replaced plugin runtime off the request path; plugin lifecycle";
@@ -496,26 +497,24 @@ const HTTP_SERVER: &str = "the HTTP server, joined by serve at the shutdown dead
 const OFFLINE_TOOL: &str = "the offline tool's file work, awaited";
 
 const SPAWN_SITES: &[(&str, usize, &str)] = &[
-    ("acquire/src/dispatch.rs", 1, AWAITED),
-    ("acquire/src/downloads/held.rs", 1, AWAITED),
     ("acquire/src/drop_import/http.rs", 1, UPLOAD_CLEANUP),
-    ("acquire/src/drop_import/mod.rs", 7, DROP_IMPORT_STEP),
+    ("acquire/src/drop_import/mod.rs", 6, DROP_IMPORT_STEP),
     ("acquire/src/drop_import/mod.rs", 1, DROP_IMPORT),
+    ("acquire/src/held/service.rs", 5, AWAITED),
+    ("acquire/src/intake/dispose.rs", 1, AWAITED),
     ("acquire/src/landing/hold.rs", 1, AWAITED),
     ("acquire/src/landing/library.rs", 2, AWAITED),
-    ("acquire/src/landing/mod.rs", 3, AWAITED),
-    ("acquire/src/library_removal.rs", 1, AWAITED),
+    ("acquire/src/landing/mod.rs", 2, AWAITED),
     ("acquire/src/probes.rs", 2, AWAITED),
     ("acquire/src/requests/discovery.rs", 1, AWAITED),
     ("acquire/src/requests/mix.rs", 1, MIX_REFRESH),
     ("acquire/src/requests/service/edition.rs", 1, AWAITED),
     ("acquire/src/search_jobs/mod.rs", 1, SEARCH),
     ("acquire/src/slskd/repository.rs", 3, AWAITED),
-    ("acquire/src/target/mod.rs", 1, AWAITED),
     ("acquire/src/usenet/sabnzbd.rs", 6, AWAITED),
+    ("acquire/src/worker.rs", 1, LIBRARY_CHECK),
     ("acquire/src/worker/landings.rs", 2, WORKER_CHILD),
     ("acquire/src/worker/review.rs", 1, WORKER_CHILD),
-    ("acquire/src/worker.rs", 2, AWAITED),
     ("auth/src/avatars.rs", 2, REQUEST),
     ("auth/src/session/login.rs", 1, REQUEST),
     ("auth/src/users/hibp.rs", 1, REQUEST),
@@ -584,12 +583,10 @@ const SPAWN_SITES: &[(&str, usize, &str)] = &[
     ("library/src/scan/pool.rs", 1, LOOP_STEP),
     ("library/src/scan/walk.rs", 3, SCAN_WALK),
     ("library/src/wiring.rs", 2, LOOP_STEP),
-    ("media/src/stream/download.rs", 3, REQUEST),
-    ("media/src/stream/gateway.rs", 3, REQUEST),
+    ("media/src/stream/download.rs", 2, REQUEST),
     ("media/src/stream/local_files.rs", 1, REQUEST),
     ("media/src/stream/plugin_url.rs", 2, REQUEST),
-    ("media/src/stream/routes.rs", 1, REQUEST),
-    ("media/src/stream/transcode.rs", 4, TRANSCODE),
+    ("media/src/stream/transcode.rs", 2, TRANSCODE),
     ("plugins/src/capabilities/events.rs", 2, PLUGIN_EVENTS),
     ("plugins/src/capabilities/library_files.rs", 1, REQUEST),
     ("plugins/src/capabilities/stream.rs", 1, REQUEST),
@@ -603,6 +600,7 @@ const SPAWN_SITES: &[(&str, usize, &str)] = &[
     ("src/bootstrap/mod.rs", 1, BOOT_STEP),
     ("src/bootstrap/platform.rs", 1, BOOT_STEP),
     ("src/bootstrap/serve.rs", 1, HTTP_SERVER),
+    ("src/settings/effects.rs", 1, LOOP_STEP),
     ("src/settings/library_policy_service.rs", 1, REQUEST),
     ("src/settings/services.rs", 3, REQUEST),
     ("src/settings/wiring.rs", 2, REQUEST),

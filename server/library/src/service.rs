@@ -1,7 +1,7 @@
 //! Library service: roots, scans, identification, and reviews.
 use droppedneedle_kernel::db::Lane;
 
-use super::clock::now_ms;
+use super::clock::LibraryClock as _;
 use super::identify::models::{AlbumIdentity, IdentifyJob, IdentifyKind};
 use super::manage::publish_error;
 use super::scan::models::{
@@ -97,11 +97,6 @@ impl LibrarySetup {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let session = cell.session(&registry);
-            let _guards = if cell.needs_refresh(&session) {
-                self.publish_guards(&registry)
-            } else {
-                Vec::new()
-            };
             cell.refresh_to(session, &self.root_dirs)
                 .map_err(publish_error)?;
         }
@@ -158,24 +153,31 @@ impl LibrarySetup {
         Ok(result)
     }
 
+    /// Every current run and the latest finished ones. Blocking.
+    pub fn recent_scan_runs(
+        &self,
+        finished: usize,
+    ) -> Result<(Vec<ScanRun>, Vec<ScanRun>), ServiceError> {
+        let current = self
+            .coordinator
+            .current_runs()
+            .map_err(super::scans::store_error)?;
+        let history = self
+            .coordinator
+            .history(finished)
+            .map_err(super::scans::store_error)?;
+        Ok((current, history))
+    }
+
     /// Run detail plus discovered files (bounded to the latest 500).
     pub fn run_detail(
         &self,
         run_id: &str,
     ) -> Result<(ScanRun, Vec<ScanScope>, Vec<ScanInventoryItem>), ServiceError> {
-        use super::scan::store::ScanStoreError;
         let (run, scopes, _) = self
             .coordinator
             .snapshot(run_id)
-            .map_err(|error| match error {
-                ScanStoreError::NotFound { .. } => ServiceError::NotFound,
-                busy @ (ScanStoreError::Busy { .. } | ScanStoreError::LaneClosed) => {
-                    super::scans::store_error(busy)
-                }
-                other => ServiceError::Conflict {
-                    message: other.to_string(),
-                },
-            })?;
+            .map_err(super::scans::store_error)?;
         let files = self
             .scan_store
             .inventory_for_run(run_id, RUN_DETAIL_FILES)
@@ -203,7 +205,7 @@ impl LibrarySetup {
             kind,
             &revision,
             Some(user_id),
-            now_ms(),
+            self.clock.now_ms_u64(),
             Lane::Foreground,
         )?)
     }

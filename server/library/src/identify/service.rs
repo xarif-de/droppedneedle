@@ -14,13 +14,16 @@ use droppedneedle_kernel::jobs::schedule::SplitMix64;
 use droppedneedle_providers::RequestPriority;
 use tokio::time::Instant;
 
-use super::evidence::{candidate_evidence, local_album, named_group};
+use super::evidence::{candidate_evidence, edition_ids, local_album, named_group};
 use super::models::{
     AlbumIdentity, AutomaticSeal, CandidateEvidence, DecisionSource, EvidenceClass,
     IdentificationOutcome, IdentifyJob, IdentifyKind, IdentityBrief, JobState, LocalAlbumFacts,
     MatchFlag, MatchFlagState, RecallResult, ReviewState, TrackIdentity,
 };
-use super::providers::{IdentifyProviders, RecallOutcome};
+use super::providers::{
+    IdentifyProviders, RELEASE_UNREADABLE, RELEASES_UNREADABLE, RecallOutcome,
+    TAGGED_RELEASE_UNREADABLE,
+};
 use super::queue::{PRIORITY_HISTORICAL_BACKLOG, PRIORITY_NEW_OR_CHANGED, PRIORITY_REVIEW_RETRY};
 use super::review::reject_review;
 use super::rules::retracts_on_contradiction;
@@ -29,10 +32,13 @@ use super::sqlite::SqliteIdentifyStore;
 use super::stores::{Approval, AttemptLanding, StoreError, keep_releases, land_job};
 use crate::edition_prefs::{LivePreferences, Preferences};
 use crate::identity::AutomaticOutcome;
-use crate::matching::decide::{EDITION_COHORT, candidate_order, eligible, named_in_tie};
+use crate::matching::decide::{
+    EDITION_COHORT, IdStance, candidate_order, eligible, hint_misses, id_stance, named_in_tie,
+};
 use crate::matching::score::heard_on_candidates;
 use crate::matching::{
-    EditionPrefs, LocalAlbum, ReleaseMatch, ReviewReason, Verdict, decide, match_release,
+    EditionHints, EditionPrefs, LocalAlbum, Release, ReleaseMatch, ReviewReason, Verdict, decide,
+    match_release,
 };
 
 /// Every dependency the identify service needs, injected by constructor.
@@ -58,6 +64,8 @@ struct LookupHold {
     until: Option<Instant>,
     failures: u32,
     rng: SplitMix64,
+    /// The id the last lookup that went unanswered asked about.
+    stuck: Option<String>,
 }
 
 /// The first wait after a failed lookup with no `Retry-After`; it doubles
@@ -71,6 +79,7 @@ impl LookupHold {
             until: None,
             failures: 0,
             rng: SplitMix64::new(SplitMix64::seed_from_time()),
+            stuck: None,
         }
     }
 
@@ -81,6 +90,7 @@ impl LookupHold {
     fn clear(&mut self) {
         self.until = None;
         self.failures = 0;
+        self.stuck = None;
     }
 
     /// Hold lookups back after one went unanswered: for the `Retry-After`
@@ -241,8 +251,31 @@ impl IdentifyService {
                 .providers
                 .recall_release(&facts, held, RequestPriority::BackgroundSync)
                 .await;
-            if !extra.result.provider_deferred {
+            // Without the held edition `keep` cannot hold the album, so a
+            // held release MusicBrainz cannot answer for defers the attempt
+            // as a busy recall does. A stale stored copy is not used: the
+            // move rules compare against what the held edition states now.
+            // One it answers in a form asking again will not change ends
+            // the attempt at once in Attention, where the Scanning panel
+            // counts it: the album keeps its edition.
+            if extra.result.provider_deferred {
+                recall.provider_deferred = true;
+                recall.failure_code = extra.result.failure_code;
+            } else if extra.result.failure_code.as_deref() == Some(RELEASE_UNREADABLE) {
+                land_job(
+                    &mut job,
+                    AttemptLanding::Attention,
+                    now_ms,
+                    Some(HELD_RELEASE_UNREADABLE),
+                );
+                return self.land(job, IdentificationOutcome::Failed, HELD_RELEASE_UNREADABLE);
+            } else {
                 recall.releases.extend(extra.result.releases);
+                // The merged recording ids the held release's files need
+                // count against every candidate.
+                for (retired, kept) in extra.result.recording_aliases {
+                    recall.recording_aliases.entry(retired).or_insert(kept);
+                }
             }
         }
         if recall.provider_deferred {
@@ -272,15 +305,48 @@ impl IdentifyService {
                 .and(row.release_group_mbid.clone()),
             _ => None,
         };
+        // An administrator who undid an automatic edition of the album's
+        // group got the edition they wanted back: it is not moved again.
+        let may_move = match current.as_ref() {
+            Some(row) if held.is_some() => match row.release_group_mbid.as_deref() {
+                Some(group) => !self
+                    .deps
+                    .store
+                    .edition_change_undone(&facts.local_album_id, group)?,
+                None => false,
+            },
+            _ => false,
+        };
         let (ranking, decision) = self.ranked(
             &facts,
             &recall,
             Held {
                 release: held.as_deref(),
                 doubted_group: doubted.as_deref(),
+                may_move,
             },
             &preferences,
         );
+        // A release MusicBrainz refused may be the one the files are: with
+        // it missing, matching nothing is not evidence, so the job waits as
+        // for an outage instead of marking the album unmatched.
+        let refused = matches!(
+            recall.failure_code.as_deref(),
+            Some(RELEASES_UNREADABLE | TAGGED_RELEASE_UNREADABLE)
+        );
+        if refused && matches!(decision, Decision::Terminal(..) | Decision::Contradictory) {
+            land_job(
+                &mut job,
+                AttemptLanding::Deferred,
+                now_ms,
+                Some(RELEASES_UNREADABLE),
+            );
+            return self.land(
+                job,
+                IdentificationOutcome::ProviderDeferred,
+                "PROVIDER_DEFERRED",
+            );
+        }
         self.apply_decision(job, &facts, &ranking, decision, now_ms)
     }
 
@@ -341,25 +407,38 @@ impl IdentifyService {
     /// answer, newest first, and write each answer in its own transaction.
     /// A lookup that gets no answer stops the batch and holds lookups back
     /// for the `Retry-After` it gave, else 5 minutes doubling to an hour,
-    /// each with up to 20% more. Returns how many ids were answered. An
-    /// answer that cannot be written holds lookups back too.
+    /// each with up to 20% more; that id is asked last in the next batch,
+    /// so it does not hold up the others. Returns how many ids were
+    /// answered. An answer that cannot be written holds lookups back too,
+    /// and only a written answer ends a hold.
     pub async fn resolve_merged_artist_ids(&self, limit: usize) -> Result<usize, StoreError> {
         if lock(&self.artist_hold).held() {
             return Ok(0);
         }
         let mut answered = 0;
-        for mbid in self.deps.store.pending_artist_ids(limit)? {
+        let mut pending = self.deps.store.pending_artist_ids(limit)?;
+        let stuck = lock(&self.artist_hold).stuck.clone();
+        if let Some(stuck) = stuck
+            && let Some(at) = pending.iter().position(|mbid| *mbid == stuck)
+        {
+            let id = pending.remove(at);
+            pending.push(id);
+        }
+        for mbid in pending {
             match self.deps.providers.canonical_artist(&mbid).await {
                 Ok(answer) => {
-                    lock(&self.artist_hold).clear();
                     if let Err(error) = self.deps.store.answer_artist_id(&mbid, &answer) {
                         lock(&self.artist_hold).hold(None);
                         return Err(error);
                     }
+                    lock(&self.artist_hold).clear();
                     answered += 1;
                 }
                 Err(unanswered) => {
-                    lock(&self.artist_hold).hold(unanswered.retry_after_secs);
+                    let mut hold = lock(&self.artist_hold);
+                    hold.hold(unanswered.retry_after_secs);
+                    hold.stuck = Some(mbid.clone());
+                    drop(hold);
                     tracing::debug!(
                         artist_mbid = mbid,
                         error = unanswered.error.0,
@@ -475,7 +554,9 @@ impl IdentifyService {
     /// `candidate_order`), so of two equally close guesses the one the
     /// files complete comes first. `held.release` is the edition the album
     /// already has: it stays unless another edition of its group fits the
-    /// files better by more than the edition cohort.
+    /// files better by more than the edition cohort, or is confirmed as the
+    /// edition the files' barcode or catalog number names (see
+    /// [`moves_to_named_edition`]).
     fn ranked(
         &self,
         facts: &LocalAlbumFacts,
@@ -505,15 +586,16 @@ impl IdentifyService {
                 .eq_ignore_ascii_case(group)
         };
         let verdict = decide(&local, &recall.releases, &matches, prefs);
-        let keep = |index: usize| -> usize {
-            let Some(held) = held.release else {
+        let ids = edition_ids(facts);
+        let keep = |index: usize, confirmed: bool| -> usize {
+            let Some(held_release) = held.release else {
                 return index;
             };
             let chosen = &recall.releases[index];
-            recall
+            let Some(kept) = recall
                 .releases
                 .iter()
-                .position(|release| release.answers_to(held))
+                .position(|release| release.answers_to(held_release))
                 .filter(|kept| {
                     let release = &recall.releases[*kept];
                     let matched = &matches[*kept];
@@ -525,18 +607,40 @@ impl IdentifyService {
                         && matched.library_distance()
                             <= matches[index].library_distance() + EDITION_COHORT
                 })
-                .unwrap_or(index)
+            else {
+                return index;
+            };
+            let moves = confirmed
+                && held.may_move
+                && kept != index
+                && moves_to_named_edition(&local, &ids, &recall.releases, kept, index);
+            if moves {
+                tracing::info!(
+                    album = facts.local_album_id,
+                    from = recall.releases[kept].id,
+                    to = chosen.id,
+                    "the files' barcode or catalog number name another edition; the album moves to it"
+                );
+                index
+            } else {
+                kept
+            }
         };
+        // Without the release the files' tags name, nothing is confirmed:
+        // the pick is a guess and never moves the album to another edition.
+        let tag_unreadable = recall.failure_code.as_deref() == Some(TAGGED_RELEASE_UNREADABLE);
         let verdict = match verdict {
-            Verdict::Identified(index) => Verdict::Identified(keep(index)),
-            Verdict::EditionUncertain(index) => Verdict::EditionUncertain(keep(index)),
-            Verdict::OutsideNamedGroup(index) => Verdict::OutsideNamedGroup(keep(index)),
+            Verdict::Identified(index) => Verdict::Identified(keep(index, !tag_unreadable)),
+            Verdict::EditionUncertain(index) => Verdict::EditionUncertain(keep(index, false)),
+            Verdict::OutsideNamedGroup(index) => Verdict::OutsideNamedGroup(keep(index, false)),
+            Verdict::AudioDisagrees(index) => Verdict::AudioDisagrees(keep(index, false)),
             other => other,
         };
         let lead = match verdict {
             Verdict::Identified(index)
             | Verdict::EditionUncertain(index)
-            | Verdict::OutsideNamedGroup(index) => Some(index),
+            | Verdict::OutsideNamedGroup(index)
+            | Verdict::AudioDisagrees(index) => Some(index),
             _ => None,
         };
         let mut order: Vec<usize> = (0..recall.releases.len()).collect();
@@ -574,10 +678,14 @@ impl IdentifyService {
                     .position(|index| Some(*index) == lead || plausible(*index))
             });
         let decision = match verdict {
+            Verdict::Identified(_) | Verdict::EditionUncertain(_) if tag_unreadable => {
+                Decision::Ambiguous(TAGGED_RELEASE_UNREADABLE.to_owned())
+            }
             Verdict::Identified(_) => Decision::Identified(0),
             Verdict::EditionUncertain(_) => Decision::EditionUncertain,
             Verdict::Review(reason) => Decision::Ambiguous(reason.code().to_owned()),
             Verdict::OutsideNamedGroup(_) => Decision::Ambiguous(NAMED_GROUP_DIFFERS.to_owned()),
+            Verdict::AudioDisagrees(_) => Decision::Ambiguous(AUDIO_DISAGREES.to_owned()),
             Verdict::Contradictory => Decision::Contradictory,
             Verdict::Insufficient => Decision::Terminal(
                 IdentificationOutcome::InsufficientEvidence,
@@ -921,10 +1029,63 @@ struct Held<'a> {
     /// another group: a pick in it stays that guess while nothing names a
     /// group.
     doubted_group: Option<&'a str>,
+    /// The album may move to the edition its files' barcode or catalog
+    /// number names: false once an administrator undid an automatic
+    /// edition of its group.
+    may_move: bool,
+}
+
+/// True when a confirmation of `releases[chosen]` takes the album off
+/// `releases[held]`, another edition of the same group: no file carries a
+/// release ID that could be of that group (the release-ID tag outranks
+/// the barcode and catalog number), the chosen edition states a barcode or
+/// catalog number most files carry and contradicts neither, the held one
+/// states another value and agrees with neither, and the chosen one
+/// contradicts no more of the files' media, country and disc count. A
+/// file's ID blocks when it is the held release's, a recalled release of
+/// the group, or a release recall did not fetch.
+fn moves_to_named_edition(
+    local: &LocalAlbum,
+    ids: &EditionHints,
+    releases: &[Release],
+    held: usize,
+    chosen: usize,
+) -> bool {
+    let (from, to) = (&releases[held], &releases[chosen]);
+    let tag_names_group = local
+        .tracks
+        .iter()
+        .filter_map(|track| track.release_mbid.as_deref())
+        .any(|mbid| {
+            from.answers_to(mbid)
+                || releases
+                    .iter()
+                    .find(|release| release.answers_to(mbid))
+                    .is_none_or(|release| {
+                        release
+                            .release_group_id
+                            .eq_ignore_ascii_case(&from.release_group_id)
+                    })
+        });
+    !tag_names_group
+        && to
+            .release_group_id
+            .eq_ignore_ascii_case(&from.release_group_id)
+        && id_stance(to, ids) == IdStance::Names
+        && id_stance(from, ids) == IdStance::Contradicts
+        && hint_misses(to, &local.hints) <= hint_misses(from, &local.hints)
 }
 
 /// The reason a release outside the group the files name is only a guess.
 pub const NAMED_GROUP_DIFFERS: &str = "NAMED_GROUP_DIFFERS";
+
+/// The reason a release some file's audio disagrees with is only a guess.
+pub const AUDIO_DISAGREES: &str = "AUDIO_DISAGREES";
+
+/// The reason an attempt ended in Attention with the album left on its
+/// edition: MusicBrainz answers for that edition in a form that does not
+/// read.
+pub const HELD_RELEASE_UNREADABLE: &str = "HELD_RELEASE_UNREADABLE";
 
 /// True when the new evidence rules `release` out: it was scored and a
 /// file's own id contradicts it, or its album title or artist do not
