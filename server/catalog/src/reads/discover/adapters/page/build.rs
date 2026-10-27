@@ -6,7 +6,8 @@
 //! to 25 seconds so one slow service only costs its own shelves. The
 //! second builds the shelves that need more reads of their own (Top
 //! Picks, Daily Mixes, radio, the weekly playlist, ...) in parallel under
-//! the same bound. The rest is shaping: artist shelves share a "seen"
+//! the same bound; the Daily Mixes, built once a day from many paced
+//! reads, get a longer one and keep the mixes finished inside it. The rest is shaping: artist shelves share a "seen"
 //! set so an artist appears once on the page, ownership is marked from
 //! the library, and album shelves are deduplicated.
 
@@ -47,6 +48,10 @@ const PICKS_SIMILARITY_BUDGET: Duration = Duration::from_secs(12);
 const RESOLVE_BUDGET: Duration = Duration::from_secs(15);
 /// Bound on one radio shelf.
 const RADIO_BUDGET: Duration = Duration::from_secs(18);
+/// Bound on the day's Daily Mixes: up to five mixes, each from three seeds'
+/// similar artists and their albums, which at ListenBrainz's pace of about
+/// one read a second is more than [`TASK_TIMEOUT`] allows.
+const MIXES_BUDGET: Duration = Duration::from_secs(120);
 /// Seed artists the page builds from.
 const SEEDS: usize = 3;
 /// Rediscover: artists played at least this often...
@@ -152,9 +157,35 @@ impl Tracker {
     }
 }
 
+/// Run `builds` one after another until `deadline`. What finished in time
+/// is kept, so a slow source costs the builds it did not reach, not the
+/// ones it already made; the flag says whether every build finished.
+async fn in_order_until<T, B>(
+    deadline: tokio::time::Instant,
+    builds: impl IntoIterator<Item = B>,
+) -> (Vec<T>, bool)
+where
+    B: Future<Output = Option<T>>,
+{
+    let mut built = Vec::new();
+    for build in builds {
+        match tokio::time::timeout_at(deadline, build).await {
+            Ok(Some(item)) => built.push(item),
+            Ok(None) => {}
+            Err(_) => return (built, false),
+        }
+    }
+    (built, true)
+}
+
 /// Run a shelf builder under the task bound; a timeout empties it.
 async fn bounded<T: Default>(what: &str, build: impl Future<Output = T>) -> T {
-    match tokio::time::timeout(TASK_TIMEOUT, build).await {
+    bounded_by(what, TASK_TIMEOUT, build).await
+}
+
+/// [`bounded`] with a bound of its own.
+async fn bounded_by<T: Default>(what: &str, bound: Duration, build: impl Future<Output = T>) -> T {
+    match tokio::time::timeout(bound, build).await {
         Ok(value) => value,
         Err(_) => {
             tracing::warn!(shelf = what, "discover shelf timed out; leaving it empty");
@@ -307,8 +338,11 @@ impl Builder<'_> {
                 "recent scrobbles",
                 self.lastfm_album_shelf(&shared.lastfm_recent, 30, "Recently Scrobbled", true,)
             ),
-            bounded(
+            // The mixes stop at MIXES_BUDGET themselves and keep what is
+            // built; this bound only catches a read that never returns.
+            bounded_by(
                 "daily mixes",
+                MIXES_BUDGET + TASK_TIMEOUT,
                 self.daily_mixes(user_id, &user, primary, &seeds, &shared, &library_groups)
             ),
             bounded(
@@ -413,6 +447,12 @@ impl Builder<'_> {
         // for users who chose Last.fm.
         let lastfm_similar = user.lastfm
             && (primary == MusicSource::LastFm || sources.listenbrainz_popularity_down());
+        // Blended, a user with both services gets both lists, merged; a
+        // popularity outage leaves the Last.fm one alone, as above.
+        let blend_similar = self.settings.queue.blend_services
+            && user.lastfm
+            && user.listenbrainz.is_some()
+            && !sources.listenbrainz_popularity_down();
         const SIMILAR_KEYS: [&str; SEEDS] = ["similar_0", "similar_1", "similar_2"];
         let similar = join_all(seeds.iter().take(SEEDS).enumerate().map(|(index, seed)| {
             let key = SIMILAR_KEYS[index];
@@ -421,7 +461,20 @@ impl Builder<'_> {
                     return Vec::new();
                 };
                 let read = async {
-                    if lastfm_similar {
+                    if blend_similar {
+                        let (lastfm, listenbrainz) = tokio::join!(
+                            sources.lastfm_similar_scored(user_id, seed, 20),
+                            sources.listenbrainz_similar_scored(user_id, mbid, 20),
+                        );
+                        match (lastfm, listenbrainz) {
+                            (Err(cause), Err(_)) => Err(cause),
+                            (lastfm, listenbrainz) => Ok(blend_scored(
+                                lastfm.unwrap_or_default(),
+                                listenbrainz.unwrap_or_default(),
+                                20,
+                            )),
+                        }
+                    } else if lastfm_similar {
                         sources.lastfm_similar_scored(user_id, seed, 20).await
                     } else {
                         sources.listenbrainz_similar_scored(user_id, mbid, 20).await
@@ -724,13 +777,33 @@ impl Builder<'_> {
         if let Some(mixes) = self.memo.mixes(&memo_key, self.now) {
             return mixes;
         }
-        let mixes = self
-            .build_daily_mixes(user_id, user, primary, seeds, shared, library_groups)
+        let deadline = tokio::time::Instant::now() + MIXES_BUDGET;
+        let (mixes, complete) = self
+            .build_daily_mixes(
+                user_id,
+                user,
+                primary,
+                seeds,
+                shared,
+                library_groups,
+                deadline,
+            )
             .await;
-        self.memo.store_mixes(memo_key, mixes.clone(), self.now);
+        if complete {
+            self.memo.store_mixes(memo_key, mixes.clone(), self.now);
+        } else {
+            // Not kept for the day: the next build makes the rest, its
+            // reads now mostly answered from the provider cache.
+            tracing::warn!(
+                built = mixes.len(),
+                "daily mixes ran out of time; keeping the ones built"
+            );
+        }
         mixes
     }
 
+    /// The mixes built by `deadline`, and whether every one was.
+    #[allow(clippy::too_many_arguments)]
     async fn build_daily_mixes(
         &self,
         user_id: &str,
@@ -739,7 +812,8 @@ impl Builder<'_> {
         seeds: &[ArtistRow],
         shared: &Shared,
         library_groups: &HashSet<String>,
-    ) -> Vec<ChartSection> {
+        deadline: tokio::time::Instant,
+    ) -> (Vec<ChartSection>, bool) {
         let mut preferred: Vec<String> = Vec::new();
         for (name, _) in shared.genres.iter().flatten() {
             let folded = fold(name);
@@ -764,7 +838,7 @@ impl Builder<'_> {
         }
         let top = or_empty("top genres", self.library.top_genres(20).await);
         if top.is_empty() {
-            return Vec::new();
+            return (Vec::new(), true);
         }
         let mut ordered = preferred.clone();
         for (genre, _) in &top {
@@ -796,24 +870,25 @@ impl Builder<'_> {
         }
         clusters.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
         clusters.truncate(5);
-        let mut mixes = Vec::new();
-        for (index, (genre, artists)) in clusters.into_iter().enumerate() {
-            if let Some(mix) = self
-                .one_daily_mix(
-                    user_id,
-                    user,
-                    primary,
-                    index,
-                    &genre,
-                    artists,
-                    library_groups,
-                )
-                .await
-            {
-                mixes.push(mix);
-            }
-        }
-        mixes
+        in_order_until(
+            deadline,
+            clusters
+                .into_iter()
+                .enumerate()
+                .map(|(index, (genre, artists))| async move {
+                    self.one_daily_mix(
+                        user_id,
+                        user,
+                        primary,
+                        index,
+                        &genre,
+                        artists,
+                        library_groups,
+                    )
+                    .await
+                }),
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1581,6 +1656,37 @@ fn mix_split(fresh: usize, familiar: usize) -> (usize, usize) {
     (new_count, familiar_count)
 }
 
+/// Merge two services' similar artists. Each list's scores are scaled to
+/// its own best (Last.fm's match runs 0 to 1, ListenBrainz's score is a
+/// raw count), an artist both suggest adds its two scores up so agreement
+/// ranks first, and the best `limit` are kept.
+fn blend_scored(
+    one: Vec<ScoredArtist>,
+    other: Vec<ScoredArtist>,
+    limit: usize,
+) -> Vec<ScoredArtist> {
+    let mut merged: Vec<ScoredArtist> = Vec::new();
+    let mut index: HashMap<String, usize> = HashMap::new();
+    for list in [one, other] {
+        let best = list.iter().map(|row| row.score).fold(0.0_f64, f64::max);
+        for mut row in list {
+            row.score = if best > 0.0 { row.score / best } else { 0.0 };
+            let key =
+                normalize(row.artist.mbid.as_deref()).unwrap_or_else(|| fold(&row.artist.name));
+            match index.get(&key) {
+                Some(&at) => merged[at].score += row.score,
+                None => {
+                    index.insert(key, merged.len());
+                    merged.push(row);
+                }
+            }
+        }
+    }
+    merged.sort_by(|a, b| b.score.total_cmp(&a.score));
+    merged.truncate(limit);
+    merged
+}
+
 /// One "Because You Listen To" shelf per seed with similar artists. A
 /// later seed needs at least three artists no earlier shelf showed.
 fn because_sections(
@@ -1985,12 +2091,62 @@ pub async fn mark_ownership(pool: &sqlx::SqlitePool, page: &mut DiscoverResponse
 
 #[cfg(test)]
 mod tests {
-    use super::mix_split;
+    use std::time::Duration;
+
+    use super::{in_order_until, mix_split};
+
+    /// The second build never answers: the first is kept, the third is not
+    /// reached, and the result says it is incomplete.
+    #[tokio::test]
+    async fn a_build_cut_off_by_the_deadline_keeps_the_ones_before_it() {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+        let builds = [1, 2, 3].map(|n| async move {
+            if n == 2 {
+                std::future::pending::<()>().await;
+            }
+            Some(n)
+        });
+        assert_eq!(in_order_until(deadline, builds).await, (vec![1], false));
+    }
+
+    #[tokio::test]
+    async fn builds_that_finish_in_time_are_all_kept() {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let builds = [Some(1), None, Some(3)].map(|n| async move { n });
+        assert_eq!(in_order_until(deadline, builds).await, (vec![1, 3], true));
+    }
 
     #[test]
     fn mix_split_prefers_sixty_forty_and_tops_up_the_short_side() {
         assert_eq!(mix_split(20, 20), (7, 5));
         assert_eq!(mix_split(2, 20), (2, 10));
         assert_eq!(mix_split(20, 1), (11, 1));
+    }
+
+    fn scored(name: &str, mbid: &str, score: f64) -> super::ScoredArtist {
+        super::ScoredArtist {
+            artist: super::ArtistRow {
+                name: name.to_owned(),
+                mbid: Some(mbid.to_owned()),
+                listen_count: 0,
+            },
+            score,
+        }
+    }
+
+    /// Last.fm's 0..1 match and ListenBrainz's raw count weigh alike once
+    /// scaled; an artist both suggest comes first, named once.
+    #[test]
+    fn blended_similar_artists_rank_agreement_first() {
+        let lastfm = vec![scored("Both", "B", 0.5), scored("Last.fm only", "L", 0.25)];
+        let listenbrainz = vec![
+            scored("ListenBrainz only", "Z", 900.0),
+            scored("Both", "b", 450.0),
+        ];
+        let blended = super::blend_scored(lastfm, listenbrainz, 10);
+        let names: Vec<&str> = blended.iter().map(|row| row.artist.name.as_str()).collect();
+        assert_eq!(names, ["Both", "ListenBrainz only", "Last.fm only"]);
+        assert!((blended[0].score - 1.5).abs() < 1e-9);
+        assert_eq!(super::blend_scored(blended, Vec::new(), 2).len(), 2);
     }
 }
