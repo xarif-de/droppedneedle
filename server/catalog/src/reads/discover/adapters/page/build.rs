@@ -209,6 +209,31 @@ struct Shared {
     library_albums: Vec<super::library::LibraryAlbum>,
 }
 
+/// The source a shelf names when it grew from blended seed artists and
+/// similar artists (see [`name_both_services`]).
+const BOTH_SERVICES: &str = "lastfm+listenbrainz";
+
+/// Name both services on the shelves that grow from the seed artists and
+/// their similar artists, which a blended build reads from both: Because
+/// You Listen To, Artists You Might Like, Top Picks and the radio shelves.
+/// The rest keeps the service it was read from.
+fn name_both_services(page: &mut DiscoverResponse) {
+    let both = || Some(BOTH_SERVICES.to_owned());
+    for because in &mut page.because_you_listen_to {
+        because.section.source = both();
+    }
+    for section in page
+        .artists_you_might_like
+        .iter_mut()
+        .chain(&mut page.radio_sections)
+    {
+        section.source = both();
+    }
+    if let Some(picks) = &mut page.top_picks {
+        picks.source = both();
+    }
+}
+
 fn source_label(source: MusicSource) -> &'static str {
     match source {
         MusicSource::ListenBrainz => "listenbrainz",
@@ -418,6 +443,13 @@ impl Builder<'_> {
             self.settings.download_client,
             user.lastfm,
         );
+        if self.settings.queue.blend_services
+            && user.lastfm
+            && user.lastfm_username.is_some()
+            && user.listenbrainz.is_some()
+        {
+            name_both_services(&mut page);
+        }
         mark_ownership(self.library_pool(), &mut page).await;
         shelves::dedupe_albums(&mut page);
         Built {
