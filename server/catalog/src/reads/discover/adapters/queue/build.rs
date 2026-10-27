@@ -181,9 +181,20 @@ fn lower_ids(items: &[QueueItemLight]) -> HashSet<String> {
         .collect()
 }
 
+/// ListenBrainz statistics windows seeds are read from: recent listening
+/// first, wider windows for quiet but real history.
+const SEED_WINDOWS: [StatsRange; 4] = [
+    StatsRange::ThisWeek,
+    StatsRange::ThisMonth,
+    StatsRange::ThisYear,
+    StatsRange::AllTime,
+];
+
 /// Seed artists from the user's listening: Last.fm top artists for a
 /// Last.fm user, else ListenBrainz top artists over widening windows,
-/// else Jellyfin's most played and favorite artists.
+/// else Jellyfin's most played and favorite artists. With the services
+/// blended and both linked, both top-artist lists take turns, the
+/// primary service's first, and an artist on both counts once.
 pub(in crate::reads::discover::adapters) async fn seed_artists(
     ctx: &BuildContext<'_>,
     user_id: &str,
@@ -208,6 +219,56 @@ pub(in crate::reads::discover::adapters) async fn seed_artists(
             }
         }
     };
+    if ctx.settings.blend_services
+        && user.lastfm
+        && let (Some(lastfm_user), Some(listenbrainz_user)) =
+            (&user.lastfm_username, &user.listenbrainz)
+    {
+        let (lastfm, listenbrainz) = tokio::join!(
+            async {
+                or_empty(
+                    "lastfm top artists",
+                    ctx.sources
+                        .lastfm_top_artists(
+                            user_id,
+                            lastfm_user,
+                            10.max(wanted as u32),
+                            ctx.priority,
+                        )
+                        .await,
+                )
+            },
+            async {
+                let mut rows: Vec<ArtistRow> = Vec::new();
+                let mut distinct = HashSet::new();
+                for range in SEED_WINDOWS {
+                    if distinct.len() >= wanted {
+                        break;
+                    }
+                    let read = or_empty(
+                        "listenbrainz top artists",
+                        ctx.sources
+                            .listenbrainz_top_artists(
+                                listenbrainz_user,
+                                range,
+                                10.max(wanted as u32),
+                                ctx.priority,
+                            )
+                            .await,
+                    );
+                    distinct.extend(read.iter().filter_map(|row| normalize(row.mbid.as_deref())));
+                    rows.extend(read);
+                }
+                rows
+            },
+        );
+        let (first, second) = match source {
+            MusicSource::LastFm => (lastfm, listenbrainz),
+            MusicSource::ListenBrainz => (listenbrainz, lastfm),
+        };
+        take(interleave(first, second), &mut seeds);
+        return seeds;
+    }
     if source == MusicSource::LastFm
         && user.lastfm
         && let Some(username) = &user.lastfm_username
@@ -224,13 +285,7 @@ pub(in crate::reads::discover::adapters) async fn seed_artists(
         return seeds;
     }
     if let Some(username) = &user.listenbrainz {
-        // Recent listening first, wider windows for quiet but real history.
-        for range in [
-            StatsRange::ThisWeek,
-            StatsRange::ThisMonth,
-            StatsRange::ThisYear,
-            StatsRange::AllTime,
-        ] {
+        for range in SEED_WINDOWS {
             if seeds.len() >= wanted {
                 break;
             }
@@ -258,6 +313,22 @@ pub(in crate::reads::discover::adapters) async fn seed_artists(
         }
     }
     seeds
+}
+
+/// `first` and `second` taking turns, `first` leading; the longer one's
+/// rest comes last.
+pub(in crate::reads::discover::adapters) fn interleave<T>(first: Vec<T>, second: Vec<T>) -> Vec<T> {
+    let mut out = Vec::with_capacity(first.len() + second.len());
+    let (mut first, mut second) = (first.into_iter(), second.into_iter());
+    loop {
+        match (first.next(), second.next()) {
+            (None, None) => return out,
+            (one, other) => {
+                out.extend(one);
+                out.extend(other);
+            }
+        }
+    }
 }
 
 /// Release groups the user has played, so deep cuts skip them.
@@ -1017,4 +1088,16 @@ async fn anonymous(
     }
     items.truncate(count);
     items
+}
+
+#[cfg(test)]
+mod tests {
+    use super::interleave;
+
+    #[test]
+    fn interleave_takes_turns_and_keeps_the_longer_rest() {
+        assert_eq!(interleave(vec![1, 3], vec![2, 4, 5, 6]), [1, 2, 3, 4, 5, 6]);
+        assert_eq!(interleave(vec![1, 2], Vec::new()), [1, 2]);
+        assert_eq!(interleave(Vec::<u8>::new(), Vec::new()), Vec::<u8>::new());
+    }
 }
