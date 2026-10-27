@@ -687,12 +687,19 @@ async fn blended_services_seed_the_page_from_both() {
             .filter_map(|shelf| shelf["seed_artist"].as_str())
             .collect();
         let shown = page.to_string().contains("Last.fm Pick");
+        let because_source = &page["because_you_listen_to"][0]["section"]["source"];
         if blend {
             assert_eq!(seeds, ["Seed", "Scrobbled Seed"], "both services seed");
             assert!(shown, "Last.fm's similar artist is on the page");
+            assert_eq!(
+                because_source, "lastfm+listenbrainz",
+                "the shelf names both"
+            );
+            assert_eq!(page["top_picks"]["source"], "lastfm+listenbrainz");
         } else {
             assert_eq!(seeds, ["Seed"], "the primary service alone");
             assert!(!shown, "Last.fm is not asked for similar artists");
+            assert_eq!(because_source, "listenbrainz", "the primary service alone");
         }
     }
 }
