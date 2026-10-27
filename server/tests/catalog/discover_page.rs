@@ -33,6 +33,7 @@ use droppedneedle_catalog::reads::discover::ports::BoxFuture;
 use droppedneedle_catalog::reads::discover::services::ReadsDeps;
 use droppedneedle_kernel::clock::{ManualClock, SystemClock};
 use droppedneedle_kernel::db::{DbRuntime, Lane};
+use droppedneedle_kernel::runtime_config::secret_sections::AdvancedSettings;
 use serde_json::{Value, json};
 use tower::ServiceExt as _;
 
@@ -62,19 +63,25 @@ fn ranked(n: u8, artist: &str, listens: i64) -> RankedAlbum {
 }
 
 /// A ListenBrainz user with one seed artist, three similar artists with
-/// two albums each, a worldwide chart and one fresh release.
-struct Scripted;
+/// two albums each, a worldwide chart and one fresh release. With
+/// `lastfm_too` the user has Last.fm linked as well: one more top artist
+/// there, and three artists per seed only Last.fm finds similar.
+#[derive(Default)]
+struct Scripted {
+    lastfm_too: bool,
+}
 
 impl QueueSources for Scripted {
     fn source_key(&self) -> String {
         "official:g0".to_owned()
     }
     fn user_music<'a>(&'a self, _user_id: &'a str) -> BoxFuture<'a, UserMusic> {
-        Box::pin(async {
+        let lastfm_too = self.lastfm_too;
+        Box::pin(async move {
             UserMusic {
                 listenbrainz: Some("listener".to_owned()),
-                lastfm_username: None,
-                lastfm: false,
+                lastfm_username: lastfm_too.then(|| "scrobbler".to_owned()),
+                lastfm: lastfm_too,
                 jellyfin: false,
                 primary: MusicSource::ListenBrainz,
             }
@@ -167,7 +174,14 @@ impl QueueSources for Scripted {
         _l: u32,
         _priority: droppedneedle_providers::RequestPriority,
     ) -> BoxFuture<'a, SourceResult<Vec<ArtistRow>>> {
-        ok(Vec::new())
+        if !self.lastfm_too {
+            return ok(Vec::new());
+        }
+        ok(vec![ArtistRow {
+            name: "Scrobbled Seed".to_owned(),
+            mbid: Some(mbid('d', 1)),
+            listen_count: 40,
+        }])
     }
     fn lastfm_similar_artists<'a>(
         &'a self,
@@ -361,10 +375,24 @@ impl PageSources for Scripted {
     fn lastfm_similar_scored<'a>(
         &'a self,
         _user: &'a str,
-        _a: &'a ArtistRow,
+        seed: &'a ArtistRow,
         _l: u32,
     ) -> BoxFuture<'a, SourceResult<Vec<ScoredArtist>>> {
-        ok(Vec::new())
+        if !self.lastfm_too {
+            return ok(Vec::new());
+        }
+        // Three of its own per seed, so each seed's shelf has new artists.
+        let first: u8 = if seed.name == "Seed" { 1 } else { 4 };
+        ok((first..first + 3)
+            .map(|n| ScoredArtist {
+                artist: ArtistRow {
+                    name: format!("Last.fm Pick {n}"),
+                    mbid: Some(mbid('e', n)),
+                    listen_count: 0,
+                },
+                score: 0.9,
+            })
+            .collect())
     }
     fn lastfm_weekly_artists<'a>(
         &'a self,
@@ -421,10 +449,25 @@ impl PageSources for Scripted {
 }
 
 fn page_app(runtime: &DbRuntime, dir: &std::path::Path) -> Router {
+    page_app_with(runtime, dir, Scripted::default(), None)
+}
+
+/// [`page_app`] over `sources`, with `advanced` saved first when given.
+fn page_app_with(
+    runtime: &DbRuntime,
+    dir: &std::path::Path,
+    sources: Scripted,
+    advanced: Option<AdvancedSettings>,
+) -> Router {
     let config = crate::common::config_store(dir);
+    if let Some(advanced) = advanced {
+        config
+            .save_secret_blocking(advanced)
+            .expect("advanced settings save");
+    }
     let pool = runtime.db().sqlx().clone();
     let page = LiveDiscover::new(PageInputs {
-        sources: Arc::new(Scripted),
+        sources: Arc::new(sources),
         queue_db: QueueDb::new(runtime.db().clone()),
         db: PageDb::new(runtime.db().clone()),
         advanced: config.live(),
@@ -585,4 +628,71 @@ async fn page_builds_in_the_background_is_saved_and_records_activity() {
 
     let (status, _) = call(&restarted, "POST", "/api/v3/discover/refresh", None).await;
     assert_eq!(status, StatusCode::ACCEPTED);
+}
+
+async fn seeded_user(runtime: &DbRuntime) {
+    runtime
+        .db()
+        .write(Lane::Foreground, "test.seed", |tx| {
+            tx.execute(
+                "INSERT INTO auth_users (id, display_name, role, created_at) \
+                 VALUES ('user-1', 'Ada', 'user', '2026-01-01T00:00:00Z')",
+                [],
+            )?;
+            Ok::<_, droppedneedle_kernel::db::DbError>(())
+        })
+        .await
+        .expect("user row");
+}
+
+/// The page once its first background build has finished.
+async fn built_page(app: &Router) -> Value {
+    let mut page = call(app, "GET", "/api/v3/discover", None).await.1;
+    for _ in 0..250 {
+        if page["refreshing"] == false {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        page = call(app, "GET", "/api/v3/discover", None).await.1;
+    }
+    assert_eq!(page["refreshing"], false, "the build finished");
+    page
+}
+
+/// A user with both services linked is seeded from the primary one alone,
+/// until the services are blended: then the Last.fm top artist gets a
+/// Because shelf next to the ListenBrainz one, and an artist only Last.fm
+/// finds similar shows up on the page.
+#[tokio::test]
+async fn blended_services_seed_the_page_from_both() {
+    for blend in [false, true] {
+        let dir = crate::common::ScratchDir::new("discover-page-blend");
+        let runtime = crate::common::scratch_runtime(&dir.join("app.db")).await;
+        seeded_user(&runtime).await;
+        let app = page_app_with(
+            &runtime,
+            &dir,
+            Scripted { lastfm_too: true },
+            Some(AdvancedSettings {
+                discover_blend_listening_services: blend,
+                ..AdvancedSettings::default()
+            }),
+        );
+        let page = built_page(&app).await;
+
+        let seeds: Vec<&str> = page["because_you_listen_to"]
+            .as_array()
+            .expect("because shelves")
+            .iter()
+            .filter_map(|shelf| shelf["seed_artist"].as_str())
+            .collect();
+        let shown = page.to_string().contains("Last.fm Pick");
+        if blend {
+            assert_eq!(seeds, ["Seed", "Scrobbled Seed"], "both services seed");
+            assert!(shown, "Last.fm's similar artist is on the page");
+        } else {
+            assert_eq!(seeds, ["Seed"], "the primary service alone");
+            assert!(!shown, "Last.fm is not asked for similar artists");
+        }
+    }
 }
