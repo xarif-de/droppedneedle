@@ -271,3 +271,43 @@ pub const RATES: &[RateRow] = &[
 pub fn row(source: &str) -> Option<&'static RateRow> {
     RATES.iter().find(|row| row.source == source)
 }
+
+/// Rows that reach one operator's front door and share one budget on top of
+/// their own: a request of any member takes a token from its row and one
+/// from the shared bucket.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SharedBudget {
+    /// The budget's name.
+    pub name: &'static str,
+    /// The member rows, by key.
+    pub sources: &'static [&'static str],
+    /// Sustained requests per second, all members together.
+    pub per_second: f64,
+    /// How many requests may go at once after a quiet spell.
+    pub burst: u32,
+    /// Why the members share it, in one line.
+    pub basis: &'static str,
+}
+
+/// Every shared budget.
+pub const SHARED_BUDGETS: &[SharedBudget] = &[SharedBudget {
+    name: "metabrainz",
+    sources: &["musicbrainz", "coverartarchive", "listenbrainz"],
+    // xarif build: this whole server sends MetaBrainz at most one request a
+    // second, all its services together (operator rule 2026-10-27). 0.8
+    // spaces requests 1.25 s apart, so network jitter cannot bunch two into
+    // one second at MetaBrainz's end.
+    per_second: 0.8,
+    burst: 1,
+    basis: "musicbrainz.org, coverartarchive.org and listenbrainz.org share one front \
+            door (142.132.241.153); a burst on one made every MetaBrainz host refuse \
+            this client (coverartarchive row). xarif build: one budget below 1/s.",
+}];
+
+/// The shared budget a row belongs to, if any.
+#[must_use]
+pub fn shared_budget(source: &str) -> Option<&'static SharedBudget> {
+    SHARED_BUDGETS
+        .iter()
+        .find(|budget| budget.sources.contains(&source))
+}
