@@ -29,7 +29,12 @@ fork:
         - cargo fmt --check
         - cargo clippy --workspace --all-targets -- -D warnings
         - cargo clippy --workspace --lib --bins -- -D warnings
-        - cargo test --workspace
+        # -j 3: at the default (one build job per CPU) this step filled the dind container's
+        # then 8 GiB and the run thrashed for hours (sync PR #75, 2026-10-27: `cargo test` from
+        # 01:20Z, OOM kill in the runner pod at 03:04Z; kubernetes/forgejo-runner now allows
+        # 12 GiB). Linking the test binaries in parallel is the measured peak: locally
+        # `ld terminated with signal 9` in a 16 GiB VM at the default, green at -j 3.
+        - cargo test --workspace -j 3
     - name: frontend              # jobs Lint, Format & Type Check, Tests
       image: node:22-bookworm@sha256:63538dfe497cc29dfafdda25ada09b46db68a3f4cc205abf1f5d6bf0913f3384
       workdir: frontend           # .github/node-version: 22; pnpm from package.json packageManager
