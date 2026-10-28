@@ -1,0 +1,28 @@
+# Patch topics in stacking order: <topic> base=<upstream sha> pr=<user-fork branch>|local [guard=<table>.<column>,…]
+# Each topic is the ref refs/xarif/patch/<topic> (.xarif/pr.sh get/save); fork-sync rebases them onto the target in this order.
+# pr=local: our own policy (rates, the shared MetaBrainz budget, SSO-only login, the User-Agent id slot of musicbrainz-user-agent-form), never sent upstream.
+joined-cover-fetch-test-margin base=5b7a167a19b32201e0b2e1438fc258285b2a7e66 pr=joined-cover-fetch-test-margin
+musicbrainz-user-agent-app-form base=5b7a167a19b32201e0b2e1438fc258285b2a7e66 pr=musicbrainz-user-agent-app-form
+musicbrainz-user-agent-form base=5b7a167a19b32201e0b2e1438fc258285b2a7e66 pr=local
+metabrainz-rates base=5b7a167a19b32201e0b2e1438fc258285b2a7e66 pr=local
+metabrainz-shared-budget base=5b7a167a19b32201e0b2e1438fc258285b2a7e66 pr=local
+oidc-callback-reads-exchange-answer base=5b7a167a19b32201e0b2e1438fc258285b2a7e66 pr=oidc-callback-reads-exchange-answer
+login-redirects-to-sso base=5b7a167a19b32201e0b2e1438fc258285b2a7e66 pr=local
+ignore-non-mbid-release-tags base=5b7a167a19b32201e0b2e1438fc258285b2a7e66 pr=ignore-non-mbid-release-tags
+quiet-audio-decoder-logs base=5b7a167a19b32201e0b2e1438fc258285b2a7e66 pr=quiet-audio-decoder-logs
+drop-empty-vorbis-values base=5b7a167a19b32201e0b2e1438fc258285b2a7e66 pr=drop-empty-vorbis-values
+log-why-a-file-is-unreadable base=5b7a167a19b32201e0b2e1438fc258285b2a7e66 pr=log-why-a-file-is-unreadable
+mp3-padding-after-id3-tag base=5b7a167a19b32201e0b2e1438fc258285b2a7e66 pr=mp3-padding-after-id3-tag
+id3v23-original-date-as-year base=5b7a167a19b32201e0b2e1438fc258285b2a7e66 pr=id3v23-original-date-as-year
+catalogue-files-with-unparsable-items base=5b7a167a19b32201e0b2e1438fc258285b2a7e66 pr=catalogue-files-with-unparsable-items
+settled-identification-failure base=5b7a167a19b32201e0b2e1438fc258285b2a7e66 pr=settled-identification-failure
+no-404-for-missing-art-and-unserved-subsonic base=5b7a167a19b32201e0b2e1438fc258285b2a7e66 pr=no-404-for-missing-art-and-unserved-subsonic
+track-target-prefers-own-release-over-compilation base=5b7a167a19b32201e0b2e1438fc258285b2a7e66 pr=track-target-prefers-own-release-over-compilation
+listenbrainz-rate-limit-lets-lastfm-stand-in base=5b7a167a19b32201e0b2e1438fc258285b2a7e66 pr=listenbrainz-rate-limit-lets-lastfm-stand-in
+no-restore-offer-for-a-root-with-no-file-left base=5b7a167a19b32201e0b2e1438fc258285b2a7e66 pr=no-restore-offer-for-a-root-with-no-file-left
+profile-hides-navidrome-folders-when-not-connected base=5b7a167a19b32201e0b2e1438fc258285b2a7e66 pr=profile-hides-navidrome-folders-when-not-connected
+lastfm-link-needs-a-session base=5b7a167a19b32201e0b2e1438fc258285b2a7e66 pr=lastfm-link-needs-a-session
+daily-mixes-survive-a-slow-source base=5b7a167a19b32201e0b2e1438fc258285b2a7e66 pr=daily-mixes-survive-a-slow-source
+discover-caches-outlive-the-warm-cycle base=5b7a167a19b32201e0b2e1438fc258285b2a7e66 pr=discover-caches-outlive-the-warm-cycle
+discover-blends-lastfm-and-listenbrainz base=5b7a167a19b32201e0b2e1438fc258285b2a7e66 pr=discover-blends-lastfm-and-listenbrainz
+quiet-routine-checkpoint-passes base=5b7a167a19b32201e0b2e1438fc258285b2a7e66 pr=quiet-routine-checkpoint-passes
