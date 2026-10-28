@@ -25,3 +25,4 @@ lastfm-link-needs-a-session base=5b7a167a19b32201e0b2e1438fc258285b2a7e66 pr=las
 daily-mixes-survive-a-slow-source base=5b7a167a19b32201e0b2e1438fc258285b2a7e66 pr=daily-mixes-survive-a-slow-source
 discover-caches-outlive-the-warm-cycle base=5b7a167a19b32201e0b2e1438fc258285b2a7e66 pr=discover-caches-outlive-the-warm-cycle
 discover-blends-lastfm-and-listenbrainz base=5b7a167a19b32201e0b2e1438fc258285b2a7e66 pr=discover-blends-lastfm-and-listenbrainz
+quiet-routine-checkpoint-passes base=5b7a167a19b32201e0b2e1438fc258285b2a7e66 pr=quiet-routine-checkpoint-passes
