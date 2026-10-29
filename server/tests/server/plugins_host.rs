@@ -14,6 +14,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::common::plugin_fakes::{
+    FakeConnection, FakeFetcher, FakeLauncher, scrobble_plugin_event,
+};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use droppedneedle_auth::Principal;
@@ -22,25 +25,20 @@ use droppedneedle_auth::users::roles::Role;
 use droppedneedle_kernel::clock::SystemClock;
 use droppedneedle_kernel::db::Db;
 use droppedneedle_kernel::jobs::plugin_ticks::{
-    MemoryTickStore, TickHost as JobsTickHost, TickPlugin as JobsTickPlugin,
+    SqliteTickStore, TickHost as JobsTickHost, TickPlugin as JobsTickPlugin,
 };
 use droppedneedle_kernel::jobs::queue::JobQueue;
 use droppedneedle_kernel::platform::Platform;
 use droppedneedle_kernel::runtime_config::ConfigStore;
 use droppedneedle_kernel::runtime_config::crypto::Crypto;
 use droppedneedle_library::wiring::LibraryCore;
-use droppedneedle_plugins::fakes::{
-    FakeConnection, FakeFetcher, FakeLauncher, FakeUnpacker, scrobble_plugin_event,
-};
 use droppedneedle_plugins::handlers::{ExtRateLimiter, PluginsDeps, plugin_routes};
 use droppedneedle_plugins::host::PluginHost;
 use droppedneedle_plugins::install::{Fetched, InstallError, parse_source, resolve};
 use droppedneedle_plugins::models::PluginRefKind;
 use droppedneedle_plugins::protocol::methods;
 use droppedneedle_plugins::runtime::{PublishPayload, ScrobbleEvent};
-use droppedneedle_plugins::ticks::{
-    HostTickAdapter, NoopTickSync, PluginTickLoops, TickLoopSync, TickStoreKind,
-};
+use droppedneedle_plugins::ticks::{HostTickAdapter, PluginTickLoops, TICK_CANCEL_GRACE};
 use serde_json::json;
 use tower::ServiceExt as _;
 
@@ -56,7 +54,7 @@ struct Rig {
     config: Arc<ConfigStore>,
     launcher: Arc<FakeLauncher>,
     /// The host's plugin state store.
-    ticks: TickStoreKind,
+    ticks: SqliteTickStore,
     /// The platform the library's write side is built over: its settings
     /// hold the library folders plugin files go to.
     platform: Platform,
@@ -69,17 +67,17 @@ async fn rig(tag: &str) -> Rig {
     let crypto = Crypto::from_key_bytes(&[7u8; 32]).unwrap();
     let config = Arc::new(ConfigStore::scratch(&dir, crypto).unwrap());
     let launcher = Arc::new(FakeLauncher::new());
-    let ticks = TickStoreKind::Memory(MemoryTickStore::new());
     crate::common::migrated_db(&dir.join("app.db"));
     let db = Db::open_for_tests(&dir.join("app.db")).unwrap();
     let platform = crate::common::TestPlatform::on(&db, &dir).build().await;
+    let ticks = droppedneedle_plugins::wiring::tick_store(&platform);
     let library =
         crate::common::library::library_core(&platform, JobQueue::new(db, Arc::new(SystemClock)));
     let host = PluginHost::new(
         dir.join("plugins"),
         Arc::clone(&config),
         launcher.clone(),
-        Arc::new(ticks.clone()),
+        ticks.clone(),
         library.clone(),
     );
     Rig {
@@ -106,25 +104,24 @@ fn session(user_id: &str) -> Principal {
     )
 }
 
-fn deps_for(rig: &Rig, fetcher: Arc<FakeFetcher>, unpacker: Arc<FakeUnpacker>) -> PluginsDeps {
+fn deps_for(rig: &Rig, fetcher: Arc<FakeFetcher>) -> PluginsDeps {
     PluginsDeps {
         host: Arc::clone(&rig.host),
         config: Arc::clone(&rig.config),
         github: droppedneedle::bootstrap::Outbound::live().plugin_hosts(),
         fetcher,
-        unpacker,
-        tick_sync: Arc::new(NoopTickSync),
+        tick_sync: Arc::new(PluginTickLoops::new(
+            rig.platform.supervisor.clone(),
+            rig.ticks.clone(),
+            TICK_CANCEL_GRACE,
+        )),
         ext_limiter: Arc::new(ExtRateLimiter::new()),
         clock: Arc::new(droppedneedle_kernel::clock::SystemClock),
     }
 }
 
 fn router_as(rig: &Rig, user: &str) -> axum::Router {
-    let deps = deps_for(
-        rig,
-        Arc::new(FakeFetcher::new()),
-        Arc::new(FakeUnpacker::new(Vec::new())),
-    );
+    let deps = deps_for(rig, Arc::new(FakeFetcher::new()));
     with_test_principal(
         plugin_routes().with_state(deps).into_router(),
         session(user),
@@ -159,7 +156,7 @@ async fn send(
 const TOY_MANIFEST: &str = "[plugin]\n\
      name = \"toy\"\n\
      version = \"1.0.0\"\n\
-     api_version = 1\n\
+     api_version = 2\n\
      entrypoint = \"plugin:Toy\"\n\
      capabilities = [\"scheduler\", \"subscriber\", \"publisher\"]\n\
      [schedule]\n\
@@ -226,7 +223,7 @@ async fn secrets_seal_at_rest_and_saves_reach_the_running_plugin() {
     let rig = rig("secrets").await;
     let manifest = "[plugin]\n\
          name = \"toy\"\n\
-         api_version = 1\n\
+         api_version = 2\n\
          entrypoint = \"plugin:Toy\"\n\
          capabilities = [\"subscriber\"]\n\
          [[settings]]\n\
@@ -294,7 +291,10 @@ async fn uninstall_stops_the_plugin_and_keeps_settings() {
 
 const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 
+const REPOSITORY: &str = "https://api.github.com/repos/acme/toy";
+
 fn github(fetcher: &FakeFetcher) {
+    fetcher.insert(REPOSITORY, br#"{"id": 1001}"#);
     fetcher.insert(
         "https://api.github.com/repos/acme/toy/releases/latest",
         br#"{"tag_name": "v1.0.0"}"#,
@@ -305,8 +305,32 @@ fn github(fetcher: &FakeFetcher) {
     );
     fetcher.insert(
         &format!("https://codeload.github.com/acme/toy/zip/{SHA}"),
-        b"zip",
+        &toy_zip(None),
     );
+}
+
+/// The toy plugin as GitHub's codeload serves it: one top folder holding
+/// the manifest and the code, or a symlink in place of the code.
+fn toy_zip(code_link: Option<&str>) -> Vec<u8> {
+    use std::io::Write as _;
+
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    writer
+        .start_file("toy-0123456/plugin.toml", options)
+        .unwrap();
+    writer.write_all(TOY_MANIFEST.as_bytes()).unwrap();
+    match code_link {
+        Some(target) => writer
+            .add_symlink("toy-0123456/plugin.py", target, options)
+            .unwrap(),
+        None => {
+            writer.start_file("toy-0123456/plugin.py", options).unwrap();
+            writer.write_all(b"# code").unwrap();
+        }
+    }
+    writer.finish().unwrap().into_inner()
 }
 
 #[tokio::test]
@@ -314,11 +338,7 @@ async fn install_previews_permissions_then_pins_the_previewed_commit() {
     let rig = rig("install").await;
     let fetcher = Arc::new(FakeFetcher::new());
     github(&fetcher);
-    let unpacker = Arc::new(FakeUnpacker::new(vec![
-        FakeUnpacker::file("toy-0123456/plugin.toml", TOY_MANIFEST.as_bytes()),
-        FakeUnpacker::file("toy-0123456/plugin.py", b"# code"),
-    ]));
-    let deps = deps_for(&rig, Arc::clone(&fetcher), unpacker);
+    let deps = deps_for(&rig, Arc::clone(&fetcher));
     let admin = with_test_principal(
         plugin_routes().with_state(deps).into_router(),
         session("admin-1"),
@@ -387,21 +407,15 @@ const BRANCH_SHA: &str = "89abcdef0123456789abcdef0123456789abcdef";
 
 /// The default branch holds unreleased code that would install fine.
 fn default_branch(fetcher: &FakeFetcher) {
+    fetcher.insert(REPOSITORY, br#"{"id": 1001}"#);
     fetcher.insert(
         DEFAULT_BRANCH,
         format!(r#"{{"sha": "{BRANCH_SHA}"}}"#).as_bytes(),
     );
     fetcher.insert(
         &format!("https://codeload.github.com/acme/toy/zip/{BRANCH_SHA}"),
-        b"zip",
+        &toy_zip(None),
     );
-}
-
-fn toy_archive() -> Arc<FakeUnpacker> {
-    Arc::new(FakeUnpacker::new(vec![
-        FakeUnpacker::file("toy-0123456/plugin.toml", TOY_MANIFEST.as_bytes()),
-        FakeUnpacker::file("toy-0123456/plugin.py", b"# code"),
-    ]))
 }
 
 /// The admin's router behind `scope`'s request wrapper, which replaces
@@ -522,7 +536,7 @@ async fn a_github_refusal_never_falls_back_to_the_default_branch() {
             Err(kind)
         );
 
-        let admin = admin_app(&scope, deps_for(&rig, Arc::clone(&fetcher), toy_archive()));
+        let admin = admin_app(&scope, deps_for(&rig, Arc::clone(&fetcher)));
         let body = json!({"repository_url": "https://github.com/acme/toy"});
         for uri in ["/api/v3/plugins/install/preview", "/api/v3/plugins/install"] {
             let got = post_for_refusal(admin.clone(), uri, body.clone()).await;
@@ -555,7 +569,7 @@ async fn a_repository_without_releases_installs_its_default_branch() {
     fetcher.answer(LATEST_RELEASE, Fetched::NotFound);
     default_branch(&fetcher);
     let scope = TestApp::start("plugins-no-releases").await;
-    let admin = admin_app(&scope, deps_for(&rig, fetcher, toy_archive()));
+    let admin = admin_app(&scope, deps_for(&rig, fetcher));
     let (status, installed) = send(
         admin,
         "POST",
@@ -569,16 +583,52 @@ async fn a_repository_without_releases_installs_its_default_branch() {
     assert_eq!(installed["install"]["commit"], BRANCH_SHA);
 }
 
+/// A repository deleted and created again under the same address holds
+/// someone else's code: an update refuses it and installs nothing.
+#[tokio::test]
+async fn an_update_never_installs_from_a_replaced_repository() {
+    let rig = rig("replaced").await;
+    let fetcher = Arc::new(FakeFetcher::new());
+    github(&fetcher);
+    let admin = with_test_principal(
+        plugin_routes()
+            .with_state(deps_for(&rig, Arc::clone(&fetcher)))
+            .into_router(),
+        session("admin-1"),
+    );
+    let body = json!({"repository_url": "https://github.com/acme/toy"});
+    let (status, _) = send(admin.clone(), "POST", "/api/v3/plugins/install", Some(body)).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    fetcher.insert(REPOSITORY, br#"{"id": 2002}"#);
+    fetcher.insert(LATEST_RELEASE, br#"{"tag_name": "v2.0.0"}"#);
+    fetcher.insert(
+        "https://api.github.com/repos/acme/toy/commits/v2.0.0",
+        format!(r#"{{"sha": "{BRANCH_SHA}"}}"#).as_bytes(),
+    );
+    let new_code = format!("https://codeload.github.com/acme/toy/zip/{BRANCH_SHA}");
+    fetcher.insert(&new_code, &toy_zip(None));
+    let (status, error) = send(admin, "POST", "/api/v3/plugins/toy/update", Some(json!({}))).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        error["error"]["message"],
+        "The repository at this address was replaced since the plugin was installed. Install it again if you trust the new one"
+    );
+    assert_eq!(rig.host.install_record("toy").unwrap().commit, SHA);
+    assert!(!fetcher.requested.lock().unwrap().contains(&new_code));
+}
+
 #[tokio::test]
 async fn a_ref_github_does_not_know_is_the_admins_mistake_not_an_outage() {
     let rig = rig("unknown-ref").await;
     let fetcher = Arc::new(FakeFetcher::new());
+    fetcher.insert(REPOSITORY, br#"{"id": 1001}"#);
     fetcher.answer(
         "https://api.github.com/repos/acme/toy/commits/mian",
         Fetched::Failed(422),
     );
     let scope = TestApp::start("plugins-unknown-ref").await;
-    let admin = admin_app(&scope, deps_for(&rig, fetcher, toy_archive()));
+    let admin = admin_app(&scope, deps_for(&rig, fetcher));
     let (status, error) = send(
         admin,
         "POST",
@@ -599,15 +649,13 @@ async fn unsafe_archives_never_reach_the_plugins_folder() {
     let rig = rig("unsafe").await;
     let fetcher = Arc::new(FakeFetcher::new());
     github(&fetcher);
-    let mut link = FakeUnpacker::file("toy-0123456/plugin.py", b"x");
-    link.is_symlink = true;
-    let unpacker = Arc::new(FakeUnpacker::new(vec![
-        FakeUnpacker::file("toy-0123456/plugin.toml", TOY_MANIFEST.as_bytes()),
-        link,
-    ]));
+    fetcher.insert(
+        &format!("https://codeload.github.com/acme/toy/zip/{SHA}"),
+        &toy_zip(Some("/etc/passwd")),
+    );
     let admin = with_test_principal(
         plugin_routes()
-            .with_state(deps_for(&rig, fetcher, unpacker))
+            .with_state(deps_for(&rig, fetcher))
             .into_router(),
         session("admin-1"),
     );
@@ -627,11 +675,7 @@ async fn unsafe_archives_never_reach_the_plugins_folder() {
 async fn plugin_routes_need_sessions_and_admins() {
     let rig = rig("auth").await;
     let bare = plugin_routes()
-        .with_state(deps_for(
-            &rig,
-            Arc::new(FakeFetcher::new()),
-            Arc::new(FakeUnpacker::new(Vec::new())),
-        ))
+        .with_state(deps_for(&rig, Arc::new(FakeFetcher::new())))
         .into_router();
     let (status, _) = send(bare, "GET", "/api/v3/plugins", None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -921,7 +965,7 @@ async fn fanout_reaches_subscribers_once_per_causation() {
     let rig = rig("fanout").await;
     let manifest = "[plugin]\n\
          name = \"toy\"\n\
-         api_version = 1\n\
+         api_version = 2\n\
          entrypoint = \"plugin:Toy\"\n\
          capabilities = [\"subscriber\", \"scrobbler\"]\n";
     let runtime = enable_toy(&rig, manifest);
@@ -997,7 +1041,7 @@ async fn ticks_run_through_the_jobs_loop_and_state_persists() {
 const WRITER_MANIFEST: &str = "[plugin]\n\
      name = \"toy\"\n\
      version = \"1.0.0\"\n\
-     api_version = 1\n\
+     api_version = 2\n\
      entrypoint = \"plugin:Toy\"\n\
      capabilities = [\"library_writer\"]\n";
 
@@ -1112,7 +1156,7 @@ async fn a_write_the_plugin_gave_up_on_never_lands_and_spends_nothing() {
         rig.dir.join("plugins"),
         Arc::clone(&rig.config),
         Arc::new(FakeLauncher::new()),
-        Arc::new(rig.ticks.clone()),
+        rig.ticks.clone(),
         library.core.clone(),
     );
     write_plugin(&rig.dir, "toy", WRITER_MANIFEST);
@@ -1120,7 +1164,7 @@ async fn a_write_the_plugin_gave_up_on_never_lands_and_spends_nothing() {
     host.update_settings("toy", true, HashMap::new()).unwrap();
     let (reached, at_place) = std::sync::mpsc::channel::<()>();
     let (release, released) = std::sync::mpsc::channel::<()>();
-    library.set_publish_hooks(
+    library.publishing.set_publish_hooks(
         Some(Box::new(move |_: &Path| {
             let _ = reached.send(());
             let _ = released.recv();
@@ -1161,7 +1205,7 @@ async fn a_write_the_plugin_gave_up_on_never_lands_and_spends_nothing() {
 
     // Only the unwound write's bytes stand between the plugin and its
     // allowance: they are back, so the same write now lands.
-    library.set_publish_hooks(None, None);
+    library.publishing.set_publish_hooks(None, None);
     seed_written(&rig, "seeded", QUOTA_BYTES_PER_DAY - 4);
     let (path, _) = host
         .write_library_file("toy", "notes/late.txt", b"late".to_vec())
@@ -1193,7 +1237,7 @@ async fn the_daily_allowance_survives_a_restart() {
         rig.dir.join("plugins"),
         Arc::clone(&rig.config),
         Arc::new(FakeLauncher::new()),
-        Arc::new(rig.ticks.clone()),
+        rig.ticks.clone(),
         library,
     );
     host.load_all();
@@ -1208,7 +1252,7 @@ async fn the_daily_allowance_survives_a_restart() {
 
 const BIG_MANIFEST: &str = "[plugin]\n\
      name = \"big\"\n\
-     api_version = 1\n\
+     api_version = 2\n\
      entrypoint = \"plugin:Big\"\n\
      capabilities = [\"library_writer\", \"purchase_links\"]\n";
 
@@ -1255,7 +1299,7 @@ async fn the_largest_library_file_fits_one_message() {
         rig.dir.join("plugins"),
         Arc::clone(&rig.config),
         Arc::new(ProcessLauncher::new(sdk, rig.platform.supervisor.clone())),
-        Arc::new(rig.ticks.clone()),
+        rig.ticks.clone(),
         rig.library.clone(),
     );
     host.load_all();

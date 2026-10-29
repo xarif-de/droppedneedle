@@ -5,7 +5,8 @@
 //! between steps, so foreground writes keep their lane while a backup runs.
 //! `VACUUM INTO` is rejected as the mechanism on purpose: it holds a shared
 //! lock for its whole run and would stall the writer lane for seconds on a
-//! large catalog.
+//! large catalog. It is used only on the finished staging copy, which
+//! nothing else reads.
 //!
 //! The flow is stage into the backups directory, fold the staging WAL into
 //! the main image, `integrity_check` plus `foreign_key_check` on the staging
@@ -14,9 +15,26 @@
 //! five untouched. Restore takes a backup back into an empty directory and
 //! refuses occupied targets and version-newer backups, mirroring the v2
 //! restore guard.
+//!
+//! Every file a backup or restore writes is synced before it is renamed or
+//! linked into place, and its folder after, so a power cut leaves either
+//! the old name or the whole new file. A restore never replaces a database:
+//! it places the copy with a hard link, which fails on a name that is
+//! taken, and an entry in the target it cannot read counts as taken. The
+//! folder syncs open a directory, so this module is for Unix hosts only.
+//!
+//! A backup carries the undo folder too. The copies a backup's database
+//! names are copied into one pool beside the backups, `backups/undo`,
+//! shared by every kept backup, so each backup adds only the copies that
+//! are new since the last one; after rotation the pool keeps only what a
+//! kept backup names. A restore puts the copies back first and the
+//! database last, so a crash in between never leaves a database naming
+//! copies that are not there.
 
 use std::{
     collections::HashSet,
+    ffi::OsString,
+    io,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -29,7 +47,17 @@ use rusqlite::{Connection, OpenFlags, backup::Backup};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use super::{error::DbError, fs::same_filesystem, sql, writer::CancelFlag};
+use super::{
+    datalock::{self, DataLock},
+    error::DbError,
+    factory::sqlite_uri_path,
+    fs::{reject_remote_filesystem, same_filesystem},
+    sql,
+    undo_dir::{
+        self, Copied, Hold, Stored, UNDO_DIR_NAME, UndoDir, ensure_dir, shard_names, sync_dir,
+    },
+    writer::CancelFlag,
+};
 use crate::clock::Clock;
 
 /// Pages copied per backup step. The v2 `pages=256` value, unchanged.
@@ -40,6 +68,10 @@ const BACKUP_STEP_PAUSE: Duration = Duration::from_millis(10);
 pub const BACKUP_KEEP: usize = 5;
 /// Manifest sidecar suffix: `<backup>.manifest.json`.
 pub const MANIFEST_SUFFIX: &str = ".manifest.json";
+/// Left in a restore's target until the restored database has its name.
+pub const RESTORE_MARKER: &str = ".restore-in-progress";
+/// The manifest format this build writes.
+const MANIFEST_FORMAT: u32 = 2;
 
 /// Progress callback: `(copied_pages, total_pages)`.
 pub type BackupProgress = Arc<dyn Fn(u64, u64) + Send + Sync>;
@@ -57,6 +89,16 @@ pub struct BackupManifest {
     pub user_version: i64,
     /// When the backup was taken.
     pub created_at: SystemTime,
+    /// Undo copies the backup holds in the pool.
+    #[serde(default)]
+    pub undo_blobs: u64,
+    /// Their size in bytes.
+    #[serde(default)]
+    pub undo_bytes: u64,
+    /// Copies the database named that were already missing or damaged
+    /// when the backup was taken.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub undo_missing: Vec<String>,
 }
 
 /// What one backup run produced.
@@ -79,6 +121,61 @@ pub struct RestoredBackup {
     pub bytes: u64,
     /// `user_version` stamped in the restored file.
     pub user_version: i64,
+    /// Undo copies put back.
+    pub undo_blobs: u64,
+    /// Undo copies the database names that the backup did not hold.
+    pub undo_missing: Vec<String>,
+    /// How the database took its name.
+    pub placement: Placement,
+}
+
+/// How a restored database took its name, none of which replaces a file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Placement {
+    /// A hard link from the synced copy.
+    HardLink,
+    /// The filesystem has no hard links: a rename that refuses a taken
+    /// name (`renameat2` with `RENAME_NOREPLACE`).
+    RenameNoReplace,
+    /// The filesystem has neither: a plain rename, made only after the
+    /// name was found free under the restore's exclusive lock.
+    RenameAfterCheck,
+}
+
+/// What the `-wal` file beside a database holds.
+#[derive(Debug)]
+pub enum WalState {
+    /// There is none.
+    Absent,
+    /// It is there and 0 bytes long.
+    Empty,
+    /// It holds this many bytes, which a read of the main file alone
+    /// would leave out.
+    HoldsData(u64),
+    /// Its metadata cannot be read (any error but not found), so what it
+    /// holds is unknown.
+    Unreadable(io::Error),
+}
+
+/// The `-wal` file beside a database.
+#[must_use]
+pub fn wal_path(db_path: &Path) -> PathBuf {
+    let mut name = db_path.as_os_str().to_owned();
+    name.push("-wal");
+    PathBuf::from(name)
+}
+
+/// What the `-wal` file beside `db_path` holds. Only not-found counts as
+/// absent and only length 0 as empty: a file that cannot be read is never
+/// taken for an empty one.
+#[must_use]
+pub fn wal_state(db_path: &Path) -> WalState {
+    match std::fs::metadata(wal_path(db_path)) {
+        Ok(meta) if meta.len() == 0 => WalState::Empty,
+        Ok(meta) => WalState::HoldsData(meta.len()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => WalState::Absent,
+        Err(error) => WalState::Unreadable(error),
+    }
 }
 
 /// Backup and restore against one live database file.
@@ -123,16 +220,17 @@ impl BackupService {
     }
 
     /// Copy the live database out: sweep stale staging, stage, verify,
-    /// rename, rotate. The progress callback fires after every step with
-    /// copied and total page counts. Blocking SQLite work runs off the
-    /// async runtime. A tripped `cancel` stops the copy between steps and
-    /// removes the staging file; nothing renames or rotates.
+    /// copy the undo copies it names, rename, rotate. The progress
+    /// callback fires after every step with copied and total page counts.
+    /// Blocking SQLite and file work runs off the async runtime. A tripped
+    /// `cancel` stops the copy between steps and removes the staging file;
+    /// nothing renames or rotates.
     pub async fn backup(
         &self,
         progress: Option<BackupProgress>,
         cancel: &CancelFlag,
     ) -> Result<BackupReport, DbError> {
-        std::fs::create_dir_all(&self.backup_dir)?;
+        ensure_dir(&self.backup_dir)?;
         if !same_filesystem(&self.db_path, &self.backup_dir)? {
             return Err(DbError::StagingCrossFilesystem {
                 path: self.backup_dir.clone(),
@@ -164,6 +262,22 @@ impl BackupService {
         let final_name = backup_file_name(created_at, seq);
         let final_path = self.backup_dir.join(&final_name);
         let started = Instant::now();
+        // Held from before the copy until the undo copies it names are in
+        // the pool: no sweep removes one in between, and no other backup
+        // cleans the pool under this one.
+        let live = UndoDir::new(undo_dir::beside(&self.db_path));
+        let pool = UndoDir::new(self.backup_dir.join(UNDO_DIR_NAME));
+        let holds = {
+            let (live, pool) = (live.clone(), pool.clone());
+            tokio::task::spawn_blocking(move || {
+                Ok::<_, DbError>((live.hold_shared()?, pool.hold_exclusive()?))
+            })
+            .await
+            .map_err(|_| DbError::WriteFailed {
+                operation: "backup".to_owned(),
+                cause: "undo folder lock task failed to join".to_owned(),
+            })??
+        };
         let staging_for_copy = staging.to_owned();
         let cancel_for_copy = cancel.clone();
         let copied = tokio::task::spawn_blocking(move || {
@@ -180,18 +294,49 @@ impl BackupService {
                 chunks: copied as usize,
             });
         }
-        // Verify, hash, publish and rotate are file and SQLite work: keep
-        // them off the async workers like the copy itself.
+        // Verify, hash, copy the undo copies, publish and rotate are file
+        // and SQLite work: keep them off the async workers like the copy
+        // itself.
         let staging = staging.to_owned();
         let backup_dir = self.backup_dir.clone();
+        let cancel = cancel.clone();
         let (path, manifest) = tokio::task::spawn_blocking(move || {
+            let (_live_hold, pool_hold) = holds;
             fold_staging(&staging)?;
-            let manifest = verify_staging(&staging, created_at)?;
+            compact_staging(&staging)?;
+            let mut manifest = verify_staging(&staging, created_at)?;
+            let undo = copy_undo(&staging, &live, &pool, &pool_hold, &cancel)?;
+            manifest.undo_blobs = undo.blobs;
+            manifest.undo_bytes = undo.bytes;
+            manifest.undo_missing = undo.missing;
             remove_staging_sidecars(&staging);
-            std::fs::rename(&staging, &final_path)?;
-            let sidecar = manifest_path(&final_path);
-            std::fs::write(&sidecar, serde_json::to_string_pretty(&manifest)?)?;
-            rotate_backups(&backup_dir, BACKUP_KEEP)?;
+            // SQLite syncs neither the backup API's target on every path
+            // nor `VACUUM INTO` output (that follows the connection's
+            // synchronous setting), so the bytes are synced here, before
+            // the name points at them.
+            std::fs::File::open(&staging)?.sync_all()?;
+            // The manifest takes its name first and the database last: a
+            // finished backup always has its manifest beside it.
+            write_synced(
+                &manifest_path(&staging),
+                &manifest_path(&final_path),
+                serde_json::to_string_pretty(&manifest)?.as_bytes(),
+            )?;
+            sync_dir(&backup_dir)?;
+            if let Err(error) = std::fs::rename(&staging, &final_path) {
+                let _ = std::fs::remove_file(manifest_path(&final_path));
+                return Err(error.into());
+            }
+            sync_dir(&backup_dir)?;
+            if let Err(error) = rotate_backups(&backup_dir, BACKUP_KEEP) {
+                tracing::warn!(%error, "older backups stay until the next backup rotates them");
+            }
+            if let Err(error) = clean_pool(&backup_dir, &pool, &pool_hold) {
+                tracing::warn!(
+                    %error,
+                    "undo copies no backup names stay in the pool until the next backup"
+                );
+            }
             Ok::<_, DbError>((final_path, manifest))
         })
         .await
@@ -206,30 +351,42 @@ impl BackupService {
         })
     }
 
-    /// Restore a backup file into an empty directory as `library.db`.
+    /// Restore a backup file into an empty directory as `db_name`, with
+    /// the undo copies it names beside it in `undo`.
     ///
-    /// Refuses occupied targets and, unless `allow_downgrade`, backups
-    /// newer than this binary. The restored copy passes `integrity_check`
-    /// before this returns.
+    /// Refuses a backup with writes in its `-wal` file (the copy takes the
+    /// main file only), occupied targets, targets on a network filesystem
+    /// and, unless `allow_downgrade`, backups newer than this binary. The
+    /// target is empty when it holds nothing but the restore's locks
+    /// (`<db_name>.lock`, `<db_name>.server.lock`); one holding only what
+    /// an interrupted restore left (its marker, its temporary files,
+    /// `undo`, and no `db_name`) is cleared and the restore starts over.
+    /// An entry it cannot read counts as occupied. The exclusive data lock
+    /// is held for the run, so a server on the target refuses to start and
+    /// a running one makes the restore refuse. A copy the backup lacks does
+    /// not stop the restore: it is listed in `undo_missing`, and Undo then
+    /// skips only the files that need it. The restored database passes
+    /// `integrity_check` before it takes its name.
     pub fn restore(
         &self,
         backup_db: &Path,
         target_dir: &Path,
+        db_name: &str,
         allow_downgrade: bool,
     ) -> Result<RestoredBackup, DbError> {
-        // The restore tool's own lock file and the server's lock file are
-        // the only entries allowed.
-        let lock_name = crate::db::datalock::lock_file_name("library.db");
-        let server_lock_name = crate::db::datalock::server_lock_file_name("library.db");
-        let occupied = target_dir.exists()
-            && target_dir.read_dir()?.filter_map(Result::ok).any(|entry| {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                name != lock_name && name != server_lock_name
-            });
-        if occupied {
-            return Err(DbError::RestoreTargetNotEmpty {
-                path: target_dir.to_owned(),
-            });
+        match wal_state(backup_db) {
+            WalState::Absent | WalState::Empty => {}
+            WalState::HoldsData(_) => {
+                return Err(DbError::BackupWalPresent {
+                    path: wal_path(backup_db),
+                });
+            }
+            WalState::Unreadable(reason) => {
+                return Err(DbError::Unreadable {
+                    path: wal_path(backup_db),
+                    reason,
+                });
+            }
         }
         let source = Connection::open_with_flags(backup_db, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         let found = user_version(&source)?;
@@ -240,25 +397,138 @@ impl BackupService {
         check_clean(&source)?;
         drop(source);
 
-        std::fs::create_dir_all(target_dir)?;
-        let target = target_dir.join("library.db");
+        ensure_dir(target_dir)?;
+        let target = target_dir.join(db_name);
+        reject_remote_filesystem(&target)?;
+        let lock = DataLock::exclusive(&target)?;
+        clear_unfinished_restore(target_dir, db_name)?;
+        let marker = target_dir.join(RESTORE_MARKER);
+        std::fs::File::create(&marker)?.sync_all()?;
+        sync_dir(target_dir)?;
         let seq = self.staging_seq.fetch_add(1, Ordering::Relaxed);
-        let temp = target_dir.join(format!(
-            ".restore-{}-{}-{}.tmp",
+        let stem = format!(
+            ".restore-{}-{}-{}",
             std::process::id(),
             self.now_millis(),
             seq
-        ));
-        let bytes = std::fs::copy(backup_db, &temp)?;
-        std::fs::rename(&temp, &target)?;
-        let restored = Connection::open_with_flags(&target, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        check_clean(&restored)?;
-        let user_version = user_version(&restored)?;
-        drop(restored);
+        );
+        let temp = target_dir.join(format!("{stem}.tmp"));
+        match self.restore_files(backup_db, target_dir, &stem, &temp, &target, &lock) {
+            Ok(restored) => {
+                std::fs::remove_file(&marker)?;
+                sync_dir(target_dir)?;
+                Ok(restored)
+            }
+            Err(error) => {
+                // Removed even when a database by the name turned up, so
+                // nothing of this run is left for a retry to trip on.
+                if let Err(cleanup) = std::fs::remove_file(&temp)
+                    && cleanup.kind() != io::ErrorKind::NotFound
+                {
+                    tracing::warn!(%cleanup, "a failed restore left its copy in its target");
+                }
+                if let Err(cleanup) = clear_unfinished_restore(target_dir, db_name) {
+                    tracing::warn!(%cleanup, "a failed restore left files in its target");
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// The copying half of [`restore`](Self::restore), under its marker:
+    /// the database to `temp`, the undo copies into a temporary folder,
+    /// then the folder and last the database to their names.
+    fn restore_files(
+        &self,
+        backup_db: &Path,
+        target_dir: &Path,
+        stem: &str,
+        temp: &Path,
+        target: &Path,
+        lock: &DataLock,
+    ) -> Result<RestoredBackup, DbError> {
+        let bytes = std::fs::copy(backup_db, temp)?;
+        std::fs::File::open(temp)?.sync_all()?;
+        let (user_version, named) = {
+            let restored = open_immutable(temp)?;
+            check_clean(&restored)?;
+            (user_version(&restored)?, named_in(&restored)?)
+        };
+
+        let known_missing: HashSet<String> = read_manifest(backup_db)
+            .map(|manifest| manifest.undo_missing.into_iter().collect())
+            .unwrap_or_default();
+        let staged = UndoDir::new(target_dir.join(format!("{stem}-undo")));
+        let staged_hold = staged.hold_shared()?;
+        let pool = UndoDir::new(
+            backup_db
+                .parent()
+                .filter(|dir| !dir.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."))
+                .join(UNDO_DIR_NAME),
+        );
+        // The shared hold only keeps a backup's clean-up off the pool while
+        // it is read. A pool that cannot be locked (a read-only backups
+        // folder) is read without it: a restore always goes ahead.
+        let pool_hold = match pool.path().is_dir().then(|| pool.hold_shared()) {
+            Some(Err(error)) => {
+                tracing::warn!(%error, "the undo copies beside the backup are read without their lock");
+                None
+            }
+            hold => hold.and_then(Result::ok),
+        };
+        let mut undo_blobs = 0;
+        let mut undo_missing = Vec::new();
+        for sha256 in named {
+            // A copy the pool cannot give (gone, damaged or unreadable) is
+            // listed, never a failed restore; only writing the target fails.
+            let found = if known_missing.contains(&sha256) {
+                None
+            } else {
+                match pool.read(&sha256) {
+                    Ok(Stored::Found(bytes)) => Some(bytes),
+                    Ok(Stored::Missing | Stored::Corrupt) => None,
+                    Err(error) => {
+                        tracing::warn!(blob = %sha256, %error, "an undo copy beside the backup cannot be read");
+                        None
+                    }
+                }
+            };
+            match found {
+                Some(bytes) => {
+                    staged.put(&staged_hold, &bytes)?;
+                    undo_blobs += 1;
+                }
+                None => {
+                    tracing::warn!(
+                        blob = %sha256,
+                        "the backup lacks an undo copy its database names; undo skips the files that need it"
+                    );
+                    undo_missing.push(sha256);
+                }
+            }
+        }
+        drop(pool_hold);
+        drop(staged_hold);
+        // A rename never replaces a folder that holds anything.
+        std::fs::rename(staged.path(), target_dir.join(UNDO_DIR_NAME))?;
+        sync_dir(target_dir)?;
+        let placement = place_new(temp, target, lock)?;
+        sync_dir(target_dir)?;
+        // The database is whole under its name now, so a temporary name
+        // left behind is only litter.
+        if placement == Placement::HardLink
+            && let Err(error) = std::fs::remove_file(temp)
+        {
+            tracing::warn!(%error, "the restore's temporary copy stays beside the database");
+        }
         Ok(RestoredBackup {
-            path: target,
+            path: target.to_owned(),
             bytes,
             user_version,
+            undo_blobs,
+            undo_missing,
+            placement,
         })
     }
 
@@ -291,7 +561,13 @@ impl BackupService {
             let name = entry.file_name().to_string_lossy().into_owned();
             let leftover = name.starts_with(".staging-")
                 || (name.starts_with(".restore-") && name.ends_with(".tmp"));
-            if !leftover || live.contains(&entry.path()) {
+            // A live run's sidecars, compact copy and manifest share its
+            // staging name as a prefix.
+            let owned = live.iter().any(|path| {
+                path.file_name()
+                    .is_some_and(|live_name| name.starts_with(&*live_name.to_string_lossy()))
+            });
+            if !leftover || owned {
                 continue;
             }
             if let Err(error) = std::fs::remove_file(entry.path()) {
@@ -317,6 +593,275 @@ impl BackupService {
             live.remove(staging);
         }
     }
+}
+
+/// The undo copies a database file names that live in the undo folder
+/// rather than in its own table. A database from before the undo tables
+/// names none. The file is opened read-only and immutable, so nothing is
+/// written beside it.
+pub fn named_undo_copies(path: &Path) -> Result<Vec<String>, DbError> {
+    named_in(&open_immutable(path)?)
+}
+
+fn named_in(connection: &Connection) -> Result<Vec<String>, DbError> {
+    let tables: i64 =
+        connection.query_row(sql::UNDO_TABLES_PRESENT.text(), [], |row| row.get(0))?;
+    if tables < 2 {
+        return Ok(Vec::new());
+    }
+    let mut stmt = connection.prepare(sql::UNDO_NAMED_IN_FOLDER.text())?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// Open a file nothing writes any more: read-only and immutable, so no
+/// sidecar is made beside it.
+fn open_immutable(path: &Path) -> rusqlite::Result<Connection> {
+    Connection::open_with_flags(
+        format!("file:{}?immutable=1", sqlite_uri_path(path)),
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )
+}
+
+/// What a backup's copy of the undo folder holds.
+#[derive(Debug, Default)]
+struct UndoCopied {
+    blobs: u64,
+    bytes: u64,
+    missing: Vec<String>,
+}
+
+/// Copy every undo copy the staged database names into the pool. One
+/// missing or damaged in the live folder is listed, not fatal: the
+/// database matters more than one undo.
+fn copy_undo(
+    staging: &Path,
+    live: &UndoDir,
+    pool: &UndoDir,
+    pool_hold: &Hold,
+    cancel: &CancelFlag,
+) -> Result<UndoCopied, DbError> {
+    let mut copied = UndoCopied::default();
+    for sha256 in named_undo_copies(staging)? {
+        if cancel.is_cancelled() {
+            return Err(DbError::Cancelled {
+                operation: "backup".to_owned(),
+                chunks: copied.blobs as usize,
+            });
+        }
+        match live.copy_to(pool, pool_hold, &sha256)? {
+            Copied::Copied(size) | Copied::Already(size) => {
+                copied.blobs += 1;
+                copied.bytes += size;
+            }
+            outcome @ (Copied::Missing | Copied::Corrupt) => {
+                tracing::warn!(
+                    blob = %sha256,
+                    damaged = outcome == Copied::Corrupt,
+                    "an undo copy the database names is not in the undo folder; the backup goes on without it"
+                );
+                copied.missing.push(sha256);
+            }
+        }
+    }
+    Ok(copied)
+}
+
+/// Remove from the pool what no kept backup names, and files a copy left
+/// mid-write. Fails before removing anything when a kept backup cannot
+/// be read: its names are unknown, so nothing is guessed away.
+fn clean_pool(backup_dir: &Path, pool: &UndoDir, hold: &Hold) -> Result<(), DbError> {
+    let mut keep = HashSet::new();
+    for backup in finished_backups(backup_dir)? {
+        keep.extend(named_undo_copies(&backup)?);
+    }
+    for shard in shard_names() {
+        let entries = pool.shard(&shard)?;
+        for temp in &entries.temps {
+            pool.remove_temp(hold, temp)?;
+        }
+        for sha256 in entries.blobs {
+            if !keep.contains(&sha256) {
+                pool.remove(hold, &sha256)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// What a restore target holds, judged from its listing.
+#[derive(Debug, PartialEq, Eq)]
+enum Target {
+    /// Nothing, or only the restore's own locks.
+    Empty,
+    /// Only what an interrupted restore left: these names, marker included.
+    Unfinished(Vec<OsString>),
+}
+
+/// Judge a restore target from the entries of its listing. The locks of
+/// a database named `db_name` are the restore's own. The marker, the
+/// `.restore-` files and `undo` are an interrupted restore's own only
+/// while the marker is there and no `db_name` sits beside them; a marker
+/// beside a database is stale and clears nothing. Anything else is
+/// occupied, and so is an entry the listing could not read: what it is
+/// cannot be known.
+fn judge_target(
+    target_dir: &Path,
+    db_name: &str,
+    listing: impl IntoIterator<Item = io::Result<OsString>>,
+) -> Result<Target, DbError> {
+    let locks = [
+        datalock::lock_file_name(db_name),
+        datalock::server_lock_file_name(db_name),
+    ];
+    let mut names = Vec::new();
+    for entry in listing {
+        let name = entry.map_err(|reason| DbError::Unreadable {
+            path: target_dir.to_owned(),
+            reason,
+        })?;
+        if !locks.iter().any(|lock| name == lock.as_str()) {
+            names.push(name);
+        }
+    }
+    if names.is_empty() {
+        return Ok(Target::Empty);
+    }
+    let leftover = |name: &OsString| {
+        name.to_str().is_some_and(|name| {
+            name != db_name
+                && (name == RESTORE_MARKER
+                    || name == UNDO_DIR_NAME
+                    || name.starts_with(".restore-"))
+        })
+    };
+    if names.iter().any(|name| name == RESTORE_MARKER) && names.iter().all(leftover) {
+        Ok(Target::Unfinished(names))
+    } else {
+        Err(DbError::RestoreTargetNotEmpty {
+            path: target_dir.to_owned(),
+        })
+    }
+}
+
+/// Clear what an interrupted restore left in `target_dir`, or refuse a
+/// target that holds anything else (see [`judge_target`]). A target that
+/// is not there is empty; one that cannot be listed is refused.
+fn clear_unfinished_restore(target_dir: &Path, db_name: &str) -> Result<(), DbError> {
+    let listing = match std::fs::read_dir(target_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(reason) => {
+            return Err(DbError::Unreadable {
+                path: target_dir.to_owned(),
+                reason,
+            });
+        }
+    };
+    let listing = listing.map(|entry| entry.map(|entry| entry.file_name()));
+    let Target::Unfinished(names) = judge_target(target_dir, db_name, listing)? else {
+        return Ok(());
+    };
+    for name in names
+        .iter()
+        .filter(|name| name.as_os_str() != RESTORE_MARKER)
+    {
+        let path = target_dir.join(name);
+        if std::fs::symlink_metadata(&path)?.is_dir() {
+            std::fs::remove_dir_all(&path)?;
+        } else {
+            std::fs::remove_file(&path)?;
+        }
+    }
+    std::fs::remove_file(target_dir.join(RESTORE_MARKER))?;
+    sync_dir(target_dir)?;
+    Ok(())
+}
+
+/// Give the file at `temp` the name `target` without ever replacing a
+/// file there: a hard link, which fails with `AlreadyExists` on a taken
+/// name. The caller syncs the folder and, after a link, removes `temp`.
+///
+/// A filesystem with no hard links (vfat, exFAT) gets a rename that
+/// refuses a taken name where the platform has one, else a plain rename
+/// made after checking the name is free. The held `_lock` is what makes
+/// that check hold: no server or other restore uses the folder meanwhile.
+fn place_new(temp: &Path, target: &Path, _lock: &DataLock) -> io::Result<Placement> {
+    let refused = match std::fs::hard_link(temp, target) {
+        Ok(()) => return Ok(Placement::HardLink),
+        Err(error) if error.raw_os_error().is_some_and(no_link_support) => error,
+        Err(error) => return Err(error),
+    };
+    tracing::info!(%refused, "the restore target has no hard links; placing by rename");
+    match rename_noreplace(temp, target) {
+        Some(Ok(())) => return Ok(Placement::RenameNoReplace),
+        Some(Err(error))
+            if !error
+                .raw_os_error()
+                .is_some_and(|code| code == libc::EINVAL || code == libc::ENOSYS) =>
+        {
+            return Err(error);
+        }
+        _ => {}
+    }
+    match std::fs::symlink_metadata(target) {
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("{} is already there", target.display()),
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            std::fs::rename(temp, target)?;
+            Ok(Placement::RenameAfterCheck)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Error codes `link(2)` answers on a filesystem without hard links.
+fn no_link_support(code: i32) -> bool {
+    code == libc::EPERM || code == libc::EOPNOTSUPP || code == libc::ENOSYS
+}
+
+/// `renameat2(RENAME_NOREPLACE)`, or `None` where the platform has no
+/// such call. Called through `syscall` because not every libc wraps it.
+#[cfg(target_os = "linux")]
+fn rename_noreplace(from: &Path, to: &Path) -> Option<io::Result<()>> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let call = || {
+        let from = CString::new(from.as_os_str().as_bytes())?;
+        let to = CString::new(to.as_os_str().as_bytes())?;
+        // SAFETY: both paths are NUL-terminated strings that outlive the
+        // call, and the descriptors are AT_FDCWD.
+        let status = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                libc::AT_FDCWD,
+                from.as_ptr(),
+                libc::AT_FDCWD,
+                to.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    };
+    Some(call())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn rename_noreplace(_from: &Path, _to: &Path) -> Option<io::Result<()>> {
+    None
+}
+
+/// Best-effort manifest read beside a backup.
+fn read_manifest(backup: &Path) -> Option<BackupManifest> {
+    let bytes = std::fs::read(manifest_path(backup)).ok()?;
+    serde_json::from_slice(&bytes).ok()
 }
 
 /// Step the live database into the staging file with the backup API.
@@ -379,10 +924,46 @@ fn fold_staging(staging: &Path) -> Result<(), DbError> {
     Ok(())
 }
 
-/// Remove a staging file and any of its sidecars. Best effort.
+/// Rewrite the staging copy without its free pages when more than a
+/// quarter of it is free, as it is once after the undo copies move out
+/// of the database. Only the copy is rewritten, never the live database.
+fn compact_staging(staging: &Path) -> Result<(), DbError> {
+    let connection = Connection::open(staging)?;
+    let free: i64 = connection.query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
+    let pages: i64 = connection.query_row("PRAGMA page_count", [], |row| row.get(0))?;
+    if free.saturating_mul(4) <= pages {
+        return Ok(());
+    }
+    let mut name = staging.as_os_str().to_owned();
+    name.push(".compact");
+    let compact = PathBuf::from(name);
+    remove_staging_tree(&compact);
+    connection.execute("VACUUM INTO ?1", [compact.to_string_lossy()])?;
+    drop(connection);
+    remove_staging_sidecars(staging);
+    std::fs::rename(&compact, staging)?;
+    remove_staging_sidecars(&compact);
+    Ok(())
+}
+
+/// Remove a staging file, its sidecars and its manifest. Best effort.
 fn remove_staging_tree(staging: &Path) {
     let _ = std::fs::remove_file(staging);
+    let _ = std::fs::remove_file(manifest_path(staging));
     remove_staging_sidecars(staging);
+}
+
+/// Write `bytes` to `temp`, sync it, rename it to `path`. The caller
+/// syncs the folder.
+fn write_synced(temp: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write as _;
+    let written = std::fs::File::create(temp)
+        .and_then(|mut file| file.write_all(bytes).and_then(|()| file.sync_all()))
+        .and_then(|()| std::fs::rename(temp, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(temp);
+    }
+    written
 }
 
 /// Remove the `-wal`/`-shm`/`-journal` sidecars of a staging file.
@@ -406,11 +987,14 @@ fn verify_staging(staging: &Path, created_at: SystemTime) -> Result<BackupManife
     drop(connection);
     let (sha256, size_bytes) = file_sha256(staging)?;
     Ok(BackupManifest {
-        format_version: 1,
+        format_version: MANIFEST_FORMAT,
         sha256,
         size_bytes,
         user_version,
         created_at,
+        undo_blobs: 0,
+        undo_bytes: 0,
+        undo_missing: Vec::new(),
     })
 }
 
@@ -448,7 +1032,26 @@ fn user_version(connection: &Connection) -> rusqlite::Result<i64> {
 
 /// Keep the newest `keep` backups; older files and sidecars rotate out only
 /// after the new backup verified.
+/// The database goes before its manifest, so no finished backup is left
+/// without one.
 fn rotate_backups(backup_dir: &Path, keep: usize) -> Result<(), DbError> {
+    let mut backups = finished_backups(backup_dir)?;
+    while backups.len() > keep {
+        let oldest = backups.remove(0);
+        for path in [oldest.clone(), manifest_path(&oldest)] {
+            match std::fs::remove_file(&path) {
+                Err(error) if error.kind() != io::ErrorKind::NotFound => {
+                    tracing::warn!(file = %path.display(), %error, "an old backup could not be rotated out");
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The finished backup files in `backup_dir`, oldest first.
+fn finished_backups(backup_dir: &Path) -> Result<Vec<PathBuf>, DbError> {
     let mut backups: Vec<PathBuf> = Vec::new();
     for entry in std::fs::read_dir(backup_dir)? {
         let entry = entry?;
@@ -460,12 +1063,7 @@ fn rotate_backups(backup_dir: &Path, keep: usize) -> Result<(), DbError> {
         }
     }
     backups.sort();
-    while backups.len() > keep {
-        let oldest = backups.remove(0);
-        let _ = std::fs::remove_file(manifest_path(&oldest));
-        let _ = std::fs::remove_file(&oldest);
-    }
-    Ok(())
+    Ok(backups)
 }
 
 /// Manifest sidecar path for a backup file.
@@ -526,6 +1124,75 @@ mod tests {
         let second = backup_file_name(same_ms, 1);
         assert_ne!(first, second);
         assert!(first < second);
+    }
+
+    /// An entry the listing cannot read means occupied; nothing, or only
+    /// the configured database's two locks, means empty.
+    #[test]
+    fn restore_target_with_an_unreadable_entry_is_occupied() {
+        let dir = Path::new("/target");
+        let unreadable = vec![
+            Ok(OsString::from("music.db.lock")),
+            Err(io::Error::from_raw_os_error(libc::EACCES)),
+        ];
+        assert!(matches!(
+            judge_target(dir, "music.db", unreadable),
+            Err(DbError::Unreadable { .. })
+        ));
+        assert_eq!(
+            judge_target(dir, "music.db", Vec::new()).unwrap(),
+            Target::Empty
+        );
+        let locks = vec![
+            Ok(OsString::from("music.db.lock")),
+            Ok(OsString::from("music.db.server.lock")),
+        ];
+        assert_eq!(judge_target(dir, "music.db", locks).unwrap(), Target::Empty);
+        let stale_marker = vec![
+            Ok(OsString::from(RESTORE_MARKER)),
+            Ok(OsString::from("music.db")),
+        ];
+        assert!(matches!(
+            judge_target(dir, "music.db", stale_marker),
+            Err(DbError::RestoreTargetNotEmpty { .. })
+        ));
+    }
+
+    /// Placing onto a name that is taken fails and leaves that file's
+    /// bytes as they were.
+    #[test]
+    fn placing_onto_an_existing_database_never_replaces_it() {
+        let dir = crate::db::scratch::ScratchDir::new("backup-place").unwrap();
+        let temp = dir.join(".restore-1-2-3.tmp");
+        let target = dir.join("library.db");
+        std::fs::write(&temp, b"restored").unwrap();
+        std::fs::write(&target, b"already here").unwrap();
+        let lock = DataLock::exclusive(&target).unwrap();
+        let error = place_new(&temp, &target, &lock).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&target).unwrap(), b"already here");
+    }
+
+    /// The copy takes the main file only, so a backup whose `-wal` holds
+    /// writes is refused rather than restored without them.
+    #[test]
+    fn a_backup_with_writes_in_its_wal_is_refused() {
+        let dir = crate::db::scratch::ScratchDir::new("backup-wal").unwrap();
+        let backup = dir.join("library-1-0.db");
+        // Held open so the writes stay in the -wal file.
+        let writer = Connection::open(&backup).unwrap();
+        writer
+            .execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE t (x INTEGER);")
+            .unwrap();
+        assert!(matches!(wal_state(&backup), WalState::HoldsData(_)));
+        let service = BackupService::new(&backup, dir.path(), Arc::new(crate::clock::SystemClock));
+        let target = dir.join("restored");
+        assert!(matches!(
+            service.restore(&backup, &target, "library.db", false),
+            Err(DbError::BackupWalPresent { .. })
+        ));
+        assert!(!target.exists(), "nothing was written for a refused backup");
+        drop(writer);
     }
 
     #[test]

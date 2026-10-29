@@ -92,6 +92,8 @@ pub struct PlayerTrack {
     pub replaygain_album_peak: Option<f64>,
     /// Whether the album has stored artwork.
     pub cover_available: bool,
+    /// The version of the album's own art, when it has some.
+    pub art_version: Option<i64>,
     /// Whether the track's file carries lyrics, as the lyrics sweep found.
     pub has_lyrics: bool,
 }
@@ -177,9 +179,9 @@ pub enum TrackOrder {
     /// One fixed shuffle per seed: pages of the same seed never repeat or
     /// skip a track. Callers draw the seed with [`ShuffleSeeds`].
     Shuffle(u32),
-    /// Insertion order (rowid): the full-library sync order. Pages walk the
-    /// table in rowid order, and pages already read stay put while a scan
-    /// appends tracks.
+    /// Insertion order (`search_key`): the full-library sync order. Pages
+    /// walk the tracks in key order, and pages already read stay put while
+    /// a scan appends tracks.
     Natural,
     /// One key, ascending or (`true`) descending; ids break ties in the
     /// same direction.
@@ -958,6 +960,7 @@ fn track_row(row: &Row<'_>) -> rusqlite::Result<PlayerTrack> {
         replaygain_track_peak: row.get("rg_track_peak")?,
         replaygain_album_peak: row.get("rg_album_peak")?,
         cover_available: row.get("cover_available")?,
+        art_version: row.get("art_version")?,
         has_lyrics: row.get("has_lyrics")?,
     })
 }
@@ -1162,12 +1165,21 @@ impl LocalCatalog {
     ) -> Result<u64, StoreError> {
         if !track_query_is_open(query) {
             let filters = track_filters(query, played)?;
+            let statements = &filters.statements;
+            let text = statements.count();
+            // Plays do not move the catalog revision, so a played filter
+            // is counted every time.
+            if played.is_some() {
+                return self
+                    .counted("player.tracks.count", text, filters.values)
+                    .await;
+            }
+            let key = format!(
+                "player.tracks {:?} {:?} {:?}",
+                statements.shape, statements.key, filters.values
+            );
             return self
-                .counted(
-                    "player.tracks.count",
-                    filters.statements.count(),
-                    filters.values,
-                )
+                .remembered("player.tracks.count", key, text, filters.values)
                 .await;
         }
         // Maintained exact count of indexed tracks (migration 0005).
@@ -1409,14 +1421,29 @@ impl LocalCatalog {
     /// on every page.
     async fn open_album_total(&self) -> Result<u64, StoreError> {
         let filters = album_filters(&AlbumQuery::default(), None)?;
-        let text = sql::player_album_count(filters.shape);
-        let values = filters.values;
+        self.remembered(
+            "player.albums.count",
+            "player.albums.open".to_owned(),
+            sql::player_album_count(filters.shape),
+            filters.values,
+        )
+        .await
+    }
+
+    /// The count `text` answers over `values`, remembered under `key` at
+    /// one catalog revision, so a list's later pages reuse its first
+    /// page's count. The store keeps at most 256 totals per revision.
+    async fn remembered(
+        &self,
+        name: &'static str,
+        key: String,
+        text: String,
+        values: Vec<Value>,
+    ) -> Result<u64, StoreError> {
         let counted = self
-            .totals(
-                "player.albums.open".to_owned(),
-                "player.albums.count",
-                move |conn| Ok(vec![unsigned(scalar(conn, &text, &values)?)]),
-            )
+            .totals(key, name, move |conn| {
+                Ok(vec![unsigned(scalar(conn, &text, &values)?)])
+            })
             .await?;
         Ok(counted.first().copied().unwrap_or(0))
     }
@@ -1451,10 +1478,22 @@ impl LocalCatalog {
             } else {
                 self.open_album_total().await?.saturating_sub(*count)
             }
-        } else {
+        } else if json.is_some() {
+            // Plays do not move the catalog revision, so a played filter
+            // is counted every time.
             let filters = album_filters(query, json)?;
             self.counted(
                 "player.albums.count",
+                sql::player_album_count(filters.shape),
+                filters.values,
+            )
+            .await?
+        } else {
+            let filters = album_filters(query, None)?;
+            let key = format!("player.albums {:?} {:?}", filters.shape, filters.values);
+            self.remembered(
+                "player.albums.count",
+                key,
                 sql::player_album_count(filters.shape),
                 filters.values,
             )
@@ -1742,37 +1781,6 @@ impl LocalCatalog {
         Ok(out)
     }
 
-    /// Every `(kind, id)` a player can address: artists, albums and
-    /// streamable tracks by local id, genres by display name.
-    pub async fn every_id(&self) -> Result<Vec<(&'static str, String)>, StoreError> {
-        self.ids_of(
-            "player.every_id",
-            [
-                ("artist", sql::PLAYER_EVERY_ARTIST),
-                ("album", sql::PLAYER_EVERY_ALBUM),
-                ("track", sql::PLAYER_EVERY_TRACK),
-                ("genre", sql::PLAYER_EVERY_GENRE),
-            ],
-        )
-        .await
-    }
-
-    /// The ids each statement answers, tagged with its kind, one read each.
-    async fn ids_of<const N: usize>(
-        &self,
-        name: &'static str,
-        statements: [(&'static str, Statement); N],
-    ) -> Result<Vec<(&'static str, String)>, StoreError> {
-        let mut out = Vec::new();
-        for (kind, statement) in statements {
-            let ids = self
-                .ids(name, statement.text().to_owned(), Vec::new())
-                .await?;
-            out.extend(ids.into_iter().map(|id| (kind, id)));
-        }
-        Ok(out)
-    }
-
     /// The id an album, artist or track (`kind`) has now: `id` itself while
     /// it is live, else the live one a merge or an alias of any kind points
     /// it at. `None` for an album or artist nothing live holds; a track
@@ -1791,21 +1799,6 @@ impl LocalCatalog {
             }
             None => Ok(None),
         }
-    }
-
-    /// Every `(kind, id)` an album or artist merge retired, every artist id
-    /// v2 gave that the upgrade replaced, and every track alias: the old
-    /// local ids an app may still hold.
-    pub async fn merged_ids(&self) -> Result<Vec<(&'static str, String)>, StoreError> {
-        self.ids_of(
-            "player.merged_ids",
-            [
-                ("album", sql::PLAYER_MERGED_ALBUMS),
-                ("artist", sql::PLAYER_MERGED_ARTISTS),
-                ("track", sql::PLAYER_MERGED_TRACKS),
-            ],
-        )
-        .await
     }
 
     /// Every year at least one album with a streamable track has,

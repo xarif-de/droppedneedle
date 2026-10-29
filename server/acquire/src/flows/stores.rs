@@ -10,9 +10,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use futures_util::future::BoxFuture;
+use rusqlite::{Connection, OptionalExtension, Params, params_from_iter};
 
+use super::sql;
 use crate::db::AcquireDb;
-use droppedneedle_kernel::db::{DbError, map_sqlx_busy};
+use droppedneedle_kernel::db::statement::ListLen;
+use droppedneedle_kernel::db::{Db, DbError};
 use droppedneedle_kernel::runtime_config::sections::{DownloadPolicy, tier_rank};
 
 /// A flows store failure, already logged by the caller with its context.
@@ -32,8 +35,35 @@ pub(crate) fn lane_failure(operation: &'static str, error: DbError) -> StoreFail
     }
 }
 
-pub(crate) fn read_failure(operation: &'static str, error: sqlx::Error) -> StoreFailure {
-    lane_failure(operation, map_sqlx_busy(operation, error))
+/// One pooled read, its failure (a row that does not decode included)
+/// mapped as [`lane_failure`] maps a write's.
+pub(crate) async fn read<R, F>(db: &Db, operation: &'static str, op: F) -> Result<R, StoreFailure>
+where
+    F: FnOnce(&Connection) -> rusqlite::Result<R> + Send + 'static,
+    R: Send + 'static,
+{
+    db.read(operation, move |conn| op(conn).map_err(DbError::from))
+        .await
+        .map_err(|error| lane_failure(operation, error))
+}
+
+/// Every row one statement selects, mapped by `map`.
+fn read_rows<T>(
+    conn: &Connection,
+    text: &str,
+    values: impl Params,
+    map: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+) -> rusqlite::Result<Vec<T>> {
+    let mut statement = conn.prepare_cached(text)?;
+    let rows = statement.query_map(values, map)?;
+    rows.collect()
+}
+
+/// A track's quality facts: format, bitrate, bit depth.
+fn quality_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<(String, Option<i64>, Option<i64>)> {
+    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
 }
 
 /// One album whose files sit below the quality cutoff.
@@ -109,8 +139,8 @@ fn tier_of(format: &str, bitrate: Option<i64>, depth: Option<i64>) -> &'static s
     )
 }
 
-/// The upgrade worklist, read from the library catalog on every call
-/// (v2 `list_cutoff_unmet`): an album is as good as its worst file.
+/// The upgrade worklist, read from the library catalog on every call:
+/// an album is as good as its worst file.
 #[derive(Clone)]
 pub struct UpgradeWorklist {
     db: AcquireDb,
@@ -128,21 +158,21 @@ impl UpgradeWorklist {
         let Some(cutoff_rank) = tier_rank(cutoff) else {
             return Ok(Vec::new());
         };
-        let rows: Vec<CatalogTrack> = sqlx::query_as(
-            "SELECT lower(COALESCE(ai.release_group_mbid, t.embedded_release_group_mbid)), \
-                    b.title, b.album_artist_name, b.year, ae.provider_artist_id, \
-                    t.file_format, t.bit_rate, t.bit_depth \
-             FROM local_tracks t \
-             JOIN local_albums b ON b.id = t.local_album_id AND b.retired_into_album_id IS NULL \
-             LEFT JOIN local_album_external_identities ai ON ai.local_album_id = b.id \
-             LEFT JOIN local_artist_external_identities ae \
-               ON ae.local_artist_id = b.album_artist_id \
-             WHERE t.availability = 'indexed' \
-               AND COALESCE(ai.release_group_mbid, t.embedded_release_group_mbid, '') <> ''",
-        )
-        .fetch_all(self.db.pool())
-        .await
-        .map_err(|error| read_failure("upgrades.cutoff_unmet", error))?;
+        let rows: Vec<CatalogTrack> = read(self.db.db(), "upgrades.cutoff_unmet", |conn| {
+            read_rows(conn, sql::IDENTIFIED_TRACKS.text(), [], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            })
+        })
+        .await?;
         let mut albums: HashMap<String, UpgradeItem> = HashMap::new();
         for (rg_mbid, title, artist, year, artist_mbid, format, bitrate, depth) in rows {
             let tier = tier_of(&format, bitrate, depth);
@@ -183,15 +213,16 @@ impl UpgradeWorklist {
         rg_mbid: &str,
         cutoff: &str,
     ) -> Result<bool, StoreFailure> {
-        let sql = format!(
-            "SELECT t.file_format, t.bit_rate, t.bit_depth {}",
-            crate::landing::library::OWNED_TRACKS_FROM
-        );
-        let rows: Vec<(String, Option<i64>, Option<i64>)> = sqlx::query_as(&sql)
-            .bind(rg_mbid.to_ascii_lowercase())
-            .fetch_all(self.db.pool())
-            .await
-            .map_err(|error| read_failure("upgrades.album_tier", error))?;
+        let group = rg_mbid.to_ascii_lowercase();
+        let rows = read(self.db.db(), "upgrades.album_tier", move |conn| {
+            read_rows(
+                conn,
+                sql::GROUP_TRACK_QUALITY.text(),
+                [group],
+                quality_from_row,
+            )
+        })
+        .await?;
         let worst = rows
             .iter()
             .filter_map(|(format, bitrate, depth)| tier_rank(tier_of(format, *bitrate, *depth)))
@@ -200,23 +231,22 @@ impl UpgradeWorklist {
     }
 
     /// Whether the library's best copy of a recording already meets
-    /// `cutoff` (v2 per-recording floor). A recording it lacks does not.
+    /// `cutoff`. A recording it lacks does not.
     pub async fn recording_meets_cutoff(
         &self,
         recording_mbid: &str,
         cutoff: &str,
     ) -> Result<bool, StoreFailure> {
-        let rows: Vec<(String, Option<i64>, Option<i64>)> = sqlx::query_as(
-            "SELECT t.file_format, t.bit_rate, t.bit_depth FROM local_tracks t \
-             JOIN local_albums b ON b.id = t.local_album_id AND b.retired_into_album_id IS NULL \
-             LEFT JOIN local_track_external_identities ti ON ti.local_track_id = t.id \
-             WHERE t.availability = 'indexed' \
-               AND lower(COALESCE(ti.recording_mbid, t.embedded_recording_mbid, '')) = ?1",
-        )
-        .bind(recording_mbid.to_ascii_lowercase())
-        .fetch_all(self.db.pool())
-        .await
-        .map_err(|error| read_failure("upgrades.recording_tier", error))?;
+        let recording = recording_mbid.to_ascii_lowercase();
+        let rows = read(self.db.db(), "upgrades.recording_tier", move |conn| {
+            read_rows(
+                conn,
+                sql::RECORDING_TRACK_QUALITY.text(),
+                [recording],
+                quality_from_row,
+            )
+        })
+        .await?;
         let best = rows
             .iter()
             .filter_map(|(format, bitrate, depth)| tier_rank(tier_of(format, *bitrate, *depth)))
@@ -224,8 +254,8 @@ impl UpgradeWorklist {
         Ok(meets(best, cutoff))
     }
 
-    /// How many of these library tracks sit below `cutoff` (v2 counted the
-    /// edition's owned tracks it would upgrade).
+    /// How many of these library tracks sit below `cutoff`: the edition's
+    /// owned tracks an upgrade would replace.
     pub async fn tracks_below_cutoff(
         &self,
         track_ids: &[String],
@@ -233,19 +263,17 @@ impl UpgradeWorklist {
     ) -> Result<Vec<String>, StoreFailure> {
         let mut below = Vec::new();
         for chunk in track_ids.chunks(400) {
-            let marks = vec!["?"; chunk.len()].join(",");
-            let sql = format!(
-                "SELECT id, file_format, bit_rate, bit_depth FROM local_tracks \
-                 WHERE id IN ({marks})"
-            );
-            let mut query = sqlx::query_as::<_, (String, String, Option<i64>, Option<i64>)>(&sql);
-            for id in chunk {
-                query = query.bind(id);
-            }
-            let rows = query
-                .fetch_all(self.db.pool())
-                .await
-                .map_err(|error| read_failure("upgrades.track_tiers", error))?;
+            let ids = chunk.to_vec();
+            let rows: Vec<(String, String, Option<i64>, Option<i64>)> =
+                read(self.db.db(), "upgrades.track_tiers", move |conn| {
+                    let mut statement =
+                        conn.prepare(&sql::track_quality_in(ListLen::new(ids.len())))?;
+                    let rows = statement.query_map(params_from_iter(&ids), |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                    })?;
+                    rows.collect()
+                })
+                .await?;
             below.extend(
                 rows.into_iter()
                     .filter(|(_, format, bitrate, depth)| {
@@ -270,26 +298,18 @@ impl UpgradeWorklist {
     /// held entry, and those whose newest finished upgrade task is younger
     /// than its back-off.
     pub async fn list_resting(&self, now: i64) -> Result<HashSet<String>, StoreFailure> {
-        let mut resting: HashSet<String> = sqlx::query_scalar(
-            "SELECT DISTINCT lower(release_group_mbid) FROM acquire_held_entries \
-             WHERE state IN ('held', 'placing') AND release_group_mbid IS NOT NULL",
-        )
-        .fetch_all(self.db.pool())
-        .await
-        .map_err(|error| read_failure("upgrades.held_groups", error))?
+        let mut resting: HashSet<String> = read(self.db.db(), "upgrades.held_groups", |conn| {
+            read_rows(conn, sql::HELD_GROUPS.text(), [], |row| row.get(0))
+        })
+        .await?
         .into_iter()
         .collect();
-        let rows: Vec<(String, String, i64)> = sqlx::query_as(
-            "SELECT lower(release_group_mbid), status, \
-                    CAST(COALESCE(completed_at, cancelled_at, updated_at) AS INTEGER) \
-             FROM download_tasks \
-             WHERE origin = 'upgrade' AND release_group_mbid <> '' \
-               AND status IN ('completed', 'partial', 'failed', 'cancelled') \
-             ORDER BY 1, created_at DESC, rowid DESC",
-        )
-        .fetch_all(self.db.pool())
-        .await
-        .map_err(|error| read_failure("upgrades.history", error))?;
+        let rows: Vec<(String, String, i64)> = read(self.db.db(), "upgrades.history", |conn| {
+            read_rows(conn, sql::UPGRADE_HISTORY.text(), [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+        })
+        .await?;
         for album in rows.chunk_by(|a, b| a.0 == b.0) {
             let Some((rg_mbid, _, finished_at)) = album.first() else {
                 continue;
@@ -304,13 +324,10 @@ impl UpgradeWorklist {
 
     /// When the newest upgrade task was made, in unix seconds.
     pub async fn newest_upgrade_at(&self) -> Result<Option<i64>, StoreFailure> {
-        sqlx::query_scalar(
-            "SELECT CAST(max(created_at) AS INTEGER) FROM download_tasks \
-             WHERE origin = 'upgrade'",
-        )
-        .fetch_one(self.db.pool())
+        read(self.db.db(), "upgrades.last_run", |conn| {
+            conn.query_row(sql::NEWEST_UPGRADE.text(), [], |row| row.get(0))
+        })
         .await
-        .map_err(|error| read_failure("upgrades.last_run", error))
     }
 }
 
@@ -331,18 +348,18 @@ impl CutoffList for UpgradeWorklist {
     }
 }
 
-/// Background-upgrade policy (v2 `download_policy` upgrade half).
+/// Background-upgrade policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpgradePolicy {
     /// Upgrades allowed at all.
     pub upgrade_allowed: bool,
     /// The tier an album must reach before it stops being upgraded.
     pub cutoff: String,
-    /// The background scan enabled (default off in v2).
+    /// The background scan enabled.
     pub scan_enabled: bool,
     /// Grabs per sweep, at most.
     pub max_per_run: usize,
-    /// Sweep cadence in hours (default 12 in v2).
+    /// Sweep cadence in hours.
     pub interval_hours: u64,
 }
 
@@ -368,7 +385,7 @@ impl UpgradePolicy {
 #[derive(Debug, Default)]
 pub struct LibraryPresence {
     mbids: Mutex<HashSet<String>>,
-    catalog: Option<sqlx::SqlitePool>,
+    catalog: Option<Db>,
 }
 
 impl LibraryPresence {
@@ -378,7 +395,7 @@ impl LibraryPresence {
     }
 
     /// Presence read from the library catalog over the reader pool.
-    pub fn over_catalog(catalog: sqlx::SqlitePool) -> Self {
+    pub fn over_catalog(catalog: Db) -> Self {
         Self {
             mbids: Mutex::new(HashSet::new()),
             catalog: Some(catalog),
@@ -409,15 +426,7 @@ impl LibraryPresence {
         let Some(catalog) = &self.catalog else {
             return false;
         };
-        let sql = format!(
-            "SELECT EXISTS (SELECT 1 {})",
-            crate::landing::library::OWNED_TRACKS_FROM
-        );
-        match sqlx::query_scalar::<_, bool>(&sql)
-            .bind(mbid.trim().to_ascii_lowercase())
-            .fetch_one(catalog)
-            .await
-        {
+        match crate::edition::library_holds(catalog, mbid.trim()).await {
             Ok(owned) => owned,
             Err(error) => {
                 tracing::warn!(mbid, %error, "library presence unreadable");
@@ -427,9 +436,9 @@ impl LibraryPresence {
     }
 }
 
-/// Admin directory: upgrades are a curator action owned by the oldest admin
-/// (v2 `run_background_upgrade_sweep`). Read from the accounts on every
-/// call, so an admin created after boot owns the next sweep.
+/// Admin directory: upgrades are a curator action owned by the oldest
+/// admin. Read from the accounts on every call, so an admin created after boot
+/// owns the next sweep.
 #[derive(Clone)]
 pub struct AdminDirectory {
     db: AcquireDb,
@@ -443,12 +452,12 @@ impl AdminDirectory {
 
     /// Oldest admin id, or `None` when nobody can own the sweep.
     pub async fn oldest_admin(&self) -> Option<String> {
-        match sqlx::query_scalar(
-            "SELECT id FROM auth_users WHERE role = 'admin' ORDER BY created_at, id LIMIT 1",
-        )
-        .fetch_optional(self.db.pool())
-        .await
-        {
+        let admin = read(self.db.db(), "upgrades.oldest_admin", |conn| {
+            conn.query_row(sql::OLDEST_ADMIN.text(), [], |row| row.get(0))
+                .optional()
+        })
+        .await;
+        match admin {
             Ok(admin) => admin,
             Err(error) => {
                 tracing::warn!(%error, "admin directory unreadable; the upgrade sweep idles");

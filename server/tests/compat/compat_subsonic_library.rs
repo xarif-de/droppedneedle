@@ -38,7 +38,8 @@ fn uri(endpoint: &str, pairs: &[(&str, &str)]) -> String {
     format!("/subsonic/rest/{endpoint}?{}", url.query().unwrap_or(""))
 }
 
-/// One request with `pairs` as its query and `body` under `content_type`.
+/// One request with `pairs` as its query and `body` under `content_type`,
+/// asked again while the app answers busy.
 async fn request(
     rig: &CompatApp,
     method: &str,
@@ -51,10 +52,10 @@ async fn request(
         .map(|kind| ("content-type", kind))
         .into_iter()
         .collect();
-    let (status, headers, body) = rig
-        .app
-        .raw_bytes(method, &uri(endpoint, pairs), &headers, body.to_vec())
-        .await;
+    let target = uri(endpoint, pairs);
+    let (status, headers, body) =
+        crate::common::through_busy(|| rig.app.raw_bytes(method, &target, &headers, body.to_vec()))
+            .await;
     Answer {
         status,
         headers,
@@ -226,9 +227,12 @@ async fn set_subsonic(rig: &CompatApp, enabled: bool) {
 }
 
 const XML_HEAD: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><subsonic-response xmlns=\"http://subsonic.org/restapi\"";
-/// `serverVersion` is the version v3 gives Jellyfin apps.
-const ATTRS: &str =
-    "version=\"1.16.1\" type=\"DroppedNeedle\" serverVersion=\"10.10.6\" openSubsonic=\"true\"";
+/// `serverVersion` is DroppedNeedle's own version.
+const ATTRS: &str = concat!(
+    "version=\"1.16.1\" type=\"DroppedNeedle\" serverVersion=\"",
+    env!("CARGO_PKG_VERSION"),
+    "\" openSubsonic=\"true\""
+);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn envelopes_are_byte_exact() {
@@ -244,7 +248,12 @@ async fn envelopes_are_byte_exact() {
         (
             client.get("ping", &[("f", "json")]).await,
             "application/json",
-            "{\"subsonic-response\":{\"status\":\"ok\",\"version\":\"1.16.1\",\"type\":\"DroppedNeedle\",\"serverVersion\":\"10.10.6\",\"openSubsonic\":true}}".to_owned(),
+            concat!(
+                "{\"subsonic-response\":{\"status\":\"ok\",\"version\":\"1.16.1\",\"type\":\"DroppedNeedle\",\"serverVersion\":\"",
+                env!("CARGO_PKG_VERSION"),
+                "\",\"openSubsonic\":true}}"
+            )
+            .to_owned(),
         ),
         // Endpoint names casefold and drop `.view`.
         (
@@ -1745,7 +1754,7 @@ fn request_limits_and_xml_escaping() {
     use droppedneedle_compat::subsonic::params::{
         MAX_REQUEST_PARAMETER_BYTES, check_limits, decode_pairs,
     };
-    use droppedneedle_compat::subsonic::value::{Val, obj};
+    use droppedneedle_compat::subsonic::value::{SubsonicFormat, render_error};
 
     assert_eq!(MAX_REQUEST_PARAMETER_BYTES, 64 * 1024);
     assert_eq!(
@@ -1776,12 +1785,340 @@ fn request_limits_and_xml_escaping() {
     let many = vec![("a".to_owned(), "b".to_owned()); 2000];
     assert_eq!(check_limits(&many).expect_err("too many").code, 10);
 
-    let value = obj(vec![("a", Val::Str("x\x07\x1b&<>\"".to_owned()))]);
-    let xml = Val::Obj(vec![("root".to_owned(), value)]).to_xml("t");
+    let xml = render_error(0, "x\x07\x1b&<>\"", SubsonicFormat::Xml, None, "s", "v").body_text();
     assert!(
-        xml.contains("x&amp;&lt;&gt;&quot;") && !xml.contains('\x07'),
+        xml.contains("message=\"x&amp;&lt;&gt;&quot;\"") && !xml.contains('\x07'),
         "{xml}"
     );
-    let stripped = obj(vec![("gone", Val::Null), ("empty", Val::List(vec![]))]).stripped();
-    assert_eq!(stripped.to_json(), "{\"empty\":[]}");
+}
+
+/// A read that finds the database busy answers 503 with `Retry-After` in
+/// both protocols, so an app asks again instead of showing an empty
+/// library: Subsonic in its failed envelope with code 0, Jellyfin with an
+/// empty body. The compat routers run over a database with one pooled
+/// reader for the collections and a short wait for it; the test holds that
+/// reader, so the playlist read gives up as busy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_busy_read_answers_503_with_retry_after_in_both_protocols() {
+    use std::net::SocketAddr;
+    use std::time::Duration;
+
+    use axum::body::Body;
+    use axum::extract::ConnectInfo;
+    use droppedneedle_auth::users::roles::Role;
+    use droppedneedle_catalog::reads::collections::CollectionsState;
+    use droppedneedle_catalog::reads::collections::db::CollectionsDb;
+    use droppedneedle_catalog::reads::library::store::LocalCatalog;
+    use droppedneedle_compat::CompatSetup;
+    use droppedneedle_compat::setup::CompatDeps;
+    use droppedneedle_kernel::db::{DbConfig, LaneLimits, open_runtime};
+    use droppedneedle_kernel::runtime_config::sections::ConnectApps;
+    use tower::ServiceExt as _;
+
+    const SECRET: &str = "alice-app-secret";
+    let scope = crate::common::TestApp::start("busy-read-scope").await;
+    let dir = crate::common::ScratchDir::new("busy-read");
+    let path = dir.join("app.db");
+    crate::common::migrated_db(&path);
+    let runtime = open_runtime(&DbConfig::new(&path))
+        .await
+        .expect("runtime opens");
+    // The collections read through a runtime of one pooled reader and a
+    // short wait for it; the test holds that reader.
+    let mut starved = DbConfig::new(&path)
+        .with_lane_limits(LaneLimits::patient())
+        .with_read_wait(Duration::from_millis(100));
+    starved.readers = 1;
+    let starved = open_runtime(&starved).await.expect("starved runtime opens");
+    let platform = crate::common::TestPlatform::on(runtime.db(), &dir)
+        .build()
+        .await;
+    let auth = crate::common::auth::AuthRig::on(&platform);
+    let user = auth.seed_user("alice", Role::User).await;
+    auth.seed_app_password(&user.id, SECRET).await;
+    let (library, _) = crate::common::library::library_at(&platform);
+    let reads = crate::common::bundles::reads_at(
+        &platform,
+        auth.deps.clone(),
+        crate::common::reads_inputs(&dir),
+        &library,
+        CollectionsState::new(
+            CollectionsDb::new(starved.db().clone(), platform.clock.clone()),
+            LocalCatalog::new(runtime.db().clone()),
+        ),
+        None,
+    );
+    let collections = crate::common::bundles::collections_at(&platform);
+    let acquire = crate::common::bundles::acquire_at(
+        &platform,
+        auth.deps.clone(),
+        &library,
+        &collections.stores,
+    );
+    let media =
+        crate::common::bundles::media_at(&platform, auth.deps.clone(), &library, &reads, &acquire);
+    platform
+        .settings
+        .save_blocking(ConnectApps {
+            subsonic_enabled: true,
+            jellyfin_enabled: true,
+            ..ConnectApps::default()
+        })
+        .expect("connect apps save");
+    let deps = CompatDeps::over_reads(
+        &platform,
+        auth.deps.clone(),
+        media.playback.clone(),
+        media.stream.engine.clone(),
+        library.scans.clone(),
+        &reads,
+    );
+    let compat = CompatSetup::build(deps);
+    compat
+        .jellyfin_ids()
+        .fill()
+        .pass()
+        .await
+        .expect("jellyfin ids load");
+    let router = scope.request_scope(compat.router());
+    let ask = |uri: String, authorization: Option<String>| {
+        let router = router.clone();
+        async move {
+            let mut request = axum::http::Request::get(uri);
+            if let Some(authorization) = authorization {
+                request = request.header("authorization", authorization);
+            }
+            let mut request = request.body(Body::empty()).expect("request builds");
+            request
+                .extensions_mut()
+                .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40_000))));
+            let response = router.oneshot(request).await.expect("router answers");
+            let status = response.status();
+            let retry_after = response
+                .headers()
+                .get("retry-after")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .expect("body reads");
+            (status, retry_after, body.to_vec())
+        }
+    };
+    let subsonic = uri(
+        "getPlaylists",
+        &[
+            ("u", "alice"),
+            ("p", SECRET),
+            ("v", "1.16.1"),
+            ("c", "test"),
+            ("f", "json"),
+        ],
+    );
+    let jellyfin = "/jellyfin/Items?IncludeItemTypes=Playlist".to_owned();
+    let token = Some(format!("MediaBrowser Client=\"Test\", Token=\"{SECRET}\""));
+
+    // The playlist list reads on the starved runtime's one reader: hold it.
+    let (entered, inside) = std::sync::mpsc::channel();
+    let (let_go, release) = std::sync::mpsc::channel::<()>();
+    let held = {
+        let db = starved.db().clone();
+        std::thread::spawn(move || {
+            db.read_blocking("test.held", |_| {
+                entered.send(()).expect("test waits");
+                release.recv().expect("test lets go");
+                Ok::<_, droppedneedle_kernel::db::DbError>(())
+            })
+        })
+    };
+    inside.recv().expect("reader held");
+    let (status, retry_after, body) = ask(subsonic.clone(), None).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(retry_after.as_deref(), Some("1"));
+    let envelope: Value = serde_json::from_slice(&body).expect("envelope is json");
+    assert_eq!(envelope["subsonic-response"]["status"], "failed");
+    assert_eq!(envelope["subsonic-response"]["error"]["code"], 0);
+    let (status, retry_after, body) = ask(jellyfin.clone(), token.clone()).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(retry_after.as_deref(), Some("1"));
+    assert!(body.is_empty());
+
+    let_go.send(()).expect("reader lets go");
+    held.join().expect("reader joins").expect("held read");
+    // The one reader is free again, though a background read may have it
+    // for a moment: ask again while the answer is busy, as a client would.
+    let freed = |uri: String, authorization: Option<String>| {
+        let ask = &ask;
+        async move {
+            let deadline = std::time::Instant::now() + crate::common::PATIENCE;
+            loop {
+                let status = ask(uri.clone(), authorization.clone()).await.0;
+                if status != StatusCode::SERVICE_UNAVAILABLE || std::time::Instant::now() > deadline
+                {
+                    return status;
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    };
+    assert_eq!(freed(subsonic, None).await, StatusCode::OK);
+    assert_eq!(freed(jellyfin, token).await, StatusCode::OK);
+    drop(router);
+    scope.stop().await;
+}
+
+/// A busy answer to a write means nothing was written, so asking again is
+/// safe. `createPlaylist` reads everything it needs before its one write:
+/// with the playlist and favorites reads busy it answers 503 with
+/// `Retry-After` and no playlist exists, and asking again once they are
+/// free makes exactly one playlist holding the song. The compat routers
+/// run over one database file whose collections go through a runtime with
+/// one pooled reader and a short wait for it; the test holds that reader.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_busy_playlist_create_writes_nothing_and_asking_again_makes_one() {
+    use std::net::SocketAddr;
+    use std::time::Duration;
+
+    use axum::body::Body;
+    use axum::extract::ConnectInfo;
+    use droppedneedle_auth::users::roles::Role;
+    use droppedneedle_catalog::reads::collections::CollectionsState;
+    use droppedneedle_catalog::reads::collections::db::CollectionsDb;
+    use droppedneedle_catalog::reads::library::store::LocalCatalog;
+    use droppedneedle_compat::CompatSetup;
+    use droppedneedle_compat::setup::CompatDeps;
+    use droppedneedle_kernel::db::{DbConfig, LaneLimits, open_runtime};
+    use droppedneedle_kernel::runtime_config::sections::ConnectApps;
+    use tower::ServiceExt as _;
+
+    const SECRET: &str = "alice-app-secret";
+    let scope = crate::common::TestApp::start("busy-write-scope").await;
+    let dir = crate::common::ScratchDir::new("busy-write");
+    let path = dir.join("app.db");
+    crate::common::migrated_db(&path);
+    let main = open_runtime(&DbConfig::new(&path))
+        .await
+        .expect("runtime opens");
+    let mut starved = DbConfig::new(&path)
+        .with_lane_limits(LaneLimits::patient())
+        .with_read_wait(Duration::from_millis(100));
+    starved.readers = 1;
+    let starved = open_runtime(&starved).await.expect("starved runtime opens");
+    let platform = crate::common::TestPlatform::on(main.db(), &dir)
+        .build()
+        .await;
+    let auth = crate::common::auth::AuthRig::on(&platform);
+    let user = auth.seed_user("alice", Role::User).await;
+    auth.seed_app_password(&user.id, SECRET).await;
+    rusqlite::Connection::open(&path)
+        .expect("database opens")
+        .execute_batch(crate::compat_catalog::LIBRARY)
+        .expect("catalog seeds");
+    let (library, _) = crate::common::library::library_at(&platform);
+    let reads = crate::common::bundles::reads_at(
+        &platform,
+        auth.deps.clone(),
+        crate::common::reads_inputs(&dir),
+        &library,
+        CollectionsState::new(
+            CollectionsDb::new(starved.db().clone(), platform.clock.clone()),
+            LocalCatalog::new(main.db().clone()),
+        ),
+        None,
+    );
+    let collections = crate::common::bundles::collections_at(&platform);
+    let acquire = crate::common::bundles::acquire_at(
+        &platform,
+        auth.deps.clone(),
+        &library,
+        &collections.stores,
+    );
+    let media =
+        crate::common::bundles::media_at(&platform, auth.deps.clone(), &library, &reads, &acquire);
+    platform
+        .settings
+        .save_blocking(ConnectApps {
+            subsonic_enabled: true,
+            ..ConnectApps::default()
+        })
+        .expect("connect apps save");
+    let deps = CompatDeps::over_reads(
+        &platform,
+        auth.deps.clone(),
+        media.playback.clone(),
+        media.stream.engine.clone(),
+        library.scans.clone(),
+        &reads,
+    );
+    let router = scope.request_scope(CompatSetup::build(deps).router());
+    let create = uri(
+        "createPlaylist",
+        &[
+            ("u", "alice"),
+            ("p", SECRET),
+            ("v", "1.16.1"),
+            ("c", "test"),
+            ("f", "json"),
+            ("name", "Mix"),
+            ("songId", "tr-trk-1"),
+        ],
+    );
+    let ask = || {
+        let router = router.clone();
+        let create = create.clone();
+        async move {
+            let mut request = axum::http::Request::get(create)
+                .body(Body::empty())
+                .expect("request builds");
+            request
+                .extensions_mut()
+                .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40_000))));
+            let response = router.oneshot(request).await.expect("router answers");
+            let status = response.status();
+            let retry_after = response
+                .headers()
+                .get("retry-after")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .expect("body reads");
+            let body: Value = serde_json::from_slice(&body).expect("envelope is json");
+            (status, retry_after, body)
+        }
+    };
+    let rows = || {
+        let db = rusqlite::Connection::open(&path).expect("database opens");
+        let count = |table: &str| {
+            db.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("rows count")
+        };
+        (count("playlists"), count("playlist_tracks"))
+    };
+
+    let held = crate::common::hold_reader(starved.db().sqlx()).await;
+    let (status, retry_after, body) = ask().await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(retry_after.as_deref(), Some("1"));
+    assert_eq!(body["subsonic-response"]["error"]["code"], 0);
+    assert_eq!(rows(), (0, 0), "a busy answer wrote nothing");
+
+    drop(held);
+    // The one reader is free again, though a background read may have it
+    // for a moment: ask again while the answer is busy, as a client would.
+    let deadline = std::time::Instant::now() + crate::common::PATIENCE;
+    let (status, _, body) = loop {
+        let answer = ask().await;
+        if answer.0 != StatusCode::SERVICE_UNAVAILABLE || std::time::Instant::now() > deadline {
+            break answer;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    };
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["subsonic-response"]["playlist"]["songCount"], 1);
+    assert_eq!(rows(), (1, 1), "asking again made one playlist");
+    drop(router);
+    scope.stop().await;
 }

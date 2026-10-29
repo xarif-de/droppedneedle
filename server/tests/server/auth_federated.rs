@@ -11,7 +11,6 @@ use axum::routing::{get, post};
 use axum::{Form, Json, Router, extract::Path, extract::Query, extract::State};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use droppedneedle_auth::federated::SessionIssuer;
 use droppedneedle_auth::federated::jellyfin_login::emby_auth_header;
 use droppedneedle_auth::federated::oidc::{
     AuthorizeParams, OidcConfig, RawClaims, authorize_url, form_encode, normalise_claims,
@@ -23,10 +22,8 @@ use droppedneedle_auth::federated::users::{
     FederatedProfile, derive_username, find_or_create_federated_user, username_base,
 };
 use droppedneedle_auth::prod::{StoredPassword, Verdict};
-use droppedneedle_auth::session::store::SessionStore as _;
 use droppedneedle_auth::session::tokens;
 use droppedneedle_auth::users::roles::Role;
-use droppedneedle_auth::users::stores::SessionManager as _;
 use droppedneedle_auth::wiring::Upstreams;
 use droppedneedle_kernel::runtime_config::Secret;
 use droppedneedle_kernel::runtime_config::secret_sections::{
@@ -414,9 +411,11 @@ async fn oidc_sign_in_verifies_the_id_token_and_creates_the_first_admin() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let token = body["token"].as_str().expect("bearer token").to_owned();
-    assert_eq!(body["role"], "admin", "first account is the admin: {body}");
-    assert_eq!(body["email"], "jane.doe@example.com");
-    assert_eq!(body["username"], "jane.doe");
+    let user = &body["user"];
+    assert_eq!(user["role"], "admin", "first account is the admin: {body}");
+    assert_eq!(user["email"], "jane.doe@example.com");
+    assert_eq!(user["username"], "jane.doe");
+    assert_eq!(user["providers"], json!(["oidc"]));
     let (status, _, _) = call(
         app.clone(),
         "GET",
@@ -573,7 +572,7 @@ async fn jellyfin_sign_in_links_the_media_account_and_feeds_the_import() {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     let (status, body, _) = login("right-password").await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["role"], "admin");
+    assert_eq!(body["user"]["role"], "admin");
     let token = body["token"].as_str().expect("bearer token").to_owned();
     // Signing in linked the Jellyfin account for playback (v2 auto-link).
     let links = linked_accounts(e2e.router(), &token).await;
@@ -1034,7 +1033,7 @@ async fn lastfm_links_with_the_instance_key_and_binds_tokens_to_the_user() {
         ),
     );
     let signing = store
-        .lastfm_session(&jane_id, users.lastfm_switch.as_ref())
+        .lastfm_session(&jane_id, &users.lastfm_switch)
         .expect("jane scrobbles");
     assert_eq!(
         (
@@ -1189,12 +1188,12 @@ async fn old_sessions_die_on_import_while_new_logins_work() {
                 .is_some()
         }
     };
-    let issuer = &rig.auth.issuer;
+    let issuer = &rig.auth.sessions;
     let live = issuer.issue_session(&user.id, None).await.unwrap();
     assert!(is_live(live.clone()).await);
 
     rig.auth
-        .session_manager
+        .sessions
         .revoke_all_for_user(&user.id)
         .await
         .expect("sessions revoke");

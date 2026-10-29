@@ -18,15 +18,17 @@ use crate::common::bundles::quiet_ticks;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use droppedneedle_acquire::clients::LiveClients;
 use droppedneedle_acquire::db::AcquireDb;
 use droppedneedle_acquire::downloads::journal::Journal;
+use droppedneedle_acquire::downloads::worker::SourceList;
+use droppedneedle_acquire::downloads::worker::WorkerSettings;
 use droppedneedle_acquire::follows::Follows;
 use droppedneedle_acquire::probes::{LiveProbes, ProbeCache, refresh_probes};
 use droppedneedle_acquire::readiness::SourceReadiness;
 use droppedneedle_acquire::settings::{ConfigLidarrSettings, ConfigSpotifySettings};
 use droppedneedle_acquire::target::Targets;
-use droppedneedle_acquire::wiring::{ClientLives, LiveClients, WorkerSettings};
-use droppedneedle_acquire::worker::SourceList;
+use droppedneedle_acquire::wiring::ClientLives;
 use droppedneedle_auth::users::roles::{Role, SessionKind};
 use droppedneedle_catalog::reads::collections::db::CollectionsDb;
 use droppedneedle_catalog::reads::collections::models::PlaylistTrack;
@@ -205,14 +207,22 @@ fn rig_with(
     }
 }
 
-/// The rows on one playlist, in order.
-async fn playlist_rows(playlists: &PlaylistStore, playlist_id: &str) -> Vec<PlaylistTrack> {
-    playlists.tracks(playlist_id).await.expect("rows read")
+/// The rows on one of the user's playlists, in order.
+async fn playlist_rows(
+    playlists: &PlaylistStore,
+    user_id: &str,
+    playlist_id: &str,
+) -> Vec<PlaylistTrack> {
+    playlists
+        .owned_by(user_id)
+        .tracks(playlist_id)
+        .await
+        .expect("rows read")
 }
 
-/// The row ids on one playlist, in order.
-async fn track_ids(playlists: &PlaylistStore, playlist_id: &str) -> Vec<String> {
-    playlist_rows(playlists, playlist_id)
+/// The row ids on one of the user's playlists, in order.
+async fn track_ids(playlists: &PlaylistStore, user_id: &str, playlist_id: &str) -> Vec<String> {
+    playlist_rows(playlists, user_id, playlist_id)
         .await
         .into_iter()
         .map(|row| row.id)
@@ -977,7 +987,7 @@ async fn spotify_import_answers_fast_then_populates_two_tracks() {
     // by its track's ISRC, so it carries its release group. The second
     // album's namesake carries another ISRC: a name alone proves nothing,
     // so it stays unresolved.
-    let rows = playlist_rows(&bundle.playlists, &playlist_id).await;
+    let rows = playlist_rows(&bundle.playlists, &user_id, &playlist_id).await;
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].track_name, "Midnight Drive");
     assert_eq!(rows[0].artist_name, "Aurora Current");
@@ -994,6 +1004,7 @@ async fn spotify_import_answers_fast_then_populates_two_tracks() {
     // The cover persisted best-effort.
     let cover = bundle
         .playlists
+        .owned_by(&user_id)
         .cover(&playlist_id)
         .await
         .expect("cover reads");
@@ -1011,7 +1022,9 @@ async fn spotify_import_answers_fast_then_populates_two_tracks() {
     let done = poll_job_done(bundle.deps.clone(), &user_id, "sp-playlist-1").await;
     assert_eq!(done["state"], "done");
     assert_eq!(
-        playlist_rows(&bundle.playlists, &playlist_id).await.len(),
+        playlist_rows(&bundle.playlists, &user_id, &playlist_id)
+            .await
+            .len(),
         2
     );
 
@@ -1055,7 +1068,7 @@ async fn spotify_failed_reimport_keeps_the_old_tracks() {
         .to_owned();
     let done = poll_job_done(bundle.deps.clone(), &user_id, "sp-playlist-1").await;
     assert_eq!(done["state"], "done");
-    let before = track_ids(&bundle.playlists, &playlist_id).await;
+    let before = track_ids(&bundle.playlists, &user_id, &playlist_id).await;
     assert_eq!(before.len(), 2);
 
     // Fail the insert of the second track, after the first one is written.
@@ -1081,7 +1094,10 @@ async fn spotify_failed_reimport_keeps_the_old_tracks() {
     assert_eq!(status, StatusCode::OK);
     let done = poll_job_done(bundle.deps.clone(), &user_id, "sp-playlist-1").await;
     assert_eq!(done["state"], "error", "{done}");
-    assert_eq!(track_ids(&bundle.playlists, &playlist_id).await, before);
+    assert_eq!(
+        track_ids(&bundle.playlists, &user_id, &playlist_id).await,
+        before
+    );
 }
 
 #[tokio::test]
@@ -1160,7 +1176,7 @@ async fn spotify_track_without_id_fails_the_import() {
     let done = poll_job_done(bundle.deps, &user_id, SPOTIFY_PLAYLIST_NO_TRACK_ID).await;
     assert_eq!(done["state"], "error", "{done}");
     assert!(
-        playlist_rows(&bundle.playlists, &playlist_id)
+        playlist_rows(&bundle.playlists, &user_id, &playlist_id)
             .await
             .is_empty()
     );
@@ -1387,7 +1403,7 @@ async fn spotify_sqlite_stores_persist_and_expire() {
     let stored: String = sqlx::query_scalar(
         "SELECT connection_data FROM user_connections WHERE user_id = 'u1' AND service = 'spotify'",
     )
-    .fetch_one(db.pool())
+    .fetch_one(db.db().sqlx())
     .await
     .expect("row reads");
     assert!(!stored.contains("SECRET"), "link is sealed at rest");
@@ -1432,14 +1448,14 @@ async fn spotify_sqlite_stores_persist_and_expire() {
     };
     for _ in 0..2 {
         bridge
-            .replace_tracks(&id, &[track.clone(), track.clone()])
+            .replace_tracks("u1", &id, &[track.clone(), track.clone()])
             .await
             .expect("replaces");
     }
     let rows: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM playlist_tracks WHERE playlist_id = ?1")
             .bind(&id)
-            .fetch_one(db.pool())
+            .fetch_one(db.db().sqlx())
             .await
             .expect("count reads");
     assert_eq!(rows, 2);
@@ -1638,7 +1654,7 @@ fn plugin_host_with_download_client(auth: &AuthRig, dir: &std::path::Path) -> Ar
         "[plugin]\n\
          name = \"toy\"\n\
          version = \"1.0.0\"\n\
-         api_version = 1\n\
+         api_version = 2\n\
          entrypoint = \"plugin:Toy\"\n\
          capabilities = [\"download_client\"]\n\
          [[capability]]\n\
@@ -1655,10 +1671,8 @@ fn plugin_host_with_download_client(auth: &AuthRig, dir: &std::path::Path) -> Ar
     let host = PluginHost::new(
         dir.join("plugins"),
         platform.settings.clone(),
-        Arc::new(droppedneedle_plugins::fakes::FakeLauncher::new()),
-        Arc::new(droppedneedle_plugins::ticks::TickStoreKind::Memory(
-            droppedneedle_kernel::jobs::plugin_ticks::MemoryTickStore::new(),
-        )),
+        Arc::new(crate::common::plugin_fakes::FakeLauncher::new()),
+        droppedneedle_plugins::wiring::tick_store(platform),
         library,
     );
     host.load_all();
@@ -1672,11 +1686,11 @@ fn plugin_host_with_download_client(auth: &AuthRig, dir: &std::path::Path) -> Ar
 /// starts. Requests and the download queue read the same answer as
 /// search, through the worker's readiness.
 async fn readiness_answers(setup: SourceSetup) -> (Vec<bool>, Vec<String>) {
+    use droppedneedle_acquire::downloads::worker::DownloadWorker;
     use droppedneedle_acquire::requests::quota::QuotaLedger;
     use droppedneedle_acquire::search_jobs::store::JobStore;
     use droppedneedle_acquire::search_jobs::{AlbumSearch, SearchJobError, SearchJobs};
-    use droppedneedle_acquire::worker::DownloadWorker;
-    use droppedneedle_catalog::reads::discover::adapters::content::IntegrationSettings;
+    use droppedneedle_catalog::reads::discover::content::IntegrationSettings;
 
     let (auth, _, user_id) = seed_rig().await;
     let scratch = crate::common::ScratchDir::new("readiness-table");

@@ -452,6 +452,28 @@ async fn user_data_carries_resumes_and_repeats_as_noop() {
     .await
     .expect("request reads");
     assert_eq!(request, (1_700_000_000_250, 1_700_000_000_250));
+    // v2's REAL-second download, quarantine, seen and approval times land
+    // as milliseconds.
+    let times: (i64, i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT created_at FROM download_tasks), \
+         (SELECT updated_at FROM download_attempts), \
+         (SELECT quarantined_at FROM download_quarantine), \
+         (SELECT first_seen_at FROM wanted_seen_candidates), \
+         (SELECT requested_at FROM personal_mix_approvals)",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("times read");
+    assert_eq!(
+        times,
+        (
+            1_700_000_100_000,
+            1_700_000_400_000,
+            1_700_000_200_000,
+            1_700_000_300_000,
+            1_700_000_000_000
+        )
+    );
     let dormant: (String, i64, i64) = sqlx::query_as(
         "SELECT state, created_at, next_check_at FROM wanted_watches \
          WHERE release_group_mbid_lower = ?",
@@ -893,6 +915,131 @@ async fn held_downloads_carry_into_the_held_list() {
     assert_eq!(again, 2, "a repeat import adds nothing");
 }
 
+/// A v2 download with a text year and a REAL track number carries: the
+/// year lands NULL and the track number as its whole number. One stray
+/// value in a whole-number column must not stop the upgrade.
+#[tokio::test]
+async fn stray_whole_numbers_carry_as_null_or_whole() {
+    let root = scratch_dir("stray-whole");
+    let fixture = build_v2_fixture(&root.join("v2")).expect("fixture builds");
+    let v2_db = root.join("v2").join("cache").join("library.db");
+    delete_orphan_rows(&v2_db).expect("repair runs");
+    let alice = &fixture.alice_id;
+    let v2 = rusqlite::Connection::open(&v2_db).expect("v2 db opens");
+    v2.execute_batch(&format!(
+        "ALTER TABLE download_tasks ADD COLUMN year INTEGER;
+         ALTER TABLE download_tasks ADD COLUMN track_number INTEGER;
+         INSERT INTO download_tasks (id, user_id, release_group_mbid, artist_name,
+             album_title, status, year, track_number, created_at, updated_at)
+         VALUES ('download-stray', '{alice}', 'dddddddd-0000-4000-8000-000000000004',
+                 'Artist', 'Album', 'completed', 'unknown', 7.4, 1700000000.0,
+                 1700000000.0);"
+    ))
+    .expect("v2 row seeds");
+    drop(v2);
+    let export_path = root.join("export.json");
+    droppedneedle_tool::export::export_v2_to_file(
+        &export_request(&root.join("v2"), PASSPHRASE),
+        &export_path,
+    )
+    .expect("export writes");
+    let text = std::fs::read_to_string(&export_path).expect("export reads back");
+    let (v3_root, pool) = seeded_target(&root).await;
+
+    run_pipeline(&text, PASSPHRASE, &v3_root, &pool, false).await;
+    let landed: (Option<i64>, Option<i64>) =
+        sqlx::query_as("SELECT year, track_number FROM download_tasks WHERE id = 'download-stray'")
+            .fetch_one(&pool)
+            .await
+            .expect("the download carries");
+    assert_eq!(landed, (None, Some(7)));
+}
+
+/// A v2 download with a text track duration and preflight score, a held
+/// file with text durations and an unknown reason, and a finished request
+/// of an unknown kind carry: the text numbers land NULL, and the kind and
+/// the reason take their safe values. One stray value must not stop the
+/// upgrade.
+#[tokio::test]
+async fn stray_reals_and_fixed_sets_carry_as_null_or_default() {
+    let root = scratch_dir("stray-real");
+    let fixture = build_v2_fixture(&root.join("v2")).expect("fixture builds");
+    let v2_cache = root.join("v2").join("cache");
+    let v2_db = v2_cache.join("library.db");
+    delete_orphan_rows(&v2_db).expect("repair runs");
+    let held_dir = v2_cache.join("held");
+    std::fs::create_dir_all(&held_dir).expect("v2 held folder");
+    std::fs::write(held_dir.join("stray.flac"), b"held bytes").expect("held file");
+    let alice = &fixture.alice_id;
+    let v2 = rusqlite::Connection::open(&v2_db).expect("v2 db opens");
+    v2.execute_batch(&format!(
+        "ALTER TABLE download_tasks ADD COLUMN track_duration_seconds REAL;
+         ALTER TABLE download_tasks ADD COLUMN preflight_score REAL;
+         INSERT INTO download_tasks (id, user_id, release_group_mbid, artist_name,
+             album_title, status, track_duration_seconds, preflight_score, created_at,
+             updated_at)
+         VALUES ('download-stray', '{alice}', 'dddddddd-0000-4000-8000-000000000005',
+                 'Artist', 'Album', 'completed', '3:42', 'high', 1700000000.0,
+                 1700000000.0);
+         INSERT INTO request_history (musicbrainz_id_lower, musicbrainz_id, artist_name,
+             album_title, requested_at, status, user_id, request_kind)
+         VALUES ('eeeeeeee-0000-4000-8000-000000000005',
+                 'eeeeeeee-0000-4000-8000-000000000005', 'Artist', 'Album', '1700000000',
+                 'imported', '{alice}', 'playlist');
+         CREATE TABLE held_imports (
+             id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL,
+             release_group_mbid TEXT, duration_seconds REAL,
+             expected_duration_seconds REAL, evidence_score REAL,
+             held_path TEXT NOT NULL, reason TEXT NOT NULL, source_task_id TEXT,
+             status TEXT NOT NULL DEFAULT 'held', created_at REAL NOT NULL);
+         INSERT INTO held_imports (user_id, release_group_mbid, duration_seconds,
+             expected_duration_seconds, evidence_score, held_path, reason, source_task_id,
+             status, created_at)
+         VALUES ('{alice}', 'dddddddd-0000-4000-8000-000000000005', '3:42', 'long',
+                 'strong', '/app/cache/held/stray.flac', 'unheard_of', 'download-stray',
+                 'held', 1700000000.0);"
+    ))
+    .expect("v2 rows seed");
+    drop(v2);
+    let export_path = root.join("export.json");
+    droppedneedle_tool::export::export_v2_to_file(
+        &export_request(&root.join("v2"), PASSPHRASE),
+        &export_path,
+    )
+    .expect("export writes");
+    let text = std::fs::read_to_string(&export_path).expect("export reads back");
+    let (v3_root, pool) = seeded_target(&root).await;
+
+    run_pipeline(&text, PASSPHRASE, &v3_root, &pool, false).await;
+    let download: (Option<f64>, Option<f64>) = sqlx::query_as(
+        "SELECT track_duration_seconds, preflight_score FROM download_tasks \
+         WHERE id = 'download-stray'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("the download carries");
+    assert_eq!(download, (None, None));
+    let kind: String = sqlx::query_scalar(
+        "SELECT request_kind FROM request_history \
+         WHERE musicbrainz_id_lower = 'eeeeeeee-0000-4000-8000-000000000005'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("the request carries");
+    assert_eq!(kind, "album");
+    let held: (Option<f64>, Option<f64>, Option<f64>, String) = sqlx::query_as(
+        "SELECT duration_seconds, expected_duration_seconds, evidence_score, reason \
+         FROM acquire_held_files WHERE path = 'stray.flac'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("the held file carries");
+    assert_eq!(
+        held,
+        (None, None, None, "held_by_earlier_version".to_owned())
+    );
+}
+
 /// One user logs in with their v2 password through the production login
 /// path; success persists the Argon2id rehash, and a wrong password still
 /// fails.
@@ -906,7 +1053,7 @@ async fn login_rehashes(
     use droppedneedle_auth::session::login::{
         LoginContext, LoginError, LoginRequest, LoginService, TransportParam,
     };
-    use droppedneedle_auth::sqlite::{AuthDb, SqliteCredentialLookup, SqliteSessionStore};
+    use droppedneedle_auth::sqlite::{AuthDb, Sessions, Users};
 
     let before: String = sqlx::query_scalar(
         "SELECT provider_data FROM auth_providers WHERE user_id = ? AND provider = 'local'",
@@ -922,9 +1069,12 @@ async fn login_rehashes(
         std::sync::Arc::new(droppedneedle_kernel::clock::SystemClock),
     );
     let login = LoginService::new(
-        SqliteSessionStore::new(&auth_db),
+        Sessions::new(
+            &auth_db,
+            std::sync::Arc::new(droppedneedle_kernel::ids::UuidGenerator),
+        ),
         droppedneedle_auth::passwords::Passwords::new(),
-        SqliteCredentialLookup::new(&auth_db),
+        Users::new(&auth_db),
     );
     let context = || LoginContext {
         user_agent: None,
@@ -1006,14 +1156,13 @@ async fn assert_compat_reauth(
     fixture: &droppedneedle_tool::tooling::fixture::V2Fixture,
 ) {
     use droppedneedle_auth::session::tokens::hash_token;
-    use droppedneedle_auth::sqlite::{AuthDb, SqliteAppPasswordStore};
-    use droppedneedle_auth::users::stores::AppPasswordStore;
+    use droppedneedle_auth::sqlite::{AppPasswords, AuthDb};
 
     let auth_db = AuthDb::new(
         db,
         std::sync::Arc::new(droppedneedle_kernel::clock::SystemClock),
     );
-    let store = SqliteAppPasswordStore::new(&auth_db);
+    let store = AppPasswords::new(&auth_db);
     let crypto = Crypto::load(&v3_root.join("config")).expect("v3 key loads");
 
     let row = store

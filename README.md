@@ -118,7 +118,7 @@ docker compose pull
 docker compose up -d
 ```
 
-Before a new version changes the database schema, DroppedNeedle writes a verified backup of the database to `/app/cache/backups`. If an upgrade goes wrong, stop the container, delete `library.db-wal` and `library.db-shm` if they exist, put the backup back in place of `/app/cache/library.db`, and run the previous image. A backup holds your settings too. Stored passwords and API keys in it are sealed with the key file `/app/config/data_enc.key`, so keep that file with your backups. DroppedNeedle refuses to start on a database whose key file is missing or belongs to another database, and changes nothing. If the key is lost for good, `droppedneedle-tool reset-key --yes`, run with the server stopped, makes a new key and clears every stored password, API key, app password and service link, so they can be entered again. Jellyfin album and artist ids change with it, so Jellyfin apps see a new library. See [docs/upgrading-from-v2.md](docs/upgrading-from-v2.md#backups-and-restore).
+Before a new version changes the database schema, DroppedNeedle writes a verified backup of the database to `/app/cache/backups`. If an upgrade goes wrong, stop the container, delete `library.db-wal` and `library.db-shm` if they exist, put the backup back in place of `/app/cache/library.db`, copy everything in `/app/cache/backups/undo` into `/app/cache/undo` (files there are named by their content, so a plain copy that skips existing files is safe), and run the previous image. `droppedneedle-tool restore` does both for you, into an empty folder, under the database file name the server uses (`LIBRARY_DB_PATH`'s, when it is set), and never replaces a file. A backup holds your settings too. Stored passwords and API keys in it are sealed with the key file `/app/config/data_enc.key`, so keep that file with your backups. DroppedNeedle refuses to start on a database whose key file is missing or belongs to another database, and changes nothing. If the key is lost for good, `droppedneedle-tool reset-key --yes`, run with the server stopped, makes a new key and clears every stored password, API key, app password and service link, so they can be entered again. It replaces a lost key and does not change the Jellyfin ids of what you already have: stored album and artist ids survive it, and only items added afterwards get ids under the new key. See [docs/upgrading-from-v2.md](docs/upgrading-from-v2.md#backups-and-restore).
 
 Coming from v2? Follow [docs/upgrading-from-v2.md](docs/upgrading-from-v2.md). Stop v2, switch the image tag to v3, and run `docker compose run --rm droppedneedle droppedneedle-tool upgrade` before you start it. It upgrades your data directory in place and keeps your v2 files in a `v2-backup` folder so you can go back. v3 refuses to start on a v2 data directory that has not been upgraded. The guide lists what comes across (accounts, settings, playlists, history, your library with its ids and matches, and the originals of files Library Management changed) and what stays behind.
 
@@ -254,7 +254,7 @@ Everything user-editable lives in the web UI and is stored in the database, so a
 | `BASE_PATH` | empty | Serve under a sub-path behind a reverse proxy, e.g. `/music`. Letters, digits and `.` `_` `~` `-` only, no trailing slash, and its first segment cannot be `api` |
 | `TZ` | `UTC` | Container time zone, as an IANA name such as `Europe/London`. Daily library scans run at their set time in this zone |
 | `SLSKD_DOWNLOADS_PATH` | `/data/downloads/slskd` | Exact in-container path to slskd completions (the compose example uses `/data/slskd/complete`) |
-| `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING` or `ERROR` |
+| `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING` or `ERROR`. The audio decoders log only errors whatever this says; set `RUST_LOG` to see more |
 
 The app answers on IPv4 and IPv6, but Docker still has to publish the port on both. `docker port droppedneedle` should list `0.0.0.0:8688` and `[::]:8688`; if only the first appears, turn on IPv6 for the daemon (`"ipv6"` and `"ip6tables"` in `/etc/docker/daemon.json`). Pinning `BIND_HOST` to one interface IP answers only there, but the container `HEALTHCHECK` still uses localhost, so keep a wildcard or loopback value unless you check that address yourself.
 
@@ -275,7 +275,7 @@ Behind a reverse proxy, list the proxy in `TRUSTED_PROXY_IPS` and have it pass `
 | `ROOT_APP_DIR` | `/app` | Base for the paths below and for `/app/plugins` and `/app/imports` |
 | `CACHE_DIR` | `/app/cache` | Database, backups, served web UI, caches |
 | `COVER_CACHE_MAX_SIZE_MB` | `500` | Size cap for downloaded and extracted cover art under `CACHE_DIR/covers`; the least recently shown covers go first |
-| `LIBRARY_DB_PATH` | `/app/cache/library.db` | The database file; backups go in `backups/` next to it |
+| `LIBRARY_DB_PATH` | `/app/cache/library.db` | The database file; backups go in `backups/` and Undo's saved copies in `undo/` next to it. `droppedneedle-tool restore` writes a backup back under this file name |
 | `CONFIG_DIR` | `/app/config` | Holds `data_enc.key`, the key that seals stored secrets. Replaces `CONFIG_FILE_PATH`, which now stops the start: set `CONFIG_DIR` to that file's folder |
 | `DROPPEDNEEDLE_STATIC_DIR` | `/app/static` | The web UI build shipped in the image |
 
@@ -295,7 +295,7 @@ Unraid commonly uses `nobody:users` (PUID 99, PGID 100). Point PUID and PGID at 
 | Data | Container path | Notes |
 |-|-|-|
 | Settings and encryption key | `/app/config` | Persist it |
-| Database, backups, cover art and metadata cache | `/app/cache` | Persist it. Provider answers (MusicBrainz, Last.fm and the like) live in `metadata-cache.db`, which survives a restart, is not in the backups, and can be deleted safely while the server is stopped |
+| Database, backups, cover art and metadata cache | `/app/cache` | Persist it. The `undo` folder beside `library.db` holds the tags, pictures and files Undo and "Restore originals" put back; backups copy it into `backups/undo`, so keep the whole `backups` folder. Provider answers (MusicBrainz, Last.fm and the like) live in `metadata-cache.db`, which survives a restart, is not in the backups, and can be deleted safely while the server is stopped |
 | Plugins | `/app/plugins` | Persist it or installs vanish on recreate |
 | Download and drop-import staging | `/app/imports` | Optional; without it, staged downloads, large uploads and unmatched files live on the container layer |
 | Media | `/data` | Shared parent for library (`/data/music`) and client completions |
@@ -423,7 +423,7 @@ Either way the user's own media account is linked for playback, so plays count f
 
 The OpenAPI document is served at `/openapi.json` on your instance. Every `/api/v3/*` route takes a Bearer token or the session cookie, everything under `/api/v3/settings/*` also needs Admin, and `/health` stays public for the container check.
 
-Plugins work like community plugins in Lidarr: paste a GitHub repository URL in Settings > Plugins, check what it asks to do, and install it, pinned to an exact commit. Each enabled plugin runs as its own process, so a crash or a hang stays with that plugin; it gets a clean environment, its own folder and a memory cap. It is still trusted code with your server's file and network access, not a sandbox, so only install plugins you trust. Python plugins work out of the box in the Docker image, and v2 plugins port with an import change. Nothing is bundled. Files a plugin adds to your library are listed on its card, where an admin can undo each one. Reference: [PLUGINS.md](PLUGINS.md). Walkthrough: [docs/PLUGIN-CREATION.md](docs/PLUGIN-CREATION.md).
+Plugins work like community plugins in Lidarr: paste a GitHub repository URL in Settings > Plugins, check what it asks to do, and install it, pinned to an exact commit. Each enabled plugin runs as its own process, so a crash or a hang stays with that plugin; it gets a clean environment, its own folder and a memory cap. It is still trusted code with your server's file and network access, not a sandbox, so only install plugins you trust. Python plugins work out of the box in the Docker image. v2 plugins do not load as they are: they port with an import change and `api_version = 2`. Nothing is bundled. Files a plugin adds to your library are listed on its card, where an admin can undo each one. Reference: [PLUGINS.md](PLUGINS.md). Walkthrough: [docs/PLUGIN-CREATION.md](docs/PLUGIN-CREATION.md).
 
 Bug reports and feature requests go to [Issues](https://github.com/DroppedNeedle/DroppedNeedle/issues), code via PRs. Dev setup, tests, and style rules are in [CONTRIBUTING.md](CONTRIBUTING.md).
 

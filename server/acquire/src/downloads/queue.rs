@@ -3,8 +3,7 @@
 //! clear, stop every retry, retry every failure), plus the admin
 //! blocklist (quarantine) view.
 //!
-//! Ports the queue half of v2's `download_service.py` and the matching
-//! orchestrator actions. Ownership follows v2: admins see and act on every
+//! Admins see and act on every
 //! task, everyone else on their own; acting on someone else's task is
 //! refused. Retry timing comes from the live worker tuning on each call.
 
@@ -18,8 +17,8 @@ use super::sources::SourceHandle;
 use super::state::TaskStatus;
 use super::store::{QuarantineRow, TaskRow};
 use super::watchdog::RetryPolicy;
+use crate::downloads::worker::{DownloadWorker, NextSourceError, RetryError};
 use crate::reason::Reason;
-use crate::worker::{DownloadWorker, NextSourceError, RetryError};
 
 /// Queue failures, mapped to HTTP statuses by the handlers.
 #[derive(Debug, thiserror::Error)]
@@ -402,6 +401,8 @@ impl DownloadQueue {
                     facts.held_for_review,
                     decision.as_ref(),
                 )
+                // A library wait says more than a copy that gave way.
+                .filter(|reason| *reason != Reason::QueueGaveWay || library_wait.is_none())
                 .or_else(|| {
                     if row.task.status == TaskStatus::Queued && no_source {
                         return Some(Reason::NoDownloadSource);

@@ -5,11 +5,11 @@
 //! edition the library has chosen for one of those albums (so a track
 //! request fills the album the user already holds, in the edition they
 //! picked), then the release the user requested it from, then the best
-//! official release by the shared MusicBrainz rank (Official, not live or
-//! remix, Album before EP before Single, no secondary types, earliest),
-//! with compilations after the artist's own releases: a download is named
-//! after the artist's album or single, never after a compilation, so a
-//! compilation as the target holds every file it brings as a weak match.
+//! official release (Official, not live or remix, no secondary types,
+//! Album before EP before Single, earliest). The secondary-type penalty
+//! ranks ahead of the primary type, so a compilation or soundtrack album
+//! falls behind the artist's own release: a download is named after that
+//! release, not after a compilation that lists the track.
 
 use std::collections::{HashMap, HashSet};
 
@@ -60,20 +60,23 @@ pub fn release_order(
     }
     let mut ranked: Vec<&ReleaseCandidate> = candidates.iter().collect();
     ranked.sort_by_key(|candidate| {
-        let rank = recording_release_group_rank(
-            candidate.status.as_deref(),
-            &candidate.secondary_types,
-            candidate.primary_type.as_deref(),
-            candidate.date.as_deref(),
-            &candidate.release_group_mbid,
-        );
-        // Official and version-keeping still decide first; within them,
-        // the artist's own releases come before compilations.
+        let (official, version_changed, primary, secondary_penalty, date, group) =
+            recording_release_group_rank(
+                candidate.status.as_deref(),
+                &candidate.secondary_types,
+                candidate.primary_type.as_deref(),
+                candidate.date.as_deref(),
+                &candidate.release_group_mbid,
+            );
+        // Official and version-keeping decide first. A secondary type then
+        // falls behind the artist's own release, whatever its primary type.
         (
-            rank.0,
-            rank.1,
-            is_compilation(candidate),
-            rank,
+            official,
+            version_changed,
+            secondary_penalty,
+            primary,
+            date,
+            group,
             candidate.id.clone(),
         )
     });
@@ -81,14 +84,6 @@ pub fn release_order(
         push(&candidate.id, "best_official", &mut out);
     }
     out
-}
-
-/// A compilation release group (`Compilation` secondary type).
-fn is_compilation(candidate: &ReleaseCandidate) -> bool {
-    candidate
-        .secondary_types
-        .iter()
-        .any(|kind| kind.eq_ignore_ascii_case("compilation"))
 }
 
 /// Distinct release groups worth checking for a library edition, best
@@ -150,30 +145,16 @@ mod tests {
         let order = release_order(&candidates, &library, Some("single"));
         assert_eq!(order[0], ("deluxe".to_owned(), "manual_identity"));
         assert_eq!(order[1], ("single".to_owned(), "requested_release"));
-    }
 
-    /// A track only on the artist's single and on a various-artists
-    /// compilation is fetched as the single; an official compilation
-    /// still beats a bootleg single.
-    #[test]
-    fn a_single_before_a_compilation_album() {
-        let candidates = vec![
-            candidate("wire-08", "g-wire", "Album", &["Compilation"]),
-            candidate("single-mixes", "g-single", "Single", &[]),
-        ];
-        let order: Vec<_> = release_order(&candidates, &HashMap::new(), None)
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect();
-        assert_eq!(order, ["single-mixes", "wire-08"]);
-
+        // Official still decides first: an official compilation beats a
+        // bootleg single.
         let mut bootleg = candidate("bootleg", "g-boot", "Single", &[]);
         bootleg.status = Some("Bootleg".to_owned());
         let candidates = vec![
             bootleg,
             candidate("wire-08", "g-wire", "Album", &["Compilation"]),
         ];
-        let order: Vec<_> = release_order(&candidates, &HashMap::new(), None)
+        let order: Vec<_> = release_order(&candidates, &none, None)
             .into_iter()
             .map(|(id, _)| id)
             .collect();

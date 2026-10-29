@@ -1,55 +1,24 @@
-//! Shared compat security posture: which Jellyfin paths are anonymous,
-//! query redaction, the rate-limit and auth-backoff budgets, the address
+//! Shared compat security posture: the public Subsonic endpoint, query
+//! redaction, the rate-limit and auth-backoff budgets, the address
 //! player apps are given and the signature on open picture links. The
 //! credential schemes are pinned in `auth_compat_goldens`.
 
 use axum::body::Body;
 use axum::extract::ConnectInfo;
 use axum::http::Request;
-use droppedneedle_compat::jellyfin::JellyfinSettings;
 use droppedneedle_compat::settings::LiveSettings;
 use droppedneedle_compat::shared::address::{ListenerConfig, base_address};
 use droppedneedle_compat::shared::{auth, ratelimit, redact};
 use droppedneedle_compat::subsonic::picture::{PURPOSE, PictureKind, PictureSigner};
 use droppedneedle_kernel::config::TrustedProxies;
 use droppedneedle_kernel::runtime_config::Crypto;
-use droppedneedle_kernel::runtime_config::origin::Origin;
+use droppedneedle_kernel::runtime_config::sections::PublicAddress;
 
+/// One Subsonic endpoint skips auth, in any case and with `.view`. The
+/// Jellyfin public routes are walked through the app in
+/// `compat_jellyfin_library`.
 #[test]
-fn anonymous_paths() {
-    // Only these Jellyfin routes skip auth: public info, login, images, audio.
-    let anonymous = [
-        ("GET", "/jellyfin/System/Info/Public"),
-        ("GET", "/jellyfin/QuickConnect/Enabled"),
-        ("POST", "/jellyfin/Sessions/Logout"),
-        ("POST", "/jellyfin/Users/AuthenticateByName"),
-        ("POST", "/jellyfin/users/authenticatebyname"),
-        ("GET", "/jellyfin/Items/abc/Images/Primary"),
-        ("GET", "/jellyfin/Items/abc/Images/Primary/0"),
-    ];
-    for (method, path) in anonymous {
-        assert!(auth::jellyfin_is_anonymous(method, path), "{method} {path}");
-    }
-    let authed = [
-        ("GET", "/jellyfin/System/Info"),
-        ("GET", "/jellyfin/Users/me"),
-        ("GET", "/jellyfin/Items"),
-        ("GET", "/jellyfin/Items/Latest"),
-        ("GET", "/jellyfin/Items/abc"),
-        ("POST", "/jellyfin/Items/abc/PlaybackInfo"),
-        ("GET", "/jellyfin/Audio/abc"),
-        ("GET", "/jellyfin/Audio/abc/universal"),
-        ("GET", "/jellyfin/Audio/abc/stream.mp3"),
-        ("GET", "/jellyfin/Audio/abc/Lyrics"),
-        ("HEAD", "/jellyfin/Audio/abc/stream"),
-        ("DELETE", "/jellyfin/Items/abc/Images/Primary"),
-    ];
-    for (method, path) in authed {
-        assert!(
-            !auth::jellyfin_is_anonymous(method, path),
-            "{method} {path}"
-        );
-    }
+fn subsonic_public_endpoint() {
     assert!(auth::subsonic_is_public("getopensubsonicextensions.view"));
     assert!(!auth::subsonic_is_public("stream"));
 }
@@ -196,6 +165,9 @@ fn base_address_for_player_apps() {
         base_path: "",
         expected: "http://music.lan:8688",
     };
+    let dir = crate::common::ScratchDir::new("base-address");
+    let store = crate::common::config_store(&dir);
+    let settings = LiveSettings::from_config(&store, false);
     let cases = [
         Case {
             name: "trusted proxy",
@@ -251,13 +223,11 @@ fn base_address_for_player_apps() {
             trusted_proxies: TrustedProxies::default(),
             base_path: case.base_path.to_owned(),
         };
-        let stated = case
-            .stated
-            .iter()
-            .map(|entry| Origin::from_stated(entry).expect("stated address"))
-            .collect();
-        let settings =
-            LiveSettings::from(JellyfinSettings::default()).with_public_addresses(stated);
+        store
+            .save_blocking(PublicAddress {
+                origins: case.stated.iter().map(|&entry| entry.to_owned()).collect(),
+            })
+            .expect("stated addresses save");
         assert_eq!(
             base_address(&request, &listener, &settings).as_deref(),
             Some(case.expected),

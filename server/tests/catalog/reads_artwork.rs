@@ -339,7 +339,8 @@ async fn a_compat_cover_joins_a_running_fetch() {
 
     let rig = rig(None).await;
     let service = rig.service(true);
-    // The archive's turn comes in one second: within a page's wait.
+    // The archive's turn comes in one second, inside the page's `WARM_WAIT`
+    // (2.5 s), which leaves the fetch time to finish.
     rig.archive
         .providers
         .limiter("coverartarchive")

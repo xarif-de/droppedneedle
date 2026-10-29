@@ -6,10 +6,8 @@
 //! on the loop supervisor under its job name. The supervisor owns the
 //! waiting, jitter, liveness rows and stop; every wake runs a pass.
 //!
-//! Cadences match v2's task schedule; each constant cites its source.
-//! Loops that v2 jitters (wanted, follow) spread each wait over 0.8 to 1.2
-//! of the interval; loops v2 sleeps plainly (sync, prune) wait the exact
-//! interval.
+//! The wanted and follow loops spread each wait over 0.8 to 1.2 of the
+//! interval; the sync and prune loops wait the exact interval.
 
 use std::collections::HashSet;
 use std::future::Future;
@@ -35,7 +33,7 @@ use crate::requests::ledger::{RequestStatus, WantedWatch, WatchState};
 use crate::requests::models::RequestKind;
 use crate::requests::service::{FollowIntake, FollowRelease, RequestsService};
 use crate::requests::settle::announce_fulfilled;
-use crate::requests::sqlite::{RequestStore, WantedStore};
+use crate::requests::sqlite::{RequestStore, WantedStore, WatchCheck};
 use crate::search_jobs::store::JobStore;
 use crate::target::Targets;
 use droppedneedle_catalog::reads::catalog::mapping::{should_include_release, type_set};
@@ -46,41 +44,40 @@ use droppedneedle_kernel::runtime_config::sections::{
     DownloadPolicy, UserPreferences, WantedWatcher,
 };
 
-/// Wanted-watcher sweep cadence in seconds (v2 `_WANTED_WATCHER_INTERVAL`).
+/// Wanted-watcher sweep cadence in seconds.
 pub const WANTED_INTERVAL: Duration = Duration::from_secs(900);
-/// Wanted-watcher startup delay in seconds (v2 `_WANTED_WATCHER_INITIAL_DELAY`).
+/// Wanted-watcher startup delay in seconds.
 pub const WANTED_INITIAL_DELAY: Duration = Duration::from_secs(240);
-/// Follow poll wake-up cadence in seconds (v2 `_FOLLOW_POLL_INTERVAL`);
+/// Follow poll wake-up cadence in seconds;
 /// each wake polls only the artists that are due.
 pub const FOLLOW_INTERVAL: Duration = Duration::from_secs(60);
-/// Follow poll startup delay in seconds (v2 `_FOLLOW_POLL_INITIAL_DELAY`).
+/// Follow poll startup delay in seconds.
 pub const FOLLOW_INITIAL_DELAY: Duration = Duration::from_secs(300);
 /// Follow poll due-driven cap: provider work happens only for due artists,
-/// at most this many per tick (v2 `_run_due_poll`, `attempted < 10`).
+/// at most this many per tick.
 pub const FOLLOW_MAX_ARTISTS_PER_TICK: usize = 10;
-/// How long after a successful poll an artist is due again (v2
-/// `follow_success_*` triggers: a day).
+/// How long after a successful poll an artist is due again: a day.
 pub const FOLLOW_ARTIST_REPOLL: Duration = Duration::from_secs(86_400);
 /// How long after a failed poll an artist is tried again.
 pub const FOLLOW_ARTIST_RETRY: Duration = Duration::from_secs(3_600);
-/// Upgrade-scan startup delay in seconds (v2 `scan_for_upgrades_periodically`).
+/// Upgrade-scan startup delay in seconds.
 pub const UPGRADE_INITIAL_DELAY: Duration = Duration::from_secs(900);
-/// Request-status-sweep cadence in seconds (v2 `_REQUEST_SYNC_INTERVAL`).
+/// Request-status-sweep cadence in seconds.
 pub const SYNC_INTERVAL: Duration = Duration::from_secs(60);
-/// Status-sweep startup delay in seconds (v2 `_REQUEST_SYNC_INITIAL_DELAY`).
+/// Status-sweep startup delay in seconds.
 pub const SYNC_INITIAL_DELAY: Duration = Duration::from_secs(15);
 
-/// Registry name for the wanted-watcher loop (v2 `TaskRegistry` key).
+/// Registry name for the wanted-watcher loop.
 pub const WANTED_JOB: &str = "wanted-watcher";
-/// Registry name for the follow new-release poll (v2 `TaskRegistry` key).
+/// Registry name for the follow new-release poll.
 pub const FOLLOW_JOB: &str = "follow-new-release-poll";
-/// Registry name for the background upgrade scan (v2 `TaskRegistry` key).
+/// Registry name for the background upgrade scan.
 pub const UPGRADE_JOB: &str = "background-upgrade-scan";
-/// Registry name for the request-status sweep (v2 `TaskRegistry` key).
+/// Registry name for the request-status sweep.
 pub const SYNC_JOB: &str = "request-status-sync";
-/// Registry name for the store prune (v2 `TaskRegistry` key).
+/// Registry name for the store prune.
 pub const PRUNE_JOB: &str = "store-prune";
-/// Store-prune startup delay (v2 `prune_stores_periodically`).
+/// Store-prune startup delay.
 pub const PRUNE_INITIAL_DELAY: Duration = Duration::from_secs(600);
 /// How often the prune loop checks whether its configured interval passed.
 pub const PRUNE_TICK: Duration = Duration::from_secs(3600);
@@ -89,7 +86,7 @@ pub const PRUNE_TICK: Duration = Duration::from_secs(3600);
 pub const UPGRADE_TICK: Duration = Duration::from_secs(3600);
 
 /// Wanted-watcher settings, re-read every sweep so flipping the toggle
-/// needs no restart (v2 `run_sweep`).
+/// needs no restart.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WantedSettings {
     /// The watcher runs at all.
@@ -115,7 +112,7 @@ impl WantedSettings {
     }
 }
 
-/// What one wanted sweep accomplished (v2 `WantedSweepSummary`).
+/// What one wanted sweep accomplished.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WantedSummary {
     /// Requests newly enrolled as watches.
@@ -140,7 +137,7 @@ pub struct WantedDeps {
     pub ledger: RequestStore,
     /// The download sources a watch searches: those turned on, plugin
     /// sources included.
-    pub sources: crate::worker::SourceList,
+    pub sources: crate::downloads::worker::SourceList,
     /// Download dispatch.
     pub downloads: Arc<DownloadDispatch>,
     /// Library presence for satisfaction checks.
@@ -158,7 +155,7 @@ fn epoch(now: i64) -> u64 {
 
 /// Run one wanted sweep: enrol availability-dead requests, then
 /// check due watches. Disabled reads as an empty pass. One bad watch never
-/// kills the sweep (v2 `run_sweep` isolation).
+/// kills the sweep.
 pub async fn wanted_tick(now: i64, deps: &WantedDeps) -> WantedSummary {
     let Some(section) = deps.settings.read() else {
         return WantedSummary::default();
@@ -235,31 +232,59 @@ async fn check_watch(
         at + u64::try_from(interval_seconds(date.schedule.as_deref(), streak, now)).unwrap_or(0)
     };
     let found = date.found;
+    let check = |quiet_streak: u32, outcome: &'static str| WatchCheck {
+        quiet_streak,
+        next_check_at: next(quiet_streak),
+        now: at,
+        outcome,
+        first_release_date: found.clone(),
+        ..WatchCheck::default()
+    };
     match searched {
         Ok(candidates) if !candidates.is_empty() => {
+            let seen: Vec<(String, String)> = candidates
+                .iter()
+                .map(|candidate| (candidate.view.source.clone(), candidate.seen_identity()))
+                .collect();
             if !settings.auto_download_on_find {
+                // Only copies the watch has not seen before badge it and
+                // tell the owner.
+                let known = deps.watches.seen(&watch.key).await?;
+                let fresh = seen.iter().filter(|pair| !known.contains(*pair)).count();
+                if fresh == 0 {
+                    let streak = watch.quiet_streak.saturating_add(1);
+                    deps.watches
+                        .record_check(
+                            &watch.key,
+                            WatchCheck {
+                                seen,
+                                ..check(streak, "seen")
+                            },
+                        )
+                        .await?;
+                    return Ok(());
+                }
+                let fresh = u32::try_from(fresh).unwrap_or(u32::MAX);
                 deps.watches
                     .record_check(
                         &watch.key,
-                        watch.quiet_streak,
-                        next(watch.quiet_streak),
-                        at,
-                        "found",
-                        found,
+                        WatchCheck {
+                            seen,
+                            new_candidates: Some(fresh),
+                            ..check(0, "found")
+                        },
                     )
                     .await?;
                 deps.ticks.emit(
                     "wanted.found",
                     &format!(
-                        "wanted {} has {} candidate(s) (badge-only)",
-                        watch.key,
-                        candidates.len()
+                        "wanted {} has {fresh} new candidate(s) (badge-only)",
+                        watch.key
                     ),
                     now,
                 );
-                let found = u32::try_from(candidates.len()).unwrap_or(u32::MAX);
                 notify_wanted(deps, watch, UserNotice::WantedNewCandidates, |notice| {
-                    notice.new_candidates = Some(found);
+                    notice.new_candidates = Some(fresh);
                 });
                 return Ok(());
             }
@@ -280,7 +305,13 @@ async fn check_watch(
                         .link_task(RequestKind::Album, &watch.key, &task_id, None)
                         .await?;
                     deps.watches
-                        .record_check(&watch.key, 0, next(0), at, "dispatched", found)
+                        .record_check(
+                            &watch.key,
+                            WatchCheck {
+                                seen,
+                                ..check(0, "dispatched")
+                            },
+                        )
                         .await?;
                     if !outcome.started() {
                         // Another download of the album is already working.
@@ -299,7 +330,7 @@ async fn check_watch(
                 Err(cause) => {
                     tracing::warn!(key = %watch.key, %cause, "wanted dispatch failed");
                     deps.watches
-                        .record_check(&watch.key, 0, next(0), at, "error", found)
+                        .record_check(&watch.key, check(0, "error"))
                         .await?;
                     summary.errors += 1;
                 }
@@ -308,15 +339,15 @@ async fn check_watch(
         Ok(_) => {
             let streak = watch.quiet_streak.saturating_add(1);
             deps.watches
-                .record_check(&watch.key, streak, next(streak), at, "quiet", found)
+                .record_check(&watch.key, check(streak, "quiet"))
                 .await?;
         }
         Err(cause) => {
             // A per-want failure reschedules normally with a reset streak:
-            // one bad want never kills the sweep (v2 `_record_error_cycle`).
+            // one bad want never kills the sweep.
             tracing::warn!(key = %watch.key, %cause, "wanted search failed");
             deps.watches
-                .record_check(&watch.key, 0, next(0), at, "error", found)
+                .record_check(&watch.key, check(0, "error"))
                 .await?;
             summary.errors += 1;
         }
@@ -325,8 +356,9 @@ async fn check_watch(
 }
 
 /// Ask every source that is on for the watch's album, through the same
-/// search (and gates) as a manual search. `None` when no source is on or
-/// the download settings do not read; an error when every source failed.
+/// search (and gates) as a manual search. Candidates outside the download
+/// settings do not count as found. `None` when no source is on or the
+/// download settings do not read; an error when every source failed.
 async fn search_watch(
     deps: &WantedDeps,
     watch: &WantedWatch,
@@ -342,15 +374,16 @@ async fn search_watch(
         wanted: Vec::new(),
         track: None,
     };
-    let (candidates, failed) =
+    let (mut candidates, failed) =
         crate::search_jobs::search_sources(&sources, &target, &watch.key).await;
     if candidates.is_empty() && failed > 0 && failed == sources.len() {
         return Err("every download source failed".to_owned());
     }
+    candidates.retain(|candidate| !candidate.is_refused());
     Ok(Some(candidates))
 }
 
-/// Tell the watch's owner what the watcher did (v2 `_publish`).
+/// Tell the watch's owner what the watcher did.
 fn notify_wanted(
     deps: &WantedDeps,
     watch: &WantedWatch,
@@ -368,7 +401,7 @@ fn notify_wanted(
 /// Enrol availability-dead album requests as watches: `failed` rows, plus
 /// `incomplete` rows when the partial toggle is on. Never auto-revives a
 /// stopped watch, skips rows with no requester, and skips rows whose
-/// linked task is still active (v2 `_maybe_enrol` guards).
+/// linked task is still active.
 async fn enrol_watches(now: i64, settings: &WantedSettings, deps: &WantedDeps) -> usize {
     let mut statuses = vec![(RequestStatus::Failed, "missing")];
     if settings.watch_partial_albums {
@@ -482,11 +515,10 @@ pub async fn watch_date(
     WatchDate { found, schedule }
 }
 
-/// Quiet streak at which old releases back off from 14 to 28 days (v2
-/// `_QUIET_DOUBLING_STREAK = 10`).
+/// Quiet streak at which old releases back off from 14 to 28 days.
 pub const QUIET_DOUBLING_STREAK: u32 = 10;
 
-/// Age-based recheck cadence in seconds (v2 `_interval_days`):
+/// Age-based recheck cadence in seconds:
 /// under 30 days old → 2 days; under 90 → 4; under a year → 7; older or
 /// unknown → 14, or 28 past the quiet-doubling streak. Unknown release
 /// date reads as old. Day granularity (the table bands are days wide).
@@ -507,7 +539,7 @@ pub fn interval_seconds(first_release_date: Option<&str>, quiet_streak: u32, now
 }
 
 /// Parse a partial MusicBrainz date (`YYYY`, `YYYY-MM`, or `YYYY-MM-DD`)
-/// to the start of its period (v2 `_parse_partial_date`).
+/// to the start of its period.
 fn parse_partial_date(value: &str) -> Option<(i64, u32, u32)> {
     let mut parts = value.split('-');
     let year: i64 = parts.next()?.parse().ok()?;
@@ -536,7 +568,7 @@ fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
     era * 146_097 + doe as i64 - 719_468
 }
 
-/// What one follow poll accomplished (v2 `PollSummary`).
+/// What one follow poll accomplished.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FollowSummary {
     /// Artists polled this tick.
@@ -580,7 +612,7 @@ pub struct FollowDeps {
 /// the release-type preferences, are not in the library and carry a
 /// complete date on or after the prior poll. When an auto-download
 /// follower exists, those releases are queued for download once their
-/// date arrives (v2 `NewReleaseService`).
+/// date arrives.
 pub async fn follow_tick(now: i64, deps: &FollowDeps) -> FollowSummary {
     let mut summary = FollowSummary::default();
     let today = (deps.today)();
@@ -704,7 +736,7 @@ async fn observe_artist(
         }
     };
     // With no auto-download follower a release only reaches the feed; it is
-    // not replayed if someone turns auto-download on later (v2 rule).
+    // not replayed if someone turns auto-download on later.
     if !followers.is_empty() {
         for row in &fresh {
             if !cursor
@@ -751,7 +783,7 @@ async fn observe_artist(
 
 /// Page rows worth acting on: unknown to the artist's inventory, within
 /// the release-type preferences, with a complete `YYYY-MM-DD` date on or
-/// after the prior cursor. Malformed rows never emit (v2 `_observe_artist`).
+/// after the prior cursor. Malformed rows never emit.
 fn fresh_releases<'a>(
     cursor: &FollowCursor,
     releases: &'a [ObservedRelease],
@@ -796,7 +828,7 @@ enum Queued {
 }
 
 /// Ask for one release as a request of the first auto-download follower
-/// (one task per release, as in v2), unless the library has it or a
+/// (one task per release), unless the library has it or a
 /// download for it is already running. The request shows on the Requests
 /// page and settles with its download.
 async fn queue_release(
@@ -939,7 +971,7 @@ fn album_dispatch(
     }
 }
 
-/// True for complete `YYYY-MM-DD` dates (v2 `_COMPLETE_DATE_RE`).
+/// True for complete `YYYY-MM-DD` dates.
 fn is_complete_date(date: &str) -> bool {
     let bytes = date.as_bytes();
     bytes.len() == 10
@@ -987,7 +1019,7 @@ pub struct SweepDeps {
 /// as enqueued. An album with an open held entry waits for its decision,
 /// and one whose last upgrade finished inside its back-off waits that
 /// out; a poison item never
-/// starves its siblings (v2 `run_background_upgrade_sweep`).
+/// starves its siblings.
 pub async fn sweep_tick(now: i64, deps: &SweepDeps) -> SweepSummary {
     let Some(policy) = deps.policy.read() else {
         return SweepSummary::default();
@@ -1102,14 +1134,12 @@ pub struct PruneSummary {
     pub requests: u64,
     /// Finished watches deleted.
     pub watches: u64,
-    /// Seen-candidate rows deleted.
-    pub seen: u64,
     /// Manual search jobs deleted.
     pub search_jobs: u64,
 }
 
 /// One prune at `now`: terminal requests and stopped or fulfilled watches
-/// past the retention window go (v2 `prune_stores_periodically`). The
+/// past the retention window go. The
 /// window is clamped to the settings' 30..3650 days. Manual search jobs
 /// keep their own, shorter window (see [`JobStore::prune`]).
 pub async fn prune_tick(now: i64, deps: &PruneDeps) -> Result<PruneSummary, RequestsError> {
@@ -1125,7 +1155,7 @@ pub async fn prune_tick(now: i64, deps: &PruneDeps) -> Result<PruneSummary, Requ
         .unwrap_or(0)
         .saturating_sub(days * 86_400);
     let requests = deps.ledger.prune_terminal(cutoff).await?;
-    let (watches, seen) = deps.watches.prune(cutoff).await?;
+    let watches = deps.watches.prune(cutoff).await?;
     let search_jobs = deps
         .search_jobs
         .prune(now as f64)
@@ -1134,7 +1164,6 @@ pub async fn prune_tick(now: i64, deps: &PruneDeps) -> Result<PruneSummary, Requ
     Ok(PruneSummary {
         requests,
         watches,
-        seen,
         search_jobs,
     })
 }
@@ -1222,8 +1251,7 @@ pub async fn sync_tick(now: i64, deps: &SyncDeps) -> SyncSummary {
     summary
 }
 
-/// Waits of 0.8 to 1.2 times `base`, drawn fresh each time (v2
-/// `_jittered_sleep`).
+/// Waits of 0.8 to 1.2 times `base`, drawn fresh each time.
 fn spread(base: Duration) -> Schedule {
     Schedule::new(base.mul_f64(0.8)).with_jitter(base.mul_f64(0.4))
 }

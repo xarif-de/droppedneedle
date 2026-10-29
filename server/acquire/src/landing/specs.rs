@@ -1,10 +1,9 @@
 //! Import specifications: the checks a landed download must pass.
 //!
 //! Lidarr's import decision engine is a list of specifications, each
-//! answering accept or a reason; v2 ported the same idea as
-//! `acquisition/specs` with typed reject codes and a disposition that
-//! decides what a rejection means for failover. This is that list for the
-//! import side, as pure functions over a [`Subject`]:
+//! answering accept or a reason. This is that list for the import side,
+//! with typed reject codes and a disposition that decides what a
+//! rejection means for failover, as pure functions over a [`Subject`]:
 //!
 //! - file checks run on what the probe read, before any lookup, cheapest
 //!   and most decisive first: files present and whole on disk, audio
@@ -34,7 +33,7 @@ use droppedneedle_library::matching::strings::{
     artist_subset, fold, string_dist, strip_edition_words,
 };
 
-/// What a rejection means for retry and failover (v2 `Disposition`).
+/// What a rejection means for retry and failover.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Disposition {
@@ -143,6 +142,9 @@ pub struct Target {
     /// one matched, the library's holdings are read from that copy only,
     /// and the files join it.
     pub planned_album: Option<crate::downloads::plan::PlannedAlbum>,
+    /// A person confirmed this attempt's candidate outside the quality
+    /// band: its files are kept whatever their quality.
+    pub quality_waived: bool,
 }
 
 impl Target {
@@ -251,8 +253,8 @@ pub fn worst(checks: &[Check]) -> Option<&Verdict> {
 // File checks.
 // ---------------------------------------------------------------------------
 
-/// The client said files landed; something must be there (v2
-/// `SOURCE_FILE_MISSING`, a local fault: the peer delivered).
+/// The client said files landed; something must be there (a local
+/// fault: the peer delivered).
 struct FilesPresent;
 
 impl ImportSpec for FilesPresent {
@@ -296,7 +298,7 @@ impl ImportSpec for FilesPresent {
     }
 }
 
-/// Each file holds the bytes the client advertised (v2 `SIZE_MISMATCH`):
+/// Each file holds the bytes the client advertised:
 /// a short file is a partial write or a stale copy on our side, so it is
 /// a local fault that never blocklists the peer.
 struct SizesMatch;
@@ -423,8 +425,8 @@ impl ImportSpec for NotSample {
     }
 }
 
-/// Product markers that mean a different release than a studio album
-/// (v2 `wrong_edition`). Remasters and deluxe editions are the same album.
+/// Product markers that mean a different release than a studio album.
+/// Remasters and deluxe editions are the same album.
 const EDITION_MARKERS: &[&str] = &[
     "live",
     "bootleg",
@@ -543,8 +545,8 @@ const NOISE_WORDS: &[&str] = &[
     "khz",
 ];
 
-/// Most tagged files name another album by the same artist (v2
-/// `_folder_names_wrong_album`): their album titles carry words the
+/// Most tagged files name another album by the same artist: their
+/// album titles carry words the
 /// requested title does not. Untagged files never count, so an untagged
 /// rip falls through to matching.
 struct WrongAlbum;
@@ -602,9 +604,9 @@ impl ImportSpec for WrongAlbum {
     }
 }
 
-/// The files' real quality must sit inside the policy band (v2
-/// `post_download_quality_mismatch`). Never blocklisted: a peer's labels
-/// were wrong, not its files broken.
+/// The files' real quality must sit inside the policy band, unless a person
+/// confirmed the candidate this attempt fetched outside it. Never blocklisted:
+/// a peer's labels were wrong, not its files broken.
 struct QualityAllowed;
 
 impl ImportSpec for QualityAllowed {
@@ -618,7 +620,9 @@ impl ImportSpec for QualityAllowed {
             return Verdict::accept();
         };
         let policy = subject.policy;
-        if super::quality::in_range(tier, &policy.quality_min, &policy.quality_max) {
+        if subject.target.quality_waived
+            || super::quality::in_range(tier, &policy.quality_min, &policy.quality_max)
+        {
             return Verdict::accept();
         }
         Verdict::reject(
@@ -633,8 +637,8 @@ impl ImportSpec for QualityAllowed {
     }
 }
 
-/// An upgrade must strictly beat what the library holds (v2
-/// `upgrade_floor`); equal or worse is never an upgrade.
+/// An upgrade must strictly beat what the library holds; equal
+/// or worse is never an upgrade.
 struct UpgradeFloor;
 
 impl ImportSpec for UpgradeFloor {
@@ -739,8 +743,8 @@ impl ImportSpec for PinnedEdition {
     }
 }
 
-/// The files' own MusicBrainz ids must not contradict every candidate
-/// (v2 `tag_mismatch` on a recording MBID conflict).
+/// The files' own MusicBrainz ids must not contradict every
+/// candidate.
 struct IdsAgree;
 
 impl ImportSpec for IdsAgree {
@@ -949,12 +953,11 @@ pub fn artist_proof(
 }
 
 /// Whether at least half the paired files' paths name the requested
-/// artist (or the album, for a various-artists release), as v2's
-/// `artist_evidence` read a Soulseek path. A file's path is read as text
-/// only, never from disk: its folders below the client's downloads folder,
-/// the folders of the remote name the client reported for it (a Soulseek
-/// share's `Music\Artist\Album`, of which only `Album` is kept on disk),
-/// and its file name without the paired track's title words, so a
+/// artist (or the album, for a various-artists release). A file's path is read
+/// as text only, never from disk: its folders below the client's downloads
+/// folder, the folders of the remote name the client reported for it (a
+/// Soulseek share's `Music\Artist\Album`, of which only `Album` is kept on
+/// disk), and its file name without the paired track's title words, so a
 /// self-titled song does not name itself.
 fn path_names_artist(target: &Target, found: &FoundRelease, landing: &Landing) -> bool {
     let release = &found.release;
@@ -1142,7 +1145,7 @@ impl ImportSpec for ArtistEvidence {
     }
 }
 
-/// v2's `_tag_conflict_reason`: a file whose own artist tag names someone
+/// A file whose own artist tag names someone
 /// other than the release's artist, while its title does not name the
 /// track or its length does not fit, is another song. Held on its own.
 /// An artist conflict alone holds nothing: classical files often credit
@@ -1259,8 +1262,8 @@ fn words_within(left: &str, right: &str) -> bool {
 }
 
 /// Lidarr's `CloseTrackMatch`, per file: a file whose pair is too far
-/// (its tags name another song) is held on its own, as v2 held a
-/// tag-mismatched file and imported the rest.
+/// (its tags name another song) is held on its own and the rest
+/// import.
 struct CloseTrackMatch;
 
 impl ImportSpec for CloseTrackMatch {
@@ -1289,7 +1292,7 @@ impl ImportSpec for CloseTrackMatch {
 }
 
 /// Files the release does not account for (bonus tracks MusicBrainz
-/// lacks, scene extras) are left out, as v2 did; a download that is
+/// lacks, scene extras) are left out; a download that is
 /// mostly such files is not this release.
 struct FilesAccountedFor;
 
@@ -1317,7 +1320,7 @@ impl ImportSpec for FilesAccountedFor {
 }
 
 /// A track download must have landed the requested recording, at the
-/// requested length (v2 `WRONG_TRACK`: fail over, never blocklist).
+/// requested length (fail over, never blocklist).
 struct RightTrack;
 
 impl ImportSpec for RightTrack {
@@ -1359,8 +1362,7 @@ fn wrong_track(found: &FoundRelease, pair: &TrackPair, landing: &Landing) -> Opt
         .then(|| format!("the file is {seconds:.0}s, the requested track {expected:.0}s"))
 }
 
-/// Tracks the library already holds are not imported twice (v2's
-/// position dedup).
+/// Tracks the library already holds are not imported twice.
 struct NotAlreadyImported;
 
 impl ImportSpec for NotAlreadyImported {
@@ -1396,11 +1398,11 @@ impl ImportSpec for NotAlreadyImported {
 /// against a fingerprint that names another recording. Copies of one
 /// master differ by a second or two (pregap, encoder padding, MusicBrainz
 /// rounding to the second), while another recording of a song is rarely
-/// within 3 s of it: v2's `max(15 s, 10%)` let most same-length pop songs
+/// within 3 s of it: a `max(15 s, 10%)` window lets most same-length pop songs
 /// through whatever AcoustID heard.
 pub const SAME_MASTER_SECS: f64 = 3.0;
 
-/// v2's `_fingerprint_disagrees`, for the ids our lookup returns: AcoustID
+/// For the ids our lookup returns: AcoustID
 /// confidently heard recordings, none of them the expected one, and the
 /// file's length is not within [`SAME_MASTER_SECS`] of the expected
 /// track's. A length that agrees outranks a conflicting fingerprint, and

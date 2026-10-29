@@ -214,10 +214,17 @@ pub fn identification_snapshot(
     {
         // A running job whose lease ran out is not running: its worker is
         // gone and the next claim picks it up again, so it counts as queued.
+        // A failure the album's later success settled is not counted, the
+        // same rule as the latest failure below.
         let mut stmt = conn.prepare(
-            "SELECT CASE WHEN state = 'running' AND NOT (lease_expires_ms > ?1) \
-             THEN 'queued' ELSE state END AS live_state, COUNT(*) \
-             FROM library_identify_jobs GROUP BY live_state",
+            "SELECT CASE WHEN j.state = 'running' AND NOT (j.lease_expires_ms > ?1) \
+             THEN 'queued' ELSE j.state END AS live_state, COUNT(*) \
+             FROM library_identify_jobs j \
+             WHERE NOT (j.state IN ('failed','attention') \
+                 AND EXISTS (SELECT 1 FROM library_identify_jobs later \
+                     WHERE later.local_album_id = j.local_album_id \
+                     AND later.state = 'succeeded' AND later.updated_ms > j.updated_ms)) \
+             GROUP BY live_state",
         )?;
         let rows = stmt.query_map(params![now_ms], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
@@ -372,8 +379,7 @@ pub struct OperationWork {
 /// Operation jobs queued, running or paused, newest first (at most 20).
 pub fn operation_work(conn: &Connection) -> rusqlite::Result<Vec<OperationWork>> {
     let mut stmt = conn.prepare(
-        "SELECT j.id, j.kind, COALESCE(json_extract(s.scope_json, '$.purpose'), \
-         CASE WHEN s.job_id IS NULL THEN NULL ELSE 'existing_matches' END), s.phase, \
+        "SELECT j.id, j.kind, s.purpose, s.phase, \
          j.state, j.expected_work_count, j.completed_count, j.succeeded_count, \
          j.failed_count, j.skipped_count, j.started_at, j.updated_at \
          FROM library_operation_jobs j LEFT JOIN library_repair_snapshots s ON s.job_id = j.id \

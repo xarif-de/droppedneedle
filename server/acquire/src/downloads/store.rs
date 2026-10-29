@@ -1,10 +1,9 @@
 //! The download journal: tasks, attempts, keys, and sweeps on SQLite.
 //!
-//! Ports the durable half of `download_store.py` plus the lifecycle bits
-//! the orchestrator leans on: task transitions, the attempt journal with
-//! revision-CAS and leases, idempotency keys, quarantine rows, held-import
-//! retry, the newest-per-target retryable sweep, and the stale-task query.
-//! Table shapes mirror migrations 0001/0002.
+//! The durable store plus the lifecycle bits the orchestrator leans on: task
+//! transitions, the attempt journal with revision-CAS and leases, idempotency
+//! keys, quarantine rows, held-import retry, the newest-per-target retryable
+//! sweep, and the stale-task query. Table shapes mirror migrations 0001/0002.
 //!
 //! [`DownloadStore`] runs over whatever connection it is given: a writer
 //! transaction for writes, a read-pool connection for reads (see
@@ -20,6 +19,7 @@ use super::plan::TaskPlan;
 use super::source_tag::SourceTag;
 use super::sql;
 use super::state::{AttemptState, TaskStatus};
+use crate::db::{ms_from_secs_f64 as ms, secs_f64_from_ms as secs};
 use crate::reason::Reason;
 use crate::requests::settle::{Fulfilled, on_task_settled};
 
@@ -88,10 +88,12 @@ pub struct TaskRow {
     /// Download client that owns the transfer (`slskd`, `sabnzbd`).
     pub download_client: String,
     /// Source username (soulseek) or linked marker (usenet persists `""`,
-    /// never NULL, per the v2 #245 note; NULL means never linked).
+    /// never NULL, see issue #245; NULL means never linked).
     pub source_username: Option<String>,
     /// Search job id that produced the picked candidate, once linked.
     pub search_job_id: Option<String>,
+    /// A person picked the linked candidate (not the automatic review).
+    pub picked_by_person: bool,
     /// Last outcome, as the worker logged it.
     pub error_message: Option<String>,
     /// Last outcome, typed: what the queue explains.
@@ -156,15 +158,16 @@ impl TaskRow {
             download_client: row.get("download_client")?,
             source_username: row.get("source_username")?,
             search_job_id: row.get("search_job_id")?,
+            picked_by_person: row.get("picked_by_person")?,
             error_message: row.get("error_message")?,
             outcome_code: row
                 .get::<_, Option<String>>("outcome_code")?
                 .map(|code| Reason::from_stored(&code)),
-            created_at: row.get("created_at")?,
-            started_at: row.get("started_at")?,
-            last_polled_at: row.get("last_polled_at")?,
-            completed_at: row.get("completed_at")?,
-            updated_at: row.get("updated_at")?,
+            created_at: secs(row.get("created_at")?),
+            started_at: row.get::<_, Option<i64>>("started_at")?.map(secs),
+            last_polled_at: row.get::<_, Option<i64>>("last_polled_at")?.map(secs),
+            completed_at: row.get::<_, Option<i64>>("completed_at")?.map(secs),
+            updated_at: secs(row.get("updated_at")?),
         })
     }
 }
@@ -256,6 +259,8 @@ pub struct AttemptRow {
     pub row_revision: i64,
     /// Whether the client handle was journaled with the attempt.
     pub handle_journaled: bool,
+    /// When the attempt was queued (unix seconds).
+    pub created_at: f64,
 }
 
 impl AttemptRow {
@@ -273,12 +278,13 @@ impl AttemptRow {
             state,
             disposition: row.get("disposition")?,
             cleanup_failures: row.get("cleanup_failures")?,
-            next_retry_at: row.get("next_retry_at")?,
+            next_retry_at: secs(row.get("next_retry_at")?),
             lease_owner: row.get("lease_owner")?,
-            lease_expires_at: row.get("lease_expires_at")?,
+            lease_expires_at: row.get::<_, Option<i64>>("lease_expires_at")?.map(secs),
             error_code: row.get("error_code")?,
             row_revision: row.get("row_revision")?,
             handle_journaled: !row.get::<_, String>("handle_json")?.is_empty(),
+            created_at: secs(row.get("created_at")?),
         })
     }
 }
@@ -296,7 +302,7 @@ pub struct QuarantineRow {
     pub release_group_mbid: Option<String>,
     /// Why it was blocklisted.
     pub reason: String,
-    /// Block time (unix seconds).
+    /// Block time (unix seconds; stored as milliseconds).
     pub quarantined_at: f64,
 }
 
@@ -309,7 +315,7 @@ impl QuarantineRow {
             identity: row.get("identity")?,
             release_group_mbid: row.get("release_group_mbid")?,
             reason: row.get("reason")?,
-            quarantined_at: row.get("quarantined_at")?,
+            quarantined_at: secs(row.get("quarantined_at")?),
         })
     }
 }
@@ -409,7 +415,7 @@ impl<'conn> DownloadStore<'conn> {
                 task.release_group_mbid,
                 task.origin,
                 task.retry_count,
-                now,
+                ms(now),
             ],
         )?;
         Ok(())
@@ -435,7 +441,7 @@ impl<'conn> DownloadStore<'conn> {
                 recording_mbid,
                 task.origin,
                 task.retry_count,
-                now,
+                ms(now),
             ],
         )?;
         Ok(())
@@ -472,7 +478,7 @@ impl<'conn> DownloadStore<'conn> {
                 details.artist_mbid,
                 details.year,
                 details.track_title,
-                now,
+                ms(now),
                 task_id,
             ],
         )?;
@@ -501,7 +507,7 @@ impl<'conn> DownloadStore<'conn> {
                 album.track_count,
                 album.duration_seconds,
                 album.year,
-                now,
+                ms(now),
                 task_id,
             ],
         )?;
@@ -562,7 +568,7 @@ impl<'conn> DownloadStore<'conn> {
         })?;
         self.conn.execute(
             sql::SET_TASK_PLAN.text(),
-            rusqlite::params![json, now, task_id],
+            rusqlite::params![json, ms(now), task_id],
         )?;
         Ok(())
     }
@@ -607,7 +613,7 @@ impl<'conn> DownloadStore<'conn> {
             rusqlite::params![
                 status.as_str(),
                 outcome.map(|outcome| outcome.text),
-                now,
+                ms(now),
                 status.is_terminal(),
                 task_id,
                 outcome.map(|outcome| outcome.reason.code()),
@@ -631,15 +637,17 @@ impl<'conn> DownloadStore<'conn> {
     /// Record a watchdog poll without changing status.
     pub fn touch_poll(&self, task_id: &str, now: f64) -> Result<(), StoreError> {
         self.conn
-            .execute(sql::TOUCH_POLL.text(), rusqlite::params![now, task_id])?;
+            .execute(sql::TOUCH_POLL.text(), rusqlite::params![ms(now), task_id])?;
         Ok(())
     }
 
-    /// Link one task to the candidate a person picked from a manual
-    /// search: the source, the peer, the search job and the position in
-    /// its list. The worker fetches exactly that candidate first; the
-    /// reimport guard reads these columns back to tell linked tasks from
-    /// never-started ones.
+    /// Link one task to the candidate picked from a search, by a person or
+    /// by the automatic search review (`picked_by_person` says which): the
+    /// source, the peer, the search job and the position in its list. The
+    /// worker fetches exactly that candidate first; the reimport guard
+    /// reads these columns back to tell linked tasks from never-started
+    /// ones.
+    #[allow(clippy::too_many_arguments)]
     pub fn link_candidate(
         &self,
         task_id: &str,
@@ -647,6 +655,7 @@ impl<'conn> DownloadStore<'conn> {
         source_username: Option<&str>,
         search_job_id: &str,
         candidate_index: i64,
+        picked_by_person: bool,
         now: f64,
     ) -> Result<(), StoreError> {
         self.conn.execute(
@@ -656,8 +665,9 @@ impl<'conn> DownloadStore<'conn> {
                 source_username,
                 search_job_id,
                 candidate_index,
-                now,
-                task_id
+                ms(now),
+                task_id,
+                picked_by_person
             ],
         )?;
         Ok(())
@@ -665,9 +675,8 @@ impl<'conn> DownloadStore<'conn> {
 
     /// Whether one task can be reimported: failed or short-landed, with
     /// an attempt whose client handle still names its files (kept on a
-    /// failure, or settled without removing the files). Ports v2
-    /// `get_reimportable_task_ids`, keyed on the attempt journal instead
-    /// of the never-written candidate link.
+    /// failure, or settled without removing the files). Keyed on the
+    /// attempt journal, not on the never-written candidate link.
     pub fn is_reimportable(&self, task_id: &str) -> Result<bool, StoreError> {
         Ok(self.conn.query_row(
             sql::REIMPORTABLE.text(),
@@ -698,13 +707,15 @@ impl<'conn> DownloadStore<'conn> {
         }
         let claimed = self.conn.execute(
             sql::CLAIM_REIMPORT.text(),
-            rusqlite::params![now, attempt_id],
+            rusqlite::params![ms(now), attempt_id],
         )?;
         if claimed == 0 {
             return Ok(ReimportStart::FilesGone);
         }
-        self.conn
-            .execute(sql::BEGIN_REIMPORT.text(), rusqlite::params![now, task_id])?;
+        self.conn.execute(
+            sql::BEGIN_REIMPORT.text(),
+            rusqlite::params![ms(now), task_id],
+        )?;
         Ok(ReimportStart::Begun)
     }
 
@@ -713,7 +724,7 @@ impl<'conn> DownloadStore<'conn> {
     pub fn release_task_kept(&self, task_id: &str, now: f64) -> Result<(), StoreError> {
         self.conn.execute(
             sql::RELEASE_TASK_KEPT.text(),
-            rusqlite::params![now, task_id],
+            rusqlite::params![ms(now), task_id],
         )?;
         Ok(())
     }
@@ -728,7 +739,7 @@ impl<'conn> DownloadStore<'conn> {
     ) -> Result<Vec<(String, String)>, StoreError> {
         self.rows(
             sql::RELEASE_KEPT.text(),
-            rusqlite::params![now, kept_before],
+            rusqlite::params![ms(now), ms(kept_before)],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
     }
@@ -744,7 +755,7 @@ impl<'conn> DownloadStore<'conn> {
     ) -> Result<bool, StoreError> {
         let changed = self.conn.execute(
             sql::CLAIM_KEY.text(),
-            rusqlite::params![key, task_id, operation, now],
+            rusqlite::params![key, task_id, operation, ms(now)],
         )?;
         Ok(changed == 1)
     }
@@ -793,7 +804,7 @@ impl<'conn> DownloadStore<'conn> {
                 job_name,
                 handle_json,
                 state.as_str(),
-                now,
+                ms(now),
             ],
         )?;
         Ok(())
@@ -879,7 +890,7 @@ impl<'conn> DownloadStore<'conn> {
                 disposition,
                 error_code,
                 clear_lease,
-                now,
+                ms(now),
                 attempt_id,
                 expected_revision,
             ],
@@ -892,7 +903,7 @@ impl<'conn> DownloadStore<'conn> {
 
     /// Claim due cleanup attempts for one worker.
     ///
-    /// Ports `claim_download_cleanup_attempts`: claimable rows are
+    /// Claimable rows are
     /// `cleanup_pending`/`workspace_removed` (plus due `needs_attention`
     /// rechecks) whose retry time passed and whose lease is absent or
     /// expired. Claiming stamps owner plus expiry so a second worker -
@@ -908,17 +919,17 @@ impl<'conn> DownloadStore<'conn> {
         let expires = now + lease_seconds;
         self.conn.execute(
             sql::CLAIM_CLEANUP.text(),
-            rusqlite::params![worker_id, expires, now, limit],
+            rusqlite::params![worker_id, ms(expires), ms(now), limit],
         )?;
         self.rows(
             sql::CLAIMED_ATTEMPTS.text(),
-            rusqlite::params![worker_id, expires],
+            rusqlite::params![worker_id, ms(expires)],
             AttemptRow::from_row,
         )
     }
 
     /// Record a deferred cleanup: bump failures, stamp the error, and push
-    /// the next retry out with the same growth the v2 worker uses.
+    /// the next retry out with the cleanup backoff's growth.
     pub fn record_cleanup_failure(
         &self,
         attempt_id: &str,
@@ -938,8 +949,8 @@ impl<'conn> DownloadStore<'conn> {
             sql::RECORD_CLEANUP_FAILURE.text(),
             rusqlite::params![
                 error_code,
-                now + backoff,
-                now,
+                ms(now + backoff),
+                ms(now),
                 attempt_id,
                 expected_revision,
             ],
@@ -980,7 +991,7 @@ impl<'conn> DownloadStore<'conn> {
 
     /// Settle a task terminal while keeping its attempt for audit.
     ///
-    /// Ports `_fail_task_preserving_attempt`: the task goes terminal but
+    /// The task goes terminal but
     /// the attempt row survives (marked preserved or cleanup-pending), so
     /// a reaped or failed download never loses its cleanup evidence.
     pub fn finalize_task_and_attempt(
@@ -1041,19 +1052,21 @@ impl<'conn> DownloadStore<'conn> {
     pub fn cancel_task(&self, task_id: &str, now: f64) -> Result<bool, StoreError> {
         let changed = self
             .conn
-            .execute(sql::CANCEL_TASK.text(), rusqlite::params![now, task_id])?;
+            .execute(sql::CANCEL_TASK.text(), rusqlite::params![ms(now), task_id])?;
         if changed == 0 {
             return Ok(false);
         }
-        self.conn
-            .execute(sql::CANCEL_ATTEMPTS.text(), rusqlite::params![now, task_id])?;
+        self.conn.execute(
+            sql::CANCEL_ATTEMPTS.text(),
+            rusqlite::params![ms(now), task_id],
+        )?;
         self.settle_requests(task_id, TaskStatus::Cancelled, now)?;
         Ok(true)
     }
 
     /// Blocklist a release by source identity, pruning expired rows first.
     ///
-    /// Ports `record_quarantine`: the prune-on-write keeps the table small
+    /// The prune-on-write keeps the table small
     /// and the TTL self-heal lands on disk, not just filtered on read.
     pub fn record_quarantine(
         &self,
@@ -1066,11 +1079,11 @@ impl<'conn> DownloadStore<'conn> {
     ) -> Result<(), StoreError> {
         self.conn.execute(
             sql::PRUNE_QUARANTINE.text(),
-            rusqlite::params![now - ttl_seconds],
+            rusqlite::params![ms(now - ttl_seconds)],
         )?;
         self.conn.execute(
             sql::INSERT_QUARANTINE.text(),
-            rusqlite::params![source, identity, release_group_mbid, reason, now],
+            rusqlite::params![source, identity, release_group_mbid, reason, ms(now)],
         )?;
         Ok(())
     }
@@ -1083,7 +1096,7 @@ impl<'conn> DownloadStore<'conn> {
     ) -> Result<Vec<(String, String)>, StoreError> {
         self.rows(
             sql::QUARANTINE_SET.text(),
-            rusqlite::params![now - ttl_seconds],
+            rusqlite::params![ms(now - ttl_seconds)],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )
     }
@@ -1127,9 +1140,9 @@ impl<'conn> DownloadStore<'conn> {
     /// Retryable tasks: the newest task per target (album, or track plus
     /// user) when that newest task is terminal `failed`/`partial` under
     /// the retry ceiling. Oldest first so the most overdue retry goes
-    /// first. Ports `list_retryable_tasks`, including the upgrade-origin
-    /// exclusion on both sides: a failed upgrade never auto-retries, and
-    /// a newer upgrade cannot suppress a user task's legitimate retry.
+    /// first. Upgrades are excluded on both sides: a failed upgrade never
+    /// auto-retries, and a newer upgrade cannot suppress a user task's
+    /// legitimate retry.
     pub fn list_retryable(&self, max_retry_count: i64) -> Result<Vec<TaskRow>, StoreError> {
         self.rows(
             sql::RETRYABLE.text(),
@@ -1151,8 +1164,8 @@ impl<'conn> DownloadStore<'conn> {
                     Ok(RetryAnchor {
                         status: row.get(0)?,
                         retry_count: row.get(1)?,
-                        completed_at: row.get(2)?,
-                        updated_at: row.get(3)?,
+                        completed_at: row.get::<_, Option<i64>>(2)?.map(secs),
+                        updated_at: secs(row.get(3)?),
                     })
                 },
             )
@@ -1172,7 +1185,7 @@ impl<'conn> DownloadStore<'conn> {
             .conn
             .query_row(
                 sql::TASK_SINCE.text(),
-                rusqlite::params![owner, kind, key, since],
+                rusqlite::params![owner, kind, key, ms(since)],
                 |row| row.get(0),
             )
             .optional()?)
@@ -1188,7 +1201,7 @@ impl<'conn> DownloadStore<'conn> {
     ) -> Result<Vec<TaskRow>, StoreError> {
         self.rows(
             sql::UNPOLLED_ACTIVE.text(),
-            rusqlite::params![now - threshold_seconds],
+            rusqlite::params![ms(now - threshold_seconds)],
             TaskRow::from_row,
         )
     }

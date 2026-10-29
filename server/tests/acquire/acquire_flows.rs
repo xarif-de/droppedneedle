@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::common::bundles::quiet_ticks;
+use droppedneedle_acquire::clients::LiveClients;
 use droppedneedle_acquire::db::AcquireDb;
 use droppedneedle_acquire::dispatch::{
     DispatchOrigin, DispatchOutcome, DispatchRequest, DispatchTarget, DownloadDispatch,
@@ -19,6 +20,8 @@ use droppedneedle_acquire::dispatch::{
 use droppedneedle_acquire::downloads::journal::Journal;
 use droppedneedle_acquire::downloads::state::TaskStatus;
 use droppedneedle_acquire::downloads::store::{NewTask, TaskRow};
+use droppedneedle_acquire::downloads::worker::SourceList;
+use droppedneedle_acquire::downloads::worker::WorkerSettings;
 use droppedneedle_acquire::flows::{
     loops::{
         FollowDeps, PruneDeps, SYNC_INITIAL_DELAY, SYNC_INTERVAL, SYNC_JOB, SweepDeps, SyncDeps,
@@ -40,8 +43,7 @@ use droppedneedle_acquire::requests::{
 };
 use droppedneedle_acquire::search_jobs::store::JobStore;
 use droppedneedle_acquire::target::Targets;
-use droppedneedle_acquire::wiring::{ClientLives, LiveClients, WorkerSettings};
-use droppedneedle_acquire::worker::SourceList;
+use droppedneedle_acquire::wiring::ClientLives;
 use droppedneedle_auth::{Principal, Role};
 use droppedneedle_kernel::db::{DbRuntime, JobState};
 use droppedneedle_kernel::events::EventHub;
@@ -177,7 +179,7 @@ async fn behind(db: &AcquireDb, id: &str, status: TaskStatus) {
 async fn tasks(db: &AcquireDb) -> Vec<TaskRow> {
     let ids: Vec<String> =
         sqlx::query_scalar("SELECT id FROM download_tasks ORDER BY created_at, rowid")
-            .fetch_all(db.pool())
+            .fetch_all(db.db().sqlx())
             .await
             .expect("task ids read");
     let journal = Journal::new(db.clone(), quiet_ticks());
@@ -567,7 +569,7 @@ async fn follow_poll_baselines_then_emits() {
     let feed: Vec<String> = sqlx::query_scalar(
         "SELECT release_group_mbid FROM new_release_feed ORDER BY release_group_mbid",
     )
-    .fetch_all(db.pool())
+    .fetch_all(db.db().sqlx())
     .await
     .unwrap();
     assert_eq!(feed, ["rg-future", "rg-new"]);
@@ -686,7 +688,7 @@ async fn presence_trusts_a_tag_only_for_an_unidentified_album() {
     })
     .await
     .unwrap();
-    let library = LibraryPresence::over_catalog(db.pool().clone());
+    let library = LibraryPresence::over_catalog(db.db().clone());
     assert!(
         !library.contains("rg-x").await,
         "an album identified as another group never holds its files' tag"
@@ -829,7 +831,7 @@ async fn until<F: Future<Output = bool>>(what: &str, mut done: impl FnMut() -> F
     }
 }
 
-// The wanted recheck table matches v2's age bands.
+// The wanted recheck table's age bands.
 #[test]
 fn recheck_bands() {
     let now = 1_716_720_000; // 2024-05-26 UTC

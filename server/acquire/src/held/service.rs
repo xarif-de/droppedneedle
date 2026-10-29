@@ -15,8 +15,10 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use droppedneedle_kernel::db::{DbError, Lane};
+use droppedneedle_kernel::jobs::{AlreadyRunning, FnTick, Next, Schedule, Supervisor, TickCtx};
 use droppedneedle_providers::RequestPriority;
 
 use super::HeldFolders;
@@ -27,6 +29,7 @@ use crate::downloads::plan::PlannedAlbum;
 use crate::downloads::queue_rows::Viewer;
 use crate::downloads::state::TaskStatus;
 use crate::downloads::store::{DownloadStore, TaskRow};
+use crate::downloads::worker::DownloadWorker;
 use crate::drop_import::{DropError, DropImports, identify};
 use crate::intake::{self, Gate, IntakeBatch, IntakeFile, Origin, Outcome};
 use crate::landing::canonical_dirs;
@@ -34,15 +37,14 @@ use crate::landing::ports::LandingLibrary;
 use crate::landing::probe::{self, LandedFile, Landing};
 use crate::landing::specs;
 use crate::reason::{Reason, ReasonKind};
-use crate::worker::DownloadWorker;
 use droppedneedle_library::matching::Release;
 
 /// Job name of the loop that removes expired entries' copies, finishes
 /// actions a restart cut off and retries files our side could not take.
 pub const PRUNE_JOB: &str = "acquire-held-prune";
 
-/// Fingerprint checks one bulk re-check runs at most (v2
-/// `HELD_REVERIFY_BULK_LIMIT`). Skipped files do not count.
+/// Fingerprint checks one bulk re-check runs at most. Skipped files do
+/// not count.
 pub const BULK_RECHECK_LIMIT: usize = 25;
 
 /// Entries one prune pass expires at most; the rest wait for the next.
@@ -1651,4 +1653,34 @@ pub fn is_retry(reason: Reason) -> bool {
 /// for a library reason and paired with a track.
 pub fn retries_by_itself(file: &HeldFile) -> bool {
     is_retry(file.reason) && file.is_paired()
+}
+
+/// The held list's loop runs every five minutes, the first pass a minute
+/// after start: often enough for the first automatic retry, five minutes
+/// after a hold.
+const HELD_PRUNE_INTERVAL: Duration = Duration::from_secs(300);
+const HELD_PRUNE_DELAY: Duration = Duration::from_secs(60);
+
+/// The held list's loop: a minute after start, then every five
+/// minutes, it finishes actions a restart cut off, removes the held
+/// copies of entries past their expiry and retries the files our side
+/// could not take whose next try is due.
+pub(crate) fn spawn_held_prune(
+    supervisor: &Supervisor,
+    held: Arc<HeldService>,
+) -> Result<(), AlreadyRunning> {
+    supervisor.periodic(
+        PRUNE_JOB,
+        Schedule::new(HELD_PRUNE_INTERVAL).with_initial_delay(HELD_PRUNE_DELAY),
+        FnTick(move |ctx: TickCtx| {
+            let held = held.clone();
+            async move {
+                tokio::select! {
+                    () = ctx.token().cancelled() => {}
+                    _ = held.tend() => {}
+                }
+                Ok(Next::Continue)
+            }
+        }),
+    )
 }

@@ -230,7 +230,7 @@ fn mount(m: Mount<'_>) -> Mount<'_> {
         .optional_area(reads::catalog::routes(), |state| {
             state.reads.catalog.clone()
         })
-        .optional_area(
+        .area(
             droppedneedle_catalog::concerts::handlers::routes(),
             |state| state.concerts.service(),
         )
@@ -368,7 +368,7 @@ fn routes(state: &AppState, web: Option<WebUi>) -> Router {
     let legacy_callbacks = state
         .acquire
         .legacy_callback_router()
-        .merge(state.library.legacy_contrib_callback_router())
+        .merge(state.library_services.legacy_contrib_callback_router())
         .layer(middleware::from_fn_with_state(
             state.auth.limits.clone(),
             rate_limit,

@@ -615,8 +615,11 @@ async fn settings_replace_filters_and_preserves() {
     );
     assert_eq!(
         stored["plugins"]["demo"],
-        json!({"enabled": true, "settings": {"k": "v"}})
+        json!({"enabled": false, "settings": {"k": "v"}})
     );
+    assert!(report.items.iter().any(|item| item.key == "plugins.demo"
+        && item.outcome == "needs_porting"
+        && item.detail == "demo needs porting before it can run"));
     // A Spotify app configured on v2 keeps its registered v2 callback.
     assert_eq!(stored["spotify_settings"]["legacy_callback"], json!(true));
     assert_eq!(stored["indexers"][0]["name"], json!("first"));
@@ -1311,4 +1314,49 @@ async fn removed_settings_import_and_are_reported() {
     let policy: DownloadPolicy =
         serde_json::from_value(stored["download_policy"].clone()).expect("the policy decodes");
     assert_eq!(policy.quality_recipe[0].max_bitrate_kbps, Some(320));
+}
+
+#[tokio::test]
+async fn event_cities_import_inside_the_city_limits() {
+    let fixture = Fixture::shared();
+    let mut export = fixture.shell();
+    export["users"] = json!([fixture.user("u1")]);
+    let city = |name: &str, latitude: f64, radius_km: f64| {
+        json!({"user_id": "u1", "city_name": name, "country_code": "GB",
+               "latitude": latitude, "longitude": -1.0, "radius_km": radius_km, "position": 0})
+    };
+    export["event_cities"] = json!([
+        city("Near", 51.0, 0.0),
+        city("Far", 52.0, 10_000.0),
+        city("Middle", 53.0, 30.0),
+    ]);
+
+    let pool = migrated_pool().await;
+    let (_dir, config_path, crypto) = scratch_config("event-cities");
+    let report = run_import(import_request(&export, pool.clone(), config_path, crypto)).await;
+    assert_eq!(report.exit.code, ExitCode::Ok);
+
+    let stored: Vec<(String, f64, i64)> = sqlx::query_as(
+        "SELECT city_name, radius_km, position FROM user_event_cities \
+         WHERE user_id = 'u1' ORDER BY position",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        stored,
+        vec![
+            ("Near".to_owned(), 1.0, 0),
+            ("Far".to_owned(), 500.0, 1),
+            ("Middle".to_owned(), 30.0, 2),
+        ]
+    );
+}
+
+#[test]
+fn event_city_limits_match_the_concerts_service() {
+    use droppedneedle_catalog::concerts::models::{MAX_CITIES, MAX_RADIUS_KM, MIN_RADIUS_KM};
+    use droppedneedle_tool::import::pipeline::{EVENT_CITY_RADIUS_KM, MAX_EVENT_CITIES};
+    assert_eq!(MAX_EVENT_CITIES, MAX_CITIES);
+    assert_eq!(EVENT_CITY_RADIUS_KM, MIN_RADIUS_KM..=MAX_RADIUS_KM);
 }

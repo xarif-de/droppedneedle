@@ -75,8 +75,9 @@ pub enum Fetched {
 pub enum FetchError {
     /// The body is over [`MAX_PLUGIN_ZIP_BYTES`].
     TooLarge,
-    /// The request or the download broke. The text is log-only.
-    Transport(String),
+    /// The request or the download broke: a fixed kind for the log, never
+    /// the transport's own text, which can carry the URL.
+    Transport(&'static str),
 }
 
 /// Fetch one URL and say what came back.
@@ -140,7 +141,15 @@ fn refusal(
 impl ArchiveFetcher for ReqwestFetcher {
     fn fetch<'a>(&'a self, url: &'a str) -> BoxFuture<'a, Result<Fetched, FetchError>> {
         Box::pin(async move {
-            let transport = |error: reqwest::Error| FetchError::Transport(error.to_string());
+            let transport = |error: reqwest::Error| {
+                FetchError::Transport(if error.is_timeout() {
+                    "timed out"
+                } else if error.is_connect() {
+                    "could not connect"
+                } else {
+                    "request failed"
+                })
+            };
             let response = self
                 .http
                 .get(url)
@@ -155,7 +164,7 @@ impl ArchiveFetcher for ReqwestFetcher {
             match read_capped(response, MAX_PLUGIN_ZIP_BYTES).await {
                 Ok(body) => Ok(Fetched::Found(body)),
                 Err(BodyError::TooLarge) => Err(FetchError::TooLarge),
-                Err(BodyError::Transport(cause)) => Err(FetchError::Transport(cause)),
+                Err(error @ BodyError::Transport(_)) => Err(FetchError::Transport(error.kind())),
             }
         })
     }
@@ -172,80 +181,69 @@ pub struct ArchiveEntry {
     pub data: Vec<u8>,
 }
 
-/// Unpack an install archive. Production reads zips ([`ZipUnpacker`]).
-pub trait ArchiveUnpacker: Send + Sync {
-    /// Every file in the archive.
-    fn unpack(&self, bytes: &[u8]) -> Result<Vec<ArchiveEntry>, String>;
-}
+/// Read every file of an install archive: a zip of stored and deflated
+/// entries (what GitHub serves). The caps apply while reading, so an
+/// archive at the download cap cannot balloon past the unpacked budget.
+pub fn unpack_zip(bytes: &[u8]) -> Result<Vec<ArchiveEntry>, String> {
+    use std::io::Read as _;
 
-/// Zip reader over stored and deflated entries (what GitHub serves). The
-/// caps apply while reading, so an archive at the download cap cannot
-/// balloon past the unpacked budget.
-#[derive(Debug, Default)]
-pub struct ZipUnpacker;
-
-impl ArchiveUnpacker for ZipUnpacker {
-    fn unpack(&self, bytes: &[u8]) -> Result<Vec<ArchiveEntry>, String> {
-        use std::io::Read as _;
-
-        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
-            .map_err(|error| format!("plugin archive is not a readable zip: {error}"))?;
-        if archive.len() > MAX_PLUGIN_ZIP_ENTRIES {
-            return Err(format!(
-                "plugin archive holds {} entries; the cap is {MAX_PLUGIN_ZIP_ENTRIES}",
-                archive.len(),
-            ));
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
+        .map_err(|error| format!("plugin archive is not a readable zip: {error}"))?;
+    if archive.len() > MAX_PLUGIN_ZIP_ENTRIES {
+        return Err(format!(
+            "plugin archive holds {} entries; the cap is {MAX_PLUGIN_ZIP_ENTRIES}",
+            archive.len(),
+        ));
+    }
+    let mut entries = Vec::new();
+    let mut total: u64 = 0;
+    for index in 0..archive.len() {
+        let file = archive
+            .by_index(index)
+            .map_err(|error| format!("plugin archive entry {index} is unreadable: {error}"))?;
+        if file.is_dir() {
+            continue;
         }
-        let mut entries = Vec::new();
-        let mut total: u64 = 0;
-        for index in 0..archive.len() {
-            let file = archive
-                .by_index(index)
-                .map_err(|error| format!("plugin archive entry {index} is unreadable: {error}"))?;
-            if file.is_dir() {
-                continue;
-            }
-            match file.compression() {
-                zip::CompressionMethod::Stored | zip::CompressionMethod::Deflated => {}
-                method => {
-                    return Err(format!(
-                        "plugin archive uses {method:?} compression; only stored and deflated entries install"
-                    ));
-                }
-            }
-            let name = file
-                .name()
-                .map_err(|error| {
-                    format!("plugin archive entry {index} has an unreadable name: {error}")
-                })?
-                .into_owned();
-            if file.enclosed_name().is_none() {
-                return Err(format!("plugin archive entry {name:?} escapes its root"));
-            }
-            let is_symlink = file
-                .unix_mode()
-                .is_some_and(|mode| mode & 0o170_000 == 0o120_000);
-            let mut data = Vec::new();
-            file.take(MAX_PLUGIN_ZIP_FILE_BYTES as u64 + 1)
-                .read_to_end(&mut data)
-                .map_err(|error| format!("plugin archive entry is unreadable: {error}"))?;
-            if data.len() > MAX_PLUGIN_ZIP_FILE_BYTES {
+        match file.compression() {
+            zip::CompressionMethod::Stored | zip::CompressionMethod::Deflated => {}
+            method => {
                 return Err(format!(
-                    "plugin archive entry {name:?} tops the per-file cap"
+                    "plugin archive uses {method:?} compression; only stored and deflated entries install"
                 ));
             }
-            total += data.len() as u64;
-            if total > MAX_PLUGIN_ZIP_DECOMPRESSED_BYTES as u64 {
-                return Err("plugin archive unpacks past the total cap".to_owned());
-            }
-            entries.push(ArchiveEntry {
-                path: name,
-                is_symlink,
-                data,
-            });
         }
-        Ok(entries)
+        let name = file
+            .name()
+            .map_err(|error| {
+                format!("plugin archive entry {index} has an unreadable name: {error}")
+            })?
+            .into_owned();
+        if file.enclosed_name().is_none() {
+            return Err(format!("plugin archive entry {name:?} escapes its root"));
+        }
+        let is_symlink = file
+            .unix_mode()
+            .is_some_and(|mode| mode & 0o170_000 == 0o120_000);
+        let mut data = Vec::new();
+        file.take(MAX_PLUGIN_ZIP_FILE_BYTES as u64 + 1)
+            .read_to_end(&mut data)
+            .map_err(|error| format!("plugin archive entry is unreadable: {error}"))?;
+        if data.len() > MAX_PLUGIN_ZIP_FILE_BYTES {
+            return Err(format!(
+                "plugin archive entry {name:?} tops the per-file cap"
+            ));
+        }
+        total += data.len() as u64;
+        if total > MAX_PLUGIN_ZIP_DECOMPRESSED_BYTES as u64 {
+            return Err("plugin archive unpacks past the total cap".to_owned());
+        }
+        entries.push(ArchiveEntry {
+            path: name,
+            is_symlink,
+            data,
+        });
     }
+    Ok(entries)
 }
 
 /// Every way an install can fail. `Denied`, `RateLimited` and `Download`
@@ -262,9 +260,12 @@ pub enum InstallError {
         /// Seconds until GitHub takes requests again, when it said.
         retry_after: Option<u64>,
     },
-    /// GitHub did not answer, answered with a failure, or sent something
-    /// unreadable.
+    /// GitHub did not answer, or answered with a failure.
     Download,
+    /// GitHub answered with a body that does not decode.
+    Unreadable,
+    /// No public repository at that address.
+    NoRepository,
     /// The repository has no such release, tag, branch or commit.
     RefNotFound(String),
     /// Archive over the cap.
@@ -288,6 +289,11 @@ pub enum InstallError {
     /// The plugin was not installed from GitHub, so there is nothing to
     /// update from.
     NoSource,
+    /// An update of a release install found no releases left.
+    NoReleasesNow,
+    /// The repository at the recorded address has another GitHub id now:
+    /// it was deleted and created again, maybe by someone else.
+    RepositoryReplaced,
     /// Local filesystem failure. The message is log-only.
     Io(String),
 }
@@ -303,6 +309,8 @@ impl std::fmt::Display for InstallError {
                 f.write_str("GitHub is rate limiting this server, try again later")
             }
             Self::Download => f.write_str("GitHub could not be reached"),
+            Self::Unreadable => f.write_str("GitHub sent an answer DroppedNeedle could not read"),
+            Self::NoRepository => f.write_str("GitHub has no public repository at that address"),
             Self::RefNotFound(what) => write!(f, "GitHub has no {what} in that repository"),
             Self::TooLarge => f.write_str("That repository is too large to install as a plugin"),
             Self::TooManyFiles => f.write_str("That repository has too many files"),
@@ -319,6 +327,12 @@ impl std::fmt::Display for InstallError {
             Self::NoSource => f.write_str(
                 "This plugin was not installed from GitHub, so there is nothing to update from",
             ),
+            Self::NoReleasesNow => f.write_str(
+                "This repository has no releases now. Pick a branch, tag or commit to install",
+            ),
+            Self::RepositoryReplaced => f.write_str(
+                "The repository at this address was replaced since the plugin was installed. Install it again if you trust the new one",
+            ),
         }
     }
 }
@@ -332,6 +346,11 @@ pub struct InstallRecord {
     pub repository_url: String,
     /// `owner/repo`.
     pub repository: String,
+    /// GitHub's id for the repository, which a rename keeps and a
+    /// re-created repository does not. `None` on records written before it
+    /// was kept: the next update fills it.
+    #[serde(default)]
+    pub repository_id: Option<u64>,
     /// What the admin asked for.
     pub ref_kind: PluginRefKind,
     /// The release tag, tag, branch or commit asked for.
@@ -353,6 +372,63 @@ impl InstallRecord {
             })
             .ok()
     }
+
+    /// What an update fetches. A reference the admin asked for wins;
+    /// otherwise releases move to the newest release, branches (the
+    /// default one included) to their tip, and tags and commits stay on the
+    /// installed commit. An update never changes the kind of install by
+    /// itself: a release install with no releases left stops, and never
+    /// falls back to the default branch.
+    pub fn update_source(&self, asked: Option<&str>) -> Result<InstallSource, InstallError> {
+        let url = format!("https://github.com/{}", self.repository);
+        let asked = asked
+            .map(str::trim)
+            .filter(|reference| !reference.is_empty());
+        let reference = match (asked, self.ref_kind) {
+            (Some(reference), _) => reference,
+            (None, PluginRefKind::Release) => {
+                let mut source = parse_source(&url, None)?;
+                source.wanted = Wanted::NewestRelease;
+                return Ok(source);
+            }
+            (None, PluginRefKind::Branch) => &self.reference,
+            (None, PluginRefKind::Tag | PluginRefKind::Commit) => &self.commit,
+        };
+        parse_source(&url, Some(reference))
+    }
+
+    /// Refuse an update whose repository is not the one installed from.
+    /// A record without an id cannot tell, so it lets the update through.
+    pub fn same_repository(&self, resolved: &ResolvedSource) -> Result<(), InstallError> {
+        match self.repository_id {
+            Some(id) if id != resolved.repository_id => Err(InstallError::RepositoryReplaced),
+            _ => Ok(()),
+        }
+    }
+
+    /// Write through a synced temp file beside the record, then rename it
+    /// over the record, so a crash leaves the old record or the new one,
+    /// never a partial one.
+    fn write(&self, plugin_dir: &Path) -> Result<(), InstallError> {
+        use std::io::Write as _;
+
+        let json =
+            serde_json::to_vec_pretty(self).map_err(|error| InstallError::Io(error.to_string()))?;
+        let temp = plugin_dir.join(format!(
+            "{INSTALL_RECORD}.{}.tmp",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let mut file = std::fs::File::create_new(&temp)
+            .map_err(|error| InstallError::Io(error.to_string()))?;
+        let synced = file.write_all(&json).and_then(|()| file.sync_all());
+        drop(file);
+        let swapped = synced.and_then(|()| std::fs::rename(&temp, plugin_dir.join(INSTALL_RECORD)));
+        if let Err(error) = swapped {
+            let _ = std::fs::remove_file(&temp);
+            return Err(InstallError::Io(error.to_string()));
+        }
+        Ok(())
+    }
 }
 
 /// A repository plus the version to install, before resolving to a commit.
@@ -373,6 +449,8 @@ pub struct InstallSource {
 pub enum Wanted {
     /// The newest release (or the default branch when there are none).
     LatestRelease,
+    /// The newest release and nothing else.
+    NewestRelease,
     /// One release tag.
     Tag(String),
     /// A branch, tag or commit named in a `/tree/` URL.
@@ -386,6 +464,8 @@ pub enum Wanted {
 pub struct ResolvedSource {
     /// The source.
     pub source: InstallSource,
+    /// GitHub's id for the repository.
+    pub repository_id: u64,
     /// What the reference is.
     pub ref_kind: PluginRefKind,
     /// The tag, branch or commit.
@@ -465,7 +545,7 @@ pub fn parse_source(url: &str, reference: Option<&str>) -> Result<InstallSource,
         };
     }
     let reference_ok = match &wanted {
-        Wanted::LatestRelease => true,
+        Wanted::LatestRelease | Wanted::NewestRelease => true,
         Wanted::Tag(text) | Wanted::Tree(text) => valid_ref(text),
         Wanted::Commit(text) => is_commit_sha(text),
     };
@@ -478,6 +558,14 @@ pub fn parse_source(url: &str, reference: Option<&str>) -> Result<InstallSource,
         repo,
         wanted,
     })
+}
+
+/// `GET /repos/{owner}/{repo}`, of which only the id is read. Probed
+/// 2026-10-27 against the public API: `id` is a JSON integer, and an
+/// unknown repository answers 404.
+#[derive(Deserialize)]
+struct Repository {
+    id: u64,
 }
 
 #[derive(Deserialize)]
@@ -511,6 +599,14 @@ fn body_of(answer: Result<Fetched, FetchError>) -> Result<Option<Vec<u8>>, Insta
     }
 }
 
+/// Decode one GitHub answer, or say it could not be read.
+fn decode<T: serde::de::DeserializeOwned>(body: &[u8], what: &str) -> Result<T, InstallError> {
+    serde_json::from_slice(body).map_err(|error| {
+        tracing::warn!(what, %error, "GitHub sent an unreadable answer to a plugin request");
+        InstallError::Unreadable
+    })
+}
+
 /// Resolve a commit-ish (tag, branch or SHA) to a commit SHA.
 async fn commit_for(
     fetcher: &dyn ArchiveFetcher,
@@ -533,9 +629,10 @@ async fn commit_for(
     let Some(body) = body_of(answer)? else {
         return Ok(None);
     };
-    let info: CommitInfo = serde_json::from_slice(&body).map_err(|_| InstallError::Download)?;
+    let info: CommitInfo = decode(&body, "commit")?;
     if !is_commit_sha(&info.sha) {
-        return Err(InstallError::Download);
+        tracing::warn!("GitHub named a commit that is not a SHA");
+        return Err(InstallError::Unreadable);
     }
     Ok(Some(info.sha.to_ascii_lowercase()))
 }
@@ -546,20 +643,28 @@ pub async fn resolve(
     hosts: &GitHubHosts,
     source: InstallSource,
 ) -> Result<ResolvedSource, InstallError> {
+    let url = format!("{}/repos/{}/{}", hosts.api, source.owner, source.repo);
+    let repository: Repository = match body_of(fetcher.fetch(&url).await)? {
+        Some(body) => decode(&body, "repository")?,
+        None => return Err(InstallError::NoRepository),
+    };
     let (ref_kind, reference) = match &source.wanted {
-        Wanted::LatestRelease => {
+        Wanted::LatestRelease | Wanted::NewestRelease => {
             let url = format!(
                 "{}/repos/{}/{}/releases/latest",
                 hosts.api, source.owner, source.repo
             );
             match body_of(fetcher.fetch(&url).await)? {
                 Some(body) => {
-                    let release: LatestRelease =
-                        serde_json::from_slice(&body).map_err(|_| InstallError::Download)?;
+                    let release: LatestRelease = decode(&body, "latest release")?;
                     if !valid_ref(&release.tag_name) {
-                        return Err(InstallError::Download);
+                        tracing::warn!("GitHub named a release tag that is not a usable ref");
+                        return Err(InstallError::Unreadable);
                     }
                     (PluginRefKind::Release, release.tag_name)
+                }
+                None if source.wanted == Wanted::NewestRelease => {
+                    return Err(InstallError::NoReleasesNow);
                 }
                 // No releases: take the default branch as it is now.
                 None => (PluginRefKind::Branch, "HEAD".to_owned()),
@@ -578,8 +683,19 @@ pub async fn resolve(
                 _ => format!("release, tag or branch named {reference}"),
             })
         })?;
+    // GitHub's answer to a commit pin must start with the SHA asked, which
+    // for a full SHA means equal.
+    if ref_kind == PluginRefKind::Commit && !commit.starts_with(&reference) {
+        tracing::warn!(
+            asked = %reference,
+            answered = %commit,
+            "GitHub answered a pinned commit with another commit"
+        );
+        return Err(InstallError::Unreadable);
+    }
     Ok(ResolvedSource {
         source,
+        repository_id: repository.id,
         ref_kind,
         reference,
         commit,
@@ -589,7 +705,6 @@ pub async fn resolve(
 /// Download and validate one resolved source without installing it.
 pub async fn stage(
     fetcher: &dyn ArchiveFetcher,
-    unpacker: &dyn ArchiveUnpacker,
     hosts: &GitHubHosts,
     resolved: ResolvedSource,
 ) -> Result<StagedPlugin, InstallError> {
@@ -602,9 +717,7 @@ pub async fn stage(
     if archive.len() > MAX_PLUGIN_ZIP_BYTES {
         return Err(InstallError::TooLarge);
     }
-    let entries = unpacker
-        .unpack(&archive)
-        .map_err(InstallError::ArchiveUnreadable)?;
+    let entries = unpack_zip(&archive).map_err(InstallError::ArchiveUnreadable)?;
     let root = check_entries(&entries)?;
     let manifest = manifest_from_entries(&entries, &root)?;
     Ok(StagedPlugin {
@@ -689,21 +802,19 @@ impl PluginHost {
         let staging = self.dir().join(format!(".installing-{name}"));
         let _ = std::fs::remove_dir_all(&staging);
         let written = write_entries(&staging, &staged.root, &staged.entries).and_then(|()| {
-            let record = InstallRecord {
+            InstallRecord {
                 repository_url: staged.resolved.source.url.clone(),
                 repository: format!(
                     "{}/{}",
                     staged.resolved.source.owner, staged.resolved.source.repo
                 ),
+                repository_id: Some(staged.resolved.repository_id),
                 ref_kind: staged.resolved.ref_kind,
                 reference: staged.resolved.reference.clone(),
                 commit: staged.resolved.commit.clone(),
                 installed_at,
-            };
-            let json = serde_json::to_vec_pretty(&record)
-                .map_err(|error| InstallError::Io(error.to_string()))?;
-            std::fs::write(staging.join(INSTALL_RECORD), json)
-                .map_err(|error| InstallError::Io(error.to_string()))
+            }
+            .write(&staging)
         });
         let checked = written.and_then(|()| {
             let manifest = load_manifest(&staging)
@@ -733,6 +844,23 @@ impl PluginHost {
     pub fn install_record(&self, name: &str) -> Option<InstallRecord> {
         let plugin = self.get(name)?;
         InstallRecord::read(Path::new(&plugin.directory))
+    }
+
+    /// Fill in the repository id on a record written before ids were
+    /// kept, after an update that found nothing new to install.
+    pub fn keep_repository_id(&self, name: &str, repository_id: u64) -> Result<(), InstallError> {
+        let Some(plugin) = self.get(name) else {
+            return Ok(());
+        };
+        let dir = Path::new(&plugin.directory);
+        match InstallRecord::read(dir) {
+            Some(record) if record.repository_id.is_none() => InstallRecord {
+                repository_id: Some(repository_id),
+                ..record
+            }
+            .write(dir),
+            _ => Ok(()),
+        }
     }
 }
 
@@ -889,10 +1017,10 @@ mod tests {
         writer.start_file("root/plugin.toml", deflated).unwrap();
         writer.write_all(b"[plugin]").unwrap();
         let bytes = writer.finish().unwrap().into_inner();
-        let entries = ZipUnpacker.unpack(&bytes).unwrap();
+        let entries = unpack_zip(&bytes).unwrap();
         assert_eq!(entries[0].path, "root/plugin.toml");
         assert_eq!(entries[0].data, b"[plugin]");
-        assert!(ZipUnpacker.unpack(b"not a zip").is_err());
+        assert!(unpack_zip(b"not a zip").is_err());
 
         let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
         writer
@@ -900,6 +1028,6 @@ mod tests {
             .unwrap();
         writer.write_all(b"[plugin]").unwrap();
         let bytes = writer.finish().unwrap().into_inner();
-        assert!(ZipUnpacker.unpack(&bytes).is_err());
+        assert!(unpack_zip(&bytes).is_err());
     }
 }

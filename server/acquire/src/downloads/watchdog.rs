@@ -1,8 +1,9 @@
-//! Watchdog and retry timing, ported from the orchestrator.
+//! Watchdog and retry timing.
 //!
 //! The poll loop watches real byte progress: an actively-transferring
 //! batch that stops moving trips the stall timeout, a batch stuck in the
-//! peer's remote queue trips the (more generous) queued timeout, and a
+//! peer's remote queue gives way to the next copy after the preferred-
+//! quality wait or trips the (more generous) queued timeout, and a
 //! fresh enqueue that never materializes a transfer fails over fast
 //! instead of sitting out the full queued window. The 6-hour ceiling is
 //! an absolute backstop the minutes-scale watchdogs normally beat.
@@ -42,6 +43,9 @@ pub enum WatchdogOutcome {
     Terminal,
     /// An active transfer stopped making progress.
     Stalled,
+    /// Queued at the peer with nothing downloaded past the preferred-
+    /// quality wait, while another copy is left to try.
+    GiveWay,
     /// Stuck in the peer's remote upload queue too long.
     QueuedTimeout,
     /// No transfer record materialized after enqueue.
@@ -50,7 +54,7 @@ pub enum WatchdogOutcome {
     Deadline,
 }
 
-/// Watchdog timing. Defaults are the v2 production values.
+/// Watchdog timing. Defaults are the production values.
 #[derive(Debug, Clone)]
 pub struct WatchdogConfig {
     /// Poll cadence in seconds.
@@ -60,6 +64,9 @@ pub struct WatchdogConfig {
     /// Idle-in-remote-queue limit (default 2 hours, more generous than the
     /// stall timeout because remote queues move slowly).
     pub queued_timeout_seconds: f64,
+    /// Zero-byte wait in a peer's queue before another copy is tried
+    /// (default 15 minutes).
+    pub preferred_quality_wait_seconds: f64,
     /// Absolute poll-loop ceiling (default 6 hours).
     pub deadline_seconds: f64,
     /// Fresh-enqueue materialization limit (default 90 seconds).
@@ -74,6 +81,7 @@ impl Default for WatchdogConfig {
             poll_interval_seconds: 2.0,
             stall_timeout_seconds: 30.0 * 60.0,
             queued_timeout_seconds: 120.0 * 60.0,
+            preferred_quality_wait_seconds: 15.0 * 60.0,
             deadline_seconds: 6.0 * 3600.0,
             materialize_seconds: 90.0,
             reap_threshold_seconds: 1800.0,
@@ -93,10 +101,23 @@ impl Watchdog {
         Self { config }
     }
 
-    /// Judge one poll sample. The order mirrors `_poll_until_done`:
+    /// Judge one poll sample, in this order:
     /// terminal states first, then the ceiling, then the materialize
     /// fast-fail, then stall versus queued off real byte progress.
     pub fn evaluate(&self, sample: &PollSample) -> WatchdogOutcome {
+        self.evaluate_with(sample, None)
+    }
+
+    /// [`Self::evaluate`] for an attempt that may give way to the task's
+    /// next copy (one on a Soulseek peer that nobody picked by hand, with
+    /// another attempt left), `give_way_waited` seconds into its
+    /// preferred-quality wait. Still queued with nothing downloaded once
+    /// the wait is over, it gives way before the queued timeout.
+    pub fn evaluate_with(
+        &self,
+        sample: &PollSample,
+        give_way_waited: Option<f64>,
+    ) -> WatchdogOutcome {
         if sample.all_terminal {
             return if sample.all_succeeded {
                 WatchdogOutcome::Completed
@@ -113,6 +134,13 @@ impl Watchdog {
             && sample.elapsed_seconds < self.config.queued_timeout_seconds
         {
             return WatchdogOutcome::MaterializeTimeout;
+        }
+        if give_way_waited
+            .is_some_and(|waited| waited >= self.config.preferred_quality_wait_seconds)
+            && sample.downloaded_bytes == 0
+            && !sample.has_active_transfer
+        {
+            return WatchdogOutcome::GiveWay;
         }
         if sample.has_active_transfer {
             if sample.idle_seconds >= self.config.stall_timeout_seconds {

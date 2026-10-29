@@ -1,84 +1,43 @@
 //! Library HTTP models: request and response DTOs.
 //!
-//! These are the API contract, decoupled from engine internals:
-//! handlers map engine types onto these views explicitly.
+//! An engine type that already is the wire shape goes on the wire as it
+//! is; these views are for the shapes that differ.
 
 use std::collections::HashMap;
 
+use droppedneedle_kernel::page::Page;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 pub use super::operations::ReasonView;
-use crate::identify::models::{JobState as IdentifyJobState, ReviewState};
+use crate::identify::models::{EvidenceClass, ReviewState};
+use crate::identity::DecisionSource;
 use crate::publish::publisher::PublishOutcome;
-use crate::scan::models::{Counters, FailureCode, ScanKind, ScanPhase, ScanState};
+use crate::scan::models::{
+    Counters, EffectivePolicy, FailureCode, RequestedControl, ScanKind, ScanPhase, ScanState,
+    ScanTrigger, Verdict,
+};
 
-/// Snake-case label for a serializable engine enum. Falls back to
-/// `"unknown"` instead of failing the whole response.
-pub fn snake<T: serde::Serialize>(value: &T) -> String {
-    serde_json::to_value(value)
-        .ok()
-        .and_then(|json| json.as_str().map(str::to_owned))
-        .unwrap_or_else(|| "unknown".to_owned())
+/// Which roots a scan run covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AggregateScope {
+    /// Every scheduled root.
+    All,
+    /// Chosen roots or path rules.
+    Selected,
 }
 
-/// One library root.
-#[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct RootView {
-    /// Stable root id.
-    pub id: String,
-    /// Absolute root directory.
-    pub path: String,
-    /// Effective policy: `automatic`, `local_metadata`, `excluded`.
-    pub policy: String,
-}
-
-/// Root registry listing.
-#[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct RootsResponse {
-    /// Configured roots.
-    pub roots: Vec<RootView>,
-    /// Whether the local library is enabled.
-    pub enabled: bool,
-    /// Policy revision of the roots and rules, as the library settings
-    /// show it. Send it back as `expected_policy_revision`.
-    pub policy_revision: String,
-    /// Managed-write bundles not yet settled: cleanup still pending, or
-    /// recovery could not finish (their root is gone or excluded, a file
-    /// operation failed). The background maintenance retries them; their
-    /// tracks take no new managed writes until then.
-    pub held_publish_bundles: Vec<String>,
-}
-
-/// Add a library root. The path must exist and be absolute; the id
-/// defaults to a fresh uuid.
-#[derive(Debug, Clone, Deserialize, ToSchema)]
-pub struct AddRootBody {
-    /// Stable root id (default: fresh id).
-    pub id: Option<String>,
-    /// Absolute root directory.
-    pub path: String,
-    /// Effective policy (default: `automatic`).
-    pub policy: Option<String>,
-}
-
-/// Trigger a scan over one root or every scheduled root.
-#[derive(Debug, Clone, Deserialize, ToSchema)]
-pub struct ScanBody {
-    /// Root id to scan (default: every scheduled root).
-    pub root_id: Option<String>,
-}
-
-/// Scan request answer.
-#[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct ScanResponse {
-    /// Run id (fresh or coalesced).
-    pub run_id: String,
-    /// Request disposition: `started`, `queued`, `coalesced`,
-    /// `expanded`, `conflict`.
-    pub disposition: String,
-    /// Run state after the request.
-    pub state: ScanState,
+impl AggregateScope {
+    /// The stored label: `all`, and anything else as `selected`, as the
+    /// activity feed reads it.
+    pub fn from_stored(label: &str) -> Self {
+        if label == "all" {
+            Self::All
+        } else {
+            Self::Selected
+        }
+    }
 }
 
 /// One scan run.
@@ -89,13 +48,12 @@ pub struct ScanRunView {
     /// Run kind.
     pub kind: ScanKind,
     /// What triggered the run.
-    pub trigger: String,
+    pub trigger: ScanTrigger,
     /// Run state.
     pub state: ScanState,
     /// Current phase.
     pub phase: ScanPhase,
-    /// Scope label: `all` or `selected`.
-    pub aggregate_scope: String,
+    pub aggregate_scope: AggregateScope,
     /// Progress counters.
     pub counters: Counters,
     /// Queue time (unix seconds).
@@ -116,8 +74,8 @@ pub struct ScanRunView {
     pub requested_by_user_id: Option<String>,
     /// Phase a paused run picks up from.
     pub resume_phase: Option<ScanPhase>,
-    /// Pending control: `none`, `pause` or `stop`.
-    pub requested_control: String,
+    /// Pending control.
+    pub requested_control: RequestedControl,
     /// Requests folded into this run.
     pub coalesced_request_count: i64,
     /// Row revision; pause, resume and stop send it back.
@@ -145,7 +103,7 @@ pub struct ScanScopeView {
     /// Path relative to the root.
     pub relative_path: String,
     /// Effective policy for the scope.
-    pub effective_policy: String,
+    pub effective_policy: EffectivePolicy,
 }
 
 /// One discovered file inside a run, with its scan-assigned track id.
@@ -158,7 +116,7 @@ pub struct ScanFileView {
     /// Scan-assigned stable track id, once indexed.
     pub track_id: Option<String>,
     /// Classify verdict.
-    pub verdict: String,
+    pub verdict: Verdict,
 }
 
 /// Run detail: the run, its scopes, and its discovered files.
@@ -170,26 +128,6 @@ pub struct RunDetailResponse {
     pub scopes: Vec<ScanScopeView>,
     /// Discovered files (bounded to the latest 500).
     pub files: Vec<ScanFileView>,
-}
-
-/// Enqueue one album for identification.
-#[derive(Debug, Clone, Deserialize, ToSchema)]
-pub struct IdentifyBody {
-    /// Catalog album id, as `GET /library/albums` lists it.
-    pub album_id: String,
-    /// Job kind: `automatic`, `manual`, `historical` (default: `manual`).
-    pub kind: Option<String>,
-}
-
-/// Enqueue answer.
-#[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct IdentifyResponse {
-    /// Job id.
-    pub job_id: String,
-    /// Local album id.
-    pub album_id: String,
-    /// Job state after enqueue.
-    pub state: IdentifyJobState,
 }
 
 /// One scored candidate inside a review.
@@ -230,8 +168,7 @@ pub struct TrackEvidenceView {
     pub local_track_id: String,
     /// The file's title as the library shows it.
     pub title: String,
-    /// `supported`, `unknown` or `contradictory`.
-    pub classification: String,
+    pub classification: EvidenceClass,
     /// What the verdict rests on (`recording_id`, `title`, `length`, ...).
     pub evidence_kinds: Vec<String>,
 }
@@ -283,19 +220,20 @@ pub struct ReviewView {
     pub updated_ms: i64,
     /// The album's current match was picked by a person.
     pub manual_identity: bool,
+    /// Goes up whenever the review's state, candidates, reason or album
+    /// changes. Every action on the review sends the one it was decided
+    /// on.
+    pub row_revision: i64,
 }
 
-/// One page of reviews.
+/// One page of reviews, with the reviews matching the filter as its
+/// total.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ReviewsResponse {
-    /// Reviews on this page, most recently changed first.
-    pub reviews: Vec<ReviewView>,
-    /// Reviews matching the filter.
-    pub total: u64,
+    #[serde(flatten)]
+    pub page: Page<ReviewView>,
     /// Reviews matching the filter apart from its reason, by reason.
     pub reason_counts: Vec<ReasonCount>,
-    pub limit: u32,
-    pub offset: u32,
 }
 
 /// What a "retry all" started.
@@ -338,9 +276,19 @@ pub struct SkippedReviews {
     pub count: u32,
 }
 
+/// An action on one review, decided on the revision the caller read.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct ReviewActionBody {
+    /// The review's `row_revision` when it was read. A review that changed
+    /// since is refused with `STALE_REVISION`.
+    pub expected_revision: i64,
+}
+
 /// Start identification again from a review.
-#[derive(Debug, Clone, Default, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct ReviewRetryBody {
+    /// The review's `row_revision` when it was read.
+    pub expected_revision: i64,
     /// Makes a retried request return the same job (single review only).
     #[serde(default)]
     pub idempotency_key: Option<String>,
@@ -355,6 +303,8 @@ pub struct ReviewRetryBody {
 pub struct ApproveBody {
     /// Candidate key from the review.
     pub candidate_key: String,
+    /// The review's `row_revision` when it was read.
+    pub expected_revision: i64,
 }
 
 /// Sealed identity after a review resolves.
@@ -364,8 +314,8 @@ pub struct IdentityView {
     pub release_mbid: Option<String>,
     /// Release-group MBID, when sealed.
     pub release_group_mbid: Option<String>,
-    /// Who decided: `automatic`, `manual`, `legacy_import`.
-    pub decision_source: String,
+    /// Who decided.
+    pub decision_source: DecisionSource,
 }
 
 /// Review resolution answer.
@@ -375,117 +325,6 @@ pub struct ReviewResolveResponse {
     pub review: ReviewView,
     /// Sealed identity (approvals only).
     pub identity: Option<IdentityView>,
-}
-
-/// One file inside a management preview.
-#[derive(Debug, Clone, Deserialize, ToSchema)]
-pub struct ManageItemBody {
-    /// Source root id.
-    pub root_id: String,
-    /// Source path relative to the root.
-    pub rel_path: String,
-    /// Destination path relative to the root (organize only;
-    /// retag writes in place).
-    pub dest_rel: Option<String>,
-    /// Managed-field updates by Picard tag-set name: `title`,
-    /// `title_sort`, `artist`, `artists`, `artist_sort`, `album`,
-    /// `album_sort`, `album_artist`, `album_artist_sort`, `genre`,
-    /// `compilation` (`1` or `0`), `track_number`, `total_tracks`,
-    /// `disc_number`, `total_discs`, `disc_subtitle`, `date`, `original_date`,
-    /// `release_status`, `release_country`, `release_type`, `media`,
-    /// `label`, `catalog_number`, `barcode`, `asin`, and the
-    /// `musicbrainz_*` ids (`recording`, `release_track`, `release`,
-    /// `release_group`, `artist`, `album_artist`). A retag also writes
-    /// the full set from the album's identified release; these win.
-    pub managed_updates: HashMap<String, Vec<String>>,
-}
-
-/// Build a sealed management preview. Identity always resolves from
-/// the accepted identify rows for `album_id`; tracks without an
-/// accepted exact mapping block the preview loudly.
-#[derive(Debug, Clone, Deserialize, ToSchema)]
-pub struct ManagePreviewBody {
-    /// `retag` (same-path write) or `organize` (move).
-    pub kind: String,
-    /// Local album id carrying the accepted identity.
-    pub album_id: String,
-    /// Files in the bundle.
-    pub items: Vec<ManageItemBody>,
-}
-
-/// One planned file inside a preview.
-#[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct ManageFileView {
-    /// Stable local track id.
-    pub track_id: String,
-    /// Source `root/rel`.
-    pub source: String,
-    /// Destination `root/rel`.
-    pub dest: String,
-    /// `same_path` or `move`.
-    pub kind: String,
-    /// For a retag, the tags the write changes, in display order: album,
-    /// album artist, title, artist, track, disc, date, label, catalog
-    /// number, barcode, then `musicbrainz_ids`. Unchanged tags are left
-    /// out. Empty for a move.
-    pub changes: Vec<ManageTagChange>,
-}
-
-/// One tag a retag would change.
-#[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct ManageTagChange {
-    /// Tag field name (`album`, `track_number`, ...), or `musicbrainz_ids`
-    /// for every MusicBrainz id field together.
-    pub field: String,
-    /// The file's value now, several values joined with "; "; null when
-    /// absent. Always null for `musicbrainz_ids`.
-    pub from: Option<String>,
-    /// The value after the write; null when the write removes the tag.
-    /// For `musicbrainz_ids`, how many id fields change and stay, such as
-    /// "4 changed, 2 kept".
-    pub to: Option<String>,
-}
-
-/// Sealed preview answer. The token is single-use and short-lived.
-#[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct ManagePreviewResponse {
-    /// Single-use confirmation token.
-    pub preview_token: String,
-    /// Expiry day (unix day, exclusive).
-    pub expires_day: i64,
-    /// Bundle id the apply will publish under.
-    pub bundle_id: String,
-    /// Planned files.
-    pub files: Vec<ManageFileView>,
-}
-
-/// Apply a sealed preview.
-#[derive(Debug, Clone, Deserialize, ToSchema)]
-pub struct ManageApplyBody {
-    /// Preview token from the preview answer.
-    pub preview_token: String,
-}
-
-/// One applied file.
-#[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct ManageAppliedFile {
-    /// Stable local track id.
-    pub track_id: String,
-    /// Adopted root id.
-    pub root_id: String,
-    /// Adopted path relative to the root.
-    pub rel_path: String,
-}
-
-/// Apply answer.
-#[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct ManageApplyResponse {
-    /// Published bundle id.
-    pub bundle_id: String,
-    /// Whether cleanup finished.
-    pub outcome: PublishOutcome,
-    /// Applied files.
-    pub files: Vec<ManageAppliedFile>,
 }
 
 /// Undo one published bundle as a new previewed operation.
@@ -512,9 +351,9 @@ pub struct ManageUndoResponse {
 pub struct PluginFilesQuery {
     /// Plugin name.
     pub plugin: String,
-    /// Cursor from the previous page.
+    /// `next_cursor` from the previous page.
     pub cursor: Option<String>,
-    /// Files per page, 1 to 100 (default 50).
+    /// Files per page, 1 to 100 (default 50); more is read as 100.
     pub limit: Option<u32>,
 }
 
@@ -542,30 +381,4 @@ pub struct PluginFileView {
     /// When it was added, in unix milliseconds.
     pub added_at: i64,
     pub state: PluginFileState,
-}
-
-/// A page of a plugin's files, newest first.
-#[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct PluginFilesPage {
-    pub items: Vec<PluginFileView>,
-    /// Cursor for the next page, when there is one.
-    pub next_cursor: Option<String>,
-}
-
-/// Restore tracks to their immutable first-management baselines.
-#[derive(Debug, Clone, Deserialize, ToSchema)]
-pub struct BaselineRestoreBody {
-    /// Track ids to restore.
-    pub track_ids: Vec<String>,
-}
-
-/// Baseline restore answer.
-#[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct BaselineRestoreResponse {
-    /// Restore operation bundle id.
-    pub bundle_id: String,
-    /// Whether cleanup finished.
-    pub outcome: PublishOutcome,
-    /// Restored track ids.
-    pub restored: Vec<String>,
 }

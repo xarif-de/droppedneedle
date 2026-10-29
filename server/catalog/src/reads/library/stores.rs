@@ -167,6 +167,9 @@ pub struct AlbumRecord {
     pub is_compilation: bool,
     /// True when an artwork row exists.
     pub cover_available: bool,
+    /// The version of the album's own art (a folder image or an embedded
+    /// picture), when it has some. It goes up when the art changes.
+    pub art_version: Option<i64>,
     /// Import time, unix seconds.
     pub date_added: Option<f64>,
     /// The album's open MusicBrainz contribution, if any.
@@ -398,8 +401,8 @@ pub struct LyricDoc {
 
 /// Lyrics reads for one track.
 ///
-/// Production serves the lyrics the track's file carries first
-/// ([`super::file_lyrics::FileLyrics`]) and the provider fetch behind it.
+/// Production serves [`crate::reads::lyrics::LyricsService`]: the lyrics
+/// the track's file carries first, then the online lookup.
 /// None is absence (the handler answers 404), never failure.
 pub trait LyricsPort: Send + Sync {
     /// Stored lyrics for one streamable track id.

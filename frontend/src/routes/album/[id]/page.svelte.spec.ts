@@ -23,6 +23,7 @@ import AlbumPage from './ProviderAlbumPage.svelte';
 import AlbumRoute from './+page.svelte';
 import { authStore } from '$lib/stores/authStore.svelte';
 import { integrationStore } from '$lib/stores/integration';
+import { libraryStore } from '$lib/stores/library';
 import { toAuthUser } from '$lib/queries/auth/types';
 
 const albumId = '3f3a6d95-326e-4384-80b0-0744f20f24ff';
@@ -32,6 +33,7 @@ type Basic = RouteData<'GET /api/v3/albums/{album_id}/basic'>;
 type Status = RouteData<'GET /api/v3/library/albums/{id}/status'>;
 type Plan = RouteData<'GET /api/v3/library/albums/{album_id}/edition/plan'>;
 type History = RouteData<'GET /api/v3/library/albums/{album_id}/history'>;
+type Fetch = RouteData<'GET /api/v3/albums/{album_id}/edition/acquire'>['latest'];
 type LocalTrack = RouteData<'GET /api/v3/library/albums/{id}/tracks'>['items'][number];
 
 // [disc, position, title, length in ms]
@@ -98,12 +100,13 @@ function localAlbum(): RouteData<'GET /api/v3/library/albums/{id}'> {
 }
 
 function removed(id: string): RouteData<'DELETE /api/v3/library/tracks/{id}'> {
-	return { id, removed_track_ids: [id], success: true };
+	return { id, removed_track_ids: [id] };
 }
 
 let status: (id: string) => Status;
 let plan: Plan | null;
 let history: History;
+let editionFetch: Fetch;
 let api: FakeApi;
 
 function routes(): FakeApi {
@@ -185,6 +188,7 @@ function routes(): FakeApi {
 		'GET /api/v3/library/albums/{album_id}/edition/plan': () =>
 			plan ?? apiError(404, 'NOT_FOUND', 'No edition chosen'),
 		'GET /api/v3/library/albums/{album_id}/history': () => history,
+		'GET /api/v3/albums/{album_id}/edition/acquire': () => ({ latest: editionFetch }),
 		'GET /api/v3/albums/{album_id}/lastfm': { listeners: 0, playcount: 0, tags: [] },
 		'GET /api/v3/albums/{album_id}/plugin-details': { links: [], tags: [] },
 		'GET /api/v3/albums/{album_id}/purchase-options': {
@@ -232,6 +236,7 @@ beforeEach(() => {
 	status = notHeld;
 	plan = null;
 	history = { items: [] };
+	editionFetch = null;
 	integrationStore.reset();
 	integrationStore.setStatus({ navidrome: true, localfiles: true, library: true });
 	signIn('admin');
@@ -346,6 +351,121 @@ describe('matched album edition controls', () => {
 	});
 });
 
+describe('choosing the edition to request', () => {
+	const requestRoute = 'POST /api/v3/requests/albums' as const;
+
+	// A request marks the album requested in the shared library store.
+	beforeEach(() => libraryStore.removeMbid(albumId));
+
+	function editions(): void {
+		api.use({
+			'GET /api/v3/albums/{album_id}/editions': {
+				items: [
+					{
+						release_mbid: 'release-remaster',
+						disambiguation: 'remaster',
+						date: '2012-02-21',
+						country: 'US',
+						track_count: 4,
+						is_owned: false,
+						is_pinned: false
+					},
+					{
+						release_mbid: 'release-deluxe',
+						disambiguation: 'deluxe',
+						date: '2013-05-01',
+						country: 'GB',
+						track_count: 2,
+						is_owned: false,
+						is_pinned: false
+					}
+				]
+			},
+			'GET /api/v3/albums/{album_id}/editions/{release_mbid}/tracks': {
+				tracks: [
+					{ disc_number: 1, position: 1, title: 'Ambrosia', length: 213093 },
+					{ disc_number: 1, position: 2, title: 'Circumambient', length: 223280 }
+				],
+				total_tracks: 2
+			},
+			'GET /api/v3/requests/active': { count: 0, items: [] },
+			'GET /api/v3/downloads/tasks': { items: [], page: 1, page_size: 100 },
+			'GET /api/v3/albums/{album_id}/basic': ({ params }) => ({
+				...basic(params.album_id),
+				in_library: false
+			}),
+			[requestRoute]: {
+				success: true,
+				message: 'Request accepted',
+				musicbrainz_id: albumId,
+				status: 'pending'
+			}
+		});
+	}
+
+	it('requests the edition a curator picked', async () => {
+		editions();
+		await renderPage();
+
+		await page.getByRole('button', { name: /^To get: Remaster\./ }).click();
+		const sheet = page.getByRole('dialog');
+		await sheet.getByRole('button', { name: /Deluxe/ }).click();
+		await expect.element(sheet.getByText('Circumambient')).toBeVisible();
+		await sheet.getByRole('button', { name: 'Choose this edition' }).first().click();
+		await expect.element(sheet).not.toBeInTheDocument();
+		await page.getByRole('button', { name: 'Add to Library' }).click();
+
+		await vi.waitFor(() => expect(api.calls(requestRoute)).toHaveLength(1));
+		expect(api.calls(requestRoute)[0].body).toMatchObject({
+			musicbrainz_id: albumId,
+			release_mbid: 'release-deluxe'
+		});
+	});
+
+	it('names the edition on its way once the download has started', async () => {
+		editions();
+		api.use({
+			'GET /api/v3/albums/{album_id}/basic': ({ params }) => ({
+				...basic(params.album_id),
+				in_library: false,
+				requested: true
+			}),
+			'GET /api/v3/requests/active': {
+				count: 1,
+				items: [
+					{
+						musicbrainz_id: albumId,
+						artist_name: 'Lumen',
+						album_title: 'Daylight Hours',
+						requested_at: 1,
+						status: 'downloading',
+						request_kind: 'album',
+						origin: 'user',
+						requester_count: 1,
+						task_id: 'task-1',
+						release_mbid: 'release-deluxe'
+					}
+				]
+			}
+		});
+		await renderPage();
+
+		await expect.element(page.getByRole('group', { name: 'Downloading: Deluxe.' })).toBeVisible();
+		await expect
+			.element(page.getByRole('button', { name: /^Downloading:/ }))
+			.not.toBeInTheDocument();
+	});
+
+	it('shows a plain user no picker', async () => {
+		editions();
+		signIn('user');
+		await renderPage();
+
+		await expect.element(page.getByRole('button', { name: 'Add to Library' })).toBeVisible();
+		await expect.element(page.getByRole('button', { name: /^To get:/ })).not.toBeInTheDocument();
+	});
+});
+
 describe('the page agrees with the edition', () => {
 	// After choosing the remaster: Circumambient's file is another version
 	// (3:30 against the edition's 3:43), the others sit on their tracks.
@@ -421,6 +541,24 @@ describe('the page agrees with the edition', () => {
 				.toBeVisible();
 		});
 	}
+
+	it('says which missing tracks an edition fetch is getting, and which it failed to get', async () => {
+		chooseRemaster();
+		editionFetch = {
+			task_id: 'task-1',
+			release_mbid: 'release-remaster',
+			state: 'failed',
+			tracks: [{ disc: 1, position: 5, state: 'failed' }],
+			replace_versions: true,
+			can_retry: true,
+			can_stop: false
+		};
+		await renderPage();
+
+		const missing = trackRow('Circumambient');
+		await expect.element(missing.getByText('Failed', { exact: true })).toBeVisible();
+		await expect.element(missing.getByText('Missing', { exact: true })).not.toBeInTheDocument();
+	});
 
 	it("shows a file's note on its row", async () => {
 		chooseRemaster();

@@ -26,7 +26,9 @@
 //! - `GET /library/unconfirmed`: albums whose match waits for a look.
 //!
 //! Changing an edition is for curators (admins and trusted users), as
-//! pinning was; reading is open to every signed-in user.
+//! pinning was; reading is open to every signed-in user. Every change sends
+//! the `identity_revision` the page read, and one read before the edition
+//! moved is refused with `STALE_REVISION`.
 
 use axum::{
     Json,
@@ -35,12 +37,14 @@ use axum::{
 use droppedneedle_kernel::error::ApiError;
 use droppedneedle_kernel::extract::{ValidJson, ValidQuery};
 use droppedneedle_kernel::mount::{Routes, routes};
+use droppedneedle_kernel::page::{Page, PageRequest};
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 
+use super::blocking;
 use super::error::refused;
 use super::models::PenaltyView;
-use super::operations::{ReasonView, blocking};
+use super::operations::ReasonView;
 use crate::identify::models::CandidateEvidence;
 use crate::jobs::{ManagementPhase, OperationState};
 use crate::management::automatic::AutomaticWrites;
@@ -57,7 +61,7 @@ use crate::wiring::LibraryServices;
 use droppedneedle_auth::{Admin, Curator, User};
 
 /// Largest page of the unconfirmed list.
-const PAGE_MAX: u32 = 200;
+const PAGE_MAX: usize = 200;
 
 /// Edition routes.
 pub fn routes() -> Routes<LibraryServices> {
@@ -196,6 +200,23 @@ impl EditionStatusView {
 pub struct ChooseEditionBody {
     /// Any MusicBrainz release, from this album's release group or another.
     pub release_mbid: String,
+    /// The `identity_revision` the edition status showed.
+    pub expected_identity_revision: i64,
+}
+
+/// The edition revision a change was decided on.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct EditionRevisionBody {
+    /// The `identity_revision` the edition status showed.
+    pub expected_identity_revision: i64,
+}
+
+/// The edition revision a removal was decided on.
+#[derive(Debug, Clone, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct EditionRevisionQuery {
+    /// The `identity_revision` the edition status or plan showed.
+    pub expected_identity_revision: i64,
 }
 
 /// A file a retag would rewrite to the chosen edition's tags.
@@ -253,12 +274,8 @@ pub struct EditionPlanFileView {
     pub track_number: u32,
     /// The file's length, when the scan read it.
     pub length_ms: Option<u64>,
-    /// `keep` (sits on its own edition track), `duplicate` (another copy
-    /// of a song the edition already has a file for), `other_version`
-    /// (the same title and artist as an edition track no file holds, but
-    /// not placed on it; that track still counts as missing) or `extra`
-    /// (the edition has no track for it). Choosing never deletes a file.
-    pub fate: String,
+    /// An `other_version` file's edition track still counts as missing.
+    pub fate: FileFate,
     /// The edition track the file keeps, duplicates or is another version
     /// of.
     pub edition_disc_number: Option<u32>,
@@ -397,7 +414,7 @@ impl From<PlanReading> for EditionPlanView {
                     disc_number: file.disc,
                     track_number: file.track,
                     length_ms: file.length_ms,
-                    fate: file.fate.as_str().to_owned(),
+                    fate: file.fate,
                     edition_disc_number: file.edition_track.map(|(disc, _)| disc),
                     edition_position: file.edition_track.map(|(_, position)| position),
                     note: file.note.map(ReasonView::from),
@@ -407,14 +424,27 @@ impl From<PlanReading> for EditionPlanView {
     }
 }
 
+/// Which albums the unconfirmed list shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WaitingState {
+    /// Matched by a guess nobody confirmed.
+    Unconfirmed,
+    /// Not matched at all.
+    Unmatched,
+}
+
 /// Paging for the unconfirmed list.
 #[derive(Debug, Clone, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct UnconfirmedQuery {
-    /// `unconfirmed` (default) or `unmatched`.
-    pub state: Option<String>,
+    /// Default: `unconfirmed`.
+    #[param(inline)]
+    pub state: Option<WaitingState>,
+    /// Page size, 1 to 200 (default 50); more is read as 200.
     pub limit: Option<u32>,
-    pub offset: Option<u32>,
+    /// `next_cursor` from the previous page.
+    pub cursor: Option<String>,
 }
 
 /// One album whose match waits for a look.
@@ -429,6 +459,9 @@ pub struct WaitingAlbumView {
     pub release_group_mbid: Option<String>,
     pub reason: ReasonView,
     pub updated_at: f64,
+    /// The identity's row revision, 0 when the album has none. "Looks
+    /// right" echoes it.
+    pub identity_revision: i64,
 }
 
 impl From<WaitingAlbum> for WaitingAlbumView {
@@ -442,17 +475,9 @@ impl From<WaitingAlbum> for WaitingAlbumView {
             release_group_mbid: album.release_group_mbid,
             reason: album.reason.into(),
             updated_at: album.updated_at,
+            identity_revision: album.identity_revision,
         }
     }
-}
-
-/// One page of albums waiting for a look.
-#[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct WaitingAlbumsResponse {
-    pub items: Vec<WaitingAlbumView>,
-    pub total: u64,
-    pub limit: u32,
-    pub offset: u32,
 }
 
 fn read_status(
@@ -517,6 +542,7 @@ pub async fn get_edition(
         (status = 401, description = "Not authenticated"),
         (status = 403, description = "Curator role required"),
         (status = 404, description = "Unknown album, or MusicBrainz does not know the release"),
+        (status = 409, description = "The album's edition changed since it was read (STALE_REVISION)"),
         (status = 503, description = "MusicBrainz is not answering"),
     )
 )]
@@ -528,7 +554,12 @@ pub async fn choose_edition(
 ) -> Result<Json<EditionChoiceView>, ApiError> {
     let ops = services.operations.clone();
     let choice: EditionChoice = ops
-        .choose_edition(&album_id, &body.release_mbid, Some(caller.user_id()))
+        .choose_edition(
+            &album_id,
+            &body.release_mbid,
+            body.expected_identity_revision,
+            Some(caller.user_id()),
+        )
         .await?;
     let status = status_of(&services, &album_id).await?;
     Ok(Json(EditionChoiceView {
@@ -556,22 +587,26 @@ pub async fn choose_edition(
     delete,
     tag = "library management",
     path = "/api/v3/library/albums/{album_id}/edition",
-    params(("album_id" = String, Path, description = "Local album id")),
+    params(("album_id" = String, Path, description = "Local album id"), EditionRevisionQuery),
     responses(
         (status = 200, description = "The album's edition, identification queued", body = EditionStatusView),
+        (status = 400, description = "No revision given"),
         (status = 401, description = "Not authenticated"),
         (status = 403, description = "Curator role required"),
         (status = 404, description = "Unknown album"),
+        (status = 409, description = "The album's edition changed since it was read (STALE_REVISION)"),
     )
 )]
 pub async fn hand_back_edition(
     State(services): State<LibraryServices>,
     caller: Curator,
     Path(album_id): Path<String>,
+    ValidQuery(query): ValidQuery<EditionRevisionQuery>,
 ) -> Result<Json<EditionStatusView>, ApiError> {
     let ops = services.operations.clone();
     let (album, user) = (album_id.clone(), caller.user_id().to_owned());
-    blocking(move || ops.hand_back_edition(&album, &user)).await?;
+    let expected = query.expected_identity_revision;
+    blocking(move || ops.hand_back_edition(&album, expected, &user)).await?;
     Ok(Json(status_of(&services, &album_id).await?))
 }
 
@@ -581,22 +616,25 @@ pub async fn hand_back_edition(
     tag = "library management",
     path = "/api/v3/library/albums/{album_id}/edition/confirm",
     params(("album_id" = String, Path, description = "Local album id")),
+    request_body = EditionRevisionBody,
     responses(
         (status = 200, description = "The album's edition", body = EditionStatusView),
         (status = 401, description = "Not authenticated"),
         (status = 403, description = "Curator role required"),
         (status = 404, description = "Unknown album"),
-        (status = 409, description = "Nothing waits for confirmation"),
+        (status = 409, description = "Nothing waits for confirmation, or the edition changed since it was read (STALE_REVISION)"),
     )
 )]
 pub async fn confirm_edition(
     State(services): State<LibraryServices>,
     caller: Curator,
     Path(album_id): Path<String>,
+    ValidJson(body): ValidJson<EditionRevisionBody>,
 ) -> Result<Json<EditionStatusView>, ApiError> {
     let ops = services.operations.clone();
     let (album, user) = (album_id.clone(), caller.user_id().to_owned());
-    blocking(move || ops.confirm_match(&album, &user)).await?;
+    let expected = body.expected_identity_revision;
+    blocking(move || ops.confirm_match(&album, expected, &user)).await?;
     Ok(Json(status_of(&services, &album_id).await?))
 }
 
@@ -606,22 +644,25 @@ pub async fn confirm_edition(
     tag = "library management",
     path = "/api/v3/library/albums/{album_id}/edition/undo",
     params(("album_id" = String, Path, description = "Local album id")),
+    request_body = EditionRevisionBody,
     responses(
         (status = 200, description = "The album's edition", body = EditionStatusView),
         (status = 401, description = "Not authenticated"),
         (status = 403, description = "Curator role required"),
         (status = 404, description = "No change to take back"),
-        (status = 409, description = "The edition changed again since"),
+        (status = 409, description = "The edition changed since it was read, or again since the change (STALE_REVISION)"),
     )
 )]
 pub async fn undo_edition(
     State(services): State<LibraryServices>,
     caller: Curator,
     Path(album_id): Path<String>,
+    ValidJson(body): ValidJson<EditionRevisionBody>,
 ) -> Result<Json<EditionStatusView>, ApiError> {
     let ops = services.operations.clone();
     let (album, user) = (album_id.clone(), caller.user_id().to_owned());
-    blocking(move || ops.undo_edition_choice(&album, &user)).await?;
+    let expected = body.expected_identity_revision;
+    blocking(move || ops.undo_edition_choice(&album, expected, &user)).await?;
     Ok(Json(status_of(&services, &album_id).await?))
 }
 
@@ -806,23 +847,27 @@ pub async fn match_edition_file(
     params(
         ("album_id" = String, Path, description = "Local album id"),
         ("track_id" = String, Path, description = "Local track id of the file"),
+        EditionRevisionQuery,
     ),
     responses(
         (status = 200, description = "The album's edition", body = EditionStatusView),
+        (status = 400, description = "No revision given"),
         (status = 401, description = "Not authenticated"),
         (status = 403, description = "Curator role required"),
         (status = 404, description = "Unknown album, not one of its files, or no match to undo"),
-        (status = 409, description = "The match changed since (STALE_REVISION), or the app has written the file since"),
+        (status = 409, description = "The edition or the match changed since (STALE_REVISION), or the app has written the file since"),
     )
 )]
 pub async fn unmatch_edition_file(
     State(services): State<LibraryServices>,
     caller: Curator,
     Path((album_id, track_id)): Path<(String, String)>,
+    ValidQuery(query): ValidQuery<EditionRevisionQuery>,
 ) -> Result<Json<EditionStatusView>, ApiError> {
     let ops = services.operations.clone();
     let (album, track, user) = (album_id.clone(), track_id, caller.user_id().to_owned());
-    blocking(move || ops.unmatch_file(&album, &track, &user)).await?;
+    let expected = query.expected_identity_revision;
+    blocking(move || ops.unmatch_file(&album, &track, expected, &user)).await?;
     Ok(Json(status_of(&services, &album_id).await?))
 }
 
@@ -831,6 +876,8 @@ pub async fn unmatch_edition_file(
 pub struct RemoveExtrasBody {
     /// Local track ids the album's edition plan marks anything but `keep`.
     pub track_ids: Vec<String>,
+    /// The `identity_revision` the edition plan showed.
+    pub expected_identity_revision: i64,
 }
 
 /// What removing extras did.
@@ -855,7 +902,7 @@ pub struct RemoveExtrasView {
         (status = 401, description = "Not authenticated"),
         (status = 403, description = "Curator role required"),
         (status = 404, description = "Unknown album or track"),
-        (status = 409, description = "Library busy or a file is outside the library folders"),
+        (status = 409, description = "The edition changed since the plan was read (STALE_REVISION), the library is busy, or a file is outside the library folders"),
         (status = 422, description = "A file could not be recycled; nothing changed"),
         (status = 503, description = "MusicBrainz is not answering"),
     )
@@ -867,7 +914,12 @@ pub async fn remove_extras(
     ValidJson(body): ValidJson<RemoveExtrasBody>,
 ) -> Result<Json<RemoveExtrasView>, ApiError> {
     let removed = mutations
-        .remove_extras(&album_id, body.track_ids, caller.user_id())
+        .remove_extras(
+            &album_id,
+            body.track_ids,
+            body.expected_identity_revision,
+            caller.user_id(),
+        )
         .await
         .map_err(|error| match error {
             ExtrasError::Plan(error) => ApiError::from(error),
@@ -886,8 +938,8 @@ pub async fn remove_extras(
     path = "/api/v3/library/unconfirmed",
     params(UnconfirmedQuery),
     responses(
-        (status = 200, description = "One page of albums", body = WaitingAlbumsResponse),
-        (status = 400, description = "Unknown state"),
+        (status = 200, description = "One page of albums", body = Page<WaitingAlbumView>),
+        (status = 400, description = "Unknown state or bad cursor"),
         (status = 401, description = "Not authenticated"),
     )
 )]
@@ -895,25 +947,18 @@ pub async fn list_unconfirmed(
     State(ops): State<Operations>,
     _caller: User,
     ValidQuery(query): ValidQuery<UnconfirmedQuery>,
-) -> Result<Json<WaitingAlbumsResponse>, ApiError> {
-    let unmatched = match query.state.as_deref() {
-        None | Some("unconfirmed") => false,
-        Some("unmatched") => true,
-        Some(_) => {
-            return Err(ApiError::invalid_input(
-                "state must be unconfirmed or unmatched",
-            ));
-        }
-    };
-    let limit = query.limit.unwrap_or(50).clamp(1, PAGE_MAX);
-    let offset = query.offset.unwrap_or(0);
+) -> Result<Json<Page<WaitingAlbumView>>, ApiError> {
+    let unmatched = query.state == Some(WaitingState::Unmatched);
+    let paging = PageRequest::<u32>::read(query.limit, query.cursor.as_deref(), 50, PAGE_MAX)?;
+    let (limit, offset) = (paging.limit as u32, paging.after.unwrap_or(0));
     let (items, total) = blocking(move || ops.waiting_albums(unmatched, limit, offset)).await?;
-    Ok(Json(WaitingAlbumsResponse {
-        items: items.into_iter().map(Into::into).collect(),
+    let items = items.into_iter().map(Into::into).collect();
+    Ok(Json(Page::at_offset(
+        items,
+        offset.into(),
+        limit.into(),
         total,
-        limit,
-        offset,
-    }))
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -1119,7 +1164,7 @@ impl From<EditionTagsJob> for EditionTagsJobView {
     fn from(found: EditionTagsJob) -> Self {
         let detail = found.detail;
         let job = &detail.job;
-        let step = match (job.state, ManagementPhase::parse(&detail.phase)) {
+        let step = match (job.state, Some(detail.phase)) {
             (OperationState::Succeeded, _) => EditionTagsStep::Done,
             (OperationState::Failed | OperationState::Cancelled | OperationState::Stopped, _) => {
                 EditionTagsStep::Failed

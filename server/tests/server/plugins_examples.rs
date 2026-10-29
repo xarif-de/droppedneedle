@@ -13,7 +13,8 @@ use droppedneedle_kernel::runtime_config::crypto::Crypto;
 use droppedneedle_plugins::capabilities::acquisition::PluginEnqueue;
 use droppedneedle_plugins::capabilities::stream::PluginStream;
 use droppedneedle_plugins::host::PluginHost;
-use droppedneedle_plugins::manifest::load_manifest;
+use droppedneedle_plugins::manifest::{load_manifest, parse_manifest};
+use droppedneedle_plugins::models::{PluginHealthStatus, PluginSource, PluginSourceHealth};
 use droppedneedle_plugins::process::ProcessLauncher;
 use droppedneedle_plugins::runtime::{
     DownloadTaskEvent, EventKind, EventPayload, PluginEvent, RuntimeState, ScrobbleEvent,
@@ -77,9 +78,7 @@ async fn rig(tag: &str, examples: &[&str]) -> Rig {
         dir.join("plugins"),
         config,
         Arc::new(launcher),
-        Arc::new(droppedneedle_plugins::ticks::TickStoreKind::Memory(
-            droppedneedle_kernel::jobs::plugin_ticks::MemoryTickStore::new(),
-        )),
+        droppedneedle_plugins::wiring::tick_store(&platform),
         library,
     );
     host.load_all();
@@ -135,6 +134,26 @@ fn every_example_manifest_validates() {
             "webhook-scrobbler",
         ]
     );
+}
+
+/// A manifest written for an older plugin API is refused before any of its
+/// code runs, and the message says where the porting guide is.
+#[test]
+fn manifests_for_older_plugin_apis_are_refused() {
+    for version in [0, 1] {
+        let text = format!(
+            "[plugin]\nname = \"old-toy\"\napi_version = {version}\n\
+             entrypoint = \"plugin:Toy\"\ncapabilities = [\"scrobbler\"]\n"
+        );
+        let error = parse_manifest("old-toy", text.as_bytes()).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "old-toy: written for api_version {version}; this DroppedNeedle reads \
+                 api_version 2; see Porting a v2 plugin in PLUGINS.md"
+            )
+        );
+    }
 }
 
 /// One-request HTTP server: answers 200 and hands back the request.
@@ -342,10 +361,38 @@ async fn scheduler_ticks_and_reports_health() {
         .fire_tick("http-catalog", Duration::from_secs(10))
         .await
         .unwrap();
-    let plugin = rig.host.get("http-catalog").unwrap();
-    let health = rig.host.plugin_health(&plugin).await;
-    assert_eq!(health.status, "error");
-    assert!(!health.configured);
+
+    // The plugin is asked once it runs, and the source list shows its answer.
+    let source = wait_for_source(&rig, |source| source.health != PluginSourceHealth::Unknown).await;
+    assert_eq!(source.health, PluginSourceHealth::Error);
+    assert!(!source.configured);
+    assert_eq!(source.health_message, "catalog_url is not configured");
+
+    // A settings save asks again.
+    let (url, served) = capture_one_request().await;
+    rig.host
+        .update_settings(
+            "http-catalog",
+            true,
+            HashMap::from([("catalog_url".to_owned(), url)]),
+        )
+        .unwrap();
+    let source = wait_for_source(&rig, |source| source.configured).await;
+    assert_eq!(source.health, PluginSourceHealth::Ok);
+    assert!(served.await.unwrap().starts_with("HEAD /hook"));
+    let health = rig.host.get("http-catalog").unwrap().health().unwrap();
+    assert_eq!(health.status, PluginHealthStatus::Ok);
+}
+
+/// Wait until the one plugin source matches `done`.
+async fn wait_for_source(rig: &Rig, done: impl Fn(&PluginSource) -> bool) -> PluginSource {
+    for _ in 0..400 {
+        if let Some(source) = rig.host.plugin_sources().into_iter().find(|s| done(s)) {
+            return source;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("the source never matched: {:?}", rig.host.plugin_sources());
 }
 
 #[tokio::test]
@@ -370,7 +417,7 @@ async fn streaming_source_resolves_inside_its_own_folder() {
 
 const PROBE_MANIFEST: &str = "[plugin]\n\
      name = \"probe\"\n\
-     api_version = 1\n\
+     api_version = 2\n\
      entrypoint = \"plugin:Probe\"\n\
      capabilities = [\"scheduler\", \"purchase_links\"]\n\
      [schedule]\n\

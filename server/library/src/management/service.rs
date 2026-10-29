@@ -28,6 +28,7 @@ use crate::publish::publisher::read_revision;
 use crate::publish::{JournalStore, snapshots::sha256_hex};
 use crate::scan::roots::RootRegistry;
 use crate::wiring::LibrarySetup;
+use droppedneedle_kernel::page::TimeKey;
 use droppedneedle_kernel::runtime_config::sections::{
     LibraryManagement, LibraryManagementRootOverrides,
 };
@@ -80,6 +81,11 @@ pub struct Management {
     /// job back to the queue between albums.
     shutdown: Option<droppedneedle_kernel::jobs::CancellationToken>,
 }
+
+/// The reason a file is left out of an undo or a restore whose saved copy
+/// is missing or damaged. It is the one block that does not hold the rest
+/// of its bundle back.
+pub(super) const UNDO_COPY_MISSING: &str = "UNDO_COPY_MISSING";
 
 pub(super) fn stale(message: &str) -> ManagementError {
     ManagementError::Conflict(message.to_owned())
@@ -173,6 +179,7 @@ impl Management {
         message: &str,
     ) -> Result<RootRegistry, ManagementError> {
         self.setup
+            .core
             .registry_at(expected)
             .map_err(|error| ManagementError::Store(error.to_string()))?
             .ok_or_else(|| stale(message))
@@ -356,7 +363,7 @@ impl Management {
             }
             None => found.push("Library Management settings could not be read.".to_owned()),
         }
-        if self.setup.live_registry().policy_revision() != snapshot.policy_revision {
+        if self.setup.core.live_registry().policy_revision() != snapshot.policy_revision {
             found.push(
                 "The library folders or their rules changed after this preview was made."
                     .to_owned(),
@@ -408,7 +415,7 @@ impl Management {
             selection: serde_json::from_str(&snapshot.selection_json).unwrap_or_default(),
             mode: snapshot.mode,
             origin: snapshot.origin,
-            phase: snapshot.phase.as_str().to_owned(),
+            phase: snapshot.phase,
             profile_id,
             profile_name,
             profile_revision: snapshot.profile_revision,
@@ -477,11 +484,7 @@ impl Management {
             .setup
             .db
             .read_blocking("management.preview_artwork", |conn| {
-                Ok::<_, ManagementError>(
-                    crate::publish::snapshots::BlobStore::new(conn)
-                        .get(sha256)
-                        .ok(),
-                )
+                Ok::<_, ManagementError>(self.setup.core.blobs.get(conn, sha256).ok())
             })?
             .ok_or(ManagementError::NotFound(
                 "That artwork is no longer kept; make a new preview.",
@@ -905,7 +908,7 @@ impl Management {
     pub fn history(
         &self,
         mut filter: HistoryFilter,
-    ) -> Result<(Vec<HistoryItem>, Option<String>), ManagementError> {
+    ) -> Result<(Vec<HistoryItem>, Option<TimeKey>), ManagementError> {
         // No limit means a full page.
         filter.limit = if filter.limit <= 0 {
             HISTORY_MAX
@@ -1168,7 +1171,11 @@ impl Management {
             // the preview then.
             tracing::warn!(%error, job_id, "automatic management apply waits: the database is busy");
             for album in &albums {
-                self.setup.queue_automatic_management(album);
+                super::automatic::queue_automatic_management(
+                    &self.setup.db,
+                    &*self.setup.clock,
+                    album,
+                );
             }
         }
         Ok(())
@@ -1315,10 +1322,10 @@ impl Management {
         let intent = planning_intent(snapshot)?;
         let selection: Selection = serde_json::from_str(&snapshot.selection_json)?;
         let scripts = CompiledScripts::new(&pinned);
-        let sandbox = self.setup.publish_sandbox().map_err(|error| {
+        let sandbox = self.setup.publishing.publish_sandbox().map_err(|error| {
             ManagementError::Conflict(format!("No library folder can be written: {error}"))
         })?;
-        let registry = self.setup.live_registry();
+        let registry = self.setup.core.live_registry();
         let mut albums = self
             .setup
             .db
@@ -1552,7 +1559,7 @@ impl Management {
     ) -> Result<Vec<PlannedItem>, ManagementError> {
         let album_id = first.album_id.clone();
         let override_of = self.override_lookup(&album_id, Some((source_job, bundle_ordinal)))?;
-        let files = match self.setup.undo_files(bundle_id, &override_of) {
+        let files = match self.setup.publishing.undo_files(bundle_id, &override_of) {
             Ok(files) => files,
             Err(crate::service::ServiceError::NotFound) => Default::default(),
             Err(error) => return Err(ManagementError::Store(format!("{error:?}"))),
@@ -1588,7 +1595,7 @@ impl Management {
             item.estimated_bytes = file.plan.staged_bytes_estimate;
             item.diff.path_changed = file.plan.source_root != file.plan.dest_root
                 || file.plan.source_rel != file.plan.dest_rel;
-            for (name, after) in &file.plan.managed_updates {
+            for (name, after) in &file.plan.managed_updates.named() {
                 let before = file.current.get(name).cloned().unwrap_or_default();
                 if &before == after {
                     continue;
@@ -1606,11 +1613,12 @@ impl Management {
             item.desired.fields = file
                 .plan
                 .managed_updates
-                .iter()
+                .named()
+                .into_iter()
                 .filter(|(_, values)| !values.is_empty())
                 .map(|(name, values)| super::models::DesiredField {
-                    name: name.clone(),
-                    value: profile::json_value(values),
+                    name,
+                    value: profile::json_value(&values),
                 })
                 .collect();
             item.diff.sidecars = file
@@ -1644,6 +1652,11 @@ impl Management {
                             .to_owned(),
                     action: "Rescan the library, then make a new undo preview.".to_owned(),
                 },
+                crate::manage::UndoSkip::CopyMissing => ItemReason {
+                    code: UNDO_COPY_MISSING.to_owned(),
+                    message: "The saved copy of this file's earlier tags is missing.".to_owned(),
+                    action: "This file stays as it is.".to_owned(),
+                },
             });
             items.push(item);
         }
@@ -1652,7 +1665,15 @@ impl Management {
             item.block(reasons::undo_nothing());
             items.push(item);
         }
-        if items.iter().any(|item| !item.eligibility.writes()) {
+        // A file whose saved copy is gone cannot be undone at all, now or
+        // later, so it does not hold the rest of the bundle back.
+        let holds_back = |item: &PlannedItem| {
+            !item.eligibility.writes()
+                && item
+                    .reason()
+                    .is_none_or(|reason| reason.code != UNDO_COPY_MISSING)
+        };
+        if items.iter().any(holds_back) {
             for item in items.iter_mut().filter(|item| item.eligibility.writes()) {
                 item.block(reasons::bundle_blocked());
             }
@@ -1910,7 +1931,7 @@ impl Management {
                 Ok::<_, ManagementError>(jobs::work_bundle(conn, job_id, ordinal)?)
             })?
         {
-            if let Err(error) = self.setup.settle_publishes() {
+            if let Err(error) = self.setup.publishing.settle_publishes() {
                 tracing::warn!(%error, bundle_id = earlier, "publish recovery did not finish");
             }
             if self.committed(&earlier) {
@@ -2064,6 +2085,7 @@ impl Management {
             settings: profile::seal_revision(&snapshot.settings_revision),
         };
         self.setup
+            .publishing
             .publish_plans(bundle_id, plans, pins, &override_of)
             .map_err(|error| {
                 // The database refused a call, or no recycle bin is known:
@@ -2074,10 +2096,27 @@ impl Management {
                     return Refused::Busy(ManagementError::Busy(cause.clone()));
                 }
                 let reason = reasons::from_publish(&error);
+                let detail = error.detail();
+                let track_id = detail.and_then(|detail| detail.track_id.as_deref());
+                let path = detail
+                    .and_then(|detail| detail.file.as_ref())
+                    .map(|file| format!("{}:{}", file.root_id, file.rel));
                 if reason.code == "WRITE_FAILED" || reason.code == "BASELINE_UNAVAILABLE" {
-                    tracing::error!(%error, job_id = snapshot.job.id, "management publish failed");
+                    tracing::error!(
+                        %error,
+                        job_id = snapshot.job.id,
+                        track_id,
+                        path,
+                        "management publish failed"
+                    );
                 } else {
-                    tracing::info!(%error, job_id = snapshot.job.id, "management publish refused");
+                    tracing::info!(
+                        %error,
+                        job_id = snapshot.job.id,
+                        track_id,
+                        path,
+                        "management publish refused"
+                    );
                 }
                 Refused::Reason(reason)
             })

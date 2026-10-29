@@ -3,53 +3,56 @@
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{Request, StatusCode};
-use axum::response::Response;
+use axum::response::{IntoResponse as _, Response};
+use droppedneedle_kernel::error::ApiError;
 
 use super::models::{BaseItemDtoQueryResult, CreatePlaylistDto};
 use super::params::{self, CiParams};
 use super::playstate::*;
 use super::query::page;
 use super::router::*;
-use super::seams::{IdMap, LibraryRead, PlaybackSessions, StreamEngine};
+use super::seams::ReadFailed;
 
 // ===== Playlists =====
 
-pub(super) async fn decode_playlist<L, E, P, I>(
-    state: &JellyfinState<L, E, P, I>,
+pub(super) async fn decode_playlist(
+    state: &JellyfinState,
     jf_id: &str,
-) -> Result<String, Response>
-where
-    L: LibraryRead,
-    E: StreamEngine,
-    P: PlaybackSessions,
-    I: IdMap,
-{
+) -> Result<String, Response> {
     match state.ids.from_jf(jf_id).await {
-        Some((kind, internal)) if kind == "playlist" => Ok(internal),
-        _ => Err(error(StatusCode::NOT_FOUND)),
+        Ok(Some((kind, internal))) if kind == "playlist" => Ok(internal),
+        Ok(_) => Err(error(StatusCode::NOT_FOUND)),
+        Err(failed) => Err(ApiError::from(failed).into_response()),
     }
+}
+
+/// The track file ids of `jf_ids`, in order; unknown and non-track ids
+/// drop out. Every id is read before the playlist write, which is one
+/// transaction, so a busy answer means nothing was written and asking
+/// again never repeats an entry.
+async fn track_file_ids(
+    state: &JellyfinState,
+    jf_ids: &[String],
+) -> Result<Vec<String>, ReadFailed> {
+    Ok(state
+        .ids
+        .from_jf_many(jf_ids)
+        .await?
+        .into_iter()
+        .flatten()
+        .filter(|(kind, _)| kind == "track")
+        .map(|(_, internal)| internal)
+        .collect())
 }
 
 /// Create from a JSON body or `?name=`/`?ids=` (v2 `_create_playlist`).
 /// Unknown track ids are skipped silently.
-pub(super) async fn create_playlist<L, E, P, I>(
-    State(state): State<JellyfinState<L, E, P, I>>,
+pub(super) async fn create_playlist(
+    State(state): State<JellyfinState>,
+    authed: Authed,
     request: Request<Body>,
-) -> Response
-where
-    L: LibraryRead,
-    E: StreamEngine,
-    P: PlaybackSessions,
-    I: IdMap,
-{
-    if let Some(denied) = gate(&state) {
-        return denied;
-    }
-    let (headers, query, body) = read_body_lenient::<CreatePlaylistDto>(request).await;
-    let authed = match authed(&state.passwords, &headers, query.as_deref()).await {
-        Ok(authed) => authed,
-        Err(denied) => return denied,
-    };
+) -> Response {
+    let (query, body) = read_body_lenient::<CreatePlaylistDto>(request).await;
     let q = CiParams::parse(query.as_deref());
     let body = body.unwrap_or_default();
     let name = if !body.name.is_empty() {
@@ -62,115 +65,84 @@ where
     } else {
         params::ids_param(&q, &["ids"])
     };
+    let file_ids = match track_file_ids(&state, &track_ids).await {
+        Ok(file_ids) => file_ids,
+        Err(failed) => return ApiError::from(failed).into_response(),
+    };
     let internal = match state
         .library
-        .create_playlist(&authed.principal.id, &name)
+        .create_playlist(&authed.principal.id, &name, &file_ids)
         .await
     {
         Ok(internal) => internal,
         Err(refusal) => return refused(refusal),
     };
-    for jf_id in &track_ids {
-        if let Some(file_id) = report_file_id(&state, jf_id).await
-            && let Err(refusal) = state
-                .library
-                .add_playlist_entry(&authed.principal.id, &internal, &file_id)
-                .await
-        {
-            return refused(refusal);
-        }
-    }
     json(
         StatusCode::OK,
         &serde_json::json!({ "Id": state.ids.to_jf("playlist", &internal).await }),
     )
 }
 
-pub(super) async fn get_playlist<L, E, P, I>(
-    State(state): State<JellyfinState<L, E, P, I>>,
+pub(super) async fn get_playlist(
+    State(state): State<JellyfinState>,
     Path(playlist_id): Path<String>,
-    request: Request<Body>,
-) -> Response
-where
-    L: LibraryRead,
-    E: StreamEngine,
-    P: PlaybackSessions,
-    I: IdMap,
-{
-    authed_handler!(state, request, |ctx| {
-        let internal = match decode_playlist(&state, &playlist_id).await {
-            Ok(internal) => internal,
-            Err(denied) => return denied,
-        };
-        let detail = match state.library.playlist(&ctx.principal.id, &internal).await {
-            Some(detail) => detail,
-            None => return error(StatusCode::NOT_FOUND),
-        };
-        let mut item_ids = Vec::new();
-        for entry in &detail.entries {
-            if let Some(file_id) = entry.file_id.as_deref() {
-                item_ids.push(state.ids.to_jf("track", file_id).await);
-            }
-        }
-        json(
-            StatusCode::OK,
-            &serde_json::json!({
-                "Id": playlist_id,
-                "Name": detail.name,
-                "Type": "Playlist",
-                "ServerId": state.server_id,
-                "OpenAccess": detail.open_access,
-                "Shares": [],
-                "ItemIds": item_ids,
-            }),
-        )
-    })
-}
-
-pub(super) async fn playlist_items<L, E, P, I>(
-    State(state): State<JellyfinState<L, E, P, I>>,
-    Path(playlist_id): Path<String>,
-    request: Request<Body>,
-) -> Response
-where
-    L: LibraryRead,
-    E: StreamEngine,
-    P: PlaybackSessions,
-    I: IdMap,
-{
-    if let Some(denied) = gate(&state) {
-        return denied;
-    }
-    let raw_query = request.uri().query().map(str::to_owned);
-    let headers = request.headers().clone();
-    let ctx = match authed(&state.passwords, &headers, raw_query.as_deref()).await {
-        Ok(ctx) => ctx,
+    ctx: Authed,
+) -> Response {
+    let internal = match decode_playlist(&state, &playlist_id).await {
+        Ok(internal) => internal,
         Err(denied) => return denied,
     };
+    let detail = match state.library.playlist(&ctx.principal.id, &internal).await {
+        Ok(Some(detail)) => detail,
+        Ok(None) => return error(StatusCode::NOT_FOUND),
+        Err(failed) => return ApiError::from(failed).into_response(),
+    };
+    let mut item_ids = Vec::new();
+    for entry in &detail.entries {
+        if let Some(file_id) = entry.file_id.as_deref() {
+            item_ids.push(state.ids.to_jf("track", file_id).await);
+        }
+    }
+    json(
+        StatusCode::OK,
+        &serde_json::json!({
+            "Id": playlist_id,
+            "Name": detail.name,
+            "Type": "Playlist",
+            "ServerId": state.server_id,
+            "OpenAccess": detail.open_access,
+            "Shares": [],
+            "ItemIds": item_ids,
+        }),
+    )
+}
+
+pub(super) async fn playlist_items(
+    State(state): State<JellyfinState>,
+    Path(playlist_id): Path<String>,
+    ctx: Authed,
+    request: Request<Body>,
+) -> Response {
+    let raw_query = request.uri().query().map(str::to_owned);
     let q = CiParams::parse(raw_query.as_deref());
     playlist_items_inner(&state, &ctx.principal.id, &playlist_id, &q).await
 }
 
 /// Real playlist-items body, split out so the auth gate stays readable.
-pub(super) async fn playlist_items_inner<L, E, P, I>(
-    state: &JellyfinState<L, E, P, I>,
+pub(super) async fn playlist_items_inner(
+    state: &JellyfinState,
     user_id: &str,
     playlist_id: &str,
     q: &CiParams,
-) -> Response
-where
-    L: LibraryRead,
-    E: StreamEngine,
-    P: PlaybackSessions,
-    I: IdMap,
-{
+) -> Response {
     let internal = match decode_playlist(state, playlist_id).await {
         Ok(internal) => internal,
         Err(denied) => return denied,
     };
     let detail = match state.library.playlist(user_id, &internal).await {
-        Some(detail) => detail,
-        None => return error(StatusCode::NOT_FOUND),
+        Ok(Some(detail)) => detail,
+        Ok(None) => return error(StatusCode::NOT_FOUND),
+        Err(failed) => return ApiError::from(failed).into_response(),
     };
     // v2 reads both `startIndex` and `StartIndex`, but params are
     // case-insensitive so both spellings are one key.
@@ -183,10 +155,11 @@ where
         .iter()
         .filter_map(|entry| entry.file_id.clone())
         .collect::<Vec<_>>();
-    let tracks = state
-        .library
-        .tracks_by_ids(user_id, &file_ids)
-        .await
+    let tracks = match state.library.tracks_by_ids(user_id, &file_ids).await {
+        Ok(tracks) => tracks,
+        Err(failed) => return ApiError::from(failed).into_response(),
+    };
+    let tracks = tracks
         .into_iter()
         .map(|track| (track.file_id.clone(), track))
         .collect::<std::collections::HashMap<_, _>>();
@@ -216,64 +189,39 @@ where
     )
 }
 
-pub(super) async fn playlist_add<L, E, P, I>(
-    State(state): State<JellyfinState<L, E, P, I>>,
+pub(super) async fn playlist_add(
+    State(state): State<JellyfinState>,
     Path(playlist_id): Path<String>,
+    authed: Authed,
     request: Request<Body>,
-) -> Response
-where
-    L: LibraryRead,
-    E: StreamEngine,
-    P: PlaybackSessions,
-    I: IdMap,
-{
-    if let Some(denied) = gate(&state) {
-        return denied;
-    }
+) -> Response {
     let raw_query = request.uri().query().map(str::to_owned);
-    let headers = request.headers().clone();
-    let authed = match authed(&state.passwords, &headers, raw_query.as_deref()).await {
-        Ok(authed) => authed,
-        Err(denied) => return denied,
-    };
     let internal = match decode_playlist(&state, &playlist_id).await {
         Ok(internal) => internal,
         Err(denied) => return denied,
     };
     let q = CiParams::parse(raw_query.as_deref());
-    for jf_id in params::ids_param(&q, &["ids", "Ids"]) {
-        if let Some(file_id) = report_file_id(&state, &jf_id).await
-            && let Err(refusal) = state
-                .library
-                .add_playlist_entry(&authed.principal.id, &internal, &file_id)
-                .await
-        {
-            return refused(refusal);
-        }
+    let file_ids = match track_file_ids(&state, &params::ids_param(&q, &["ids", "Ids"])).await {
+        Ok(file_ids) => file_ids,
+        Err(failed) => return ApiError::from(failed).into_response(),
+    };
+    if let Err(refusal) = state
+        .library
+        .add_playlist_entries(&authed.principal.id, &internal, &file_ids)
+        .await
+    {
+        return refused(refusal);
     }
     no_content()
 }
 
-pub(super) async fn playlist_remove<L, E, P, I>(
-    State(state): State<JellyfinState<L, E, P, I>>,
+pub(super) async fn playlist_remove(
+    State(state): State<JellyfinState>,
     Path(playlist_id): Path<String>,
+    authed: Authed,
     request: Request<Body>,
-) -> Response
-where
-    L: LibraryRead,
-    E: StreamEngine,
-    P: PlaybackSessions,
-    I: IdMap,
-{
-    if let Some(denied) = gate(&state) {
-        return denied;
-    }
+) -> Response {
     let raw_query = request.uri().query().map(str::to_owned);
-    let headers = request.headers().clone();
-    let authed = match authed(&state.passwords, &headers, raw_query.as_deref()).await {
-        Ok(authed) => authed,
-        Err(denied) => return denied,
-    };
     let internal = match decode_playlist(&state, &playlist_id).await {
         Ok(internal) => internal,
         Err(denied) => return denied,
@@ -291,26 +239,11 @@ where
     no_content()
 }
 
-pub(super) async fn playlist_move<L, E, P, I>(
-    State(state): State<JellyfinState<L, E, P, I>>,
+pub(super) async fn playlist_move(
+    State(state): State<JellyfinState>,
     Path((playlist_id, entry_id, new_index)): Path<(String, String, String)>,
-    request: Request<Body>,
-) -> Response
-where
-    L: LibraryRead,
-    E: StreamEngine,
-    P: PlaybackSessions,
-    I: IdMap,
-{
-    if let Some(denied) = gate(&state) {
-        return denied;
-    }
-    let raw_query = request.uri().query().map(str::to_owned);
-    let headers = request.headers().clone();
-    let authed = match authed(&state.passwords, &headers, raw_query.as_deref()).await {
-        Ok(authed) => authed,
-        Err(denied) => return denied,
-    };
+    authed: Authed,
+) -> Response {
     let Ok(index) = new_index.parse::<usize>() else {
         return error(StatusCode::BAD_REQUEST);
     };

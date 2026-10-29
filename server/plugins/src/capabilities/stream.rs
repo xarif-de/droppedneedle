@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::super::host::{LoadedPlugin, PluginHost};
+use super::super::manifest::Capability;
 use super::super::protocol::methods;
 use super::{call, decode};
 
@@ -94,7 +95,7 @@ impl PluginHost {
         if recording_mbid.is_empty() || user_id.is_empty() {
             return None;
         }
-        for plugin in self.serving("streaming_source") {
+        for plugin in self.serving(Capability::StreamingSource) {
             let params = json!({ "recording_mbid": recording_mbid, "user_id": user_id });
             let Ok(value) = call(&plugin, methods::RESOLVE_STREAM, params, RESOLVE_TIMEOUT).await
             else {
@@ -134,10 +135,8 @@ impl PluginHost {
                     .settings
                     .iter()
                     .any(|field| field.key == "downloads_dir")
-                    && let Ok(stored) = self.config().get_plugin(&name)
-                    && let Some(dir) = stored
-                        .settings
-                        .get("downloads_dir")
+                    && let Some(dir) = self
+                        .running_setting(&name, "downloads_dir")
                         .filter(|dir| !dir.trim().is_empty())
                 {
                     roots.push(PathBuf::from(dir.trim()));

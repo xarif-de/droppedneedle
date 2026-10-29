@@ -15,7 +15,7 @@
 //! - The session row, a rehash of a stored hash weaker than the pin and
 //!   `last_login_at` are written in one transaction, and only while the
 //!   stored credential is still the one the password was checked against
-//!   ([`SqliteSessionStore::insert_login`]). If it changed in between, the
+//!   ([`Sessions::insert_login`]). If it changed in between, the
 //!   login checks the password once more against the current row; a second
 //!   change in that window answers busy. A session is never stored for a
 //!   credential the login did not verify.
@@ -23,16 +23,15 @@
 //!   store too busy to answer in time is [`LoginError::Busy`], never either.
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use super::{
     extract::Transport,
-    store::{SessionKind, SessionRecord, SessionStoreError},
+    store::{NewSession, SessionStoreError},
     tokens,
 };
 use crate::passwords::{Passwords, StoredPassword, Verdict};
-use crate::sqlite::{LoginWrite, SqliteSessionStore};
+use crate::sqlite::{LoginWrite, Sessions, Users};
 
 /// Login transport: cookie (browser default) or Bearer (devices and scripts).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -93,7 +92,7 @@ pub enum LoginError {
     Busy,
 }
 
-/// Stored local credential returned by the user lookup.
+/// Stored local credential returned by [`Users::login_credential`].
 #[derive(Debug, Clone)]
 pub struct LocalCredential {
     /// User id.
@@ -104,16 +103,6 @@ pub struct LocalCredential {
     pub password: StoredPassword,
 }
 
-/// User-lookup port. Production reads `auth_users` + the `local` provider row.
-pub trait CredentialLookup: Clone + Send + Sync + 'static {
-    /// Local credential for a lowercased username, `None` when the user or
-    /// its local credential is absent, `Err` when the store failed.
-    fn local_user(
-        &self,
-        username_lc: &str,
-    ) -> impl Future<Output = Result<Option<LocalCredential>, LoginError>> + Send;
-}
-
 /// `Cache-Control` value on every login/token-mint response.
 pub const NO_STORE: &str = "no-store";
 
@@ -122,22 +111,19 @@ pub const INVALID_CREDENTIALS: &str = "Invalid username or password";
 
 /// Local-login service: lookup, verify-or-dummy, mint, hand off.
 #[derive(Debug, Clone)]
-pub struct LoginService<C> {
-    sessions: SqliteSessionStore,
+pub struct LoginService {
+    sessions: Sessions,
     passwords: Passwords,
-    users: C,
+    users: Users,
 }
 
 /// Login attempts before a credential that keeps changing answers busy:
 /// the first, and one re-check after a change.
 const LOGIN_ATTEMPTS: usize = 2;
 
-impl<C> LoginService<C>
-where
-    C: CredentialLookup,
-{
+impl LoginService {
     /// Wire the service from its parts.
-    pub fn new(sessions: SqliteSessionStore, passwords: Passwords, users: C) -> Self {
+    pub fn new(sessions: Sessions, passwords: Passwords, users: Users) -> Self {
         Self {
             sessions,
             passwords,
@@ -155,7 +141,7 @@ where
         let username_lc = request.username.trim().to_lowercase();
         let raw_token = tokens::mint_token().map_err(|_| LoginError::Unavailable)?;
         for _ in 0..LOGIN_ATTEMPTS {
-            let credential = self.users.local_user(&username_lc).await?;
+            let credential = self.users.login_credential(&username_lc).await?;
             let passwords = self.passwords.clone();
             let stored = credential.as_ref().map(|found| found.password.clone());
             let password = request.password.clone();
@@ -166,21 +152,15 @@ where
             let (Some(credential), Verdict::Verified { rehash }) = (credential, verdict) else {
                 return Err(LoginError::InvalidCredentials);
             };
-            let record = SessionRecord {
-                id: uuid_simple(&raw_token, ctx.now_unix),
+            let session = NewSession {
                 user_id: credential.user_id.clone(),
                 token_hash: tokens::hash_token(&raw_token),
-                kind: SessionKind::Standard,
-                label: None,
                 issued_at: ctx.now_unix,
-                expires_at: tokens::expires_at(ctx.now_unix),
-                last_seen_at: ctx.now_unix,
-                revoked: false,
                 user_agent: ctx.user_agent.clone(),
             };
             let written = self
                 .sessions
-                .insert_login(record, &credential.password, rehash)
+                .insert_login(session, &credential.password, rehash)
                 .await
                 .map_err(|error| match error {
                     SessionStoreError::Busy => LoginError::Busy,
@@ -211,11 +191,4 @@ impl From<TransportParam> for Transport {
             TransportParam::Bearer => Transport::Bearer,
         }
     }
-}
-
-/// Stable session-row id derived from the token hash, so this layer needs
-/// no uuid dependency.
-fn uuid_simple(raw_token: &str, now_unix: i64) -> String {
-    let digest = Sha256::digest(format!("{raw_token}:{now_unix}").as_bytes());
-    format!("{digest:x}")
 }

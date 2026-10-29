@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use droppedneedle_catalog::reads::collections::service::{
-    CollectionsService, LOCAL_SOURCE, Visible,
+    CollectionsService, LOCAL_SOURCE, SavedPlaylist, Visible,
 };
 use droppedneedle_catalog::reads::collections::store::play_marks::MarkScope;
 use droppedneedle_catalog::reads::collections::store::playlists::NewEntry;
@@ -27,12 +27,14 @@ use droppedneedle_catalog::reads::library::store::LocalCatalog;
 use droppedneedle_catalog::reads::library::stores::{
     ArtistRecord, ArtistScope, ArtistSort, GenreRecord, LyricDoc, LyricsPort, StoreError,
 };
+use droppedneedle_catalog::reads::platform::artwork::ArtworkService;
 use droppedneedle_catalog::reads::platform::covers::{CoverArt, CoverLookup};
 
 /// A compat read or write failed. Client faults keep their kind so each
 /// protocol answers its own code (Subsonic 70/50/10/0, Jellyfin
 /// 404/403/400/409); server faults go to the log only and answer the
-/// fixed internal message.
+/// fixed internal message, a busy database as 503 with `Retry-After` and
+/// anything else as 500.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompatError {
     /// The item does not exist (or is another user's private playlist).
@@ -43,6 +45,9 @@ pub enum CompatError {
     Invalid(String),
     /// Valid input against the wrong state; the message is user-safe.
     Conflict(String),
+    /// The database was too busy to answer in time; the text is for the
+    /// log only.
+    Busy(String),
     /// Server fault; the text is for the log only.
     Internal(String),
 }
@@ -52,22 +57,30 @@ impl std::fmt::Display for CompatError {
         match self {
             Self::NotFound => f.write_str("not found"),
             Self::Forbidden => f.write_str("not allowed"),
-            Self::Invalid(message) | Self::Conflict(message) | Self::Internal(message) => {
-                f.write_str(message)
-            }
+            Self::Invalid(message)
+            | Self::Conflict(message)
+            | Self::Busy(message)
+            | Self::Internal(message) => f.write_str(message),
         }
     }
 }
 
 impl From<StoreError> for CompatError {
     fn from(error: StoreError) -> Self {
-        Self::Internal(error.to_string())
+        match error {
+            StoreError::Busy(_) => Self::Busy(error.to_string()),
+            StoreError::Internal(_) => Self::Internal(error.to_string()),
+        }
     }
 }
 
 impl From<droppedneedle_catalog::reads::collections::db::StoreError> for CompatError {
     fn from(error: droppedneedle_catalog::reads::collections::db::StoreError) -> Self {
-        Self::Internal(error.to_string())
+        use droppedneedle_catalog::reads::collections::db::StoreError as CollectionsStoreError;
+        match error {
+            CollectionsStoreError::Busy(_) => Self::Busy(error.to_string()),
+            CollectionsStoreError::Internal(_) => Self::Internal(error.to_string()),
+        }
     }
 }
 
@@ -79,7 +92,7 @@ impl From<CollectionsError> for CompatError {
             CollectionsError::InvalidInput { message } => Self::Invalid(message),
             CollectionsError::Conflict { message } => Self::Conflict(message),
             CollectionsError::Busy { operation } => {
-                Self::Internal(format!("collections database busy during {operation}"))
+                Self::Busy(format!("collections database busy during {operation}"))
             }
             CollectionsError::Internal { cause } => {
                 Self::Internal(format!("collections failed: {cause}"))
@@ -88,8 +101,11 @@ impl From<CollectionsError> for CompatError {
     }
 }
 
-impl crate::subsonic::store::StoreFailure for CompatError {
-    fn client_error(&self) -> Option<(u8, String)> {
+impl CompatError {
+    /// The Subsonic code and user-safe message for a client fault (not
+    /// found, not allowed, bad input); `None` for a server fault, which is
+    /// logged and answered with code 0 and the fixed message.
+    pub fn client_error(&self) -> Option<(u8, String)> {
         use crate::subsonic::error::{GENERIC, NOT_AUTHORIZED, NOT_FOUND, PARAM_MISSING};
         match self {
             Self::NotFound => Some((NOT_FOUND, "The requested data was not found.".to_owned())),
@@ -99,7 +115,17 @@ impl crate::subsonic::store::StoreFailure for CompatError {
             )),
             Self::Invalid(message) => Some((PARAM_MISSING, message.clone())),
             Self::Conflict(message) => Some((GENERIC, message.clone())),
-            Self::Internal(_) => None,
+            Self::Busy(_) | Self::Internal(_) => None,
+        }
+    }
+
+    /// The error of a step taken after the request already wrote. A busy
+    /// answer tells an app nothing was done and to ask again, which would
+    /// repeat the write, so busy here answers as a failure.
+    pub fn after_write(self) -> Self {
+        match self {
+            Self::Busy(cause) => Self::Internal(format!("{cause}, after the request wrote")),
+            other => other,
         }
     }
 }
@@ -112,10 +138,17 @@ impl From<CompatError> for crate::jellyfin::seams::WriteRefusal {
             CompatError::Forbidden => WriteRefusal::Forbidden,
             CompatError::Invalid(_) => WriteRefusal::Invalid,
             CompatError::Conflict(_) => WriteRefusal::Conflict,
-            CompatError::Internal(cause) => {
-                tracing::error!(%cause, "jellyfin library write failed");
-                WriteRefusal::Failed
-            }
+            CompatError::Busy(cause) => WriteRefusal::Busy(cause),
+            CompatError::Internal(cause) => WriteRefusal::Failed(cause),
+        }
+    }
+}
+
+impl From<CompatError> for crate::jellyfin::seams::ReadFailed {
+    fn from(error: CompatError) -> Self {
+        match error {
+            CompatError::Busy(cause) => Self::Busy(cause),
+            other => Self::Failed(other.to_string()),
         }
     }
 }
@@ -135,6 +168,8 @@ pub struct CompatLibrary {
     pub lyrics: Arc<dyn LyricsPort>,
     /// Cover art by MBID.
     pub covers: Arc<dyn CoverArt>,
+    /// The service behind `covers`, read for the local-art setting.
+    pub artwork: Option<ArtworkService>,
     /// Per-caller seeds for paged random lists, shared by both protocols.
     pub shuffles: Arc<ShuffleSeeds>,
 }
@@ -186,6 +221,26 @@ fn tile_covers(covers: &[ImageBytes]) -> Option<ImageBytes> {
     Some((out, "image/jpeg".to_owned()))
 }
 
+/// The version an album's cover id carries: eight hex digits of what
+/// chooses the picture the cover read serves, so a change to any of them
+/// gives the album a new cover id and apps fetch the picture again. The
+/// inputs are the version of the album's own art (it goes up when a scan
+/// finds new art), the release group the Cover Art Archive is asked for,
+/// and whether local art comes first. Art replaced at the Cover Art
+/// Archive for the same release group is not seen.
+pub fn cover_version(
+    art_version: Option<i64>,
+    release_group: Option<&str>,
+    local_first: bool,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let art = art_version.map_or_else(|| "-".to_owned(), |version| version.to_string());
+    let group = release_group.unwrap_or("-");
+    let order = if local_first { "local" } else { "archive" };
+    let digest = Sha256::digest(format!("{art}\0{group}\0{order}").as_bytes());
+    format!("{digest:x}")[..8].to_owned()
+}
+
 /// Unix seconds as a whole number.
 pub fn whole(seconds: Option<f64>) -> Option<i64> {
     seconds
@@ -202,6 +257,7 @@ impl CompatLibrary {
             collections: reads.collections.clone(),
             lyrics: reads.library.lyrics.clone(),
             covers: reads.platform.covers.covers.clone(),
+            artwork: reads.artwork.clone(),
             shuffles: Arc::new(ShuffleSeeds::default()),
         }
     }
@@ -486,12 +542,12 @@ impl CompatLibrary {
         Ok(self.catalog.playable_counts().await?)
     }
 
-    /// Every playlist with what the user may see of it.
+    /// Every playlist the user may read.
     pub async fn playlists(&self, user_id: &str) -> Result<Vec<Visible>, CompatError> {
         Ok(self.service().visible_playlists(user_id).await?)
     }
 
-    /// A readable playlist with its entries, or None.
+    /// A readable playlist, or None.
     pub async fn playlist(
         &self,
         user_id: &str,
@@ -500,7 +556,6 @@ impl CompatLibrary {
         match self.service().readable_playlist(user_id, playlist_id).await {
             Ok(row) => Ok(Some(Visible {
                 is_owner: row.owner_id.as_deref() == Some(user_id),
-                full: true,
                 row,
             })),
             Err(CollectionsError::NotFound) => Ok(None),
@@ -508,26 +563,70 @@ impl CompatLibrary {
         }
     }
 
-    /// Entries of a playlist as `(entry id, library file id)`, in order.
-    /// Callers check readability first.
+    /// Entries of a playlist the user may read as `(entry id, library
+    /// file id)`, in order; none when they may not read it.
     pub async fn playlist_entries(
         &self,
+        user_id: &str,
         playlist_id: &str,
     ) -> Result<Vec<(String, Option<String>)>, CompatError> {
         Ok(self
-            .collections
-            .stores
-            .playlists
-            .tracks(playlist_id)
+            .service()
+            .readable_entries(user_id, playlist_id)
             .await?
             .into_iter()
             .map(|track| (track.id, track.library_file_id))
             .collect())
     }
 
-    /// Create a playlist owned by the user; returns its id.
-    pub async fn create_playlist(&self, user_id: &str, name: &str) -> Result<String, CompatError> {
-        Ok(self.service().create_named(user_id, name, None).await?)
+    /// Entries of one of the user's own playlists as `(entry id, library
+    /// file id)`, in order; None when it is not theirs.
+    pub async fn owned_entries(
+        &self,
+        user_id: &str,
+        playlist_id: &str,
+    ) -> Result<Option<Vec<(String, Option<String>)>>, CompatError> {
+        Ok(self
+            .service()
+            .owned_entries(user_id, playlist_id)
+            .await?
+            .map(|tracks| {
+                tracks
+                    .into_iter()
+                    .map(|track| (track.id, track.library_file_id))
+                    .collect()
+            }))
+    }
+
+    /// Create a playlist owned by the user holding the library files
+    /// `file_ids`, in order, as one write. Unknown files are skipped.
+    pub async fn create_playlist(
+        &self,
+        user_id: &str,
+        name: &str,
+        file_ids: &[String],
+    ) -> Result<SavedPlaylist, CompatError> {
+        let entries = self.file_entries(file_ids).await?;
+        Ok(self
+            .service()
+            .create_with_entries(user_id, name, entries)
+            .await?)
+    }
+
+    /// Replace the entries of a playlist the user owns with the library
+    /// files `file_ids` and, when `name` is given, rename it, as one write.
+    pub async fn replace_playlist(
+        &self,
+        user_id: &str,
+        playlist_id: &str,
+        name: Option<&str>,
+        file_ids: &[String],
+    ) -> Result<SavedPlaylist, CompatError> {
+        let entries = self.file_entries(file_ids).await?;
+        Ok(self
+            .service()
+            .replace_with_entries(user_id, playlist_id, name, entries)
+            .await?)
     }
 
     /// Rename a playlist the user owns.
@@ -537,13 +636,7 @@ impl CompatLibrary {
         playlist_id: &str,
         name: &str,
     ) -> Result<(), CompatError> {
-        let body = droppedneedle_catalog::reads::collections::models::UpdatePlaylistBody {
-            name: Some(name.to_owned()),
-        };
-        self.service()
-            .update_playlist(user_id, playlist_id, &body)
-            .await?;
-        Ok(())
+        Ok(self.service().rename(user_id, playlist_id, name).await?)
     }
 
     /// Flip visibility of a playlist the user owns.
@@ -553,10 +646,10 @@ impl CompatLibrary {
         playlist_id: &str,
         public: bool,
     ) -> Result<(), CompatError> {
-        self.service()
-            .set_visibility(user_id, playlist_id, public)
-            .await?;
-        Ok(())
+        Ok(self
+            .service()
+            .set_public(user_id, playlist_id, public)
+            .await?)
     }
 
     /// Delete a playlist the user owns.
@@ -595,23 +688,35 @@ impl CompatLibrary {
         Ok(())
     }
 
-    /// Append library files to a playlist the user owns. Each entry keeps
-    /// the file's names so the web UI shows it too (v2 `add_file_id_entry`).
-    /// A file asked twice is added twice, as v2 appends each; unknown files
-    /// are skipped.
+    /// Append library files to a playlist the user owns, as one write.
     pub async fn add_files(
         &self,
         user_id: &str,
         playlist_id: &str,
         file_ids: &[String],
     ) -> Result<(), CompatError> {
+        let entries = self.file_entries(file_ids).await?;
+        if entries.is_empty() {
+            return Ok(());
+        }
+        self.service()
+            .add_entries(user_id, playlist_id, None, entries)
+            .await?;
+        Ok(())
+    }
+
+    /// Playlist entries for library files, in order. Each entry keeps the
+    /// file's names so the web UI shows it too (v2 `add_file_id_entry`). A
+    /// file asked twice is added twice, as v2 appends each; unknown files
+    /// are skipped.
+    async fn file_entries(&self, file_ids: &[String]) -> Result<Vec<NewEntry>, CompatError> {
         let by_id = self
             .tracks_by_ids(file_ids)
             .await?
             .into_iter()
             .map(|track| (track.id.clone(), track))
             .collect::<HashMap<_, _>>();
-        let entries = file_ids
+        Ok(file_ids
             .iter()
             .filter_map(|id| by_id.get(id).cloned())
             .map(|track| NewEntry {
@@ -631,14 +736,7 @@ impl CompatLibrary {
                 plex_rating_key: None,
                 library_file_id: Some(track.id),
             })
-            .collect::<Vec<_>>();
-        if entries.is_empty() {
-            return Ok(());
-        }
-        self.service()
-            .add_entries(user_id, playlist_id, None, entries)
-            .await?;
-        Ok(())
+            .collect())
     }
 
     /// Cover of a readable playlist: the uploaded one, else a picture made
@@ -661,7 +759,7 @@ impl CompatLibrary {
             };
         }
         let file_ids = self
-            .playlist_entries(playlist_id)
+            .playlist_entries(user_id, playlist_id)
             .await?
             .into_iter()
             .filter_map(|(_, file_id)| file_id)
@@ -696,6 +794,15 @@ impl CompatLibrary {
             .await
             .map_err(|error| CompatError::Internal(format!("playlist cover task: {error}")))?;
         Ok(tiled.or(first))
+    }
+
+    /// Whether an album's own art comes before the Cover Art Archive,
+    /// as the cover read decides it. Local art wins without the service,
+    /// as it does when the setting cannot be read.
+    pub fn local_art_first(&self) -> bool {
+        self.artwork
+            .as_ref()
+            .is_none_or(ArtworkService::prefers_local_art)
     }
 
     /// Art for a local album: its own folder or embedded art, or the

@@ -111,16 +111,16 @@ impl TagFormat for Vorbis {
             _ => return Err(foreign(key)),
         };
         // Spellings are matched without case on write, so a key the file
-        // also spells another way, or holds empty, is refused rather than
-        // touched.
+        // also spells another way is refused rather than touched.
         let blocked = truth.is_some_and(|truth| {
-            truth.pairs.iter().any(|(held, value)| {
-                held.eq_ignore_ascii_case(rest) && (held != rest || value.is_empty())
-            })
+            truth
+                .pairs
+                .iter()
+                .any(|(held, _)| held.eq_ignore_ascii_case(rest) && held != rest)
         });
         if blocked {
             return Err(Refusal::NoByteInventory {
-                detail: format!("tag '{key}' is spelled more than one way or holds no value"),
+                detail: format!("tag '{key}' is spelled more than one way"),
             });
         }
         Ok(VorbisEdit {
@@ -224,9 +224,8 @@ fn mixed_spelling(truth: &VorbisTruth) -> Option<(String, Vec<String>)> {
 }
 
 /// Vorbis comments no writable field owns (pictures excluded). A key
-/// the file spells more than one way, or that holds an empty value, is
-/// not listed: an edit of one spelling would touch the others, and an
-/// empty value cannot be written back.
+/// the file spells more than one way is not listed: an edit of one
+/// spelling would touch the others.
 fn vorbis_native(truth: &VorbisTruth) -> BTreeMap<String, Vec<String>> {
     let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut unlisted: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
@@ -242,9 +241,7 @@ fn vorbis_native(truth: &VorbisTruth) -> BTreeMap<String, Vec<String>> {
             continue;
         }
         let folded = key.to_ascii_uppercase();
-        if *spelling.entry(folded.clone()).or_insert(key.as_str()) != key.as_str()
-            || value.is_empty()
-        {
+        if *spelling.entry(folded.clone()).or_insert(key.as_str()) != key.as_str() {
             unlisted.insert(folded);
             continue;
         }

@@ -1,5 +1,5 @@
 import { page } from 'vitest/browser';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { fakeApi, type FakeRequest } from '$lib/test/api';
 import { renderWithQuery } from '$lib/test/render';
 
@@ -19,6 +19,10 @@ const prefs = {
 	now_playing_visibility: 'full',
 	auto_request_personal_mix: false
 };
+
+afterEach(() => {
+	vi.restoreAllMocks();
+});
 
 describe('Last.fm link on the profile', () => {
 	it('finishes a sign-in that saved the user’s own API key pair first', async () => {
@@ -46,7 +50,6 @@ describe('Last.fm link on the profile', () => {
 		// is the last one.
 		const connectLastFm = page.getByRole('button', { name: 'Connect' }).last();
 		await expect.element(connectLastFm).toBeVisible();
-		expect(page.getByRole('button', { name: 'Disconnect' }).elements()).toHaveLength(0);
 
 		await connectLastFm.click();
 		expect(open).toHaveBeenCalledWith(
@@ -60,6 +63,19 @@ describe('Last.fm link on the profile', () => {
 		// here the exchange itself is the proof.
 		await expect.poll(() => exchanged).toEqual([{ token: 'lfm-token' }]);
 		await expect.element(page.getByRole('button', { name: 'Finish' })).not.toBeInTheDocument();
+	});
+
+	it('keeps Disconnect next to Connect while the link has no account name', async () => {
+		fakeApi({
+			'GET /api/v3/me/connections': {
+				connections: [{ service: 'lastfm', enabled: true, username: '' }]
+			},
+			'GET /api/v3/me/scrobble-preferences': prefs
+		});
+		await renderWithQuery(ScrobblingDiscoveryCard, { navidromeEnabled: false });
+
+		await expect.element(page.getByRole('button', { name: 'Connect' }).last()).toBeVisible();
+		await expect.element(page.getByRole('button', { name: 'Disconnect' })).toBeVisible();
 	});
 
 	it('shows a linked account as connected', async () => {

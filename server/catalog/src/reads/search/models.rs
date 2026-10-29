@@ -6,6 +6,7 @@
 //! `in_library` and `requested` are read fresh from the library and the
 //! request list on every search.
 
+use droppedneedle_kernel::runtime_config::sections::ListenSource;
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 
@@ -64,13 +65,19 @@ pub struct SearchResultItem {
     pub requested: bool,
     /// Match score, 0-100. MusicBrainz hits carry MusicBrainz's relevance;
     /// library rows score 100 exact, 90 prefix, 70 substring, and songs
-    /// matched only through their artist or album 60. Ranks hits,
-    /// never filters them.
+    /// matched only through their artist or album 60. A MusicBrainz hit
+    /// the library holds carries the better of the two. Library rows that
+    /// match exactly or as a prefix rank above every other row. Ranks
+    /// hits, never filters them.
     pub score: i32,
     /// MusicBrainz disambiguation comment.
     pub disambiguation: Option<String>,
     /// Artist type, or an `Album + Live` style type label.
     pub type_info: Option<String>,
+    /// True when the server knows there is no cover to show: a library
+    /// album, or a song's album, with no art of its own and no release
+    /// group to look one up by. False means ask the cover routes.
+    pub art_missing: bool,
     /// Library details of a song hit; present exactly when `kind` is
     /// `track`.
     pub track: Option<SearchTrackDetail>,
@@ -132,7 +139,8 @@ pub struct SearchBucketResponse {
     pub limit: u32,
     /// Echoed offset.
     pub offset: u32,
-    /// This page of hits, best first.
+    /// This page of hits, best first. Library rows page in step with
+    /// MusicBrainz hits, so a page can hold up to `limit` of each.
     pub results: Vec<SearchResultItem>,
     /// Standout hit, present only on the first page and only when one
     /// scored high enough to headline.
@@ -189,6 +197,20 @@ pub struct SearchQuery {
     pub limit_tracks: Option<u32>,
     /// Comma-separated subset (`artists,albums,tracks`); absent means all.
     pub buckets: Option<String>,
+    /// Where to look; absent means `all`.
+    #[param(inline)]
+    pub scope: Option<SearchScope>,
+}
+
+/// Where a unified search looks.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum SearchScope {
+    /// The library and MusicBrainz.
+    #[default]
+    All,
+    /// The library alone: MusicBrainz is not asked.
+    Library,
 }
 
 /// Query params for `GET /api/v3/search/{bucket}`.
@@ -248,18 +270,6 @@ pub struct EnrichmentBatchRequest {
     pub albums: Vec<AlbumEnrichmentRequest>,
 }
 
-/// Which provider answered the batch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum EnrichmentSource {
-    /// ListenBrainz listen counts.
-    Listenbrainz,
-    /// Last.fm listener counts.
-    Lastfm,
-    /// No provider answered; counts are absent, never zero-filled.
-    None,
-}
-
 /// Enriched artist counts. Absent counts mean unknown, never zero.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ArtistEnrichment {
@@ -301,8 +311,9 @@ pub struct EnrichmentResponse {
     pub artists: Vec<ArtistEnrichment>,
     /// Album counts, same order as the request.
     pub albums: Vec<AlbumEnrichment>,
-    /// Provider that answered.
-    pub source: EnrichmentSource,
+    /// Provider that answered; `null` when none did, and the counts are
+    /// then absent, never zero-filled.
+    pub source: Option<ListenSource>,
     /// Sources that degraded while answering; usually empty.
     pub degradations: Vec<Degradation>,
 }

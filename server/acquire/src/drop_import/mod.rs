@@ -24,6 +24,7 @@
 pub mod extract;
 pub mod http;
 pub mod identify;
+pub(crate) mod sql;
 pub mod store;
 
 use std::collections::HashSet;
@@ -31,7 +32,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use self::identify::Outcome;
-use self::store::{DropStore, ItemRecord, JobRecord, item_status, job_status};
+use self::store::{DropStore, ItemRecord, JobRecord, StoreError, item_status, job_status};
 use crate::flows::seams::{FlowEvent, TickSink};
 use crate::held::store::{
     Entry, EntryOrigin, FileState, GroupKey, HeldFile, HeldRows, NewEntry, NewFile,
@@ -51,11 +52,11 @@ use droppedneedle_kernel::events::{
     DropImportUpdated, EventHub, RequestImported, UserNotice, new_event_id,
 };
 
-/// Most files one upload may carry (v2 `_MAX_FILES_PER_DROP`).
+/// Most files one upload may carry.
 pub const MAX_FILES_PER_DROP: usize = 25;
 /// More audio than this in one folder is not one album.
 const MAX_FILES_PER_UNIT: usize = 60;
-/// Jobs listed per page (v2 `list_jobs` limit).
+/// Jobs listed per page.
 const LIST_LIMIT: i64 = 50;
 /// Where uploads stream before a job exists.
 const INCOMING_DIR: &str = "_incoming";
@@ -80,10 +81,30 @@ pub enum DropError {
     Unavailable(String),
 }
 
-impl From<store::StoreError> for DropError {
-    fn from(error: store::StoreError) -> Self {
-        Self::Unavailable(error.0)
+impl From<StoreError> for DropError {
+    fn from(error: StoreError) -> Self {
+        Self::Unavailable(error.to_string())
     }
+}
+
+/// How the startup sweep ends after a failed step, already logged: a busy
+/// database is handed back so the sweep runs again, anything else stops
+/// it for the next start.
+fn sweep_stopped(error: StoreError) -> Result<(), StoreError> {
+    match error {
+        StoreError::Busy { .. } => Err(error),
+        StoreError::Failed(_) => Ok(()),
+    }
+}
+
+/// One grouped folder as a stored item: its name and its files' paths.
+fn item_paths(unit: &extract::Unit) -> (String, Vec<String>) {
+    let paths = unit
+        .files
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect();
+    (unit.folder_name.clone(), paths)
 }
 
 /// What became of one file of an item.
@@ -403,8 +424,9 @@ impl DropImports {
     /// and staging folders with no file left waiting are removed, orphans
     /// and partial uploads included. When a cut-off upload cannot be read
     /// or kept, the sweep stops there: its job stays processing with its
-    /// files, for a later sweep to group.
-    pub async fn sweep_stale(&self) {
+    /// files, for a later sweep to group. A busy database stops it with an
+    /// error, so the caller can run it again; any other failure is logged.
+    pub async fn sweep_stale(&self) -> Result<(), StoreError> {
         // A job cut off before its upload became items: unpack and group
         // it now, so its files wait for review instead of being swept.
         match self.store.processing_jobs_without_items().await {
@@ -425,26 +447,16 @@ impl DropImports {
                             continue;
                         }
                     };
-                    for unit in units {
-                        let paths: Vec<String> = unit
-                            .files
-                            .iter()
-                            .map(|path| path.to_string_lossy().into_owned())
-                            .collect();
-                        if let Err(error) = self
-                            .store
-                            .add_item(&job_id, &unit.folder_name, &paths)
-                            .await
-                        {
-                            tracing::warn!(%job_id, %error, "cut-off drop upload not kept; staging left as is");
-                            return;
-                        }
+                    let units = units.iter().map(item_paths).collect();
+                    if let Err(error) = self.store.add_items(&job_id, units).await {
+                        tracing::warn!(%job_id, %error, "cut-off drop upload not kept; staging left as is");
+                        return sweep_stopped(error);
                     }
                 }
             }
             Err(error) => {
                 tracing::warn!(%error, "cut-off drop jobs unreadable; staging left as is");
-                return;
+                return sweep_stopped(error);
             }
         }
         match self
@@ -456,7 +468,7 @@ impl DropImports {
             Ok(failed) => tracing::info!(jobs = failed, "drop imports cut off by a restart failed"),
             Err(error) => {
                 tracing::warn!(%error, "drop import restart sweep failed; staging left as is");
-                return;
+                return sweep_stopped(error);
             }
         }
         // Every folder under the drop staging root goes, except those of
@@ -471,7 +483,7 @@ impl DropImports {
                 .collect(),
             Err(error) => {
                 tracing::warn!(%error, "drop import jobs unreadable; staging left as is");
-                return;
+                return sweep_stopped(error);
             }
         };
         let root = self.root.clone();
@@ -498,6 +510,7 @@ impl DropImports {
         if let Err(error) = swept {
             tracing::warn!(%error, "drop staging sweep did not run");
         }
+        Ok(())
     }
 
     /// Run one job to the end; a crash records a failed job instead of
@@ -545,24 +558,16 @@ impl DropImports {
             self.store
                 .set_job_status(&job.id, job_status::FAILED, Some(error))
                 .await
-                .map_err(|error| error.0)?;
+                .map_err(|error| error.to_string())?;
             self.publish(&job.user_id, &job.id);
             return Ok((job_status::FAILED, 0));
         }
-        let mut items = Vec::with_capacity(units.len());
-        for unit in units {
-            let paths: Vec<String> = unit
-                .files
-                .iter()
-                .map(|path| path.to_string_lossy().into_owned())
-                .collect();
-            let id = self
-                .store
-                .add_item(&job.id, &unit.folder_name, &paths)
-                .await
-                .map_err(|error| error.0)?;
-            items.push((id, unit));
-        }
+        let ids = self
+            .store
+            .add_items(&job.id, units.iter().map(item_paths).collect())
+            .await
+            .map_err(|error| error.to_string())?;
+        let items: Vec<_> = ids.into_iter().zip(units).collect();
         self.publish(&job.user_id, &job.id);
         let count = items.len();
         for (id, unit) in items {
@@ -587,7 +592,7 @@ impl DropImports {
         self.store
             .set_job_status(&job.id, job_status::COMPLETED, note)
             .await
-            .map_err(|error| error.0)?;
+            .map_err(|error| error.to_string())?;
         self.tidy(job).await;
         self.publish(&job.user_id, &job.id);
         Ok((job_status::COMPLETED, count))
@@ -604,7 +609,7 @@ impl DropImports {
             .store
             .get_item(item_id)
             .await
-            .map_err(|error| error.0)?
+            .map_err(|error| error.to_string())?
             .ok_or("item vanished")?;
         let library = self
             .library()
@@ -1078,7 +1083,7 @@ impl DropImports {
 
     /// After files reached the library: tell plugins, and when the album
     /// is now complete, resolve its request and wanted watch and tell
-    /// everyone else who asked for it (v2 `_after_import`).
+    /// everyone else who asked for it.
     async fn after_import(
         &self,
         job: &JobRecord,
@@ -1192,7 +1197,7 @@ impl DropImports {
 /// imports every paired file of a track the library lacks (their choice of
 /// album is the authority), but a far file never stands in for an owned
 /// track. With `extras`, files the release does not list go with the album
-/// (v2 kept bonus files alongside it). `None` when nothing was found.
+/// (bonus files stay beside it). `None` when nothing was found.
 pub(crate) fn album_pairing(
     summary: &MatchSummary,
     files: usize,
@@ -1292,7 +1297,7 @@ fn with_unreadable(detail: Option<String>, unreadable: usize) -> Option<String> 
     })
 }
 
-/// The settled item's summary (v2 `_finish_item` wording).
+/// The settled item's summary.
 fn describe(done: &Counts, unreadable: usize, complete: bool) -> String {
     let plural = |count: usize, one: &str, many: &str| {
         if count == 1 {

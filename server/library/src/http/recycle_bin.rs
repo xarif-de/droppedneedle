@@ -4,18 +4,21 @@
 //! run of the bin's expiry with no retention. Put back is the album's
 //! removal route.
 
+use crate::manage::Publishing;
 use axum::{Json, extract::State, http::StatusCode};
 use droppedneedle_auth::Admin;
 use droppedneedle_kernel::error::{ApiError, Unavailable};
 use droppedneedle_kernel::extract::{ValidJson, ValidQuery};
 use droppedneedle_kernel::mount::{Routes, routes};
+use droppedneedle_kernel::page::{Page, PageRequest};
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 
+use super::blocking;
 use crate::publish::PublishError;
 use crate::publish::bin_contents::{self, BinGroup, BinKind};
 use crate::recycle_bin::{self, Emptied, EmptyingState};
-use crate::wiring::{LibraryServices, LibrarySetup};
+use crate::wiring::LibraryServices;
 
 /// Recycle bin routes.
 pub fn routes() -> Routes<LibraryServices> {
@@ -71,9 +74,8 @@ pub struct BinRemovalView {
 /// One page of the recycle bin, newest first.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct RecycleBinPage {
-    pub items: Vec<BinRemovalView>,
-    /// Pass back as `cursor` for the next page; absent on the last.
-    pub next_cursor: Option<String>,
+    #[serde(flatten)]
+    pub page: Page<BinRemovalView>,
     /// Days a copy stays in the bin; absent while it can't be read.
     pub retention_days: Option<i64>,
     /// The bins can be looked at now.
@@ -86,7 +88,7 @@ pub struct RecycleBinPage {
 pub struct RecycleBinQuery {
     /// The previous page's `next_cursor`.
     pub cursor: Option<String>,
-    /// Items per page, 1 to 100 (50 by default).
+    /// Items per page, 1 to 100 (50 by default); more is read as 100.
     pub limit: Option<u32>,
 }
 
@@ -137,31 +139,18 @@ pub struct EmptyRecycleBinView {
     params(RecycleBinQuery),
     responses(
         (status = 200, description = "A page of the recycle bin", body = RecycleBinPage),
-        (status = 400, description = "Bad cursor or limit"),
+        (status = 400, description = "Bad cursor"),
         (status = 401, description = "Not authenticated"),
         (status = 403, description = "Admin role required"),
         (status = 503, description = "The server is busy; try again"),
     )
 )]
 pub async fn list_recycle_bin(
-    State(state): State<LibrarySetup>,
+    State(state): State<Publishing>,
     _caller: Admin,
     ValidQuery(query): ValidQuery<RecycleBinQuery>,
 ) -> Result<Json<RecycleBinPage>, ApiError> {
-    let limit = query.limit.unwrap_or(50);
-    if !(1..=100).contains(&limit) {
-        return Err(ApiError::invalid_input("Limit must be 1 to 100"));
-    }
-    let cursor = match query.cursor.as_deref().filter(|raw| !raw.is_empty()) {
-        None => None,
-        Some(raw) => Some(
-            raw.split_once('|')
-                .and_then(|(at, id)| Some((at.parse::<i64>().ok()?, id.to_owned())))
-                .ok_or_else(|| {
-                    ApiError::invalid_input("That cursor is not valid; start from the first page.")
-                })?,
-        ),
-    };
+    let paging = PageRequest::read(query.limit, query.cursor.as_deref(), 50, 100)?;
     let retention_days = state
         .settings
         .download_policy
@@ -169,18 +158,19 @@ pub async fn list_recycle_bin(
         .map(|policy| policy.recycle_retention_days.max(0));
     let (page, bins_known) = blocking(move || {
         let sandbox = state.expiry_sandbox();
-        let page = bin_contents::page(&state.db, sandbox.as_ref(), cursor, limit as usize)?;
-        Ok((page, sandbox.is_some()))
+        bin_contents::page(&state.db, sandbox.as_ref(), paging.after, paging.limit)
+            .map(|page| (page, sandbox.is_some()))
+            .map_err(publish_error)
     })
     .await?;
-    let next_cursor = page.next.map(|(at, id)| format!("{at}|{id}"));
     Ok(Json(RecycleBinPage {
-        items: page
-            .items
-            .into_iter()
-            .map(|group| view(group, retention_days))
-            .collect(),
-        next_cursor,
+        page: Page::new(
+            page.items
+                .into_iter()
+                .map(|group| view(group, retention_days))
+                .collect(),
+            page.next,
+        ),
         retention_days,
         bins_known,
     }))
@@ -225,13 +215,13 @@ fn view(group: BinGroup, retention_days: Option<i64>) -> BinRemovalView {
     )
 )]
 pub async fn recycle_bin_summary(
-    State(state): State<LibrarySetup>,
+    State(state): State<Publishing>,
     _caller: Admin,
 ) -> Result<Json<RecycleBinSummary>, ApiError> {
-    let as_of = state.clock.now_ms();
+    let as_of = state.core.clock.now_ms();
     let summary = blocking(move || {
         let sandbox = state.expiry_sandbox();
-        bin_contents::summary(&state.db, sandbox.as_ref(), as_of)
+        bin_contents::summary(&state.db, sandbox.as_ref(), as_of).map_err(publish_error)
     })
     .await?;
     Ok(Json(RecycleBinSummary {
@@ -256,14 +246,12 @@ pub async fn recycle_bin_summary(
     )
 )]
 pub async fn recycle_bin_status(
-    State(state): State<LibrarySetup>,
+    State(state): State<Publishing>,
     _caller: Admin,
 ) -> Result<Json<RecycleBinStatus>, ApiError> {
     let emptying = recycle_bin::state(&state).await.map_err(db_error)?;
-    let last_emptied = tokio::task::spawn_blocking(move || recycle_bin::last_emptied(&state))
-        .await
-        .map_err(ApiError::internal)?
-        .map_err(db_error)?;
+    let last_emptied =
+        blocking(move || recycle_bin::last_emptied(&state).map_err(db_error)).await?;
     Ok(Json(RecycleBinStatus {
         state: emptying,
         last_emptied,
@@ -288,23 +276,21 @@ pub async fn recycle_bin_status(
     )
 )]
 pub async fn empty_recycle_bin(
-    State(state): State<LibrarySetup>,
+    State(state): State<Publishing>,
     caller: Admin,
     ValidJson(body): ValidJson<EmptyRecycleBinBody>,
 ) -> Result<(StatusCode, Json<EmptyRecycleBinView>), ApiError> {
     let actor = caller.user_id().to_owned();
-    let enqueued = tokio::task::spawn_blocking(move || {
-        recycle_bin::request_empty(&state, body.before, &actor)
+    let enqueued = blocking(move || {
+        recycle_bin::request_empty(&state, body.before, &actor).map_err(|error| {
+            if error.is_busy() {
+                ApiError::unavailable(Unavailable::ServerBusy, error)
+            } else {
+                ApiError::internal(error)
+            }
+        })
     })
-    .await
-    .map_err(ApiError::internal)?
-    .map_err(|error| {
-        if error.is_busy() {
-            ApiError::unavailable(Unavailable::ServerBusy, error)
-        } else {
-            ApiError::internal(error)
-        }
-    })?;
+    .await?;
     Ok((
         StatusCode::ACCEPTED,
         Json(EmptyRecycleBinView {
@@ -323,17 +309,10 @@ fn db_error(error: droppedneedle_kernel::db::DbError) -> ApiError {
     }
 }
 
-async fn blocking<T: Send + 'static>(
-    work: impl FnOnce() -> Result<T, PublishError> + Send + 'static,
-) -> Result<T, ApiError> {
-    tokio::task::spawn_blocking(work)
-        .await
-        .map_err(ApiError::internal)?
-        .map_err(|error| {
-            if error.wrote_nothing() {
-                ApiError::unavailable(Unavailable::ServerBusy, error)
-            } else {
-                ApiError::internal(error)
-            }
-        })
+fn publish_error(error: PublishError) -> ApiError {
+    if error.wrote_nothing() {
+        ApiError::unavailable(Unavailable::ServerBusy, error)
+    } else {
+        ApiError::internal(error)
+    }
 }

@@ -1,11 +1,14 @@
-import { createMutation, createQuery } from '@tanstack/svelte-query';
+import { createInfiniteQuery, createMutation, createQuery } from '@tanstack/svelte-query';
 import type { Getter } from 'runed';
 
 import { api } from '$lib/api/client';
+import { v3 } from '$lib/api/v3/endpoint';
 import type { components } from '$lib/api/v3/openapi';
 import { CACHE_TTL } from '$lib/constants';
 import { purchaseOptionsKey } from '$lib/queries/albums/GetItQueries.svelte';
 import { CATALOG_ENDPOINTS } from '$lib/queries/catalog/endpoints';
+import { REQUESTS_ENDPOINTS } from '$lib/queries/requests/endpoints';
+import { RequestQueryKeyFactory } from '$lib/queries/requests/RequestQueryKeyFactory';
 import { DownloadQueryKeyFactory } from '$lib/queries/downloads/DownloadQueryKeyFactory';
 import { LibraryQueryKeyFactory } from '$lib/queries/library/LibraryQueryKeyFactory';
 import { invalidateLibraryManagementSurfaces } from '$lib/queries/library-management/LibraryManagementInvalidation';
@@ -18,7 +21,7 @@ import { invalidateQueriesWithPersister, queryClient } from '$lib/queries/QueryC
 import { musicBrainzSourceKey } from '$lib/queries/musicbrainz/sourceScope.svelte';
 import { authStore } from '$lib/stores/authStore.svelte';
 import { LibraryV3Api } from '$lib/queries/library/LibraryV3Api';
-import { albumBasicCache, albumTracksCache } from '$lib/utils/albumDetailCache';
+import { AlbumQueryKeyFactory } from '$lib/queries/catalog/AlbumQueryKeyFactory';
 
 // Choosing an edition is for curators; the list of a group's editions is
 // open to any authenticated user.
@@ -48,6 +51,54 @@ export const getAlbumEditionsQuery = (
 		queryFn: ({ signal }) => api.global.v3.GET(CATALOG_ENDPOINTS.editions(mbid()), { signal })
 	}));
 
+export const editionTracksKey = (userId: EditionUserId, release: string) => {
+	const normalizedUserId = userId ?? null;
+	return [
+		'albums',
+		'edition-tracks',
+		normalizedUserId,
+		musicBrainzSourceKey(normalizedUserId),
+		release
+	] as const;
+};
+
+// One edition's tracklist, for an album the library does not hold.
+export const getEditionTracksQuery = (
+	getUserId: Getter<EditionUserId>,
+	group: Getter<string>,
+	release: Getter<string | null>,
+	enabled: Getter<boolean>
+) =>
+	createQuery(() => ({
+		queryKey: editionTracksKey(getUserId(), release() ?? ''),
+		enabled: enabled() && !!getUserId() && !!group() && !!release(),
+		staleTime: CACHE_TTL.ALBUM_DETAIL_EDITIONS,
+		queryFn: ({ signal }) =>
+			api.global.v3.GET(CATALOG_ENDPOINTS.editionTracks(group(), release() ?? ''), { signal })
+	}));
+
+// Switch a live request to another edition (curators). The answer says
+// whether it switched or the download had already started.
+export function switchRequestedEdition() {
+	return createMutation(() => ({
+		mutationFn: (input: {
+			group: string;
+			release: string;
+			artistName: string | null;
+			albumTitle: string;
+		}) =>
+			api.global.v3.POST(REQUESTS_ENDPOINTS.requestAlbum(), {
+				musicbrainz_id: input.group,
+				artist: input.artistName,
+				album: input.albumTitle,
+				release_mbid: input.release
+			}),
+		onSettled: () => {
+			void invalidateQueriesWithPersister({ queryKey: RequestQueryKeyFactory.all });
+		}
+	}));
+}
+
 export function acquireEdition() {
 	return createMutation(() => ({
 		mutationFn: ({
@@ -60,7 +111,8 @@ export function acquireEdition() {
 			replaceVersions?: boolean;
 		}) => api.global.v3.POST(CATALOG_ENDPOINTS.acquireEdition(mbid, copyId, replaceVersions)),
 		// The acquire starts a download task: show it in the queue, the album's
-		// download strip and the album's library status now, not on the next poll.
+		// download strip, its edition fetch and its library status now, not on
+		// the next poll.
 		onSuccess: (_data, { mbid }) => {
 			void invalidateQueriesWithPersister({
 				queryKey: DownloadQueryKeyFactory.tasksPrefix(authStore.user?.id)
@@ -70,12 +122,73 @@ export function acquireEdition() {
 	}));
 }
 
+// The album's current or last edition fetch, and where each track it asked
+// for is (curators). Kept under the user's download tasks, so starting,
+// cancelling or retrying any download reads it again.
+export type EditionFetch = components['schemas']['EditionFetchView'];
+export type EditionFetchTrackState = components['schemas']['EditionFetchTrackState'];
+
+export const editionFetchKey = (userId: EditionUserId, group: string) =>
+	[...DownloadQueryKeyFactory.tasks(userId ?? undefined), 'edition', group] as const;
+
+const EDITION_FETCH_POLL_MS = 2_500;
+
+export type EditionFetchAnswer = components['schemas']['EditionFetchResponse'];
+
+export function editionFetchLive(edition: EditionFetch | null | undefined): boolean {
+	return edition?.state === 'waiting' || edition?.state === 'fetching';
+}
+
+/** Tracks the fetch has landed so far. */
+function landedCount(edition: EditionFetch | null | undefined): number {
+	return edition?.tracks.filter((track) => track.state === 'landed').length ?? 0;
+}
+
+export const getEditionFetchQuery = (
+	getUserId: Getter<EditionUserId>,
+	getGroup: Getter<string>,
+	getLocalId: Getter<string>,
+	getEnabled: Getter<boolean> = () => true
+) =>
+	createQuery(() => {
+		const userId = getUserId();
+		const group = getGroup();
+		const localId = getLocalId();
+		const queryKey = editionFetchKey(userId, group);
+		return {
+			queryKey,
+			enabled: getEnabled() && !!userId && !!group,
+			staleTime: 0,
+			refetchInterval: (query: { state: { data?: EditionFetchAnswer } }) =>
+				editionFetchLive(query.state.data?.latest) ? EDITION_FETCH_POLL_MS : false,
+			queryFn: async ({ signal }: { signal: AbortSignal }): Promise<EditionFetchAnswer> => {
+				const before = queryClient.getQueryData<EditionFetchAnswer>(queryKey)?.latest;
+				const answer = await api.global.v3.GET(
+					v3('/api/v3/albums/{album_id}/edition/acquire', { path: { album_id: group } }),
+					{ signal }
+				);
+				// A track that landed, or a fetch that ended, changes the album's
+				// files: its edition plan and track rows are stale.
+				const after = answer.latest;
+				if (
+					localId &&
+					before &&
+					(landedCount(after) > landedCount(before) ||
+						(editionFetchLive(before) && !editionFetchLive(after)))
+				) {
+					invalidateEditionScope({ userId, localId, rgMbid: group });
+				}
+				return answer;
+			}
+		};
+	});
+
 // One library album's edition (library-local album id, never an RG MBID).
 // The album identity row is the edition: choosing one goes through the
 // library's one edition operation, which accepts any MusicBrainz release.
 export type EditionStatus = components['schemas']['EditionStatusView'];
 export type EditionChoice = components['schemas']['EditionChoiceView'];
-export type WaitingAlbums = components['schemas']['WaitingAlbumsResponse'];
+export type WaitingAlbums = components['schemas']['Page_WaitingAlbumView'];
 
 const editionKey = LibraryQueryKeyFactory.catalog.edition;
 const editionPlanKey = LibraryQueryKeyFactory.catalog.editionPlan;
@@ -153,8 +266,19 @@ export const getEditionPlanQuery = (
 // Put back.
 export function removeEditionExtras() {
 	return createMutation(() => ({
-		mutationFn: ({ localId, trackIds }: { localId: string; trackIds: string[] }) =>
-			api.global.v3.POST(LibraryV3Api.editionExtrasRemove(localId), { track_ids: trackIds }),
+		mutationFn: ({
+			localId,
+			trackIds,
+			identityRevision
+		}: {
+			localId: string;
+			trackIds: string[];
+			identityRevision: number;
+		}) =>
+			api.global.v3.POST(LibraryV3Api.editionExtrasRemove(localId), {
+				track_ids: trackIds,
+				expected_identity_revision: identityRevision
+			}),
 		onSuccess: (_data, { localId }) => {
 			const userId = authStore.user?.id;
 			invalidateEditionScope({ userId, localId });
@@ -205,8 +329,15 @@ export function matchEditionFile() {
 
 export function unmatchEditionFile() {
 	return createMutation(() => ({
-		mutationFn: ({ localId, trackId }: { localId: string; trackId: string }) =>
-			api.global.v3.DELETE(LibraryV3Api.editionFile(localId, trackId)),
+		mutationFn: ({
+			localId,
+			trackId,
+			identityRevision
+		}: {
+			localId: string;
+			trackId: string;
+			identityRevision: number;
+		}) => api.global.v3.DELETE(LibraryV3Api.editionFileUnmatch(localId, trackId, identityRevision)),
 		onSettled: (_data, _error, { localId }) => invalidateHandMatchScope(localId)
 	}));
 }
@@ -214,17 +345,23 @@ export function unmatchEditionFile() {
 export const getWaitingAlbumsQuery = (
 	getUserId: Getter<EditionUserId>,
 	getState: Getter<'unconfirmed' | 'unmatched'>,
-	getOffset: Getter<number>,
 	limit = 50
 ) =>
-	createQuery(() => ({
-		queryKey: LibraryQueryKeyFactory.catalog.unconfirmed(getUserId(), getState(), getOffset()),
-		enabled: !!getUserId(),
-		queryFn: ({ signal }) =>
-			api.global.v3.GET(LibraryV3Api.unconfirmed(getState(), limit, getOffset()), { signal })
-	}));
+	createInfiniteQuery(() => {
+		const state = getState();
+		return {
+			queryKey: LibraryQueryKeyFactory.catalog.unconfirmed(getUserId(), state),
+			enabled: !!getUserId(),
+			initialPageParam: undefined as string | undefined,
+			queryFn: ({ pageParam, signal }): Promise<WaitingAlbums> =>
+				api.global.v3.GET(LibraryV3Api.unconfirmed(state, limit, pageParam), { signal }),
+			getNextPageParam: (lastPage: WaitingAlbums) => lastPage.next_cursor ?? undefined
+		};
+	});
 
 type EditionTarget = { userId: EditionUserId; localId: string; rgMbid?: string };
+// The edition status's `identity_revision` the action was decided on.
+type GuardedEditionTarget = EditionTarget & { identityRevision: number };
 
 // Guards the per-album boundary: the local id must be known, and it must not
 // be the RG MBID itself.
@@ -254,18 +391,29 @@ function invalidateEditionScope(
 	];
 	for (const group of new Set([rgMbid, joinedGroup])) {
 		if (!group) continue;
-		albumBasicCache.remove(group);
-		albumTracksCache.remove(group);
-		keys.push(editionsKey(userId, group), purchaseOptionsKey(group));
+		keys.push(
+			AlbumQueryKeyFactory.basic(userId, group),
+			AlbumQueryKeyFactory.tracks(userId, group),
+			editionsKey(userId, group),
+			purchaseOptionsKey(group)
+		);
 	}
 	for (const queryKey of keys) void invalidateQueriesWithPersister({ queryKey });
 }
 
 export function chooseAlbumEdition() {
 	return createMutation(() => ({
-		mutationFn: ({ localId, rgMbid, releaseMbid }: EditionTarget & { releaseMbid: string }) => {
+		mutationFn: ({
+			localId,
+			rgMbid,
+			releaseMbid,
+			identityRevision
+		}: GuardedEditionTarget & { releaseMbid: string }) => {
 			assertLocalAlbumId(localId, rgMbid);
-			return api.global.v3.PUT(LibraryV3Api.edition(localId), { release_mbid: releaseMbid });
+			return api.global.v3.PUT(LibraryV3Api.edition(localId), {
+				release_mbid: releaseMbid,
+				expected_identity_revision: identityRevision
+			});
 		},
 		onSuccess: (choice, variables) => invalidateEditionScope(variables, choice.release_group_mbid)
 	}));
@@ -273,9 +421,9 @@ export function chooseAlbumEdition() {
 
 export function handBackAlbumEdition() {
 	return createMutation(() => ({
-		mutationFn: ({ localId, rgMbid }: EditionTarget) => {
+		mutationFn: ({ localId, rgMbid, identityRevision }: GuardedEditionTarget) => {
 			assertLocalAlbumId(localId, rgMbid);
-			return api.global.v3.DELETE(LibraryV3Api.edition(localId));
+			return api.global.v3.DELETE(LibraryV3Api.editionHandBack(localId, identityRevision));
 		},
 		onSuccess: (_d, variables) => invalidateEditionScope(variables)
 	}));
@@ -283,8 +431,10 @@ export function handBackAlbumEdition() {
 
 export function confirmAlbumEdition() {
 	return createMutation(() => ({
-		mutationFn: ({ localId }: EditionTarget) =>
-			api.global.v3.POST(LibraryV3Api.editionConfirm(localId)),
+		mutationFn: ({ localId, identityRevision }: GuardedEditionTarget) =>
+			api.global.v3.POST(LibraryV3Api.editionConfirm(localId), {
+				expected_identity_revision: identityRevision
+			}),
 		onSuccess: (_d, variables) => invalidateEditionScope(variables)
 	}));
 }
@@ -443,8 +593,10 @@ export function undoTagWrite() {
 
 export function undoAlbumEdition() {
 	return createMutation(() => ({
-		mutationFn: ({ localId }: EditionTarget) =>
-			api.global.v3.POST(LibraryV3Api.editionUndo(localId)),
+		mutationFn: ({ localId, identityRevision }: GuardedEditionTarget) =>
+			api.global.v3.POST(LibraryV3Api.editionUndo(localId), {
+				expected_identity_revision: identityRevision
+			}),
 		onSuccess: (_d, variables) => {
 			invalidateHeldEditionScope(variables);
 			// Identity reports list this album's change too.

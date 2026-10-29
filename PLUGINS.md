@@ -25,6 +25,8 @@ What DroppedNeedle does to keep a plugin in its lane:
   it. The install screen shows that commit, the plugin's version, and what it
   asks to do, before anything is written. If the repository changes between
   the preview and the install, the install stops and asks you to look again.
+  An update stays the kind of install you chose, and stops if the
+  repository at that address was deleted and created again.
 - **Each plugin is its own process.** If it crashes, only that plugin stops;
   DroppedNeedle restarts it after a short wait (1 second, doubling up to 5
   minutes). If it hangs, its calls time out and the rest of the server
@@ -67,9 +69,12 @@ disabled; enable it, fill in its settings, and save.
 To update later, press **Update** on the plugin. What moves depends on how
 it was installed:
 
-- From releases (a plain repository URL): to the newest release.
+- From releases (a plain repository URL): to the newest release. If the
+  repository has no releases any more, the update stops; install it again
+  from a `/tree/` or `/commit/` URL to pick a branch, tag or commit.
 - From a branch (a `/tree/` URL, or the default branch of a repository with
   no releases): to the branch's newest commit, only when you press Update.
+  It stays on the branch even if the repository has releases now.
 - From a tag or a commit: nowhere. Those pins stay until you install a
   different version.
 
@@ -84,6 +89,10 @@ Plugins:
 ```bash
 cp -r examples/plugins/webhook-scrobbler /path/to/app/plugins/
 ```
+
+If you edit a running plugin's files in place, it starts again with the new
+code the next time plugins reload: a settings save, an install, an update or
+a server restart.
 
 Under Docker the plugins directory is `/app/plugins`. **Mount it as a
 volume**, or installed plugins disappear when the container is recreated.
@@ -126,7 +135,7 @@ silently ignored.
 name = "acme-music"                 # lowercase letters, digits and dashes, up to 32
 display_name = "Acme Music"
 version = "1.0.0"
-api_version = 1
+api_version = 2                     # the plugin API this host reads
 entrypoint = "plugin:AcmeMusic"     # <python module>:<class>
 capabilities = ["download_client", "indexer", "scheduler"]
 description = "One line about what it does."
@@ -164,9 +173,17 @@ pages = ["panel"]
 # external_url = "https://acme-music.test/setup"   # or a link instead
 ```
 
-`api_version = 0` is the older, frozen contract: only `scrobbler` and
-`purchase_links`, no `[schedule]`, `[[route]]` or `[plugin_ui]`. Manifests
-from DroppedNeedle v2 load unchanged.
+`plugin.toml` is ordinary TOML: arrays may span lines, and strings may use
+single quotes. A capability not in the table below is an error, and so is
+a `homepage` that is not an `http` or `https` address.
+
+This DroppedNeedle reads plugin API version 2 only. A manifest with any
+other `api_version`, including 0 and 1 from DroppedNeedle v2, is refused
+before its code runs:
+
+```
+acme-music: written for api_version 1; this DroppedNeedle reads api_version 2; see Porting a v2 plugin in PLUGINS.md
+```
 
 ### Settings
 
@@ -203,8 +220,13 @@ server carries on as if the plugin had said nothing.
 | `indexer` | `search_album(...)`, `search_track(...)` | 35 s | no results from it |
 | `download_client` | `enqueue`, `get_status`, `inspect_materialization`, `discard_client_artifacts`, `abort` | 120 s enqueue, 30 s others | the download fails over |
 
-Every plugin may also have `is_configured()` and `health_check()`; they feed
-the plugin's health in Settings and the source list.
+Every plugin may also have `is_configured()` and `health_check()`. The server
+asks for them once the plugin is running, after every settings save, and
+again when Settings or a source list is opened and the last answer is over a
+minute old. The answer (status, message, and whether it is configured) shows
+on the plugin's card in Settings > Plugins and in the source lists. A plugin
+without them counts as healthy and configured; one that fails or does not
+answer within 10 seconds shows as an error.
 
 ### scrobbler
 
@@ -420,10 +442,15 @@ PluginSearchResult(
 ```
 
 You rank your source; DroppedNeedle applies its rules on top, the same as
-for every other source: quarantined releases, ignored and required terms, the
-size limit and the quality range drop results. A score of 0.70 or more
-downloads automatically; 0.50 to 0.70 is kept back for a person to pick;
-lower is dropped. When a download fails, the next result is tried.
+for every other source. Quarantined releases are dropped. A score of
+`preflight_score_auto_accept` (0.70 by default) or more downloads
+automatically. A score from `preflight_score_manual_min` (0.50 by default) up
+to that is kept back for a person to pick. Both cut-offs are download policy
+settings. A result with a lower score, an ignored term, a missing required
+term, a size over the limit or a quality outside the range never downloads by
+itself: a person searching by hand sees it last, with the reason, and can
+still pick it after confirming. When a download fails, the next result is
+tried.
 
 The client then gets `enqueue(request)` with `task_id`, `source`, `files`,
 `payload`, `job_name` and `download_type`, and returns a `TaskHandle`. Every
@@ -471,8 +498,11 @@ With `[plugin_ui] entry`, the admin's plugin card shows the plugin's own
 script in a locked-down frame: no access to the page or its cookies, and no
 requests of its own. It can talk to the page only through `postMessage`, with four
 read-only requests: `sources.list`, `search.preview`, `get_settings` (its own,
-secrets masked) and `health.get` (its own). `external_url` shows a link
-instead.
+secrets masked) and `health.get` (its own). `search.preview` with `{query}`
+calls the plugin's own `search` route
+(`GET /api/v3/plugins/ext/<plugin>/search?query=...`), so a panel that uses
+it needs the `publisher` capability and a `[[route]] path = "search"`.
+`external_url` shows a link instead.
 
 The server reads the script from inside the plugin folder and serves it to
 admins only, inlined into a small page of its own with an empty
@@ -515,7 +545,12 @@ too, one entry per line.
 
 ### Porting a v2 plugin
 
-1. Change the imports. Everything v2 plugins imported from
+1. Set `api_version = 2` in `plugin.toml`. The rest of a v2 manifest
+   reads as it is, as long as `name` uses only lowercase letters, digits
+   and dashes, `homepage`, if set, is an `http` or `https` address, and
+   each value has its proper type (text quoted, `secret` `true` or
+   `false`).
+2. Change the imports. Everything v2 plugins imported from
    `infrastructure.plugins.protocols`, `models.common` and
    `repositories.protocols.*` now comes from `droppedneedle_plugin`:
 
@@ -523,17 +558,18 @@ too, one entry per line.
    from droppedneedle_plugin import PluginRouteResponse, ServiceStatus, TaskHandle
    ```
 
-2. If you used `ctx.http` like `httpx`, it keeps working for the common calls
+3. If you used `ctx.http` like `httpx`, it keeps working for the common calls
    above. Streaming responses and client options are not there.
-3. Anything that reached into the server's own Python code no longer exists;
+4. Anything that reached into the server's own Python code no longer exists;
    use `ctx` instead. `plugin_write_library_file(plugin_name=..., rel_path=...,
    data=...)` becomes `await ctx.write_library_file(rel_path, data)`. Paths may
    now contain dots, and an existing file is never replaced (v2 replaced it).
-4. State you kept in memory is lost when the plugin restarts (it is a separate
+5. State you kept in memory is lost when the plugin restarts (it is a separate
    process now). Keep anything important in `ctx.state_set` or in files under
    `ctx.data_dir`.
 
-`plugin.toml` stays as it was.
+A v2 plugin's settings come across in an upgrade, switched off. Once the
+ported plugin is installed, switch it on in Settings > Plugins.
 
 ## The protocol
 
@@ -551,7 +587,7 @@ of this; you need it only for a plugin in another language.
    {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
      "protocol_version": 1,
      "host": {"name": "droppedneedle", "version": "3.0.0"},
-     "plugin": {"name": "acme-music", "version": "1.0.0", "api_version": 1,
+     "plugin": {"name": "acme-music", "version": "1.0.0", "api_version": 2,
                 "entrypoint": "plugin:AcmeMusic", "capabilities": ["indexer"]},
      "settings": {"api_key": "..."},
      "plugin_dir": "/app/plugins/acme-music",
@@ -621,7 +657,7 @@ at most 1000 keys and 64 MiB in total. `host.log` is a notification with `{level
 
 All in `examples/plugins/`, all using fictional hosts:
 
-- `webhook-scrobbler`: `scrobbler`, the smallest plugin (v0 manifest).
+- `webhook-scrobbler`: `scrobbler`, the smallest plugin.
 - `metadata-joke-toy`: `metadata_provider` and `purchase_links`.
 - `events-echo-toy`: `subscriber`, `publisher` and routes.
 - `stream-toy`: `streaming_source` with a file in its own folder.

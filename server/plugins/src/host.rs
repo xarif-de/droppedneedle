@@ -21,12 +21,13 @@ use std::sync::{Arc, Mutex, Weak};
 
 use serde_json::Value;
 
+use droppedneedle_kernel::jobs::plugin_ticks::{SqliteTickStore, TickStoreError};
 use droppedneedle_kernel::runtime_config::ConfigStore;
 use droppedneedle_kernel::runtime_config::sections::PluginConfig;
 
 use super::capabilities::events::EventState;
-use super::manifest::{PluginManifest, active_capabilities, load_manifest};
-use super::models::PluginSource;
+use super::manifest::{Capability, PluginManifest, load_manifest};
+use super::models::{PluginHealth, PluginHealthStatus, PluginSource, PluginSourceHealth};
 use super::protocol::{RpcError, codes, methods};
 use super::runtime::{
     BoxFuture, HostServices, LaunchSpec, PluginConnection, PluginLauncher, PublishPayload,
@@ -37,24 +38,12 @@ use super::runtime::{
 /// Hidden, so discovery skips it.
 pub const DATA_FOLDER: &str = ".data";
 
-/// Durable per-plugin key/value state, reached by plugins through
-/// `host.state.get` and `host.state.set`. Production backs it with the
-/// jobs tick store (SQLite), so state survives restarts and reinstalls.
-pub trait PluginStateStore: Send + Sync {
-    /// Read one key; `None` when unset.
-    fn read<'a>(
-        &'a self,
-        plugin: &'a str,
-        key: &'a str,
-    ) -> BoxFuture<'a, Result<Option<Vec<u8>>, String>>;
-    /// Write one key.
-    fn write<'a>(
-        &'a self,
-        plugin: &'a str,
-        key: &'a str,
-        value: Vec<u8>,
-    ) -> BoxFuture<'a, Result<(), String>>;
-}
+/// A list read asks a plugin for its health again when the last answer is
+/// older than this.
+const HEALTH_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Most entries of a plugin folder the code fingerprint reads.
+const FINGERPRINT_ENTRIES_MAX: usize = 4096;
 
 /// One discovered plugin.
 #[derive(Clone)]
@@ -66,9 +55,8 @@ pub struct LoadedPlugin {
     /// Load failure: an invalid manifest, unreadable settings, or a
     /// launch that could not start.
     pub error: Option<String>,
-    /// Declared capabilities this host dispatches to (those active for the
-    /// manifest's `api_version`). Empty while disabled.
-    pub active_capabilities: Vec<String>,
+    /// Declared capabilities this host dispatches to. Empty while disabled.
+    pub active_capabilities: Vec<Capability>,
     /// On-disk folder. It need not equal the manifest name; uninstall
     /// removes exactly this one.
     pub directory: String,
@@ -78,15 +66,18 @@ pub struct LoadedPlugin {
 
 impl LoadedPlugin {
     /// Whether calls for `capability` should go to this plugin.
-    pub fn serves(&self, capability: &str) -> bool {
-        self.enabled
-            && self.runtime.is_some()
-            && self.active_capabilities.iter().any(|c| c == capability)
+    pub fn serves(&self, capability: Capability) -> bool {
+        self.enabled && self.runtime.is_some() && self.active_capabilities.contains(&capability)
     }
 
     /// Runtime health, or `None` while disabled.
     pub fn runtime_status(&self) -> Option<RuntimeStatus> {
         self.runtime.as_ref().map(|runtime| runtime.status())
+    }
+
+    /// The plugin's own health answer in its current run, once it gave one.
+    pub fn health(&self) -> Option<PluginHealth> {
+        self.runtime.as_ref().and_then(|runtime| runtime.health())
     }
 }
 
@@ -143,8 +134,10 @@ pub struct PluginHost {
     /// Bumped after every reload; acquisition wakes its download worker
     /// on it, so enabling a download client takes effect at once.
     generation: tokio::sync::watch::Sender<u64>,
-    /// Backs the `host.state.*` requests.
-    state: Arc<dyn PluginStateStore>,
+    /// Durable per-plugin key/value state behind the `host.state.*`
+    /// requests, shared with the tick loops, so state survives restarts
+    /// and reinstalls.
+    state: SqliteTickStore,
     /// Subscriber fan-out and publish bookkeeping.
     pub(super) events: EventState,
     /// Library writes per plugin (`host.library.write`).
@@ -162,7 +155,7 @@ impl PluginHost {
         plugins_dir: PathBuf,
         config: Arc<ConfigStore>,
         launcher: Arc<dyn PluginLauncher>,
-        state: Arc<dyn PluginStateStore>,
+        state: SqliteTickStore,
         library: droppedneedle_library::wiring::LibraryCore,
     ) -> Arc<Self> {
         Arc::new_cyclic(|me| Self {
@@ -338,23 +331,7 @@ impl PluginHost {
                 return;
             }
         };
-        let active_set = active_capabilities(manifest.api_version);
-        let active: Vec<String> = manifest
-            .capabilities
-            .iter()
-            .filter(|capability| {
-                let active = active_set.contains(&capability.as_str());
-                if !active {
-                    tracing::info!(
-                        plugin = %manifest.name,
-                        %capability,
-                        "capability reserved for api_version 1, not active"
-                    );
-                }
-                active
-            })
-            .cloned()
-            .collect();
+        let active = manifest.capabilities.clone();
         plugins.insert(
             manifest.name.clone(),
             LoadedPlugin {
@@ -437,7 +414,8 @@ impl PluginHost {
         futures_util::future::join_all(stops).await;
     }
 
-    /// Every discovered plugin, sorted by name.
+    /// Every discovered plugin, sorted by name. A stale health answer is
+    /// asked again in the background; the list never waits for it.
     pub fn list_plugins(&self) -> Vec<LoadedPlugin> {
         let mut plugins = self
             .plugins
@@ -445,6 +423,11 @@ impl PluginHost {
             .map(|guard| guard.values().cloned().collect::<Vec<_>>())
             .unwrap_or_default();
         plugins.sort_by(|left, right| left.manifest.name.cmp(&right.manifest.name));
+        for plugin in &plugins {
+            if let Some(runtime) = &plugin.runtime {
+                runtime.refresh_health(HEALTH_MAX_AGE);
+            }
+        }
         plugins
     }
 
@@ -458,7 +441,7 @@ impl PluginHost {
 
     /// Enabled plugins serving one capability, sorted by name so fan-outs
     /// and first-hit lookups are deterministic.
-    pub fn serving(&self, capability: &str) -> Vec<LoadedPlugin> {
+    pub fn serving(&self, capability: Capability) -> Vec<LoadedPlugin> {
         let mut plugins: Vec<LoadedPlugin> = self
             .plugins
             .lock()
@@ -482,10 +465,10 @@ impl PluginHost {
             let mut display = manifest.display_name.clone();
             let mut target_source = String::new();
             for cap in &manifest.capability_configs {
-                if cap.id == "download_client" && !cap.display_name.is_empty() {
+                if cap.id == Capability::DownloadClient && !cap.display_name.is_empty() {
                     display = cap.display_name.clone();
                 }
-                if cap.id == "indexer" && !cap.target_source.is_empty() {
+                if cap.id == Capability::Indexer && !cap.target_source.is_empty() {
                     target_source = cap.target_source.clone();
                 }
             }
@@ -499,7 +482,13 @@ impl PluginHost {
             if key != "usenet" && !super::manifest::valid_plugin_key(&key) {
                 return;
             }
-            let health = source_health(plugin.runtime_status().as_ref());
+            if let Some(runtime) = &plugin.runtime {
+                runtime.refresh_health(HEALTH_MAX_AGE);
+            }
+            let answer = plugin.health();
+            let health = source_health(plugin.runtime_status().as_ref(), answer.as_ref());
+            let configured = answer.as_ref().is_some_and(|answer| answer.configured);
+            let message = answer.map(|answer| answer.message).unwrap_or_default();
             let target = if target_source.is_empty() {
                 key.clone()
             } else {
@@ -509,11 +498,12 @@ impl PluginHost {
                 Some(existing) => {
                     existing.has_client = existing.has_client || is_client;
                     existing.has_indexer = existing.has_indexer || is_indexer;
-                    existing.configured = existing.configured || plugin.enabled;
+                    existing.configured = existing.configured || configured;
                     if is_client {
                         existing.plugin = manifest.name.clone();
                         existing.display_name = display;
-                        existing.health = health.to_owned();
+                        existing.health = health;
+                        existing.health_message = message;
                     }
                 }
                 None => {
@@ -526,17 +516,18 @@ impl PluginHost {
                             has_client: is_client,
                             has_indexer: is_indexer,
                             target_source: target,
-                            configured: plugin.enabled,
-                            health: health.to_owned(),
+                            configured,
+                            health,
+                            health_message: message,
                         },
                     );
                 }
             }
         };
-        for plugin in self.serving("download_client") {
+        for plugin in self.serving(Capability::DownloadClient) {
             seen(&plugin, true, false);
         }
-        for plugin in self.serving("indexer") {
+        for plugin in self.serving(Capability::Indexer) {
             seen(&plugin, false, true);
         }
         let mut sources: Vec<PluginSource> = by_key.into_values().collect();
@@ -592,7 +583,7 @@ impl PluginHost {
 
     /// Enabled scheduler plugins mapped to their loops, sorted by name.
     pub fn desired_ticks(&self) -> Vec<DesiredTick> {
-        self.serving("scheduler")
+        self.serving(Capability::Scheduler)
             .into_iter()
             .map(|plugin| {
                 let schedule = plugin.manifest.schedule.as_ref();
@@ -610,33 +601,106 @@ impl PluginHost {
             .collect()
     }
 
-    fn state_store(&self) -> Arc<dyn PluginStateStore> {
-        self.state.clone()
+    /// One setting as the running plugin got it (secrets opened), or
+    /// `None` while it is not running.
+    pub(super) fn running_setting(&self, name: &str, key: &str) -> Option<String> {
+        self.running
+            .lock()
+            .ok()?
+            .get(name)
+            .and_then(|entry| entry.settings.get(key).cloned())
+    }
+
+    /// One plugin's state key; an unset key or a plugin the store has not
+    /// met yet reads as empty.
+    async fn read_state(&self, plugin: &str, key: &str) -> Result<Option<Vec<u8>>, String> {
+        match self.state.read(plugin, key).await {
+            Ok(found) => Ok(found),
+            Err(TickStoreError::NotFound(_)) | Err(TickStoreError::UnknownPlugin(_)) => Ok(None),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    /// Store one plugin's state key, registering the plugin first.
+    async fn write_state(&self, plugin: &str, key: &str, value: Vec<u8>) -> Result<(), String> {
+        self.state.add_plugin(plugin);
+        self.state
+            .write(plugin, key, value)
+            .await
+            .map_err(|error| error.to_string())
     }
 }
 
-/// Source health from runtime health: a closed set the UI understands.
-fn source_health(status: Option<&RuntimeStatus>) -> &'static str {
+/// Source health from the process state and, while it runs, the plugin's
+/// own answer.
+fn source_health(
+    status: Option<&RuntimeStatus>,
+    answer: Option<&PluginHealth>,
+) -> PluginSourceHealth {
     match status.map(|status| status.state) {
-        Some(RuntimeState::Running) => "ok",
-        Some(RuntimeState::Starting) => "unknown",
-        Some(RuntimeState::Restarting) => "degraded",
-        Some(RuntimeState::Failed) => "error",
-        Some(RuntimeState::Stopped) | None => "unknown",
+        Some(RuntimeState::Running) => match answer.map(|answer| answer.status) {
+            Some(PluginHealthStatus::Ok) => PluginSourceHealth::Ok,
+            Some(PluginHealthStatus::Error) => PluginSourceHealth::Error,
+            None => PluginSourceHealth::Unknown,
+        },
+        Some(RuntimeState::Restarting) => PluginSourceHealth::Degraded,
+        Some(RuntimeState::Failed) => PluginSourceHealth::Error,
+        Some(RuntimeState::Starting | RuntimeState::Stopped) | None => PluginSourceHealth::Unknown,
     }
 }
 
-/// Code identity for one plugin folder: a reinstall rewrites `plugin.toml`,
-/// so its modification time changes whenever the code does.
+/// Code identity for one plugin folder: the manifest's launch fields plus
+/// every entry below the folder (relative path, size and modification
+/// time), so editing any file relaunches the plugin on the next reload.
+/// Links are recorded, never followed, and the walk stops after
+/// [`FINGERPRINT_ENTRIES_MAX`] entries.
 fn fingerprint(plugin_dir: &Path, manifest: &PluginManifest) -> String {
-    let modified = std::fs::metadata(plugin_dir.join("plugin.toml"))
-        .and_then(|meta| meta.modified())
-        .ok()
-        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|elapsed| elapsed.as_nanos())
-        .unwrap_or(0);
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::hash::DefaultHasher::new();
+    let mut seen = 0usize;
+    let mut folders = vec![PathBuf::new()];
+    while let Some(relative) = folders.pop() {
+        let mut entries: Vec<(PathBuf, std::fs::Metadata)> = match std::fs::read_dir(
+            plugin_dir.join(&relative),
+        ) {
+            Ok(entries) => entries
+                .filter_map(|entry| {
+                    let entry = entry.ok()?;
+                    let meta = entry.metadata().ok()?;
+                    Some((relative.join(entry.file_name()), meta))
+                })
+                .collect(),
+            Err(error) => {
+                tracing::warn!(folder = %plugin_dir.join(&relative).display(), %error, "plugin folder unreadable");
+                continue;
+            }
+        };
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        for (path, meta) in entries {
+            if seen == FINGERPRINT_ENTRIES_MAX {
+                tracing::warn!(folder = %plugin_dir.display(), "plugin folder too large to fingerprint in full");
+                return finish_fingerprint(plugin_dir, manifest, hasher.finish());
+            }
+            seen += 1;
+            path.hash(&mut hasher);
+            meta.len().hash(&mut hasher);
+            meta.file_type().is_symlink().hash(&mut hasher);
+            meta.modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|elapsed| elapsed.as_nanos())
+                .hash(&mut hasher);
+            if meta.is_dir() {
+                folders.push(path);
+            }
+        }
+    }
+    finish_fingerprint(plugin_dir, manifest, hasher.finish())
+}
+
+fn finish_fingerprint(plugin_dir: &Path, manifest: &PluginManifest, files: u64) -> String {
     format!(
-        "{}|{}|{}|{:?}|{modified}",
+        "{}|{}|{}|{:?}|{files:016x}",
         plugin_dir.display(),
         manifest.version,
         manifest.entrypoint,
@@ -724,9 +788,8 @@ impl HostServices for HostRequests {
                 }
                 methods::HOST_STATE_GET => {
                     let key = state_key(&params)?;
-                    let store = host.state_store();
-                    let value = store
-                        .read(plugin, &key)
+                    let value = host
+                        .read_state(plugin, &key)
                         .await
                         .map_err(|reason| RpcError::new(codes::INTERNAL_ERROR, reason))?;
                     let text = value.map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
@@ -743,9 +806,7 @@ impl HostServices for HostRequests {
                     if value.len() > STATE_VALUE_MAX {
                         return Err(RpcError::new(codes::INVALID_PARAMS, "value is over 1 MiB"));
                     }
-                    let store = host.state_store();
-                    store
-                        .write(plugin, &key, value.as_bytes().to_vec())
+                    host.write_state(plugin, &key, value.as_bytes().to_vec())
                         .await
                         .map_err(|reason| RpcError::new(codes::HOST_REFUSED, reason))?;
                     Ok(serde_json::json!({}))

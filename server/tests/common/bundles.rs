@@ -8,9 +8,8 @@ use droppedneedle_acquire::AcquireSetup;
 use droppedneedle_acquire::flows::seams::{FlowEvent, TickSink};
 use droppedneedle_acquire::landing::library::LibraryLanding;
 use droppedneedle_acquire::plugin_events::FlowTicks;
-use droppedneedle_acquire::requests::discovery::DiscoveryBatchRequests;
 use droppedneedle_acquire::wiring::{AcquirePorts, AcquireStores};
-use droppedneedle_auth::{Admin, Principal, users::UsersDeps};
+use droppedneedle_auth::users::UsersDeps;
 use droppedneedle_catalog::reads::catalog::{
     Catalog,
     library::LocalCatalog,
@@ -19,9 +18,7 @@ use droppedneedle_catalog::reads::catalog::{
 use droppedneedle_catalog::reads::collections::{
     CollectionsState, db::CollectionsDb, store::Stores,
 };
-use droppedneedle_catalog::reads::discover::adapters::batches::{BatchAlbum, BatchRequests};
-use droppedneedle_catalog::reads::discover::adapters::content::DownloadReadiness;
-use droppedneedle_catalog::reads::discover::ports::{BatchFailure, BoxFuture, ProviderFailure};
+use droppedneedle_catalog::reads::discover::content::DownloadReadiness;
 use droppedneedle_catalog::reads::{ReadsInputs, ReadsPorts, ReadsSetup};
 use droppedneedle_kernel::platform::Platform;
 use droppedneedle_library::wiring::{LibraryCore, LibrarySetup};
@@ -68,8 +65,8 @@ pub fn idle_host(platform: &Platform, library: LibraryCore) -> Arc<PluginHost> {
     PluginHost::new(
         platform.config.plugins_dir(),
         platform.settings.clone(),
-        Arc::new(droppedneedle_plugins::fakes::FakeLauncher::new()),
-        Arc::new(droppedneedle_plugins::wiring::tick_store(platform)),
+        Arc::new(super::plugin_fakes::FakeLauncher::new()),
+        droppedneedle_plugins::wiring::tick_store(platform),
         library,
     )
 }
@@ -100,9 +97,8 @@ pub fn acquire_at(
         AcquireStores::open(platform, ticks),
         AcquirePorts {
             library: Arc::new(LibraryLanding::new(
-                library.clone(),
-                library.releases.clone(),
-                platform.db.sqlx().clone(),
+                library,
+                library.imports.releases.clone(),
             )),
             edition_plans: Arc::new(crate::common::library::operations(library)),
             album_lookup: Arc::new(droppedneedle_acquire::target::lookup::live_albums(
@@ -115,6 +111,7 @@ pub fn acquire_at(
             plugins,
             collections: collections.clone(),
             providers,
+            albums: droppedneedle_library::mutations::Mutations::new(library),
         },
         &outbound.spotify(),
         droppedneedle_kernel::jobs::queue::JobQueue::new(
@@ -127,8 +124,8 @@ pub fn acquire_at(
 
 /// The production reads bundle over `platform`, with no provider pair:
 /// collections in `collections`, the catalog and artwork on closed
-/// upstreams, files read through `library`, and discovery batches filed
-/// through `acquire` when there is one.
+/// upstreams, files read through `library`, and download readiness from
+/// `acquire` when there is one.
 pub fn reads_at(
     platform: &Platform,
     users: UsersDeps,
@@ -148,13 +145,6 @@ pub fn reads_at(
         LocalCatalog::new(platform.db.clone()),
     );
     let artwork = droppedneedle_catalog::reads::artwork(platform, &inputs, catalog.clone());
-    let batch_requests: Arc<dyn BatchRequests> = match acquire {
-        Some(acquire) => Arc::new(DiscoveryBatchRequests::new(
-            acquire.requests.clone(),
-            Some(library.clone()),
-        )),
-        None => Arc::new(NoBatchRequests),
-    };
     let download_readiness: Arc<dyn DownloadReadiness> = match acquire {
         Some(acquire) => Arc::new(acquire.readiness.clone()),
         None => Arc::new(NoDownloadSource),
@@ -169,8 +159,7 @@ pub fn reads_at(
             collections,
             catalog,
             artwork,
-            library_files: LibraryFiles::new(platform.db.sqlx().clone(), library.root_source()),
-            batch_requests,
+            library_files: LibraryFiles::new(platform.db.clone(), library.core.root_source()),
             download_readiness,
             cover_warm: None,
         },
@@ -212,40 +201,6 @@ impl DownloadReadiness for NoDownloadSource {
     }
 }
 
-/// Discovery batches for a rig with no download system: every request is
-/// refused.
-struct NoBatchRequests;
-
-impl BatchRequests for NoBatchRequests {
-    fn request_albums<'a>(
-        &'a self,
-        _caller: &'a Principal,
-        _albums: Vec<BatchAlbum>,
-    ) -> BoxFuture<'a, Result<(), BatchFailure>> {
-        Box::pin(async { Err(BatchFailure::Provider(not_running())) })
-    }
-
-    fn withdraw_album<'a>(
-        &'a self,
-        _owner_id: &'a str,
-        _release_group_mbid: &'a str,
-    ) -> BoxFuture<'a, Result<bool, String>> {
-        Box::pin(async { Ok(false) })
-    }
-
-    fn remove_album<'a>(
-        &'a self,
-        _admin: &'a Admin,
-        _release_group_mbid: &'a str,
-    ) -> BoxFuture<'a, Result<bool, String>> {
-        Box::pin(async { Ok(false) })
-    }
-}
-
-fn not_running() -> ProviderFailure {
-    ProviderFailure::not_built("no download system in this rig")
-}
-
 /// The connection resolver the app builds: the per-user rows in the
 /// platform's database, sealed with its key, over the admin's server
 /// settings.
@@ -272,8 +227,50 @@ pub fn media_jobs(platform: &Platform) -> droppedneedle_media::remotes::presence
         droppedneedle_media::playback::presence::PresenceRegistry::new(platform.events.clone()),
         Arc::new(remotes_resolver(platform)),
         platform.http.shared().clone(),
-        platform.db.sqlx().clone(),
         platform.clock.clone(),
         droppedneedle_media::remotes::warmup::MbidIndex::default(),
     )
+}
+
+/// The production media bundle over `platform`, with no ffmpeg: files read
+/// through `library`, remote playlist imports landing in `reads`'
+/// collections and the personal mix granted through `acquire`. Its workers
+/// are not started.
+pub fn media_at(
+    platform: &Platform,
+    users: UsersDeps,
+    library: &LibrarySetup,
+    reads: &ReadsSetup,
+    acquire: &AcquireSetup,
+) -> droppedneedle_media::MediaSetup {
+    let outbound = super::closed_outbound();
+    let providers = Providers::build(
+        platform,
+        outbound.providers(),
+        droppedneedle_kernel::db::cache::CacheDb::scratch(),
+    );
+    let (media, _workers) = droppedneedle_media::MediaSetup::build(
+        platform,
+        users,
+        library.core.root_source(),
+        Arc::new(
+            droppedneedle_catalog::reads::collections::remote_import::PlaylistImportSink::new(
+                reads.collections.clone(),
+            ),
+        ),
+        idle_host(platform, library.core.clone()),
+        droppedneedle_media::MediaSetup::remotes(platform, outbound.plex_tv.clone()),
+        None,
+        &providers,
+        Arc::new(droppedneedle_acquire::requests::mix::MixGrantHooks::new(
+            acquire.requests.mixer.clone(),
+        )),
+        droppedneedle_kernel::jobs::queue::JobQueue::new(
+            platform.db.clone(),
+            platform.clock.clone(),
+        ),
+        platform.clock.clone(),
+    )
+    .expect("media bundle builds");
+    media
 }

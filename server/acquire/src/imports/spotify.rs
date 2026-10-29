@@ -17,7 +17,7 @@ use super::spotify_oauth::{SpotifyConnection, authorize_url};
 use super::spotify_store::{CollectionsPlaylistBridge, SqliteSpotifyLinks};
 use crate::settings::ConfigSpotifySettings;
 
-/// One imported track row (v2 `populate_playlist` dict shape).
+/// One imported track row.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ImportedTrack {
     /// Track title.
@@ -41,8 +41,7 @@ pub struct ImportedTrack {
 }
 
 /// Spotify import service: OAuth helpers, playlist listing, and the
-/// populate worker the `spotify:import` job runs (v2
-/// `SpotifyImportService`).
+/// populate worker the `spotify:import` job runs.
 pub struct SpotifyImportService {
     client: SpotifyClient,
     settings: Arc<ConfigSpotifySettings>,
@@ -80,9 +79,8 @@ impl SpotifyImportService {
         }
     }
 
-    /// Build the authorize URL for one user and state (v2
-    /// `spotify_auth_url`). Requires the admin app to be enabled and
-    /// complete; else the v2 400 text.
+    /// Build the authorize URL for one user and state. Requires the admin
+    /// app to be enabled and complete; else a 400.
     pub fn auth_url(
         &self,
         redirect_uri: &str,
@@ -106,7 +104,7 @@ impl SpotifyImportService {
             .ok_or(SpotifyError::NotLinked)
     }
 
-    /// Refreshing API access over one user's link (v2 `_get_client`).
+    /// Refreshing API access over one user's link.
     fn refresher(&self, user_id: &str, connection: SpotifyConnection) -> TokenRefresher<'_> {
         let raw = self.settings.get_raw();
         TokenRefresher::new(
@@ -119,10 +117,9 @@ impl SpotifyImportService {
         )
     }
 
-    /// Owned playlists annotated with the imported mapping (v2
-    /// `list_playlists`). Only playlists whose owner id matches the
-    /// caller's Spotify id are listed; the id is fetched from `/me` when
-    /// the link row does not carry it yet.
+    /// Owned playlists annotated with the imported mapping. Only playlists
+    /// whose owner id matches the caller's Spotify id are listed; the id is
+    /// fetched from `/me` when the link row does not carry it yet.
     pub async fn list_playlists(
         &self,
         user_id: &str,
@@ -163,8 +160,8 @@ impl SpotifyImportService {
         Ok(SpotifyPlaylistListResponse { playlists })
     }
 
-    /// Ensure the internal record for one Spotify playlist (v2
-    /// `ensure_playlist_record`): the existing id wins, else a record named
+    /// Ensure the internal record for one Spotify playlist: the
+    /// existing id wins, else a record named
     /// `name` or `Spotify Playlist` under `spotify:{id}`.
     pub async fn ensure_playlist_record(
         &self,
@@ -194,7 +191,7 @@ impl SpotifyImportService {
 
     /// Populate one playlist: fetch metadata + tracks, resolve MBIDs,
     /// replace the track rows wholesale, then persist the cover
-    /// best-effort (v2 `populate_playlist`). Returns the tracks written.
+    /// best-effort. Returns the tracks written.
     pub async fn populate_playlist(
         &self,
         user_id: &str,
@@ -238,9 +235,11 @@ impl SpotifyImportService {
             })
             .collect();
         let written = rows.len();
-        self.playlists.replace_tracks(playlist_id, &rows).await?;
+        self.playlists
+            .replace_tracks(user_id, playlist_id, &rows)
+            .await?;
         if let CoverOutcome::Skipped(reason) = self
-            .persist_cover(spotify_playlist_id, playlist_id, &info)
+            .persist_cover(user_id, spotify_playlist_id, playlist_id, &info)
             .await
         {
             tracing::debug!(%reason, "spotify playlist imported without a cover");
@@ -305,9 +304,10 @@ impl SpotifyImportService {
 
     /// Store the picked provider image as the local cover. Any failure
     /// degrades and leaves the import untouched: artwork must never fail a
-    /// playlist import, and no cover is normal (v2 `_persist_playlist_cover`).
+    /// playlist import, and no cover is normal.
     pub async fn persist_cover(
         &self,
+        user_id: &str,
         spotify_playlist_id: &str,
         playlist_id: &str,
         info: &PlaylistInfo,
@@ -330,7 +330,7 @@ impl SpotifyImportService {
         };
         match self
             .playlists
-            .set_imported_cover(playlist_id, &data, &content_type)
+            .set_imported_cover(user_id, playlist_id, &data, &content_type)
             .await
         {
             Ok(true) => CoverOutcome::Stored,
@@ -351,7 +351,7 @@ fn first_artist(track: &EntryTrack) -> String {
         .to_owned()
 }
 
-/// Comma-joined track artist names (v2 populate loop).
+/// Comma-joined track artist names.
 fn joined_artists(track: &EntryTrack) -> String {
     track
         .artists

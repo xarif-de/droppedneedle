@@ -2,10 +2,8 @@
 //! through its files, apply or discard it, get a new token for it, read
 //! the history and results of applied jobs, and preview an undo.
 //!
-//! Every route is admin-only, as in v2. Store and file work runs on
-//! `spawn_blocking`.
-
-use std::collections::BTreeMap;
+//! Every route is admin-only, as in v2. Store and file work runs on a
+//! blocking thread.
 
 use axum::{
     Json,
@@ -14,17 +12,19 @@ use axum::{
 use droppedneedle_kernel::error::{ApiError, Unavailable};
 use droppedneedle_kernel::extract::{ValidJson, ValidQuery};
 use droppedneedle_kernel::mount::{Routes, routes};
+use droppedneedle_kernel::page::{Page, PageRequest};
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 
-use super::error::LibraryError;
+use super::blocking;
 use super::operations::{OperationView, ReasonView, job_view};
+use crate::jobs::{ControlRequest, ManagementPhase};
 use crate::management::models::{
-    CatalogFilter, Eligibility, HistoryFilter, HistoryItem, ItemFilter, JobDetail, ManagementError,
-    PlannedItem, PreviewHandle, ResultItem, Selection, SelectionKind, Summary,
+    Eligibility, HistoryFilter, HistoryItem, ItemFilter, JobDetail, ManagementError, PlannedItem,
+    PreviewHandle, ResultItem, ResultState, Selection, Summary,
 };
 use crate::management::reasons::ItemReason;
-use crate::management::service::{ApplyRequest, Management, PreviewRequest};
+use crate::management::service::{ApplyRequest, HISTORY_MAX, Management, PAGE_MAX, PreviewRequest};
 use crate::operations::models::OperationState;
 use crate::wiring::LibraryServices;
 use droppedneedle_auth::Admin;
@@ -59,85 +59,14 @@ impl From<ManagementError> for ApiError {
     }
 }
 
-async fn blocking<T: Send + 'static>(
-    work: impl FnOnce() -> Result<T, ManagementError> + Send + 'static,
-) -> Result<T, ApiError> {
-    tokio::task::spawn_blocking(work)
-        .await
-        .map_err(ApiError::internal)?
-        .map_err(ApiError::from)
-}
-
 // ---------------------------------------------------------------------------
 // DTOs.
 // ---------------------------------------------------------------------------
 
-/// What a preview covers.
-#[derive(Debug, Clone, Copy, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ManagementSelectionKind {
-    Roots,
-    Artists,
-    Albums,
-    Tracks,
-    Filter,
-}
-
-/// Catalog filter for a `filter` selection.
-#[derive(Debug, Clone, Default, Deserialize, ToSchema)]
-pub struct ManagementCatalogFilterBody {
-    #[serde(default)]
-    pub search: Option<String>,
-    #[serde(default)]
-    pub genre: Option<String>,
-    #[serde(default)]
-    pub from_year: Option<i64>,
-    #[serde(default)]
-    pub to_year: Option<i64>,
-    #[serde(default)]
-    pub artist_ids: Vec<String>,
-    #[serde(default)]
-    pub album_artist_only: bool,
-}
-
-/// A preview's scope: library folders, artists, albums, files, or a
-/// catalog filter.
-#[derive(Debug, Clone, Deserialize, ToSchema)]
-pub struct ManagementSelectionBody {
-    pub kind: ManagementSelectionKind,
-    #[serde(default)]
-    pub ids: Vec<String>,
-    #[serde(default)]
-    pub catalog_filter: Option<ManagementCatalogFilterBody>,
-}
-
-impl From<ManagementSelectionBody> for Selection {
-    fn from(body: ManagementSelectionBody) -> Self {
-        Self {
-            kind: match body.kind {
-                ManagementSelectionKind::Roots => SelectionKind::Roots,
-                ManagementSelectionKind::Artists => SelectionKind::Artists,
-                ManagementSelectionKind::Albums => SelectionKind::Albums,
-                ManagementSelectionKind::Tracks => SelectionKind::Tracks,
-                ManagementSelectionKind::Filter => SelectionKind::Filter,
-            },
-            ids: body.ids,
-            catalog_filter: body.catalog_filter.map(|filter| CatalogFilter {
-                search: filter.search,
-                genre: filter.genre,
-                from_year: filter.from_year,
-                to_year: filter.to_year,
-                artist_ids: filter.artist_ids,
-                album_artist_only: filter.album_artist_only,
-            }),
-        }
-    }
-}
-
 /// Make a preview.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct ManagementPreviewCreateBody {
-    pub selection: ManagementSelectionBody,
+    pub selection: Selection,
     pub profile_id: String,
     /// The settings revision the page loaded; refused when it moved.
     pub expected_settings_revision: String,
@@ -187,67 +116,13 @@ pub struct ManagementPreviewReissueResponse {
     pub expires_at: f64,
 }
 
-/// What a preview counted.
-#[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct ManagementSummaryView {
-    pub selected_item_count: Option<i64>,
-    pub item_count: i64,
-    pub bundle_count: i64,
-    pub eligible_count: i64,
-    pub warning_count: i64,
-    pub blocked_count: i64,
-    pub stale_count: i64,
-    pub no_change_count: i64,
-    pub tag_change_count: i64,
-    pub artwork_change_count: i64,
-    pub path_change_count: i64,
-    pub sidecar_change_count: i64,
-    pub estimated_temporary_bytes: i64,
-    pub expanded_track_count: i64,
-    /// Files per reason code.
-    pub reasons: BTreeMap<String, i64>,
-    /// Files per library folder.
-    pub roots: BTreeMap<String, i64>,
-    /// Files per audio format.
-    pub formats: BTreeMap<String, i64>,
-    pub deferred_sources: BTreeMap<String, i64>,
-    pub metadata_snapshot_ids: Vec<String>,
-}
-
-impl From<Summary> for ManagementSummaryView {
-    fn from(summary: Summary) -> Self {
-        Self {
-            selected_item_count: summary.selected_item_count,
-            item_count: summary.item_count,
-            bundle_count: summary.bundle_count,
-            eligible_count: summary.eligible_count,
-            warning_count: summary.warning_count,
-            blocked_count: summary.blocked_count,
-            stale_count: summary.stale_count,
-            no_change_count: summary.no_change_count,
-            tag_change_count: summary.tag_change_count,
-            artwork_change_count: summary.artwork_change_count,
-            path_change_count: summary.path_change_count,
-            sidecar_change_count: summary.sidecar_change_count,
-            estimated_temporary_bytes: summary.estimated_temporary_bytes,
-            expanded_track_count: summary.expanded_track_count,
-            reasons: summary.reasons,
-            roots: summary.roots,
-            formats: summary.formats,
-            deferred_sources: summary.deferred_sources,
-            metadata_snapshot_ids: summary.metadata_snapshot_ids,
-        }
-    }
-}
-
 /// A management job: a preview, an apply in progress, or a finished one.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ManagementJobView {
     pub job_id: String,
     /// The operation state.
     pub state: OperationState,
-    /// `planning`, `ready`, `applying`, `undoing`, or `complete`.
-    pub phase: String,
+    pub phase: ManagementPhase,
     /// `preview`, `apply`, or `undo` (v2 history may show others).
     pub mode: String,
     pub origin: String,
@@ -263,7 +138,7 @@ pub struct ManagementJobView {
     pub linked_job_id: Option<String>,
     #[schema(value_type = Object)]
     pub selection: serde_json::Value,
-    pub summary: ManagementSummaryView,
+    pub summary: Summary,
     pub created_at: f64,
     pub updated_at: f64,
     pub expires_at: Option<f64>,
@@ -287,7 +162,7 @@ pub struct ManagementJobView {
     pub succeeded_count: i64,
     pub failed_count: i64,
     pub skipped_count: i64,
-    pub control_request: String,
+    pub control_request: ControlRequest,
     /// Files whose change can still be undone.
     pub undo_available_count: i64,
     pub undo_expired_count: i64,
@@ -316,7 +191,7 @@ impl From<JobDetail> for ManagementJobView {
             target_root_id: detail.target_root_id,
             linked_job_id: detail.linked_job_id,
             selection: detail.selection,
-            summary: detail.summary.into(),
+            summary: detail.summary,
             created_at: job.created_at,
             updated_at: job.updated_at,
             expires_at: detail.expires_at,
@@ -341,7 +216,7 @@ impl From<JobDetail> for ManagementJobView {
             succeeded_count: job.succeeded_count,
             failed_count: job.failed_count,
             skipped_count: job.skipped_count,
-            control_request: job.control_request.as_str().to_owned(),
+            control_request: job.control_request,
             undo_available_count: detail.undo_available_count,
             undo_expired_count: detail.undo_expired_count,
             undo_expires_at: detail.undo_expires_at,
@@ -382,8 +257,7 @@ pub struct ManagementPlanItemView {
     pub source_relative_path: Option<String>,
     pub destination_root_id: Option<String>,
     pub destination_relative_path: Option<String>,
-    /// `eligible`, `warning`, `blocked`, or `stale`.
-    pub eligibility: String,
+    pub eligibility: Eligibility,
     pub reason_code: Option<String>,
     /// The reason in words, with what to do about it.
     pub reason: Option<ManagementReasonView>,
@@ -423,7 +297,7 @@ impl From<PlannedItem> for ManagementPlanItemView {
             source_relative_path: Some(item.source_rel),
             destination_root_id: item.dest_root,
             destination_relative_path: item.dest_rel,
-            eligibility: item.eligibility.as_str().to_owned(),
+            eligibility: item.eligibility,
             reason_code: reason.as_ref().map(|reason| reason.code.clone()),
             reason: reason
                 .filter(|reason| !reason.message.is_empty())
@@ -438,20 +312,11 @@ impl From<PlannedItem> for ManagementPlanItemView {
     }
 }
 
-/// One page of planned files.
-#[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct ManagementPlanItemPage {
-    pub items: Vec<ManagementPlanItemView>,
-    pub next_after_ordinal: Option<i64>,
-    pub has_more: bool,
-}
-
 /// One file after apply.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ManagementResultItemView {
     pub plan: ManagementPlanItemView,
-    /// `pending`, `running`, `succeeded`, `failed`, or `not_scheduled`.
-    pub work_state: String,
+    pub work_state: ResultState,
     pub failure_code: Option<String>,
     /// Why the file failed or was not written, with what to do about it.
     pub failure_reason: Option<ManagementReasonView>,
@@ -476,21 +341,13 @@ impl From<ResultItem> for ManagementResultItemView {
     }
 }
 
-/// One page of results.
-#[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct ManagementResultPage {
-    pub items: Vec<ManagementResultItemView>,
-    pub next_after_ordinal: Option<i64>,
-    pub has_more: bool,
-}
-
 /// One row of management history.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ManagementHistoryItemView {
     pub operation: OperationView,
     pub mode: String,
     pub origin: String,
-    pub phase: String,
+    pub phase: ManagementPhase,
     pub profile_id: String,
     pub profile_name: String,
     pub profile_revision: String,
@@ -525,47 +382,64 @@ impl From<HistoryItem> for ManagementHistoryItemView {
     }
 }
 
-/// One page of history, newest first.
-#[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct ManagementHistoryPage {
-    pub items: Vec<ManagementHistoryItemView>,
-    /// Pass back as `cursor` for the next page; null on the last.
-    pub next_cursor: Option<String>,
-}
-
 /// Paging through a job's files.
 #[derive(Debug, Clone, Default, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct ManagementItemsQuery {
-    /// Return files after this ordinal (-1 for the first page).
-    pub after_ordinal: Option<i64>,
-    /// Files per page, 1 to 200 (default 100).
-    pub limit: Option<i64>,
-    /// `eligible`, `warning`, `blocked`, or `stale`.
-    pub eligibility: Option<String>,
+    /// `next_cursor` from the previous page.
+    pub cursor: Option<String>,
+    /// Files per page, 1 to 200 (default 100); more is read as 200.
+    pub limit: Option<u32>,
+    pub eligibility: Option<Eligibility>,
     pub reason_code: Option<String>,
     pub root_id: Option<String>,
     pub album_id: Option<String>,
     pub audio_format: Option<String>,
-    /// `tags`, `path`, `sidecars`, or `no_change`.
-    pub change_kind: Option<String>,
+    #[param(inline)]
+    pub change_kind: Option<ChangeKind>,
+}
+
+/// What a planned file changes, to filter by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeKind {
+    Tags,
+    Path,
+    Sidecars,
+    Artwork,
+    /// Files with nothing to change.
+    NoChange,
+}
+
+impl ChangeKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Tags => "tags",
+            Self::Path => "path",
+            Self::Sidecars => "sidecars",
+            Self::Artwork => "artwork",
+            Self::NoChange => "no_change",
+        }
+    }
 }
 
 /// Paging through a job's results.
 #[derive(Debug, Clone, Default, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct ManagementResultsQuery {
-    pub after_ordinal: Option<i64>,
-    pub limit: Option<i64>,
+    /// `next_cursor` from the previous page.
+    pub cursor: Option<String>,
+    /// Files per page, 1 to 200 (default 100); more is read as 200.
+    pub limit: Option<u32>,
 }
 
 /// History filters.
 #[derive(Debug, Clone, Default, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct ManagementHistoryQuery {
-    /// Rows per page, 1 to 50 (default 50).
-    pub limit: Option<i64>,
-    /// Cursor from the previous page.
+    /// Rows per page, 1 to 50 (default 50); more is read as 50.
+    pub limit: Option<u32>,
+    /// `next_cursor` from the previous page.
     pub cursor: Option<String>,
     pub origin: Option<String>,
     pub profile_id: Option<String>,
@@ -625,7 +499,7 @@ pub async fn create_management_preview(
     ValidJson(body): ValidJson<ManagementPreviewCreateBody>,
 ) -> Result<Json<ManagementPreviewCreatedResponse>, ApiError> {
     let request = PreviewRequest {
-        selection: body.selection.into(),
+        selection: body.selection,
         profile_id: body.profile_id,
         expected_settings_revision: body.expected_settings_revision,
         expected_policy_revision: body.expected_policy_revision,
@@ -659,34 +533,15 @@ pub async fn get_management_preview(
     Ok(Json(detail.into()))
 }
 
-fn item_filter(query: &ManagementItemsQuery) -> Result<ItemFilter, LibraryError> {
-    let eligibility = match query.eligibility.as_deref() {
-        None => None,
-        Some("eligible") => Some(Eligibility::Eligible),
-        Some("warning") => Some(Eligibility::Warning),
-        Some("blocked") => Some(Eligibility::Blocked),
-        Some("stale") => Some(Eligibility::Stale),
-        Some(_) => {
-            return Err(LibraryError::InvalidInput {
-                message: "eligibility must be eligible, warning, blocked or stale".to_owned(),
-            });
-        }
-    };
-    if let Some(kind) = query.change_kind.as_deref()
-        && !matches!(kind, "tags" | "path" | "sidecars" | "no_change" | "artwork")
-    {
-        return Err(LibraryError::InvalidInput {
-            message: "change_kind must be tags, path, sidecars or no_change".to_owned(),
-        });
-    }
-    Ok(ItemFilter {
-        eligibility,
+fn item_filter(query: &ManagementItemsQuery) -> ItemFilter {
+    ItemFilter {
+        eligibility: query.eligibility,
         reason_code: query.reason_code.clone(),
         root_id: query.root_id.clone(),
         album_id: query.album_id.clone(),
         audio_format: query.audio_format.clone(),
-        change_kind: query.change_kind.clone(),
-    })
+        change_kind: query.change_kind.map(|kind| kind.as_str().to_owned()),
+    }
 }
 
 /// A page of the files a preview planned.
@@ -696,8 +551,8 @@ fn item_filter(query: &ManagementItemsQuery) -> Result<ItemFilter, LibraryError>
     path = "/api/v3/library/management/previews/{job_id}/items",
     params(("job_id" = String, Path, description = "Management job id"), ManagementItemsQuery),
     responses(
-        (status = 200, description = "Planned files", body = ManagementPlanItemPage),
-        (status = 400, description = "Bad filter"),
+        (status = 200, description = "Planned files", body = Page<ManagementPlanItemView>),
+        (status = 400, description = "Bad filter or cursor"),
         (status = 401, description = "Not authenticated"),
         (status = 403, description = "Admin role required"),
         (status = 404, description = "Unknown job"),
@@ -708,16 +563,20 @@ pub async fn list_management_preview_items(
     _caller: Admin,
     Path(job_id): Path<String>,
     ValidQuery(query): ValidQuery<ManagementItemsQuery>,
-) -> Result<Json<ManagementPlanItemPage>, ApiError> {
-    let filter = item_filter(&query)?;
-    let after = query.after_ordinal.unwrap_or(-1);
-    let limit = query.limit.unwrap_or(100);
+) -> Result<Json<Page<ManagementPlanItemView>>, ApiError> {
+    let filter = item_filter(&query);
+    let (after, limit) = ordinal_paging(query.limit, query.cursor.as_deref())?;
     let page = blocking(move || management.items(&job_id, after, limit, &filter)).await?;
-    Ok(Json(ManagementPlanItemPage {
-        items: page.items.into_iter().map(Into::into).collect(),
-        next_after_ordinal: page.next_after_ordinal,
-        has_more: page.has_more,
-    }))
+    Ok(Json(Page::new(
+        page.items.into_iter().map(Into::into).collect(),
+        page.next_after_ordinal,
+    )))
+}
+
+/// The ordinal a job's file page starts after, and its size.
+fn ordinal_paging(limit: Option<u32>, cursor: Option<&str>) -> Result<(i64, i64), ApiError> {
+    let paging = PageRequest::<i64>::read(limit, cursor, 100, PAGE_MAX as usize)?;
+    Ok((paging.after.unwrap_or(-1), paging.limit as i64))
 }
 
 /// The cover art one planned file embeds or writes, as the preview lists
@@ -858,18 +717,6 @@ pub async fn reissue_management_preview(
     }))
 }
 
-fn history_cursor(raw: Option<&str>) -> Result<Option<(f64, String)>, LibraryError> {
-    let Some(raw) = raw.filter(|raw| !raw.is_empty()) else {
-        return Ok(None);
-    };
-    let bad = || LibraryError::InvalidInput {
-        message: "That history cursor is not valid; start from the first page.".to_owned(),
-    };
-    let (at, id) = raw.split_once('|').ok_or_else(bad)?;
-    let at: f64 = at.parse().map_err(|_| bad())?;
-    Ok(Some((at, id.to_owned())))
-}
-
 /// Management history, newest first.
 #[utoipa::path(
     get,
@@ -877,7 +724,7 @@ fn history_cursor(raw: Option<&str>) -> Result<Option<(f64, String)>, LibraryErr
     path = "/api/v3/library/management/operations",
     params(ManagementHistoryQuery),
     responses(
-        (status = 200, description = "History page", body = ManagementHistoryPage),
+        (status = 200, description = "History page, newest first", body = Page<ManagementHistoryItemView>),
         (status = 400, description = "Bad cursor"),
         (status = 401, description = "Not authenticated"),
         (status = 403, description = "Admin role required"),
@@ -887,10 +734,16 @@ pub async fn list_management_operations(
     State(management): State<Management>,
     _caller: Admin,
     ValidQuery(query): ValidQuery<ManagementHistoryQuery>,
-) -> Result<Json<ManagementHistoryPage>, ApiError> {
+) -> Result<Json<Page<ManagementHistoryItemView>>, ApiError> {
+    let paging = PageRequest::read(
+        query.limit,
+        query.cursor.as_deref(),
+        HISTORY_MAX as usize,
+        HISTORY_MAX as usize,
+    )?;
     let filter = HistoryFilter {
-        limit: query.limit.unwrap_or(50),
-        cursor: history_cursor(query.cursor.as_deref())?,
+        limit: paging.limit as i64,
+        cursor: paging.after,
         origin: query.origin,
         profile_id: query.profile_id,
         root_id: query.root_id,
@@ -899,11 +752,11 @@ pub async fn list_management_operations(
         created_from: query.created_from,
         created_to: query.created_to,
     };
-    let (items, next_cursor) = blocking(move || management.history(filter)).await?;
-    Ok(Json(ManagementHistoryPage {
-        items: items.into_iter().map(Into::into).collect(),
-        next_cursor,
-    }))
+    let (items, next) = blocking(move || management.history(filter)).await?;
+    Ok(Json(Page::new(
+        items.into_iter().map(Into::into).collect(),
+        next,
+    )))
 }
 
 /// One management operation.
@@ -934,7 +787,8 @@ pub async fn get_management_operation(
     path = "/api/v3/library/management/operations/{job_id}/results",
     params(("job_id" = String, Path, description = "Management job id"), ManagementResultsQuery),
     responses(
-        (status = 200, description = "Results", body = ManagementResultPage),
+        (status = 200, description = "Results", body = Page<ManagementResultItemView>),
+        (status = 400, description = "Bad cursor"),
         (status = 401, description = "Not authenticated"),
         (status = 403, description = "Admin role required"),
         (status = 404, description = "Unknown job"),
@@ -945,15 +799,13 @@ pub async fn list_management_operation_results(
     _caller: Admin,
     Path(job_id): Path<String>,
     ValidQuery(query): ValidQuery<ManagementResultsQuery>,
-) -> Result<Json<ManagementResultPage>, ApiError> {
-    let after = query.after_ordinal.unwrap_or(-1);
-    let limit = query.limit.unwrap_or(100);
+) -> Result<Json<Page<ManagementResultItemView>>, ApiError> {
+    let (after, limit) = ordinal_paging(query.limit, query.cursor.as_deref())?;
     let page = blocking(move || management.results(&job_id, after, limit)).await?;
-    Ok(Json(ManagementResultPage {
-        items: page.items.into_iter().map(Into::into).collect(),
-        next_after_ordinal: page.next_after_ordinal,
-        has_more: page.has_more,
-    }))
+    Ok(Json(Page::new(
+        page.items.into_iter().map(Into::into).collect(),
+        page.next_after_ordinal,
+    )))
 }
 
 /// Preview undoing an applied operation. Apply the undo preview like any

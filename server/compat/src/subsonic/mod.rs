@@ -94,19 +94,22 @@
 //!   apiKeyAuthentication, formPost, transcodeOffset, songLyrics,
 //!   playbackReport, indexBasedQueue, transcoding.
 //!
-//! # Seams (implemented elsewhere, bound in `compat::setup`)
+//! # What the handlers call (in `compat::adapters`, built in `compat::setup`)
 //!
 //! - Auth: [`auth::Credentials`] classification here; secret verification
-//!   lives in `auth::compat_auth::subsonic::authenticate`, and [`Verifier`]
-//!   delegates to it.
-//! - Data: [`store::Store`] (library, playlists, favorites, scrobble,
+//!   lives in `auth::compat_auth::subsonic::authenticate`, and
+//!   [`SubsonicVerifier`](crate::adapters::principal::SubsonicVerifier)
+//!   delegates to it. The HTTP adapter (`compat::http`) gates, verifies
+//!   and runs the method from [`ENDPOINTS`].
+//! - Data: [`SubsonicStore`] (library, playlists, favorites, scrobble,
 //!   queues, bookmarks, lyrics, avatars, scan, cover art, advanced
 //!   transcode).
-//! - Audio bytes: [`stream::AudioBackend`] on the stream engine
-//!   (ranges, HEAD, leases per caller).
+//! - Audio bytes: [`GatewayAudio`](crate::adapters::audio::GatewayAudio)
+//!   on the stream gateway (ranges, HEAD, leases per caller).
 //! - Edge (`compat::shared`): enablement kill-switch default, rate limits,
 //!   CORS, case-insensitive paths, access-log redaction. The enablement
-//!   gate itself (`enabled` in [`Settings`]) runs here before lookup.
+//!   gate itself (`enabled` in [`Settings`]) runs in the HTTP adapter
+//!   before lookup.
 
 pub mod advanced;
 pub mod auth;
@@ -123,38 +126,27 @@ pub mod stream;
 pub mod value;
 pub mod views;
 
-#[cfg(any(test, feature = "test-support"))]
-pub mod fake;
-
-use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 
 use droppedneedle_kernel::runtime_config::sections::DownloadAccess;
+use serde::Serialize;
 
-// Seam surface: public for the HTTP adapter.
-pub use auth::{Credentials, Principal, classify};
+use crate::adapters::library::CompatError;
+use crate::adapters::principal::CompatPrincipal;
+use crate::adapters::subsonic_store::SubsonicStore;
+use crate::setup::CompatAudio;
+
+pub use auth::{Credentials, classify};
 pub use error::{GENERIC, PARAM_MISSING, SubsonicError};
 pub use params::SubsonicParameters;
-pub use store::Store;
-pub use stream::AudioBackend;
 pub use value::{
-    Rendered, SubsonicFormat, parse_format, render_binary_error, render_error, render_ok,
+    Payload, Rendered, SubsonicFormat, parse_format, render_binary_error, render_error, render_ok,
+    sniff_format,
 };
-
-/// Binary endpoints (normalized names): dispatch-path errors outside
-/// the auth codes render `text/plain` (v2 `_BINARY`).
-pub const BINARY_ENDPOINTS: &[&str] = &[
-    "stream",
-    "download",
-    "getcoverart",
-    "getavatar",
-    "gettranscodestream",
-];
 
 /// Codes that stay enveloped on the binary dispatch path (v2 `_AUTH_CODES`).
 pub const AUTH_CODES: &[u8] = &[10, 40, 41, 42, 43, 44, 50];
-
-/// The one public endpoint (normalized name, v2 `_PUBLIC`).
-pub const PUBLIC_ENDPOINT: &str = "getopensubsonicextensions";
 
 /// getAvatar refusal for a non-self username, v2 message verbatim.
 pub const AVATAR_FORBIDDEN_MESSAGE: &str = "Avatar access is limited to the authenticated user";
@@ -166,9 +158,140 @@ pub fn normalize_endpoint(raw: &str) -> String {
     folded.strip_suffix(".view").unwrap_or(&folded).to_owned()
 }
 
-/// True for the five binary endpoints (takes a normalized name).
-pub fn is_binary_endpoint(normalized: &str) -> bool {
-    BINARY_ENDPOINTS.contains(&normalized)
+/// A handler's answer, still to be awaited.
+pub type HandlerFuture<'c> =
+    Pin<Box<dyn Future<Output = Result<Outcome, SubsonicError>> + Send + 'c>>;
+
+/// A method's handler.
+pub type Handler = for<'c> fn(&'c Ctx<'c>) -> HandlerFuture<'c>;
+
+/// One Subsonic method (v2 `_HANDLERS`, `_BINARY` and `_PUBLIC`).
+pub struct Endpoint {
+    /// Normalized name.
+    pub name: &'static str,
+    /// The handler.
+    pub handler: Handler,
+    /// Answers bytes: dispatch-path errors outside [`AUTH_CODES`] render
+    /// `text/plain`.
+    pub binary: bool,
+    /// Answers without sign-in.
+    pub public: bool,
+}
+
+impl Endpoint {
+    const fn envelope(name: &'static str, handler: Handler) -> Self {
+        Self {
+            name,
+            handler,
+            binary: false,
+            public: false,
+        }
+    }
+
+    const fn binary(name: &'static str, handler: Handler) -> Self {
+        Self {
+            name,
+            handler,
+            binary: true,
+            public: false,
+        }
+    }
+
+    const fn public(name: &'static str, handler: Handler) -> Self {
+        Self {
+            name,
+            handler,
+            binary: false,
+            public: true,
+        }
+    }
+}
+
+/// Every Subsonic method. Only `getOpenSubsonicExtensions` is public;
+/// stream, download, getCoverArt, getAvatar and getTranscodeStream answer
+/// bytes.
+pub static ENDPOINTS: &[Endpoint] = &[
+    Endpoint::envelope("ping", |c| Box::pin(browse::ping(c))),
+    Endpoint::envelope("getlicense", |c| Box::pin(browse::license(c))),
+    Endpoint::public("getopensubsonicextensions", |c| {
+        Box::pin(browse::extensions(c))
+    }),
+    Endpoint::envelope("getmusicfolders", |c| Box::pin(browse::music_folders(c))),
+    Endpoint::envelope("getartists", |c| Box::pin(browse::artists(c))),
+    Endpoint::envelope("getindexes", |c| Box::pin(browse::indexes(c))),
+    Endpoint::envelope("getartist", |c| Box::pin(browse::artist(c))),
+    Endpoint::envelope("getalbum", |c| Box::pin(browse::album(c))),
+    Endpoint::envelope("getsong", |c| Box::pin(browse::song(c))),
+    Endpoint::envelope("getalbumlist2", |c| Box::pin(browse::album_list2(c))),
+    Endpoint::envelope("getalbumlist", |c| Box::pin(browse::album_list(c))),
+    Endpoint::envelope("getrandomsongs", |c| Box::pin(browse::random_songs(c))),
+    Endpoint::envelope("getmusicdirectory", |c| {
+        Box::pin(browse::music_directory(c))
+    }),
+    Endpoint::envelope("search3", |c| Box::pin(browse::search3(c))),
+    Endpoint::envelope("search2", |c| Box::pin(browse::search2(c))),
+    Endpoint::binary("getcoverart", |c| Box::pin(media::cover_art(c))),
+    Endpoint::binary("stream", |c| Box::pin(media::stream(c))),
+    Endpoint::binary("download", |c| Box::pin(media::download(c))),
+    Endpoint::envelope("gettranscodedecision", |c| {
+        Box::pin(media::transcode_decision(c))
+    }),
+    Endpoint::binary("gettranscodestream", |c| {
+        Box::pin(media::transcode_stream(c))
+    }),
+    Endpoint::envelope("getplaylists", |c| Box::pin(library::playlists(c))),
+    Endpoint::envelope("getplaylist", |c| Box::pin(library::playlist(c))),
+    Endpoint::envelope("createplaylist", |c| Box::pin(library::create_playlist(c))),
+    Endpoint::envelope("updateplaylist", |c| Box::pin(library::update_playlist(c))),
+    Endpoint::envelope("deleteplaylist", |c| Box::pin(library::delete_playlist(c))),
+    Endpoint::envelope("star", |c| Box::pin(library::star(c, true))),
+    Endpoint::envelope("unstar", |c| Box::pin(library::star(c, false))),
+    Endpoint::envelope("getstarred2", |c| Box::pin(library::starred2(c))),
+    Endpoint::envelope("getstarred", |c| Box::pin(library::starred(c))),
+    Endpoint::envelope("setrating", |c| Box::pin(library::set_rating(c))),
+    Endpoint::envelope("scrobble", |c| Box::pin(library::scrobble(c))),
+    Endpoint::envelope("getnowplaying", |c| Box::pin(library::now_playing(c))),
+    Endpoint::envelope("reportplayback", |c| Box::pin(library::report_playback(c))),
+    Endpoint::envelope("getplayqueue", |c| Box::pin(library::get_play_queue(c))),
+    Endpoint::envelope("saveplayqueue", |c| Box::pin(library::save_play_queue(c))),
+    Endpoint::envelope("getplayqueuebyindex", |c| {
+        Box::pin(library::get_play_queue_by_index(c))
+    }),
+    Endpoint::envelope("saveplayqueuebyindex", |c| {
+        Box::pin(library::save_play_queue_by_index(c))
+    }),
+    Endpoint::envelope("getbookmarks", |c| Box::pin(library::get_bookmarks(c))),
+    Endpoint::envelope("createbookmark", |c| Box::pin(library::create_bookmark(c))),
+    Endpoint::envelope("deletebookmark", |c| Box::pin(library::delete_bookmark(c))),
+    Endpoint::envelope("getartistinfo2", |c| Box::pin(library::artist_info(c))),
+    Endpoint::envelope("getartistinfo", |c| Box::pin(library::artist_info(c))),
+    Endpoint::envelope("getalbuminfo2", |c| Box::pin(library::album_info(c))),
+    Endpoint::envelope("getalbuminfo", |c| Box::pin(library::album_info(c))),
+    Endpoint::binary("getavatar", |c| Box::pin(media::avatar(c))),
+    Endpoint::envelope("getlyricsbysongid", |c| {
+        Box::pin(library::lyrics_by_song_id(c))
+    }),
+    Endpoint::envelope("getlyrics", |c| Box::pin(library::lyrics(c))),
+    Endpoint::envelope("getgenres", |c| Box::pin(library::genres(c))),
+    Endpoint::envelope("getpodcasts", |c| Box::pin(browse::podcasts(c))),
+    Endpoint::envelope("getnewestpodcasts", |c| {
+        Box::pin(browse::newest_podcasts(c))
+    }),
+    Endpoint::envelope("getinternetradiostations", |c| {
+        Box::pin(browse::internet_radio_stations(c))
+    }),
+    Endpoint::envelope("getsongsbygenre", |c| Box::pin(library::songs_by_genre(c))),
+    Endpoint::envelope("getuser", |c| Box::pin(library::user(c))),
+    Endpoint::envelope("getscanstatus", |c| Box::pin(library::scan_status(c))),
+    Endpoint::envelope("startscan", |c| Box::pin(library::start_scan(c))),
+    Endpoint::envelope("gettopsongs", |c| Box::pin(library::top_songs(c))),
+    Endpoint::envelope("getsimilarsongs2", |c| Box::pin(library::similar_songs2(c))),
+    Endpoint::envelope("getsimilarsongs", |c| Box::pin(library::similar_songs(c))),
+];
+
+/// The method with this normalized name, or `None` for an unknown method.
+pub fn endpoint(name: &str) -> Option<&'static Endpoint> {
+    ENDPOINTS.iter().find(|endpoint| endpoint.name == name)
 }
 
 /// Dispatch rule: binary endpoints render codes outside [`AUTH_CODES`]
@@ -176,7 +299,7 @@ pub fn is_binary_endpoint(normalized: &str) -> bool {
 /// enveloped as Navidrome 0.62.0 answers it. Other endpoints are always
 /// enveloped.
 pub fn dispatch_uses_envelope(code: u8, normalized_endpoint: &str) -> bool {
-    !is_binary_endpoint(normalized_endpoint)
+    !endpoint(normalized_endpoint).is_some_and(|endpoint| endpoint.binary)
         || AUTH_CODES.contains(&code)
         || (normalized_endpoint == "stream" && code == error::NOT_FOUND)
 }
@@ -232,50 +355,18 @@ impl Settings {
     }
 }
 
-/// One inbound request (the HTTP adapter builds this).
-#[derive(Debug, Clone, Default)]
-pub struct Request {
-    /// Uppercase HTTP method (`GET`/`POST`/`HEAD`).
-    pub method: String,
-    /// Raw endpoint path segment (may carry `.view`, any case).
-    pub endpoint: String,
-    /// Decoded query+form params (JSON bodies pre-flattened for reportPlayback).
-    pub params: SubsonicParameters,
-    /// Request headers (only `Range` and `Content-Type` are read).
-    pub headers: HashMap<String, String>,
-    /// Raw body (getTranscodeDecision JSON).
-    pub body: Vec<u8>,
-    /// Request content type.
-    pub content_type: Option<String>,
-    /// When the request arrived, unix seconds.
-    pub now_unix: f64,
-    /// The address the app reached this server at, for picture links.
-    /// `None` leaves the link keys out.
-    pub picture_base: Option<String>,
-}
-
-impl Request {
-    /// Header lookup, case-insensitive.
-    pub fn header(&self, name: &str) -> Option<&str> {
-        self.headers
-            .iter()
-            .find(|(key, _)| key.eq_ignore_ascii_case(name))
-            .map(|(_, value)| value.as_str())
-    }
-}
-
 /// Handler context: everything one endpoint call needs.
-pub struct Ctx<'a, P, S, B> {
+pub struct Ctx<'a> {
     /// Normalized endpoint name.
     pub endpoint_name: String,
     /// Decoded params.
     pub params: SubsonicParameters,
     /// Authenticated principal (None only for the public endpoint).
-    pub principal: Option<P>,
-    /// Data store.
-    pub store: &'a S,
-    /// Audio backend.
-    pub audio: &'a B,
+    pub principal: Option<CompatPrincipal>,
+    /// Data store, scoped to the caller.
+    pub store: &'a SubsonicStore,
+    /// Audio over the stream gateway, scoped to the caller.
+    pub audio: &'a CompatAudio,
     /// Server settings.
     pub settings: &'a Settings,
     /// Requested format.
@@ -296,7 +387,7 @@ pub struct Ctx<'a, P, S, B> {
     pub picture_base: Option<String>,
 }
 
-impl<P: Principal, S: Store, B: AudioBackend> Ctx<'_, P, S, B> {
+impl Ctx<'_> {
     /// Single param.
     pub fn p(&self, key: &str) -> Result<Option<String>, SubsonicError> {
         self.params.string(key, None)
@@ -335,7 +426,7 @@ impl<P: Principal, S: Store, B: AudioBackend> Ctx<'_, P, S, B> {
     }
 
     /// Authenticated principal (handlers other than the public one).
-    pub fn user(&self) -> Result<&P, SubsonicError> {
+    pub fn user(&self) -> Result<&CompatPrincipal, SubsonicError> {
         self.principal
             .as_ref()
             .ok_or_else(|| SubsonicError::code_only(PARAM_MISSING))
@@ -353,13 +444,14 @@ impl<P: Principal, S: Store, B: AudioBackend> Ctx<'_, P, S, B> {
     }
 
     /// The open link to an album or artist picture the catalog just
-    /// returned, or `None` when the request named no address: a link is
-    /// absolute or not sent.
+    /// returned, with an album's cover version, or `None` when the request
+    /// named no address: a link is absolute or not sent.
     pub fn picture_link(
         &self,
         kind: picture::PictureKind,
         internal_id: &str,
         size: u32,
+        cover_version: Option<&str>,
     ) -> Option<String> {
         let base = self.picture_base.as_deref()?;
         Some(picture::link(
@@ -368,6 +460,7 @@ impl<P: Principal, S: Store, B: AudioBackend> Ctx<'_, P, S, B> {
             kind,
             internal_id,
             size,
+            cover_version,
         ))
     }
 
@@ -386,34 +479,65 @@ impl<P: Principal, S: Store, B: AudioBackend> Ctx<'_, P, S, B> {
             picture::PictureKind::Artist,
             &artist.artist_mbid,
             picture::ARTIST_IMAGE_SIZE,
+            None,
         )
     }
 
     /// Storage errors surface as code 0 (generic), never an auth code. The
-    /// cause is logged; the client sees only the fixed internal message.
-    pub fn store_err<E: store::StoreFailure>(err: E) -> SubsonicError {
-        match err.client_error() {
-            Some((code, message)) => SubsonicError::new(code, message),
-            None => store_failure(err),
+    /// client sees only the fixed internal message, under 503 with
+    /// `Retry-After` when the database was busy and 500 otherwise; the
+    /// request boundary logs the cause once.
+    pub fn store_err(err: CompatError) -> SubsonicError {
+        if let Some((code, message)) = err.client_error() {
+            return SubsonicError::new(code, message);
+        }
+        match err {
+            CompatError::Busy(cause) => {
+                SubsonicError::server_fault(error::ServerFault::Busy(cause))
+            }
+            other => store_failure(other),
         }
     }
 }
 
-/// Log a storage failure and answer code 0 with the fixed message.
-fn store_failure<E: std::fmt::Display>(err: E) -> SubsonicError {
-    tracing::error!(cause = %err, "subsonic store call failed");
-    SubsonicError::new(GENERIC, droppedneedle_kernel::error::FIXED_INTERNAL_MESSAGE)
+/// Answer a storage failure as code 0 with the fixed message.
+fn store_failure(err: impl std::fmt::Display) -> SubsonicError {
+    SubsonicError::server_fault(error::ServerFault::Internal(err.to_string()))
+}
+
+/// The status, `Retry-After` and request-boundary fault of a server fault,
+/// as the kernel's error answers it: busy is the closed-list 503, anything
+/// else 500. The boundary logs the fault once, with its cause.
+fn fault_answer(
+    fault: error::ServerFault,
+) -> (
+    u16,
+    Option<String>,
+    Option<droppedneedle_kernel::error::Fault>,
+) {
+    use axum::response::IntoResponse as _;
+    use droppedneedle_kernel::error::{ApiError, Fault, Unavailable};
+    let error = match fault {
+        error::ServerFault::Busy(cause) => ApiError::unavailable(Unavailable::ServerBusy, cause),
+        error::ServerFault::Internal(cause) => ApiError::internal(cause),
+    };
+    let mut response = error.into_response();
+    let retry_after = response
+        .headers()
+        .get(axum::http::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    (
+        response.status().as_u16(),
+        retry_after,
+        response.extensions_mut().remove::<Fault>(),
+    )
 }
 
 /// Handler outcome: an envelope payload or a binary response.
 pub enum Outcome {
-    /// `ok` envelope with an optional response key + payload.
-    Envelope {
-        /// Response key (`None` for bare-ok endpoints).
-        key: Option<&'static str>,
-        /// Payload value.
-        payload: Option<value::Val>,
-    },
+    /// `ok` envelope, with the answer under its key unless bare.
+    Envelope(Option<(&'static str, Payload)>),
     /// Binary bytes with status, content type, and headers.
     Binary {
         /// HTTP status.
@@ -442,158 +566,20 @@ pub enum Outcome {
 impl Outcome {
     /// Bare-ok envelope (no response key).
     pub fn ok() -> Self {
-        Outcome::Envelope {
-            key: None,
-            payload: None,
-        }
+        Outcome::Envelope(None)
     }
 
-    /// Envelope with a response key + payload.
-    pub fn keyed(key: &'static str, payload: value::Val) -> Self {
-        Outcome::Envelope {
-            key: Some(key),
-            payload: Some(payload),
-        }
+    /// Envelope with the answer under `key`, serialized now.
+    pub fn keyed(key: &'static str, answer: impl Serialize) -> Result<Self, SubsonicError> {
+        Ok(Outcome::Envelope(Some((key, value::payload(&answer)?))))
     }
 }
 
-/// Secret verifier. Implemented by delegating to
-/// `auth::compat_auth::subsonic::authenticate` and adapting the result.
-pub trait Verifier: Clone + Send + Sync {
-    /// Principal type the handlers see.
-    type Principal: Principal;
-
-    /// Verify classified credentials against the app-password store.
-    fn verify(
-        &self,
-        credentials: &Credentials,
-    ) -> impl Future<Output = Result<Self::Principal, SubsonicError>> + Send;
-}
-
-/// Dispatch one request: normalize, parse `f`, gate enablement, resolve
-/// the handler, authenticate (except the public endpoint), run, and
-/// render. Failures map through the binary-vs-envelope split (v2
-/// `_dispatch` boundary: nothing escapes this function as a panic).
-pub async fn dispatch<V: Verifier, S: Store, B: AudioBackend>(
-    verifier: &V,
-    store: &S,
-    audio: &B,
-    settings: &Settings,
-    request: &Request,
-) -> Rendered {
-    dispatch_with(verifier, store, audio, settings, request, None).await
-}
-
-/// [`dispatch`] with a pre-verified principal. The HTTP adapter verifies
-/// before dispatching so it can enforce the per-principal rate buckets and
-/// record auth failures without verifying twice; `None` verifies inline
-/// exactly like [`dispatch`]. A pre-verified principal is used only for
-/// non-public endpoints and never skips the enablement gate.
-pub async fn dispatch_with<V: Verifier, S: Store, B: AudioBackend>(
-    verifier: &V,
-    store: &S,
-    audio: &B,
-    settings: &Settings,
-    request: &Request,
-    preverified: Option<V::Principal>,
-) -> Rendered {
-    let name = normalize_endpoint(&request.endpoint);
-    // Early format sniffing preserves the requested envelope even when
-    // strict decoding fails (v2 reads a unique valid query value only).
-    let mut format = SubsonicFormat::Xml;
-    let mut callback: Option<String> = None;
-    if request.params.all("f").len() == 1
-        && let Some(sniffed) = request.params.all("f").into_iter().next()
-        && matches!(sniffed, "xml" | "json" | "jsonp")
-    {
-        format = parse_format(Some(sniffed)).unwrap_or(SubsonicFormat::Xml);
-    }
-    if request.params.all("callback").len() == 1
-        && let Some(sniffed) = request.params.all("callback").into_iter().next()
-        && sniffed.len() <= 128
-    {
-        callback = Some(sniffed.to_owned());
-    }
-    let failure =
-        |code: u8, message: &str, format: SubsonicFormat, callback: Option<&str>| -> Rendered {
-            if dispatch_uses_envelope(code, &name) {
-                render_error(
-                    code,
-                    message,
-                    format,
-                    callback,
-                    &settings.server_name,
-                    &settings.server_version,
-                )
-            } else {
-                render_binary_error(code, message)
-            }
-        };
-    let outcome: Result<Rendered, SubsonicError> = async {
-        let requested = request.params.string_max("f", Some("xml"), 16)?;
-        let parsed = parse_format(requested.as_deref())?;
-        format = parsed;
-        callback = request.params.string_max("callback", None, 128)?;
-        // Gate before handler lookup: a disabled API must not leak
-        // method existence (v2 `ensure_subsonic_enabled`).
-        if !settings.enabled {
-            return Err(SubsonicError::new(
-                0,
-                "The Subsonic API is disabled on this server.",
-            ));
-        }
-        if !is_known_endpoint(&name) {
-            return Ok(value::render_unknown_method());
-        }
-        let principal = if name == PUBLIC_ENDPOINT {
-            None
-        } else if let Some(preverified) = preverified {
-            Some(preverified)
-        } else {
-            let credentials = classify(&request.params)?
-                .ok_or_else(|| SubsonicError::code_only(PARAM_MISSING))?;
-            Some(verifier.verify(&credentials).await?)
-        };
-        let scoped = principal
-            .as_ref()
-            .map(|principal| store.for_caller(principal.user_id()));
-        let scoped_audio = principal
-            .as_ref()
-            .map(|principal| audio.for_caller(principal.user_id()));
-        let ctx = Ctx {
-            endpoint_name: name.clone(),
-            params: request.params.clone(),
-            principal,
-            store: scoped.as_ref().unwrap_or(store),
-            audio: scoped_audio.as_ref().unwrap_or(audio),
-            settings,
-            format,
-            callback: callback.clone(),
-            method: request.method.clone(),
-            range: request.header("Range").map(str::to_owned),
-            content_type: request.content_type.clone(),
-            body: request.body.clone(),
-            now_unix: request.now_unix,
-            picture_base: request.picture_base.clone(),
-        };
-        run_handler(&ctx).await
-    }
-    .await;
-    match outcome {
-        Ok(rendered) => rendered,
-        Err(err) => failure(err.code, &err.message, format, callback.as_deref()),
-    }
-}
-
-/// Render an outcome in the request's format.
-pub fn render_outcome(
-    outcome: Outcome,
-    ctx: &Ctx<impl Principal, impl Store, impl AudioBackend>,
-) -> Rendered {
-    match outcome {
-        Outcome::Envelope { key, payload } => render_ok(
-            key,
-            payload,
+/// Run a method and render its outcome in the request's format.
+pub async fn run(endpoint: &Endpoint, ctx: &Ctx<'_>) -> Result<Rendered, SubsonicError> {
+    match (endpoint.handler)(ctx).await? {
+        Outcome::Envelope(answer) => render_ok(
+            answer.as_ref().map(|(key, payload)| (*key, &**payload)),
             ctx.format,
             ctx.callback.as_deref(),
             &ctx.settings.server_name,
@@ -604,157 +590,59 @@ pub fn render_outcome(
             content_type,
             headers,
             body,
-        } => Rendered {
+        } => Ok(Rendered {
             status,
             content_type,
             headers,
             body,
             stream: None,
-        },
+        }),
         Outcome::Stream {
             status,
             content_type,
             headers,
             body,
-        } => Rendered {
+        } => Ok(Rendered {
             status,
             content_type,
             headers,
             body: Vec::new(),
             stream: Some(body),
-        },
+        }),
     }
 }
 
-/// True when the normalized name has a handler.
-pub fn is_known_endpoint(name: &str) -> bool {
-    matches!(
-        name,
-        "ping"
-            | "getlicense"
-            | "getopensubsonicextensions"
-            | "getmusicfolders"
-            | "getartists"
-            | "getindexes"
-            | "getartist"
-            | "getalbum"
-            | "getsong"
-            | "getalbumlist2"
-            | "getalbumlist"
-            | "getrandomsongs"
-            | "getmusicdirectory"
-            | "search3"
-            | "search2"
-            | "getcoverart"
-            | "stream"
-            | "download"
-            | "gettranscodedecision"
-            | "gettranscodestream"
-            | "getplaylists"
-            | "getplaylist"
-            | "createplaylist"
-            | "updateplaylist"
-            | "deleteplaylist"
-            | "star"
-            | "unstar"
-            | "getstarred2"
-            | "getstarred"
-            | "setrating"
-            | "scrobble"
-            | "getnowplaying"
-            | "reportplayback"
-            | "getplayqueue"
-            | "saveplayqueue"
-            | "getplayqueuebyindex"
-            | "saveplayqueuebyindex"
-            | "getbookmarks"
-            | "createbookmark"
-            | "deletebookmark"
-            | "getartistinfo2"
-            | "getartistinfo"
-            | "getalbuminfo2"
-            | "getalbuminfo"
-            | "getavatar"
-            | "getlyricsbysongid"
-            | "getlyrics"
-            | "getgenres"
-            | "getsongsbygenre"
-            | "getuser"
-            | "getscanstatus"
-            | "startscan"
-            | "gettopsongs"
-            | "getsimilarsongs2"
-            | "getsimilarsongs"
-            | "getpodcasts"
-            | "getnewestpodcasts"
-            | "getinternetradiostations"
-    )
-}
-
-/// Route to the endpoint handler (v2 `_HANDLERS`).
-async fn run_handler<P: Principal, S: Store, B: AudioBackend>(
-    ctx: &Ctx<'_, P, S, B>,
-) -> Result<Rendered, SubsonicError> {
-    let outcome = match ctx.endpoint_name.as_str() {
-        "ping" => browse::ping(ctx).await?,
-        "getlicense" => browse::license(ctx).await?,
-        "getopensubsonicextensions" => browse::extensions(ctx).await?,
-        "getmusicfolders" => browse::music_folders(ctx).await?,
-        "getartists" => browse::artists(ctx).await?,
-        "getindexes" => browse::indexes(ctx).await?,
-        "getartist" => browse::artist(ctx).await?,
-        "getalbum" => browse::album(ctx).await?,
-        "getsong" => browse::song(ctx).await?,
-        "getalbumlist2" => browse::album_list2(ctx).await?,
-        "getalbumlist" => browse::album_list(ctx).await?,
-        "getrandomsongs" => browse::random_songs(ctx).await?,
-        "getmusicdirectory" => browse::music_directory(ctx).await?,
-        "search3" => browse::search3(ctx).await?,
-        "search2" => browse::search2(ctx).await?,
-        "getcoverart" => media::cover_art(ctx).await?,
-        "stream" => media::stream(ctx).await?,
-        "download" => media::download(ctx).await?,
-        "gettranscodedecision" => media::transcode_decision(ctx).await?,
-        "gettranscodestream" => media::transcode_stream(ctx).await?,
-        "getplaylists" => library::playlists(ctx).await?,
-        "getplaylist" => library::playlist(ctx).await?,
-        "createplaylist" => library::create_playlist(ctx).await?,
-        "updateplaylist" => library::update_playlist(ctx).await?,
-        "deleteplaylist" => library::delete_playlist(ctx).await?,
-        "star" => library::star(ctx, true).await?,
-        "unstar" => library::star(ctx, false).await?,
-        "getstarred2" => library::starred2(ctx).await?,
-        "getstarred" => library::starred(ctx).await?,
-        "setrating" => library::set_rating(ctx).await?,
-        "scrobble" => library::scrobble(ctx).await?,
-        "getnowplaying" => library::now_playing(ctx).await?,
-        "reportplayback" => library::report_playback(ctx).await?,
-        "getplayqueue" => library::get_play_queue(ctx).await?,
-        "saveplayqueue" => library::save_play_queue(ctx).await?,
-        "getplayqueuebyindex" => library::get_play_queue_by_index(ctx).await?,
-        "saveplayqueuebyindex" => library::save_play_queue_by_index(ctx).await?,
-        "getbookmarks" => library::get_bookmarks(ctx).await?,
-        "createbookmark" => library::create_bookmark(ctx).await?,
-        "deletebookmark" => library::delete_bookmark(ctx).await?,
-        "getartistinfo2" | "getartistinfo" => library::artist_info(ctx).await?,
-        "getalbuminfo2" | "getalbuminfo" => library::album_info(ctx).await?,
-        "getavatar" => media::avatar(ctx).await?,
-        "getlyricsbysongid" => library::lyrics_by_song_id(ctx).await?,
-        "getlyrics" => library::lyrics(ctx).await?,
-        "getgenres" => library::genres(ctx).await?,
-        "getpodcasts" => browse::podcasts(ctx).await?,
-        "getnewestpodcasts" => browse::newest_podcasts(ctx).await?,
-        "getinternetradiostations" => browse::internet_radio_stations(ctx).await?,
-        "getsongsbygenre" => library::songs_by_genre(ctx).await?,
-        "getuser" => library::user(ctx).await?,
-        "getscanstatus" => library::scan_status(ctx).await?,
-        "startscan" => library::start_scan(ctx).await?,
-        "gettopsongs" => library::top_songs(ctx).await?,
-        "getsimilarsongs2" => library::similar_songs2(ctx).await?,
-        "getsimilarsongs" => library::similar_songs(ctx).await?,
-        _ => return Ok(value::render_unknown_method()),
+/// Answer a failure through the binary-vs-envelope split. A server fault
+/// keeps its 5xx status and `Retry-After` under the failed envelope, and
+/// comes back beside it for the request boundary to log.
+pub fn failure(
+    err: SubsonicError,
+    normalized_endpoint: &str,
+    format: SubsonicFormat,
+    callback: Option<&str>,
+    settings: &Settings,
+) -> (Rendered, Option<droppedneedle_kernel::error::Fault>) {
+    let mut rendered = if dispatch_uses_envelope(err.code, normalized_endpoint) {
+        render_error(
+            err.code,
+            &err.message,
+            format,
+            callback,
+            &settings.server_name,
+            &settings.server_version,
+        )
+    } else {
+        render_binary_error(err.code, &err.message)
     };
-    Ok(render_outcome(outcome, ctx))
+    let Some(fault) = err.fault else {
+        return (rendered, None);
+    };
+    let (status, retry_after, fault) = fault_answer(fault);
+    rendered.status = status;
+    if let Some(seconds) = retry_after {
+        rendered.headers.push(("Retry-After".to_owned(), seconds));
+    }
+    (rendered, fault)
 }
 
 #[cfg(test)]

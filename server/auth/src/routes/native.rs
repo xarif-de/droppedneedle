@@ -11,13 +11,12 @@ use crate::session::login::{
 };
 use crate::session::rate_limit::{LOGIN_USERNAME_CLASS, RateLimiter, rate_limited};
 use crate::session::stated::StatedAddresses;
-use crate::session::store::{SessionKind, SessionRecord, SessionStore as _};
 use crate::session::tokens;
-use crate::sqlite::SqliteSessionStore;
+use crate::sqlite::{Sessions, Users};
 use crate::users::UsersDeps;
 use crate::users::models::UserResponse;
+use crate::users::services::SetupSession;
 use crate::users::{clock_now, services};
-use crate::wiring::ProdNativeAuth;
 use axum::{
     Json,
     extract::{ConnectInfo, FromRequestParts, State},
@@ -50,16 +49,15 @@ pub struct AuthSessionBody {
     pub token: Option<String>,
 }
 
-/// State for the native auth routes. The session store mints setup sessions,
-/// the login service owns local login, and the users deps own user creation,
-/// the setup probe, logout revocation, and login enrichment.
+/// State for the native auth routes. The login service owns local login,
+/// and the users deps own setup, the setup probe, logout revocation, and
+/// login enrichment.
 #[derive(Clone)]
-pub struct NativeAuthState<C> {
-    /// Token store (setup session mint).
-    pub sessions: SqliteSessionStore,
+pub struct NativeAuthState {
     /// Local-login service.
-    pub login: LoginService<C>,
-    /// User stores, clock, ids, passwords (setup, probe, logout, enrichment).
+    pub login: LoginService,
+    /// User stores, sessions, clock, ids, passwords (setup, probe, logout,
+    /// enrichment).
     pub users: UsersDeps,
     /// Deployment base path (`""` at the domain root).
     pub base_path: String,
@@ -73,22 +71,17 @@ pub struct NativeAuthState<C> {
     pub limits: Arc<RateLimiter>,
 }
 
-impl<C> NativeAuthState<C>
-where
-    C: crate::session::login::CredentialLookup,
-{
+impl NativeAuthState {
     /// Wire the state from its parts. The login service is built here from
     /// the same handles so wiring passes each dependency once.
     pub fn new(
-        sessions: SqliteSessionStore,
+        sessions: Sessions,
         passwords: crate::passwords::Passwords,
-        credentials: C,
         users: UsersDeps,
         base_path: &str,
     ) -> Self {
         Self {
-            sessions: sessions.clone(),
-            login: LoginService::new(sessions, passwords, credentials),
+            login: LoginService::new(sessions, passwords, users.users.clone()),
             users,
             base_path: base_path.to_owned(),
             trusted_proxies: TrustedProxies::default(),
@@ -132,7 +125,7 @@ where
     )
 )]
 pub async fn login_handler(
-    State(state): State<ProdNativeAuth>,
+    State(state): State<NativeAuthState>,
     uri: Uri,
     headers: HeaderMap,
     peer: PeerAddr,
@@ -159,7 +152,7 @@ pub async fn login_handler(
     };
     match state.login.login(request, ctx).await {
         Ok(success) => {
-            let user = login_user(&state.users, &success.user_id).await?;
+            let user = login_user(&state.users.users, &success.user_id).await?;
             Ok(login_handoff(
                 &state.base_path,
                 secure,
@@ -190,7 +183,7 @@ pub async fn login_handler(
     responses((status = 204, description = "Logged out; cookie cleared"))
 )]
 pub async fn logout_handler(
-    State(state): State<ProdNativeAuth>,
+    State(state): State<NativeAuthState>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let presented = match extract::extract(&headers) {
@@ -222,10 +215,12 @@ pub async fn logout_handler(
 }
 
 /// First-admin setup. Creates the admin and logs them in (201 + session,
-/// v2 parity) iff no users exist; otherwise 409. The emptiness check runs
-/// inside the insert transaction, so concurrent setups, or a setup racing
-/// a first federated login (whose role is also decided in its insert),
-/// leave exactly one admin. The early probe only skips the password hash.
+/// v2 parity) iff no users exist; otherwise 409. The account and its
+/// session are one write: a busy or failed setup leaves nothing, so a retry
+/// can still run it. The emptiness check runs inside that transaction, so
+/// concurrent setups, or a setup racing a first federated login (whose role
+/// is also decided in its insert), leave exactly one admin. The early probe
+/// only skips the password hash.
 #[utoipa::path(
     post,
     tag = "auth",
@@ -238,7 +233,7 @@ pub async fn logout_handler(
     )
 )]
 pub async fn setup_handler(
-    State(state): State<ProdNativeAuth>,
+    State(state): State<NativeAuthState>,
     uri: Uri,
     headers: HeaderMap,
     peer: PeerAddr,
@@ -250,40 +245,21 @@ pub async fn setup_handler(
         }
         .into());
     }
+    let raw_token = tokens::mint_token().map_err(|error| AuthRouteError::internal(&error))?;
     let user = services::create_first_admin(
         &state.users,
         &body.username,
         &body.password,
         body.display_name.as_deref(),
         body.email.as_deref(),
+        SetupSession {
+            token_hash: tokens::hash_token(&raw_token),
+            user_agent: user_agent_of(&headers),
+        },
         SETUP_ALREADY_COMPLETED,
     )
     .await
     .map_err(AuthRouteError::from)?;
-    let now = clock_now(&state.users);
-    let raw_token = tokens::mint_token().map_err(|error| AuthRouteError::internal(&error))?;
-    state
-        .sessions
-        .insert(SessionRecord {
-            id: state.users.ids.new_id(),
-            user_id: user.id.clone(),
-            token_hash: tokens::hash_token(&raw_token),
-            kind: SessionKind::Standard,
-            label: None,
-            issued_at: now,
-            expires_at: tokens::expires_at(now),
-            last_seen_at: now,
-            revoked: false,
-            user_agent: user_agent_of(&headers),
-        })
-        .await
-        .map_err(|error| AuthRouteError::internal(&error))?;
-    state
-        .users
-        .users
-        .touch_login(&user.id, now)
-        .await
-        .map_err(|error| AuthRouteError::from(store_failure(&error)))?;
     let secure = cookies::secure_for_sign_in(
         uri.scheme_str().unwrap_or("http"),
         &headers,
@@ -309,7 +285,7 @@ pub async fn setup_handler(
     responses((status = 200, description = "Whether setup must run", body = SetupStatusBody))
 )]
 pub async fn setup_status_handler(
-    State(state): State<ProdNativeAuth>,
+    State(state): State<NativeAuthState>,
 ) -> Result<Json<SetupStatusBody>, ApiError> {
     Ok(Json(SetupStatusBody {
         setup_required: !users_exist(&state.users).await?,
@@ -326,17 +302,19 @@ async fn users_exist(users: &UsersDeps) -> Result<bool, AuthRouteError> {
         .map_err(|error| AuthRouteError::from(store_failure(&error)))
 }
 
-/// Full login user for the response body. The credential lookup already
-/// proved the account exists; a vanished row is a 500, never a partial body.
-async fn login_user(users: &UsersDeps, user_id: &str) -> Result<UserResponse, AuthRouteError> {
+/// Full login user for the response body of every sign-in. The credential
+/// lookup already proved the account exists; a vanished row is a 500, never a
+/// partial body.
+pub(super) async fn login_user(
+    users: &Users,
+    user_id: &str,
+) -> Result<UserResponse, AuthRouteError> {
     let user = users
-        .users
         .get_by_id(user_id)
         .await
         .map_err(|error| AuthRouteError::from(store_failure(&error)))?
         .ok_or_else(|| AuthRouteError::internal(&"login credential has no user row"))?;
     let providers = users
-        .users
         .provider_names(user_id)
         .await
         .map_err(|error| AuthRouteError::from(store_failure(&error)))?;

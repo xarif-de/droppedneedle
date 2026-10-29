@@ -61,9 +61,10 @@ droppedneedle_kernel::sql! {
     /// Record a poll without a status change.
     pub(super) TOUCH_POLL = "UPDATE download_tasks SET last_polled_at = ?1, updated_at = ?1 \
              WHERE id = ?2";
-    /// Link a task to the candidate a person picked.
+    /// Link a task to a picked candidate, saying whether a person picked it.
     pub(super) LINK_CANDIDATE = "UPDATE download_tasks SET source = ?1, source_username = ?2, \
-             search_job_id = ?3, candidate_index = ?4, updated_at = ?5 WHERE id = ?6";
+             search_job_id = ?3, candidate_index = ?4, updated_at = ?5, \
+             picked_by_person = ?7 WHERE id = ?6";
     /// Reimport guard: a failed or partial task with an attempt whose handle
     /// still names its files and whose cleanup has not run.
     pub(super) REIMPORTABLE = "SELECT EXISTS (SELECT 1 FROM download_tasks t \
@@ -296,6 +297,10 @@ droppedneedle_kernel::sql! {
     /// The newest decision of a task (`?1`).
     pub(super) LATEST_DECISION = DECISION_ROW + " WHERE task_id = ?1 \
              ORDER BY decided_at DESC, id DESC LIMIT 1";
+    /// The newest decision of a task (`?1`) that imported files.
+    pub(super) LATEST_IMPORT = DECISION_ROW + " WHERE task_id = ?1 \
+             AND outcome IN ('imported', 'partial') \
+             ORDER BY decided_at DESC, id DESC LIMIT 1";
     /// The newest decision of a task (`?1`) for one attempt (`?2`, NULL for
     /// none) that is not a deferral.
     pub(super) LAST_LANDING_OF_ATTEMPT = DECISION_ROW + " WHERE task_id = ?1 \
@@ -307,6 +312,52 @@ droppedneedle_kernel::sql! {
                WHERE reason_code IS NOT NULL \
              UNION SELECT outcome_code FROM download_tasks WHERE outcome_code IS NOT NULL \
              UNION SELECT reason_code FROM drop_import_items WHERE reason_code IS NOT NULL";
+    /// Record one landing's decision.
+    pub(super) INSERT_DECISION = "INSERT INTO download_import_decisions (task_id, attempt_id, \
+             outcome, reason_code, detail, release_mbid, distance, files_total, files_imported, \
+             files_held, checks_json, missing_positions, decided_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)";
+    /// Stamp a task's (`?3`) wrong-product verdict; the first one stands.
+    pub(super) SET_WRONG_PRODUCT = "UPDATE download_tasks \
+             SET wrong_product_verdict_at = ?1, wrong_product_detail = ?2 \
+             WHERE id = ?3 AND wrong_product_verdict_at IS NULL";
+    /// Clear a task's (`?1`) wrong-product verdict.
+    pub(super) CLEAR_WRONG_PRODUCT = "UPDATE download_tasks \
+             SET wrong_product_verdict_at = NULL, wrong_product_detail = NULL WHERE id = ?1";
+    /// A failed or short task (`?2`) a person made whole by hand completes.
+    pub(super) COMPLETE_AFTER_MANUAL_IMPORT = "UPDATE download_tasks \
+             SET status = 'completed', error_message = NULL, outcome_code = NULL, \
+                 completed_at = ?1, updated_at = ?1 \
+             WHERE id = ?2 AND status IN ('failed', 'partial')";
+    /// Stop retrying an album's (`?1`) failed and short tasks made at or
+    /// before `?3`; answers their ids.
+    pub(super) PURGE_ALBUM_TASKS = "UPDATE download_tasks \
+             SET status = 'cancelled', cancelled_at = ?2, remote_queued = 0, updated_at = ?2 \
+             WHERE lower(release_group_mbid) = lower(?1) AND status IN ('failed', 'partial') \
+               AND created_at <= ?3 RETURNING id";
+    /// Clear an album's (`?1`) blocklist entries made at or before `?2`.
+    pub(super) PURGE_ALBUM_QUARANTINE = "DELETE FROM download_quarantine \
+             WHERE lower(release_group_mbid) = lower(?1) AND quarantined_at <= ?2";
+    /// One poll's progress on a live task (`?1`).
+    pub(super) RECORD_PROGRESS = "UPDATE download_tasks SET downloaded_bytes = ?2, \
+             total_size_bytes = COALESCE(?3, total_size_bytes), progress_percent = ?4, \
+             files_total = ?5, files_completed = ?6, files_failed = ?7, \
+             queue_position_start = ?8, queue_position_end = ?9, remote_queued = ?10, \
+             last_polled_at = ?11 \
+             WHERE id = ?1 AND status IN ('downloading', 'processing')";
+    /// Stop retrying one failed or short task (`?1`).
+    pub(super) STOP_RETRIES = "UPDATE download_tasks \
+             SET status = 'cancelled', cancelled_at = ?2, remote_queued = 0, updated_at = ?2 \
+             WHERE id = ?1 AND status IN ('failed', 'partial')";
+    /// Stop an owner's (`?2`) wanted watch on an album (`?1`).
+    pub(super) STOP_WATCH = "UPDATE wanted_watches SET state = 'stopped' \
+             WHERE release_group_mbid_lower = lower(?1) AND user_id = ?2 \
+               AND state = 'watching'";
+    /// Delete finished tasks of one owner (`?1`, NULL for everyone).
+    pub(super) CLEAR_FINISHED = "DELETE FROM download_tasks \
+             WHERE status IN ('completed', 'cancelled') AND (?1 IS NULL OR user_id = ?1)";
+    /// Remove one quarantine entry (`?1`).
+    pub(super) DELETE_QUARANTINE = "DELETE FROM download_quarantine WHERE id = ?1";
 }
 
 /// `?, ?, ...` for a list of `len` values.
@@ -319,7 +370,7 @@ pub(super) fn tasks_in(statuses: ListLen) -> String {
     format!("{TASK_ROW} WHERE status IN ({})", marks(statuses))
 }
 
-/// Per task: attempts that reached a client, and v2's cleanup summary.
+/// Per task: attempts that reached a client, and the cleanup summary.
 pub(super) fn attempt_facts(tasks: ListLen) -> String {
     format!(
         "SELECT task_id, SUM(handle_json != ''), \

@@ -7,6 +7,8 @@
 //! user reads (administrators see a little more). Ported from v2's
 //! `library_scan_target` routes.
 
+use crate::activity::Activity;
+use crate::scans::Scans;
 use axum::{
     Json,
     extract::{Path, State},
@@ -15,17 +17,18 @@ use axum::{
 use droppedneedle_kernel::error::ApiError;
 use droppedneedle_kernel::extract::{ValidJson, ValidQuery};
 use droppedneedle_kernel::mount::{Routes, routes};
+use droppedneedle_kernel::page::{Page, PageRequest};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use super::error::LibraryError;
+use super::blocking;
 use super::handlers::run_view;
 use super::models::ScanRunView;
 use crate::activity::feed::LibraryActivity;
 use crate::scan::models::{Disposition, FailureCode, ScanKind, ScanPhase, ScanState};
 use crate::scan::reasons::scan_reason;
 use crate::scans::{MAX_FAILURE_PAGE, MAX_PAGE, RunControl};
-use crate::wiring::{LibraryServices, LibrarySetup};
+use crate::wiring::LibraryServices;
 use droppedneedle_auth::{Admin, User};
 
 /// Scan control and activity routes.
@@ -42,15 +45,6 @@ pub fn routes() -> Routes<LibraryServices> {
         .user(routes!(library_activity))
         .admin(routes!(pause_identification))
         .admin(routes!(resume_identification))
-}
-
-/// Run store-backed work on a blocking thread.
-async fn blocking<T: Send + 'static>(
-    work: impl FnOnce() -> T + Send + 'static,
-) -> Result<T, LibraryError> {
-    tokio::task::spawn_blocking(work)
-        .await
-        .map_err(|cause| LibraryError::internal(&cause))
 }
 
 // ---------------------------------------------------------------------------
@@ -95,40 +89,12 @@ pub struct ScanRunRequestBody {
     pub expected_policy_revision: String,
 }
 
-/// How the request was taken.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ScanDisposition {
-    /// A new run started.
-    Started,
-    /// A new run waits behind the active one.
-    Queued,
-    /// An existing run already covers it.
-    Coalesced,
-    /// A queued run grew to cover it.
-    Expanded,
-    /// A run of another kind is in the way.
-    Conflict,
-}
-
-impl From<Disposition> for ScanDisposition {
-    fn from(disposition: Disposition) -> Self {
-        match disposition {
-            Disposition::Started => Self::Started,
-            Disposition::Queued => Self::Queued,
-            Disposition::Coalesced => Self::Coalesced,
-            Disposition::Expanded => Self::Expanded,
-            Disposition::Conflict => Self::Conflict,
-        }
-    }
-}
-
 /// Answer to a scan request.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ScanRunRequestedResponse {
     /// The run that will do the work.
     pub run_id: String,
-    pub disposition: ScanDisposition,
+    pub disposition: Disposition,
     /// That run's state.
     pub state: ScanState,
     /// That run's row revision.
@@ -153,19 +119,10 @@ pub struct ScanRunCurrentResponse {
 /// History page query.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct HistoryQuery {
-    /// Runs per page, 1 to 50 (default 50).
-    pub limit: Option<usize>,
-    /// Cursor from the previous page.
+    /// Runs per page, 1 to 50 (default 50); more is read as 50.
+    pub limit: Option<u32>,
+    /// `next_cursor` from the previous page.
     pub cursor: Option<String>,
-}
-
-/// One page of finished runs, newest first.
-#[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct ScanRunHistoryResponse {
-    pub items: Vec<ScanRunView>,
-    /// Pass back as `cursor` for the next page; null on the last.
-    #[schema(required = true)]
-    pub next_cursor: Option<String>,
 }
 
 /// Approximate size of a scan.
@@ -183,10 +140,10 @@ pub struct ScanEstimateResponse {
 /// Failed paths query.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct FailuresQuery {
-    /// Rows per page, 1 to 200 (default 50).
-    pub limit: Option<usize>,
-    /// Cursor from the previous page.
-    pub cursor: Option<i64>,
+    /// Rows per page, 1 to 200 (default 50); more is read as 200.
+    pub limit: Option<u32>,
+    /// `next_cursor` from the previous page.
+    pub cursor: Option<String>,
 }
 
 /// One path a scan could not read or index.
@@ -206,15 +163,6 @@ pub struct ScanRunFailureItem {
     pub phase: ScanPhase,
     /// Unix seconds.
     pub recorded_at: f64,
-}
-
-/// One page of a run's failed paths, oldest first.
-#[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct ScanRunFailuresResponse {
-    pub items: Vec<ScanRunFailureItem>,
-    /// Pass back as `cursor` for the next page; null on the last.
-    #[schema(required = true)]
-    pub next_cursor: Option<i64>,
 }
 
 /// A pause, resume or stop request.
@@ -278,7 +226,7 @@ pub struct IdentificationControlResponse {
     )
 )]
 pub async fn request_scan_run(
-    State(state): State<LibrarySetup>,
+    State(state): State<Scans>,
     caller: Admin,
     ValidJson(body): ValidJson<ScanRunRequestBody>,
 ) -> Result<(StatusCode, Json<ScanRunRequestedResponse>), ApiError> {
@@ -291,12 +239,12 @@ pub async fn request_scan_run(
             &user_id,
         )
     })
-    .await??;
+    .await?;
     Ok((
         StatusCode::ACCEPTED,
         Json(ScanRunRequestedResponse {
             run_id: result.run_id,
-            disposition: result.disposition.into(),
+            disposition: result.disposition,
             state: result.state,
             row_revision: result.row_revision,
             queued_reason: result.queued_reason,
@@ -317,10 +265,10 @@ pub async fn request_scan_run(
     )
 )]
 pub async fn current_scan_runs(
-    State(state): State<LibrarySetup>,
+    State(state): State<Scans>,
     _caller: Admin,
 ) -> Result<Json<ScanRunCurrentResponse>, ApiError> {
-    let (active, queued) = blocking(move || state.current_scan_runs()).await??;
+    let (active, queued) = blocking(move || state.current_scan_runs()).await?;
     Ok(Json(ScanRunCurrentResponse {
         active: active.as_ref().map(run_view),
         queued: queued.as_ref().map(run_view),
@@ -333,28 +281,25 @@ pub async fn current_scan_runs(
     tag = "library management",
     path = "/api/v3/library/scan/runs/history",
     params(
-        ("limit" = Option<usize>, Query, description = "Runs per page, 1 to 50"),
-        ("cursor" = Option<String>, Query, description = "Cursor from the previous page"),
+        ("limit" = Option<u32>, Query, description = "Runs per page, 1 to 50; more is read as 50"),
+        ("cursor" = Option<String>, Query, description = "`next_cursor` from the previous page"),
     ),
     responses(
-        (status = 200, description = "History page", body = ScanRunHistoryResponse),
+        (status = 200, description = "History page, newest first", body = Page<ScanRunView>),
         (status = 400, description = "Bad cursor"),
         (status = 401, description = "Not authenticated"),
         (status = 403, description = "Admin role required"),
     )
 )]
 pub async fn scan_run_history(
-    State(state): State<LibrarySetup>,
+    State(state): State<Scans>,
     _caller: Admin,
     ValidQuery(query): ValidQuery<HistoryQuery>,
-) -> Result<Json<ScanRunHistoryResponse>, ApiError> {
-    let limit = query.limit.unwrap_or(MAX_PAGE);
-    let (runs, next_cursor) =
-        blocking(move || state.scan_history_page(limit, query.cursor.as_deref())).await??;
-    Ok(Json(ScanRunHistoryResponse {
-        items: runs.iter().map(run_view).collect(),
-        next_cursor,
-    }))
+) -> Result<Json<Page<ScanRunView>>, ApiError> {
+    let paging = PageRequest::read(query.limit, query.cursor.as_deref(), MAX_PAGE, MAX_PAGE)?;
+    let (runs, next) =
+        blocking(move || state.scan_history_page(paging.limit, paging.after)).await?;
+    Ok(Json(Page::new(runs.iter().map(run_view).collect(), next)))
 }
 
 /// Roughly how many files a scan over the chosen scopes would read.
@@ -373,7 +318,7 @@ pub async fn scan_run_history(
     )
 )]
 pub async fn estimate_scan_run(
-    State(state): State<LibrarySetup>,
+    State(state): State<Scans>,
     _caller: Admin,
     ValidQuery(pairs): ValidQuery<Vec<(String, String)>>,
 ) -> Result<Json<ScanEstimateResponse>, ApiError> {
@@ -382,7 +327,7 @@ pub async fn estimate_scan_run(
         .filter(|(key, _)| key == "scope_ids")
         .map(|(_, value)| value)
         .collect();
-    let (count, at) = blocking(move || state.estimate_scan(&scope_ids)).await??;
+    let (count, at) = blocking(move || state.estimate_scan(&scope_ids)).await?;
     Ok(Json(ScanEstimateResponse {
         approximate: true,
         estimated_file_count: Some(count),
@@ -397,27 +342,28 @@ pub async fn estimate_scan_run(
     path = "/api/v3/library/scan/runs/{id}/failures",
     params(
         ("id" = String, Path, description = "Scan run id"),
-        ("limit" = Option<usize>, Query, description = "Rows per page, 1 to 200"),
-        ("cursor" = Option<i64>, Query, description = "Cursor from the previous page"),
+        ("limit" = Option<u32>, Query, description = "Rows per page, 1 to 200; more is read as 200"),
+        ("cursor" = Option<String>, Query, description = "`next_cursor` from the previous page"),
     ),
     responses(
-        (status = 200, description = "Failed paths", body = ScanRunFailuresResponse),
+        (status = 200, description = "Failed paths, oldest first", body = Page<ScanRunFailureItem>),
+        (status = 400, description = "Bad cursor"),
         (status = 401, description = "Not authenticated"),
         (status = 403, description = "Admin role required"),
         (status = 404, description = "Unknown run id"),
     )
 )]
 pub async fn scan_run_failures(
-    State(state): State<LibrarySetup>,
+    State(state): State<Scans>,
     _caller: Admin,
     Path(id): Path<String>,
     ValidQuery(query): ValidQuery<FailuresQuery>,
-) -> Result<Json<ScanRunFailuresResponse>, ApiError> {
-    let limit = query.limit.unwrap_or(50).min(MAX_FAILURE_PAGE);
-    let (failures, next_cursor) =
-        blocking(move || state.scan_run_failures(&id, limit, query.cursor)).await??;
-    Ok(Json(ScanRunFailuresResponse {
-        items: failures
+) -> Result<Json<Page<ScanRunFailureItem>>, ApiError> {
+    let paging = PageRequest::read(query.limit, query.cursor.as_deref(), 50, MAX_FAILURE_PAGE)?;
+    let (failures, next) =
+        blocking(move || state.scan_run_failures(&id, paging.limit, paging.after)).await?;
+    Ok(Json(Page::new(
+        failures
             .into_iter()
             .map(|failure| {
                 let reason = scan_reason(failure.failure_code);
@@ -433,18 +379,18 @@ pub async fn scan_run_failures(
                 }
             })
             .collect(),
-        next_cursor,
-    }))
+        next,
+    )))
 }
 
 async fn control(
-    state: LibrarySetup,
+    state: Scans,
     id: String,
     control: RunControl,
     body: ScanControlBody,
 ) -> Result<Json<ScanControlResponse>, ApiError> {
     let controlled =
-        blocking(move || state.control_scan_run(&id, control, body.expected_revision)).await??;
+        blocking(move || state.control_scan_run(&id, control, body.expected_revision)).await?;
     let run = controlled.run;
     Ok(Json(ScanControlResponse {
         state: run.state.scan_state(),
@@ -471,7 +417,7 @@ async fn control(
     )
 )]
 pub async fn pause_scan_run(
-    State(state): State<LibrarySetup>,
+    State(state): State<Scans>,
     _caller: Admin,
     Path(id): Path<String>,
     ValidJson(body): ValidJson<ScanControlBody>,
@@ -495,7 +441,7 @@ pub async fn pause_scan_run(
     )
 )]
 pub async fn resume_scan_run(
-    State(state): State<LibrarySetup>,
+    State(state): State<Scans>,
     _caller: Admin,
     Path(id): Path<String>,
     ValidJson(body): ValidJson<ScanControlBody>,
@@ -519,7 +465,7 @@ pub async fn resume_scan_run(
     )
 )]
 pub async fn stop_scan_run(
-    State(state): State<LibrarySetup>,
+    State(state): State<Scans>,
     _caller: Admin,
     Path(id): Path<String>,
     ValidJson(body): ValidJson<ScanControlBody>,
@@ -543,17 +489,15 @@ pub async fn stop_scan_run(
     )
 )]
 pub async fn library_activity(
-    State(state): State<LibrarySetup>,
+    State(state): State<Activity>,
     User(caller): User,
 ) -> Result<Json<LibraryActivity>, ApiError> {
     let admin = caller.is_admin();
-    Ok(Json(
-        blocking(move || state.library_activity(admin)).await??,
-    ))
+    Ok(Json(blocking(move || state.library_activity(admin)).await?))
 }
 
 async fn identification_control(
-    state: LibrarySetup,
+    state: Activity,
     paused: bool,
     user_id: String,
     body: IdentificationControlBody,
@@ -561,7 +505,7 @@ async fn identification_control(
     let answer = blocking(move || {
         state.set_identification_paused(paused, &user_id, Some(body.expected_revision))
     })
-    .await??;
+    .await?;
     Ok(Json(IdentificationControlResponse {
         state: match answer.state {
             "pausing" => IdentificationState::Pausing,
@@ -586,7 +530,7 @@ async fn identification_control(
     )
 )]
 pub async fn pause_identification(
-    State(state): State<LibrarySetup>,
+    State(state): State<Activity>,
     caller: Admin,
     ValidJson(body): ValidJson<IdentificationControlBody>,
 ) -> Result<Json<IdentificationControlResponse>, ApiError> {
@@ -607,7 +551,7 @@ pub async fn pause_identification(
     )
 )]
 pub async fn resume_identification(
-    State(state): State<LibrarySetup>,
+    State(state): State<Activity>,
     caller: Admin,
     ValidJson(body): ValidJson<IdentificationControlBody>,
 ) -> Result<Json<IdentificationControlResponse>, ApiError> {

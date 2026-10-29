@@ -1,9 +1,9 @@
 //! Production auth adapters: the wiring surface the app owns.
 //!
 //! This module is the single import point for the production auth types:
-//! the password hasher and the SQLite adapters over the 0001
-//! baseline tables. The auth modules define ports; this module re-exports the production types
-//! behind them plus one bundle constructor, so app wiring touches one path.
+//! the password hasher, the repositories over the auth tables and the
+//! avatar files, re-exported with one bundle constructor so app wiring
+//! touches one path.
 //!
 //! ## What the wiring calls
 //!
@@ -12,10 +12,10 @@
 //! use droppedneedle_auth::prod::ProdAuth;
 //!
 //! let auth = ProdAuth::new(&platform);
-//! // Native login: LoginService::new(auth.sessions.clone(), auth.passwords.clone(), auth.credentials.clone())
+//! // Native login: LoginService::new(auth.sessions.clone(), auth.passwords.clone(), auth.users.clone())
 //! // UsersDeps: users/auth.sessions/auth.app_passwords/auth.recovery/auth.lastfm/auth.avatars,
 //! //   passwords: auth.passwords.clone()
-//! // Federated: auth.federated.clone() + auth.issuer.clone()
+//! // Federated: auth.federated.clone() + auth.sessions.clone()
 //! // OIDC states: auth.oidc_states.clone()
 //! ```
 //!
@@ -28,10 +28,11 @@
 //! - Local credential JSON is `{"password_hash": ..., "scheme": ...}`
 //!   in `auth_providers.provider_data` with `provider = 'local'`; no
 //!   migration adds a scheme column.
-//! - `last_seen_at` rewrites at most once per 5 minutes per token.
+//! - `last_seen_at` rewrites at most once per 5 minutes per token, in a
+//!   background write the request does not wait for.
 //! - A login against a hash weaker than the pin writes the rehash in the
 //!   same transaction as its session (see
-//!   [`SqliteSessionStore::insert_login`]).
+//!   [`Sessions::insert_login`]).
 //! - Federated `token_json` is sealed with the deployment key on every
 //!   write; no read path decrypts it.
 //! - App-password verification is decrypt-free (`secret_sha256` +
@@ -39,14 +40,13 @@
 //!   exports can re-encrypt it under a fresh key.
 //!
 
-pub use super::avatars::FileAvatarStore;
+pub use super::avatars::Avatars;
 pub use super::passwords::{
     OWASP_M_COST_KIB, OWASP_P_COST, OWASP_T_COST, Passwords, StoredPassword, Verdict,
 };
 pub use super::sqlite::{
-    AuthDb, SqliteAppPasswordStore, SqliteCredentialLookup, SqliteFederatedStore,
-    SqliteLastFmStore, SqliteOidcStateStore, SqliteRecoveryStore, SqliteSessionIssuer,
-    SqliteSessionManager, SqliteSessionStore, SqliteUserStore, session_expires_at,
+    AppPasswords, AuthDb, FederatedUsers, LastFmLinks, OidcStates, RecoveryCodes, Sessions, Users,
+    session_expires_at,
 };
 pub use super::times::{parse_iso, to_iso};
 
@@ -60,28 +60,24 @@ pub struct ProdAuth {
     pub db: AuthDb,
     /// Argon2id native / bcrypt legacy / dummy unknown.
     pub passwords: Passwords,
-    /// Logins + middleware over `auth_tokens`.
-    pub sessions: SqliteSessionStore,
-    /// Session list/revoke surface over `auth_tokens`.
-    pub session_manager: SqliteSessionManager,
-    /// Accounts + local credentials over `auth_users` / `auth_providers`.
-    pub users: SqliteUserStore,
+    /// Every session over `auth_tokens`: logins, the gate, the session
+    /// list and federated sign-ins.
+    pub sessions: Sessions,
+    /// Accounts, local credentials and the sign-in lookup over
+    /// `auth_users` / `auth_providers`.
+    pub users: Users,
     /// Federated import over `auth_users` / `auth_providers`.
-    pub federated: SqliteFederatedStore,
-    /// Post-login session mint + `last_login_at`.
-    pub issuer: SqliteSessionIssuer,
-    /// Native login lookup (`scheme$hash` tagged rows).
-    pub credentials: SqliteCredentialLookup,
+    pub federated: FederatedUsers,
     /// Compat secrets over `connect_app_passwords`.
-    pub app_passwords: SqliteAppPasswordStore,
+    pub app_passwords: AppPasswords,
     /// Single-active-code rows over `auth_password_recovery_codes`.
-    pub recovery: SqliteRecoveryStore,
+    pub recovery: RecoveryCodes,
     /// Per-user links over `user_connections`.
-    pub lastfm: SqliteLastFmStore,
+    pub lastfm: LastFmLinks,
     /// PKCE states over `auth_oidc_states`.
-    pub oidc_states: SqliteOidcStateStore,
+    pub oidc_states: OidcStates,
     /// Avatar bytes under `<avatar_dir>/avatars/`.
-    pub avatars: FileAvatarStore,
+    pub avatars: Avatars,
 }
 
 impl ProdAuth {
@@ -90,24 +86,17 @@ impl ProdAuth {
     /// avatar files live under its cache folder.
     pub fn new(platform: &droppedneedle_kernel::platform::Platform) -> Self {
         let db = AuthDb::new(&platform.db, platform.clock.clone());
-        let (crypto, ids, clock) = (
-            platform.crypto.clone(),
-            platform.ids.clone(),
-            platform.clock.clone(),
-        );
+        let (crypto, ids) = (platform.crypto.clone(), platform.ids.clone());
         Self {
             passwords: Passwords::new(),
-            sessions: SqliteSessionStore::new(&db),
-            session_manager: SqliteSessionManager::new(&db, clock),
-            users: SqliteUserStore::new(&db),
-            federated: SqliteFederatedStore::new(&db, crypto, ids.clone()),
-            issuer: SqliteSessionIssuer::new(&db, ids),
-            credentials: SqliteCredentialLookup::new(&db),
-            app_passwords: SqliteAppPasswordStore::new(&db),
-            recovery: SqliteRecoveryStore::new(&db),
-            lastfm: SqliteLastFmStore::new(&db),
-            oidc_states: SqliteOidcStateStore::new(&db),
-            avatars: FileAvatarStore::new(&platform.config.cache_dir),
+            sessions: Sessions::new(&db, ids.clone()),
+            users: Users::new(&db),
+            federated: FederatedUsers::new(&db, crypto, ids),
+            app_passwords: AppPasswords::new(&db),
+            recovery: RecoveryCodes::new(&db),
+            lastfm: LastFmLinks::new(&db),
+            oidc_states: OidcStates::new(&db),
+            avatars: Avatars::new(&platform.config.cache_dir),
             db,
         }
     }

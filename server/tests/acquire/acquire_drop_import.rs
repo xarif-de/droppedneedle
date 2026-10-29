@@ -206,6 +206,7 @@ async fn bundles() -> (AcquireDb, LibrarySetup, PathBuf, AuthRig) {
     let music = dir.join("music");
     std::fs::create_dir_all(&music).expect("music root");
     library
+        .scans
         .add_root(
             Some("music".to_owned()),
             music.to_string_lossy().into_owned(),
@@ -244,16 +245,14 @@ async fn dropped_album_lands_and_the_unknown_folder_waits_for_review() {
     let mysterons = tagged(&work, "flac_full_01.flac", "Dummy", "Mysterons", 1);
     let impostor = tagged(&work, "flac_full_01.flac", "Dummy", "Glory Box", 1);
     let lengths = [None, length_ms(&sour_times, &work)];
-    let pool = db.pool().clone();
     let acquire = acquire_over(
         &db,
         Arc::new(LibraryLanding::new(
-            library.clone(),
+            &library,
             every_priority(Arc::new(OneRelease(release(
                 &["Mysterons", "Sour Times"],
                 &lengths,
             )))),
-            pool,
         )),
     );
 
@@ -310,14 +309,14 @@ async fn dropped_album_lands_and_the_unknown_folder_waits_for_review() {
         "SELECT COUNT(*) FROM local_tracks WHERE availability = 'indexed' \
          AND ingest_source = 'drop' AND download_task_id IS NULL",
     )
-    .fetch_one(acquire.db.pool())
+    .fetch_one(acquire.db.db().sqlx())
     .await
     .expect("catalog");
     assert_eq!(drops, 3, "indexed as a drop, not a download");
     let request: String =
         sqlx::query_scalar("SELECT status FROM request_history WHERE musicbrainz_id_lower = ?1")
             .bind(GROUP)
-            .fetch_one(acquire.db.pool())
+            .fetch_one(acquire.db.db().sqlx())
             .await
             .expect("request row");
     assert_eq!(
@@ -339,7 +338,7 @@ async fn dropped_album_lands_and_the_unknown_folder_waits_for_review() {
     assert!(entry.expires_at > entry.created_at);
     // The job's folder stays while a file of it waits for a decision.
     let job_dir = PathBuf::from(&job.staging_dir);
-    acquire.drops.sweep_stale().await;
+    acquire.drops.sweep_stale().await.unwrap();
     assert!(job_dir.is_dir(), "a folder with a waiting upload was swept");
     let held_viewer = HeldViewer {
         user_id: curator.user_id.clone(),
@@ -358,7 +357,7 @@ async fn dropped_album_lands_and_the_unknown_folder_waits_for_review() {
         .expect("review item");
     assert_eq!(odd.status, "discarded");
     assert!(staged.iter().all(|path| !path.exists()));
-    acquire.drops.sweep_stale().await;
+    acquire.drops.sweep_stale().await.unwrap();
     assert!(!job_dir.exists(), "the job folder goes once nothing waits");
 
     // A better file tagged as another song never replaces the owned copy.
@@ -415,9 +414,8 @@ async fn same_named_files_on_two_discs_both_wait() {
     let acquire = acquire_over(
         &db,
         Arc::new(LibraryLanding::new(
-            library.clone(),
+            &library,
             every_priority(Arc::new(OneRelease(release(&["Mysterons"], &[None])))),
-            db.pool().clone(),
         )),
     );
     let curator = Viewer {
@@ -436,7 +434,7 @@ async fn same_named_files_on_two_discs_both_wait() {
     let (entry, staged) = entry_of(&acquire, &curator.user_id, job.items[0].id).await;
     assert_eq!(entry.files.len(), 2, "{:?}", entry.files);
     assert!(staged.iter().all(|path| path.is_file()));
-    acquire.drops.sweep_stale().await;
+    acquire.drops.sweep_stale().await.unwrap();
     assert!(
         staged.iter().all(|path| path.is_file()),
         "a waiting file was swept"
@@ -460,9 +458,8 @@ async fn an_upgrade_the_bin_cannot_take_keeps_the_upload() {
     let acquire = acquire_over(
         &db,
         Arc::new(LibraryLanding::new(
-            library.clone(),
+            &library,
             every_priority(Arc::new(OneRelease(release(&["Mysterons"], &[None])))),
-            db.pool().clone(),
         )),
     );
     let curator = Viewer {
@@ -607,13 +604,11 @@ async fn a_hand_match_finds_the_edition_in_a_large_group() {
     let (db, library, dir, _auth) = bundles().await;
     let mut known = editions(1);
     known.extend(editions(2));
-    let pool = db.pool().clone();
     let acquire = acquire_over(
         &db,
         Arc::new(LibraryLanding::new(
-            library.clone(),
+            &library,
             every_priority(Arc::new(LargeGroups(known))),
-            pool,
         )),
     );
     let curator = Viewer {
@@ -670,7 +665,7 @@ async fn a_hand_match_finds_the_edition_in_a_large_group() {
              WHERE release_group_mbid = ?1",
         )
         .bind(group(case))
-        .fetch_all(acquire.db.pool())
+        .fetch_all(acquire.db.db().sqlx())
         .await
         .expect("identities");
         assert_eq!(releases, vec![release_id(case, 130)], "case {case}");
@@ -693,13 +688,11 @@ async fn a_deferred_upload_match_leaves_its_files_as_they_were() {
     guess.tracks[0].id = "9d0b7a1e-0000-4000-8000-000000000003".to_owned();
     let guessed_track = guess.tracks[0].clone();
     let (db, library, dir, _auth) = bundles().await;
-    let pool = db.pool().clone();
     let acquire = acquire_over(
         &db,
         Arc::new(LibraryLanding::new(
-            library.clone(),
+            &library,
             every_priority(Arc::new(LargeGroups(vec![picked, guess]))),
-            pool,
         )),
     );
     let curator = Viewer {
@@ -750,7 +743,7 @@ async fn a_deferred_upload_match_leaves_its_files_as_they_were() {
             "SELECT state, reason, release_mbid FROM acquire_held_files WHERE id = ?1",
         )
         .bind(file_id)
-        .fetch_one(acquire.db.pool())
+        .fetch_one(acquire.db.db().sqlx())
         .await
         .expect("held file")
     };
@@ -788,13 +781,11 @@ async fn a_matched_uploads_bonus_track_is_not_retried_onto_the_old_guess() {
     guess.tracks[0].recording_id = "9d0b7a1e-0000-4000-8000-000000000014".to_owned();
     let guessed = guess.tracks[0].clone();
     let (db, library, dir, _auth) = bundles().await;
-    let pool = db.pool().clone();
     let acquire = acquire_over(
         &db,
         Arc::new(LibraryLanding::new(
-            library.clone(),
+            &library,
             every_priority(Arc::new(LargeGroups(vec![picked, guess]))),
-            pool,
         )),
     );
     let curator = Viewer {
@@ -860,7 +851,7 @@ async fn a_matched_uploads_bonus_track_is_not_retried_onto_the_old_guess() {
             "SELECT state, reason, release_mbid FROM acquire_held_files WHERE id = ?1",
         )
         .bind(file_id)
-        .fetch_one(acquire.db.pool())
+        .fetch_one(acquire.db.db().sqlx())
         .await
         .expect("held file")
     };
@@ -961,13 +952,11 @@ async fn upload_and_settle(
 #[tokio::test]
 async fn an_entry_longer_than_its_header_leaves_nothing_behind() {
     let (db, library, _dir, _auth) = bundles().await;
-    let pool = db.pool().clone();
     let acquire = acquire_over(
         &db,
         Arc::new(LibraryLanding::new(
-            library,
+            &library,
             every_priority(Arc::new(OneRelease(release(&["Big"], &[None])))),
-            pool,
         )),
     );
     let curator = Viewer {
@@ -1016,15 +1005,15 @@ async fn an_entry_longer_than_its_header_leaves_nothing_behind() {
     }
     assert!(left.is_empty(), "staging still holds {left:?}");
     let indexed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM local_tracks")
-        .fetch_one(acquire.db.pool())
+        .fetch_one(acquire.db.db().sqlx())
         .await
         .expect("catalog");
     assert_eq!(indexed, 0);
 }
 
 /// An upload a restart cut off before it became items keeps its files when
-/// the startup sweep cannot read the jobs: the job stays processing, and the
-/// next sweep turns its files into items.
+/// the startup sweep cannot read the jobs: the sweep answers busy, the job
+/// stays processing, and the next sweep turns its files into items.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cut_off_upload_survives_a_sweep_that_cannot_read_its_jobs() {
     let dir = crate::common::ScratchDir::new("drop-sweep-busy");
@@ -1070,16 +1059,40 @@ async fn a_cut_off_upload_survives_a_sweep_that_cannot_read_its_jobs() {
         .await
         .expect("job");
 
-    // The only reader is out, as on a swapping host at boot.
-    let held = runtime.db().sqlx().acquire().await.expect("reader");
-    acquire.drops.sweep_stale().await;
-    drop(held);
+    // The only reader is out, as on a swapping host at boot: the sweep
+    // answers busy so its caller runs it again.
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let reader_db = runtime.db().clone();
+    let holder = tokio::spawn(async move {
+        reader_db
+            .read("test.hold", move |_| {
+                started_tx.send(()).ok();
+                release_rx.recv().ok();
+                Ok::<_, droppedneedle_kernel::db::DbError>(())
+            })
+            .await
+    });
+    tokio::task::spawn_blocking(move || started_rx.recv())
+        .await
+        .expect("join")
+        .expect("the reader checks out");
+    let swept = acquire.drops.sweep_stale().await;
+    assert!(
+        matches!(
+            swept,
+            Err(droppedneedle_acquire::drop_import::store::StoreError::Busy { .. })
+        ),
+        "{swept:?}"
+    );
+    release_tx.send(()).expect("release");
+    holder.await.expect("join").expect("hold");
     assert!(track.exists(), "the cut-off upload was swept");
     let job = store.get_job("job-cut").await.expect("read").expect("job");
     assert_eq!(job.status, "processing", "{:?}", job.error);
     assert!(job.items.is_empty(), "{:?}", job.items);
 
-    acquire.drops.sweep_stale().await;
+    acquire.drops.sweep_stale().await.unwrap();
     assert!(track.exists(), "the grouped upload was swept");
     let job = store.get_job("job-cut").await.expect("read").expect("job");
     assert_eq!(job.items.len(), 1, "{:?}", job.items);
@@ -1089,6 +1102,68 @@ async fn a_cut_off_upload_survives_a_sweep_that_cannot_read_its_jobs() {
     );
     drop(acquire);
     runtime.shutdown().await;
+}
+
+/// A cut-off upload whose items cannot all be written keeps none of them,
+/// so the next start groups every folder: a job left with some items
+/// would never be grouped again and its other files would be swept.
+#[tokio::test]
+async fn a_cut_off_upload_is_grouped_whole_or_not_at_all() {
+    let (db, library, dir, _auth) = bundles().await;
+    let acquire = acquire_over(
+        &db,
+        Arc::new(LibraryLanding::new(
+            &library,
+            every_priority(Arc::new(OneRelease(release(&["Mysterons"], &[None])))),
+        )),
+    );
+    let staging = dir.join("cut-staging");
+    for folder in ["Album A", "Album B"] {
+        let track = staging.join(folder).join("01 Track.flac");
+        std::fs::create_dir_all(track.parent().expect("album folder")).expect("staging");
+        std::fs::write(&track, b"audio").expect("track");
+    }
+    let store = droppedneedle_acquire::drop_import::store::DropStore::new(acquire.db.clone());
+    store
+        .create_job(
+            "job-cut",
+            "u-curator",
+            "Cora",
+            "albums.zip",
+            &staging.to_string_lossy(),
+        )
+        .await
+        .expect("job");
+    // The second item of the job is refused, as a write cut off partway.
+    let refuse = |sql: &'static str| {
+        acquire.db.write("test.refuse", move |tx| {
+            tx.execute_batch(sql)?;
+            Ok(())
+        })
+    };
+    refuse(
+        "CREATE TRIGGER test_refuse_second_item BEFORE INSERT ON drop_import_items \
+         WHEN EXISTS (SELECT 1 FROM drop_import_items WHERE job_id = NEW.job_id) \
+         BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+    )
+    .await
+    .expect("trigger");
+    acquire.drops.sweep_stale().await.unwrap();
+    let job = store.get_job("job-cut").await.expect("read").expect("job");
+    assert!(job.items.is_empty(), "{:?}", job.items);
+
+    refuse("DROP TRIGGER test_refuse_second_item;")
+        .await
+        .expect("drop trigger");
+    acquire.drops.sweep_stale().await.unwrap();
+    let job = store.get_job("job-cut").await.expect("read").expect("job");
+    let mut folders: Vec<&str> = job
+        .items
+        .iter()
+        .map(|item| item.folder_name.as_str())
+        .collect();
+    folders.sort_unstable();
+    assert_eq!(folders, ["Album A", "Album B"]);
 }
 
 /// An upload whose declared length is over the 8 GB limit is refused with

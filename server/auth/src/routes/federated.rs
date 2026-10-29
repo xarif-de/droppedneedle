@@ -12,24 +12,19 @@
 
 use std::sync::Arc;
 
-use crate::federated::FederatedError;
-use crate::federated::SessionIssuer;
-use crate::federated::jellyfin_login::{JellyfinConnectionLink, JellyfinIdp, JellyfinLogin};
-use crate::federated::oidc::{
-    OidcConfig, OidcExchangeStore, OidcIdp, OidcLogin, OidcStateStore, STATE_TTL_SECS,
-};
-use crate::federated::plex::{
-    PinClaim, PlexConnectionLink, PlexJourney, PlexPinClient, PlexPoll, PlexPurpose,
-    PlexStartDenied,
-};
-use crate::federated::users::FederatedUserStore;
-use crate::routes::native::PeerAddr;
+use crate::federated::jellyfin_http::JellyfinHttp;
+use crate::federated::jellyfin_login::JellyfinLogin;
+use crate::federated::oidc::{OidcLogin, STATE_TTL_SECS};
+use crate::federated::plex::{PinClaim, PlexJourney, PlexPoll, PlexPurpose, PlexStartDenied};
+use crate::federated::plex_http::PlexTv;
+use crate::federated::{FederatedError, MediaLinks};
+use crate::routes::native::{AuthSessionBody, PeerAddr, login_user};
 use crate::session::cookies;
 use crate::session::rate_limit::{LOGIN_CLASS, RateLimiter, rate_limited};
 use crate::session::stated::StatedAddresses;
 use crate::session::tokens::{constant_time_eq, hash_token};
+use crate::sqlite::{FederatedUsers, Sessions, Users};
 use crate::users::roles::{Admin, RoleRequired, User};
-use crate::wiring::{ProdJellyfinRoutes, ProdOidcRoutes, ProdPlexRoutes};
 use axum::{
     Json,
     extract::State,
@@ -59,19 +54,6 @@ pub const PLEX_DENIED: &str = "Access denied";
 /// Plex link/connect start without a configured server, v2 message verbatim.
 pub const PLEX_NOT_CONFIGURED: &str = "Plex is not configured by the administrator";
 
-/// Live OIDC settings. A port (not a value in state) so admin config edits
-/// take effect without a restart.
-pub trait OidcConfigSource: Clone + Send + Sync + 'static {
-    /// Current OIDC connection settings.
-    fn current(&self) -> impl Future<Output = OidcConfig> + Send;
-}
-
-impl OidcConfigSource for SignInSettings {
-    async fn current(&self) -> OidcConfig {
-        self.oidc_config()
-    }
-}
-
 /// Which sign-in methods are switched on (v2 `GET /auth/providers`).
 #[utoipa::path(
     get,
@@ -91,11 +73,14 @@ pub async fn providers_handler(State(settings): State<SignInSettings>) -> Json<A
 
 /// State for the OIDC routes.
 #[derive(Clone)]
-pub struct OidcRouteState<S, I, T, E, N, F> {
+pub struct OidcRouteState {
     /// OIDC login service.
-    pub login: OidcLogin<S, I, T, E, N>,
-    /// Live settings source.
-    pub config: F,
+    pub login: OidcLogin,
+    /// The sign-in settings, read live so an admin's edit applies to the
+    /// next login without a restart.
+    pub config: SignInSettings,
+    /// Account rows, read for the signed-in user's answer.
+    pub accounts: Users,
     /// Deployment base path (`""` at the domain root).
     pub base_path: String,
     /// Proxies trusted to set `X-Forwarded-Proto` for the cookie `Secure`
@@ -106,20 +91,14 @@ pub struct OidcRouteState<S, I, T, E, N, F> {
     pub stated: StatedAddresses,
 }
 
-impl<S, I, T, E, N, F> OidcRouteState<S, I, T, E, N, F>
-where
-    S: FederatedUserStore,
-    I: OidcIdp,
-    T: OidcStateStore,
-    E: OidcExchangeStore,
-    N: SessionIssuer,
-    F: OidcConfigSource,
-{
-    /// Wire the state from the login service plus its HTTP ports.
-    pub fn new(login: OidcLogin<S, I, T, E, N>, config: F, base_path: &str) -> Self {
+impl OidcRouteState {
+    /// Wire the state from the login service, the live settings and the
+    /// account rows.
+    pub fn new(login: OidcLogin, config: SignInSettings, accounts: Users, base_path: &str) -> Self {
         Self {
             login,
             config,
+            accounts,
             base_path: base_path.to_owned(),
             trusted_proxies: TrustedProxies::default(),
             stated: StatedAddresses::default(),
@@ -160,12 +139,12 @@ fn oidc_state_cookie_path(base_path: &str) -> String {
     )
 )]
 pub async fn oidc_authorize_handler(
-    State(state): State<ProdOidcRoutes>,
+    State(state): State<OidcRouteState>,
     uri: Uri,
     headers: HeaderMap,
     peer: PeerAddr,
 ) -> Result<Response, ApiError> {
-    let config = state.config.current().await;
+    let config = state.config.oidc_config();
     match state.login.build_authorize_url(&config).await {
         Ok((url, login_state)) => {
             let secure = cookies::secure_for_sign_in(
@@ -208,7 +187,7 @@ pub async fn oidc_authorize_handler(
     )
 )]
 pub async fn oidc_callback_handler(
-    State(state): State<ProdOidcRoutes>,
+    State(state): State<OidcRouteState>,
     headers: HeaderMap,
     ValidQuery(query): ValidQuery<OidcCallbackQuery>,
 ) -> Result<Response, ApiError> {
@@ -220,7 +199,7 @@ pub async fn oidc_callback_handler(
         tracing::debug!("oidc callback without the matching state cookie");
         return Err(AuthRouteError::auth_failed(OIDC_FAILED).into());
     }
-    let config = state.config.current().await;
+    let config = state.config.oidc_config();
     let user_agent = user_agent_of(&headers);
     match state
         .login
@@ -259,12 +238,12 @@ pub async fn oidc_callback_handler(
     path = "/api/v3/auth/oidc/exchange",
     request_body = OidcExchangeBody,
     responses(
-        (status = 200, description = "Authenticated user; token only in Bearer mode"),
+        (status = 200, description = "Authenticated user; token only in Bearer mode", body = inline(AuthSessionBody)),
         (status = 401, description = "Invalid or expired code")
     )
 )]
 pub async fn oidc_exchange_handler(
-    State(state): State<ProdOidcRoutes>,
+    State(state): State<OidcRouteState>,
     uri: Uri,
     headers: HeaderMap,
     peer: PeerAddr,
@@ -272,8 +251,7 @@ pub async fn oidc_exchange_handler(
 ) -> Result<Response, ApiError> {
     match state.login.exchange_code(&body.code).await {
         Ok((user, raw_token)) => {
-            let body_value = serde_json::to_value(FederatedUserView::from(&user))
-                .map_err(|cause| AuthRouteError::internal(&cause))?;
+            let user = login_user(&state.accounts, &user.id).await?;
             Ok(federated_login_response(
                 &Handoff {
                     base_path: &state.base_path,
@@ -285,7 +263,7 @@ pub async fn oidc_exchange_handler(
                     ),
                     transport: body.transport,
                 },
-                body_value,
+                serde_json::json!({ "user": user }),
                 raw_token,
             ))
         }
@@ -299,9 +277,11 @@ pub async fn oidc_exchange_handler(
 
 /// State for the Jellyfin route.
 #[derive(Clone)]
-pub struct JellyfinRouteState<S, I, L, N> {
+pub struct JellyfinRouteState {
     /// Jellyfin login service.
-    pub login: JellyfinLogin<S, I, L, N>,
+    pub login: JellyfinLogin,
+    /// Account rows, read for the signed-in user's answer.
+    pub accounts: Users,
     /// Deployment base path (`""` at the domain root).
     pub base_path: String,
     /// Proxies trusted to set `X-Forwarded-Proto` for the cookie `Secure`
@@ -315,17 +295,20 @@ pub struct JellyfinRouteState<S, I, L, N> {
     pub limits: Arc<RateLimiter>,
 }
 
-impl<S, I, L, N> JellyfinRouteState<S, I, L, N>
-where
-    S: FederatedUserStore,
-    I: JellyfinIdp,
-    L: JellyfinConnectionLink,
-    N: SessionIssuer,
-{
-    /// Wire the state from its ports.
-    pub fn new(users: S, idp: I, links: L, sessions: N, base_path: &str) -> Self {
+impl JellyfinRouteState {
+    /// Wire the state from the store, client, links, sessions and account
+    /// rows.
+    pub fn new(
+        users: FederatedUsers,
+        idp: JellyfinHttp,
+        links: MediaLinks,
+        sessions: Sessions,
+        accounts: Users,
+        base_path: &str,
+    ) -> Self {
         Self {
             login: JellyfinLogin::new(users, idp, links, sessions),
+            accounts,
             base_path: base_path.to_owned(),
             trusted_proxies: TrustedProxies::default(),
             stated: StatedAddresses::default(),
@@ -360,14 +343,14 @@ where
     path = "/api/v3/auth/jellyfin/login",
     request_body = JellyfinLoginBody,
     responses(
-        (status = 200, description = "Authenticated user; token only in Bearer mode"),
+        (status = 200, description = "Authenticated user; token only in Bearer mode", body = inline(AuthSessionBody)),
         (status = 401, description = "Invalid credentials"),
         (status = 429, description = "Too many attempts for this client or username"),
         (status = 503, description = "Jellyfin unavailable")
     )
 )]
 pub async fn jellyfin_login_handler(
-    State(state): State<ProdJellyfinRoutes>,
+    State(state): State<JellyfinRouteState>,
     uri: Uri,
     headers: HeaderMap,
     peer: PeerAddr,
@@ -385,8 +368,7 @@ pub async fn jellyfin_login_handler(
         .await
     {
         Ok((user, raw_token)) => {
-            let body_value = serde_json::to_value(FederatedUserView::from(&user))
-                .map_err(|cause| AuthRouteError::internal(&cause))?;
+            let user = login_user(&state.accounts, &user.id).await?;
             Ok(federated_login_response(
                 &Handoff {
                     base_path: &state.base_path,
@@ -398,7 +380,7 @@ pub async fn jellyfin_login_handler(
                     ),
                     transport: body.transport,
                 },
-                body_value,
+                serde_json::json!({ "user": user }),
                 raw_token,
             ))
         }
@@ -412,9 +394,9 @@ pub async fn jellyfin_login_handler(
 
 /// State for the Plex journey routes.
 #[derive(Clone)]
-pub struct PlexRouteState<S, C, L, N> {
+pub struct PlexRouteState {
     /// Unified Plex journey.
-    pub journey: PlexJourney<S, C, L, N>,
+    pub journey: PlexJourney,
     /// Deployment base path (`""` at the domain root).
     pub base_path: String,
     /// Proxies trusted to set `X-Forwarded-Proto` for the cookie `Secure`
@@ -425,15 +407,15 @@ pub struct PlexRouteState<S, C, L, N> {
     pub stated: StatedAddresses,
 }
 
-impl<S, C, L, N> PlexRouteState<S, C, L, N>
-where
-    S: FederatedUserStore,
-    C: PlexPinClient,
-    L: PlexConnectionLink,
-    N: SessionIssuer,
-{
-    /// Wire the state from its ports.
-    pub fn new(users: S, client: C, links: L, sessions: N, base_path: &str) -> Self {
+impl PlexRouteState {
+    /// Wire the state from the store, client, links and sessions.
+    pub fn new(
+        users: FederatedUsers,
+        client: PlexTv,
+        links: MediaLinks,
+        sessions: Sessions,
+        base_path: &str,
+    ) -> Self {
         Self {
             journey: PlexJourney::new(users, client, links, sessions),
             base_path: base_path.to_owned(),
@@ -458,7 +440,7 @@ where
 /// Run one start and render it. The secret is returned once and never
 /// stored in clear.
 async fn start_rendered(
-    state: &ProdPlexRoutes,
+    state: &PlexRouteState,
     purpose: PlexPurpose,
     caller: Option<&str>,
 ) -> Result<Json<PlexStartBody>, ApiError> {
@@ -494,7 +476,7 @@ async fn start_rendered(
     )
 )]
 pub async fn plex_start_handler(
-    State(state): State<ProdPlexRoutes>,
+    State(state): State<PlexRouteState>,
 ) -> Result<Json<PlexStartBody>, ApiError> {
     start_rendered(&state, PlexPurpose::Login, None).await
 }
@@ -513,7 +495,7 @@ pub async fn plex_start_handler(
     )
 )]
 pub async fn plex_start_link_handler(
-    State(state): State<ProdPlexRoutes>,
+    State(state): State<PlexRouteState>,
     User(caller): User,
 ) -> Result<Json<PlexStartBody>, ApiError> {
     start_rendered(&state, PlexPurpose::Link, Some(caller.user_id())).await
@@ -533,7 +515,7 @@ pub async fn plex_start_link_handler(
     )
 )]
 pub async fn plex_start_connect_handler(
-    State(state): State<ProdPlexRoutes>,
+    State(state): State<PlexRouteState>,
     admin: Admin,
 ) -> Result<Json<PlexStartBody>, ApiError> {
     start_rendered(&state, PlexPurpose::Connect, Some(admin.user_id())).await
@@ -553,7 +535,7 @@ pub async fn plex_start_connect_handler(
     )
 )]
 pub async fn plex_poll_login_handler(
-    State(state): State<ProdPlexRoutes>,
+    State(state): State<PlexRouteState>,
     uri: Uri,
     headers: HeaderMap,
     peer: PeerAddr,
@@ -623,7 +605,7 @@ pub async fn plex_poll_login_handler(
     )
 )]
 pub async fn plex_poll_link_handler(
-    State(state): State<ProdPlexRoutes>,
+    State(state): State<PlexRouteState>,
     User(caller): User,
     ValidJson(body): ValidJson<PlexPinBody>,
 ) -> Result<Json<PlexLinkPollResult>, ApiError> {
@@ -667,7 +649,7 @@ pub async fn plex_poll_link_handler(
     )
 )]
 pub async fn plex_poll_connect_handler(
-    State(state): State<ProdPlexRoutes>,
+    State(state): State<PlexRouteState>,
     User(caller): User,
     ValidJson(body): ValidJson<PlexPinBody>,
 ) -> Result<Json<PlexConnectPollResult>, ApiError> {
@@ -720,7 +702,7 @@ struct Handoff<'a> {
 }
 
 /// One login-shaped federated response. The session row already exists (the
-/// `SessionIssuer` wrote it); this only hands the token over under the login
+/// session issue wrote it); this only hands the token over under the login
 /// transport rule.
 fn federated_login_response(
     handoff: &Handoff<'_>,

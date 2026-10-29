@@ -1,8 +1,9 @@
 <script lang="ts">
 	import { Radio, Headphones } from 'lucide-svelte';
+	import type { components } from '$lib/api/v3/openapi';
 
 	interface Props {
-		source?: string;
+		source?: components['schemas']['ShelfSource'];
 	}
 
 	let { source }: Props = $props();
@@ -26,7 +27,7 @@
 	{@render lastfm()}
 {:else if source === 'listenbrainz'}
 	{@render listenbrainz()}
-{:else if source === 'lastfm+listenbrainz'}
+{:else if source === 'blended'}
 	<span class="inline-flex gap-1">
 		{@render lastfm()}
 		{@render listenbrainz()}

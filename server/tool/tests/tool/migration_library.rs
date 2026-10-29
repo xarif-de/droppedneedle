@@ -237,7 +237,7 @@ fn managed_album(v2_root: &Path, alice: &str) -> PathBuf {
 
 pub(crate) async fn drain_scans(library: &LibrarySetup) {
     use droppedneedle_library::scan::{ScanKind, ScanRequest, ScanTrigger};
-    let registry = library.live_registry();
+    let registry = library.core.live_registry();
     library
         .coordinator
         .request_run(&ScanRequest {
@@ -248,9 +248,9 @@ pub(crate) async fn drain_scans(library: &LibrarySetup) {
             policy_revision: registry.policy_revision().to_owned(),
         })
         .expect("scan requested");
-    library.scan_startup_recovery().await;
+    library.scans.scan_startup_recovery().await;
     for _ in 0..100 {
-        library.supervisor_tick().await;
+        library.scans.supervisor_tick().await;
         if library.coordinator.current().is_empty() {
             break;
         }
@@ -332,6 +332,16 @@ async fn managed_identified_album_keeps_ids_identity_and_original() {
     assert_eq!(count("youtube_link"), 1);
     assert_eq!(count("youtube_track_link"), 1);
     assert_eq!(count("ignored_release"), 1);
+    let ignored_at: i64 = sqlx::query_scalar(
+        "SELECT ignored_at FROM catalog_ignored_releases WHERE release_group_mbid = 'RG-HIDDEN'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("hidden release carried");
+    assert_eq!(
+        ignored_at, 1_700_000_800_000,
+        "v2 seconds arrive as milliseconds"
+    );
     pool.close().await;
 
     // v3 starts on the imported state and scans the carried root.
@@ -424,6 +434,7 @@ async fn managed_identified_album_keeps_ids_identity_and_original() {
     // "Restore original" brings back the file as v2 first found it: its
     // place and exactly its tags, with the fields management added gone.
     library
+        .publishing
         .baseline_restore(&[V2_TRACK_ID.to_owned()])
         .expect("restore publishes");
     let original = music.join(ORIGINAL_REL);

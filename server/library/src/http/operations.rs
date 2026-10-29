@@ -4,7 +4,7 @@
 //!
 //! Every route is admin-only, as in v2, except the release search, which
 //! curators use to choose an edition. Store work runs on
-//! `spawn_blocking`; the release search awaits MusicBrainz.
+//! a blocking thread; the release search awaits MusicBrainz.
 
 use axum::{
     Json,
@@ -14,18 +14,21 @@ use axum::{
 use droppedneedle_kernel::error::{ApiError, Unavailable};
 use droppedneedle_kernel::extract::{ValidJson, ValidQuery};
 use droppedneedle_kernel::mount::{Routes, routes};
+use droppedneedle_kernel::page::{Page, PageRequest};
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 
+use super::blocking;
 use super::error::refused;
 use super::models::PenaltyView;
 use crate::identify::models::EvidenceClass;
 use crate::operations::models::{
-    Control, OperationDetail, OperationError, OperationJob, OperationState,
-    ReidentificationCandidate,
+    AutomaticUndone, Control, ControlRequest, OperationDetail, OperationError, OperationJob,
+    OperationState, ReidentificationCandidate, WorkState,
 };
 use crate::operations::reasons::{self, Reason};
 use crate::operations::service::{Operations, RELEASE_PAGE_MAX};
+use crate::repairs::models::Summary;
 use crate::repairs::service::Repairs;
 use crate::wiring::LibraryServices;
 use droppedneedle_auth::{Admin, Curator};
@@ -67,19 +70,6 @@ impl From<OperationError> for ApiError {
     }
 }
 
-/// Run blocking operation work off the async workers.
-pub(super) async fn blocking<T: Send + 'static, E: Send + 'static>(
-    work: impl FnOnce() -> Result<T, E> + Send + 'static,
-) -> Result<T, ApiError>
-where
-    ApiError: From<E>,
-{
-    tokio::task::spawn_blocking(work)
-        .await
-        .map_err(ApiError::internal)?
-        .map_err(ApiError::from)
-}
-
 // ---------------------------------------------------------------------------
 // DTOs.
 // ---------------------------------------------------------------------------
@@ -112,8 +102,7 @@ fn ending(code: Option<&str>) -> Option<ReasonView> {
 pub struct OperationWorkResultView {
     pub ordinal: i64,
     pub action: String,
-    /// `pending`, `running`, `succeeded`, `failed`, or `skipped`.
-    pub state: String,
+    pub state: WorkState,
     pub local_album_id: Option<String>,
     pub local_track_id: Option<String>,
     pub failure_code: Option<String>,
@@ -129,8 +118,7 @@ pub struct OperationWorkResultView {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct OperationTrackEvidenceView {
     pub local_track_id: String,
-    /// `supported`, `unknown`, or `contradictory`.
-    pub classification: String,
+    pub classification: EvidenceClass,
     /// What ties the file to the release track (`embedded_id`, `acoustid`,
     /// `title_position_length`, or `track_id_elsewhere`: the recording ID,
     /// on a file whose track ID belongs to another edition), or why it does
@@ -155,10 +143,8 @@ pub struct OperationCandidateEvidenceView {
     pub release_date: Option<String>,
     pub local_album_title: String,
     pub local_album_artist_name: String,
-    /// `supported`, `unknown`, or `contradictory`.
-    pub album_title_classification: String,
-    /// `supported`, `unknown`, or `contradictory`.
-    pub album_artist_classification: String,
+    pub album_title_classification: EvidenceClass,
+    pub album_artist_classification: EvidenceClass,
     pub track_evidence: Vec<OperationTrackEvidenceView>,
     /// Release track titles no local file took.
     pub unmatched_expected_tracks: Vec<String>,
@@ -201,8 +187,8 @@ pub struct OperationView {
     pub succeeded_count: i64,
     pub failed_count: i64,
     pub skipped_count: i64,
-    /// A control the worker has not acted on yet: `none`, `pause`, `stop`.
-    pub control_request: String,
+    /// A control the worker has not acted on yet.
+    pub control_request: ControlRequest,
     pub terminal_code: Option<String>,
     /// What `terminal_code` means and what to do about it.
     pub terminal_reason: Option<ReasonView>,
@@ -218,7 +204,7 @@ pub struct OperationView {
     pub reidentification_candidates: Vec<ReidentificationCandidateView>,
     pub selected_reidentification_candidate_key: Option<String>,
     /// An identity repair or preparation's report, once its check is done.
-    pub repair_summary: Option<super::repairs::RepairSummaryView>,
+    pub repair_summary: Option<Summary>,
 }
 
 /// Pause, resume, or stop a job.
@@ -241,8 +227,7 @@ pub struct AutomaticEditionUndoBody {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct AutomaticEditionUndoResponse {
     pub local_album_id: String,
-    /// `restored` (the earlier identity is back) or `cleared_to_review`.
-    pub outcome: String,
+    pub outcome: AutomaticUndone,
     /// The review the album went to, when there was no earlier identity.
     pub review_id: Option<String>,
 }
@@ -260,10 +245,10 @@ pub struct ReleaseSearchQuery {
     /// List every release of this release group instead of searching by
     /// title, so any edition of the album can be chosen.
     pub release_group_mbid: Option<String>,
-    /// Page size, 1 to 12 (default 12).
+    /// Page size, 1 to 12 (default 12); more is read as 12.
     pub limit: Option<u32>,
-    /// Page offset (default 0).
-    pub offset: Option<u32>,
+    /// `next_cursor` from the previous page.
+    pub cursor: Option<String>,
 }
 
 /// One MusicBrainz release in the edition finder.
@@ -291,9 +276,12 @@ pub struct ReleaseEditionView {
     pub is_current_release: bool,
 }
 
-/// One page of the edition finder.
+/// One page of the edition finder, with MusicBrainz's count of matches as
+/// its total.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ReleaseEditionSearchResponse {
+    #[serde(flatten)]
+    pub page: Page<ReleaseEditionView>,
     pub title_query: String,
     pub artist_query: String,
     /// The release group whose editions are listed, when the page is a
@@ -302,19 +290,6 @@ pub struct ReleaseEditionSearchResponse {
     /// The album's current release group, for "every edition of this
     /// album".
     pub current_release_group_mbid: Option<String>,
-    pub items: Vec<ReleaseEditionView>,
-    pub total: u64,
-    pub offset: u64,
-    pub limit: u32,
-}
-
-fn class_label(class: EvidenceClass) -> String {
-    match class {
-        EvidenceClass::Supported => "supported",
-        EvidenceClass::Unknown => "unknown",
-        EvidenceClass::Contradictory => "contradictory",
-    }
-    .to_owned()
 }
 
 fn candidate_view(
@@ -333,7 +308,7 @@ fn candidate_view(
                 .find(|place| place.local_track_id == track.local_track_id);
             OperationTrackEvidenceView {
                 local_track_id: track.local_track_id.clone(),
-                classification: class_label(track.classification),
+                classification: track.classification,
                 evidence_kinds: track.evidence_kinds.clone(),
                 candidate_track_title: placed.and_then(|place| place.title.clone()),
                 candidate_disc_number: placed.and_then(|place| place.disc_number),
@@ -357,8 +332,8 @@ fn candidate_view(
             release_date: candidate.release_date.clone(),
             local_album_title: candidate.local_album_title.clone(),
             local_album_artist_name: candidate.local_album_artist_name.clone(),
-            album_title_classification: class_label(candidate.album_title_classification),
-            album_artist_classification: class_label(candidate.album_artist_classification),
+            album_title_classification: candidate.album_title_classification,
+            album_artist_classification: candidate.album_artist_classification,
             track_evidence,
             unmatched_expected_tracks: candidate.unmatched_expected_tracks.clone(),
             score: evidence.score,
@@ -388,7 +363,7 @@ pub(super) fn job_view(job: &OperationJob) -> OperationView {
         succeeded_count: job.succeeded_count,
         failed_count: job.failed_count,
         skipped_count: job.skipped_count,
-        control_request: job.control_request.as_str().to_owned(),
+        control_request: job.control_request,
         terminal_code: job.terminal_code.clone(),
         terminal_reason: ending(job.terminal_code.as_deref()),
         row_revision: job.row_revision,
@@ -412,7 +387,7 @@ pub(super) fn detail_view(detail: &OperationDetail) -> OperationView {
             .map(|result| OperationWorkResultView {
                 ordinal: result.ordinal,
                 action: result.action.clone(),
-                state: result.state.clone(),
+                state: result.state,
                 local_album_id: result.local_album_id.clone(),
                 local_track_id: result.local_track_id.clone(),
                 failure_code: result.failure_code.clone(),
@@ -464,7 +439,7 @@ pub async fn get_operation(
     })
     .await?;
     Ok(Json(OperationView {
-        repair_summary: summary.map(Into::into),
+        repair_summary: summary,
         ..detail_view(&detail)
     }))
 }
@@ -571,7 +546,7 @@ pub async fn stop_operation(
     params(("album_id" = String, Path, description = "Local album id"), ReleaseSearchQuery),
     responses(
         (status = 200, description = "One page of releases", body = ReleaseEditionSearchResponse),
-        (status = 400, description = "Missing title or bad paging"),
+        (status = 400, description = "Missing title or bad cursor"),
         (status = 401, description = "Not authenticated"),
         (status = 403, description = "Curator role required"),
         (status = 404, description = "Unknown album"),
@@ -584,11 +559,9 @@ pub async fn search_reidentification_releases(
     Path(album_id): Path<String>,
     ValidQuery(query): ValidQuery<ReleaseSearchQuery>,
 ) -> Result<Json<ReleaseEditionSearchResponse>, ApiError> {
-    let limit = query.limit.unwrap_or(RELEASE_PAGE_MAX);
-    if !(1..=RELEASE_PAGE_MAX).contains(&limit)
-        || query.title.chars().count() > 250
-        || query.artist.chars().count() > 250
-    {
+    let max = RELEASE_PAGE_MAX as usize;
+    let paging = PageRequest::<u32>::read(query.limit, query.cursor.as_deref(), max, max)?;
+    if query.title.chars().count() > 250 || query.artist.chars().count() > 250 {
         return Err(OperationError::Invalid(reasons::SEARCH_TOO_LONG).into());
     }
     let release_group = query
@@ -601,50 +574,53 @@ pub async fn search_reidentification_releases(
             &query.title,
             &query.artist,
             release_group,
-            limit,
-            query.offset.unwrap_or(0),
+            paging.limit as u32,
+            paging.after.unwrap_or(0),
         )
         .await?;
     let same = |left: &str, right: Option<&String>| {
         right.is_some_and(|right| left.eq_ignore_ascii_case(right))
     };
+    let items = search
+        .page
+        .items
+        .iter()
+        .map(|item| ReleaseEditionView {
+            musicbrainz_url: format!("https://musicbrainz.org/release/{}", item.release_mbid),
+            belongs_to_current_release_group: same(
+                &item.release_group_mbid,
+                search.current_release_group_mbid.as_ref(),
+            ),
+            is_current_release: same(&item.release_mbid, search.current_release_mbid.as_ref()),
+            release_mbid: item.release_mbid.clone(),
+            release_group_mbid: item.release_group_mbid.clone(),
+            artist_name: item.artist_name.clone(),
+            title: item.title.clone(),
+            date: item.date.clone(),
+            country: item.country.clone(),
+            status: item.status.clone(),
+            packaging: item.packaging.clone(),
+            media_formats: item.media_formats.clone(),
+            disc_count: item.disc_count,
+            track_count: item.track_count,
+            label: item.label.clone(),
+            catalogue_number: item.catalogue_number.clone(),
+            barcode: item.barcode.clone(),
+            disambiguation: item.disambiguation.clone(),
+            score: item.score,
+        })
+        .collect();
     Ok(Json(ReleaseEditionSearchResponse {
-        items: search
-            .page
-            .items
-            .iter()
-            .map(|item| ReleaseEditionView {
-                musicbrainz_url: format!("https://musicbrainz.org/release/{}", item.release_mbid),
-                belongs_to_current_release_group: same(
-                    &item.release_group_mbid,
-                    search.current_release_group_mbid.as_ref(),
-                ),
-                is_current_release: same(&item.release_mbid, search.current_release_mbid.as_ref()),
-                release_mbid: item.release_mbid.clone(),
-                release_group_mbid: item.release_group_mbid.clone(),
-                artist_name: item.artist_name.clone(),
-                title: item.title.clone(),
-                date: item.date.clone(),
-                country: item.country.clone(),
-                status: item.status.clone(),
-                packaging: item.packaging.clone(),
-                media_formats: item.media_formats.clone(),
-                disc_count: item.disc_count,
-                track_count: item.track_count,
-                label: item.label.clone(),
-                catalogue_number: item.catalogue_number.clone(),
-                barcode: item.barcode.clone(),
-                disambiguation: item.disambiguation.clone(),
-                score: item.score,
-            })
-            .collect(),
+        page: Page::at_offset(
+            items,
+            search.page.offset,
+            search.limit.into(),
+            search.page.total,
+        ),
         title_query: search.title_query,
         artist_query: search.artist_query,
         release_group_query: search.release_group_query,
         current_release_group_mbid: search.current_release_group_mbid,
-        total: search.page.total,
-        offset: search.page.offset,
-        limit: search.limit,
     }))
 }
 

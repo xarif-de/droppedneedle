@@ -4,7 +4,8 @@
 //!
 //! - [`requests`] serves the user-facing ask/approval/wanted surface.
 //! - [`downloads`] owns the durable task journal, task plans, watchdog
-//!   math, recovery classification, and quarantine.
+//!   math, recovery classification, quarantine, and the worker that
+//!   drives every download through them.
 //! - [`slskd`] and [`usenet`] own the source clients and indexers, which
 //!   all fail with one [`client_error::ClientError`].
 //! - [`flows`] runs the wanted watcher, follow poll, upgrade sweep and
@@ -25,8 +26,8 @@
 //! - [`search_jobs`] runs manual album searches: every source's ranked
 //!   candidates for one album, and the pick that starts a download.
 //!
-//! The `db`, `dispatch`, `search`, `sources`, `settings`, `probes`,
-//! `readiness`, `worker`, and `wiring` modules unify the per-area seams onto one
+//! The `db`, `dispatch`, `search`, `sources`, `clients`, `settings`, `probes`,
+//! `readiness`, and `wiring` modules unify the per-area seams onto one
 //! production spelling each (one [`dispatch::DownloadDispatch`] starts
 //! every download, every source is one
 //! [`downloads::sources::DownloadSource`] in the worker's list, and so on)
@@ -36,6 +37,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod client_error;
+pub mod clients;
 pub mod db;
 pub mod dispatch;
 pub mod downloads;
@@ -60,10 +62,10 @@ pub mod search_jobs;
 pub mod settings;
 pub mod slskd;
 pub mod sources;
+mod sql;
 pub mod target;
 pub mod usenet;
 pub mod wiring;
-pub mod worker;
 
 pub use wiring::AcquireSetup;
 
@@ -72,7 +74,14 @@ pub use wiring::AcquireSetup;
 pub fn statement_files() -> Vec<droppedneedle_kernel::db::statement::StatementFile> {
     vec![
         downloads::sql::registered(),
+        drop_import::sql::registered(),
+        flows::sql::registered(),
+        follows::sql::registered(),
         held::sql::registered(),
+        imports::sql::registered(),
+        landing::sql::registered(),
         requests::sql::registered(),
+        search_jobs::sql::registered(),
+        sql::registered(),
     ]
 }

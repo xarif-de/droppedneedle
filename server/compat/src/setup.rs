@@ -1,4 +1,5 @@
-//! Compat bundle: production seam bindings plus the mounted routers.
+//! Compat bundle: the adapters both protocols call plus the mounted
+//! routers.
 //!
 //! [`CompatSetup`] is the one `AppState` field compat adds. It binds auth
 //! to the app-password store ([`ProdCompatPasswords`]), the library to the
@@ -18,7 +19,8 @@ use axum::Router;
 use axum::middleware::from_fn_with_state;
 
 use crate::adapters::audio::GatewayAudio;
-use crate::adapters::jellyfin_library::{CatalogIds, JellyfinLibrary, REBUILD_COOLDOWN};
+use crate::adapters::jellyfin_ids::{JellyfinIds, RESOLVE_WAIT};
+use crate::adapters::jellyfin_library::{CatalogIds, JellyfinLibrary};
 use crate::adapters::library::CompatLibrary;
 use crate::adapters::playback::CompatPlayback;
 use crate::adapters::principal::SubsonicVerifier;
@@ -31,25 +33,21 @@ use crate::shared::address::ListenerConfig;
 use droppedneedle_auth::compat_auth::prod::ProdCompatPasswords;
 use droppedneedle_auth::users::UsersDeps;
 use droppedneedle_catalog::reads::ReadsSetup;
+use droppedneedle_kernel::db::Db;
+use droppedneedle_kernel::jobs::{AlreadyRunning, Supervisor};
 use droppedneedle_kernel::platform::Platform;
 use droppedneedle_kernel::runtime_config::Crypto;
-use droppedneedle_library::wiring::LibrarySetup;
+use droppedneedle_library::scans::Scans;
 use droppedneedle_media::MediaEngine;
 use droppedneedle_media::playback::PlaybackDeps;
 
 /// Subsonic audio over the stream engine.
 pub type CompatAudio = GatewayAudio<MediaEngine>;
 
-/// Wired Jellyfin router state.
-pub type CompatJellyfinState = crate::jellyfin::JellyfinState<
-    JellyfinLibrary,
-    GatewayAudio<MediaEngine>,
-    CompatPlayback,
-    CatalogIds,
->;
-
 /// What the compat bundle is built from.
 pub struct CompatDeps {
+    /// The database, for the stored Jellyfin ids.
+    pub db: Db,
     /// Users and avatars.
     pub users: UsersDeps,
     /// Key for the app-password store.
@@ -59,7 +57,7 @@ pub struct CompatDeps {
     /// The stream engine the native routes use.
     pub engine: Arc<MediaEngine>,
     /// Scan status and triggers.
-    pub scan: LibrarySetup,
+    pub scan: Scans,
     /// Catalog, collections, lyrics and covers.
     pub library: CompatLibrary,
     /// Saved queues and bookmarks.
@@ -79,12 +77,13 @@ impl CompatDeps {
         users: UsersDeps,
         playback: PlaybackDeps,
         engine: Arc<MediaEngine>,
-        scan: LibrarySetup,
+        scan: Scans,
         reads: &ReadsSetup,
     ) -> Self {
         let config = &platform.config;
         let settings = LiveSettings::from_config(&platform.settings, engine.can_transcode());
         Self {
+            db: platform.db.clone(),
             users,
             crypto: platform.crypto.clone(),
             playback,
@@ -105,19 +104,14 @@ impl CompatDeps {
 /// Everything `create_app` needs to mount the compat routers.
 #[derive(Clone)]
 pub struct CompatSetup {
-    verifier: SubsonicVerifier,
-    store: SubsonicStore,
-    audio: CompatAudio,
-    jellyfin: CompatJellyfinState,
+    ids: JellyfinIds,
     settings: LiveSettings,
-    limits: CompatLimits,
-    listener: ListenerConfig,
     router: Router,
     templates: Arc<[&'static str]>,
 }
 
 impl CompatSetup {
-    /// Bind the production seams.
+    /// Build the adapters and mount both routers.
     pub fn build(deps: CompatDeps) -> Self {
         let passwords = ProdCompatPasswords::new(deps.users.clone(), Arc::clone(&deps.crypto));
         let playback = CompatPlayback::new(deps.playback);
@@ -130,22 +124,20 @@ impl CompatSetup {
             Arc::clone(&deps.crypto),
             deps.settings.clone(),
         );
+        let ids = JellyfinIds::new(deps.db, Arc::clone(&deps.crypto), RESOLVE_WAIT);
         let jellyfin = JellyfinState::new(
             passwords.clone(),
             JellyfinLibrary::new(deps.library.clone()),
             GatewayAudio::new(Arc::clone(&deps.engine)),
             playback,
-            CatalogIds::new(deps.library, deps.crypto, REBUILD_COOLDOWN),
+            CatalogIds::new(ids.clone(), deps.library.catalog.clone()),
             deps.settings.clone(),
             deps.listener.clone(),
         );
         let verifier = SubsonicVerifier::new(passwords.clone(), deps.users);
         // Rate limits key the client behind these proxies (`TRUSTED_PROXY_IPS`).
-        let limits = CompatLimits::new(
-            Arc::new(crate::http::StoreLabels::new(passwords)),
-            deps.settings.clone(),
-        )
-        .with_trusted_proxies(deps.listener.trusted_proxies.clone());
+        let limits = CompatLimits::new(passwords, deps.settings.clone())
+            .with_trusted_proxies(deps.listener.trusted_proxies.clone());
         let audio = CompatAudio::new(deps.engine);
         let (router, templates) = Self::assemble(
             &verifier,
@@ -157,38 +149,22 @@ impl CompatSetup {
             &deps.listener,
         );
         Self {
-            verifier,
-            store,
-            audio,
-            jellyfin,
+            ids,
             settings: deps.settings,
-            limits,
-            listener: deps.listener,
             router,
             templates,
         }
     }
 
-    /// Enable one or both protocols with fixed settings (wiring tests;
-    /// production reads the config per request).
-    pub fn with_enabled(mut self, subsonic: bool, jellyfin: bool) -> Self {
-        let mut subsonic_settings = self.settings.subsonic();
-        subsonic_settings.enabled = subsonic;
-        let mut jellyfin_settings = self.settings.jellyfin();
-        jellyfin_settings.enabled = jellyfin;
-        self.settings = LiveSettings::fixed(subsonic_settings, jellyfin_settings);
-        self.jellyfin.settings = self.settings.clone();
-        self.limits.settings = self.settings.clone();
-        (self.router, self.templates) = Self::assemble(
-            &self.verifier,
-            &self.store,
-            &self.audio,
-            &self.settings,
-            &self.jellyfin,
-            &self.limits,
-            &self.listener,
-        );
-        self
+    /// Start compat's loops ([`crate::LOOPS`]) on `supervisor`: the fill of
+    /// the stored Jellyfin ids.
+    pub fn start_loops(&self, supervisor: &Supervisor) -> Result<(), AlreadyRunning> {
+        self.ids.start(supervisor)
+    }
+
+    /// The stored Jellyfin ids, for a caller that waits for the fill.
+    pub fn jellyfin_ids(&self) -> &JellyfinIds {
+        &self.ids
     }
 
     /// The mounted compat routers with the shared layers, ready to merge
@@ -230,7 +206,7 @@ impl CompatSetup {
         store: &SubsonicStore,
         audio: &CompatAudio,
         settings: &LiveSettings,
-        jellyfin: &CompatJellyfinState,
+        jellyfin: &JellyfinState,
         limits: &CompatLimits,
         listener: &ListenerConfig,
     ) -> (Router, Arc<[&'static str]>) {

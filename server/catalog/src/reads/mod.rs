@@ -15,6 +15,7 @@ pub mod collections;
 pub mod discover;
 pub mod enrichment;
 pub mod library;
+pub mod lyrics;
 pub mod platform;
 pub mod search;
 pub mod youtube;
@@ -59,10 +60,8 @@ pub struct ReadsPorts {
     /// File tags and the lyrics files carry, from the library catalog and
     /// roots.
     pub library_files: droppedneedle_media::stream::local_files::LibraryFiles,
-    /// Discovery batches file their albums through this.
-    pub batch_requests: Arc<dyn discover::adapters::batches::BatchRequests>,
     /// Acquisition's answer on whether a download source is on.
-    pub download_readiness: Arc<dyn discover::adapters::content::DownloadReadiness>,
+    pub download_readiness: Arc<dyn discover::content::DownloadReadiness>,
     /// Where discover, home and genre pages queue their image warm.
     pub cover_warm: Option<platform::artwork::warm::CoverWarm>,
 }
@@ -96,8 +95,8 @@ impl ReadsSetup {
     /// library reads, search reads (through its sqlx pool) and discover's
     /// writes, and its settings hand out the live handles the reads hold
     /// on their sections;
-    /// `users` gives wrapped its display names and discover its batch
-    /// callers and Last.fm links;
+    /// `users` gives wrapped its display names and discover its Last.fm
+    /// links;
     /// `inputs` carries what the version check, wrapped and discover read
     /// from the composition root; `enrichment` carries the live provider
     /// pair (`None` keeps the unconfigured ports: bare enrichment echoes
@@ -117,12 +116,11 @@ impl ReadsSetup {
             catalog,
             artwork,
             library_files,
-            batch_requests,
             download_readiness,
             cover_warm,
         } = ports;
-        let discover = discover::adapters::production_deps(
-            discover::adapters::DiscoverInputs {
+        let discover = discover::wiring::production_deps(
+            discover::wiring::DiscoverInputs {
                 db: db.clone(),
                 http: inputs.http.clone(),
                 providers: inputs.providers.clone(),
@@ -131,7 +129,6 @@ impl ReadsSetup {
                 users: users.clone(),
                 discover_warmer: inputs.discover_warmer,
                 clock: Arc::clone(&platform.clock),
-                batch_requests,
                 download_readiness,
                 warm: cover_warm,
                 remotes,
@@ -178,33 +175,22 @@ impl ReadsSetup {
     }
 }
 
-/// The library reads: the one local catalog, and tags
-/// and lyrics read from the files first. Without the
-/// provider pair lyrics fall back to the empty port (404s); with it,
-/// catalog tracks resolve through live LRCLIB while the lyrics setting
-/// (read per call) is on, and read as absent while it is off.
+/// The library reads: the one local catalog, and tags and lyrics read
+/// from the files first. Without the provider pair a track whose file
+/// carries no lyrics has none (404); with it, the online lyrics answer
+/// while the lyrics setting (read per call) is on.
 fn library_deps(
     catalog: library::store::LocalCatalog,
     settings: &droppedneedle_kernel::runtime_config::ConfigStore,
     enrichment: Option<&enrichment::live::ProductionEnrichment>,
     files: droppedneedle_media::stream::local_files::LibraryFiles,
 ) -> library::LibraryDeps {
-    let provider_lyrics: Arc<dyn library::stores::LyricsPort> = match enrichment {
-        Some(pair) => Arc::new(
-            enrichment::ProviderLyrics::new(
-                catalog.clone(),
-                pair.lyrics.clone(),
-                enrichment::SourceBudgets::default(),
-            )
-            .with_settings(pair.lyrics_settings.clone()),
-        ),
-        None => Arc::new(library::file_lyrics::NoOnlineLyrics),
-    };
+    let online = enrichment.map(|pair| pair.lyrics.clone());
     library::LibraryDeps {
-        lyrics: Arc::new(library::file_lyrics::FileLyrics::new(
+        lyrics: Arc::new(lyrics::LyricsService::new(
             catalog.clone(),
             files.clone(),
-            provider_lyrics,
+            online,
         )),
         catalog,
         upgrade_policy: Some(settings.live()),

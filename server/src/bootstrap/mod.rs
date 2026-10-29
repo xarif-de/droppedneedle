@@ -42,7 +42,6 @@ use crate::{
 use droppedneedle_acquire::{
     AcquireSetup,
     library_removal::{self, AcquireAlbumCleanup},
-    requests::discovery::DiscoveryBatchRequests,
     wiring::{AcquirePorts, AcquireStores},
 };
 use droppedneedle_auth::{
@@ -62,12 +61,13 @@ use droppedneedle_catalog::reads::{
         CollectionsState, db::CollectionsDb, remote_import::PlaylistImportSink, store::Stores,
     },
     enrichment::{library::LiveEnrichment, live::production_enrichment},
+    lyrics::OnlineLyrics,
     platform::artwork::ArtworkService,
 };
 use droppedneedle_compat::{CompatSetup, setup::CompatDeps};
 use droppedneedle_kernel::{
     config::AppConfig,
-    db::{BOOT_WAIT, BackupService, datalock::DataLockError, error::DbError},
+    db::{BOOT_WAIT, datalock::DataLockError, error::DbError},
     http_client::HttpClientError,
     platform::Platform,
     runtime_config::crypto::CryptoError,
@@ -245,7 +245,7 @@ pub async fn build_with(config: AppConfig, outbound: Outbound) -> Result<Built, 
     // stays shared with the admin stats and clear routes.
     let providers = Arc::new(Providers::build(p, outbound.providers(), cache_db.clone()));
     let provider_cache = providers.cache.clone();
-    let auth = AuthSetup::build_with_upstreams(
+    let auth = AuthSetup::build(
         p,
         ProdAuth::new(p),
         &outbound.sign_in(),
@@ -258,9 +258,14 @@ pub async fn build_with(config: AppConfig, outbound: Outbound) -> Result<Built, 
         sign_in_links(p),
     );
 
-    // Read live so turning ListenBrainz or lyrics on or off takes effect
+    // Read live so turning ListenBrainz, Last.fm or lyrics on or off takes effect
     // at once.
-    let enrichment = production_enrichment(&providers, config_store.live(), config_store.live());
+    let enrichment = production_enrichment(
+        &providers,
+        config_store.live(),
+        config_store.live(),
+        config_store.live(),
+    );
     let reads_inputs = ReadsInputs {
         covers_dir: config.cache_dir.join("covers"),
         cover_cache_max_bytes: config.cover_cache_max_bytes,
@@ -314,7 +319,15 @@ pub async fn build_with(config: AppConfig, outbound: Outbound) -> Result<Built, 
         mb_source.clone(),
         queues.queue().clone(),
         outbound.library(),
-        library_ports(p, &providers, &auth, &artwork, &scans, library_core),
+        library_ports(
+            p,
+            &providers,
+            &auth,
+            &artwork,
+            &scans,
+            enrichment.lyrics.clone(),
+            library_core,
+        ),
     )
     .map_err(stage("library setup"))?;
     let library_services = LibraryServices::build(&library);
@@ -323,7 +336,6 @@ pub async fn build_with(config: AppConfig, outbound: Outbound) -> Result<Built, 
         auth.users.clone(),
         acquire_stores,
         acquire_ports(
-            p,
             &library_services,
             &providers,
             mb_source,
@@ -347,13 +359,7 @@ pub async fn build_with(config: AppConfig, outbound: Outbound) -> Result<Built, 
             collections: CollectionsState::over(collections_db, collections, local),
             catalog,
             artwork,
-            library_files: LibraryFiles::new(db.sqlx().clone(), library.root_source()),
-            // Discovery batches file their albums through the requests
-            // service.
-            batch_requests: Arc::new(DiscoveryBatchRequests::new(
-                acquire.requests.clone(),
-                Some(library.clone()),
-            )),
+            library_files: LibraryFiles::new(db.clone(), library.core.root_source()),
             download_readiness: Arc::new(acquire.readiness.clone()),
             cover_warm: Some(cover_warm),
         },
@@ -366,7 +372,7 @@ pub async fn build_with(config: AppConfig, outbound: Outbound) -> Result<Built, 
     let (media, media_workers) = MediaSetup::build(
         p,
         auth.users.clone(),
-        library.root_source(),
+        library.core.root_source(),
         // Remote playlist imports land in the user's playlists.
         Arc::new(PlaylistImportSink::new(reads.collections.clone())),
         plugin_host.clone(),
@@ -394,7 +400,7 @@ pub async fn build_with(config: AppConfig, outbound: Outbound) -> Result<Built, 
     );
     // Publish journal reconciliation; scan recovery runs when the scan
     // supervisor starts.
-    let library_recovery = library.run_recovery().await;
+    let library_recovery = library_services.run_recovery().await;
     tracing::info!(
         publish_bundles = library_recovery.publish_recoveries.len(),
         "library recovery complete"
@@ -404,7 +410,7 @@ pub async fn build_with(config: AppConfig, outbound: Outbound) -> Result<Built, 
         auth.users.clone(),
         media.playback.clone(),
         media.stream.engine.clone(),
-        library.clone(),
+        library.scans.clone(),
         &reads,
     ));
     let admin = AdminSetup::new(
@@ -414,11 +420,7 @@ pub async fn build_with(config: AppConfig, outbound: Outbound) -> Result<Built, 
         providers.clone(),
     )
     .with_db(AdminDb::new(db.clone()))
-    .with_backups(BackupService::new(
-        &config.library_db_path,
-        runtime.backups().backup_dir(),
-        platform.clock.clone(),
-    ))
+    .with_backups(runtime.backups().clone())
     .with_checkpoint(runtime.checkpoint().clone());
     // Durable quota overrides back into the live ledger. A failure warns
     // instead of stopping the boot; the admin can re-save.
@@ -437,7 +439,7 @@ pub async fn build_with(config: AppConfig, outbound: Outbound) -> Result<Built, 
         p,
         runtime.checkpoint().clone(),
         media.jobs(p),
-        concerts.sweep(),
+        Some(concerts.sweep()),
         scans.clone(),
     )
     .with_queue(queues)
@@ -448,7 +450,7 @@ pub async fn build_with(config: AppConfig, outbound: Outbound) -> Result<Built, 
     )
     .with_job(
         droppedneedle_library::recycle_bin::SPEC,
-        droppedneedle_library::recycle_bin::handler(&library),
+        droppedneedle_library::recycle_bin::handler(&library.publishing),
     )
     .with_mixer(mix_hooks)
     .with_precache_sources_from(&reads, config_store)
@@ -469,7 +471,7 @@ pub async fn build_with(config: AppConfig, outbound: Outbound) -> Result<Built, 
     }
     .with_precache(jobs.precache_trigger());
     let download_worker = acquire.worker.clone();
-    let roots_library = library.clone();
+    let roots_library = library.scans.clone();
     // Each section's declared effects run after every committed change to
     // it, whoever saved it; settings routes wait for them before answering.
     let (effects, effects_runner) = Effects::new(
@@ -549,6 +551,10 @@ pub async fn build_with(config: AppConfig, outbound: Outbound) -> Result<Built, 
         .library_services
         .start_loops(supervisor)
         .map_err(|error| stage("library loops")(error.to_string()))?;
+    state
+        .compat
+        .start_loops(supervisor)
+        .map_err(|error| stage("compat loops")(error.to_string()))?;
     // `activity.changed` and `downloads.changed` for every open stream.
     droppedneedle_kernel::events::revisions::start(supervisor, events.clone(), db.clone())
         .map_err(|error| stage("event loops")(error.to_string()))?;
@@ -576,8 +582,8 @@ pub async fn build_with(config: AppConfig, outbound: Outbound) -> Result<Built, 
 
 /// What the library calls outside itself. Completed scans refresh the library's
 /// images, as v2 did after a sync. Library Management plans genres, lyrics
-/// and covers through the same clients and artwork cache the pages use, and
-/// AcoustID ids on identification's shared rate limit.
+/// and covers through the same clients, online lyrics and artwork cache the
+/// pages use, and AcoustID ids on identification's shared rate limit.
 #[allow(clippy::too_many_arguments)]
 fn library_ports(
     p: &Platform,
@@ -585,6 +591,7 @@ fn library_ports(
     auth: &AuthSetup,
     artwork: &ArtworkService,
     scans: &jobs::ScansEnded,
+    lyrics: OnlineLyrics,
     core: droppedneedle_library::wiring::LibraryCore,
 ) -> droppedneedle_library::wiring::LibraryPorts {
     let enrichment = LiveEnrichment {
@@ -596,7 +603,7 @@ fn library_ports(
             auth.users.clone(),
         ),
         artwork: Some(artwork.clone()),
-        lrclib: Default::default(),
+        lyrics,
     };
     let scans = scans.clone();
     droppedneedle_library::wiring::LibraryPorts {
@@ -612,7 +619,6 @@ fn library_ports(
 /// pace through the shared limiters. Plugins act as download sources, feed
 /// usenet and hear acquisition events.
 fn acquire_ports(
-    p: &Platform,
     library: &LibraryServices,
     providers: &Arc<Providers>,
     mb_source: droppedneedle_providers::musicbrainz::LiveSource,
@@ -622,9 +628,8 @@ fn acquire_ports(
     AcquirePorts {
         library: Arc::new(
             droppedneedle_acquire::landing::library::LibraryLanding::new(
-                library.setup.clone(),
-                library.setup.releases.clone(),
-                p.db.sqlx().clone(),
+                &library.setup,
+                library.setup.imports.releases.clone(),
             ),
         ),
         edition_plans: Arc::new(library.operations.clone()),
@@ -638,6 +643,7 @@ fn acquire_ports(
         plugins: plugin_host.clone(),
         collections: collections.clone(),
         providers: providers.clone(),
+        albums: library.mutations.clone(),
     }
 }
 

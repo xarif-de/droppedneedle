@@ -158,6 +158,54 @@ async fn layered_limits_reject_in_each_protocol_shape() {
     }
 }
 
+/// An IPv6 client is keyed by its /64, as the native limiter keys it:
+/// another address in the same /64 gets no fresh public bucket and no
+/// fresh sign-in backoff, while another /64 is another client. The
+/// addresses come through the trusted loopback proxy.
+#[tokio::test]
+async fn ipv6_clients_share_limits_across_their_64() {
+    let app = enabled("compat-ipv6").await;
+    let ask = |uri: &'static str, client: &'static str| {
+        let app = &app;
+        async move {
+            let (_, headers, body) =
+                oneshot(app, "GET", uri, &[("x-forwarded-for", client)], b"").await;
+            (subsonic_code(&body), headers.get("retry-after").is_some())
+        }
+    };
+    let public = "/subsonic/rest/getOpenSubsonicExtensions?f=json";
+    let limited = (Value::from(0), true);
+    let drain = async || {
+        for _ in 0..100 {
+            if ask(public, "2001:db8:1:2::a").await == limited {
+                return true;
+            }
+        }
+        false
+    };
+    // The bucket refills five tokens a second, so a stall on a loaded host
+    // between tripping it and asking from `::b` can hand `::b` a fresh
+    // token. A bucket of its own would answer `::b` at least twenty times,
+    // so the shared one is the only way any of a few tries is refused.
+    let mut shared = false;
+    for _ in 0..5 {
+        assert!(drain().await, "the public bucket never tripped");
+        if ask(public, "2001:db8:1:2::b").await == limited {
+            shared = true;
+            break;
+        }
+    }
+    assert!(shared, "another address in the /64 got a bucket of its own");
+    assert_eq!(ask(public, "2001:db8:1:3::a").await, (Value::Null, false));
+
+    let ping = "/subsonic/rest/ping?f=json";
+    for _ in 0..5 {
+        assert_eq!(ask(ping, "2001:db8:5:6::1").await, (Value::from(10), false));
+    }
+    assert_eq!(ask(ping, "2001:db8:5:6::2").await, limited);
+    assert_eq!(ask(ping, "2001:db8:5:7::1").await, (Value::from(10), false));
+}
+
 #[tokio::test]
 async fn api_bodies_compress_when_the_client_accepts() {
     let app = enabled("compat-gzip").await;

@@ -1,18 +1,19 @@
 //! Media handlers: cover art, stream, download, transcode, avatar.
 //! v2: the Subsonic router's endpoint functions.
 
-use super::auth::Principal;
 use super::error::{NOT_AUTHORIZED, NOT_FOUND, SubsonicError};
 use super::ids::{IdKind, decode, decode_expect};
 use super::library::current_id;
-use super::models::{Render, SStreamDetails, STranscodeDecision};
+use super::models::{SStreamDetails, STranscodeDecision};
 use super::picture::PictureKind;
-use super::store::{ClientInfo, Store};
+use super::store::ClientInfo;
 use super::stream::{
-    AudioBackend, AudioBody, MAX_OFFSET_SECONDS, ServeError, ServedAudio, StreamParams,
-    cover_bucket, download_filename, placeholder_cover, serve,
+    AudioBody, MAX_OFFSET_SECONDS, ServeError, ServedAudio, StreamParams, cover_bucket,
+    download_filename, placeholder_cover, serve,
 };
 use super::{AVATAR_FORBIDDEN_MESSAGE, Ctx, Outcome};
+use crate::adapters::library::CompatError;
+use crate::adapters::subsonic_store::SubsonicStore;
 use droppedneedle_media::stream::leases::RETRY_AFTER_SECONDS;
 use droppedneedle_providers::musicbrainz::is_valid_mbid;
 
@@ -101,52 +102,65 @@ fn immutable(body: Vec<u8>, content_type: String) -> Outcome {
 }
 
 /// An album's cover or an artist's picture in a size bucket, or the
-/// placeholder when there is none. `None` when the album or artist is not
-/// in the library. `getCoverArt` and the open picture address both serve
-/// these through here.
-pub async fn library_picture<S: Store>(
-    store: &S,
+/// placeholder, coloured from the id, when there is none. The caller has
+/// checked that the album or artist is in the library. `None` only if the
+/// placeholder could not be drawn. `getCoverArt` and the open picture
+/// address both serve these through here.
+pub async fn library_picture(
+    store: &SubsonicStore,
     kind: PictureKind,
     internal: &str,
     bucket: &str,
-) -> Result<Option<Outcome>, S::Error> {
-    let (art, name) = match kind {
-        PictureKind::Album => {
-            let Some(album) = store.get_album(internal).await? else {
-                return Ok(None);
-            };
-            (
-                store.release_group_cover(internal, bucket).await?,
-                album.title,
-            )
-        }
+) -> Result<Option<Outcome>, CompatError> {
+    let art = match kind {
+        PictureKind::Album => store.release_group_cover(internal, bucket).await?,
         PictureKind::Artist => {
-            let Some((artist, _)) = store.get_artist_with_albums(internal).await? else {
-                return Ok(None);
-            };
-            (
-                store
-                    .artist_image(internal, bucket.parse::<i64>().ok())
-                    .await?,
-                artist.name,
-            )
+            store
+                .artist_image(internal, bucket.parse::<i64>().ok())
+                .await?
         }
     };
     Ok(match art {
         Some((body, content_type)) => Some(immutable(body, content_type)),
-        None => placeholder(placeholder_seed(Some(internal), &name)),
+        None => placeholder(internal),
     })
+}
+
+/// An album's or artist's picture for `getCoverArt`: the read that
+/// resolves the id is the existence check, so no album or artist is
+/// loaded. `missing` is the answer for an id nothing live holds.
+async fn picture_of(
+    ctx: &Ctx<'_>,
+    kind: PictureKind,
+    internal: &str,
+    bucket: &str,
+    missing: &str,
+) -> Result<Outcome, SubsonicError> {
+    let id_kind = match kind {
+        PictureKind::Album => IdKind::Album,
+        PictureKind::Artist => IdKind::Artist,
+    };
+    let live = ctx
+        .store
+        .current_id(id_kind, internal)
+        .await
+        .map_err(Ctx::store_err)?
+        .ok_or_else(|| SubsonicError::new(NOT_FOUND, missing))?;
+    library_picture(ctx.store, kind, &live, bucket)
+        .await
+        .map_err(Ctx::store_err)?
+        .ok_or_else(|| SubsonicError::new(NOT_FOUND, missing))
 }
 
 /// Cover art: album/track -> release-group art, artist -> artist image,
 /// playlist -> its uploaded cover (Feishin #287) or one made from its
 /// tracks. Misses serve a WebP placeholder coloured from the item;
-/// non-playlist hits carry immutable cache headers; `size` buckets to 250/500/1200. HEAD is
-/// served by the HTTP layer (which strips bodies); only the playlist
-/// branch needs explicit headers.
-pub async fn cover_art<P: Principal, S: Store, B: AudioBackend>(
-    ctx: &'_ Ctx<'_, P, S, B>,
-) -> Result<Outcome, SubsonicError> {
+/// non-playlist hits carry immutable cache headers whatever cover version
+/// the id carries; `size` buckets to 250/500/1200. An album or artist is
+/// found by the one read that resolves its id (an alias or a merged id
+/// names the live one). HEAD is served by the HTTP layer (which strips
+/// bodies); only the playlist branch needs explicit headers.
+pub async fn cover_art(ctx: &Ctx<'_>) -> Result<Outcome, SubsonicError> {
     // A target that is not (or no longer) in the library gets the neutral
     // placeholder, as a playlist without a cover does: a cover is never a
     // reason for a client to see an error.
@@ -156,25 +170,40 @@ pub async fn cover_art<P: Principal, S: Store, B: AudioBackend>(
     }
 }
 
-async fn cover_art_target<P: Principal, S: Store, B: AudioBackend>(
-    ctx: &'_ Ctx<'_, P, S, B>,
-) -> Result<Outcome, SubsonicError> {
+async fn cover_art_target(ctx: &Ctx<'_>) -> Result<Outcome, SubsonicError> {
     let sid = ctx.p("id")?.unwrap_or_default();
-    // Unknown prefix -> 70 -> 404-as-text on the binary path.
+    // Unknown prefix -> 70 -> 404-as-text on the binary path. An album's
+    // cover version is dropped here, so any version opens today's picture.
     let (kind, internal) = decode(&sid)?;
-    let internal = current_id(ctx, kind, internal).await?;
     let bucket = cover_bucket(ctx.pint("size", None, Some(1), Some(2000))?);
     match kind {
-        IdKind::Album => library_picture(ctx.store, PictureKind::Album, &internal, bucket)
+        IdKind::Album => {
+            picture_of(
+                ctx,
+                PictureKind::Album,
+                &internal,
+                bucket,
+                "Album not found",
+            )
             .await
-            .map_err(Ctx::<P, S, B>::store_err)?
-            .ok_or_else(|| SubsonicError::new(NOT_FOUND, "Album not found")),
+        }
+        IdKind::Artist => {
+            picture_of(
+                ctx,
+                PictureKind::Artist,
+                &internal,
+                bucket,
+                "Artist not found",
+            )
+            .await
+        }
         IdKind::Track => {
+            let internal = current_id(ctx, kind, internal).await?;
             let track = ctx
                 .store
                 .get_track(&internal)
                 .await
-                .map_err(Ctx::<P, S, B>::store_err)?
+                .map_err(Ctx::store_err)?
                 .ok_or_else(|| SubsonicError::new(NOT_FOUND, "Song not found"))?;
             let mut art = None;
             if let Some(rg) = &track.rg_mbid {
@@ -182,7 +211,7 @@ async fn cover_art_target<P: Principal, S: Store, B: AudioBackend>(
                     .store
                     .release_group_cover(rg, bucket)
                     .await
-                    .map_err(Ctx::<P, S, B>::store_err)?;
+                    .map_err(Ctx::store_err)?;
             }
             match art {
                 Some((body, content_type)) => Ok(immutable(body, content_type)),
@@ -193,17 +222,13 @@ async fn cover_art_target<P: Principal, S: Store, B: AudioBackend>(
                 .ok_or_else(|| SubsonicError::new(NOT_FOUND, "Song not found")),
             }
         }
-        IdKind::Artist => library_picture(ctx.store, PictureKind::Artist, &internal, bucket)
-            .await
-            .map_err(Ctx::<P, S, B>::store_err)?
-            .ok_or_else(|| SubsonicError::new(NOT_FOUND, "Artist not found")),
         IdKind::Playlist => {
             let user_id = ctx.user()?.user_id().to_owned();
             let art = ctx
                 .store
                 .playlist_cover(&internal, &user_id)
                 .await
-                .map_err(Ctx::<P, S, B>::store_err)?;
+                .map_err(Ctx::store_err)?;
             match art {
                 // Playlists without a cover get the neutral pair, as on the web.
                 None => placeholder("")
@@ -242,10 +267,8 @@ async fn cover_art_target<P: Principal, S: Store, B: AudioBackend>(
 /// or transcode. `format=raw` always serves the original bytes;
 /// `timeOffset` applies to transcodes only; `estimateContentLength` adds
 /// Content-Length on transcodes only. A local miss falls through to the
-/// plugin fallback behind the backend seam, else 70 (v2 `_stream`).
-pub async fn stream<P: Principal, S: Store, B: AudioBackend>(
-    ctx: &'_ Ctx<'_, P, S, B>,
-) -> Result<Outcome, SubsonicError> {
+/// plugin fallback in the gateway adapter, else 70 (v2 `_stream`).
+pub async fn stream(ctx: &Ctx<'_>) -> Result<Outcome, SubsonicError> {
     let fid = decode_expect(&ctx.p("id")?.unwrap_or_default(), IdKind::Track)?;
     let fid = current_id(ctx, IdKind::Track, fid).await?;
     let params = StreamParams {
@@ -272,9 +295,7 @@ pub async fn stream<P: Principal, S: Store, B: AudioBackend>(
 /// Download: always original bytes, with a sanitized attachment filename.
 /// A user the admin's download setting excludes is refused with code 50,
 /// the Subsonic API's "not authorized for the given operation".
-pub async fn download<P: Principal, S: Store, B: AudioBackend>(
-    ctx: &'_ Ctx<'_, P, S, B>,
-) -> Result<Outcome, SubsonicError> {
+pub async fn download(ctx: &Ctx<'_>) -> Result<Outcome, SubsonicError> {
     if !ctx.settings.download_access.admits(ctx.user()?.role()) {
         return Err(SubsonicError::new(
             NOT_AUTHORIZED,
@@ -287,7 +308,7 @@ pub async fn download<P: Principal, S: Store, B: AudioBackend>(
         .store
         .get_track(&fid)
         .await
-        .map_err(Ctx::<P, S, B>::store_err)?
+        .map_err(Ctx::store_err)?
         .ok_or_else(|| SubsonicError::new(NOT_FOUND, "Song not found"))?;
     let filename = download_filename(&track.title, track.file_format.as_deref().unwrap_or(""));
     let disposition = format!("attachment; filename=\"{}\"", filename.replace('"', "_"));
@@ -436,9 +457,7 @@ pub fn parse_client_info(
 
 /// Transcode decision: POST-only, JSON-only client description,
 /// mediaType=song only, signed params minted by the store.
-pub async fn transcode_decision<P: Principal, S: Store, B: AudioBackend>(
-    ctx: &'_ Ctx<'_, P, S, B>,
-) -> Result<Outcome, SubsonicError> {
+pub async fn transcode_decision(ctx: &Ctx<'_>) -> Result<Outcome, SubsonicError> {
     let client = parse_client_info(&ctx.method, ctx.content_type.as_deref(), &ctx.body)?;
     if ctx
         .params
@@ -454,7 +473,7 @@ pub async fn transcode_decision<P: Principal, S: Store, B: AudioBackend>(
         .store
         .get_track(&file_id)
         .await
-        .map_err(Ctx::<P, S, B>::store_err)?
+        .map_err(Ctx::store_err)?
         .ok_or_else(|| SubsonicError::new(NOT_FOUND, "Song not found"))?;
     let user_id = ctx.user()?.user_id().to_owned();
     let client = ClientInfo {
@@ -471,7 +490,7 @@ pub async fn transcode_decision<P: Principal, S: Store, B: AudioBackend>(
         .store
         .advanced_decide(&track, &client, &user_id)
         .await
-        .map_err(Ctx::<P, S, B>::store_err)?;
+        .map_err(Ctx::store_err)?;
     let details = |stream: Option<super::store::StreamDetailsData>| {
         stream.map(|s| SStreamDetails {
             protocol: s.protocol,
@@ -484,7 +503,7 @@ pub async fn transcode_decision<P: Principal, S: Store, B: AudioBackend>(
             audioBitdepth: s.audio_bitdepth,
         })
     };
-    Ok(Outcome::keyed(
+    Outcome::keyed(
         "transcodeDecision",
         STranscodeDecision {
             canDirectPlay: decision.can_direct_play,
@@ -494,17 +513,14 @@ pub async fn transcode_decision<P: Principal, S: Store, B: AudioBackend>(
             transcodeParams: decision.transcode_params,
             sourceStream: details(decision.source_stream),
             transcodeStream: details(decision.transcode_stream),
-        }
-        .render(),
-    ))
+        },
+    )
 }
 
 /// Transcode stream: validates the signed parameters. Direct parameters
 /// serve the original file; otherwise their format and bitrate go to the
 /// stream gateway as the request, with the offset (estimate off).
-pub async fn transcode_stream<P: Principal, S: Store, B: AudioBackend>(
-    ctx: &'_ Ctx<'_, P, S, B>,
-) -> Result<Outcome, SubsonicError> {
+pub async fn transcode_stream(ctx: &Ctx<'_>) -> Result<Outcome, SubsonicError> {
     if ctx
         .params
         .one_of("mediaType", &["song", "podcast"], None)?
@@ -531,7 +547,7 @@ pub async fn transcode_stream<P: Principal, S: Store, B: AudioBackend>(
         .store
         .decode_transcode_params(&params, &user_id, &file_id)
         .await
-        .map_err(Ctx::<P, S, B>::store_err)?;
+        .map_err(Ctx::store_err)?;
     let params = if direct {
         StreamParams::original()
     } else {
@@ -563,9 +579,7 @@ pub async fn transcode_stream<P: Principal, S: Store, B: AudioBackend>(
 
 /// Avatar: self-only. A username that is not the caller's is the one
 /// direct 403-as-text (`_binary_error(50)`); a missing avatar is 70.
-pub async fn avatar<P: Principal, S: Store, B: AudioBackend>(
-    ctx: &'_ Ctx<'_, P, S, B>,
-) -> Result<Outcome, SubsonicError> {
+pub async fn avatar(ctx: &Ctx<'_>) -> Result<Outcome, SubsonicError> {
     let username = ctx.p("username")?.unwrap_or_default();
     let user = ctx.user()?;
     let folded = username.to_lowercase();
@@ -586,7 +600,7 @@ pub async fn avatar<P: Principal, S: Store, B: AudioBackend>(
         .store
         .resolve_avatar(user.user_id())
         .await
-        .map_err(Ctx::<P, S, B>::store_err)?
+        .map_err(Ctx::store_err)?
         .ok_or_else(|| SubsonicError::new(NOT_FOUND, "Avatar not found"))?;
     let (body, content_type) = resolved;
     let headers = vec![

@@ -16,20 +16,18 @@ use axum::{
 };
 use droppedneedle_auth::prod::{Passwords, ProdAuth};
 use droppedneedle_auth::session::middleware::SessionAuth;
-use droppedneedle_auth::session::store::{SessionKind, SessionRecord, SessionStore as _};
+use droppedneedle_auth::session::store::{SessionKind, SessionRecord};
 use droppedneedle_auth::session::tokens;
-use droppedneedle_auth::sqlite::SqliteSessionStore;
 use droppedneedle_auth::users::UsersDeps;
 use droppedneedle_auth::users::models::{LocalCredential, UserRecord};
 use droppedneedle_auth::users::roles::{Admin, Principal, Role};
-use droppedneedle_auth::users::stores::UserStore as _;
 use droppedneedle_auth::wiring::AuthSetup;
 use droppedneedle_kernel::clock::{Clock, ManualClock};
 use droppedneedle_kernel::db::DbRuntime;
 use droppedneedle_kernel::platform::Platform;
-use droppedneedle_kernel::runtime_config::ConfigStore;
 use droppedneedle_kernel::runtime_config::secret_sections::LastFmSettings;
 use droppedneedle_kernel::runtime_config::sections::SecuritySettings;
+use droppedneedle_kernel::runtime_config::{ConfigStore, Secret};
 
 use super::{ScratchDir, TestPlatform, closed_outbound, scratch_runtime};
 
@@ -58,7 +56,7 @@ pub struct AuthRig {
     pub config: Arc<ConfigStore>,
     /// What the rig was built from, for the test's other bundles.
     pub platform: Platform,
-    gate: SessionAuth<SqliteSessionStore>,
+    gate: SessionAuth,
     runtime: Option<DbRuntime>,
     _scratch: Option<ScratchDir>,
 }
@@ -102,7 +100,7 @@ impl AuthRig {
             })
             .expect("Last.fm settings save");
         let auth = ProdAuth::new(&platform);
-        let setup = AuthSetup::build_with_upstreams(
+        let setup = AuthSetup::build(
             &platform,
             auth.clone(),
             &closed_outbound().sign_in(),
@@ -126,6 +124,17 @@ impl AuthRig {
             runtime: None,
             _scratch: None,
         }
+    }
+
+    /// Save `api_key` as Last.fm's instance key, with Last.fm on.
+    pub fn set_lastfm_instance_key(&self, api_key: &str) {
+        self.config
+            .save_secret_blocking(LastFmSettings {
+                enabled: true,
+                api_key: Secret::new(api_key),
+                shared_secret: Secret::new("instance-secret"),
+            })
+            .expect("Last.fm settings save");
     }
 
     /// The rig's own database. Only a rig from [`AuthRig::new`] has one.
@@ -171,7 +180,7 @@ impl AuthRig {
         let token = format!("raw-token-for-{session_id}");
         self.auth
             .sessions
-            .insert(SessionRecord {
+            .seed(SessionRecord {
                 id: session_id.to_owned(),
                 user_id: user_id.to_owned(),
                 token_hash: tokens::hash_token(&token),
@@ -190,7 +199,7 @@ impl AuthRig {
 
     /// The production session gate over the rig's sessions, as the
     /// production builder makes it.
-    pub fn session_gate(&self) -> SessionAuth<SqliteSessionStore> {
+    pub fn session_gate(&self) -> SessionAuth {
         self.gate.clone()
     }
 
@@ -201,7 +210,7 @@ impl AuthRig {
         let token_hash = tokens::hash_token(token);
         self.auth
             .sessions
-            .insert(SessionRecord {
+            .seed(SessionRecord {
                 id: format!("signed-in-{}", &token_hash[..16]),
                 user_id: user_id.to_owned(),
                 token_hash,

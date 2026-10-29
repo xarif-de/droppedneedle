@@ -6,7 +6,7 @@
 //! [`super::journal::Journal`]: the scoped task list, the per-task attempt
 //! and decision summaries the cards show, and the activity summary.
 //!
-//! "Scoped" means what v2 did: an admin sees every user's tasks, anyone
+//! "Scoped" means an admin sees every user's tasks, anyone
 //! else only their own.
 
 use droppedneedle_kernel::db::statement::ListLen;
@@ -15,6 +15,7 @@ use rusqlite::{OptionalExtension as _, Row, params};
 use super::sql;
 use super::state::TaskStatus;
 use super::store::{DownloadStore, NewTask, StoreError, TaskRow};
+use crate::db::{ms_from_secs_f64 as ms, secs_f64_from_ms};
 use crate::held::store::{FileState, HeldRows};
 use crate::reason::Reason;
 use crate::requests::settle::relink;
@@ -76,7 +77,7 @@ pub struct AlbumPurge {
 
 impl DownloadStore<'_> {
     /// Download-side cleanup after an album left the library at
-    /// `removed_at` (unix seconds; v2 `purge_album_downloads`): its failed
+    /// `removed_at` (unix seconds): its failed
     /// or short tasks stop retrying, its held downloads are discarded and
     /// its blocklist entries go. Only rows made at or before the removal
     /// are touched, so a request made since keeps its own; held files go
@@ -92,15 +93,11 @@ impl DownloadStore<'_> {
     ) -> Result<AlbumPurge, StoreError> {
         let cancelled: Vec<String> = self
             .conn
-            .prepare(
-                "UPDATE download_tasks SET status = 'cancelled', cancelled_at = ?2, \
-                     remote_queued = 0, updated_at = ?2 \
-                 WHERE lower(release_group_mbid) = lower(?1) AND status IN ('failed', 'partial') \
-                 AND created_at <= ?3 RETURNING id",
+            .prepare(sql::PURGE_ALBUM_TASKS.text())?
+            .query_map(
+                params![release_group_mbid, ms(now), ms(removed_at)],
+                |row| row.get(0),
             )?
-            .query_map(params![release_group_mbid, now, removed_at], |row| {
-                row.get(0)
-            })?
             .collect::<Result<_, _>>()?;
         // Files kept for "Retry import" go with the tasks that kept them.
         for task_id in &cancelled {
@@ -108,16 +105,15 @@ impl DownloadStore<'_> {
         }
         let retries_cancelled = cancelled.len();
         let held = HeldRows::new(self.conn);
-        let removed_ms = (removed_at * 1000.0) as i64;
-        let now_ms = (now * 1000.0) as i64;
+        let removed_ms = ms(removed_at);
+        let now_ms = ms(now);
         let mut held_removed = 0;
         for (file, entry, _) in held.removed_album_files(release_group_mbid, removed_ms)? {
             held_removed += held.resolve(entry, &[file], FileState::Discarded, now_ms)?;
         }
         self.conn.execute(
-            "DELETE FROM download_quarantine WHERE lower(release_group_mbid) = lower(?1) \
-             AND quarantined_at <= ?2",
-            params![release_group_mbid, removed_at],
+            sql::PURGE_ALBUM_QUARANTINE.text(),
+            params![release_group_mbid, ms(removed_at)],
         )?;
         Ok(AlbumPurge {
             retries_cancelled,
@@ -133,12 +129,7 @@ impl DownloadStore<'_> {
         now: f64,
     ) -> Result<(), StoreError> {
         self.conn.execute(
-            "UPDATE download_tasks SET downloaded_bytes = ?2, \
-                 total_size_bytes = COALESCE(?3, total_size_bytes), progress_percent = ?4, \
-                 files_total = ?5, files_completed = ?6, files_failed = ?7, \
-                 queue_position_start = ?8, queue_position_end = ?9, remote_queued = ?10, \
-                 last_polled_at = ?11 \
-             WHERE id = ?1 AND status IN ('downloading', 'processing')",
+            sql::RECORD_PROGRESS.text(),
             params![
                 task_id,
                 progress.downloaded_bytes,
@@ -150,7 +141,7 @@ impl DownloadStore<'_> {
                 progress.queue_position_start,
                 progress.queue_position_end,
                 progress.remote_queued,
-                now,
+                ms(now),
             ],
         )?;
         Ok(())
@@ -161,7 +152,7 @@ impl DownloadStore<'_> {
     /// cancelled so the retry sweep skips it, and files kept for "Retry
     /// import" go to cleanup. Either way the owner's
     /// wanted watch on the album stops too, so it cannot start the task
-    /// again (v2 #255: one action, no hidden second switch).
+    /// again (issue #255: one action, no hidden second switch).
     pub fn stop_task(&self, task: &TaskRow, now: f64) -> Result<Stopped, StoreError> {
         let outcome = match task.status {
             TaskStatus::Queued | TaskStatus::Downloading | TaskStatus::Processing => {
@@ -172,12 +163,9 @@ impl DownloadStore<'_> {
                 }
             }
             TaskStatus::Failed | TaskStatus::Partial => {
-                let changed = self.conn.execute(
-                    "UPDATE download_tasks SET status = 'cancelled', cancelled_at = ?2, \
-                         remote_queued = 0, updated_at = ?2 \
-                     WHERE id = ?1 AND status IN ('failed', 'partial')",
-                    params![task.id, now],
-                )?;
+                let changed = self
+                    .conn
+                    .execute(sql::STOP_RETRIES.text(), params![task.id, ms(now)])?;
                 if changed == 0 {
                     Stopped::AlreadySettled
                 } else {
@@ -189,9 +177,7 @@ impl DownloadStore<'_> {
         };
         if outcome != Stopped::AlreadySettled && !task.release_group_mbid.is_empty() {
             self.conn.execute(
-                "UPDATE wanted_watches SET state = 'stopped' \
-                 WHERE release_group_mbid_lower = lower(?1) AND user_id = ?2 \
-                   AND state = 'watching'",
+                sql::STOP_WATCH.text(),
                 params![task.release_group_mbid, task.user_id],
             )?;
         }
@@ -232,11 +218,9 @@ impl DownloadStore<'_> {
     /// outlives the queue row by design, and files still kept for a
     /// removed task go to cleanup at the next hourly sweep.
     pub fn clear_finished(&self, owner: Option<&str>) -> Result<i64, StoreError> {
-        let removed = self.conn.execute(
-            "DELETE FROM download_tasks WHERE status IN ('completed', 'cancelled') \
-             AND (?1 IS NULL OR user_id = ?1)",
-            params![owner],
-        )?;
+        let removed = self
+            .conn
+            .execute(sql::CLEAR_FINISHED.text(), params![owner])?;
         Ok(removed as i64)
     }
 
@@ -245,7 +229,7 @@ impl DownloadStore<'_> {
     pub fn delete_quarantine(&self, id: i64) -> Result<bool, StoreError> {
         let removed = self
             .conn
-            .execute("DELETE FROM download_quarantine WHERE id = ?1", params![id])?;
+            .execute(sql::DELETE_QUARANTINE.text(), params![id])?;
         Ok(removed > 0)
     }
 }
@@ -303,7 +287,9 @@ impl QueueTask {
                 quality_sample_rate: row.get("quality_sample_rate")?,
                 advertised_queue_depth: row.get("advertised_queue_depth")?,
                 final_path: row.get("final_path")?,
-                wrong_product_verdict_at: row.get("wrong_product_verdict_at")?,
+                wrong_product_verdict_at: row
+                    .get::<_, Option<i64>>("wrong_product_verdict_at")?
+                    .map(secs_f64_from_ms),
                 wrong_product_detail: row.get("wrong_product_detail")?,
             },
         })
@@ -326,7 +312,7 @@ pub struct ListFilter {
 pub struct TaskFacts {
     /// Attempts that reached a download client.
     pub attempts: i64,
-    /// v2's `acquisition_cleanup_state` summary of the attempts.
+    /// The cleanup-state summary of the attempts.
     pub cleanup_state: Option<String>,
     /// A file of this task waits in the held list.
     pub held_for_review: bool,
@@ -436,7 +422,7 @@ impl DownloadStore<'_> {
                     files_total: row.get(4)?,
                     files_imported: row.get(5)?,
                     files_held: row.get(6)?,
-                    decided_at: row.get(7)?,
+                    decided_at: secs_f64_from_ms(row.get(7)?),
                 });
             }
         }

@@ -6,8 +6,8 @@
 //! `usenet` to add releases (with an NZB URL) to the SABnzbd pipeline.
 //!
 //! This module only speaks to plugins: typed calls, time budgets, and
-//! "absence, not failure" fallbacks (a failing search is no results, a
-//! failing health check is an error status). Ranking and the download
+//! "absence, not failure" fallbacks (a failing search is no results).
+//! Ranking and the download
 //! worker live in `acquire`, which applies the same quality, size, term
 //! and quarantine rules to plugin results as to every other source.
 
@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::super::host::{LoadedPlugin, PluginHost};
+use super::super::manifest::Capability;
 use super::super::protocol::methods;
 use super::super::runtime::CallError;
 use super::{call, decode};
@@ -29,8 +30,6 @@ const SEARCH_GRACE: Duration = Duration::from_secs(5);
 const ENQUEUE_TIMEOUT: Duration = Duration::from_secs(120);
 /// Budget for status, inspect, discard and abort.
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(30);
-/// Budget for a health check.
-const HEALTH_TIMEOUT: Duration = Duration::from_secs(10);
 /// Results kept per plugin search.
 const RESULTS_PER_SEARCH: usize = 200;
 
@@ -66,23 +65,6 @@ pub struct PluginSearchResult {
     pub nzb_url: String,
     /// Usenet post date (unix seconds), for indexers that feed `usenet`.
     pub usenet_date: Option<f64>,
-}
-
-/// Health of one plugin source.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PluginHealth {
-    /// `ok` or `error`.
-    pub status: String,
-    /// Detail for the admin.
-    #[serde(default)]
-    pub message: String,
-    /// Whether the plugin has the settings it needs.
-    #[serde(default = "default_true")]
-    pub configured: bool,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 /// Correlation handle for one plugin download.
@@ -164,7 +146,7 @@ pub fn indexer_target(plugin: &LoadedPlugin) -> String {
         .manifest
         .capability_configs
         .iter()
-        .find(|config| config.id == "indexer" && !config.target_source.is_empty())
+        .find(|config| config.id == Capability::Indexer && !config.target_source.is_empty())
         .map(|config| config.target_source.clone())
         .unwrap_or_else(|| format!("plugin:{}", plugin.manifest.name))
 }
@@ -174,12 +156,12 @@ impl PluginHost {
     pub fn download_client(&self, source_key: &str) -> Option<LoadedPlugin> {
         let name = source_key.strip_prefix("plugin:")?;
         self.get(name)
-            .filter(|plugin| plugin.serves("download_client"))
+            .filter(|plugin| plugin.serves(Capability::DownloadClient))
     }
 
     /// Enabled plugin source keys with a download client, sorted.
     pub fn download_source_keys(&self) -> Vec<String> {
-        self.serving("download_client")
+        self.serving(Capability::DownloadClient)
             .iter()
             .map(|plugin| format!("plugin:{}", plugin.manifest.name))
             .collect()
@@ -187,7 +169,7 @@ impl PluginHost {
 
     /// Enabled indexers feeding one source key, in name order.
     pub fn indexers_for(&self, source_key: &str) -> Vec<LoadedPlugin> {
-        self.serving("indexer")
+        self.serving(Capability::Indexer)
             .into_iter()
             .filter(|plugin| indexer_target(plugin) == source_key)
             .collect()
@@ -253,30 +235,6 @@ impl PluginHost {
             .flatten()
             .flat_map(|results| results.into_iter().take(RESULTS_PER_SEARCH))
             .collect()
-    }
-
-    /// Health of one plugin (any capability). Errors read as an error
-    /// status, never a failure.
-    pub async fn plugin_health(&self, plugin: &LoadedPlugin) -> PluginHealth {
-        match call(plugin, methods::HEALTH, Value::Null, HEALTH_TIMEOUT).await {
-            Ok(value) => {
-                decode::<PluginHealth>(plugin, methods::HEALTH, value).unwrap_or(PluginHealth {
-                    status: "error".to_owned(),
-                    message: "health answer was malformed".to_owned(),
-                    configured: false,
-                })
-            }
-            Err(CallError::Unsupported(_)) => PluginHealth {
-                status: "ok".to_owned(),
-                message: String::new(),
-                configured: true,
-            },
-            Err(error) => PluginHealth {
-                status: "error".to_owned(),
-                message: error.to_string(),
-                configured: false,
-            },
-        }
     }
 
     /// Start one download on the client serving `request.source`.

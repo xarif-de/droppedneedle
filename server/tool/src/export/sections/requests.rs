@@ -43,12 +43,15 @@ macro_rules! millis {
     };
 }
 
+pub(crate) use millis;
+
 /// Now, as integer milliseconds.
 macro_rules! now_millis {
     () => {
         "CAST(round((julianday('now') - 2440587.5) * 86400000.0) AS INTEGER)"
     };
 }
+pub(crate) use now_millis;
 
 /// A v2 whole-number column, NULL when it holds something else.
 macro_rules! whole {
@@ -75,6 +78,67 @@ macro_rules! whole {
         )
     };
 }
+
+pub(crate) use whole;
+
+/// A v2 whole-number column, `$default` when it does not read as one.
+macro_rules! whole_or {
+    ($column:literal, $default:literal) => {
+        concat!("COALESCE(", whole!($column), ", ", $default, ")")
+    };
+}
+
+pub(crate) use whole_or;
+
+/// A v2 whole-number column kept at `$min` or above, so a v3 CHECK holds.
+macro_rules! whole_min {
+    ($column:literal, $min:literal) => {
+        concat!("MAX(", $min, ", ", whole_or!($column, $min), ")")
+    };
+}
+
+pub(crate) use whole_min;
+
+/// A v2 flag column as 0 or 1: 1 when it reads as a non-zero number.
+macro_rules! flag {
+    ($column:literal) => {
+        concat!("CASE WHEN ", whole!($column), " != 0 THEN 1 ELSE 0 END")
+    };
+}
+
+pub(crate) use flag;
+
+/// A v2 REAL column: the value when it is a number, NULL otherwise.
+macro_rules! real {
+    ($column:literal) => {
+        concat!(
+            "CASE WHEN typeof(s.",
+            $column,
+            ") IN ('integer', 'real') THEN s.",
+            $column,
+            " END"
+        )
+    };
+}
+
+pub(crate) use real;
+
+/// A v2 text column with a fixed set of values: each `$from` maps to its v3
+/// `$to`; anything else, NULL included, takes `$default`.
+macro_rules! set_or {
+    ($column:literal, $default:literal, $($from:literal => $to:literal),+ $(,)?) => {
+        concat!(
+            "CASE s.",
+            $column,
+            $(" WHEN '", $from, "' THEN '", $to, "'",)+
+            " ELSE '",
+            $default,
+            "' END"
+        )
+    };
+}
+
+pub(crate) use set_or;
 
 /// Requester and dismissal rows hang off their request.
 const ON_REQUEST: &[Parent] = &[Parent::required(
@@ -117,9 +181,23 @@ pub const REQUESTS: TableSection = TableSection {
             ")"
         )),
         Column::new("completed_at").from_sql(millis!("completed_at")),
-        col("status"),
-        col("monitor_artist"),
-        col("auto_download_artist"),
+        // A live status would send a finished request back to work, so anything
+        // else reads as failed.
+        Column::new("status").from_sql_of(
+            "status",
+            set_or!(
+                "status",
+                "failed",
+                "imported" => "imported",
+                "incomplete" => "incomplete",
+                "failed" => "failed",
+                "cancelled" => "cancelled",
+                "rejected" => "rejected",
+            ),
+        ),
+        Column::new("monitor_artist").from_sql_of("monitor_artist", flag!("monitor_artist")),
+        Column::new("auto_download_artist")
+            .from_sql_of("auto_download_artist", flag!("auto_download_artist")),
         col("user_id"),
         col("requested_by_name"),
         Column::new("reviewed_by_id").from_sql(live_user!("reviewed_by_id")),
@@ -127,12 +205,16 @@ pub const REQUESTS: TableSection = TableSection {
         Column::new("reviewed_at").from_sql(millis!("reviewed_at")),
         col("download_task_id"),
         col("release_mbid"),
-        col("request_kind"),
+        Column::new("request_kind").from_sql_of(
+            "request_kind",
+            set_or!("request_kind", "album", "album" => "album", "track" => "track"),
+        ),
         col("track_title"),
         Column::new("duration_seconds").from_sql(whole!("duration_seconds")),
         col("track_release_group_mbid"),
-        col("dispatch_authorized"),
-        col("generation"),
+        Column::new("dispatch_authorized")
+            .from_sql_of("dispatch_authorized", flag!("dispatch_authorized")),
+        Column::new("generation").from_sql_of("generation", whole_or!("generation", 1)),
     ],
     key: &["musicbrainz_id_lower"],
     unique: &[],
@@ -208,9 +290,22 @@ pub const WANTED_WATCHES: TableSection = TableSection {
         col("artist_mbid"),
         Column::new("year").from_sql(whole!("year")),
         col("cover_url"),
-        col("kind"),
-        Column::new("state")
-            .from_sql("CASE s.state WHEN 'dormant' THEN 'watching' ELSE s.state END"),
+        Column::new("kind").from_sql_of(
+            "kind",
+            set_or!("kind", "missing", "missing" => "missing", "partial" => "partial"),
+        ),
+        // Only watching watches are checked, so an unknown state reads as stopped.
+        Column::new("state").from_sql_of(
+            "state",
+            set_or!(
+                "state",
+                "stopped",
+                "watching" => "watching",
+                "dormant" => "watching",
+                "stopped" => "stopped",
+                "fulfilled" => "fulfilled",
+            ),
+        ),
         Column::new("created_at").from_sql(concat!(
             "COALESCE(",
             millis!("created_at"),
@@ -219,8 +314,8 @@ pub const WANTED_WATCHES: TableSection = TableSection {
             ")"
         )),
         col("first_release_date"),
-        col("check_count"),
-        col("quiet_streak"),
+        Column::new("check_count").from_sql_of("check_count", whole_or!("check_count", 0)),
+        Column::new("quiet_streak").from_sql_of("quiet_streak", whole_or!("quiet_streak", 0)),
         Column::new("last_checked_at").from_sql(millis!("last_checked_at")),
         Column::new("next_check_at").from_sql(concat!(
             "CASE WHEN s.state = 'dormant' THEN ",
@@ -232,7 +327,8 @@ pub const WANTED_WATCHES: TableSection = TableSection {
             ") END"
         )),
         col("last_outcome"),
-        col("new_candidate_count"),
+        Column::new("new_candidate_count")
+            .from_sql_of("new_candidate_count", whole_or!("new_candidate_count", 0)),
     ],
     key: &["release_group_mbid_lower"],
     unique: &[],
@@ -256,7 +352,16 @@ pub const WANTED_SEEN_CANDIDATES: TableSection = TableSection {
         col("release_group_mbid_lower"),
         col("source"),
         col("identity"),
-        col("first_seen_at"),
+        Column::new("first_seen_at").from_sql_of(
+            "first_seen_at",
+            concat!(
+                "COALESCE(",
+                millis!("first_seen_at"),
+                ", ",
+                now_millis!(),
+                ")"
+            ),
+        ),
     ],
     key: &["release_group_mbid_lower", "source", "identity"],
     unique: &[],
@@ -276,9 +381,11 @@ pub const QUOTAS: TableSection = TableSection {
     target: Target::Table("user_quotas"),
     columns: &[
         col("user_id"),
-        col("request_quota_count"),
-        col("request_quota_days"),
-        col("storage_quota_gb"),
+        Column::new("request_quota_count")
+            .from_sql_of("request_quota_count", whole!("request_quota_count")),
+        Column::new("request_quota_days")
+            .from_sql_of("request_quota_days", whole!("request_quota_days")),
+        Column::new("storage_quota_gb").from_sql_of("storage_quota_gb", whole!("storage_quota_gb")),
     ],
     key: &["user_id"],
     unique: &[],

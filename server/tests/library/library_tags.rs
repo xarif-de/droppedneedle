@@ -5,6 +5,7 @@
 //! its fixture into a scratch dir first; the committed files are never
 //! written. Nothing here touches the network.
 
+use droppedneedle_library::publish::TagTarget;
 use droppedneedle_library::tags;
 
 use crate::common::ScratchDir;
@@ -1451,8 +1452,10 @@ fn vorbis_spellings_restore_their_own_values() {
     flac_inject_pairs(&path, &[("TOTALTRACKS", "12"), ("TRACKTOTAL", "9")]);
     let baseline = staging::document_from_file(&path).unwrap();
     assert_eq!(
-        baseline.managed["total_tracks:TRACKTOTAL"],
-        vec!["9".to_owned()]
+        baseline
+            .managed
+            .get(&TagTarget::Spelling(TagField::TrackTotal, "TRACKTOTAL")),
+        Some(&vec!["9".to_owned()])
     );
     let totals = vorbis_values(&path, "TOTALTRACKS");
     tags::save_tags(
@@ -1461,7 +1464,7 @@ fn vorbis_spellings_restore_their_own_values() {
     )
     .unwrap();
     assert_eq!(vorbis_values(&path, "TRACKTOTAL"), vec!["15"]);
-    let edits = staging::check_managed_updates(&baseline.managed).unwrap();
+    let edits = staging::tag_edits(&baseline.managed);
     tags::save_tags(&path, &edits).unwrap();
     assert_eq!(vorbis_values(&path, "TOTALTRACKS"), totals);
     assert_eq!(vorbis_values(&path, "TRACKTOTAL"), vec!["9"]);
@@ -1475,13 +1478,16 @@ fn restore_updates_spare_opaque_and_older_baselines() {
     let mut baseline = TagDocument::empty();
     baseline
         .managed
-        .insert("title".to_owned(), vec!["Kept".to_owned()]);
+        .insert(TagTarget::Field(TagField::Title), vec!["Kept".to_owned()]);
     let mut current = TagDocument::empty();
     current.opaque.push("date".to_owned());
     let updates = staging::restore_updates(&baseline, &current, "a.flac");
-    assert_eq!(updates["title"], vec!["Kept".to_owned()]);
-    assert_eq!(updates["artist"], Vec::<String>::new());
-    assert!(!updates.contains_key("date"));
+    assert_eq!(
+        updates.field(TagField::Title),
+        Some(&vec!["Kept".to_owned()])
+    );
+    assert_eq!(updates.field(TagField::Artist), Some(&Vec::new()));
+    assert!(updates.field(TagField::Date).is_none());
     baseline.version = 1;
     let updates = staging::restore_updates(&baseline, &current, "a.flac");
     assert_eq!(updates, baseline.managed);
@@ -1524,7 +1530,7 @@ fn older_baselines_keep_the_credit_tags() {
         .position(|field| *field == TagField::AlbumArtists)
         .unwrap()..];
     for field in new_fields {
-        let Some(values) = old.managed.remove(field.name()) else {
+        let Some(values) = old.managed.remove(&TagTarget::Field(*field)) else {
             continue;
         };
         let key = match field {
@@ -1548,7 +1554,7 @@ fn older_baselines_keep_the_credit_tags() {
         tags::save_tags(&path, &[TagEdit::set_title("Later")]).unwrap();
         let current = staging::document_from_file(&path).unwrap();
         let updates = staging::restore_updates(&baseline, &current, "a.mp3");
-        let edits = staging::check_managed_updates(&updates).unwrap();
+        let edits = staging::tag_edits(&updates);
         tags::save_tags(&path, &edits).unwrap();
         assert_eq!(held(&path), original, "version {version}");
         assert_eq!(id3_text_values(&path, "TIT2"), texts(&["Management Track"]));
@@ -1575,7 +1581,7 @@ fn version_5_baselines_keep_the_other_role_tags() {
     let restore = |path: &Path, native: &[(TagField, &str)], later: &[TagEdit]| {
         let mut baseline = staging::document_from_file(path).unwrap();
         for field in other_roles {
-            let values = baseline.managed.remove(field.name());
+            let values = baseline.managed.remove(&TagTarget::Field(field));
             if let Some((_, key)) = native.iter().find(|(owned, _)| *owned == field) {
                 baseline
                     .custom
@@ -1589,7 +1595,7 @@ fn version_5_baselines_keep_the_other_role_tags() {
         let current = staging::document_from_file(path).unwrap();
         let name = path.file_name().unwrap().to_str().unwrap();
         let updates = staging::restore_updates(&baseline, &current, name);
-        let edits = staging::check_managed_updates(&updates).unwrap();
+        let edits = staging::tag_edits(&updates);
         tags::save_tags(path, &edits).unwrap();
     };
 
@@ -3556,7 +3562,7 @@ fn v2_baseline_restore_keeps_v23_musician_credits() {
         .doc;
     let current = staging::document_from_file(&path).unwrap();
     let updates = staging::restore_updates(&baseline, &current, "a.mp3");
-    let edits = staging::check_managed_updates(&updates).unwrap();
+    let edits = staging::tag_edits(&updates);
     tags::save_tags(&path, &edits).unwrap();
     assert_eq!(
         id3_people(&path, "IPLS"),
@@ -3929,6 +3935,8 @@ fn frames_kept_only_once_are_refused_before_saving() {
 
 /// Zero padding between an MP3's ID3v2 tag and its first frame, outside
 /// the tag's size, keeps the file readable and writable, pictures included.
+/// Padding past what the save looks through is unreadable at preview, not
+/// a save that fails at Apply.
 #[test]
 fn mp3_with_padding_after_the_tag_is_saved() {
     let (_scratch, path) = temp_copy("management_full.mp3", "padded");
@@ -3938,10 +3946,18 @@ fn mp3_with_padding_after_the_tag_is_saved() {
         .iter()
         .fold(0usize, |size, byte| (size << 7) | usize::from(*byte & 0x7F));
     let end = 10 + size;
-    let mut padded = bytes[..end].to_vec();
-    padded.extend(std::iter::repeat_n(0u8, 1044));
-    padded.extend_from_slice(&bytes[end..]);
-    std::fs::write(&path, padded).unwrap();
+    let padded = |zeros: usize| {
+        let mut padded = bytes[..end].to_vec();
+        padded.extend(std::iter::repeat_n(0u8, zeros));
+        padded.extend_from_slice(&bytes[end..]);
+        padded
+    };
+    std::fs::write(&path, padded(70 * 1024)).unwrap();
+    assert!(matches!(
+        tags::save::read_document(&path),
+        Err(TagsError::TagRead { .. })
+    ));
+    std::fs::write(&path, padded(1044)).unwrap();
     let pictures = tags::save::read_document(&path).unwrap().pictures;
     assert_eq!(tags::save::tags_kept(&path).unwrap().refusal, None);
     tags::save_tags(&path, &[TagEdit::set_title("Padded")]).unwrap();

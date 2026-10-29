@@ -641,12 +641,7 @@ impl<'c> HeldRows<'c> {
     fn settle_item(&self, item_id: i64, discarded: &str, now: i64) -> rusqlite::Result<()> {
         self.conn.execute(
             sql::SETTLE_ITEM.text(),
-            params![
-                item_id,
-                discarded,
-                now as f64 / 1000.0,
-                Reason::AlreadyOwned.message()
-            ],
+            params![item_id, discarded, now, Reason::AlreadyOwned.message()],
         )?;
         Ok(())
     }
@@ -895,7 +890,7 @@ mod tests {
 
     #[test]
     fn the_reason_check_lists_every_spelling() {
-        let migration = include_str!("../../../migrations/0087_acquire_held_retry.sql");
+        let migration = include_str!("../../../migrations/0090_acquire_queue_gave_way.sql");
         let check = migration
             .split("reason TEXT NOT NULL CHECK (reason IN (")
             .nth(1)

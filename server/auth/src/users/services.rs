@@ -7,6 +7,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 
 use super::super::federated::password_import::HashScheme;
 use super::super::passwords::{StoredPassword, Verdict};
+use super::super::session::store::NewSession;
 use super::super::session::tokens;
 use super::error::UsersError;
 use super::models::{
@@ -17,10 +18,9 @@ use super::models::{
     RecoveryCode, RecoveryCodeResponse, SessionListResponse, SessionView, UserRecord, UserResponse,
 };
 use super::roles::{Admin, Principal, Role};
-use super::stores::{
-    LastFmError, LastFmKeys, RecoveryStore, RoleChange, StoreError, UserDeletion, UserStore,
-};
+use super::stores::{LastFmError, LastFmKeys, RoleChange, StoreError, UserDeletion};
 use super::{UsersDeps, clock_now};
+use crate::sqlite::{RecoveryCodes, Users};
 
 // ---------------------------------------------------------------------------
 // Validation and crypto helpers
@@ -156,8 +156,7 @@ pub fn validate_device_label(raw: &str) -> Result<String, UsersError> {
 /// Run the breach screen. A corpus hit is a 400; the screen itself fails
 /// open, so only hits surface here.
 async fn screen_password(deps: &UsersDeps, password: &str) -> Result<(), UsersError> {
-    let policy = deps.security.hibp();
-    if deps.screen.screen(password, &policy).await {
+    if deps.screen.screen(password).await {
         return Err(UsersError::InvalidInput {
             message: "This password has appeared in a known data breach. Please choose a different password."
                 .to_owned(),
@@ -236,7 +235,12 @@ pub(crate) async fn user_response(
         .provider_names(&user.id)
         .await
         .map_err(store_internal)?;
-    Ok(UserResponse {
+    Ok(response_of(user, providers))
+}
+
+/// The answer for `user` bound to `providers`.
+fn response_of(user: &UserRecord, providers: Vec<String>) -> UserResponse {
+    UserResponse {
         id: user.id.clone(),
         username: user.username.clone(),
         username_display: user.username_display.clone(),
@@ -247,7 +251,7 @@ pub(crate) async fn user_response(
         providers,
         created_at: user.created_at,
         last_login_at: user.last_login_at,
-    })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -538,7 +542,6 @@ pub async fn mint_device_session(
     let row = deps
         .sessions
         .replace_companion(
-            &deps.ids.new_id(),
             caller.user_id(),
             &tokens::hash_token(&token),
             &label,
@@ -663,19 +666,33 @@ pub async fn admin_create_user(
     email: Option<&str>,
     role: Role,
 ) -> Result<UserResponse, UsersError> {
-    create_local_user(deps, username, password, display_name, email, role, false).await
+    create_local_user(deps, username, password, display_name, email, role, None).await
 }
 
-/// First-run setup: create the first admin, or [`UsersError::Conflict`]
-/// with `setup_done` when any user already exists. Emptiness is decided in
-/// the insert transaction, so a concurrent setup or first federated login
-/// cannot leave two admins.
+/// The provider name of a local password account.
+const LOCAL_PROVIDER: &str = "local";
+
+/// The session first-run setup signs the new admin in with.
+pub struct SetupSession {
+    /// SHA-256 hex of the raw token.
+    pub token_hash: String,
+    /// Client label from the request.
+    pub user_agent: Option<String>,
+}
+
+/// First-run setup: create the first admin signed in with `session`, or
+/// [`UsersError::Conflict`] with `setup_done` when any user already exists.
+/// The account, its password, the session and the sign-in time are one
+/// write, so a failure leaves nothing behind. Emptiness is decided in that
+/// transaction, so a concurrent setup or first federated login cannot leave
+/// two admins.
 pub async fn create_first_admin(
     deps: &UsersDeps,
     username: &str,
     password: &str,
     display_name: Option<&str>,
     email: Option<&str>,
+    session: SetupSession,
     setup_done: &str,
 ) -> Result<UserResponse, UsersError> {
     create_local_user(
@@ -685,7 +702,7 @@ pub async fn create_first_admin(
         display_name,
         email,
         Role::Admin,
-        true,
+        Some(session),
     )
     .await
     .map_err(|error| match error {
@@ -703,7 +720,7 @@ async fn create_local_user(
     display_name: Option<&str>,
     email: Option<&str>,
     role: Role,
-    first_user: bool,
+    setup: Option<SetupSession>,
 ) -> Result<UserResponse, UsersError> {
     let (lower, display) = validate_username(username)?;
     validate_password(password)?;
@@ -760,21 +777,31 @@ async fn create_local_user(
         scheme: native_scheme().to_owned(),
         hash,
     };
-    if first_user {
+    if let Some(setup) = setup {
+        let session = deps.sessions.standard_row(NewSession {
+            user_id: user.id.clone(),
+            token_hash: setup.token_hash,
+            issued_at: now,
+            user_agent: setup.user_agent,
+        });
         let created = deps
             .users
-            .insert_first_user(user.clone(), credential)
+            .insert_first_user(user.clone(), credential, session)
             .await
             .map_err(create_insert_error)?;
         if !created {
             return Err(vague_create_conflict());
         }
-    } else {
-        deps.users
-            .insert_with_local_credential(user.clone(), credential)
-            .await
-            .map_err(create_insert_error)?;
+        // Committed: the answer is built from what was written, since a
+        // read failing now would report a failed setup that happened.
+        let mut user = user;
+        user.last_login_at = Some(now);
+        return Ok(response_of(&user, vec![LOCAL_PROVIDER.to_owned()]));
     }
+    deps.users
+        .insert_with_local_credential(user.clone(), credential)
+        .await
+        .map_err(create_insert_error)?;
     user_response(deps, &user).await
 }
 
@@ -938,8 +965,8 @@ pub struct IssuedRecoveryCode {
 /// user (a new one replaces the last), only the hash stored. The admin
 /// route and the offline tool both issue through here.
 pub async fn issue_recovery_code(
-    users: &dyn UserStore,
-    recovery: &dyn RecoveryStore,
+    users: &Users,
+    recovery: &RecoveryCodes,
     user_id: &str,
     reach: RecoveryReach,
     now: i64,
@@ -985,8 +1012,8 @@ pub async fn admin_mint_recovery_code(
     user_id: &str,
 ) -> Result<RecoveryCodeResponse, UsersError> {
     issue_recovery_code(
-        deps.users.as_ref(),
-        deps.recovery.as_ref(),
+        &deps.users,
+        &deps.recovery,
         user_id,
         RecoveryReach::LocalPasswordOnly,
         clock_now(deps),

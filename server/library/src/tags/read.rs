@@ -160,9 +160,8 @@ pub fn read_scan_metadata(
     let tagged = read_lenient(path).map_err(|error| {
         // An I/O failure (a file vanishing mid-scan, a contended disk) is
         // worth a retry; anything else is a broken file.
-        let io = std::error::Error::source(&error)
-            .and_then(|source| source.downcast_ref::<std::io::Error>())
-            .map(|source| std::io::Error::new(source.kind(), source.to_string()));
+        let io =
+            io_source(&error).map(|source| std::io::Error::new(source.kind(), source.to_string()));
         match io {
             Some(source) => TagsError::Io {
                 path: path.display().to_string(),
@@ -201,16 +200,30 @@ pub fn read_scan_metadata(
     Ok((tag, header))
 }
 
-/// The file as the catalog reads it: an item lofty cannot parse (a
-/// `TDRL` holding a web address rather than a date) is dropped instead of
-/// failing the whole file, so the track is still listed. Writes keep
-/// lofty's default mode and refuse such a file.
+/// The file as the catalog reads it. lofty's default mode comes first,
+/// so a file that reads there reads exactly as before. Only when that
+/// fails on the file's content is it read again in `Relaxed` mode, which
+/// drops an item lofty cannot parse (a `TDRL` holding a web address
+/// rather than a date) instead of failing the whole file, so the track is
+/// still listed. Writes keep the default mode and refuse such a file.
 fn read_lenient(path: &Path) -> Result<TaggedFile, lofty::error::FileParseError> {
-    lofty::probe::Probe::open(path)?
-        .options(
-            lofty::config::ParseOptions::new().parsing_mode(lofty::config::ParsingMode::Relaxed),
-        )
-        .read()
+    match lofty::read_from_path(path) {
+        Err(error) if io_source(&error).is_none() => {
+            tracing::debug!(path = %path.display(), %error, "tags read again in relaxed mode");
+            lofty::probe::Probe::open(path)?
+                .options(
+                    lofty::config::ParseOptions::new()
+                        .parsing_mode(lofty::config::ParsingMode::Relaxed),
+                )
+                .read()
+        }
+        read => read,
+    }
+}
+
+/// The I/O error under a lofty read failure, if that is what it was.
+fn io_source(error: &lofty::error::FileParseError) -> Option<&std::io::Error> {
+    std::error::Error::source(error).and_then(|source| source.downcast_ref::<std::io::Error>())
 }
 
 /// Read the tag half only. The probe half lives in [`super::probe`].

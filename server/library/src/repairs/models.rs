@@ -3,55 +3,163 @@
 
 use std::collections::BTreeMap;
 
+use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
 use serde::{Deserialize, Serialize};
 
 use crate::operations::models::ReidentificationCandidate;
 
-/// What a repair job checks. Stored in `library_repair_snapshots.scope_json`
-/// under `purpose`, with v2's names.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Purpose {
-    /// Identity repair: recheck existing automatic and imported matches
-    /// against MusicBrainz and offer to detach the ones that fail.
-    ExistingMatches,
-    /// Identity preparation: make sure every album Library Management may
-    /// touch has an exact release with each file placed on it.
-    ManagementReadiness,
-    /// Catalog cleanup after an upgrade: retire empty album shells and
-    /// fold albums an imported identity split off back together.
-    CatalogIdentityHygiene,
-    /// File plays that name no track under the track they were plays of.
-    PlayHistoryFiling,
+/// One SQL conversion for a closed set stored as text: the value is its
+/// `as_str`, and text outside the set fails decoding.
+macro_rules! sql_text {
+    ($type:ty) => {
+        impl ToSql for $type {
+            fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+                Ok(ToSqlOutput::from(self.as_str()))
+            }
+        }
+
+        impl FromSql for $type {
+            fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+                let text = value.as_str()?;
+                Self::parse(text).ok_or_else(|| {
+                    FromSqlError::Other(
+                        format!(concat!("not a ", stringify!($type), ": {}"), text).into(),
+                    )
+                })
+            }
+        }
+    };
+}
+
+/// A closed set of stored names: `as_str`, `parse` and the SQL conversion.
+macro_rules! named {
+    ($(#[$meta:meta])* $type:ident { $($(#[$vmeta:meta])* $variant:ident => $name:literal,)+ }) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub enum $type {
+            $($(#[$vmeta])* $variant,)+
+        }
+
+        impl $type {
+            pub fn as_str(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $name,)+
+                }
+            }
+
+            pub fn parse(raw: &str) -> Option<Self> {
+                match raw {
+                    $($name => Some(Self::$variant),)+
+                    _ => None,
+                }
+            }
+        }
+
+        sql_text!($type);
+    };
+}
+
+named! {
+    /// What a repair job checks, in `library_repair_snapshots.purpose`
+    /// with v2's names.
+    #[derive(Serialize, Deserialize, utoipa::ToSchema)]
+    #[serde(rename_all = "snake_case")]
+    Purpose {
+        /// Identity repair: recheck existing automatic and imported
+        /// matches against MusicBrainz and offer to detach the ones that
+        /// fail.
+        ExistingMatches => "existing_matches",
+        /// Identity preparation: make sure every album Library Management
+        /// may touch has an exact release with each file placed on it.
+        ManagementReadiness => "management_readiness",
+        /// Catalog cleanup after an upgrade: retire empty album shells and
+        /// fold albums an imported identity split off back together.
+        CatalogIdentityHygiene => "catalog_identity_hygiene",
+        /// File plays that name no track under the track they were plays
+        /// of.
+        PlayHistoryFiling => "play_history_filing",
+    }
 }
 
 impl Purpose {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::ExistingMatches => "existing_matches",
-            Self::ManagementReadiness => "management_readiness",
-            Self::CatalogIdentityHygiene => "catalog_identity_hygiene",
-            Self::PlayHistoryFiling => "play_history_filing",
-        }
-    }
-
-    /// v2 treated a snapshot without a purpose as an identity repair.
-    pub fn parse(raw: Option<&str>) -> Option<Self> {
-        match raw.unwrap_or("existing_matches") {
-            "existing_matches" => Some(Self::ExistingMatches),
-            "management_readiness" => Some(Self::ManagementReadiness),
-            "catalog_identity_hygiene" => Some(Self::CatalogIdentityHygiene),
-            "play_history_filing" => Some(Self::PlayHistoryFiling),
-            _ => None,
-        }
-    }
-
     /// The finding Apply acts on.
-    pub fn apply_finding(self) -> &'static str {
+    pub fn apply_finding(self) -> FindingCode {
         match self {
-            Self::ManagementReadiness => "mapping_ready",
-            _ => "safe_detach",
+            Self::ManagementReadiness => FindingCode::MappingReady,
+            _ => FindingCode::SafeDetach,
         }
+    }
+}
+
+named! {
+    /// One album's verdict in a repair report.
+    #[derive(Serialize, utoipa::ToSchema)]
+    #[serde(rename_all = "snake_case")]
+    FindingCode {
+        /// The match holds.
+        Valid => "valid",
+        /// The match fails; Apply removes it.
+        SafeDetach => "safe_detach",
+        /// A person's match: reported, never removed.
+        ManualIdentity => "manual_identity",
+        NeedsReview => "needs_review",
+        Unverifiable => "unverifiable",
+        /// The album changed or went before it was checked.
+        Stale => "stale",
+        /// Every file is placed on its exact release.
+        Ready => "ready",
+        /// Apply can place every file on the release.
+        MappingReady => "mapping_ready",
+        ExactReleaseRequired => "exact_release_required",
+        /// Apply can choose the suggested edition.
+        ExactReleaseSuggested => "exact_release_suggested",
+        /// The check chose the suggested edition by itself.
+        ExactReleaseAutoAccepted => "exact_release_auto_accepted",
+    }
+}
+
+named! {
+    /// Where a finding is.
+    #[derive(Serialize, utoipa::ToSchema)]
+    #[serde(rename_all = "snake_case")]
+    FindingState {
+        Open => "open",
+        Applied => "applied",
+        Skipped => "skipped",
+        Stale => "stale",
+    }
+}
+
+named! {
+    /// What Apply did with a finding.
+    #[derive(Serialize, utoipa::ToSchema)]
+    #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+    ApplyResult {
+        Detached => "DETACHED",
+        MappingsAccepted => "MAPPINGS_ACCEPTED",
+        EditionAccepted => "EDITION_ACCEPTED",
+        EditionAutoAccepted => "EDITION_AUTO_ACCEPTED",
+        /// The album changed since it was checked.
+        StaleSubject => "STALE_SUBJECT",
+    }
+}
+
+named! {
+    /// How far a finding can be trusted, in the finding's `confidence`.
+    #[derive(Serialize, utoipa::ToSchema)]
+    #[serde(rename_all = "snake_case")]
+    Confidence {
+        /// Apply may act on it.
+        Complete => "complete",
+        Bounded => "bounded",
+    }
+}
+
+named! {
+    /// Phase a repair job is in: checking or applying.
+    Phase {
+        DryRun => "dry_run",
+        Apply => "apply",
     }
 }
 
@@ -70,8 +178,6 @@ pub struct Scope {
     pub root_ids: Vec<String>,
     #[serde(default)]
     pub album_ids: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub purpose: Option<String>,
     #[serde(default)]
     pub legacy_only: bool,
     /// Cleanup after one scan: only albums that run changed, plus empty
@@ -136,14 +242,14 @@ pub struct FindingPayload {
 /// One album's verdict, before it is stored.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Verdict {
-    pub finding_code: &'static str,
+    pub finding_code: FindingCode,
     pub reason_code: &'static str,
     pub apply_eligible: bool,
     pub payload: FindingPayload,
 }
 
 impl Verdict {
-    pub fn new(finding_code: &'static str, reason_code: &'static str) -> Self {
+    pub fn new(finding_code: FindingCode, reason_code: &'static str) -> Self {
         Self {
             finding_code,
             reason_code,
@@ -164,7 +270,7 @@ impl Verdict {
 }
 
 /// One stored finding with the album it is about.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, utoipa::ToSchema)]
 pub struct FindingRow {
     pub id: String,
     pub local_album_id: String,
@@ -173,15 +279,21 @@ pub struct FindingRow {
     pub album_year: Option<i64>,
     pub cover_available: bool,
     pub review_id: Option<String>,
-    pub finding_code: String,
+    pub finding_code: FindingCode,
     pub reason_code: String,
-    pub confidence: String,
+    pub confidence: Confidence,
     pub apply_eligible: bool,
-    pub state: String,
-    pub apply_result: Option<String>,
+    pub state: FindingState,
+    pub apply_result: Option<ApplyResult>,
+    #[serde(skip)]
     pub suggested_release_mbid: Option<String>,
+    #[serde(skip)]
     pub suggested_release_group_mbid: Option<String>,
+    #[serde(skip)]
     pub payload: FindingPayload,
+    /// The album and identity revisions an undo of its automatic edition
+    /// echoes.
+    #[serde(skip)]
     pub automatic_undo: Option<(i64, i64)>,
     pub updated_at: f64,
     pub row_revision: i64,
@@ -191,33 +303,95 @@ pub struct FindingRow {
 #[derive(Debug, Clone, Default)]
 pub struct FindingPage {
     pub items: Vec<FindingRow>,
-    pub next_cursor: Option<String>,
-    pub has_more: bool,
+    /// The `(updated_at, id)` the next page starts after.
+    pub next: Option<(f64, String)>,
     pub current_counts_by_finding: BTreeMap<String, i64>,
     pub refresh_required: bool,
 }
 
-/// What a finished check found, kept in the snapshot's `result_json`.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+/// What a finished check found.
+// Kept in the snapshot's `result_json`. A count missing from an older
+// summary reads as zero; a summary without a known purpose does not read,
+// like any unreadable summary.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[schema(as = RepairSummaryView)]
 pub struct Summary {
+    /// Albums checked.
+    #[serde(default)]
+    #[schema(required = true)]
     pub total_identities: i64,
+    #[serde(default)]
+    #[schema(required = true)]
     pub remaining_identities: i64,
+    #[serde(default)]
+    #[schema(required = true)]
     pub input_track_count: i64,
+    #[serde(default)]
+    #[schema(required = true)]
     pub playable_after_detach_track_count: i64,
+    /// Albums Apply would change.
+    #[serde(default)]
+    #[schema(required = true)]
     pub estimated_apply_changes: i64,
+    #[serde(default)]
+    #[schema(required = true)]
     pub catalog_snapshot_revision: i64,
+    #[serde(default)]
+    #[schema(required = true)]
     pub target_matcher_version: String,
+    #[serde(default)]
+    #[schema(required = true)]
     pub counts_by_finding: BTreeMap<String, i64>,
+    #[serde(default)]
+    #[schema(required = true)]
     pub counts_by_reason: BTreeMap<String, i64>,
+    #[serde(default)]
+    #[schema(required = true)]
     pub album_counts_by_root: BTreeMap<String, i64>,
+    #[serde(default)]
+    #[schema(required = true)]
     pub provider_deferred_count: i64,
+    #[serde(default)]
+    #[schema(required = true)]
     pub failed_evidence_count: i64,
-    pub purpose: String,
+    pub purpose: Purpose,
+    #[serde(default)]
+    #[schema(required = true)]
     pub ready_album_count: i64,
+    #[serde(default)]
+    #[schema(required = true)]
     pub mapping_candidate_count: i64,
+    #[serde(default)]
+    #[schema(required = true)]
     pub exact_release_required_count: i64,
+    #[serde(default)]
+    #[schema(required = true)]
     pub needs_review_count: i64,
+}
+
+impl Summary {
+    /// An empty report for a job of `purpose`.
+    pub fn new(purpose: Purpose, target_matcher_version: String) -> Self {
+        Self {
+            total_identities: 0,
+            remaining_identities: 0,
+            input_track_count: 0,
+            playable_after_detach_track_count: 0,
+            estimated_apply_changes: 0,
+            catalog_snapshot_revision: 0,
+            target_matcher_version,
+            counts_by_finding: BTreeMap::new(),
+            counts_by_reason: BTreeMap::new(),
+            album_counts_by_root: BTreeMap::new(),
+            provider_deferred_count: 0,
+            failed_evidence_count: 0,
+            purpose,
+            ready_album_count: 0,
+            mapping_candidate_count: 0,
+            exact_release_required_count: 0,
+            needs_review_count: 0,
+        }
+    }
 }
 
 /// Start a repair or a preparation.

@@ -2,9 +2,10 @@
 //!
 //! - [`SqliteSpotifyStates`]: authorize states in `spotify_auth_requests`
 //!   (migration 0023), each with the redirect URI the authorize step sent,
-//!   valid for ten minutes and pruned on every insert, as v2 did.
+//!   valid for ten minutes and pruned on every insert.
 //! - [`SqliteSpotifyLinks`]: per-user links in `user_connections` under
-//!   service `spotify`. The document keeps v2's field names and is sealed
+//!   service `spotify`. The document keeps the field names v2 links were
+//!   imported with and is sealed
 //!   whole with the instance key, like the other sealed connections.
 //! - [`CollectionsPlaylistBridge`]: imported playlists are ordinary rows in
 //!   `playlists` / `playlist_tracks`, written through the collections
@@ -20,15 +21,17 @@ use serde::{Deserialize, Serialize};
 use super::spotify::ImportedTrack;
 use super::spotify_client::{SpotifyError, now_unix_secs};
 use super::spotify_oauth::{PendingAuth, STATE_TTL_SECS, SpotifyConnection};
+use super::sql;
 use crate::db::AcquireDb;
 use droppedneedle_auth::times::{parse_iso, to_iso};
 use droppedneedle_catalog::reads::collections::db::StoreError;
 use droppedneedle_catalog::reads::collections::store::PlaylistStore;
 use droppedneedle_catalog::reads::collections::store::playlists::{CoverImage, NewEntry, Written};
 use droppedneedle_kernel::clock::Clock;
+use droppedneedle_kernel::db::DbError;
 use droppedneedle_kernel::runtime_config::crypto::Crypto;
 
-/// The `user_connections.service` tag for Spotify links (v2's).
+/// The `user_connections.service` tag for Spotify links.
 const SERVICE: &str = "spotify";
 
 /// Single-use authorize states over the shared database.
@@ -49,19 +52,15 @@ impl SqliteSpotifyStates {
         let clock = self.db.clock().clone();
         self.db
             .write("spotify.state.store", move |tx| {
-                let now = now_unix_secs(clock.as_ref());
+                let now = clock.now_ms();
+                tx.execute(sql::PRUNE_STATES.text(), params![now])?;
                 tx.execute(
-                    "DELETE FROM spotify_auth_requests WHERE expires_at <= ?1",
-                    params![now],
-                )?;
-                tx.execute(
-                    "INSERT INTO spotify_auth_requests \
-                     (state, user_id, redirect_uri, expires_at) VALUES (?1, ?2, ?3, ?4)",
+                    sql::INSERT_STATE.text(),
                     params![
                         state,
                         pending.user_id,
                         pending.redirect_uri,
-                        now + STATE_TTL_SECS
+                        now.saturating_add(STATE_TTL_SECS.saturating_mul(1000))
                     ],
                 )?;
                 Ok(())
@@ -78,19 +77,13 @@ impl SqliteSpotifyStates {
         self.db
             .write("spotify.state.consume", move |tx| {
                 let row: Option<(String, String, i64)> = tx
-                    .query_row(
-                        "SELECT user_id, redirect_uri, expires_at \
-                         FROM spotify_auth_requests WHERE state = ?1",
-                        params![state],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                    )
+                    .query_row(sql::STATE_BY_KEY.text(), params![state], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    })
                     .optional()?;
-                tx.execute(
-                    "DELETE FROM spotify_auth_requests WHERE state = ?1",
-                    params![state],
-                )?;
+                tx.execute(sql::DELETE_STATE.text(), params![state])?;
                 Ok(row
-                    .filter(|(_, _, expires_at)| *expires_at > now_unix_secs(clock.as_ref()))
+                    .filter(|(_, _, expires_at)| *expires_at > clock.now_ms())
                     .map(|(user_id, redirect_uri, _)| PendingAuth {
                         user_id,
                         redirect_uri,
@@ -101,7 +94,8 @@ impl SqliteSpotifyStates {
     }
 }
 
-/// The sealed link document, with v2's field names.
+/// The sealed link document, with the field names v2 links were imported
+/// with.
 #[derive(Serialize, Deserialize)]
 struct LinkDocument {
     access_token: String,
@@ -166,12 +160,7 @@ impl SqliteSpotifyLinks {
             .write("spotify.link.upsert", move |tx| {
                 let now = to_iso(now_unix_secs(clock.as_ref()));
                 tx.execute(
-                    "INSERT INTO user_connections \
-                     (user_id, service, connection_data, enabled, created_at, updated_at) \
-                     VALUES (?1, ?2, ?3, 1, ?4, ?4) \
-                     ON CONFLICT (user_id, service) DO UPDATE SET \
-                     connection_data = excluded.connection_data, enabled = 1, \
-                     updated_at = excluded.updated_at",
+                    sql::UPSERT_LINK.text(),
                     params![user_id, SERVICE, sealed, now],
                 )?;
                 Ok(())
@@ -193,8 +182,7 @@ impl SqliteSpotifyLinks {
         self.db
             .write("spotify.link.refresh", move |tx| {
                 let changed = tx.execute(
-                    "UPDATE user_connections SET connection_data = ?3, updated_at = ?4 \
-                     WHERE user_id = ?1 AND service = ?2",
+                    sql::UPDATE_LINK.text(),
                     params![
                         user_id,
                         SERVICE,
@@ -210,20 +198,26 @@ impl SqliteSpotifyLinks {
 
     /// Read one user's link, if any.
     pub async fn get(&self, user_id: &str) -> Result<Option<SpotifyConnection>, String> {
-        let sealed: Option<String> = sqlx::query_scalar(
-            "SELECT connection_data FROM user_connections \
-             WHERE user_id = ?1 AND service = ?2 AND enabled = 1",
-        )
-        .bind(user_id)
-        .bind(SERVICE)
-        .fetch_optional(self.db.pool())
-        .await
-        .map_err(|error| format!("spotify link read: {error}"))?;
+        let user_id = user_id.to_owned();
+        let sealed: Option<String> = self
+            .db
+            .db()
+            .read("spotify.link.get", move |conn| {
+                conn.query_row(
+                    sql::LINK_DOCUMENT.text(),
+                    params![user_id, SERVICE],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(DbError::from)
+            })
+            .await
+            .map_err(|error| format!("spotify link read: {error}"))?;
         let Some(sealed) = sealed else {
             return Ok(None);
         };
         // A link that no longer opens (lost or rotated key, damaged
-        // row) reads as no link, as in v2: the user connects again.
+        // row) reads as no link: the user connects again.
         let document = match self.crypto.decrypt(&sealed).map(|plain| {
             serde_json::from_str::<LinkDocument>(&plain).map_err(|error| error.to_string())
         }) {
@@ -241,7 +235,7 @@ impl SqliteSpotifyLinks {
             access_token: document.access_token,
             refresh_token: document.refresh_token,
             // An unreadable expiry reads as expired, so the next call
-            // refreshes (v2 `_is_expired`).
+            // refreshes.
             expires_at_unix: parse_iso(&document.expires_at).unwrap_or(0),
             username: document.username,
             spotify_user_id: document.spotify_user_id,
@@ -253,10 +247,7 @@ impl SqliteSpotifyLinks {
         let user_id = user_id.to_owned();
         self.db
             .write("spotify.link.remove", move |tx| {
-                let changed = tx.execute(
-                    "DELETE FROM user_connections WHERE user_id = ?1 AND service = ?2",
-                    params![user_id, SERVICE],
-                )?;
+                let changed = tx.execute(sql::DELETE_LINK.text(), params![user_id, SERVICE])?;
                 Ok(changed > 0)
             })
             .await
@@ -265,7 +256,7 @@ impl SqliteSpotifyLinks {
 }
 
 /// Imported playlists as collection playlists, keyed on `spotify:{id}`
-/// source refs (v2 `PlaylistService` source-ref half).
+/// source refs.
 #[derive(Clone)]
 pub struct CollectionsPlaylistBridge {
     playlists: PlaylistStore,
@@ -286,7 +277,8 @@ impl CollectionsPlaylistBridge {
         user_id: &str,
     ) -> Result<Option<String>, String> {
         self.playlists
-            .find_by_source(user_id, source_ref)
+            .owned_by(user_id)
+            .find_by_source(source_ref)
             .await
             .map_err(|error| error.to_string())
     }
@@ -301,7 +293,8 @@ impl CollectionsPlaylistBridge {
     ) -> Result<String, String> {
         if let Some(id) = self
             .playlists
-            .create(user_id, name, Some(source_ref))
+            .owned_by(user_id)
+            .create(name, Some(source_ref))
             .await
             .map_err(|error| error.to_string())?
         {
@@ -309,7 +302,8 @@ impl CollectionsPlaylistBridge {
         }
         // A racing import made it first: answer that one.
         self.playlists
-            .find_by_source(user_id, source_ref)
+            .owned_by(user_id)
+            .find_by_source(source_ref)
             .await
             .map_err(|error| error.to_string())?
             .ok_or_else(|| format!("playlist for {source_ref} vanished during create"))
@@ -318,26 +312,32 @@ impl CollectionsPlaylistBridge {
     /// One user's `(source_ref, playlist_id)` pairs, for the imported
     /// mapping.
     pub async fn source_refs_for(&self, user_id: &str) -> Result<Vec<(String, String)>, String> {
-        sqlx::query_as(
-            "SELECT source_ref, id FROM playlists \
-             WHERE user_id = ?1 AND source_ref LIKE 'spotify:%'",
-        )
-        .bind(user_id)
-        .fetch_all(self.db.pool())
-        .await
-        .map_err(|error| format!("spotify playlist refs read: {error}"))
+        let user_id = user_id.to_owned();
+        self.db
+            .db()
+            .read("spotify.playlist_refs", move |conn| {
+                conn.prepare(sql::SPOTIFY_SOURCE_REFS.text())?
+                    .query_map(params![user_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .collect::<rusqlite::Result<_>>()
+                    .map_err(DbError::from)
+            })
+            .await
+            .map_err(|error| format!("spotify playlist refs read: {error}"))
     }
 
-    /// Replace every row on a playlist with `tracks`, in order, in one
-    /// transaction: a failed write keeps the rows the playlist had.
+    /// Replace every row on one of the user's playlists with `tracks`, in
+    /// order, in one transaction: a failed write keeps the rows the
+    /// playlist had.
     pub async fn replace_tracks(
         &self,
+        user_id: &str,
         playlist_id: &str,
         tracks: &[ImportedTrack],
     ) -> Result<(), SpotifyError> {
         let entries = tracks.iter().map(entry_for).collect();
         match self
             .playlists
+            .owned_by(user_id)
             .replace_entries(playlist_id, entries)
             .await
             .map_err(|error| match error {
@@ -351,9 +351,10 @@ impl CollectionsPlaylistBridge {
         }
     }
 
-    /// How many rows a playlist holds.
-    pub async fn track_count(&self, playlist_id: &str) -> Result<usize, String> {
+    /// How many rows one of the user's playlists holds.
+    pub async fn track_count(&self, user_id: &str, playlist_id: &str) -> Result<usize, String> {
         self.playlists
+            .owned_by(user_id)
             .tracks(playlist_id)
             .await
             .map(|rows| rows.len())
@@ -361,15 +362,17 @@ impl CollectionsPlaylistBridge {
     }
 
     /// Store the picked provider image as the local cover. Answers false
-    /// when a cover already exists (v2 `kept_existing`).
+    /// when a cover already exists.
     pub async fn set_imported_cover(
         &self,
+        user_id: &str,
         playlist_id: &str,
         data: &[u8],
         content_type: &str,
     ) -> Result<bool, String> {
         if self
             .playlists
+            .owned_by(user_id)
             .cover(playlist_id)
             .await
             .map_err(|error| error.to_string())?
@@ -383,6 +386,7 @@ impl CollectionsPlaylistBridge {
         };
         match self
             .playlists
+            .owned_by(user_id)
             .set_cover(playlist_id, cover)
             .await
             .map_err(|error| error.to_string())?

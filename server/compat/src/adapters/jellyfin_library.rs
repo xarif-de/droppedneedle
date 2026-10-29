@@ -6,55 +6,48 @@
 //! weighed against the caller's played and unplayed marks) are read for
 //! that page only, and image tags come from the rows themselves.
 //!
-//! [`CatalogIds`] makes album and artist ids with the data key, so nobody
-//! without an account can work one out, and every other id as
-//! `sha256("kind:internal")[:32]`. Because an id is a pure function of
-//! what it names and the key, nothing needs storing: an id a client cached
-//! before a restart resolves again by deriving the ids of everything the
-//! library holds.
+//! [`CatalogIds`] answers Jellyfin ids from the stored table
+//! ([`jellyfin_ids`](super::jellyfin_ids)), which a loop fills. Album and
+//! artist ids are made with the data key, so nobody without an account can
+//! work one out, and once stored an id never changes, not even with the
+//! key. An id a client cached before a restart resolves with one read.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
-use super::library::{CompatError, CompatLibrary};
-use crate::jellyfin::builders::LIBRARY_INTERNAL_ID;
+use super::jellyfin_ids::{IdKind, IdsError, JellyfinIds};
+use super::library::{CompatError, CompatLibrary, cover_version};
 use crate::jellyfin::params::SortKey;
 use crate::jellyfin::seams::{
-    AlbumFilter, AlbumView, ArtistScope, ArtistView, CoverBytes, GenreView, IdMap, ItemSort,
-    ItemView, LibraryRead, LyricsView, PlaylistDetail, PlaylistEntry, PlaylistView, ReadFailed,
-    TrackFilter, TrackView, WriteRefusal,
+    AlbumFilter, AlbumView, ArtistScope, ArtistView, CoverBytes, GenreView, ItemSort, ItemView,
+    LyricsView, PlaylistDetail, PlaylistEntry, PlaylistView, ReadFailed, TrackFilter, TrackView,
+    WriteRefusal,
 };
-use crate::subsonic::views::{genre_slug, song_path};
+use crate::subsonic::views::song_path;
 use droppedneedle_catalog::reads::collections::store::play_marks::MarkScope;
 use droppedneedle_catalog::reads::library::player::{
     AlbumOrder, AlbumQuery, OrderKey, PlayerAlbum, PlayerTrack, TrackOrder, TrackQuery,
 };
+use droppedneedle_catalog::reads::library::store::LocalCatalog;
 use droppedneedle_catalog::reads::library::stores::{ArtistRecord, ArtistScope as CatalogScope};
-use droppedneedle_kernel::runtime_config::Crypto;
-
-/// Shortest gap between two catalog reads for the id map.
-pub const REBUILD_COOLDOWN: Duration = Duration::from_secs(10);
-
-/// The data key's purpose for album and artist ids: nothing else the key
-/// signs is a valid id, and an id signs nothing else.
-const ITEM_ID_PURPOSE: &str = "jellyfin-item-id";
-
-/// Log a failed read and fall back to the empty answer the seam allows.
-fn logged<T: Default>(operation: &str, outcome: Result<T, CompatError>) -> T {
-    outcome.unwrap_or_else(|error| {
-        tracing::error!(operation, %error, "jellyfin library read failed");
-        T::default()
-    })
-}
 
 fn to_u32(value: Option<i64>) -> Option<u32> {
     value.and_then(|value| u32::try_from(value).ok())
 }
 
-fn track_view(track: PlayerTrack) -> TrackView {
-    let album_image_tag = (track.cover_available || track.release_group_mbid.is_some())
-        .then(|| tag_for(&format!("album:{}", track.album_id)));
+/// A track as the Jellyfin builders see it. `local_first` is the local-art
+/// setting its album's picture tag is worked out under.
+fn track_view(track: PlayerTrack, local_first: bool) -> TrackView {
+    let album_image_tag =
+        (track.cover_available || track.release_group_mbid.is_some()).then(|| {
+            album_tag(
+                &track.album_id,
+                &cover_version(
+                    track.art_version,
+                    track.release_group_mbid.as_deref(),
+                    local_first,
+                ),
+            )
+        });
     TrackView {
         file_id: track.id,
         title: track.title,
@@ -91,10 +84,20 @@ fn track_view(track: PlayerTrack) -> TrackView {
     }
 }
 
-fn album_view(album: PlayerAlbum) -> AlbumView {
+/// An album as the Jellyfin builders see it, its picture tag worked out
+/// under the local-art setting `local_first`.
+fn album_view(album: PlayerAlbum, local_first: bool) -> AlbumView {
     let record = album.record;
-    let image_tag = (record.cover_available || record.release_group_mbid.is_some())
-        .then(|| tag_for(&format!("album:{}", record.id)));
+    let image_tag = (record.cover_available || record.release_group_mbid.is_some()).then(|| {
+        album_tag(
+            &record.id,
+            &cover_version(
+                record.art_version,
+                record.release_group_mbid.as_deref(),
+                local_first,
+            ),
+        )
+    });
     AlbumView {
         id: record.id,
         release_group_mbid: record.release_group_mbid,
@@ -137,6 +140,13 @@ fn artist_view(artist: ArtistRecord) -> ArtistView {
 /// has album art to draw its picture from (see `overlay_artists`).
 fn artist_tag(id: &str) -> String {
     tag_for(&format!("artist:{id}"))
+}
+
+/// The picture tag of an album: it changes with the album's cover version,
+/// so an app that sends the tag asks for the new picture. The item id
+/// stays the same.
+fn album_tag(id: &str, version: &str) -> String {
+    tag_for(&format!("album:{id}:{version}"))
 }
 
 /// Short stable etag for an image key.
@@ -261,7 +271,11 @@ impl JellyfinLibrary {
         unique.sort();
         unique.dedup();
         let found = self.library.tracks_by_ids(&unique).await?;
-        let views = found.into_iter().map(track_view).collect();
+        let local_first = self.library.local_art_first();
+        let views = found
+            .into_iter()
+            .map(|track| track_view(track, local_first))
+            .collect();
         let views = self.overlay_tracks(user_id, views).await?;
         Ok(in_order(ids, views, |view| view.file_id.as_str()))
     }
@@ -272,13 +286,14 @@ impl JellyfinLibrary {
         user_id: &str,
         ids: &[String],
     ) -> Result<Vec<AlbumView>, CompatError> {
+        let local_first = self.library.local_art_first();
         let found = self
             .library
             .albums_in_order(ids)
             .await?
             .into_iter()
             .filter(|album| album.record.track_count > 0)
-            .map(album_view)
+            .map(|album| album_view(album, local_first))
             .collect();
         self.overlay_albums(user_id, found).await
     }
@@ -307,7 +322,7 @@ impl JellyfinLibrary {
         };
         let entries = self
             .library
-            .playlist_entries(playlist_id)
+            .playlist_entries(user_id, playlist_id)
             .await?
             .into_iter()
             .map(|(id, file_id)| PlaylistEntry { id, file_id })
@@ -386,222 +401,272 @@ fn in_order<T: Clone>(ids: &[String], found: Vec<T>, id_of: impl Fn(&T) -> &str)
     ids.iter().filter_map(|id| by_id.get(id).cloned()).collect()
 }
 
-impl LibraryRead for JellyfinLibrary {
-    async fn track_page(
+impl JellyfinLibrary {
+    /// One page of tracks; `limit` [`ALL`] means every match. The match
+    /// total is counted only when `counted`.
+    pub async fn track_page(
         &self,
         user_id: &str,
         filter: &TrackFilter,
         sort: ItemSort,
         start: usize,
         limit: usize,
-    ) -> (Vec<TrackView>, usize) {
-        let outcome = async {
-            let query = TrackQuery {
-                q: filter.search.clone(),
-                album_id: filter.album.clone(),
-                artist_ids: filter.artists.clone(),
-                album_artist_ids: filter.album_artists.clone(),
-                listener: filter
-                    .played
-                    .map(|_| user_id.to_owned())
-                    .or_else(|| history_user(sort, user_id)),
-                played: filter.played,
-                ..TrackQuery::default()
-            };
-            let (tracks, total) = self
+        counted: bool,
+    ) -> Result<(Vec<TrackView>, Option<usize>), ReadFailed> {
+        let query = TrackQuery {
+            q: filter.search.clone(),
+            album_id: filter.album.clone(),
+            artist_ids: filter.artists.clone(),
+            album_artist_ids: filter.album_artists.clone(),
+            listener: filter
+                .played
+                .map(|_| user_id.to_owned())
+                .or_else(|| history_user(sort, user_id)),
+            played: filter.played,
+            ..TrackQuery::default()
+        };
+        let order = track_order(sort, || {
+            self.library.track_shuffle(user_id, &query, to_u64(start))
+        });
+        let (limit, offset) = (to_u64(limit), to_u64(start));
+        let (tracks, total) = if counted {
+            let (tracks, total) = self.library.tracks(&query, order, limit, offset).await?;
+            (tracks, Some(to_usize(total)))
+        } else {
+            let tracks = self
                 .library
-                .tracks(
-                    &query,
-                    track_order(sort, || {
-                        self.library.track_shuffle(user_id, &query, to_u64(start))
-                    }),
-                    to_u64(limit),
-                    to_u64(start),
-                )
+                .track_page(&query, order, limit, offset)
                 .await?;
-            let views = tracks.into_iter().map(track_view).collect();
-            Ok((self.overlay_tracks(user_id, views).await?, to_usize(total)))
-        }
-        .await;
-        logged("track_page", outcome)
+            (tracks, None)
+        };
+        let local_first = self.library.local_art_first();
+        let views = tracks
+            .into_iter()
+            .map(|track| track_view(track, local_first))
+            .collect();
+        Ok((self.overlay_tracks(user_id, views).await?, total))
     }
 
-    async fn tracks_by_ids(&self, user_id: &str, ids: &[String]) -> Vec<TrackView> {
-        logged("tracks_by_ids", self.read_tracks(user_id, ids).await)
+    /// Tracks by id in the order asked; unknown ids drop out.
+    pub async fn tracks_by_ids(
+        &self,
+        user_id: &str,
+        ids: &[String],
+    ) -> Result<Vec<TrackView>, ReadFailed> {
+        Ok(self.read_tracks(user_id, ids).await?)
     }
 
-    async fn track(&self, user_id: &str, file_id: &str) -> Option<TrackView> {
-        self.tracks_by_ids(user_id, &[file_id.to_owned()])
-            .await
-            .pop()
+    pub async fn track(
+        &self,
+        user_id: &str,
+        file_id: &str,
+    ) -> Result<Option<TrackView>, ReadFailed> {
+        Ok(self
+            .tracks_by_ids(user_id, &[file_id.to_owned()])
+            .await?
+            .pop())
     }
 
-    async fn album_page(
+    /// One page of albums; `limit` [`ALL`] means every match. The match
+    /// total is counted only when `counted`.
+    pub async fn album_page(
         &self,
         user_id: &str,
         filter: &AlbumFilter,
         sort: ItemSort,
         start: usize,
         limit: usize,
-    ) -> (Vec<AlbumView>, usize) {
-        let outcome = async {
-            let query = AlbumQuery {
-                q: filter.search.clone(),
-                album_artist_ids: filter.artists.clone(),
-                appears_on: filter.appears_on.clone(),
-                listener: filter
-                    .played
-                    .map(|_| user_id.to_owned())
-                    .or_else(|| history_user(sort, user_id)),
-                played: filter.played,
-                ..AlbumQuery::default()
-            };
-            let (albums, total) = self
+        counted: bool,
+    ) -> Result<(Vec<AlbumView>, Option<usize>), ReadFailed> {
+        let query = AlbumQuery {
+            q: filter.search.clone(),
+            album_artist_ids: filter.artists.clone(),
+            appears_on: filter.appears_on.clone(),
+            listener: filter
+                .played
+                .map(|_| user_id.to_owned())
+                .or_else(|| history_user(sort, user_id)),
+            played: filter.played,
+            ..AlbumQuery::default()
+        };
+        let order = album_order(sort, || {
+            self.library.album_shuffle(user_id, &query, to_u64(start))
+        });
+        let (limit, offset) = (to_u64(limit), to_u64(start));
+        let (albums, total) = if counted {
+            let (albums, total) = self.library.albums(&query, order, limit, offset).await?;
+            (albums, Some(to_usize(total)))
+        } else {
+            let albums = self
                 .library
-                .albums(
-                    &query,
-                    album_order(sort, || {
-                        self.library.album_shuffle(user_id, &query, to_u64(start))
-                    }),
-                    to_u64(limit),
-                    to_u64(start),
-                )
+                .album_page(&query, order, limit, offset)
                 .await?;
-            let views = albums.into_iter().map(album_view).collect();
-            Ok((self.overlay_albums(user_id, views).await?, to_usize(total)))
-        }
-        .await;
-        logged("album_page", outcome)
+            (albums, None)
+        };
+        let local_first = self.library.local_art_first();
+        let views = albums
+            .into_iter()
+            .map(|album| album_view(album, local_first))
+            .collect();
+        Ok((self.overlay_albums(user_id, views).await?, total))
     }
 
-    async fn albums_by_ids(&self, user_id: &str, ids: &[String]) -> Vec<AlbumView> {
-        logged("albums_by_ids", self.read_albums(user_id, ids).await)
+    /// Albums by id in the order asked; unknown ids drop out.
+    pub async fn albums_by_ids(
+        &self,
+        user_id: &str,
+        ids: &[String],
+    ) -> Result<Vec<AlbumView>, ReadFailed> {
+        Ok(self.read_albums(user_id, ids).await?)
     }
 
-    async fn album(&self, user_id: &str, rg_mbid: &str) -> Option<AlbumView> {
-        self.albums_by_ids(user_id, &[rg_mbid.to_owned()])
-            .await
-            .pop()
+    pub async fn album(
+        &self,
+        user_id: &str,
+        rg_mbid: &str,
+    ) -> Result<Option<AlbumView>, ReadFailed> {
+        Ok(self
+            .albums_by_ids(user_id, &[rg_mbid.to_owned()])
+            .await?
+            .pop())
     }
 
-    async fn artist_page(
+    /// One page of artists in name order, optionally name-filtered.
+    pub async fn artist_page(
         &self,
         user_id: &str,
         scope: ArtistScope,
         search: Option<&str>,
         start: usize,
         limit: usize,
-    ) -> (Vec<ArtistView>, usize) {
-        let outcome = async {
-            let scope = match scope {
-                ArtistScope::All => CatalogScope::WithMusic,
-                ArtistScope::Album => CatalogScope::AlbumArtists,
-            };
-            let (artists, total) = self
-                .library
-                .artist_page(scope, search, to_u64(limit), to_u64(start))
-                .await?;
-            let views = artists.into_iter().map(artist_view).collect();
-            Ok((self.overlay_artists(user_id, views).await?, to_usize(total)))
-        }
-        .await;
-        logged("artist_page", outcome)
+    ) -> Result<(Vec<ArtistView>, usize), ReadFailed> {
+        let scope = match scope {
+            ArtistScope::All => CatalogScope::WithMusic,
+            ArtistScope::Album => CatalogScope::AlbumArtists,
+        };
+        let (artists, total) = self
+            .library
+            .artist_page(scope, search, to_u64(limit), to_u64(start))
+            .await?;
+        let views = artists.into_iter().map(artist_view).collect();
+        Ok((self.overlay_artists(user_id, views).await?, to_usize(total)))
     }
 
-    async fn artist(&self, user_id: &str, mbid: &str) -> Option<ArtistView> {
-        logged("artist", self.read_artist(user_id, mbid).await)
+    pub async fn artist(
+        &self,
+        user_id: &str,
+        mbid: &str,
+    ) -> Result<Option<ArtistView>, ReadFailed> {
+        Ok(self.read_artist(user_id, mbid).await?)
     }
 
-    async fn item(
+    /// One track, album or artist (`kind`) as the reads above give it,
+    /// `Ok(None)` when there is none (any other kind has none).
+    pub async fn item(
         &self,
         user_id: &str,
         kind: &str,
         internal: &str,
     ) -> Result<Option<ItemView>, ReadFailed> {
         let ids = [internal.to_owned()];
-        let outcome = match kind {
+        Ok(match kind {
             "track" => self
                 .read_tracks(user_id, &ids)
-                .await
-                .map(|mut found| found.pop().map(|item| ItemView::Track(Box::new(item)))),
+                .await?
+                .pop()
+                .map(|item| ItemView::Track(Box::new(item))),
             "album" => self
                 .read_albums(user_id, &ids)
-                .await
-                .map(|mut found| found.pop().map(|item| ItemView::Album(Box::new(item)))),
+                .await?
+                .pop()
+                .map(|item| ItemView::Album(Box::new(item))),
             "artist" => self
                 .read_artist(user_id, internal)
-                .await
-                .map(|found| found.map(|item| ItemView::Artist(Box::new(item)))),
-            _ => Ok(None),
-        };
-        outcome.map_err(|error| {
-            tracing::error!(%error, "jellyfin item read failed");
-            ReadFailed
+                .await?
+                .map(|item| ItemView::Artist(Box::new(item))),
+            _ => None,
         })
     }
 
-    async fn genres(&self) -> Vec<GenreView> {
-        let outcome = self.library.genres().await.map(|genres| {
-            genres
-                .into_iter()
-                .map(|genre| GenreView {
-                    name: genre.name,
-                    song_count: genre.track_count as usize,
-                })
-                .collect()
-        });
-        logged("genres", outcome)
+    pub async fn genres(&self) -> Result<Vec<GenreView>, ReadFailed> {
+        Ok(self
+            .library
+            .genres()
+            .await?
+            .into_iter()
+            .map(|genre| GenreView {
+                name: genre.name,
+                song_count: genre.track_count as usize,
+            })
+            .collect())
     }
 
-    async fn years(&self) -> Vec<i32> {
-        let outcome = async {
-            let years = self.library.catalog.album_years().await?;
-            Ok(years
-                .into_iter()
-                .filter_map(|year| i32::try_from(year).ok())
-                .collect())
-        }
-        .await;
-        logged("years", outcome)
+    /// Every year a playable album has, ascending.
+    pub async fn years(&self) -> Result<Vec<i32>, ReadFailed> {
+        let years = self
+            .library
+            .catalog
+            .album_years()
+            .await
+            .map_err(CompatError::from)?;
+        Ok(years
+            .into_iter()
+            .filter_map(|year| i32::try_from(year).ok())
+            .collect())
     }
 
-    async fn playlists(&self, user_id: &str) -> Vec<PlaylistView> {
-        let outcome = self.library.playlists(user_id).await.map(|visible| {
-            visible
-                .into_iter()
-                .filter(|visible| visible.full)
-                .map(|visible| PlaylistView {
-                    id: visible.row.id,
-                    name: visible.row.name,
-                    track_count: visible.row.streamable_count,
-                    total_duration_seconds: Some(visible.row.streamable_duration),
-                })
-                .collect()
-        });
-        logged("playlists", outcome)
+    pub async fn playlists(&self, user_id: &str) -> Result<Vec<PlaylistView>, ReadFailed> {
+        Ok(self
+            .library
+            .playlists(user_id)
+            .await?
+            .into_iter()
+            .map(|visible| PlaylistView {
+                id: visible.row.id,
+                name: visible.row.name,
+                track_count: visible.row.streamable_count,
+                total_duration_seconds: Some(visible.row.streamable_duration),
+            })
+            .collect())
     }
 
-    async fn playlist(&self, user_id: &str, id: &str) -> Option<PlaylistDetail> {
-        logged("playlist", self.readable_entries(user_id, id).await)
+    pub async fn playlist(
+        &self,
+        user_id: &str,
+        id: &str,
+    ) -> Result<Option<PlaylistDetail>, ReadFailed> {
+        Ok(self.readable_entries(user_id, id).await?)
     }
 
-    async fn create_playlist(&self, user_id: &str, name: &str) -> Result<String, WriteRefusal> {
-        Ok(self.library.create_playlist(user_id, name).await?)
+    /// Create a playlist holding the library files `file_ids`, as one
+    /// write; returns its id.
+    pub async fn create_playlist(
+        &self,
+        user_id: &str,
+        name: &str,
+        file_ids: &[String],
+    ) -> Result<String, WriteRefusal> {
+        Ok(self
+            .library
+            .create_playlist(user_id, name, file_ids)
+            .await?
+            .id)
     }
 
-    async fn add_playlist_entry(
+    /// Append the library files `file_ids`, as one write.
+    pub async fn add_playlist_entries(
         &self,
         user_id: &str,
         playlist_id: &str,
-        file_id: &str,
+        file_ids: &[String],
     ) -> Result<(), WriteRefusal> {
         Ok(self
             .library
-            .add_files(user_id, playlist_id, &[file_id.to_owned()])
+            .add_files(user_id, playlist_id, file_ids)
             .await?)
     }
 
-    async fn remove_playlist_entries(
+    pub async fn remove_playlist_entries(
         &self,
         user_id: &str,
         playlist_id: &str,
@@ -613,7 +678,7 @@ impl LibraryRead for JellyfinLibrary {
             .await?)
     }
 
-    async fn move_playlist_entry(
+    pub async fn move_playlist_entry(
         &self,
         user_id: &str,
         playlist_id: &str,
@@ -626,16 +691,18 @@ impl LibraryRead for JellyfinLibrary {
             .await?)
     }
 
-    async fn favorites(&self, user_id: &str, kind: &str) -> Vec<String> {
-        let outcome = self
+    /// Favorited internal ids of one kind for one caller.
+    pub async fn favorites(&self, user_id: &str, kind: &str) -> Result<Vec<String>, ReadFailed> {
+        Ok(self
             .library
             .favorite_ids(user_id, kind)
-            .await
-            .map(|ids| ids.into_iter().map(|(id, _)| id).collect());
-        logged("favorites", outcome)
+            .await?
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect())
     }
 
-    async fn set_favorite(
+    pub async fn set_favorite(
         &self,
         user_id: &str,
         kind: &str,
@@ -648,7 +715,10 @@ impl LibraryRead for JellyfinLibrary {
             .await?)
     }
 
-    async fn set_played(
+    /// Mark a track played or unplayed for the caller; an album marks each
+    /// of its tracks, an artist the tracks on the albums it leads. The play
+    /// history is not touched.
+    pub async fn set_played(
         &self,
         user_id: &str,
         kind: &str,
@@ -666,274 +736,196 @@ impl LibraryRead for JellyfinLibrary {
         Ok(self.library.mark_played(user_id, scope, played).await?)
     }
 
-    async fn cover(&self, rg_mbid: &str, size: &str) -> Option<CoverBytes> {
-        let outcome = self.library.album_cover(rg_mbid, Some(size)).await;
-        logged("cover", outcome).map(|(bytes, content_type)| CoverBytes {
+    /// Release art bytes (`size` is the 250/500/1200 bucket); `None` renders
+    /// 404 with no placeholder, unlike Subsonic (v2 `_image`).
+    pub async fn cover(&self, rg_mbid: &str, size: &str) -> Result<Option<CoverBytes>, ReadFailed> {
+        let found = self.library.album_cover(rg_mbid, Some(size)).await?;
+        Ok(found.map(|(bytes, content_type)| CoverBytes {
             bytes,
             content_type,
-        })
+        }))
     }
 
-    async fn artist_image(&self, mbid: &str, size: &str) -> Option<CoverBytes> {
-        let outcome = self.library.artist_cover(mbid, None, size).await;
-        logged("artist_image", outcome).map(|(bytes, content_type)| CoverBytes {
+    /// An artist's picture. `size` (the 250/500/1200 bucket) sizes the
+    /// picture drawn for an artist with no MusicBrainz link; a linked
+    /// artist's own image is served as stored.
+    pub async fn artist_image(
+        &self,
+        mbid: &str,
+        size: &str,
+    ) -> Result<Option<CoverBytes>, ReadFailed> {
+        let found = self.library.artist_cover(mbid, None, size).await?;
+        Ok(found.map(|(bytes, content_type)| CoverBytes {
             bytes,
             content_type,
+        }))
+    }
+
+    /// The lyrics of one track: its file's first, else the online lookup
+    /// while that is on. `Ok(None)` when it has none.
+    pub async fn lyrics(&self, file_id: &str) -> Result<Option<LyricsView>, ReadFailed> {
+        let doc = self.library.lyrics(file_id).await?;
+        Ok(doc.map(|doc| LyricsView {
+            lines: doc.lines,
+            synced: doc.synced,
+        }))
+    }
+
+    /// The album title or artist name of a catalog id, read for a caller who
+    /// has not signed in (the picture address), so no user overlays. `kind`
+    /// is `album` or `artist`; any other kind has no name here, and so does
+    /// an album or artist that a merge retired or that is gone.
+    pub async fn name_of(
+        &self,
+        kind: &str,
+        catalog_id: &str,
+    ) -> Result<Option<String>, ReadFailed> {
+        if !matches!(kind, "album" | "artist") {
+            return Ok(None);
+        }
+        // A merged-away album or artist keeps its old id, and the picture
+        // address never opens one, so only the live holder of the id has a
+        // name here.
+        let live = self
+            .library
+            .catalog
+            .current_id(kind, catalog_id)
+            .await
+            .map_err(CompatError::from)?;
+        if live.as_deref() != Some(catalog_id) {
+            return Ok(None);
+        }
+        Ok(if kind == "album" {
+            self.library
+                .album(catalog_id)
+                .await?
+                .map(|album| album.record.title)
+        } else {
+            self.library
+                .artist(catalog_id)
+                .await?
+                .map(|artist| artist.name)
         })
-    }
-
-    async fn lyrics(&self, file_id: &str) -> Result<Option<LyricsView>, ReadFailed> {
-        match self.library.lyrics(file_id).await {
-            Ok(doc) => Ok(doc.map(|doc| LyricsView {
-                lines: doc.lines,
-                synced: doc.synced,
-            })),
-            Err(error) => {
-                tracing::error!(%error, "jellyfin lyrics read failed");
-                Err(ReadFailed)
-            }
-        }
-    }
-
-    async fn name_of(&self, kind: &str, catalog_id: &str) -> Option<String> {
-        let outcome = async {
-            if !matches!(kind, "album" | "artist") {
-                return Ok(None);
-            }
-            // A merged-away album or artist keeps its old id, and the picture
-            // address never opens one, so only the live holder of the id has
-            // a name here.
-            let live = self.library.catalog.current_id(kind, catalog_id).await?;
-            if live.as_deref() != Some(catalog_id) {
-                return Ok(None);
-            }
-            Ok(if kind == "album" {
-                self.library
-                    .album(catalog_id)
-                    .await?
-                    .map(|album| album.record.title)
-            } else {
-                self.library
-                    .artist(catalog_id)
-                    .await?
-                    .map(|artist| artist.name)
-            })
-        }
-        .await;
-        logged("name_of", outcome)
     }
 }
 
-#[derive(Default)]
-struct IdTable {
-    /// The ids this server hands out today, every kind.
-    current: HashMap<String, (String, String)>,
-    /// The unkeyed ids albums and artists had before theirs were keyed, and
-    /// both ids of every album and artist a merge retired.
-    old: HashMap<String, (String, String)>,
-    /// Whether a whole catalog read has succeeded in this process.
-    filled: bool,
-    /// When the catalog was last read, whether or not the read succeeded.
-    read_at: Option<Instant>,
-}
-
-/// Jellyfin ids over the catalog (see module docs).
-///
-/// The catalog is read for the first lookup of the process, by anyone.
-/// After that only a miss from a signed-in caller ([`IdMap::from_jf`]) reads
-/// it again, at most once per `cooldown`; a read that failed is retried no
-/// sooner than that either.
+/// Jellyfin ids over the stored table (see
+/// [`jellyfin_ids`](super::jellyfin_ids)): an id resolves with one read by
+/// primary key, and an album, artist or track is then followed to the one
+/// that holds it now.
 #[derive(Clone)]
 pub struct CatalogIds {
-    library: CompatLibrary,
-    crypto: Arc<Crypto>,
-    cooldown: Duration,
-    table: Arc<Mutex<IdTable>>,
-    /// One catalog read at a time: concurrent misses wait for it instead of
-    /// each reading the whole catalog.
-    reading: Arc<tokio::sync::Mutex<()>>,
+    ids: JellyfinIds,
+    catalog: LocalCatalog,
 }
 
 impl CatalogIds {
-    /// Ids over the shared compat reads, keyed with the data key.
-    /// Production passes [`REBUILD_COOLDOWN`] as `cooldown`.
-    pub fn new(library: CompatLibrary, crypto: Arc<Crypto>, cooldown: Duration) -> Self {
-        Self {
-            library,
-            crypto,
-            cooldown,
-            table: Arc::new(Mutex::new(IdTable::default())),
-            reading: Arc::new(tokio::sync::Mutex::new(())),
-        }
+    /// Ids over the stored table, followed through `catalog`.
+    pub fn new(ids: JellyfinIds, catalog: LocalCatalog) -> Self {
+        Self { ids, catalog }
     }
 
-    /// The unkeyed id: the first 32 hex characters of
-    /// `sha256("kind:internal")`. Tracks, playlists, genres and the library
-    /// keep it; for an album or artist it is the old id.
+    /// The unkeyed id (see [`JellyfinIds::derive`]).
     pub fn derive(kind: &str, internal: &str) -> String {
-        use sha2::{Digest, Sha256};
-        format!(
-            "{:x}",
-            Sha256::digest(format!("{kind}:{internal}").as_bytes())
-        )[..32]
-            .to_owned()
+        JellyfinIds::derive(kind, internal)
     }
 
-    /// The id handed out for a (kind, internal) pair, without remembering
-    /// it. Album and artist ids are the first 32 hex characters of a MAC
-    /// under the data key over `kind\0internal`.
+    /// The id an item gets under today's data key (see
+    /// [`JellyfinIds::computed`]).
     pub fn id_for(&self, kind: &str, internal: &str) -> String {
-        if kind != "album" && kind != "artist" {
-            return Self::derive(kind, internal);
-        }
-        let message = [kind.as_bytes(), b"\0", internal.as_bytes()].concat();
-        self.crypto.mac(ITEM_ID_PURPOSE, &message)[..16]
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect()
-    }
-
-    fn normalize(jf_id: &str) -> String {
-        jf_id.replace('-', "").trim().to_lowercase()
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, IdTable> {
-        self.table
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    fn lookup(&self, jf_id: &str, with_old: bool) -> Option<(String, String)> {
-        let table = self.lock();
-        table
-            .current
-            .get(jf_id)
-            .or_else(|| with_old.then(|| table.old.get(jf_id)).flatten())
-            .cloned()
-    }
-
-    /// Whether a lookup may read the catalog now: never within `cooldown`
-    /// of the last read, and once a read has succeeded only for a
-    /// signed-in caller.
-    fn may_read(&self, signed_in: bool) -> bool {
-        let table = self.lock();
-        let rested = table.read_at.is_none_or(|at| at.elapsed() >= self.cooldown);
-        rested && (signed_in || !table.filled)
-    }
-
-    /// Read every id the catalog holds and remember the current id of each,
-    /// plus the old id of each album and artist, when [`Self::may_read`]
-    /// allows it.
-    async fn read_catalog(&self, signed_in: bool) {
-        // Waiters see the read that ran while they queued and return; the
-        // caller then looks the id up again.
-        let _single = self.reading.lock().await;
-        if !self.may_read(signed_in) {
-            return;
-        }
-        let mut complete = true;
-        let mut pairs: Vec<(String, String)> =
-            vec![("library".to_owned(), LIBRARY_INTERNAL_ID.to_owned())];
-        match self.library.catalog.every_id().await {
-            Ok(ids) => {
-                for (kind, id) in ids {
-                    let internal = if kind == "genre" { genre_slug(&id) } else { id };
-                    pairs.push((kind.to_owned(), internal));
-                }
-            }
-            Err(error) => {
-                complete = false;
-                tracing::error!(%error, "jellyfin id rebuild could not read the catalog");
-            }
-        }
-        match self.library.collections.stores.playlists.list().await {
-            Ok(rows) => pairs.extend(rows.into_iter().map(|row| ("playlist".to_owned(), row.id))),
-            Err(error) => {
-                complete = false;
-                tracing::error!(%error, "jellyfin id rebuild could not read playlists");
-            }
-        }
-        let merged = match self.library.catalog.merged_ids().await {
-            Ok(merged) => merged,
-            Err(error) => {
-                complete = false;
-                tracing::error!(%error, "jellyfin id rebuild could not read merged ids");
-                Vec::new()
-            }
-        };
-        let mut current = Vec::with_capacity(pairs.len());
-        let mut old = Vec::new();
-        for (kind, internal) in pairs {
-            if kind == "album" || kind == "artist" {
-                old.push((
-                    Self::derive(&kind, &internal),
-                    (kind.clone(), internal.clone()),
-                ));
-            }
-            current.push((self.id_for(&kind, &internal), (kind, internal)));
-        }
-        // A merged album or artist answers to both ids it was handed out
-        // under, and a track alias to its own, for signed-in callers only;
-        // `from_jf` follows it to the one that holds it now.
-        for (kind, internal) in merged {
-            let found = (kind.to_owned(), internal.clone());
-            old.push((Self::derive(kind, &internal), found.clone()));
-            old.push((self.id_for(kind, &internal), found));
-        }
-        let mut table = self.lock();
-        table.current.extend(current);
-        table.old.extend(old);
-        table.filled |= complete;
-        table.read_at = Some(Instant::now());
+        self.ids.computed(kind, internal)
     }
 
     /// An album, artist or track as it is now: a merged album or artist
     /// becomes the one that holds it, and one with nothing live behind it
     /// is not found; the old id of a missing track that continued into
-    /// another becomes that track. Other kinds pass through, and so does an
-    /// id that could not be followed, so a live one still answers.
-    async fn current(&self, (kind, internal): (String, String)) -> Option<(String, String)> {
-        if kind != "album" && kind != "artist" && kind != "track" {
-            return Some((kind, internal));
+    /// another becomes that track. Other kinds pass through.
+    async fn current(
+        &self,
+        kind: IdKind,
+        internal: String,
+    ) -> Result<Option<(String, String)>, ReadFailed> {
+        let name = kind.as_str().to_owned();
+        if !matches!(kind, IdKind::Album | IdKind::Artist | IdKind::Track) {
+            return Ok(Some((name, internal)));
         }
-        match self.library.catalog.current_id(&kind, &internal).await {
-            Ok(current) => current.map(|id| (kind, id)),
-            Err(error) => {
-                tracing::warn!(%error, "jellyfin id could not be followed to its current item");
-                Some((kind, internal))
-            }
+        let current = self
+            .catalog
+            .current_id(&name, &internal)
+            .await
+            .map_err(CompatError::from)?;
+        Ok(current.map(|id| (name, id)))
+    }
+}
+
+impl From<IdsError> for ReadFailed {
+    fn from(error: IdsError) -> Self {
+        match error {
+            IdsError::Busy => Self::Busy("jellyfin ids: database busy".to_owned()),
+            IdsError::Failed(cause) => Self::Failed(format!("jellyfin ids: {cause}")),
         }
     }
 }
 
-impl IdMap for CatalogIds {
-    async fn to_jf(&self, kind: &str, internal: &str) -> String {
-        let jf_id = self.id_for(kind, internal);
-        self.lock()
-            .current
-            .entry(jf_id.clone())
-            .or_insert_with(|| (kind.to_owned(), internal.to_owned()));
-        jf_id
+impl CatalogIds {
+    /// Whether ids can be handed out and resolved yet. Until the stored
+    /// ids are loaded at start, every route answers busy.
+    pub fn ready(&self) -> bool {
+        self.ids.ready()
     }
 
-    async fn from_jf(&self, jf_id: &str) -> Option<(String, String)> {
-        let normalized = Self::normalize(jf_id);
-        let found = match self.lookup(&normalized, true) {
-            Some(found) => found,
-            None => {
-                self.read_catalog(true).await;
-                self.lookup(&normalized, true)?
-            }
-        };
-        self.current(found).await
+    /// Stable 32-hex id for a (kind, internal) pair. Reads nothing.
+    pub async fn to_jf(&self, kind: &str, internal: &str) -> String {
+        self.ids.handed_out(kind, internal)
     }
 
-    async fn from_jf_anonymous(&self, jf_id: &str) -> Option<(String, String)> {
-        let normalized = Self::normalize(jf_id);
-        if let Some(found) = self.lookup(&normalized, false) {
-            return Some(found);
+    /// Reverse lookup for a signed-in caller only: call it after `authed`.
+    /// Answers to current ids, to the old ids albums and artists had
+    /// before theirs were keyed, and to the ids of a merged album or
+    /// artist; an album or artist comes back as the one that holds it now.
+    /// Accepts dashed or undashed input, `Ok(None)` when unknown or when
+    /// nothing live holds it, `Err` when a read failed. An id handed out
+    /// since the last stored one is waited for, briefly. (`from_*` takes
+    /// `self` by v2-naming parity, not by convention.)
+    #[allow(clippy::wrong_self_convention)]
+    pub async fn from_jf(&self, jf_id: &str) -> Result<Option<(String, String)>, ReadFailed> {
+        Ok(self
+            .from_jf_many(&[jf_id.to_owned()])
+            .await?
+            .pop()
+            .flatten())
+    }
+
+    /// [`Self::from_jf`] for several ids, in order, waiting at most once
+    /// for all of them.
+    #[allow(clippy::wrong_self_convention)]
+    pub async fn from_jf_many(
+        &self,
+        jf_ids: &[String],
+    ) -> Result<Vec<Option<(String, String)>>, ReadFailed> {
+        let found = self.ids.resolve(jf_ids, true).await?;
+        let mut out = Vec::with_capacity(found.len());
+        for item in found {
+            out.push(match item {
+                Some((kind, internal)) => self.current(kind, internal).await?,
+                None => None,
+            });
         }
-        self.read_catalog(false).await;
-        self.lookup(&normalized, false)
+        Ok(out)
+    }
+
+    /// Reverse lookup for a caller who has not signed in (the picture
+    /// address): current ids only, never an old one, and a miss answers at
+    /// once.
+    #[allow(clippy::wrong_self_convention)]
+    pub async fn from_jf_anonymous(
+        &self,
+        jf_id: &str,
+    ) -> Result<Option<(String, String)>, ReadFailed> {
+        let mut found = self.ids.resolve(&[jf_id.to_owned()], false).await?;
+        Ok(found
+            .pop()
+            .flatten()
+            .map(|(kind, internal)| (kind.as_str().to_owned(), internal)))
     }
 }

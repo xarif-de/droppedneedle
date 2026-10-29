@@ -1,35 +1,37 @@
-//! Jellyfin router: state, route registration, response helpers and the
-//! auth gates every handler shares.
+//! Jellyfin router: state, the route table, response helpers and the two
+//! layers every route sits behind.
 //!
 //! Wire contract: PascalCase JSON, real HTTP statuses, empty error bodies
 //! (not the native envelope), except the answers Jellyfin itself sends with
-//! a body (see `not_found_item`). Audio needs the caller's token like every
-//! other library route. Headerless players (Jellify, Finamp, Manet) still
-//! work: the URLs PlaybackInfo hands out carry `api_key=<token>`, and the
-//! token is read from the query as well as the headers. Anonymous audio is
-//! a 401, so nobody can stream or start transcodes without an account.
-//!
-//! Route notes: `/Items/Filters` must stay registered
-//! alongside (before, for clarity) `/Items/{item_id}` or "Filters" would be
-//! captured as an id (v2 comment; axum prefers the static route). There is
-//! no `/jellyfin/socket` endpoint, on purpose (v2 gap: uvicorn 403s the
-//! websocket scope; Finamp PlayOn only, non-blocking).
+//! a body (see `not_found_item`). The table ([`ROUTES`]) says which routes
+//! are public; every other one, audio included, needs the caller's token.
+//! Headerless players (Jellify, Finamp, Manet) still work: the URLs
+//! PlaybackInfo hands out carry `api_key=<token>`, and the token is read
+//! from the query as well as the headers.
 
 use axum::body::Body;
+use axum::extract::{FromRequestParts, State};
+use axum::http::request::Parts;
 use axum::http::{HeaderMap, Request, StatusCode};
-use axum::response::Response;
-use axum::routing::{get, post};
+use axum::middleware::{Next, from_fn_with_state};
+use axum::response::{IntoResponse as _, Response};
+use axum::routing::{MethodFilter, MethodRouter, on};
 use droppedneedle_auth::compat_auth::jellyfin::{
     JellyfinRequest, extract_client, extract_token, resolve_token, server_id,
 };
 use droppedneedle_auth::compat_auth::prod::ProdCompatPasswords;
+use droppedneedle_kernel::error::{ApiError, Unavailable};
 use droppedneedle_kernel::ids::RequestId;
 use droppedneedle_kernel::mount::CompatRoutes;
 use uuid::Uuid;
 
+use crate::adapters::jellyfin_library::{CatalogIds, JellyfinLibrary};
+use crate::adapters::playback::CompatPlayback;
 use crate::body::AudioBody;
 use crate::settings::LiveSettings;
+use crate::setup::CompatAudio;
 use crate::shared::address::{ListenerConfig, base_address};
+use crate::shared::percent::{self, Malformed, Plus};
 
 use super::audio::*;
 use super::browse::*;
@@ -37,29 +39,24 @@ use super::builders::Builder;
 use super::images::*;
 use super::playlists::*;
 use super::playstate::*;
-use super::seams::{
-    ByteOutcome, IdMap, LibraryRead, PlaybackSessions, Principal, StreamEngine, WriteRefusal,
-};
+use super::seams::{ByteOutcome, Principal, WriteRefusal};
 use super::system::*;
 
 // ===== State + registration =====
 
-/// Router dependencies. Every seam but the app-password store is a generic
-/// so production binds the real adapters without touching the routes: `L`
-/// library reads, `E` stream engine, `P` scrobble adapter, `I` persisted id
-/// map.
+/// Router dependencies.
 #[derive(Clone)]
-pub struct JellyfinState<L, E, P, I> {
+pub struct JellyfinState {
     /// App-password store.
     pub passwords: ProdCompatPasswords,
     /// Library reads.
-    pub library: L,
-    /// Streaming engine.
-    pub engine: E,
-    /// Playback sessions (scrobble adapter binding).
-    pub sessions: P,
-    /// Opaque id map.
-    pub ids: I,
+    pub library: JellyfinLibrary,
+    /// Audio over the stream gateway.
+    pub engine: CompatAudio,
+    /// Presence and scrobbles.
+    pub sessions: CompatPlayback,
+    /// The stored Jellyfin ids.
+    pub ids: CatalogIds,
     /// Connect-apps settings subset, read per request.
     pub settings: LiveSettings,
     /// Restart-stable server id, computed once (`compat_auth` owns the value).
@@ -68,15 +65,15 @@ pub struct JellyfinState<L, E, P, I> {
     pub listener: ListenerConfig,
 }
 
-impl<L, E, P, I> JellyfinState<L, E, P, I> {
+impl JellyfinState {
     /// Assemble state; `server_id()` is restart-stable.
     pub fn new(
         passwords: ProdCompatPasswords,
-        library: L,
-        engine: E,
-        sessions: P,
-        ids: I,
-        settings: impl Into<LiveSettings>,
+        library: JellyfinLibrary,
+        engine: CompatAudio,
+        sessions: CompatPlayback,
+        ids: CatalogIds,
+        settings: LiveSettings,
         listener: ListenerConfig,
     ) -> Self {
         Self {
@@ -85,155 +82,214 @@ impl<L, E, P, I> JellyfinState<L, E, P, I> {
             engine,
             sessions,
             ids,
-            settings: settings.into(),
+            settings,
             server_id: server_id(),
             listener,
         }
     }
 }
 
-/// The `/jellyfin` routes.
-pub fn routes<L, E, P, I>(state: JellyfinState<L, E, P, I>) -> CompatRoutes
-where
-    L: LibraryRead,
-    E: StreamEngine,
-    P: PlaybackSessions,
-    I: IdMap,
-{
-    CompatRoutes::new()
-        .at(
-            "/jellyfin/System/Info/Public",
-            get(system_info_public::<L, E, P, I>),
-        )
-        .at("/jellyfin/System/Info", get(system_info::<L, E, P, I>))
-        .at(
-            "/jellyfin/QuickConnect/Enabled",
-            get(quick_connect::<L, E, P, I>),
-        )
-        .at(
-            "/jellyfin/Sessions/Logout",
-            post(sessions_logout::<L, E, P, I>),
-        )
-        .at(
-            "/jellyfin/Users/AuthenticateByName",
-            post(authenticate::<L, E, P, I>),
-        )
-        .at("/jellyfin/Users/Me", get(users_me::<L, E, P, I>))
-        .at("/jellyfin/Users/{user_id}", get(user_by_id::<L, E, P, I>))
-        .at("/jellyfin/Users/{user_id}/Views", get(views::<L, E, P, I>))
-        .at("/jellyfin/UserViews", get(views::<L, E, P, I>))
-        .at("/jellyfin/Users/{user_id}/Items", get(browse::<L, E, P, I>))
-        .at("/jellyfin/Items", get(browse::<L, E, P, I>))
-        // Not recorded: Jellyfin 10.10.6 serves this from
-        // `UserLibraryController.GetLatestMedia`, the user from the token.
-        // Jellify asks here (`@jellyfin/sdk` 0.13.0). Before `/Items/{item_id}`.
-        .at("/jellyfin/Items/Latest", get(latest::<L, E, P, I>))
-        .at(
-            "/jellyfin/Users/{user_id}/Items/Latest",
-            get(latest::<L, E, P, I>),
-        )
-        .at("/jellyfin/Artists", get(artists::<L, E, P, I>))
-        .at(
-            "/jellyfin/Artists/AlbumArtists",
-            get(album_artists::<L, E, P, I>),
-        )
-        .at("/jellyfin/Genres", get(genres::<L, E, P, I>))
-        .at("/jellyfin/MusicGenres", get(genres::<L, E, P, I>))
-        // Filters before `/{item_id}`: "Filters" must never be an id.
-        .at("/jellyfin/Items/Filters", get(filters::<L, E, P, I>))
-        .at(
-            "/jellyfin/Users/{user_id}/Items/Filters",
-            get(filters::<L, E, P, I>),
-        )
-        .at(
-            "/jellyfin/Users/{user_id}/Items/{item_id}",
-            get(single_item_legacy::<L, E, P, I>),
-        )
-        .at("/jellyfin/Items/{item_id}", get(single_item::<L, E, P, I>))
-        .at(
-            "/jellyfin/Items/{item_id}/Images/{image_type}",
-            get(image::<L, E, P, I>),
-        )
-        .at(
-            "/jellyfin/Items/{item_id}/Images/{image_type}/{index}",
-            get(image_indexed::<L, E, P, I>),
-        )
-        .at(
-            "/jellyfin/Audio/{item_id}/{tail}",
-            get(audio::<L, E, P, I>).head(audio_head::<L, E, P, I>),
-        )
-        .at(
-            "/jellyfin/Items/{item_id}/File",
-            get(item_file::<L, E, P, I>).head(item_file_head::<L, E, P, I>),
-        )
-        .at(
-            "/jellyfin/Items/{item_id}/Download",
-            get(item_download::<L, E, P, I>).head(item_download_head::<L, E, P, I>),
-        )
-        .at(
-            "/jellyfin/Items/{item_id}/PlaybackInfo",
-            get(playback_info::<L, E, P, I>).post(playback_info::<L, E, P, I>),
-        )
-        .at(
-            "/jellyfin/Users/{user_id}/FavoriteItems/{item_id}",
-            post(favorite_add_legacy::<L, E, P, I>).delete(favorite_remove_legacy::<L, E, P, I>),
-        )
-        .at(
-            "/jellyfin/UserFavoriteItems/{item_id}",
-            post(favorite_add_modern::<L, E, P, I>).delete(favorite_remove_modern::<L, E, P, I>),
-        )
-        .at(
-            "/jellyfin/Users/{user_id}/PlayedItems/{item_id}",
-            post(played_add_legacy::<L, E, P, I>).delete(played_remove_legacy::<L, E, P, I>),
-        )
-        .at(
-            "/jellyfin/UserPlayedItems/{item_id}",
-            post(played_add_modern::<L, E, P, I>).delete(played_remove_modern::<L, E, P, I>),
-        )
-        .at("/jellyfin/Sessions/Playing", post(playing::<L, E, P, I>))
-        .at(
-            "/jellyfin/Sessions/Playing/Progress",
-            post(playing_progress::<L, E, P, I>),
-        )
-        .at(
-            "/jellyfin/Sessions/Playing/Stopped",
-            post(playing_stopped::<L, E, P, I>),
-        )
-        .at(
-            "/jellyfin/Sessions/Playing/Ping",
-            post(sessions_ping::<L, E, P, I>),
-        )
-        .at(
-            "/jellyfin/Sessions/Capabilities/Full",
-            post(sessions_capabilities::<L, E, P, I>),
-        )
-        .at("/jellyfin/Playlists", post(create_playlist::<L, E, P, I>))
-        .at(
-            "/jellyfin/Playlists/{playlist_id}",
-            get(get_playlist::<L, E, P, I>),
-        )
-        .at(
-            "/jellyfin/Playlists/{playlist_id}/Items",
-            get(playlist_items::<L, E, P, I>)
-                .post(playlist_add::<L, E, P, I>)
-                .delete(playlist_remove::<L, E, P, I>),
-        )
-        .at(
-            "/jellyfin/Playlists/{playlist_id}/Items/{entry_id}/Move/{new_index}",
-            post(playlist_move::<L, E, P, I>),
-        )
-        .at(
-            "/jellyfin/Items/{item_id}/Similar",
-            get(similar::<L, E, P, I>),
-        )
-        .at(
-            "/jellyfin/Items/{item_id}/InstantMix",
-            get(similar::<L, E, P, I>),
-        )
-        .at(
-            "/jellyfin/Artists/{item_id}/InstantMix",
-            get(similar::<L, E, P, I>),
-        )
+// ===== The route table =====
+
+/// Who may call a route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Access {
+    /// Anyone who can reach the server, while the API is on.
+    Public,
+    /// A caller with a valid app password.
+    SignedIn,
+}
+
+/// The methods the table uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verb {
+    /// `GET`, which also answers `HEAD` on a template with no `HEAD` row.
+    Get,
+    /// `HEAD`.
+    Head,
+    /// `POST`.
+    Post,
+    /// `DELETE`.
+    Delete,
+}
+
+impl Verb {
+    /// The method's name on the wire.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Get => "GET",
+            Self::Head => "HEAD",
+            Self::Post => "POST",
+            Self::Delete => "DELETE",
+        }
+    }
+
+    fn filter(self) -> MethodFilter {
+        match self {
+            Self::Get => MethodFilter::GET,
+            Self::Head => MethodFilter::HEAD,
+            Self::Post => MethodFilter::POST,
+            Self::Delete => MethodFilter::DELETE,
+        }
+    }
+}
+
+/// One row of the route table.
+#[derive(Debug, Clone, Copy)]
+pub struct Route {
+    /// Who may call it.
+    pub access: Access,
+    /// Its method.
+    pub verb: Verb,
+    /// Its path template, as axum matches it.
+    pub template: &'static str,
+}
+
+/// Whether `method` on the route axum matched as `template` is public.
+/// `HEAD` is answered by the `GET` row where the template has no `HEAD`
+/// row, as axum does.
+pub fn is_public(method: &str, template: &str) -> bool {
+    let row = |verb: Verb| {
+        ROUTES
+            .iter()
+            .find(|row| row.template == template && row.verb == verb)
+    };
+    let found = match method {
+        "GET" => row(Verb::Get),
+        "HEAD" => row(Verb::Head).or_else(|| row(Verb::Get)),
+        "POST" => row(Verb::Post),
+        "DELETE" => row(Verb::Delete),
+        _ => None,
+    };
+    found.is_some_and(|row| row.access == Access::Public)
+}
+
+/// The handlers of one or more rows.
+type Methods = MethodRouter<JellyfinState>;
+
+/// One template with the handlers of all its rows.
+type Template = (&'static str, Methods);
+
+/// Lists every route once, with its access and handler, and makes both
+/// [`ROUTES`] and the handlers, in the same order, from that one list.
+macro_rules! route_table {
+    ($(
+        $access:ident $verb:ident $template:literal => $handler:ident;
+    )*) => {
+        /// Every Jellyfin route: who may call it, its method and template.
+        pub const ROUTES: &[Route] = &[
+            $(Route { access: Access::$access, verb: Verb::$verb, template: $template },)*
+        ];
+
+        /// The handler of each row of [`ROUTES`], in the same order.
+        fn handlers() -> Vec<Methods> {
+            vec![$(on(Verb::$verb.filter(), $handler),)*]
+        }
+    };
+}
+
+// Public: what a real Jellyfin 10.10.6 serves without sign-in, so an app
+// can find the server, sign in and load pictures. Everything else, audio
+// included, needs a token. `/Users/Public` lists nobody: every user here
+// is hidden.
+//
+// `POST /Sessions/Logout` needs a token, as on a real server
+// (`SessionController.cs:419-420`). Neither listed app is held signed in by
+// a refusal there. Finamp (`673b568a`, `logoutCurrentUser`) sends it with
+// its token in `Authorization` and removes the user on the device whatever
+// the answer. Jellify (`7dae4ea3`, `sign-out-modal.tsx`) never calls it.
+//
+// `/Items/Latest` and `/Items/Filters` sit beside `/Items/{item_id}`, and
+// `/Users/Public` and `/Users/Me` beside `/Users/{user_id}`: axum and the
+// case fixing both prefer a literal segment to a parameter, so none of them
+// is read as an id. There is no `/jellyfin/socket`, on purpose (Finamp's
+// PlayOn only, which does not block playback).
+route_table! {
+    Public Get "/jellyfin/System/Info/Public" => system_info_public;
+    SignedIn Get "/jellyfin/System/Info" => system_info;
+    Public Get "/jellyfin/QuickConnect/Enabled" => quick_connect;
+    SignedIn Post "/jellyfin/Sessions/Logout" => sessions_logout;
+    Public Post "/jellyfin/Users/AuthenticateByName" => authenticate;
+    Public Get "/jellyfin/Users/Public" => users_public;
+    SignedIn Get "/jellyfin/Users/Me" => users_me;
+    SignedIn Get "/jellyfin/Users/{user_id}" => user_by_id;
+    SignedIn Get "/jellyfin/Users/{user_id}/Views" => views;
+    SignedIn Get "/jellyfin/UserViews" => views;
+    SignedIn Get "/jellyfin/Users/{user_id}/Items" => browse;
+    SignedIn Get "/jellyfin/Items" => browse;
+    // Not recorded: Jellyfin 10.10.6 serves this from
+    // `UserLibraryController.GetLatestMedia`, the user from the token.
+    // Jellify asks here (`@jellyfin/sdk` 0.13.0).
+    SignedIn Get "/jellyfin/Items/Latest" => latest;
+    SignedIn Get "/jellyfin/Users/{user_id}/Items/Latest" => latest;
+    SignedIn Get "/jellyfin/Artists" => artists;
+    SignedIn Get "/jellyfin/Artists/AlbumArtists" => album_artists;
+    SignedIn Get "/jellyfin/Genres" => genres;
+    SignedIn Get "/jellyfin/MusicGenres" => genres;
+    SignedIn Get "/jellyfin/Items/Filters" => filters;
+    SignedIn Get "/jellyfin/Users/{user_id}/Items/Filters" => filters;
+    SignedIn Get "/jellyfin/Users/{user_id}/Items/{item_id}" => single_item_legacy;
+    SignedIn Get "/jellyfin/Items/{item_id}" => single_item;
+    Public Get "/jellyfin/Items/{item_id}/Images/{image_type}" => image;
+    Public Get "/jellyfin/Items/{item_id}/Images/{image_type}/{index}" => image_indexed;
+    SignedIn Get "/jellyfin/Audio/{item_id}/{tail}" => audio;
+    SignedIn Head "/jellyfin/Audio/{item_id}/{tail}" => audio_head;
+    SignedIn Get "/jellyfin/Items/{item_id}/File" => item_file;
+    SignedIn Head "/jellyfin/Items/{item_id}/File" => item_file_head;
+    SignedIn Get "/jellyfin/Items/{item_id}/Download" => item_download;
+    SignedIn Head "/jellyfin/Items/{item_id}/Download" => item_download_head;
+    SignedIn Get "/jellyfin/Items/{item_id}/PlaybackInfo" => playback_info;
+    SignedIn Post "/jellyfin/Items/{item_id}/PlaybackInfo" => playback_info;
+    SignedIn Post "/jellyfin/Users/{user_id}/FavoriteItems/{item_id}" => favorite_add_legacy;
+    SignedIn Delete "/jellyfin/Users/{user_id}/FavoriteItems/{item_id}" => favorite_remove_legacy;
+    SignedIn Post "/jellyfin/UserFavoriteItems/{item_id}" => favorite_add_modern;
+    SignedIn Delete "/jellyfin/UserFavoriteItems/{item_id}" => favorite_remove_modern;
+    SignedIn Post "/jellyfin/Users/{user_id}/PlayedItems/{item_id}" => played_add_legacy;
+    SignedIn Delete "/jellyfin/Users/{user_id}/PlayedItems/{item_id}" => played_remove_legacy;
+    SignedIn Post "/jellyfin/UserPlayedItems/{item_id}" => played_add_modern;
+    SignedIn Delete "/jellyfin/UserPlayedItems/{item_id}" => played_remove_modern;
+    SignedIn Post "/jellyfin/Sessions/Playing" => playing;
+    SignedIn Post "/jellyfin/Sessions/Playing/Progress" => playing_progress;
+    SignedIn Post "/jellyfin/Sessions/Playing/Stopped" => playing_stopped;
+    SignedIn Post "/jellyfin/Sessions/Playing/Ping" => sessions_ping;
+    SignedIn Post "/jellyfin/Sessions/Capabilities/Full" => sessions_capabilities;
+    SignedIn Post "/jellyfin/Playlists" => create_playlist;
+    SignedIn Get "/jellyfin/Playlists/{playlist_id}" => get_playlist;
+    SignedIn Get "/jellyfin/Playlists/{playlist_id}/Items" => playlist_items;
+    SignedIn Post "/jellyfin/Playlists/{playlist_id}/Items" => playlist_add;
+    SignedIn Delete "/jellyfin/Playlists/{playlist_id}/Items" => playlist_remove;
+    SignedIn Post "/jellyfin/Playlists/{playlist_id}/Items/{entry_id}/Move/{new_index}" => playlist_move;
+    SignedIn Get "/jellyfin/Items/{item_id}/Similar" => similar;
+    SignedIn Get "/jellyfin/Items/{item_id}/InstantMix" => similar;
+    SignedIn Get "/jellyfin/Artists/{item_id}/InstantMix" => similar;
+}
+
+/// The `/jellyfin` routes, built from [`ROUTES`]. A signed-in row sits
+/// behind the sign-in layer, and every route, public or not, behind the
+/// gate outside it: with the API off nothing reads a token, so nothing
+/// answers 401 or counts toward a lockout.
+pub fn routes(state: JellyfinState) -> CompatRoutes {
+    let signed_in = from_fn_with_state(state.passwords.clone(), sign_in);
+    let gate = from_fn_with_state(state.clone(), gate);
+    let mut grouped: Vec<Template> = Vec::new();
+    for (row, handler) in ROUTES.iter().zip(handlers()) {
+        let handler = match row.access {
+            Access::Public => handler,
+            Access::SignedIn => handler.route_layer(signed_in.clone()),
+        };
+        match grouped
+            .iter_mut()
+            .find(|(template, _)| *template == row.template)
+        {
+            Some((_, methods)) => *methods = std::mem::take(methods).merge(handler),
+            None => grouped.push((row.template, handler)),
+        }
+    }
+    grouped
+        .into_iter()
+        .fold(CompatRoutes::new(), |routes, (template, methods)| {
+            routes.at(template, methods.layer(gate.clone()))
+        })
         .with_state(state)
 }
 
@@ -298,14 +354,20 @@ pub(super) fn no_content() -> Response {
 }
 
 /// Map a refused library write to its status (v2 maps not-found to 404
-/// and permission errors to 403).
+/// and permission errors to 403). A busy write wrote nothing, so it is
+/// 503 with `Retry-After`; the request boundary logs a server fault once,
+/// with its cause.
 pub(super) fn refused(refusal: WriteRefusal) -> Response {
+    use droppedneedle_kernel::error::{ApiError, Unavailable};
     error(match refusal {
         WriteRefusal::NotFound => StatusCode::NOT_FOUND,
         WriteRefusal::Forbidden => StatusCode::FORBIDDEN,
         WriteRefusal::Invalid => StatusCode::BAD_REQUEST,
         WriteRefusal::Conflict => StatusCode::CONFLICT,
-        WriteRefusal::Failed => StatusCode::INTERNAL_SERVER_ERROR,
+        WriteRefusal::Busy(cause) => {
+            return ApiError::unavailable(Unavailable::ServerBusy, cause).into_response();
+        }
+        WriteRefusal::Failed(cause) => return ApiError::internal(cause).into_response(),
     })
 }
 
@@ -346,10 +408,24 @@ pub(super) fn outcome_response(outcome: &ByteOutcome) -> Response {
 
 // ===== Auth + gates =====
 
-/// Authenticated request context: principal plus the media-browser facts.
+/// The signed-in caller: principal plus the media-browser facts. Only the
+/// sign-in layer makes one; a handler that takes it on a route without that
+/// layer answers an empty 401.
+#[derive(Clone)]
 pub(super) struct Authed {
     pub(super) principal: Principal,
     pub(super) client: Option<String>,
+}
+
+impl<S: Send + Sync> FromRequestParts<S> for Authed {
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Response> {
+        parts
+            .extensions
+            .remove::<Authed>()
+            .ok_or_else(|| error(StatusCode::UNAUTHORIZED))
+    }
 }
 
 pub(super) fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -371,48 +447,14 @@ fn query_exact<'a>(raw: Option<&'a str>, key: &str) -> Option<&'a str> {
     None
 }
 
-/// A query token that is not valid percent-encoding.
-#[derive(Debug)]
-pub(crate) struct MalformedToken;
-
 /// Undo the percent-encoding of a query token, once: `%3D` is `=`, and
 /// `%253D` is the text `%3D`. An app password ends in `=`, which a player
 /// may send either way. Nothing else changes: a `+` stays a `+` and is
 /// never a space (app passwords are URL-safe base64 and hold neither),
 /// nothing is trimmed and case is kept. A `%` without two hex digits, or
 /// bytes that are not UTF-8, refuse the token.
-///
-/// Written here because no decoder among the dependencies is strict
-/// enough for a credential: `percent-encoding` keeps a bad escape as
-/// text, and the form decoders turn `+` into a space and replace bytes
-/// that are not UTF-8.
-fn decode_token(raw: &str) -> Result<String, MalformedToken> {
-    fn hex(byte: u8) -> Option<u8> {
-        match byte {
-            b'0'..=b'9' => Some(byte - b'0'),
-            b'a'..=b'f' => Some(byte - b'a' + 10),
-            b'A'..=b'F' => Some(byte - b'A' + 10),
-            _ => None,
-        }
-    }
-    let mut out = Vec::with_capacity(raw.len());
-    let mut rest = raw.as_bytes();
-    while let Some((&byte, tail)) = rest.split_first() {
-        if byte != b'%' {
-            out.push(byte);
-            rest = tail;
-            continue;
-        }
-        let [hi, lo, tail @ ..] = tail else {
-            return Err(MalformedToken);
-        };
-        let (Some(hi), Some(lo)) = (hex(*hi), hex(*lo)) else {
-            return Err(MalformedToken);
-        };
-        out.push(hi << 4 | lo);
-        rest = tail;
-    }
-    String::from_utf8(out).map_err(|_| MalformedToken)
+fn decode_token(raw: &str) -> Result<String, Malformed> {
+    percent::strict(raw, Plus::Literal)
 }
 
 /// The tokens a request carries in its query, decoded. The handlers and
@@ -425,7 +467,7 @@ pub(crate) struct QueryTokens {
 impl QueryTokens {
     /// Fails when either value is malformed, even if a header token or the
     /// other value would have been used: such a request is refused.
-    pub(crate) fn read(raw_query: Option<&str>) -> Result<Self, MalformedToken> {
+    pub(crate) fn read(raw_query: Option<&str>) -> Result<Self, Malformed> {
         let token = |key| query_exact(raw_query, key).map(decode_token).transpose();
         Ok(Self {
             apikey: token("ApiKey")?,
@@ -446,69 +488,66 @@ impl QueryTokens {
     }
 }
 
-/// Resolve the caller or return the 401 (empty body, never raises).
-pub(super) async fn authed(
-    passwords: &ProdCompatPasswords,
-    headers: &HeaderMap,
-    raw_query: Option<&str>,
-) -> Result<Authed, Response> {
-    let Ok(query) = QueryTokens::read(raw_query) else {
-        return Err(error(StatusCode::UNAUTHORIZED));
+/// The sign-in layer of every signed-in route: reads the token once (the
+/// headers, then `ApiKey` and `api_key` in the query) and hands the caller
+/// to the handler as [`Authed`]. No token, a malformed one or an unknown
+/// one is an empty 401, which the limits layer counts toward the lockout.
+/// A credential-store failure keeps its own status, never a 401.
+pub(super) async fn sign_in(
+    State(passwords): State<ProdCompatPasswords>,
+    mut request: Request<Body>,
+    next: Next,
+) -> Response {
+    let Ok(query) = QueryTokens::read(request.uri().query()) else {
+        return error(StatusCode::UNAUTHORIZED);
     };
-    let request = query.request(headers);
-    let token = extract_token(&request);
-    let client = extract_client(&request);
-    match resolve_token(passwords, token.as_deref()).await {
-        Ok(user) => Ok(Authed {
-            principal: Principal::from_user(&user, token.as_deref().unwrap_or("")),
-            client,
-        }),
-        Err(denied) => Err(error(
-            StatusCode::from_u16(denied.status()).unwrap_or(StatusCode::UNAUTHORIZED),
-        )),
+    let (token, client) = {
+        let inputs = query.request(request.headers());
+        (extract_token(&inputs), extract_client(&inputs))
+    };
+    match resolve_token(&passwords, token.as_deref()).await {
+        Ok(user) => {
+            request.extensions_mut().insert(Authed {
+                principal: Principal::from_user(&user, token.as_deref().unwrap_or("")),
+                client,
+            });
+            next.run(request).await
+        }
+        Err(denied) => {
+            error(StatusCode::from_u16(denied.status()).unwrap_or(StatusCode::UNAUTHORIZED))
+        }
     }
 }
 
-/// The kill-switch gate: disabled → 404 before any handler lookup.
-pub(super) fn gate<L, E, P, I>(state: &JellyfinState<L, E, P, I>) -> Option<Response> {
-    if state.settings.jellyfin().enabled {
-        None
-    } else {
-        Some(error(StatusCode::NOT_FOUND))
+/// The gate in front of every route, outside sign-in. With the API off it
+/// answers the empty 404 before anything reads a token. Then, until this
+/// process has loaded the stored ids, 503 server busy with `Retry-After`,
+/// so no answer is a 404 or an empty list for an id the store has not
+/// caught up with.
+pub(super) async fn gate(
+    State(state): State<JellyfinState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    if !state.settings.jellyfin().enabled {
+        return error(StatusCode::NOT_FOUND);
     }
+    if !state.ids.ready() {
+        return ApiError::unavailable(Unavailable::ServerBusy, "jellyfin ids are not loaded yet")
+            .into_response();
+    }
+    next.run(request).await
 }
 
 /// The address of this API as `request` reached it ([`base_address`]) plus
 /// `/jellyfin`. `LocalAddress` is required, so a request that names no host
 /// gets `http://localhost` and the base path.
-pub(super) fn local_address<L, E, P, I>(
-    state: &JellyfinState<L, E, P, I>,
-    request: &Request<Body>,
-) -> String {
+pub(super) fn local_address(state: &JellyfinState, request: &Request<Body>) -> String {
     let base = base_address(request, &state.listener, &state.settings)
         .unwrap_or_else(|| format!("http://localhost{}", state.listener.base_path));
     format!("{base}/jellyfin")
 }
 
-pub(super) fn builder<'a, L, E, P, I>(state: &'a JellyfinState<L, E, P, I>) -> Builder<'a, I>
-where
-    I: IdMap,
-{
+pub(super) fn builder<'a>(state: &'a JellyfinState) -> Builder<'a> {
     Builder::new(&state.ids, &state.server_id)
 }
-
-macro_rules! authed_handler {
-    ($state:expr, $request:expr, |$authed:ident| $body:expr) => {{
-        if let Some(denied) = gate(&$state) {
-            return denied;
-        }
-        let raw_query = $request.uri().query().map(str::to_owned);
-        let headers = $request.headers().clone();
-        let $authed = match authed(&$state.passwords, &headers, raw_query.as_deref()).await {
-            Ok(authed) => authed,
-            Err(denied) => return denied,
-        };
-        $body
-    }};
-}
-pub(super) use authed_handler;

@@ -7,6 +7,7 @@ use rusqlite::{OptionalExtension, params};
 
 use super::sql;
 use super::store::{DownloadStore, StoreError};
+use crate::db::{ms_from_secs_f64 as ms, secs_f64_from_ms as secs};
 use crate::reason::Reason;
 
 /// One landing's decision, as `download_import_decisions` stores it.
@@ -43,10 +44,7 @@ impl DownloadStore<'_> {
     /// Record one landing's decision.
     pub fn record_import_decision(&self, row: &ImportDecisionRow) -> Result<(), StoreError> {
         self.conn.execute(
-            "INSERT INTO download_import_decisions (task_id, attempt_id, outcome, reason_code, \
-             detail, release_mbid, distance, files_total, files_imported, files_held, \
-             checks_json, missing_positions, decided_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            sql::INSERT_DECISION.text(),
             params![
                 row.task_id,
                 row.attempt_id,
@@ -60,7 +58,7 @@ impl DownloadStore<'_> {
                 row.files_held,
                 row.checks_json,
                 row.missing_positions,
-                row.decided_at,
+                ms(row.decided_at),
             ],
         )?;
         Ok(())
@@ -95,7 +93,7 @@ impl DownloadStore<'_> {
         Ok(serde_json::from_str(&row.missing_positions).unwrap_or_default())
     }
 
-    /// v2's wrong-product verdict: the album's files all named different
+    /// The wrong-product verdict: the album's files all named different
     /// content. The first verdict stands.
     pub fn record_wrong_product_verdict(
         &self,
@@ -104,26 +102,22 @@ impl DownloadStore<'_> {
         now: f64,
     ) -> Result<(), StoreError> {
         self.conn.execute(
-            "UPDATE download_tasks SET wrong_product_verdict_at = ?, wrong_product_detail = ? \
-             WHERE id = ? AND wrong_product_verdict_at IS NULL",
-            params![now, detail, task_id],
+            sql::SET_WRONG_PRODUCT.text(),
+            params![ms(now), detail, task_id],
         )?;
         Ok(())
     }
 
     /// Clear a task's wrong-product verdict once none of its files is held.
     pub fn clear_wrong_product_verdict(&self, task_id: &str) -> Result<(), StoreError> {
-        self.conn.execute(
-            "UPDATE download_tasks SET wrong_product_verdict_at = NULL, \
-             wrong_product_detail = NULL WHERE id = ?",
-            params![task_id],
-        )?;
+        self.conn
+            .execute(sql::CLEAR_WRONG_PRODUCT.text(), params![task_id])?;
         Ok(())
     }
 
     /// A person imported held files and the album is now whole: a failed
     /// or partial task becomes completed, so it stops waiting on a retry
-    /// it no longer needs (v2 `settle_after_manual_import`). Answers
+    /// it no longer needs. Answers
     /// whether the task moved.
     pub fn complete_after_manual_import(
         &self,
@@ -131,10 +125,8 @@ impl DownloadStore<'_> {
         now: f64,
     ) -> Result<bool, StoreError> {
         let changed = self.conn.execute(
-            "UPDATE download_tasks SET status = 'completed', error_message = NULL, \
-                 outcome_code = NULL, completed_at = ?1, updated_at = ?1 \
-             WHERE id = ?2 AND status IN ('failed', 'partial')",
-            params![now, task_id],
+            sql::COMPLETE_AFTER_MANUAL_IMPORT.text(),
+            params![ms(now), task_id],
         )?;
         if changed > 0 {
             self.settle_requests(task_id, super::state::TaskStatus::Completed, now)?;
@@ -151,6 +143,20 @@ impl DownloadStore<'_> {
             .conn
             .query_row(
                 sql::LATEST_DECISION.text(),
+                params![task_id],
+                ImportDecisionRow::from_row,
+            )
+            .optional()?)
+    }
+
+    /// The newest landing of a task that imported files (`imported` or
+    /// `partial`). Its missing positions are what the release still lacked
+    /// after it, earlier landings included.
+    pub fn latest_import(&self, task_id: &str) -> Result<Option<ImportDecisionRow>, StoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                sql::LATEST_IMPORT.text(),
                 params![task_id],
                 ImportDecisionRow::from_row,
             )
@@ -195,7 +201,7 @@ impl ImportDecisionRow {
             files_held: row.get(9)?,
             checks_json: row.get(10)?,
             missing_positions: row.get(11)?,
-            decided_at: row.get(12)?,
+            decided_at: secs(row.get(12)?),
         })
     }
 }

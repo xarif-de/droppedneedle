@@ -13,7 +13,8 @@ use rusqlite::{Connection, OptionalExtension as _, Transaction, params};
 
 use super::models::{
     DesiredDocument, Eligibility, HistoryFilter, HistoryItem, ItemDiff, ItemFacts, ItemFilter,
-    ItemPage, JobIntent, JobMode, Origin, PlannedItem, ResultItem, ResultPage, Revisions, Summary,
+    ItemPage, JobIntent, JobMode, Origin, PlannedItem, ResultItem, ResultPage, ResultState,
+    Revisions, Summary,
 };
 use super::reasons::{self, ItemReason};
 use super::sql;
@@ -22,6 +23,7 @@ use crate::jobs::{
     OperationState, WorkState,
 };
 use crate::publish::snapshots::sha256_hex;
+use droppedneedle_kernel::page::TimeKey;
 
 pub use crate::jobs::live_job_sql;
 
@@ -634,7 +636,7 @@ pub fn rotate_token(
 }
 
 /// One album's work row: state, failure code, result and bundle id.
-type WorkRow = (String, Option<String>, Option<String>, Option<String>);
+type WorkRow = (WorkState, Option<String>, Option<String>, Option<String>);
 
 /// Result rows of an applied job, with each album's work outcome.
 pub fn results(
@@ -677,7 +679,7 @@ pub fn results(
                             action: String::new(),
                         })
                     });
-                (state, failure, result)
+                (state.into(), failure, result)
             }
             None => {
                 let failure = if plan.eligibility.writes() {
@@ -685,7 +687,7 @@ pub fn results(
                 } else {
                     plan.reason().cloned()
                 };
-                ("not_scheduled".to_owned(), failure, serde_json::Value::Null)
+                (ResultState::NotScheduled, failure, serde_json::Value::Null)
             }
         };
         items.push(ResultItem {
@@ -854,7 +856,7 @@ pub fn external_refreshes(
 pub fn history(
     conn: &Connection,
     filter: &HistoryFilter,
-) -> rusqlite::Result<(Vec<HistoryItem>, Option<String>)> {
+) -> rusqlite::Result<(Vec<HistoryItem>, Option<TimeKey>)> {
     let (cursor_at, cursor_id) = filter
         .cursor
         .clone()
@@ -894,7 +896,7 @@ pub fn history(
             selection: serde_json::from_str(&snapshot.selection_json).unwrap_or_default(),
             mode: snapshot.mode,
             origin: snapshot.origin,
-            phase: snapshot.phase.as_str().to_owned(),
+            phase: snapshot.phase,
             profile_id,
             profile_name,
             profile_revision: snapshot.profile_revision,
@@ -908,7 +910,7 @@ pub fn history(
     let next = if more {
         items
             .last()
-            .map(|item| format!("{}|{}", item.job.created_at, item.job.id))
+            .map(|item| (item.job.created_at, item.job.id.clone()))
     } else {
         None
     };

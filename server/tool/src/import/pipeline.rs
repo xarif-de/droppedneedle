@@ -663,6 +663,7 @@ fn stage_settings(
                 }
                 if *section == "plugins" {
                     note_unflagged_plugin_settings(&filtered, report);
+                    note_plugins_need_porting(&filtered, report);
                 }
                 if *section == "library_management" {
                     carry_v2_management_fields(&mut filtered);
@@ -716,6 +717,22 @@ fn note_dropped_setting(report: &mut ReportBuilder, path: String) {
         DROPPED_SETTING,
         "v3 removed this setting; it is not imported".to_owned(),
     );
+}
+
+/// Note each carried plugin: a v2 plugin cannot run in v3 until it is
+/// ported, so its entry arrives switched off.
+fn note_plugins_need_porting(plugins: &Value, report: &mut ReportBuilder) {
+    let Some(plugins) = plugins.as_object() else {
+        return;
+    };
+    for plugin in plugins.keys() {
+        report.note(
+            "settings",
+            format!("plugins.{plugin}"),
+            "needs_porting",
+            format!("{plugin} needs porting before it can run"),
+        );
+    }
 }
 
 /// Note every plugin setting the exporter sealed without knowing whether it
@@ -832,7 +849,8 @@ fn carry_v2_management_fields(section: &mut Value) {
 /// Drop fields the export spec excludes, before re-encryption:
 /// lastfm keeps the switch and the instance app key pair (v2's legacy
 /// global session key and username go), the MusicBrainz transient trio
-/// goes, plugins keep `enabled` + `settings`. A configured Spotify app
+/// goes, plugins keep `settings` and arrive switched off (a v2 plugin
+/// needs porting before v3 can run it). A configured Spotify app
 /// gains the `legacy_callback` marker.
 fn filter_section(name: &str, value: &Value) -> Value {
     match name {
@@ -873,9 +891,7 @@ fn filter_section(name: &str, value: &Value) -> Value {
             if let Some(object) = value.as_object() {
                 for (plugin, config) in object {
                     let mut entry = serde_json::Map::new();
-                    if let Some(enabled) = config.get("enabled") {
-                        entry.insert("enabled".to_owned(), enabled.clone());
-                    }
+                    entry.insert("enabled".to_owned(), Value::Bool(false));
                     if let Some(settings) = config.get("settings") {
                         entry.insert("settings".to_owned(), settings.clone());
                     }
@@ -1002,6 +1018,26 @@ struct EventCityRow {
 
 /// Concerts city key: the table's (user, latitude, longitude) primary key.
 type CityKey = (String, u64, u64);
+
+/// Cities kept per user; the same limit as catalog's `concerts::models::MAX_CITIES`.
+pub const MAX_EVENT_CITIES: usize = 50;
+/// City match radius bounds in km; the same as catalog's `MIN_RADIUS_KM` and `MAX_RADIUS_KM`.
+pub const EVENT_CITY_RADIUS_KM: std::ops::RangeInclusive<f64> = 1.0..=500.0;
+/// Radius a v2 city without one gets, as the picker defaults it.
+const DEFAULT_RADIUS_KM: f64 = 30.0;
+
+/// A city's radius as v3 stores it: the v2 value clamped into range.
+fn event_city_radius(record: &Value) -> f64 {
+    num_or(record, "radius_km", DEFAULT_RADIUS_KM)
+        .clamp(*EVENT_CITY_RADIUS_KM.start(), *EVENT_CITY_RADIUS_KM.end())
+}
+
+/// Per user: cities already saved or planned, and the next free position.
+#[derive(Debug, Default, Clone, Copy)]
+struct CitySlots {
+    count: usize,
+    next_position: i64,
+}
 
 /// A coordinate as a key part. SQLite compares REAL keys by value, so
 /// -0.0 folds into 0.0 here as it does there.
@@ -1210,6 +1246,8 @@ enum Planned {
     },
     InsertEventCity {
         record: Value,
+        radius_km: f64,
+        position: i64,
     },
     SetEventSeen {
         user_id: String,
@@ -1288,8 +1326,16 @@ impl Plan {
             .get("event_cities")
             .and_then(Value::as_array)
             .unwrap_or(&empty_list);
+        let mut slots: HashMap<String, CitySlots> = HashMap::new();
+        for city in snapshot.event_cities.values() {
+            let slot = slots.entry(city.user_id.clone()).or_default();
+            slot.count += 1;
+            slot.next_position = slot.next_position.max(city.position + 1);
+        }
+        let mut event_cities: Vec<&Value> = event_cities.iter().collect();
+        event_cities.sort_by_key(|city| city.get("position").and_then(Value::as_i64).unwrap_or(0));
         for city in event_cities {
-            plan.decide_event_city(city, snapshot, &known_users, report);
+            plan.decide_event_city(city, snapshot, &known_users, &mut slots, report);
         }
         let event_seen = root
             .get("event_seen")
@@ -1699,12 +1745,15 @@ impl Plan {
     }
 
     /// A city the user already has (same coordinates) keeps its saved
-    /// name, radius and order; a new one is added.
+    /// name, radius and order. A new one goes after the user's other
+    /// cities, in export order, with its radius clamped; past the per-user
+    /// limit it is dropped.
     fn decide_event_city(
         &mut self,
         city: &Value,
         snapshot: &DatabaseSnapshot,
         known_users: &HashSet<String>,
+        slots: &mut HashMap<String, CitySlots>,
         report: &mut ReportBuilder,
     ) {
         let user_id = str_or(city, "user_id", "");
@@ -1720,22 +1769,36 @@ impl Plan {
             );
             return;
         }
-        match snapshot
-            .event_cities
-            .get(&(user_id, coord_bits(latitude), coord_bits(longitude)))
-        {
+        let radius_km = event_city_radius(city);
+        match snapshot.event_cities.get(&(
+            user_id.clone(),
+            coord_bits(latitude),
+            coord_bits(longitude),
+        )) {
             None => {
+                let slot = slots.entry(user_id).or_default();
+                if slot.count >= MAX_EVENT_CITIES {
+                    report.record(
+                        "event_city",
+                        key,
+                        "dropped_invalid",
+                        format!("user already has {MAX_EVENT_CITIES} cities"),
+                    );
+                    return;
+                }
                 report.record("event_city", key, "imported", String::new());
                 self.writes.push(Planned::InsertEventCity {
                     record: city.clone(),
+                    radius_km,
+                    position: slot.next_position,
                 });
+                slot.count += 1;
+                slot.next_position += 1;
             }
             Some(existing) => {
                 let identical = existing.city_name == str_or(city, "city_name", "")
                     && existing.country_code == opt_str(city, "country_code")
-                    && existing.radius_km == num_or(city, "radius_km", 0.0)
-                    && existing.position
-                        == city.get("position").and_then(Value::as_i64).unwrap_or(0);
+                    && existing.radius_km == radius_km;
                 if identical {
                     report.record("event_city", key, "skipped_identical", String::new());
                 } else {
@@ -1980,7 +2043,11 @@ impl Plan {
                     )
                     .await?;
                 }
-                Planned::InsertEventCity { record } => insert_event_city(tx, record).await?,
+                Planned::InsertEventCity {
+                    record,
+                    radius_km,
+                    position,
+                } => insert_event_city(tx, record, *radius_km, *position).await?,
                 Planned::SetEventSeen { user_id, seen_at } => {
                     set_event_seen(tx, user_id, *seen_at).await?;
                 }
@@ -2212,6 +2279,8 @@ async fn merge_follow(
 async fn insert_event_city(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     record: &Value,
+    radius_km: f64,
+    position: i64,
 ) -> Result<(), ImportError> {
     sqlx::query(
         "INSERT INTO user_event_cities (user_id, city_name, country_code, latitude, \
@@ -2222,8 +2291,8 @@ async fn insert_event_city(
     .bind(opt_str(record, "country_code"))
     .bind(num_or(record, "latitude", 0.0))
     .bind(num_or(record, "longitude", 0.0))
-    .bind(num_or(record, "radius_km", 30.0))
-    .bind(record.get("position").and_then(Value::as_i64).unwrap_or(0))
+    .bind(radius_km)
+    .bind(position)
     .execute(&mut **tx)
     .await?;
     Ok(())

@@ -43,6 +43,19 @@ pub struct SubsonicError {
     /// Wire message. v2 surfaces our own exception text and falls back
     /// to the static default for unexpected failures.
     pub message: String,
+    /// Set for a server fault: the failure keeps a 5xx status.
+    pub fault: Option<ServerFault>,
+}
+
+/// The server fault behind a code 0 failure, with its cause for the log
+/// only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServerFault {
+    /// The database was too busy and nothing was written: 503 with
+    /// `Retry-After`.
+    Busy(String),
+    /// Anything else: 500.
+    Internal(String),
 }
 
 impl SubsonicError {
@@ -51,6 +64,7 @@ impl SubsonicError {
         Self {
             code,
             message: message.into(),
+            fault: None,
         }
     }
 
@@ -59,6 +73,16 @@ impl SubsonicError {
         Self {
             code,
             message: default_message(code).to_owned(),
+            fault: None,
+        }
+    }
+
+    /// Code 0 with the fixed internal message, answered with a 5xx status.
+    pub fn server_fault(fault: ServerFault) -> Self {
+        Self {
+            code: GENERIC,
+            message: droppedneedle_kernel::error::FIXED_INTERNAL_MESSAGE.to_owned(),
+            fault: Some(fault),
         }
     }
 

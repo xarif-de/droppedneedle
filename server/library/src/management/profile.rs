@@ -9,7 +9,7 @@ use super::reasons::{self, ItemReason};
 use super::script::{self, Statement, Value, Variables};
 use crate::management::settings;
 use crate::matching::model::{Release, ReleaseTrack};
-use crate::publish::TagDocument;
+use crate::publish::{TagDocument, TagTarget, TagUpdate, TagUpdates};
 use crate::tags::{TagEdit, TagField, picard, save};
 use droppedneedle_kernel::runtime_config::sections::{
     FieldMode, LibraryManagement, LibraryManagementProfile, LibraryManagementRootAssignment,
@@ -271,14 +271,9 @@ pub fn tag_field(name: &str) -> Option<TagField> {
 
 /// A field's current values: the plain name, or its first Vorbis spelling.
 fn current(doc: &TagDocument, field: TagField) -> Vec<String> {
-    if let Some(values) = doc.managed.get(field.name()) {
-        return values.clone();
-    }
-    let prefix = format!("{}:", field.name());
     doc.managed
-        .iter()
-        .find(|(name, _)| name.starts_with(&prefix))
-        .map(|(_, values)| values.clone())
+        .field_or_spelling(field)
+        .cloned()
         .unwrap_or_default()
 }
 
@@ -303,17 +298,6 @@ fn mode_value(
             Some(merged)
         }
         _ => None,
-    }
-}
-
-/// Whether an ID3v2.3 write joins this field's values into one: a plain
-/// text or TXXX frame (ISRC reads back split, so it stays a list).
-fn joined_on_v23(field: TagField) -> bool {
-    use crate::tags::fields::Id3Target;
-    match field.id3(true) {
-        Id3Target::Text(id) => id != "TSRC",
-        Id3Target::User(_) => true,
-        _ => false,
     }
 }
 
@@ -361,7 +345,7 @@ pub fn field_variables(fields: &BTreeMap<String, Vec<String>>) -> Variables {
 /// The tags one file should end up with.
 pub struct TagPlan {
     /// What to write: changed fields only.
-    pub updates: BTreeMap<String, Vec<String>>,
+    pub updates: TagUpdates,
     /// Every tag field after the plan, for display and naming.
     pub desired: BTreeMap<String, Vec<String>>,
     pub mutations: Vec<FieldMutation>,
@@ -586,7 +570,7 @@ pub fn plan_tags(
             }
             let existing = desired.get(field.name()).cloned().unwrap_or_default();
             if id3v23
-                && joined_on_v23(field)
+                && save::joined_on_v23(field)
                 && let Some(values) = canonical.get(field.name())
             {
                 if let Some(values) = joined_mode_value(
@@ -702,22 +686,16 @@ pub fn plan_tags(
     }
     desired.retain(|_, values| !values.is_empty());
     if id3v23 {
-        // Compare in the form the file can hold, or every plan would see
-        // a change: one "/"-joined value, and only the year of the
-        // original date (`TORY`).
+        // One "/"-joined value, as the file holds it. Other reductions
+        // (a date's year) wait for the compare below: naming reads
+        // `desired`, and must name a v2.3 file as it names its siblings.
         for (name, values) in desired.iter_mut() {
-            let field = TagField::from_name(name);
-            if values.len() > 1 && field.is_some_and(joined_on_v23) {
+            if values.len() > 1 && TagField::from_name(name).is_some_and(save::joined_on_v23) {
                 *values = vec![values.join("/")];
-            }
-            if field == Some(TagField::OriginalDate) {
-                for value in values.iter_mut() {
-                    *value = crate::tags::save::year_of(value);
-                }
             }
         }
     }
-    let mut updates = BTreeMap::new();
+    let mut updates = TagUpdates::new();
     let mut mutations = Vec::new();
     let names: BTreeSet<&String> = before.keys().chain(desired.keys()).collect();
     for name in names {
@@ -729,6 +707,11 @@ pub fn plan_tags(
         let Some(field) = TagField::from_name(name) else {
             continue;
         };
+        // Compare in the form a v2.3 file holds (the save writes that
+        // form itself), or every plan would see a change.
+        if id3v23 && old == save::as_v23_holds(field, &new) {
+            continue;
+        }
         if doc.opaque.contains(name) {
             warnings.push(format!(
                 "\"{name}\" holds a value in a form undo could not put back, so it is left as it is."
@@ -751,7 +734,7 @@ pub fn plan_tags(
             before: json_value(&old),
             after: json_value(&new),
         });
-        updates.insert(name.clone(), new);
+        updates.insert(TagTarget::Field(field), new);
     }
     // Scrubbing (v2's rule): every native item outside the managed
     // fields goes, except the ones the profile preserves and v2's other
@@ -770,14 +753,14 @@ pub fn plan_tags(
             if preserved.contains(&folded) || scrub_keeps(&folded) {
                 continue;
             }
-            let name = format!("{}{key}", crate::publish::staging::NATIVE_PREFIX);
+            let target = TagTarget::Native(key.clone());
             mutations.push(FieldMutation {
-                name: name.clone(),
+                name: target.name(),
                 operation: "clear".to_owned(),
                 before: json_value(values),
                 after: serde_json::Value::Null,
             });
-            updates.insert(name, Vec::new());
+            updates.insert(target, Vec::new());
             scrubbed.push((key.clone(), values.clone()));
         }
     }
@@ -786,17 +769,19 @@ pub fn plan_tags(
             "Tags cannot be written to {} files, so only the file's path is managed.",
             format.to_uppercase()
         ));
-        updates.clear();
+        updates = TagUpdates::new();
         mutations.clear();
         scrubbed.clear();
     }
     // What the file holds after the write: skipped fields keep their value.
     let mut desired = before;
-    for (name, values) in &updates {
-        if values.is_empty() {
-            desired.remove(name);
-        } else {
-            desired.insert(name.clone(), values.clone());
+    for update in updates.iter() {
+        if let TagUpdate::Field { field, values } = update {
+            if values.is_empty() {
+                desired.remove(field.name());
+            } else {
+                desired.insert(field.name().to_owned(), values.to_vec());
+            }
         }
     }
     Ok(TagPlan {
@@ -1257,7 +1242,9 @@ mod tests {
     use crate::management::enrich::{AlbumExtras, Credits, LyricsAnswer};
     use crate::management::planner::Overrides;
     use crate::matching::model::{RecordingRelations, ReleaseRelations, RoleCredit, WorkCredit};
-    use droppedneedle_kernel::runtime_config::sections::RelationshipType;
+    use droppedneedle_kernel::runtime_config::sections::{
+        PathCompatibilitySettings, RelationshipType,
+    };
 
     /// The classical probe: Gould and Karajan's Beethoven concerto, then
     /// Sibelius and a spoken track that performs no work.
@@ -1786,43 +1773,48 @@ mod tests {
                 "pass {pass}"
             );
             assert_eq!(plan.desired["producer"], vec!["AC/DC"], "pass {pass}");
-            let credits_changed = plan
-                .updates
-                .keys()
-                .any(|name| matches!(name.as_str(), "composer" | "producer"));
+            let credits_changed = plan.updates.targets().any(|target| {
+                matches!(
+                    target,
+                    TagTarget::Field(TagField::Composer | TagField::Producer)
+                )
+            });
             assert_eq!(
                 credits_changed,
                 pass == 0,
                 "pass {pass}: {:?}",
                 plan.updates
             );
-            doc.managed = plan.desired.clone();
+            doc.managed = TagUpdates::from_fields(plan.desired.clone()).expect("fields");
         }
     }
 
-    /// ID3v2.3 keeps only the year of the original date (`TORY`). Planned
-    /// in that form, a second plan finds nothing to change.
+    /// ID3v2.3 keeps only the year of the original date (`TORY`), and
+    /// only the year of a date with a month but no day (`TYER`). Once the
+    /// file holds that form, a second plan finds nothing to change, and
+    /// the file is named from the full dates, as a FLAC sibling is.
     #[test]
     fn id3v23_original_date_is_planned_as_its_year() {
         let (mut release, _) = classical();
         release.original_date = Some("2015-01-12".to_owned());
+        release.date = Some("2016-03".to_owned());
         let settings = settings::initial_settings("");
         let pinned = pin(&settings, settings::PICARD_ORGANIZER_PROFILE_ID, None).expect("pinned");
-        let mut doc: TagDocument = serde_json::from_value(serde_json::json!({
+        let empty: TagDocument = serde_json::from_value(serde_json::json!({
             "managed": {},
             "custom": {}
         }))
         .expect("document");
-        for pass in 0..2 {
-            let plan = plan_tags(
+        let plan = |doc: &TagDocument, format: &str, id3v23: bool| {
+            plan_tags(
                 &pinned,
                 &CompiledScripts::new(&pinned),
                 &FileInput {
                     release: &release,
                     track: &release.tracks[0],
-                    doc: &doc,
-                    format: "mp3",
-                    id3v23: true,
+                    doc,
+                    format,
+                    id3v23,
                     writable: true,
                     overrides: &Overrides::default(),
                     extras: &AlbumExtras::default(),
@@ -1830,16 +1822,58 @@ mod tests {
                     lyrics: &LyricsAnswer::Off,
                 },
             )
-            .expect("planned");
-            assert_eq!(plan.desired["original_date"], vec!["2015"], "pass {pass}");
-            assert_eq!(
-                plan.updates.contains_key("original_date"),
-                pass == 0,
-                "pass {pass}: {:?}",
-                plan.updates
-            );
-            doc.managed = plan.desired.clone();
+            .expect("planned")
+        };
+        let mut doc = empty.clone();
+        for pass in 0..2 {
+            let planned = plan(&doc, "mp3", true);
+            for field in [TagField::OriginalDate, TagField::Date] {
+                assert_eq!(
+                    planned.updates.field(field).is_some(),
+                    pass == 0,
+                    "pass {pass}: {:?}",
+                    planned.updates
+                );
+            }
+            let held = planned.desired.iter().map(|(name, values)| {
+                let field = TagField::from_name(name).expect("field");
+                (name.clone(), save::as_v23_holds(field, values))
+            });
+            doc.managed = TagUpdates::from_fields(held).expect("fields");
         }
+        assert_eq!(
+            doc.managed.field(TagField::OriginalDate),
+            Some(&vec!["2015".to_owned()])
+        );
+        assert_eq!(
+            doc.managed.field(TagField::Date),
+            Some(&vec!["2016".to_owned()])
+        );
+        let name = |fields: &BTreeMap<String, Vec<String>>| {
+            let facts = NamingFacts {
+                extension: "x",
+                codec: "x",
+                bit_rate: None,
+                sample_rate: None,
+                bit_depth: None,
+                medium_format: String::new(),
+                medium_number: 1,
+                album_disambiguation: String::new(),
+            };
+            script::render_path(
+                "{original_date}/{date}",
+                &naming_variables(fields, &facts),
+                &PathCompatibilitySettings::default(),
+                "/m",
+            )
+            .expect("renders")
+        };
+        let flac = plan(&empty, "flac", false);
+        assert_eq!(
+            name(&plan(&empty, "mp3", true).desired),
+            name(&flac.desired)
+        );
+        assert_eq!(name(&flac.desired), "2015-01-12/2016-03");
     }
 
     /// Picard's performer wording and the work rules, case by case.

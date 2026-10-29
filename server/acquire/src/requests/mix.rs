@@ -18,6 +18,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use futures_util::future::BoxFuture;
+use rusqlite::{OptionalExtension, params_from_iter};
 
 use super::RequestsState;
 use super::error::RequestsError;
@@ -29,8 +30,10 @@ use droppedneedle_catalog::reads::catalog::library::LocalCatalog;
 use droppedneedle_catalog::reads::collections::store::playlists::{
     NewEntry, PlaylistStore, Written,
 };
-use droppedneedle_catalog::reads::discover::adapters::queue::select::{self, Shuffler};
 use droppedneedle_catalog::reads::discover::models::QueueItemLight;
+use droppedneedle_catalog::reads::discover::queue::select::{self, Shuffler};
+use droppedneedle_kernel::db::DbError;
+use droppedneedle_kernel::db::statement::ListLen;
 use droppedneedle_kernel::events::{
     EventHub, PersonalMixRefreshed, UserNotice, model::new_event_id,
 };
@@ -42,7 +45,7 @@ use droppedneedle_providers::listenbrainz::{
     ListenBrainzCredentials, SimilarArtist, TopRecording, TopReleaseGroup,
 };
 
-/// The playlist's display name (v2).
+/// The playlist's display name.
 pub const PLAYLIST_NAME: &str = "Your Weekly Mix";
 /// Source-ref prefix that marks a user's mix playlist.
 pub const SOURCE_REF_PREFIX: &str = "personal-mix:";
@@ -80,7 +83,7 @@ pub enum SkipReason {
 }
 
 impl SkipReason {
-    /// Stable code (v2 spellings).
+    /// Stable code.
     pub fn code(self) -> &'static str {
         match self {
             Self::NotLinked => "listenbrainz_not_linked",
@@ -260,7 +263,7 @@ impl PersonalMixBuilder {
 
     /// Display state of the user's standing grant
     /// (`none|pending|approved|rejected|revoked`), with the override for
-    /// admins and trusted users. An enabled toggle with no row reads `none` (v2).
+    /// admins and trusted users. An enabled toggle with no row reads `none`.
     pub async fn auto_request_state(&self, user_id: &str, role: Role, toggle_on: bool) -> String {
         if toggle_on && role.is_curator() {
             return "approved".to_owned();
@@ -366,12 +369,14 @@ impl PersonalMixBuilder {
         let source_ref = format!("{SOURCE_REF_PREFIX}{user_id}");
         let existing = self
             .playlists
-            .find_by_source(user_id, &source_ref)
+            .owned_by(user_id)
+            .find_by_source(&source_ref)
             .await
             .map_err(store_fault)?;
         if !force && let Some(id) = &existing {
             let updated_at = self
                 .playlists
+                .owned_by(user_id)
                 .get(id)
                 .await
                 .map_err(store_fault)?
@@ -532,14 +537,14 @@ impl PersonalMixBuilder {
                         continue;
                     }
                     pool.push(QueueItemLight {
-                        release_group_mbid: group_mbid,
-                        album_name: group.name,
+                        musicbrainz_id: group_mbid,
+                        title: group.name,
                         artist_name: if group.artist_name.is_empty() {
                             artist.artist_name.clone()
                         } else {
                             group.artist_name
                         },
-                        artist_mbid: artist_mbid.clone(),
+                        artist_id: artist_mbid.clone(),
                         recommendation_reason: format!("Similar to {seed_name}"),
                         cover_url: None,
                         is_wildcard: false,
@@ -562,26 +567,26 @@ impl PersonalMixBuilder {
             if tracks.len() >= needed {
                 break;
             }
-            if !top.contains_key(&item.artist_mbid) {
+            if !top.contains_key(&item.artist_id) {
                 let recording = self
                     .sources
-                    .top_recording(&item.artist_mbid)
+                    .top_recording(&item.artist_id)
                     .await
                     .unwrap_or_else(|cause| {
                         tracing::debug!(%cause, "personal mix: top recording unavailable");
                         None
                     });
-                top.insert(item.artist_mbid.clone(), recording);
+                top.insert(item.artist_id.clone(), recording);
             }
-            let Some(Some(recording)) = top.get(&item.artist_mbid) else {
+            let Some(Some(recording)) = top.get(&item.artist_id) else {
                 continue;
             };
             tracks.push(MixTrack {
                 track_name: recording.title.clone(),
                 artist_name: item.artist_name,
-                album_name: item.album_name,
-                release_group_mbid: item.release_group_mbid,
-                artist_mbid: Some(item.artist_mbid),
+                album_name: item.title,
+                release_group_mbid: item.musicbrainz_id,
+                artist_mbid: Some(item.artist_id),
                 recording_mbid: recording.recording_mbid.clone(),
                 // Owned albums never enter the pools.
                 in_library: false,
@@ -605,30 +610,23 @@ impl PersonalMixBuilder {
         if groups.is_empty() {
             return Ok(());
         }
-        let sql = format!(
-            "SELECT t.id, lower(ae.release_group_mbid), lower(te.recording_mbid), \
-             t.track_number, t.disc_number FROM local_tracks t \
-             JOIN local_albums b ON b.id = t.local_album_id \
-             JOIN local_album_external_identities ae ON ae.local_album_id = b.id \
-             JOIN local_track_external_identities te \
-             ON te.local_track_id = t.id AND te.provider = 'musicbrainz' \
-             WHERE b.retired_into_album_id IS NULL AND t.availability = 'indexed' \
-             AND te.recording_mbid IS NOT NULL AND lower(ae.release_group_mbid) IN ({})",
-            vec!["?"; groups.len()].join(", ")
-        );
-        let mut query =
-            sqlx::query_as::<_, (String, String, String, Option<i64>, Option<i64>)>(&sql);
-        for group in &groups {
-            query = query.bind(group);
-        }
-        let rows = query
-            .fetch_all(self.requests.library.pool())
+        let text = super::sql::mix_library_files(ListLen::new(groups.len()));
+        let by_key: HashMap<(String, String), LibraryFile> = self
+            .requests
+            .library
+            .db()
+            .read("mix.library_files", move |conn| {
+                let mut statement = conn.prepare(&text)?;
+                let rows = statement.query_map(params_from_iter(&groups), |row| {
+                    Ok((
+                        (row.get(1)?, row.get(2)?),
+                        (row.get(0)?, row.get(3)?, row.get(4)?),
+                    ))
+                })?;
+                Ok::<_, DbError>(rows.collect::<rusqlite::Result<_>>()?)
+            })
             .await
             .map_err(|error| RequestsError::internal(&error))?;
-        let by_key: HashMap<(String, String), LibraryFile> = rows
-            .into_iter()
-            .map(|(id, group, recording, number, disc)| ((group, recording), (id, number, disc)))
-            .collect();
         for track in mix.iter_mut().filter(|track| track.in_library) {
             let Some(recording) = &track.recording_mbid else {
                 continue;
@@ -654,10 +652,10 @@ impl PersonalMixBuilder {
         source_ref: &str,
         mix: &[MixTrack],
     ) -> Result<String, RequestsError> {
+        let playlists = self.playlists.owned_by(user_id);
         let playlist_id = match existing {
             Some(id) => {
-                let entries: Vec<String> = self
-                    .playlists
+                let entries: Vec<String> = playlists
                     .tracks(&id)
                     .await
                     .map_err(store_fault)?
@@ -665,31 +663,25 @@ impl PersonalMixBuilder {
                     .map(|track| track.id)
                     .collect();
                 if !entries.is_empty() {
-                    self.playlists
-                        .remove(&id, &entries)
-                        .await
-                        .map_err(store_fault)?;
+                    playlists.remove(&id, &entries).await.map_err(store_fault)?;
                 }
                 id
             }
-            None => match self
-                .playlists
-                .create(user_id, PLAYLIST_NAME, Some(source_ref))
+            None => match playlists
+                .create(PLAYLIST_NAME, Some(source_ref))
                 .await
                 .map_err(store_fault)?
             {
                 Some(id) => id,
-                None => self
-                    .playlists
-                    .find_by_source(user_id, source_ref)
+                None => playlists
+                    .find_by_source(source_ref)
                     .await
                     .map_err(store_fault)?
                     .ok_or_else(|| RequestsError::internal(&"mix playlist vanished on create"))?,
             },
         };
         let entries = mix.iter().map(entry_for).collect();
-        match self
-            .playlists
+        match playlists
             .insert(&playlist_id, None, entries)
             .await
             .map_err(store_fault)?
@@ -760,13 +752,20 @@ impl PersonalMixBuilder {
         &self,
         user_id: &str,
     ) -> Result<Option<(Role, Option<String>)>, RequestsError> {
-        let row: Option<(String, Option<String>)> = sqlx::query_as(
-            "SELECT role, COALESCE(username_display, username) FROM auth_users WHERE id = ?",
-        )
-        .bind(user_id)
-        .fetch_optional(self.requests.library.pool())
-        .await
-        .map_err(|error| RequestsError::internal(&error))?;
+        let user_id = user_id.to_owned();
+        let row: Option<(String, Option<String>)> = self
+            .requests
+            .library
+            .db()
+            .read("mix.owner", move |conn| {
+                conn.query_row(super::sql::MIX_OWNER.text(), [user_id], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })
+                .optional()
+                .map_err(DbError::from)
+            })
+            .await
+            .map_err(|error| RequestsError::internal(&error))?;
         Ok(row.map(|(role, name)| (Role::from_stored(&role), name)))
     }
 }

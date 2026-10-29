@@ -5,9 +5,9 @@
 //! dismiss, cancel), and the quality-upgrade worklist and asks. Held files
 //! are in [`crate::held`].
 //!
-//! Every route sits inside the session gate. Tasks follow v2's ownership:
-//! admins see and act on every task, everyone else on their own (another
-//! user's task answers 403). Reimport and quarantine are admin only. Live
+//! Every route sits inside the session gate. Admins see and act on every
+//! task, everyone else on their own (another user's task answers 403).
+//! Reimport and quarantine are admin only. Live
 //! updates come over the shared event stream (`downloads.changed` and
 //! `download_progress`), not a per-task stream.
 
@@ -30,11 +30,11 @@ use super::state::TaskStatus;
 use super::store::QuarantineRow;
 use super::upgrades::{UpgradeAsk, UpgradeError, UpgradeOutcome, Upgrades};
 use crate::dispatch::DispatchTarget;
+use crate::downloads::worker::{DownloadWorker, ReimportError};
 use crate::reason::{Reason, ReasonKind};
 use crate::requests::error::RequestsError;
 use crate::search_jobs::candidates::SearchCandidateView;
 use crate::search_jobs::{AlbumSearch, JobView, SearchJobError, SearchJobs, StartOutcome};
-use crate::worker::{DownloadWorker, ReimportError};
 use droppedneedle_auth::{Admin, Curator, Principal, User};
 use droppedneedle_kernel::error::ApiError;
 use droppedneedle_kernel::extract::{ValidJson, ValidQuery};
@@ -107,8 +107,7 @@ pub struct ImportDecisionView {
     pub decided_at: f64,
 }
 
-/// One download task as the queue shows it. Field names match v2's
-/// `DownloadTaskResponse`, so the web UI reads them unchanged.
+/// One download task as the queue shows it.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct DownloadTaskResponse {
     pub id: String,
@@ -382,7 +381,7 @@ pub struct QuarantineEntry {
     pub id: i64,
     /// `soulseek`, `usenet` or `plugin:<key>`.
     pub source: String,
-    /// v2's client label: `slskd`, `sabnzbd`, or the source for plugins.
+    /// The client label: `slskd`, `sabnzbd`, or the source for plugins.
     pub client_id: String,
     /// Soulseek peer, empty for other sources.
     pub username: String,
@@ -1129,6 +1128,10 @@ pub struct SearchJobResponse {
 pub struct PickRequest {
     /// `candidate_index` of the candidate to download.
     pub candidate_index: usize,
+    /// Download it even though it is outside the download settings (its
+    /// `refusal` is not empty). Without it such a pick answers 409.
+    #[serde(default)]
+    pub confirm_policy_break: bool,
 }
 
 /// The download a pick started.
@@ -1154,6 +1157,13 @@ impl From<SearchJobError> for ApiError {
             },
             SearchJobError::Invalid(message) => RequestsError::InvalidInput { message },
             SearchJobError::Conflict(message) => RequestsError::Conflict { message },
+            SearchJobError::PolicyBreak(refusal) => {
+                return ApiError::conflict(format!(
+                    "This candidate is outside your download settings: {}. Confirm to download it anyway.",
+                    refusal.text()
+                ))
+                .with_details(serde_json::json!({ "refusal": refusal }));
+            }
             SearchJobError::Refused(error) => error,
             SearchJobError::Internal(cause) => RequestsError::internal(&cause),
         })
@@ -1258,7 +1268,12 @@ pub async fn pick_candidate_handler(
     ValidJson(body): ValidJson<PickRequest>,
 ) -> Result<Json<PickResponse>, ApiError> {
     let task_id = search
-        .pick(&principal, &job_id, body.candidate_index)
+        .pick(
+            &principal,
+            &job_id,
+            body.candidate_index,
+            body.confirm_policy_break,
+        )
         .await?;
     Ok(Json(PickResponse { task_id }))
 }

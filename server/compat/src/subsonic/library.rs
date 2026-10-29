@@ -2,21 +2,20 @@
 //! bookmarks, info, lyrics, genres, user, scan, discovery.
 //! v2: the Subsonic router's endpoint functions.
 
-use super::auth::Principal;
 use super::browse::validate_music_folder;
 use super::error::{NOT_AUTHORIZED, NOT_FOUND, SubsonicError};
 use super::ids::{IdKind, decode, decode_expect, encode};
 use super::models::{
-    Render, SAlbumInfo, SArtistInfo, SBookmark, SLyrics, SLyricsLine, SPlayQueue,
-    SPlayQueueByIndex, SPlaylist, SScanStatus, SStructuredLyrics, SUser,
+    SAlbumInfo, SArtistInfo, SBookmark, SLyrics, SLyricsLine, SPlayQueue, SPlayQueueByIndex,
+    SPlaylist, SScanStatus, SSearchResult, SStructuredLyrics, SUser, Wrap,
 };
 use super::params::SubsonicParameters;
 use super::picture::{INFO_SIZES, PictureKind};
-use super::store::{PlaylistDetail, Store};
-use super::stream::AudioBackend;
-use super::value::{Val, obj};
-use super::views::iso;
+use super::store::{PlaylistDetail, PlaylistRecord};
+use super::views::{ViewTrack, iso};
 use super::{Ctx, Outcome};
+use crate::adapters::library::CompatError;
+use crate::adapters::principal::CompatPrincipal;
 
 /// Max play-queue items (v2 `_MAX_QUEUE_ITEMS`).
 pub const MAX_QUEUE_ITEMS: usize = 500;
@@ -29,122 +28,118 @@ pub const FAVORITE_KINDS: &[IdKind] = &[IdKind::Artist, IdKind::Album, IdKind::T
 /// Playlist detail with streamable entries only: legacy/outbound
 /// entries and dead file links are skipped, and the count matches what
 /// is served (#181).
-pub async fn playlist_detail<P: Principal, S: Store, B: AudioBackend>(
-    ctx: &'_ Ctx<'_, P, S, B>,
+pub async fn playlist_detail(
+    ctx: &Ctx<'_>,
     detail: &PlaylistDetail,
 ) -> Result<SPlaylist, SubsonicError> {
-    let mut songs = Vec::new();
-    let mut total = 0i64;
+    let mut tracks = Vec::new();
     for entry in &detail.tracks {
         let Some(file_id) = entry.library_file_id.as_deref() else {
             continue;
         };
-        let Some(track) = ctx
-            .store
-            .get_track(file_id)
-            .await
-            .map_err(Ctx::<P, S, B>::store_err)?
-        else {
-            continue;
-        };
-        total += track.duration_seconds.round() as i64;
-        songs.push(ctx.child(&track));
+        if let Some(track) = ctx.store.get_track(file_id).await.map_err(Ctx::store_err)? {
+            tracks.push(track);
+        }
     }
-    let record = &detail.record;
     let owner = if detail.is_owner {
         ctx.user()?.username().to_owned()
     } else {
         detail.owner_name.clone()
     };
-    Ok(SPlaylist {
+    Ok(playlist_view(
+        ctx,
+        &detail.record,
+        &tracks,
+        owner,
+        detail.is_owner,
+    ))
+}
+
+/// A playlist with the tracks it serves.
+fn playlist_view(
+    ctx: &Ctx<'_>,
+    record: &PlaylistRecord,
+    tracks: &[ViewTrack],
+    owner: String,
+    is_owner: bool,
+) -> SPlaylist {
+    let total = tracks
+        .iter()
+        .map(|track| track.duration_seconds.round() as i64)
+        .sum::<i64>();
+    let songs = tracks
+        .iter()
+        .map(|track| ctx.child(track))
+        .collect::<Vec<_>>();
+    SPlaylist {
         id: encode(IdKind::Playlist, &record.id),
         name: record.name.clone(),
         comment: None,
         owner: Some(owner),
         public: Some(record.is_public),
-        readonly: !detail.is_owner,
+        readonly: !is_owner,
         songCount: songs.len() as i64,
         duration: Some(total),
         created: record.created_at.clone(),
         changed: record.changed_at.clone(),
         coverArt: Some(encode(IdKind::Playlist, &record.id)),
         entry: Some(songs),
-    })
+    }
 }
 
-/// Playlist list with streamable-only counts (#181); redacted private
-/// rows are skipped.
-pub async fn playlists<P: Principal, S: Store, B: AudioBackend>(
-    ctx: &'_ Ctx<'_, P, S, B>,
-) -> Result<Outcome, SubsonicError> {
+/// The playlists the caller may read, with streamable-only counts (#181).
+pub async fn playlists(ctx: &Ctx<'_>) -> Result<Outcome, SubsonicError> {
     let user_id = ctx.user()?.user_id().to_owned();
     let views = ctx
         .store
         .get_all_playlists(&user_id)
         .await
-        .map_err(Ctx::<P, S, B>::store_err)?;
-    let streamable = ctx
-        .store
-        .get_streamable_counts()
-        .await
-        .map_err(Ctx::<P, S, B>::store_err)?;
+        .map_err(Ctx::store_err)?;
     let mut out = Vec::new();
     for view in &views {
-        let Some(record) = view.record.as_ref() else {
-            continue;
-        };
+        let record = &view.record;
         let owner = if view.is_owner {
             ctx.user()?.username().to_owned()
         } else {
             view.owner_name.clone()
         };
-        let (song_count, duration) = streamable.get(&record.id).copied().unwrap_or((0, 0));
-        out.push(
-            SPlaylist {
-                id: encode(IdKind::Playlist, &record.id),
-                name: record.name.clone(),
-                comment: None,
-                owner: Some(owner),
-                public: Some(record.is_public),
-                readonly: !view.is_owner,
-                songCount: song_count,
-                duration: Some(duration),
-                created: record.created_at.clone(),
-                changed: record.changed_at.clone(),
-                coverArt: Some(encode(IdKind::Playlist, &record.id)),
-                entry: None,
-            }
-            .render(),
-        );
+        let (song_count, duration) = (view.song_count, view.duration);
+        out.push(SPlaylist {
+            id: encode(IdKind::Playlist, &record.id),
+            name: record.name.clone(),
+            comment: None,
+            owner: Some(owner),
+            public: Some(record.is_public),
+            readonly: !view.is_owner,
+            songCount: song_count,
+            duration: Some(duration),
+            created: record.created_at.clone(),
+            changed: record.changed_at.clone(),
+            coverArt: Some(encode(IdKind::Playlist, &record.id)),
+            entry: None,
+        });
     }
-    Ok(Outcome::keyed(
-        "playlists",
-        obj(vec![("playlist", Val::List(out))]),
-    ))
+    Outcome::keyed("playlists", Wrap("playlist", out))
 }
 
 /// Playlist detail.
-pub async fn playlist<P: Principal, S: Store, B: AudioBackend>(
-    ctx: &'_ Ctx<'_, P, S, B>,
-) -> Result<Outcome, SubsonicError> {
+pub async fn playlist(ctx: &Ctx<'_>) -> Result<Outcome, SubsonicError> {
     let pid = decode_expect(&ctx.p("id")?.unwrap_or_default(), IdKind::Playlist)?;
     let user_id = ctx.user()?.user_id().to_owned();
     let detail = ctx
         .store
         .get_playlist_with_tracks(&pid, &user_id)
         .await
-        .map_err(Ctx::<P, S, B>::store_err)?
+        .map_err(Ctx::store_err)?
         .ok_or_else(|| SubsonicError::new(NOT_FOUND, "Playlist not found"))?;
-    Ok(Outcome::keyed(
-        "playlist",
-        playlist_detail(ctx, &detail).await?.render(),
-    ))
+    Outcome::keyed("playlist", playlist_detail(ctx, &detail).await?)
 }
 
-/// Create a playlist, or replace contents when `playlistId` is given.
-pub async fn create_playlist<P: Principal, S: Store, B: AudioBackend>(
-    ctx: &'_ Ctx<'_, P, S, B>,
-) -> Result<Outcome, SubsonicError> {
+/// Create a playlist, or replace its contents when `playlistId` is given.
+/// Every read comes first and the change is one write with nothing read
+/// back, so a busy answer means nothing was written and asking again is
+/// safe. The answer lists the songs as read before the write.
+pub async fn create_playlist(ctx: &Ctx<'_>) -> Result<Outcome, SubsonicError> {
     let user_id = ctx.user()?.user_id().to_owned();
     let song_file_ids = ctx
         .plist("songId")?
@@ -152,31 +147,20 @@ pub async fn create_playlist<P: Principal, S: Store, B: AudioBackend>(
         .map(|sid| decode_expect(sid, IdKind::Track))
         .collect::<Result<Vec<_>, _>>()?;
     let song_file_ids = current_tracks(ctx, song_file_ids).await?;
-    let pid = match ctx.p("playlistId")? {
+    let mut tracks = Vec::new();
+    for fid in &song_file_ids {
+        if let Some(track) = ctx.store.get_track(fid).await.map_err(Ctx::store_err)? {
+            tracks.push(track);
+        }
+    }
+    let record = match ctx.p("playlistId")? {
         Some(playlist_id) => {
             let pid = decode_expect(&playlist_id, IdKind::Playlist)?;
-            let existing = ctx
-                .store
-                .get_playlist_tracks(&pid)
+            let name = ctx.p("name")?;
+            ctx.store
+                .replace_playlist(&pid, &user_id, name.as_deref(), &song_file_ids)
                 .await
-                .map_err(Ctx::<P, S, B>::store_err)?;
-            if !existing.is_empty() {
-                let entry_ids = existing
-                    .iter()
-                    .map(|entry| entry.id.clone())
-                    .collect::<Vec<_>>();
-                ctx.store
-                    .remove_playlist_tracks(&pid, &user_id, &entry_ids)
-                    .await
-                    .map_err(Ctx::<P, S, B>::store_err)?;
-            }
-            if let Some(name) = ctx.p("name")? {
-                ctx.store
-                    .update_playlist(&pid, &user_id, &name)
-                    .await
-                    .map_err(Ctx::<P, S, B>::store_err)?;
-            }
-            pid
+                .map_err(Ctx::store_err)?
         }
         None => {
             let name = ctx.p("name")?.unwrap_or_default();
@@ -184,34 +168,24 @@ pub async fn create_playlist<P: Principal, S: Store, B: AudioBackend>(
                 return Err(SubsonicError::missing("name"));
             }
             ctx.store
-                .create_playlist(&name, &user_id)
+                .create_playlist(&name, &user_id, &song_file_ids)
                 .await
-                .map_err(Ctx::<P, S, B>::store_err)?
-                .id
+                .map_err(Ctx::store_err)?
         }
     };
-    for fid in &song_file_ids {
-        ctx.store
-            .add_playlist_file(&pid, fid, &user_id)
-            .await
-            .map_err(Ctx::<P, S, B>::store_err)?;
-    }
-    let detail = ctx
-        .store
-        .get_playlist_with_tracks(&pid, &user_id)
-        .await
-        .map_err(Ctx::<P, S, B>::store_err)?
-        .ok_or_else(|| SubsonicError::new(NOT_FOUND, "Playlist not found"))?;
-    Ok(Outcome::keyed(
+    let owner = ctx.user()?.username().to_owned();
+    Outcome::keyed(
         "playlist",
-        playlist_detail(ctx, &detail).await?.render(),
-    ))
+        playlist_view(ctx, &record, &tracks, owner, true),
+    )
 }
 
-/// Update a playlist: rename, visibility, remove-by-index, append.
-pub async fn update_playlist<P: Principal, S: Store, B: AudioBackend>(
-    ctx: &'_ Ctx<'_, P, S, B>,
-) -> Result<Outcome, SubsonicError> {
+/// Update a playlist: rename, visibility, remove-by-index, append. Every
+/// read and check comes first, and each kind of change is one write. A
+/// request asking for more than one kind makes more than one write, so
+/// after the first lands a busy database answers as a failure: a busy
+/// answer tells the app nothing was done and to ask again.
+pub async fn update_playlist(ctx: &Ctx<'_>) -> Result<Outcome, SubsonicError> {
     let pid = decode_expect(&ctx.p("playlistId")?.unwrap_or_default(), IdKind::Playlist)?;
     let user_id = ctx.user()?.user_id().to_owned();
     let add_file_ids = ctx
@@ -230,57 +204,78 @@ pub async fn update_playlist<P: Principal, S: Store, B: AudioBackend>(
             Some(2_147_483_647),
         )?);
     }
+    let public = match ctx.p("public")? {
+        Some(public) => {
+            let single = SubsonicParameters::new(vec![("public".to_owned(), public)]);
+            Some(single.boolean("public", false)?)
+        }
+        None => None,
+    };
+    // Indexes are read against the caller's own playlist. On anyone else's
+    // the remove is still sent, so it answers the usual refusal whatever
+    // the index and never hints at the playlist's length.
+    let (remove_ids, not_theirs) = if remove_indices.is_empty() {
+        (Vec::new(), false)
+    } else {
+        match ctx
+            .store
+            .get_playlist_tracks(&pid, &user_id)
+            .await
+            .map_err(Ctx::store_err)?
+        {
+            Some(entries) => (
+                remove_indices
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|index| entries.get(index as usize).map(|entry| entry.id.clone()))
+                    .collect::<Vec<_>>(),
+                false,
+            ),
+            None => (Vec::new(), true),
+        }
+    };
+    let mut wrote = false;
+    let failed = |wrote: bool| {
+        move |err: CompatError| Ctx::store_err(if wrote { err.after_write() } else { err })
+    };
     if let Some(name) = ctx.p("name")? {
         ctx.store
             .update_playlist(&pid, &user_id, &name)
             .await
-            .map_err(Ctx::<P, S, B>::store_err)?;
+            .map_err(failed(wrote))?;
+        wrote = true;
     }
-    if let Some(public) = ctx.p("public")? {
-        let single = SubsonicParameters::new(vec![("public".to_owned(), public)]);
-        let is_public = single.boolean("public", false)?;
+    if let Some(is_public) = public {
         ctx.store
             .set_playlist_public(&pid, &user_id, is_public)
             .await
-            .map_err(Ctx::<P, S, B>::store_err)?;
+            .map_err(failed(wrote))?;
+        wrote = true;
     }
-    if !remove_indices.is_empty() {
-        let entries = ctx
-            .store
-            .get_playlist_tracks(&pid)
-            .await
-            .map_err(Ctx::<P, S, B>::store_err)?;
-        let ids = remove_indices
-            .into_iter()
-            .flatten()
-            .filter_map(|index| entries.get(index as usize).map(|entry| entry.id.clone()))
-            .collect::<Vec<_>>();
-        if !ids.is_empty() {
-            ctx.store
-                .remove_playlist_tracks(&pid, &user_id, &ids)
-                .await
-                .map_err(Ctx::<P, S, B>::store_err)?;
-        }
-    }
-    for fid in &add_file_ids {
+    if !remove_ids.is_empty() || not_theirs {
         ctx.store
-            .add_playlist_file(&pid, fid, &user_id)
+            .remove_playlist_tracks(&pid, &user_id, &remove_ids)
             .await
-            .map_err(Ctx::<P, S, B>::store_err)?;
+            .map_err(failed(wrote))?;
+        wrote = true;
+    }
+    if !add_file_ids.is_empty() {
+        ctx.store
+            .add_playlist_files(&pid, &add_file_ids, &user_id)
+            .await
+            .map_err(failed(wrote))?;
     }
     Ok(Outcome::ok())
 }
 
 /// Delete a playlist.
-pub async fn delete_playlist<P: Principal, S: Store, B: AudioBackend>(
-    ctx: &'_ Ctx<'_, P, S, B>,
-) -> Result<Outcome, SubsonicError> {
+pub async fn delete_playlist(ctx: &Ctx<'_>) -> Result<Outcome, SubsonicError> {
     let pid = decode_expect(&ctx.p("id")?.unwrap_or_default(), IdKind::Playlist)?;
     let user_id = ctx.user()?.user_id().to_owned();
     ctx.store
         .delete_playlist(&pid, &user_id)
         .await
-        .map_err(Ctx::<P, S, B>::store_err)?;
+        .map_err(Ctx::store_err)?;
     Ok(Outcome::ok())
 }
 
@@ -288,8 +283,8 @@ pub async fn delete_playlist<P: Principal, S: Store, B: AudioBackend>(
 /// album or artist, an alias, or the old id of a missing track that
 /// continued into another, becomes the id of the one that holds it. An id
 /// nothing live holds is kept, so it answers as an unknown id does.
-pub async fn current_id<P: Principal, S: Store, B: AudioBackend>(
-    ctx: &'_ Ctx<'_, P, S, B>,
+pub async fn current_id(
+    ctx: &Ctx<'_>,
     kind: IdKind,
     internal: String,
 ) -> Result<String, SubsonicError> {
@@ -300,13 +295,13 @@ pub async fn current_id<P: Principal, S: Store, B: AudioBackend>(
         .store
         .current_id(kind, &internal)
         .await
-        .map_err(Ctx::<P, S, B>::store_err)?
+        .map_err(Ctx::store_err)?
         .unwrap_or(internal))
 }
 
 /// Track ids as they are now, one read each, in order.
-async fn current_tracks<P: Principal, S: Store, B: AudioBackend>(
-    ctx: &'_ Ctx<'_, P, S, B>,
+async fn current_tracks(
+    ctx: &Ctx<'_>,
     file_ids: Vec<String>,
 ) -> Result<Vec<String>, SubsonicError> {
     let mut current = Vec::with_capacity(file_ids.len());
@@ -318,9 +313,7 @@ async fn current_tracks<P: Principal, S: Store, B: AudioBackend>(
 
 /// (kind, internal id) pairs from `id` (prefix-routed) + `albumId` +
 /// `artistId`. Non-favorite `id` prefixes are ignored.
-fn collect_star_targets(
-    ctx: &Ctx<impl Principal, impl Store, impl AudioBackend>,
-) -> Result<Vec<(IdKind, String)>, SubsonicError> {
+fn collect_star_targets(ctx: &Ctx<'_>) -> Result<Vec<(IdKind, String)>, SubsonicError> {
     let mut targets = Vec::new();
     for sid in ctx.plist("id")? {
         let (kind, internal) = decode(&sid)?;
@@ -339,9 +332,7 @@ fn collect_star_targets(
 
 /// Validated star targets, each album and artist at its current id and
 /// every target once: empty -> 10, unknown target -> 70.
-pub async fn validated_star_targets<P: Principal, S: Store, B: AudioBackend>(
-    ctx: &'_ Ctx<'_, P, S, B>,
-) -> Result<Vec<(IdKind, String)>, SubsonicError> {
+pub async fn validated_star_targets(ctx: &Ctx<'_>) -> Result<Vec<(IdKind, String)>, SubsonicError> {
     let mut targets = Vec::new();
     for (kind, internal) in collect_star_targets(ctx)? {
         let target = (kind, current_id(ctx, kind, internal).await?);
@@ -359,7 +350,7 @@ pub async fn validated_star_targets<P: Principal, S: Store, B: AudioBackend>(
         .store
         .missing_targets(&targets)
         .await
-        .map_err(Ctx::<P, S, B>::store_err)?;
+        .map_err(Ctx::store_err)?;
     if !missing.is_empty() {
         return Err(SubsonicError::new(NOT_FOUND, "Favorite target not found"));
     }
@@ -367,22 +358,19 @@ pub async fn validated_star_targets<P: Principal, S: Store, B: AudioBackend>(
 }
 
 /// Star (`add=true`) or unstar.
-pub async fn star<P: Principal, S: Store, B: AudioBackend>(
-    ctx: &'_ Ctx<'_, P, S, B>,
-    add: bool,
-) -> Result<Outcome, SubsonicError> {
+pub async fn star(ctx: &Ctx<'_>, add: bool) -> Result<Outcome, SubsonicError> {
     let targets = validated_star_targets(ctx).await?;
     let user_id = ctx.user()?.user_id().to_owned();
     ctx.store
         .apply_favorites(&user_id, &targets, add)
         .await
-        .map_err(Ctx::<P, S, B>::store_err)?;
+        .map_err(Ctx::store_err)?;
     Ok(Outcome::ok())
 }
 
 /// Starred artists/albums/songs (dead links skipped).
-pub async fn starred_lists<P: Principal, S: Store, B: AudioBackend>(
-    ctx: &'_ Ctx<'_, P, S, B>,
+pub async fn starred_lists(
+    ctx: &Ctx<'_>,
 ) -> Result<
     (
         Vec<super::views::ViewArtist>,
@@ -397,13 +385,13 @@ pub async fn starred_lists<P: Principal, S: Store, B: AudioBackend>(
         .store
         .list_favorites(&user_id, IdKind::Artist)
         .await
-        .map_err(Ctx::<P, S, B>::store_err)?
+        .map_err(Ctx::store_err)?
     {
         if let Some((artist, _)) = ctx
             .store
             .get_artist_with_albums(&mbid)
             .await
-            .map_err(Ctx::<P, S, B>::store_err)?
+            .map_err(Ctx::store_err)?
         {
             artists.push(artist);
         }
@@ -413,14 +401,9 @@ pub async fn starred_lists<P: Principal, S: Store, B: AudioBackend>(
         .store
         .list_favorites(&user_id, IdKind::Album)
         .await
-        .map_err(Ctx::<P, S, B>::store_err)?
+        .map_err(Ctx::store_err)?
     {
-        if let Some(album) = ctx
-            .store
-            .get_album(&rg)
-            .await
-            .map_err(Ctx::<P, S, B>::store_err)?
-        {
+        if let Some(album) = ctx.store.get_album(&rg).await.map_err(Ctx::store_err)? {
             albums.push(album);
         }
     }
@@ -429,14 +412,9 @@ pub async fn starred_lists<P: Principal, S: Store, B: AudioBackend>(
         .store
         .list_favorites(&user_id, IdKind::Track)
         .await
-        .map_err(Ctx::<P, S, B>::store_err)?
+        .map_err(Ctx::store_err)?
     {
-        if let Some(track) = ctx
-            .store
-            .get_track(&fid)
-            .await
-            .map_err(Ctx::<P, S, B>::store_err)?
-        {
+        if let Some(track) = ctx.store.get_track(&fid).await.map_err(Ctx::store_err)? {
             songs.push(track);
         }
     }
@@ -444,90 +422,42 @@ pub async fn starred_lists<P: Principal, S: Store, B: AudioBackend>(
 }
 
 /// ID3 starred.
-pub async fn starred2<P: Principal, S: Store, B: AudioBackend>(
-    ctx: &'_ Ctx<'_, P, S, B>,
-) -> Result<Outcome, SubsonicError> {
+pub async fn starred2(ctx: &Ctx<'_>) -> Result<Outcome, SubsonicError> {
     validate_music_folder(&ctx.params)?;
     let (artists, albums, songs) = starred_lists(ctx).await?;
-    Ok(Outcome::keyed(
+    Outcome::keyed(
         "starred2",
-        obj(vec![
-            (
-                "artist",
-                Val::List(
-                    artists
-                        .iter()
-                        .map(|artist| ctx.artist_id3(artist).render())
-                        .collect(),
-                ),
-            ),
-            (
-                "album",
-                Val::List(
-                    albums
-                        .iter()
-                        .map(|album| super::views::to_album_id3(album).render())
-                        .collect(),
-                ),
-            ),
-            (
-                "song",
-                Val::List(
-                    songs
-                        .iter()
-                        .map(|track| ctx.child(track).render())
-                        .collect(),
-                ),
-            ),
-        ]),
-    ))
+        SSearchResult {
+            artist: artists
+                .iter()
+                .map(|artist| ctx.artist_id3(artist))
+                .collect(),
+            album: albums.iter().map(super::views::to_album_id3).collect(),
+            song: songs.iter().map(|track| ctx.child(track)).collect(),
+        },
+    )
 }
 
 /// File-structure starred.
-pub async fn starred<P: Principal, S: Store, B: AudioBackend>(
-    ctx: &'_ Ctx<'_, P, S, B>,
-) -> Result<Outcome, SubsonicError> {
+pub async fn starred(ctx: &Ctx<'_>) -> Result<Outcome, SubsonicError> {
     validate_music_folder(&ctx.params)?;
     let (artists, albums, songs) = starred_lists(ctx).await?;
-    Ok(Outcome::keyed(
+    Outcome::keyed(
         "starred",
-        obj(vec![
-            (
-                "artist",
-                Val::List(
-                    artists
-                        .iter()
-                        .map(|artist| ctx.artist_file(artist).render())
-                        .collect(),
-                ),
-            ),
-            (
-                "album",
-                Val::List(
-                    albums
-                        .iter()
-                        .map(|album| super::views::to_album_child(album).render())
-                        .collect(),
-                ),
-            ),
-            (
-                "song",
-                Val::List(
-                    songs
-                        .iter()
-                        .map(|track| ctx.child(track).render())
-                        .collect(),
-                ),
-            ),
-        ]),
-    ))
+        SSearchResult {
+            artist: artists
+                .iter()
+                .map(|artist| ctx.artist_file(artist))
+                .collect(),
+            album: albums.iter().map(super::views::to_album_child).collect(),
+            song: songs.iter().map(|track| ctx.child(track)).collect(),
+        },
+    )
 }
 
 /// Set the caller's rating of an artist, album or track at its current
 /// id, 1 to 5, or clear it with 0. An unknown target is 70.
-pub async fn set_rating<P: Principal, S: Store, B: AudioBackend>(
-    ctx: &'_ Ctx<'_, P, S, B>,
-) -> Result<Outcome, SubsonicError> {
+pub async fn set_rating(ctx: &Ctx<'_>) -> Result<Outcome, SubsonicError> {
     let rating = ctx
         .pint("rating", None, Some(0), Some(5))?
         .ok_or_else(|| SubsonicError::missing("rating"))?;
@@ -537,7 +467,7 @@ pub async fn set_rating<P: Principal, S: Store, B: AudioBackend>(
         .store
         .missing_targets(&[(kind, internal.clone())])
         .await
-        .map_err(Ctx::<P, S, B>::store_err)?;
+        .map_err(Ctx::store_err)?;
     if !FAVORITE_KINDS.contains(&kind) || !missing.is_empty() {
         return Err(SubsonicError::new(NOT_FOUND, "Rating target not found"));
     }
@@ -547,16 +477,14 @@ pub async fn set_rating<P: Principal, S: Store, B: AudioBackend>(
     ctx.store
         .set_rating(&user_id, kind, &internal, rating)
         .await
-        .map_err(Ctx::<P, S, B>::store_err)?;
+        .map_err(Ctx::store_err)?;
     Ok(Outcome::ok())
 }
 
 /// Scrobble: `time[]` is positionally parallel to `id[]` (a count
 /// mismatch is code 0); `submission=false` records now-playing for the
 /// first id only.
-pub async fn scrobble<P: Principal, S: Store, B: AudioBackend>(
-    ctx: &'_ Ctx<'_, P, S, B>,
-) -> Result<Outcome, SubsonicError> {
+pub async fn scrobble(ctx: &Ctx<'_>) -> Result<Outcome, SubsonicError> {
     let ids = ctx.plist("id")?;
     if ids.is_empty() {
         return Err(SubsonicError::missing("id"));
@@ -587,9 +515,13 @@ pub async fn scrobble<P: Principal, S: Store, B: AudioBackend>(
         ctx.store
             .now_playing(&fid, &user_id, client.as_deref(), &user_name)
             .await
-            .map_err(Ctx::<P, S, B>::store_err)?;
+            .map_err(Ctx::store_err)?;
         return Ok(Outcome::ok());
     }
+    // Every id is resolved before the first play is recorded, so a busy
+    // read answers before anything is written and asking again records
+    // each play once.
+    let mut plays = Vec::with_capacity(ids.len());
     for (index, sid) in ids.iter().enumerate() {
         let fid = decode_expect(sid, IdKind::Track)?;
         let fid = current_id(ctx, IdKind::Track, fid).await?;
@@ -598,23 +530,24 @@ pub async fn scrobble<P: Principal, S: Store, B: AudioBackend>(
             .copied()
             .flatten()
             .map(|ms| ms as f64 / 1000.0);
+        plays.push((fid, played_at));
+    }
+    for (fid, played_at) in plays {
         ctx.store
             .scrobble(&fid, &user_id, client.as_deref(), played_at, &user_name)
             .await
-            .map_err(Ctx::<P, S, B>::store_err)?;
+            .map_err(Ctx::store_err)?;
     }
     Ok(Outcome::ok())
 }
 
 /// Presence: song children plus username/minutesAgo/playerId/playerName.
-pub async fn now_playing<P: Principal, S: Store, B: AudioBackend>(
-    ctx: &'_ Ctx<'_, P, S, B>,
-) -> Result<Outcome, SubsonicError> {
+pub async fn now_playing(ctx: &Ctx<'_>) -> Result<Outcome, SubsonicError> {
     let rows = ctx
         .store
         .compat_now_playing()
         .await
-        .map_err(Ctx::<P, S, B>::store_err)?;
+        .map_err(Ctx::store_err)?;
     let now = ctx.now_unix;
     let mut entries = Vec::new();
     for (index, row) in rows.iter().enumerate() {
@@ -622,32 +555,24 @@ pub async fn now_playing<P: Principal, S: Store, B: AudioBackend>(
             .store
             .get_track(&row.file_id)
             .await
-            .map_err(Ctx::<P, S, B>::store_err)?
+            .map_err(Ctx::store_err)?
         else {
             continue;
         };
-        entries.push(
-            super::models::SNowPlayingEntry {
-                child: ctx.child(&track),
-                username: row.user_name.clone(),
-                minutesAgo: ((now - row.updated_at) / 60.0).max(0.0) as i64,
-                playerId: index as i64,
-                playerName: row.source.clone().or_else(|| row.device_name.clone()),
-            }
-            .render(),
-        );
+        entries.push(super::models::SNowPlayingEntry {
+            child: ctx.child(&track),
+            username: row.user_name.clone(),
+            minutesAgo: ((now - row.updated_at) / 60.0).max(0.0) as i64,
+            playerId: index as i64,
+            playerName: row.source.clone().or_else(|| row.device_name.clone()),
+        });
     }
-    Ok(Outcome::keyed(
-        "nowPlaying",
-        obj(vec![("entry", Val::List(entries))]),
-    ))
+    Outcome::keyed("nowPlaying", Wrap("entry", entries))
 }
 
 /// Playback report (extension playbackReport:1): GET, form, or JSON
 /// (the HTTP layer flattens allowed JSON fields into params).
-pub async fn report_playback<P: Principal, S: Store, B: AudioBackend>(
-    ctx: &'_ Ctx<'_, P, S, B>,
-) -> Result<Outcome, SubsonicError> {
+pub async fn report_playback(ctx: &Ctx<'_>) -> Result<Outcome, SubsonicError> {
     if ctx
         .params
         .one_of("mediaType", &["song", "podcast"], None)?
@@ -685,14 +610,12 @@ pub async fn report_playback<P: Principal, S: Store, B: AudioBackend>(
             ctx.pbool("ignoreScrobble", false)?,
         )
         .await
-        .map_err(Ctx::<P, S, B>::store_err)?;
+        .map_err(Ctx::store_err)?;
     Ok(Outcome::ok())
 }
 
 /// Validated queue ids: at most 500, all tracks, all present.
-pub async fn validated_queue_ids<P: Principal, S: Store, B: AudioBackend>(
-    ctx: &'_ Ctx<'_, P, S, B>,
-) -> Result<Vec<String>, SubsonicError> {
+pub async fn validated_queue_ids(ctx: &Ctx<'_>) -> Result<Vec<String>, SubsonicError> {
     let ids = ctx.plist("id")?;
     if ids.len() > MAX_QUEUE_ITEMS {
         return Err(SubsonicError::new(
@@ -715,7 +638,7 @@ pub async fn validated_queue_ids<P: Principal, S: Store, B: AudioBackend>(
         .store
         .missing_targets(&unique)
         .await
-        .map_err(Ctx::<P, S, B>::store_err)?;
+        .map_err(Ctx::store_err)?;
     if !missing.is_empty() {
         return Err(SubsonicError::new(NOT_FOUND, "Play queue song not found"));
     }
@@ -724,8 +647,8 @@ pub async fn validated_queue_ids<P: Principal, S: Store, B: AudioBackend>(
 
 /// Queue entries with stale file ids filtered and the current index
 /// remapped (out-of-range current falls back to 0).
-pub async fn queue_entries<P: Principal, S: Store, B: AudioBackend>(
-    ctx: &'_ Ctx<'_, P, S, B>,
+pub async fn queue_entries(
+    ctx: &Ctx<'_>,
 ) -> Result<
     (
         super::store::QueueState,
@@ -739,12 +662,12 @@ pub async fn queue_entries<P: Principal, S: Store, B: AudioBackend>(
         .store
         .get_play_queue(&user_id)
         .await
-        .map_err(Ctx::<P, S, B>::store_err)?;
+        .map_err(Ctx::store_err)?;
     let mapped = ctx
         .store
         .get_tracks_by_file_ids(&queue.file_ids)
         .await
-        .map_err(Ctx::<P, S, B>::store_err)?;
+        .map_err(Ctx::store_err)?;
     let mut tracks = Vec::new();
     let mut retained = Vec::new();
     for (index, file_id) in queue.file_ids.iter().enumerate() {
@@ -764,14 +687,12 @@ pub async fn queue_entries<P: Principal, S: Store, B: AudioBackend>(
 }
 
 /// Saved queue (current is a song id; position only when non-empty).
-pub async fn get_play_queue<P: Principal, S: Store, B: AudioBackend>(
-    ctx: &'_ Ctx<'_, P, S, B>,
-) -> Result<Outcome, SubsonicError> {
+pub async fn get_play_queue(ctx: &Ctx<'_>) -> Result<Outcome, SubsonicError> {
     let (queue, tracks, current_index) = queue_entries(ctx).await?;
     let current = current_index
         .and_then(|index| tracks.get(index))
         .map(|child| child.id.clone());
-    Ok(Outcome::keyed(
+    Outcome::keyed(
         "playQueue",
         SPlayQueue {
             username: effective_username(ctx.user()?),
@@ -781,16 +702,13 @@ pub async fn get_play_queue<P: Principal, S: Store, B: AudioBackend>(
             current,
             position: current_index.map(|_| queue.position_ms),
             entry: tracks,
-        }
-        .render(),
-    ))
+        },
+    )
 }
 
 /// Save the queue: `current` must reference a queued song for
 /// non-empty queues and must be absent for empty ones.
-pub async fn save_play_queue<P: Principal, S: Store, B: AudioBackend>(
-    ctx: &'_ Ctx<'_, P, S, B>,
-) -> Result<Outcome, SubsonicError> {
+pub async fn save_play_queue(ctx: &Ctx<'_>) -> Result<Outcome, SubsonicError> {
     let file_ids = validated_queue_ids(ctx).await?;
     let current = ctx.p("current")?;
     let position = ctx
@@ -829,16 +747,14 @@ pub async fn save_play_queue<P: Principal, S: Store, B: AudioBackend>(
             &ctx.p("c")?.unwrap_or_default(),
         )
         .await
-        .map_err(Ctx::<P, S, B>::store_err)?;
+        .map_err(Ctx::store_err)?;
     Ok(Outcome::ok())
 }
 
 /// Saved queue by index (extension indexBasedQueue:1).
-pub async fn get_play_queue_by_index<P: Principal, S: Store, B: AudioBackend>(
-    ctx: &'_ Ctx<'_, P, S, B>,
-) -> Result<Outcome, SubsonicError> {
+pub async fn get_play_queue_by_index(ctx: &Ctx<'_>) -> Result<Outcome, SubsonicError> {
     let (queue, tracks, current_index) = queue_entries(ctx).await?;
-    Ok(Outcome::keyed(
+    Outcome::keyed(
         "playQueueByIndex",
         SPlayQueueByIndex {
             username: effective_username(ctx.user()?),
@@ -848,15 +764,12 @@ pub async fn get_play_queue_by_index<P: Principal, S: Store, B: AudioBackend>(
             currentIndex: current_index.map(|index| index as i64),
             position: current_index.map(|_| queue.position_ms),
             entry: tracks,
-        }
-        .render(),
-    ))
+        },
+    )
 }
 
 /// Save the queue by index.
-pub async fn save_play_queue_by_index<P: Principal, S: Store, B: AudioBackend>(
-    ctx: &'_ Ctx<'_, P, S, B>,
-) -> Result<Outcome, SubsonicError> {
+pub async fn save_play_queue_by_index(ctx: &Ctx<'_>) -> Result<Outcome, SubsonicError> {
     let file_ids = validated_queue_ids(ctx).await?;
     let current_index = ctx.pint(
         "currentIndex",
@@ -890,20 +803,18 @@ pub async fn save_play_queue_by_index<P: Principal, S: Store, B: AudioBackend>(
             &ctx.p("c")?.unwrap_or_default(),
         )
         .await
-        .map_err(Ctx::<P, S, B>::store_err)?;
+        .map_err(Ctx::store_err)?;
     Ok(Outcome::ok())
 }
 
 /// Bookmarks (dead links skipped; pinned fields always present).
-pub async fn get_bookmarks<P: Principal, S: Store, B: AudioBackend>(
-    ctx: &'_ Ctx<'_, P, S, B>,
-) -> Result<Outcome, SubsonicError> {
+pub async fn get_bookmarks(ctx: &Ctx<'_>) -> Result<Outcome, SubsonicError> {
     let user_id = ctx.user()?.user_id().to_owned();
     let records = ctx
         .store
         .list_bookmarks(&user_id)
         .await
-        .map_err(Ctx::<P, S, B>::store_err)?;
+        .map_err(Ctx::store_err)?;
     let file_ids = records
         .iter()
         .map(|record| record.file_id.clone())
@@ -912,36 +823,28 @@ pub async fn get_bookmarks<P: Principal, S: Store, B: AudioBackend>(
         .store
         .get_tracks_by_file_ids(&file_ids)
         .await
-        .map_err(Ctx::<P, S, B>::store_err)?;
+        .map_err(Ctx::store_err)?;
     let mut bookmarks = Vec::new();
     for bookmark in &records {
         let Some(track) = mapped.get(&bookmark.file_id) else {
             continue;
         };
-        bookmarks.push(
-            SBookmark {
-                position: bookmark.position_ms,
-                username: effective_username(ctx.user()?),
-                created: super::views::iso(Some(bookmark.created_at))
-                    .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_owned()),
-                changed: super::views::iso(Some(bookmark.changed_at))
-                    .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_owned()),
-                entry: ctx.child(track),
-                comment: (!bookmark.comment.is_empty()).then(|| bookmark.comment.clone()),
-            }
-            .render(),
-        );
+        bookmarks.push(SBookmark {
+            position: bookmark.position_ms,
+            username: effective_username(ctx.user()?),
+            created: super::views::iso(Some(bookmark.created_at))
+                .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_owned()),
+            changed: super::views::iso(Some(bookmark.changed_at))
+                .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_owned()),
+            entry: ctx.child(track),
+            comment: (!bookmark.comment.is_empty()).then(|| bookmark.comment.clone()),
+        });
     }
-    Ok(Outcome::keyed(
-        "bookmarks",
-        obj(vec![("bookmark", Val::List(bookmarks))]),
-    ))
+    Outcome::keyed("bookmarks", Wrap("bookmark", bookmarks))
 }
 
 /// Create or update a bookmark.
-pub async fn create_bookmark<P: Principal, S: Store, B: AudioBackend>(
-    ctx: &'_ Ctx<'_, P, S, B>,
-) -> Result<Outcome, SubsonicError> {
+pub async fn create_bookmark(ctx: &Ctx<'_>) -> Result<Outcome, SubsonicError> {
     let file_id = decode_expect(&ctx.p("id")?.unwrap_or_default(), IdKind::Track)?;
     let file_id = current_id(ctx, IdKind::Track, file_id).await?;
     let position = ctx.pint("position", None, Some(0), Some(MAX_MEDIA_POSITION_MS))?;
@@ -957,21 +860,19 @@ pub async fn create_bookmark<P: Principal, S: Store, B: AudioBackend>(
         .store
         .missing_targets(&[(IdKind::Track, file_id.clone())])
         .await
-        .map_err(Ctx::<P, S, B>::store_err)?;
+        .map_err(Ctx::store_err)?;
     if !missing.is_empty() {
         return Err(SubsonicError::new(NOT_FOUND, "Bookmark song not found"));
     }
     ctx.store
         .upsert_bookmark(&user_id, &file_id, position.unwrap_or(0), &comment)
         .await
-        .map_err(Ctx::<P, S, B>::store_err)?;
+        .map_err(Ctx::store_err)?;
     Ok(Outcome::ok())
 }
 
 /// Delete a bookmark (the song must exist).
-pub async fn delete_bookmark<P: Principal, S: Store, B: AudioBackend>(
-    ctx: &'_ Ctx<'_, P, S, B>,
-) -> Result<Outcome, SubsonicError> {
+pub async fn delete_bookmark(ctx: &Ctx<'_>) -> Result<Outcome, SubsonicError> {
     let file_id = decode_expect(&ctx.p("id")?.unwrap_or_default(), IdKind::Track)?;
     let file_id = current_id(ctx, IdKind::Track, file_id).await?;
     let user_id = ctx.user()?.user_id().to_owned();
@@ -979,20 +880,20 @@ pub async fn delete_bookmark<P: Principal, S: Store, B: AudioBackend>(
         .store
         .missing_targets(&[(IdKind::Track, file_id.clone())])
         .await
-        .map_err(Ctx::<P, S, B>::store_err)?;
+        .map_err(Ctx::store_err)?;
     if !missing.is_empty() {
         return Err(SubsonicError::new(NOT_FOUND, "Bookmark song not found"));
     }
     ctx.store
         .delete_bookmark(&user_id, &file_id)
         .await
-        .map_err(Ctx::<P, S, B>::store_err)?;
+        .map_err(Ctx::store_err)?;
     Ok(Outcome::ok())
 }
 
 /// Login name, falling back to the display name (v2 `username or
 /// display_name` in queue/bookmark/user responses).
-pub fn effective_username(user: &impl Principal) -> String {
+pub fn effective_username(user: &CompatPrincipal) -> String {
     if user.username().is_empty() {
         user.display_name().to_owned()
     } else {
@@ -1003,9 +904,7 @@ pub fn effective_username(user: &impl Principal) -> String {
 /// Artist info: projected MBID or an empty string (else the raw mbid when
 /// it looks like one) plus small/medium/large open picture links. `count`
 /// and `includeNotPresent` are parsed and ignored.
-pub async fn artist_info<P: Principal, S: Store, B: AudioBackend>(
-    ctx: &'_ Ctx<'_, P, S, B>,
-) -> Result<Outcome, SubsonicError> {
+pub async fn artist_info(ctx: &Ctx<'_>) -> Result<Outcome, SubsonicError> {
     let mbid = decode_expect(&ctx.p("id")?.unwrap_or_default(), IdKind::Artist)?;
     let mbid = current_id(ctx, IdKind::Artist, mbid).await?;
     ctx.pint("count", Some(20), Some(0), Some(500))?;
@@ -1014,7 +913,7 @@ pub async fn artist_info<P: Principal, S: Store, B: AudioBackend>(
         .store
         .get_artist_with_albums(&mbid)
         .await
-        .map_err(Ctx::<P, S, B>::store_err)?
+        .map_err(Ctx::store_err)?
         .ok_or_else(|| SubsonicError::new(NOT_FOUND, "Artist not found"))?;
     let music_brainz_id = if artist.provider_identity_projected {
         Some(artist.musicbrainz_artist_id.clone().unwrap_or_default())
@@ -1023,14 +922,14 @@ pub async fn artist_info<P: Principal, S: Store, B: AudioBackend>(
     } else {
         None
     };
-    let [small, medium, large] =
-        INFO_SIZES.map(|size| ctx.picture_link(PictureKind::Artist, &artist.artist_mbid, size));
+    let [small, medium, large] = INFO_SIZES
+        .map(|size| ctx.picture_link(PictureKind::Artist, &artist.artist_mbid, size, None));
     let key = if ctx.endpoint_name == "getartistinfo2" {
         "artistInfo2"
     } else {
         "artistInfo"
     };
-    Ok(Outcome::keyed(
+    Outcome::keyed(
         key,
         SArtistInfo {
             biography: None,
@@ -1040,32 +939,35 @@ pub async fn artist_info<P: Principal, S: Store, B: AudioBackend>(
             mediumImageUrl: medium,
             largeImageUrl: large,
             similarArtist: Vec::new(),
-        }
-        .render(),
-    ))
+        },
+    )
 }
 
 /// Album info: projected MBID or an empty string (else the raw rg mbid)
 /// plus sized open picture links.
-pub async fn album_info<P: Principal, S: Store, B: AudioBackend>(
-    ctx: &'_ Ctx<'_, P, S, B>,
-) -> Result<Outcome, SubsonicError> {
+pub async fn album_info(ctx: &Ctx<'_>) -> Result<Outcome, SubsonicError> {
     let rg = decode_expect(&ctx.p("id")?.unwrap_or_default(), IdKind::Album)?;
     let rg = current_id(ctx, IdKind::Album, rg).await?;
     let album = ctx
         .store
         .get_album(&rg)
         .await
-        .map_err(Ctx::<P, S, B>::store_err)?
+        .map_err(Ctx::store_err)?
         .ok_or_else(|| SubsonicError::new(NOT_FOUND, "Album not found"))?;
-    let [small, medium, large] =
-        INFO_SIZES.map(|size| ctx.picture_link(PictureKind::Album, &album.rg_mbid, size));
+    let [small, medium, large] = INFO_SIZES.map(|size| {
+        ctx.picture_link(
+            PictureKind::Album,
+            &album.rg_mbid,
+            size,
+            album.cover_version.as_deref(),
+        )
+    });
     let music_brainz_id = if album.provider_identity_projected {
         Some(album.musicbrainz_album_id.clone().unwrap_or_default())
     } else {
         Some(album.rg_mbid.clone())
     };
-    Ok(Outcome::keyed(
+    Outcome::keyed(
         "albumInfo",
         SAlbumInfo {
             notes: None,
@@ -1074,60 +976,49 @@ pub async fn album_info<P: Principal, S: Store, B: AudioBackend>(
             smallImageUrl: small,
             mediumImageUrl: medium,
             largeImageUrl: large,
-        }
-        .render(),
-    ))
+        },
+    )
 }
 
 /// Structured lyrics (extension songLyrics:1); no lyrics -> empty list.
-pub async fn lyrics_by_song_id<P: Principal, S: Store, B: AudioBackend>(
-    ctx: &'_ Ctx<'_, P, S, B>,
-) -> Result<Outcome, SubsonicError> {
+pub async fn lyrics_by_song_id(ctx: &Ctx<'_>) -> Result<Outcome, SubsonicError> {
     let file_id = decode_expect(&ctx.p("id")?.unwrap_or_default(), IdKind::Track)?;
     let file_id = current_id(ctx, IdKind::Track, file_id).await?;
     let track = ctx
         .store
         .get_track(&file_id)
         .await
-        .map_err(Ctx::<P, S, B>::store_err)?
+        .map_err(Ctx::store_err)?
         .ok_or_else(|| SubsonicError::new(NOT_FOUND, "Song not found"))?;
     let lyrics = ctx
         .store
         .get_lyrics(&file_id)
         .await
-        .map_err(Ctx::<P, S, B>::store_err)?;
+        .map_err(Ctx::store_err)?;
     let mut values = Vec::new();
     if let Some(lyrics) = lyrics {
-        values.push(
-            SStructuredLyrics {
-                lang: lyrics.language,
-                synced: lyrics.synced,
-                line: lyrics
-                    .lines
-                    .into_iter()
-                    .map(|line| SLyricsLine {
-                        value: line.value,
-                        start: line.start_ms,
-                    })
-                    .collect(),
-                displayArtist: (!track.artist_name.is_empty()).then(|| track.artist_name.clone()),
-                displayTitle: (!track.title.is_empty()).then(|| track.title.clone()),
-                offset: None,
-            }
-            .render(),
-        );
+        values.push(SStructuredLyrics {
+            lang: lyrics.language,
+            synced: lyrics.synced,
+            line: lyrics
+                .lines
+                .into_iter()
+                .map(|line| SLyricsLine {
+                    value: line.value,
+                    start: line.start_ms,
+                })
+                .collect(),
+            displayArtist: (!track.artist_name.is_empty()).then(|| track.artist_name.clone()),
+            displayTitle: (!track.title.is_empty()).then(|| track.title.clone()),
+            offset: None,
+        });
     }
-    Ok(Outcome::keyed(
-        "lyricsList",
-        obj(vec![("structuredLyrics", Val::List(values))]),
-    ))
+    Outcome::keyed("lyricsList", Wrap("structuredLyrics", values))
 }
 
 /// Legacy flat lyrics: exact title (+artist) match, deterministic by
 /// file id; a miss renders an empty value (not an error).
-pub async fn lyrics<P: Principal, S: Store, B: AudioBackend>(
-    ctx: &'_ Ctx<'_, P, S, B>,
-) -> Result<Outcome, SubsonicError> {
+pub async fn lyrics(ctx: &Ctx<'_>) -> Result<Outcome, SubsonicError> {
     let artist = ctx.p("artist")?;
     let title = ctx.p("title")?.unwrap_or_default();
     if title.is_empty() {
@@ -1137,7 +1028,7 @@ pub async fn lyrics<P: Principal, S: Store, B: AudioBackend>(
         .store
         .get_tracks_by_title(&title)
         .await
-        .map_err(Ctx::<P, S, B>::store_err)?;
+        .map_err(Ctx::store_err)?;
     let mut candidates: Vec<_> = tracks
         .into_iter()
         .filter(|track| track.title.to_lowercase() == title.to_lowercase())
@@ -1146,15 +1037,14 @@ pub async fn lyrics<P: Principal, S: Store, B: AudioBackend>(
         candidates.retain(|track| track.artist_name.to_lowercase() == artist.to_lowercase());
     }
     if candidates.is_empty() {
-        return Ok(Outcome::keyed(
+        return Outcome::keyed(
             "lyrics",
             SLyrics {
                 artist: artist.unwrap_or_default(),
                 title,
                 value: String::new(),
-            }
-            .render(),
-        ));
+            },
+        );
     }
     candidates.sort_by(|a, b| a.file_id.cmp(&b.file_id));
     let track = &candidates[0];
@@ -1162,7 +1052,7 @@ pub async fn lyrics<P: Principal, S: Store, B: AudioBackend>(
         .store
         .get_lyrics(&track.file_id)
         .await
-        .map_err(Ctx::<P, S, B>::store_err)?;
+        .map_err(Ctx::store_err)?;
     let value = lyrics
         .map(|lyrics| {
             lyrics
@@ -1173,44 +1063,33 @@ pub async fn lyrics<P: Principal, S: Store, B: AudioBackend>(
                 .join("\n")
         })
         .unwrap_or_default();
-    Ok(Outcome::keyed(
+    Outcome::keyed(
         "lyrics",
         SLyrics {
             artist: track.artist_name.clone(),
             title: track.title.clone(),
             value,
-        }
-        .render(),
-    ))
+        },
+    )
 }
 
 /// Genre list.
-pub async fn genres<P: Principal, S: Store, B: AudioBackend>(
-    ctx: &'_ Ctx<'_, P, S, B>,
-) -> Result<Outcome, SubsonicError> {
-    let genres = ctx
-        .store
-        .get_genres()
-        .await
-        .map_err(Ctx::<P, S, B>::store_err)?;
-    Ok(Outcome::keyed(
+pub async fn genres(ctx: &Ctx<'_>) -> Result<Outcome, SubsonicError> {
+    let genres = ctx.store.get_genres().await.map_err(Ctx::store_err)?;
+    Outcome::keyed(
         "genres",
-        obj(vec![(
+        Wrap(
             "genre",
-            Val::List(
-                genres
-                    .iter()
-                    .map(|genre| super::views::to_genre(genre).render())
-                    .collect(),
-            ),
-        )]),
-    ))
+            genres
+                .iter()
+                .map(super::views::to_genre)
+                .collect::<Vec<_>>(),
+        ),
+    )
 }
 
 /// Songs of a genre page.
-pub async fn songs_by_genre<P: Principal, S: Store, B: AudioBackend>(
-    ctx: &'_ Ctx<'_, P, S, B>,
-) -> Result<Outcome, SubsonicError> {
+pub async fn songs_by_genre(ctx: &Ctx<'_>) -> Result<Outcome, SubsonicError> {
     validate_music_folder(&ctx.params)?;
     let genre = ctx.p("genre")?.unwrap_or_default();
     if genre.is_empty() {
@@ -1228,55 +1107,44 @@ pub async fn songs_by_genre<P: Principal, S: Store, B: AudioBackend>(
         .store
         .get_songs_by_genre(&genre, count, offset)
         .await
-        .map_err(Ctx::<P, S, B>::store_err)?;
-    Ok(Outcome::keyed(
+        .map_err(Ctx::store_err)?;
+    Outcome::keyed(
         "songsByGenre",
-        obj(vec![(
+        Wrap(
             "song",
-            Val::List(
-                tracks
-                    .iter()
-                    .map(|track| ctx.child(track).render())
-                    .collect(),
-            ),
-        )]),
-    ))
+            tracks
+                .iter()
+                .map(|track| ctx.child(track))
+                .collect::<Vec<_>>(),
+        ),
+    )
 }
 
 /// Caller user object; the `username` param is required but ignored.
-pub async fn user<P: Principal, S: Store, B: AudioBackend>(
-    ctx: &'_ Ctx<'_, P, S, B>,
-) -> Result<Outcome, SubsonicError> {
+pub async fn user(ctx: &Ctx<'_>) -> Result<Outcome, SubsonicError> {
     if ctx.p("username")?.unwrap_or_default().is_empty() {
         return Err(SubsonicError::missing("username"));
     }
     let caller = ctx.user()?;
-    Ok(Outcome::keyed(
+    Outcome::keyed(
         "user",
         SUser::caller(
             effective_username(caller),
             caller.is_admin(),
             ctx.settings.download_access.admits(caller.role()),
             ctx.settings.transcode_max_bitrate_kbps,
-        )
-        .render(),
-    ))
+        ),
+    )
 }
 
 /// Scan status. Before the first finished scan the three keys about the
 /// last one are left out: Navidrome 0.62.0 leaves `scanType` and
 /// `elapsedTime` out then (`omitempty` in `responses.ScanStatus`) and
 /// sends a zero date for `lastScan`, which would not be true here.
-pub async fn scan_status<P: Principal, S: Store, B: AudioBackend>(
-    ctx: &'_ Ctx<'_, P, S, B>,
-) -> Result<Outcome, SubsonicError> {
-    let status = ctx
-        .store
-        .scan_status()
-        .await
-        .map_err(Ctx::<P, S, B>::store_err)?;
+pub async fn scan_status(ctx: &Ctx<'_>) -> Result<Outcome, SubsonicError> {
+    let status = ctx.store.scan_status().await.map_err(Ctx::store_err)?;
     let last = status.last.as_ref();
-    Ok(Outcome::keyed(
+    Outcome::keyed(
         "scanStatus",
         SScanStatus {
             scanning: status.scanning,
@@ -1285,41 +1153,32 @@ pub async fn scan_status<P: Principal, S: Store, B: AudioBackend>(
             lastScan: last.and_then(|last| iso(Some(last.finished_at))),
             scanType: last.map(|last| last.kind.clone()),
             elapsedTime: last.and_then(|last| last.elapsed_nanos),
-        }
-        .render(),
-    ))
+        },
+    )
 }
 
 /// Start a scan (admin-only -> 50).
-pub async fn start_scan<P: Principal, S: Store, B: AudioBackend>(
-    ctx: &'_ Ctx<'_, P, S, B>,
-) -> Result<Outcome, SubsonicError> {
+pub async fn start_scan(ctx: &Ctx<'_>) -> Result<Outcome, SubsonicError> {
     if !ctx.user()?.is_admin() {
         return Err(SubsonicError::new(
             NOT_AUTHORIZED,
             "Administrator role is required to start a scan",
         ));
     }
-    ctx.store
-        .start_scan()
-        .await
-        .map_err(Ctx::<P, S, B>::store_err)?;
-    Ok(Outcome::keyed(
+    ctx.store.start_scan().await.map_err(Ctx::store_err)?;
+    Outcome::keyed(
         "scanStatus",
         SScanStatus {
             scanning: true,
             count: Some(0),
             ..SScanStatus::default()
-        }
-        .render(),
-    ))
+        },
+    )
 }
 
 /// Top songs: the artist name must match exactly (case-insensitive),
 /// else 70.
-pub async fn top_songs<P: Principal, S: Store, B: AudioBackend>(
-    ctx: &'_ Ctx<'_, P, S, B>,
-) -> Result<Outcome, SubsonicError> {
+pub async fn top_songs(ctx: &Ctx<'_>) -> Result<Outcome, SubsonicError> {
     let artist = ctx.p("artist")?.unwrap_or_default();
     if artist.is_empty() {
         return Err(SubsonicError::missing("artist"));
@@ -1332,7 +1191,7 @@ pub async fn top_songs<P: Principal, S: Store, B: AudioBackend>(
         .store
         .get_artists(10, 0, Some(&artist))
         .await
-        .map_err(Ctx::<P, S, B>::store_err)?;
+        .map_err(Ctx::store_err)?;
     if !artists
         .iter()
         .any(|item| item.name.to_lowercase() == artist.to_lowercase())
@@ -1344,24 +1203,22 @@ pub async fn top_songs<P: Principal, S: Store, B: AudioBackend>(
         .store
         .get_top_songs(&artist, &user_id, count)
         .await
-        .map_err(Ctx::<P, S, B>::store_err)?;
-    Ok(Outcome::keyed(
+        .map_err(Ctx::store_err)?;
+    Outcome::keyed(
         "topSongs",
-        obj(vec![(
+        Wrap(
             "song",
-            Val::List(
-                tracks
-                    .iter()
-                    .map(|track| ctx.child(track).render())
-                    .collect(),
-            ),
-        )]),
-    ))
+            tracks
+                .iter()
+                .map(|track| ctx.child(track))
+                .collect::<Vec<_>>(),
+        ),
+    )
 }
 
 /// Similar songs for an artist id (shared by both spellings).
-pub async fn similar_songs_query<P: Principal, S: Store, B: AudioBackend>(
-    ctx: &'_ Ctx<'_, P, S, B>,
+pub async fn similar_songs_query(
+    ctx: &Ctx<'_>,
 ) -> Result<Vec<super::views::ViewTrack>, SubsonicError> {
     let mbid = decode_expect(&ctx.p("id")?.unwrap_or_default(), IdKind::Artist)?;
     let mbid = current_id(ctx, IdKind::Artist, mbid).await?;
@@ -1373,7 +1230,7 @@ pub async fn similar_songs_query<P: Principal, S: Store, B: AudioBackend>(
         .store
         .get_artist_with_albums(&mbid)
         .await
-        .map_err(Ctx::<P, S, B>::store_err)?
+        .map_err(Ctx::store_err)?
         .is_none()
     {
         return Err(SubsonicError::new(NOT_FOUND, "Artist not found"));
@@ -1382,43 +1239,35 @@ pub async fn similar_songs_query<P: Principal, S: Store, B: AudioBackend>(
     ctx.store
         .get_similar_songs(&mbid, &user_id, count)
         .await
-        .map_err(Ctx::<P, S, B>::store_err)
+        .map_err(Ctx::store_err)
 }
 
 /// Similar songs (ID3 key).
-pub async fn similar_songs2<P: Principal, S: Store, B: AudioBackend>(
-    ctx: &'_ Ctx<'_, P, S, B>,
-) -> Result<Outcome, SubsonicError> {
+pub async fn similar_songs2(ctx: &Ctx<'_>) -> Result<Outcome, SubsonicError> {
     let tracks = similar_songs_query(ctx).await?;
-    Ok(Outcome::keyed(
+    Outcome::keyed(
         "similarSongs2",
-        obj(vec![(
+        Wrap(
             "song",
-            Val::List(
-                tracks
-                    .iter()
-                    .map(|track| ctx.child(track).render())
-                    .collect(),
-            ),
-        )]),
-    ))
+            tracks
+                .iter()
+                .map(|track| ctx.child(track))
+                .collect::<Vec<_>>(),
+        ),
+    )
 }
 
 /// Similar songs (file key).
-pub async fn similar_songs<P: Principal, S: Store, B: AudioBackend>(
-    ctx: &'_ Ctx<'_, P, S, B>,
-) -> Result<Outcome, SubsonicError> {
+pub async fn similar_songs(ctx: &Ctx<'_>) -> Result<Outcome, SubsonicError> {
     let tracks = similar_songs_query(ctx).await?;
-    Ok(Outcome::keyed(
+    Outcome::keyed(
         "similarSongs",
-        obj(vec![(
+        Wrap(
             "song",
-            Val::List(
-                tracks
-                    .iter()
-                    .map(|track| ctx.child(track).render())
-                    .collect(),
-            ),
-        )]),
-    ))
+            tracks
+                .iter()
+                .map(|track| ctx.child(track))
+                .collect::<Vec<_>>(),
+        ),
+    )
 }

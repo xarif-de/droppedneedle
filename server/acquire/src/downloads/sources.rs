@@ -2,7 +2,7 @@
 //!
 //! The slskd and usenet clients live in their own modules. This one defines
 //! only the narrow surface downloads depend on (search, enqueue, poll,
-//! landed, discard, abort), ported from v2's download-client protocol. Source adapters implement
+//! landed, discard, abort). Source adapters implement
 //! [`DownloadSource`]; the watchdog, recovery, and orphan logic below
 //! never touch a client directly.
 
@@ -17,7 +17,7 @@ use crate::reason::Reason;
 use crate::search_jobs::candidates::Candidate;
 use crate::target::SearchTarget;
 
-/// Client correlation handle. Mirrors v2's `TaskHandle`: soulseek fills
+/// Client correlation handle: soulseek fills
 /// username plus filenames (no batch id); usenet fills the job name before
 /// enqueue so a crash between enqueue and journaling stays recoverable.
 /// Serializes into the attempt journal's `handle_json` at enqueue time.
@@ -50,6 +50,11 @@ pub struct SourceHandle {
     /// identified by peer and files.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub release_identity: String,
+    /// This attempt fetches exactly the candidate a person picked (never a
+    /// failover or a fallback search), so a quality waiver confirmed with
+    /// that pick covers it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pinned: bool,
 }
 
 impl SourceHandle {
@@ -64,6 +69,7 @@ impl SourceHandle {
             plugin_token: String::new(),
             sizes: Vec::new(),
             release_identity: String::new(),
+            pinned: false,
         }
     }
 }

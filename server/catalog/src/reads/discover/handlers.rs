@@ -17,16 +17,15 @@ use serde::Deserialize;
 
 use super::{
     models::{
-        AlbumPreviewResponse, ChartSection, DiscoverActivityRequest, DiscoverActivityResponse,
-        DiscoverQueuePreview, DiscoverQueueResponse, DiscoverQueueStatusResponse, DiscoverResponse,
-        DiscoveryBatchCreate, DiscoveryBatchDetail, DiscoveryBatchListResponse,
-        DiscoveryBatchRemoveResult, GenreDetailResponse, HomeResponse, IgnoredReleasesResponse,
-        IntegrationStatus, NowPlayingSnapshot, PlaylistSuggestionsRequest,
-        PlaylistSuggestionsResponse, PopularAlbumsPage, QueueEnrichment, QueueGenerateRequest,
-        QueueGenerateResponse, QueueIgnoreRequest, QueueValidateRequest, QueueValidateResponse,
-        RadioPlanRequest, RadioPlanResponse, RadioRequest, RefreshResponse, TrackCacheCheckRequest,
-        TrackCacheCheckResponse, TrackPreviewResponse, TrendingArtistsPage, YouTubeQuotaResponse,
-        YouTubeSearchResponse,
+        AlbumPreviewResponse, AlbumRef, ArtistRef, ChartPage, ChartSection,
+        DiscoverActivityRequest, DiscoverActivityResponse, DiscoverQueuePreview,
+        DiscoverQueueResponse, DiscoverQueueStatusResponse, DiscoverResponse, GenreDetailResponse,
+        HomeResponse, IgnoredReleasesResponse, IntegrationStatus, ListenSource,
+        PlaylistSuggestionsRequest, PlaylistSuggestionsResponse, QueueEnrichment,
+        QueueGenerateRequest, QueueGenerateResponse, QueueIgnoreRequest, QueueValidateRequest,
+        QueueValidateResponse, RadioPlanRequest, RadioPlanResponse, RadioRequest, RefreshResponse,
+        StatsRange, TrackCacheCheckRequest, TrackCacheCheckResponse, TrackPreviewResponse,
+        YouTubeQuotaResponse, YouTubeSearchResponse,
     },
     services::{self, ReadsDeps},
 };
@@ -45,14 +44,14 @@ pub struct QueueQuery {
 /// Chart page params shared by the three redesigned routes.
 #[derive(Debug, Deserialize)]
 pub struct ChartQuery {
-    /// Range key (`this_week` default).
-    pub range: Option<String>,
+    /// Range (`this_week` default).
+    pub range: Option<StatsRange>,
     /// Page size.
     pub limit: Option<i64>,
     /// Page offset.
     pub offset: Option<i64>,
     /// Provider preference (`listenbrainz` default).
-    pub source: Option<String>,
+    pub source: Option<ListenSource>,
 }
 
 /// Genre detail params.
@@ -102,13 +101,6 @@ pub struct AlbumPreviewQuery {
     pub album: String,
     /// Wanted sample count (1-8, default 4).
     pub count: Option<i64>,
-}
-
-/// Batch removal params.
-#[derive(Debug, Deserialize)]
-pub struct RemoveBatchQuery {
-    /// Also remove/cancel the batch's albums (default true).
-    pub remove_albums: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -596,113 +588,6 @@ pub async fn album_preview(
 }
 
 // ---------------------------------------------------------------------------
-// Batches
-// ---------------------------------------------------------------------------
-
-/// Create a discovery batch: every album the library lacks and nobody
-/// has requested yet is filed as an album request, under the caller's
-/// quota and approval rules.
-#[utoipa::path(
-    post,
-    tag = "discover",
-    path = "/api/v3/discover/batches",
-    request_body = DiscoveryBatchCreate,
-    responses(
-        (status = 202, description = "Batch created", body = DiscoveryBatchDetail),
-        (status = 400, description = "Empty or oversized batch, or every album is already owned or requested"),
-        (status = 401, description = "Not authenticated"),
-        (status = 403, description = "Storage full (STORAGE_FULL)"),
-        (status = 429, description = "Request quota spent (QUOTA_EXCEEDED)"),
-        (status = 409, description = "Acquisition is not running (NOT_AVAILABLE)"),
-    )
-)]
-pub async fn create_batch(
-    State(deps): State<ReadsDeps>,
-    User(user): User,
-    ValidJson(body): ValidJson<DiscoveryBatchCreate>,
-) -> Result<(StatusCode, Json<DiscoveryBatchDetail>), ApiError> {
-    services::create_batch(&deps, &user, &body)
-        .await
-        .map(|detail| (StatusCode::ACCEPTED, Json(detail)))
-        .map_err(ApiError::from)
-}
-
-/// The caller's batches, newest first.
-#[utoipa::path(
-    get,
-    tag = "discover",
-    path = "/api/v3/discover/batches",
-    responses(
-        (status = 200, description = "Batch list", body = DiscoveryBatchListResponse),
-        (status = 401, description = "Not authenticated"),
-        (status = 500, description = "The batch store failed"),
-    )
-)]
-pub async fn list_batches(
-    State(deps): State<ReadsDeps>,
-    User(user): User,
-) -> Result<Json<DiscoveryBatchListResponse>, ApiError> {
-    services::list_batches(&deps, user.user_id())
-        .await
-        .map(Json)
-        .map_err(ApiError::from)
-}
-
-/// One batch with each album's current state. Admins may open any batch;
-/// anyone else's reads as missing.
-#[utoipa::path(
-    get,
-    tag = "discover",
-    path = "/api/v3/discover/batches/{batch_id}",
-    params(("batch_id" = String, Path, description = "Batch id")),
-    responses(
-        (status = 200, description = "Batch detail", body = DiscoveryBatchDetail),
-        (status = 401, description = "Not authenticated"),
-        (status = 404, description = "Unknown batch id"),
-    )
-)]
-pub async fn get_batch(
-    State(deps): State<ReadsDeps>,
-    User(user): User,
-    Path(batch_id): Path<String>,
-) -> Result<Json<DiscoveryBatchDetail>, ApiError> {
-    services::get_batch(&deps, &user, &batch_id)
-        .await
-        .map(Json)
-        .map_err(ApiError::from)
-}
-
-/// Remove one batch. With `remove_albums` (the default) its pending
-/// requests are cancelled and the albums it brought in go to the recycle
-/// bin; albums that were already owned or requested are never touched.
-#[utoipa::path(
-    delete,
-    tag = "discover",
-    path = "/api/v3/discover/batches/{batch_id}",
-    params(
-        ("batch_id" = String, Path, description = "Batch id"),
-        ("remove_albums" = Option<bool>, Query, description = "Also remove the batch albums"),
-    ),
-    responses(
-        (status = 200, description = "Removal outcome", body = DiscoveryBatchRemoveResult),
-        (status = 400, description = "Bad query string"),
-        (status = 401, description = "Not authenticated"),
-        (status = 404, description = "Unknown batch id"),
-    )
-)]
-pub async fn remove_batch(
-    State(deps): State<ReadsDeps>,
-    User(user): User,
-    Path(batch_id): Path<String>,
-    ValidQuery(query): ValidQuery<RemoveBatchQuery>,
-) -> Result<Json<DiscoveryBatchRemoveResult>, ApiError> {
-    services::remove_batch(&deps, &user, &batch_id, query.remove_albums.unwrap_or(true))
-        .await
-        .map(Json)
-        .map_err(ApiError::from)
-}
-
-// ---------------------------------------------------------------------------
 // Home
 // ---------------------------------------------------------------------------
 
@@ -789,13 +674,13 @@ pub async fn genre_detail(
     tag = "discover",
     path = "/api/v3/home/trending/artists",
     params(
-        ("range" = Option<String>, Query, description = "Range key, this_week default"),
+        ("range" = Option<StatsRange>, Query, description = "Range, this_week default"),
         ("limit" = Option<i64>, Query, description = "Page size"),
         ("offset" = Option<i64>, Query, description = "Page offset"),
-        ("source" = Option<String>, Query, description = "listenbrainz or lastfm"),
+        ("source" = Option<ListenSource>, Query, description = "Provider, listenbrainz default"),
     ),
     responses(
-        (status = 200, description = "Trending artists page", body = TrendingArtistsPage),
+        (status = 200, description = "Trending artists page", body = ChartPage<ArtistRef>),
         (status = 400, description = "Bad range or source"),
         (status = 401, description = "Not authenticated"),
         (status = 409, description = "Not configured (NOT_CONFIGURED) or not built in this version yet (NOT_AVAILABLE)"),
@@ -803,15 +688,16 @@ pub async fn genre_detail(
 )]
 pub async fn trending_artists(
     State(deps): State<ReadsDeps>,
-    _user: User,
+    User(user): User,
     ValidQuery(query): ValidQuery<ChartQuery>,
-) -> Result<Json<TrendingArtistsPage>, ApiError> {
+) -> Result<Json<ChartPage<ArtistRef>>, ApiError> {
     services::trending_artists(
         &deps,
-        query.range.as_deref(),
+        user.user_id(),
+        query.range,
         query.limit,
         query.offset,
-        query.source.as_deref(),
+        query.source,
     )
     .await
     .map(Json)
@@ -824,13 +710,13 @@ pub async fn trending_artists(
     tag = "discover",
     path = "/api/v3/home/popular/albums",
     params(
-        ("range" = Option<String>, Query, description = "Range key, this_week default"),
+        ("range" = Option<StatsRange>, Query, description = "Range, this_week default"),
         ("limit" = Option<i64>, Query, description = "Page size"),
         ("offset" = Option<i64>, Query, description = "Page offset"),
-        ("source" = Option<String>, Query, description = "listenbrainz or lastfm"),
+        ("source" = Option<ListenSource>, Query, description = "Provider, listenbrainz default"),
     ),
     responses(
-        (status = 200, description = "Popular albums page", body = PopularAlbumsPage),
+        (status = 200, description = "Popular albums page", body = ChartPage<AlbumRef>),
         (status = 400, description = "Bad range or source"),
         (status = 401, description = "Not authenticated"),
         (status = 409, description = "Not configured (NOT_CONFIGURED) or not built in this version yet (NOT_AVAILABLE)"),
@@ -838,15 +724,16 @@ pub async fn trending_artists(
 )]
 pub async fn popular_albums(
     State(deps): State<ReadsDeps>,
-    _user: User,
+    User(user): User,
     ValidQuery(query): ValidQuery<ChartQuery>,
-) -> Result<Json<PopularAlbumsPage>, ApiError> {
+) -> Result<Json<ChartPage<AlbumRef>>, ApiError> {
     services::popular_albums(
         &deps,
-        query.range.as_deref(),
+        user.user_id(),
+        query.range,
         query.limit,
         query.offset,
-        query.source.as_deref(),
+        query.source,
     )
     .await
     .map(Json)
@@ -859,13 +746,13 @@ pub async fn popular_albums(
     tag = "discover",
     path = "/api/v3/home/your-top/albums",
     params(
-        ("range" = Option<String>, Query, description = "Range key, this_week default"),
+        ("range" = Option<StatsRange>, Query, description = "Range, this_week default"),
         ("limit" = Option<i64>, Query, description = "Page size"),
         ("offset" = Option<i64>, Query, description = "Page offset"),
-        ("source" = Option<String>, Query, description = "listenbrainz or lastfm"),
+        ("source" = Option<ListenSource>, Query, description = "Provider, listenbrainz default"),
     ),
     responses(
-        (status = 200, description = "Your-top albums page", body = PopularAlbumsPage),
+        (status = 200, description = "Your-top albums page", body = ChartPage<AlbumRef>),
         (status = 400, description = "Bad range or source"),
         (status = 401, description = "Not authenticated"),
         (status = 409, description = "Not configured (NOT_CONFIGURED) or not built in this version yet (NOT_AVAILABLE)"),
@@ -875,14 +762,14 @@ pub async fn your_top_albums(
     State(deps): State<ReadsDeps>,
     User(user): User,
     ValidQuery(query): ValidQuery<ChartQuery>,
-) -> Result<Json<PopularAlbumsPage>, ApiError> {
+) -> Result<Json<ChartPage<AlbumRef>>, ApiError> {
     services::your_top_albums(
         &deps,
         user.user_id(),
-        query.range.as_deref(),
+        query.range,
         query.limit,
         query.offset,
-        query.source.as_deref(),
+        query.source,
     )
     .await
     .map(Json)
@@ -890,34 +777,11 @@ pub async fn your_top_albums(
 }
 
 // ---------------------------------------------------------------------------
-// Now playing
-// ---------------------------------------------------------------------------
-
-/// The now-playing snapshot across users. Presence writes (POST/DELETE)
-/// live in `playback`; this only reads.
-#[utoipa::path(
-    get,
-    tag = "discover",
-    path = "/api/v3/now-playing",
-    responses(
-        (status = 200, description = "Live snapshot", body = NowPlayingSnapshot),
-        (status = 401, description = "Not authenticated"),
-    )
-)]
-pub async fn now_playing(State(deps): State<ReadsDeps>, _user: User) -> Json<NowPlayingSnapshot> {
-    Json(services::now_playing(&deps))
-}
-
-// ---------------------------------------------------------------------------
 // Routers
 // ---------------------------------------------------------------------------
 
 /// Discover and home routes at their full `/api/v3` paths, for any
-/// signed-in user.
-///
-/// `GET /now-playing` is absent on purpose: `playback` serves it from the
-/// live presence registry (same JSON shape), and mounting both would panic
-/// on the duplicate route.
+/// signed-in user. `GET /now-playing` is served by `playback`.
 pub fn routes() -> Routes<ReadsDeps> {
     Routes::new()
         .user(routes!(get_discover))
@@ -940,21 +804,10 @@ pub fn routes() -> Routes<ReadsDeps> {
         .user(routes!(youtube_cache_check))
         .user(routes!(track_preview))
         .user(routes!(album_preview))
-        .user(routes!(create_batch, list_batches))
-        .user(routes!(get_batch, remove_batch))
         .user(routes!(get_home))
         .user(routes!(integration_status))
         .user(routes!(genre_detail))
         .user(routes!(trending_artists))
         .user(routes!(popular_albums))
         .user(routes!(your_top_albums))
-}
-
-/// Now-playing snapshot route. Presence writes live in `playback`.
-pub fn now_playing_router(deps: ReadsDeps) -> axum::Router {
-    use axum::routing::get;
-
-    axum::Router::new()
-        .route("/now-playing", get(now_playing))
-        .with_state(deps)
 }

@@ -1,7 +1,7 @@
 //! Clean-slate wire shapes for request intake.
 //!
 //! Times are epoch seconds; ids are MusicBrainz ids validated to the UUID
-//! shape v2 enforces (its `MBID_PATTERN` validator).
+//! shape.
 
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
@@ -37,7 +37,7 @@ impl RequestKind {
 
 /// Album intake body. Names may be omitted only when they resolve; intake
 /// has no catalog lookup, so blank or literal-"Unknown" names are
-/// rejected (v2 `request_service._meaningful_name` quirk).
+/// rejected.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct AlbumIntake {
     /// Release-group MBID.
@@ -99,7 +99,7 @@ pub struct BatchItem {
     pub artist_mbid: Option<String>,
 }
 
-/// Batch intake body (v2 caps batches at 500 rows).
+/// Batch intake body (at most 500 rows).
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct BatchIntake {
     /// Rows to request.
@@ -205,8 +205,7 @@ pub struct BatchCancelResponse {
 }
 
 /// One grouped status detail behind the request card's expander. Intake
-/// has no producer for these yet (v2 never sent them
-/// either), so views answer None until one exists.
+/// has no producer for these yet, so views answer None until one exists.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct RequestStatusMessage {
     /// Group heading, when grouped.
@@ -232,7 +231,7 @@ pub struct RequestItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub year: Option<i32>,
     /// Custom artwork URL override. None: artwork resolves client-side
-    /// from the MBID, which is what v2's built cover URL did anyway.
+    /// from the MBID.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cover_url: Option<String>,
     /// Epoch seconds when asked.
@@ -246,7 +245,7 @@ pub struct RequestItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub progress: Option<f64>,
     /// Epoch seconds when the transfer should finish. None: no live ETA
-    /// source exists (v2 never sent one either).
+    /// source exists.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub eta: Option<u64>,
     /// Total transfer bytes from the linked task, once known.
@@ -256,7 +255,7 @@ pub struct RequestItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size_remaining: Option<f64>,
     /// Task status detail groups behind the card's expander. None until a
-    /// producer exists (v2 never sent these either).
+    /// producer exists.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status_messages: Option<Vec<RequestStatusMessage>>,
     /// Why a live request has not started, when it waits.
@@ -314,6 +313,9 @@ pub struct RequestItem {
     /// Containing release group for exact-track rows (album context).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub track_release_group_mbid: Option<String>,
+    /// The edition (release MBID) the request fetches, when one is set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub release_mbid: Option<String>,
     /// Co-requester count beyond the owner.
     pub requester_count: u32,
 }
@@ -544,4 +546,73 @@ pub struct EditionAcquireQuery {
     /// is another version of, and replace that file with it (the default).
     /// With `false` those files stay and their tracks are not fetched.
     pub replace_versions: Option<bool>,
+}
+
+/// The album's current or last edition fetch.
+#[derive(Debug, Clone, Default, Serialize, ToSchema)]
+pub struct EditionFetchResponse {
+    /// Absent when the album has no edition fetch on record (none was
+    /// started, or its download was cleared from the queue).
+    pub latest: Option<EditionFetchView>,
+}
+
+/// One edition fetch: the download asking for the edition's tracks.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct EditionFetchView {
+    /// The download fetching the tracks: the one started for them, or the
+    /// retry the queue started by itself after it.
+    pub task_id: String,
+    /// The edition fetched.
+    pub release_mbid: Option<String>,
+    pub state: EditionFetchState,
+    /// Each position asked for. Empty when the whole album was asked for
+    /// because the edition's plan could not be read.
+    pub tracks: Vec<EditionFetchTrack>,
+    /// The fetch also replaces tracks the copy holds in another version;
+    /// a retry asks the same way.
+    pub replace_versions: bool,
+    /// A new fetch may be started for what is still missing.
+    pub can_retry: bool,
+    /// The download can be stopped.
+    pub can_stop: bool,
+}
+
+/// Where an edition fetch is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EditionFetchState {
+    /// Queued, or waiting for a download source.
+    Waiting,
+    /// Searching, downloading or landing.
+    Fetching,
+    /// Finished with every track it asked for.
+    Done,
+    /// Gave up with tracks still missing.
+    Failed,
+    /// Stopped by a person.
+    Stopped,
+}
+
+/// One edition position an edition fetch asked for.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct EditionFetchTrack {
+    pub disc: u32,
+    pub position: u32,
+    pub state: EditionFetchTrackState,
+}
+
+/// Where one asked-for track is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EditionFetchTrackState {
+    /// The download has not started.
+    Waiting,
+    /// The download is working on it.
+    Fetching,
+    /// Its file is in the library.
+    Landed,
+    /// The fetch ended without it.
+    Failed,
+    /// Its file is held for a person's decision.
+    Held,
 }

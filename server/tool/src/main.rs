@@ -31,7 +31,7 @@
 
 use std::path::PathBuf;
 
-use droppedneedle::bootstrap::data_dirs::{DataDirs, Layout};
+use droppedneedle::bootstrap::data_dirs::{DataDirs, Layout, refuse_unfinished_restore};
 use droppedneedle_kernel::config::AppConfig;
 use droppedneedle_kernel::db::datalock::DataLock;
 use droppedneedle_kernel::runtime_config::Secret;
@@ -77,9 +77,13 @@ environment says otherwise). upgrade --undo --yes deletes everything in
 the two folders except the v2-backup folders, then puts the v2 files back.
 remove-v2-backup deletes the kept v2 files.
 
-restore copies a server backup into an empty folder as library.db. The
-settings come with the database. Keep the instance's config/data_enc.key
-with it: without that key, stored passwords and API keys cannot be read.
+restore copies a server backup into an empty folder under the database
+file name the server uses (library.db, or the name LIBRARY_DB_PATH gives),
+with the undo copies it names in undo/ beside it (read from the undo
+folder next to the backup). It never replaces a file, and refuses a folder
+holding anything it cannot read. The settings come with the database.
+Keep the instance's config/data_enc.key with it: without that key, stored
+passwords and API keys cannot be read.
 
 The passphrase comes from --passphrase-file or stdin, never from argv.
 Export writes <file> plus <name>.bundle.sqlite beside it; keep the two
@@ -191,10 +195,10 @@ settings it cleared, never their values. The old key is kept as
 config/data_enc.key.old (or .old.1, .old.2), which still opens backups made
 before the reset.
 
-Also changed with the key: Jellyfin album and artist ids are new, so
-Finamp and Jellify see a new library and lose their pins and downloads, and
-Subsonic picture links, corrections links and transcode links made before
-stop opening.
+It replaces a lost key and does not change the Jellyfin ids of what you
+already have: stored album and artist ids survive the reset, and only items
+added afterwards get ids under the new key. Subsonic picture links,
+corrections links and transcode links made before stop opening.
 
 It refuses, changing nothing, while the key file belongs to the database.
 Stop the server first. It finds the data the way upgrade does.
@@ -512,6 +516,7 @@ fn run_import_cmd(args: &[String], dry_run: bool) -> Result<(), String> {
     // the import, and a server cannot start until the import ends.
     let data_lock = DataLock::exclusive(&db_path)
         .map_err(|error| format!("{error} (stop the server before importing)"))?;
+    refuse_unfinished_restore(&db_path).map_err(|error| error.to_string())?;
     let report = runtime
         .block_on(upgrade::run_offline_import(
             &data_lock,
@@ -751,9 +756,15 @@ fn run_restore(args: &[String]) -> Result<(), String> {
     )?;
     let backup = required_flag(args, "--backup")?;
     let target = required_flag(args, "--target-dir")?;
+    let db_path = data_dirs()?.db_path;
+    let db_name = db_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("{} has no usable file name", db_path.display()))?;
     let summary = droppedneedle_tool::tooling::restore::restore_backup(
         PathBuf::from(&backup).as_path(),
         PathBuf::from(&target).as_path(),
+        db_name,
         has_flag(args, "--allow-downgrade"),
     )
     .map_err(|error| error.to_string())?;
@@ -867,9 +878,9 @@ fn run_reset_key(args: &[String]) -> Result<(), String> {
         );
     }
     println!(
-        "Re-enter the cleared settings. Jellyfin album and artist ids are new, so Finamp and \
-         Jellify see a new library; Subsonic picture, corrections and transcode links made \
-         before stop opening. If nobody can sign in, run droppedneedle-tool recovery-code."
+        "Re-enter the cleared settings. Stored Jellyfin ids are kept, so Finamp and Jellify \
+         keep their pins; Subsonic picture, corrections and transcode links made before stop \
+         opening. If nobody can sign in, run droppedneedle-tool recovery-code."
     );
     if let Some(config) = &done.unread_config {
         eprintln!(

@@ -8,7 +8,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 use rusqlite::Transaction;
-use sqlx::SqlitePool;
 
 use droppedneedle_kernel::clock::Clock;
 use droppedneedle_kernel::db::{Db, DbError, Lane};
@@ -41,11 +40,6 @@ impl AcquireDb {
             #[cfg(any(test, feature = "test-support"))]
             _scratch: None,
         }
-    }
-
-    /// The sqlx reader pool.
-    pub fn pool(&self) -> &SqlitePool {
-        self.db.sqlx()
     }
 
     /// The database, for a write that is not one of the two below.
@@ -117,8 +111,7 @@ impl AcquireDb {
         let (id, display_name, role) = (id.to_owned(), display_name.to_owned(), role.to_owned());
         self.write("test.add_user", move |tx| {
             tx.execute(
-                "INSERT OR IGNORE INTO auth_users (id, display_name, role, created_at) \
-                 VALUES (?1, ?2, ?3, '2024-01-01T00:00:00Z')",
+                crate::sql::INSERT_TEST_USER.text(),
                 rusqlite::params![id, display_name, role],
             )?;
             Ok(())
@@ -138,6 +131,16 @@ pub fn epoch_secs(clock: &dyn Clock) -> u64 {
 /// before the epoch reads as zero.
 pub fn unix_secs_f64(clock: &dyn Clock) -> f64 {
     clock.now_ms().max(0) as f64 / 1000.0
+}
+
+/// Float unix seconds as a time column stores them: integer milliseconds.
+pub fn ms_from_secs_f64(seconds: f64) -> i64 {
+    (seconds * 1000.0).round() as i64
+}
+
+/// A stored millisecond time as float unix seconds.
+pub fn secs_f64_from_ms(millis: i64) -> f64 {
+    millis as f64 / 1000.0
 }
 
 /// Convert a stored integer to `u64`, clamping negatives to zero.

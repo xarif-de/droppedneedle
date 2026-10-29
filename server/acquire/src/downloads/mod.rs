@@ -1,8 +1,7 @@
 //! Durable downloads: SQLite state machines with crash-safe recovery.
 //!
-//! Ports the v2 acquisition durability contract (the download
-//! orchestrator, acquisition cleanup, download store journal,
-//! and acquisition status) as small pieces wired to the real sources:
+//! The durability contract (orchestrator, cleanup, the download journal
+//! and task status), as small pieces wired to the real sources:
 //!
 //! - [`state`] task and attempt states, terminal sets, legal transitions.
 //! - [`store`] the journal itself: tasks, attempts, idempotency keys and
@@ -20,11 +19,10 @@
 //! - [`queue`] the queue view and its actions, over [`queue_rows`].
 //! - [`reasons`] why a task sits where it does, in plain words.
 //! - [`upgrades`] the quality-upgrade worklist and asks.
+//! - [`worker`] the loop that drives every task: startup recovery, then
+//!   enqueue, poll, retry, cleanup and the orphan sweep on one cadence.
 //! - [`http`] the queue routes and the upgrade routes. Held files are in
 //!   [`crate::held`].
-//!
-//! Quirk citations name the v2 behavior each port preserves, so a reader
-//! can diff against the Python without guessing.
 
 pub mod http;
 pub mod journal;
@@ -43,6 +41,7 @@ pub mod state;
 pub mod store;
 pub mod upgrades;
 pub mod watchdog;
+pub mod worker;
 
 #[cfg(any(test, feature = "test-support"))]
 pub use http::downloads_router;

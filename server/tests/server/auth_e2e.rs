@@ -145,7 +145,7 @@ impl E2e {
                 ..droppedneedle_providers::ProviderEndpoints::closed()
             },
         );
-        AuthSetup::build_with_upstreams(
+        AuthSetup::build(
             p,
             self.bundle.clone(),
             &self.upstreams,
@@ -204,7 +204,7 @@ impl E2e {
         let (media, _worker) = droppedneedle_media::MediaSetup::build(
             p,
             auth.users.clone(),
-            library.root_source(),
+            library.core.root_source(),
             Arc::new(
                 droppedneedle_catalog::reads::collections::remote_import::PlaylistImportSink::new(
                     reads.collections.clone(),
@@ -230,7 +230,7 @@ impl E2e {
                 auth.users.clone(),
                 media.playback.clone(),
                 media.stream.engine.clone(),
-                library.clone(),
+                library.scans.clone(),
                 &reads,
             ),
         );
@@ -252,18 +252,31 @@ impl E2e {
             providers.clone(),
         )
         .with_db(droppedneedle::admin::AdminDb::new(p.db.clone()))
-        .with_backups(droppedneedle_kernel::db::BackupService::new(
-            &self.db_path,
-            &backup_dir,
-            p.clock.clone(),
+        .with_backups(std::sync::Arc::new(
+            droppedneedle_kernel::db::BackupService::new(
+                &self.db_path,
+                &backup_dir,
+                p.clock.clone(),
+            ),
         ))
         .with_checkpoint(self.runtime.checkpoint().clone())
         .with_precache(jobs.precache_trigger());
-        let plugins = droppedneedle_plugins::wiring::PluginsSetup::for_tests(
-            jobs.supervisor().clone(),
+        // The production plugins bundle over the scratch plugins folder,
+        // launching nothing, with GitHub's addresses closed.
+        let ticks = droppedneedle_plugins::wiring::tick_store(p);
+        let plugin_host = droppedneedle_plugins::host::PluginHost::new(
+            p.config.plugins_dir(),
+            p.settings.clone(),
+            Arc::new(crate::common::plugin_fakes::FakeLauncher::new()),
+            ticks.clone(),
             library.core.clone(),
-        )
-        .expect("test plugins bundle builds");
+        );
+        let plugins = droppedneedle_plugins::wiring::PluginsSetup::build(
+            p,
+            plugin_host,
+            ticks,
+            crate::common::closed_outbound().plugin_hosts(),
+        );
         let settings =
             droppedneedle::settings::wiring::SettingsSetup::for_tests(Arc::clone(&p.ids))
                 .expect("test settings bundle builds")
@@ -470,6 +483,7 @@ pub(crate) async fn setup_admin(
     password: &str,
     transport: &str,
 ) -> (Value, Value) {
+    let app_again = app.clone();
     let (status, body, headers) = call(
         app,
         "POST",
@@ -483,6 +497,20 @@ pub(crate) async fn setup_admin(
         })),
     )
     .await;
+    // Setup makes the account before it signs the owner in, so on a loaded
+    // host a setup that answered a failure, or a retry that answered 409,
+    // may still have made it: then signing in is how the owner gets in.
+    let (status, body, headers) = if status.is_server_error() || status == StatusCode::CONFLICT {
+        let (signed, session, headers) = login(app_again, username, password, transport).await;
+        assert_eq!(
+            signed,
+            StatusCode::OK,
+            "setup must succeed: {status} {body}; sign-in: {session}"
+        );
+        (StatusCode::CREATED, session, headers)
+    } else {
+        (status, body, headers)
+    };
     assert_eq!(status, StatusCode::CREATED, "setup must succeed: {body}");
     let credential = if transport == "bearer" {
         body["token"].clone()
@@ -1682,7 +1710,7 @@ async fn trusted_tier_edition_admitted_approvals_forbidden() {
         "PUT",
         "/api/v3/library/albums/e2e-dummy-id/edition",
         &tris_headers,
-        Some(json!({"release_mbid": "e2e-dummy-id"})),
+        Some(json!({"release_mbid": "e2e-dummy-id", "expected_identity_revision": 0})),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
@@ -1930,10 +1958,11 @@ async fn rate_limits_key_by_client_and_username() {
 #[tokio::test]
 async fn login_guesses_from_fresh_addresses_meet_the_username_wall() {
     let e2e = E2e::open("username-wall").await;
-    let app = e2e.router();
+    let app = held_clock_router(&e2e);
 
     // No address repeats, so no per-client bucket ever fills: only the
-    // username's own budget (burst 50) can refuse these.
+    // username's own budget (burst 50) can refuse these, and with the
+    // clock held it never refills.
     let peers: Vec<String> = (0..60).map(|n| format!("203.0.113.{n}:1")).collect();
     let attempts = peers.iter().map(|peer| {
         call_from(
@@ -1944,13 +1973,13 @@ async fn login_guesses_from_fresh_addresses_meet_the_username_wall() {
         )
     });
     let statuses = futures_util::future::join_all(attempts).await;
-    // The budget refills on the real clock, so the count of refusals moves
-    // with how fast the attempts land. The wall is that some are refused.
     let limited = statuses
         .iter()
         .filter(|status| **status == StatusCode::TOO_MANY_REQUESTS)
         .count();
-    assert!(limited >= 5, "{statuses:?}");
+    // At least every attempt past the burst; a busy answer asked again
+    // spends one more token.
+    assert!(limited >= peers.len() - 50, "{statuses:?}");
     assert!(
         statuses.iter().all(|status| matches!(
             *status,
@@ -1980,24 +2009,62 @@ async fn failed_authentications_are_throttled_per_client() {
     );
 }
 
+/// A setup whose write runs past its budget while it stores the admin's
+/// session answers busy and leaves no account, so the retry runs setup
+/// rather than hearing it was already done.
+#[tokio::test]
+async fn busy_setup_leaves_no_admin_and_a_retry_runs_it() {
+    use droppedneedle_kernel::db::{Budget, LaneLimits};
+    let e2e = E2e::open_with("setup-busy", |config| {
+        config.with_lane_limits(LaneLimits {
+            foreground: Budget {
+                warn: Duration::from_secs(1),
+                abort: Duration::from_secs(3),
+            },
+            ..LaneLimits::patient()
+        })
+    })
+    .await;
+    // A session insert that never finishes in time: the stand-in for a host
+    // too busy to finish the write within its budget.
+    crate::common::break_schema(
+        e2e.db(),
+        "CREATE TRIGGER slow_session AFTER INSERT ON auth_tokens BEGIN \
+         SELECT count(*) FROM sqlite_master a, sqlite_master b, sqlite_master c, \
+         sqlite_master d, sqlite_master e; END;",
+    )
+    .await;
+    let setup = json!({"username": "root", "password": "root-password-1234"});
+    let (status, body, headers) = call_once(
+        e2e.router(),
+        "POST",
+        "/api/v3/auth/setup",
+        &[],
+        Some(setup.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["error"]["code"], "SERVER_BUSY", "{body}");
+    assert!(headers.contains_key("retry-after"));
+    let (_, body, _) = call(e2e.router(), "GET", "/api/v3/auth/setup/status", &[], None).await;
+    assert_eq!(body, json!({"setup_required": true}), "no admin was left");
+
+    crate::common::break_schema(e2e.db(), "DROP TRIGGER slow_session;").await;
+    let (status, body, _) =
+        call_once(e2e.router(), "POST", "/api/v3/auth/setup", &[], Some(setup)).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert!(body["user"]["last_login_at"].is_i64(), "{body}");
+}
+
 #[tokio::test]
 async fn login_store_failure_is_a_500_not_bad_credentials() {
     let e2e = E2e::open("login-store-down").await;
     setup_admin(e2e.router(), "e2e-owner", "e2e-owner-password-1", "bearer").await;
-    e2e.runtime
-        .db()
-        // A rename re-parses the whole schema, which outruns the request
-        // budget on a busy host; the job budget fits it.
-        .write(
-            droppedneedle_kernel::db::Lane::Background,
-            "test.break",
-            |tx| {
-                tx.execute_batch("ALTER TABLE auth_providers RENAME TO auth_providers_gone")?;
-                Ok::<_, droppedneedle_kernel::db::DbError>(())
-            },
-        )
-        .await
-        .expect("table renames");
+    crate::common::break_schema(
+        e2e.runtime.db(),
+        "ALTER TABLE auth_providers RENAME TO auth_providers_gone",
+    )
+    .await;
     let (status, body, _) =
         login(e2e.router(), "e2e-owner", "e2e-owner-password-1", "bearer").await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
@@ -2013,12 +2080,31 @@ async fn sign_in_waits_out_a_full_read_pool_as_busy_not_a_fault() {
     .await;
     let (_, token) = setup_admin(e2e.router(), "e2e-owner", "e2e-owner-password-1", "bearer").await;
     let auth = bearer(token.as_str().expect("setup token"));
-    // Every reader checked out: the stand-in for a host too busy to hand
-    // one over before the checkout limit.
+    // Every reader of both read pools checked out: the stand-in for a host
+    // too busy to hand one over before the checkout limit.
+    let readers = droppedneedle_kernel::db::MAX_READERS as usize;
     let mut held = Vec::new();
-    for _ in 0..droppedneedle_kernel::db::MAX_READERS {
+    for _ in 0..readers {
         held.push(e2e.pool().acquire().await.expect("reader checks out"));
     }
+    let started = Arc::new(std::sync::Barrier::new(readers + 1));
+    let release = Arc::new(std::sync::Barrier::new(readers + 1));
+    let mut holders = Vec::new();
+    for _ in 0..readers {
+        let (started, release) = (Arc::clone(&started), Arc::clone(&release));
+        let db = e2e.db().clone();
+        holders.push(tokio::spawn(async move {
+            db.read("test.hold", move |_| {
+                started.wait();
+                release.wait();
+                Ok::<_, droppedneedle_kernel::db::DbError>(())
+            })
+            .await
+        }));
+    }
+    tokio::task::spawn_blocking(move || started.wait())
+        .await
+        .expect("readers check out");
     let headers = [("authorization", auth.as_str())];
     let setup = json!({"username": "second", "password": "second-password-12"});
     let sign_in = json!({
@@ -2047,6 +2133,12 @@ async fn sign_in_waits_out_a_full_read_pool_as_busy_not_a_fault() {
         assert!(body["error"]["details"]["error_id"].is_string(), "{body}");
     }
     drop(held);
+    tokio::task::spawn_blocking(move || release.wait())
+        .await
+        .expect("readers release");
+    for holder in holders {
+        holder.await.expect("holder joins").expect("held read ends");
+    }
     let (status, body, _) =
         login(e2e.router(), "e2e-owner", "e2e-owner-password-1", "bearer").await;
     assert_eq!(status, StatusCode::OK, "{body}");

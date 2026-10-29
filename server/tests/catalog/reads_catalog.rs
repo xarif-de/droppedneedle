@@ -22,7 +22,7 @@ use droppedneedle_catalog::reads::catalog::{
 use droppedneedle_catalog::reads::search::{self, SearchDeps, service::SearchService};
 use droppedneedle_kernel::runtime_config::secret_sections::AdvancedSettings;
 use droppedneedle_kernel::runtime_config::sections::{
-    MbSourceMode, MusicBrainzSettings, MusicSource, UserPreferences,
+    ListenSource, MbSourceMode, MusicBrainzSettings, UserPreferences,
 };
 use droppedneedle_providers::Providers;
 use serde_json::{Value, json};
@@ -290,8 +290,8 @@ impl CatalogSettings for TestSettings {
         true
     }
 
-    fn primary_source(&self) -> MusicSource {
-        MusicSource::Listenbrainz
+    fn primary_source(&self) -> ListenSource {
+        ListenSource::Listenbrainz
     }
 
     fn store_region(&self) -> Option<String> {
@@ -642,7 +642,7 @@ async fn artist_sections_use_listenbrainz_then_lastfm() {
         .as_array()
         .unwrap()
         .iter()
-        .map(|album| &album["release_group_mbid"])
+        .map(|album| &album["musicbrainz_id"])
         .collect();
     assert_eq!(
         groups,
@@ -664,7 +664,6 @@ async fn artist_sections_use_listenbrainz_then_lastfm() {
             "title": "Dummy",
             "artist_name": "Portishead",
             "artist_id": "b7539c32-53e7-4908-bda3-81449c367da6",
-            "year": null,
             "in_library": false,
             "requested": false,
             "cover_url": format!("/api/v3/covers/release-group/{DUMMY_GROUP}?size=500")
@@ -833,7 +832,11 @@ async fn unified_search_joins_musicbrainz_with_the_library() {
 
     let page = get(&app, "/api/v3/search/albums?q=ok%20computer&limit=2").await;
     assert_eq!(page["status"], "ok");
-    assert_eq!(titles(&page["results"]), ["OK Computer", "Kid A"]);
+    // The library-only bootleg must show in "see all" too, not only in the overview.
+    assert_eq!(
+        titles(&page["results"]),
+        ["OK Computer", "OK Computer Live Bootleg", "Kid A"]
+    );
     assert_eq!(page["results"][0]["id"], "album-okc");
 
     let suggest = get(&app, "/api/v3/search/suggest?q=ok%20computer&limit=3").await;
@@ -848,10 +851,29 @@ async fn unified_search_joins_musicbrainz_with_the_library() {
     assert_eq!(album["in_library"], true);
 }
 
+/// The library scope answers from the library alone: MusicBrainz is never
+/// asked, and only library rows come back.
+#[tokio::test]
+async fn library_scoped_search_never_asks_musicbrainz() {
+    let fixtures = Fixtures::start().await;
+    let (app, _auth) = app(&fixtures).await;
+
+    let body = get(&app, "/api/v3/search?q=ok%20computer&scope=library").await;
+
+    assert_eq!(
+        titles(&body["albums"]),
+        ["OK Computer", "OK Computer Live Bootleg"]
+    );
+    for row in body["albums"].as_array().unwrap() {
+        assert!(row["id"].is_string(), "library rows only: {row}");
+    }
+    assert_eq!(fixtures.hits("/mb/ws/2/release-group"), 0);
+    assert_eq!(fixtures.hits("/mb/ws/2/artist"), 0);
+}
+
 #[tokio::test]
 async fn lastfm_reads_fall_back_to_the_instance_key() {
     let rig = AuthRig::new("reads-catalog").await;
-    let switch = Arc::new(crate::common::auth_fakes::InstanceKeySwitch::default());
     let upstream = Upstream::new(
         Arc::new(Providers::unpaced(Arc::new(
             droppedneedle_providers::executor::ScriptedWire::new(),
@@ -859,16 +881,13 @@ async fn lastfm_reads_fall_back_to_the_instance_key() {
         Arc::new(TestSettings {
             mb_url: String::new(),
         }),
-        droppedneedle_auth::users::UsersDeps {
-            lastfm_switch: switch.clone(),
-            ..rig.deps.clone()
-        },
+        rig.deps.clone(),
     );
     assert!(
         upstream.lastfm("no-key-user").await.is_none(),
         "no user key and no instance key"
     );
-    switch.set("instance-key");
+    rig.set_lastfm_instance_key("instance-key");
     let (_, creds) = upstream.lastfm("no-key-user").await.expect("instance key");
     assert_eq!(creds.api_key, "instance-key");
 }
@@ -1305,7 +1324,8 @@ async fn a_commons_portrait_answers_its_credit_as_plain_text() {
 /// while the read behind them fails.
 #[tokio::test]
 async fn a_passing_failure_is_not_cached_as_a_short_section() {
-    use droppedneedle_catalog::reads::catalog::models::{DiscoveryAlbum, DiscoverySource};
+    use droppedneedle_catalog::reads::catalog::models::AlbumRef;
+    use droppedneedle_kernel::runtime_config::sections::ListenSource;
     use droppedneedle_providers::executor::{Method, Scripted, ScriptedWire};
     use droppedneedle_providers::{
         ProviderEndpoints, RequestPriority, TransportKind, listenbrainz,
@@ -1406,7 +1426,7 @@ async fn a_passing_failure_is_not_cached_as_a_short_section() {
             USER,
             ARTIST,
             5,
-            Some(DiscoverySource::Listenbrainz),
+            Some(ListenSource::Listenbrainz),
             RequestPriority::UserInitiated,
         )
     };
@@ -1420,10 +1440,10 @@ async fn a_passing_failure_is_not_cached_as_a_short_section() {
         "the song links its album once ListenBrainz answers"
     );
 
-    let ids = |albums: &[DiscoveryAlbum]| {
+    let ids = |albums: &[AlbumRef]| {
         albums
             .iter()
-            .map(|album| album.musicbrainz_id.clone())
+            .filter_map(|album| album.musicbrainz_id.clone())
             .collect::<Vec<_>>()
     };
     let first = catalog
@@ -1482,21 +1502,40 @@ async fn provider_answers_survive_a_restart() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["title"], "OK Computer");
     assert_eq!(*hits.lock().unwrap(), 1);
-    app.until("the answer is in the cache file", || async {
-        let (_, stats) = app
-            .call("GET", "/api/v3/admin/cache/stats", &auth, None)
-            .await;
-        (stats["entries"].as_u64().unwrap_or(0) > 0).then_some(())
+    // The release group's own entry, not just any: the page stores others
+    // too, and the cache file is written behind the answer.
+    let cache_file = app
+        .config
+        .cache_dir
+        .join(droppedneedle_kernel::db::cache::FILE_NAME);
+    app.until("the release group is in the cache file", || async {
+        let cache = rusqlite::Connection::open(&cache_file).ok()?;
+        cache
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM provider_cache_entries \
+                 WHERE kind = 'found' AND key LIKE '%:rg:' || ?1)",
+                [OK_COMPUTER],
+                |row| row.get::<_, bool>(0),
+            )
+            .ok()?
+            .then_some(())
     })
     .await;
 
+    // Background work may have asked for the group again before its entry
+    // landed; from here on the network is gone.
     server.abort();
     let _ = server.await;
+    let served = *hits.lock().unwrap();
     let app = app.restart().await;
     let (status, body) = app.call("GET", &basic, &auth, None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["title"], "OK Computer");
-    assert_eq!(*hits.lock().unwrap(), 1, "answered from the cache file");
+    assert_eq!(
+        *hits.lock().unwrap(),
+        served,
+        "answered from the cache file"
+    );
     app.stop().await;
 }
 

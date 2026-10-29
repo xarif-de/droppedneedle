@@ -9,7 +9,7 @@ import type {
 } from './LibraryQueryKeyFactory';
 
 /** A review list filter as the server's query fields (paging aside). */
-export function reviewFilterQuery(params: Omit<LibraryReviewParams, 'limit' | 'offset'>) {
+export function reviewFilterQuery(params: Omit<LibraryReviewParams, 'limit'>) {
 	return {
 		...(params.search ? { search: params.search } : {}),
 		...(params.reasonCode ? { reason_code: params.reasonCode } : {}),
@@ -79,6 +79,11 @@ export const LibraryV3Api = {
 	// The album's edition: read, choose, hand back, confirm, undo.
 	edition: (albumId: string) =>
 		v3('/api/v3/library/albums/{album_id}/edition', { path: { album_id: albumId } }),
+	editionHandBack: (albumId: string, identityRevision: number) =>
+		v3('/api/v3/library/albums/{album_id}/edition', {
+			path: { album_id: albumId },
+			query: { expected_identity_revision: identityRevision }
+		}),
 	editionConfirm: (albumId: string) =>
 		v3('/api/v3/library/albums/{album_id}/edition/confirm', { path: { album_id: albumId } }),
 	editionUndo: (albumId: string) =>
@@ -110,10 +115,15 @@ export const LibraryV3Api = {
 		v3('/api/v3/library/albums/{album_id}/removals/{removal_id}/put-back', {
 			path: { album_id: albumId, removal_id: removalId }
 		}),
-	// One file matched to an edition track by hand (PUT), and its undo (DELETE).
+	// One file matched to an edition track by hand (PUT), and its undo.
 	editionFile: (albumId: string, trackId: string) =>
 		v3('/api/v3/library/albums/{album_id}/edition/files/{track_id}', {
 			path: { album_id: albumId, track_id: trackId }
+		}),
+	editionFileUnmatch: (albumId: string, trackId: string, identityRevision: number) =>
+		v3('/api/v3/library/albums/{album_id}/edition/files/{track_id}', {
+			path: { album_id: albumId, track_id: trackId },
+			query: { expected_identity_revision: identityRevision }
 		}),
 	// What taking an edition would do to the files; the current one without a release.
 	editionPlan: (albumId: string, releaseMbid?: string) =>
@@ -137,11 +147,10 @@ export const LibraryV3Api = {
 		v3('/api/v3/library/albums/{album_id}/edition/tags/{job_id}/undo', {
 			path: { album_id: albumId, job_id: jobId }
 		}),
-	unconfirmed: (state: 'unconfirmed' | 'unmatched', limit: number, offset: number) =>
-		v3('/api/v3/library/unconfirmed', { query: { state, limit, offset } }),
-	managePreview: () => v3('/api/v3/library/manage/preview'),
-	manageApply: () => v3('/api/v3/library/manage/apply'),
-	manageUndo: () => v3('/api/v3/library/manage/undo'),
+	unconfirmed: (state: 'unconfirmed' | 'unmatched', limit: number, cursor?: string) =>
+		v3('/api/v3/library/unconfirmed', {
+			query: { state, limit, ...(cursor ? { cursor } : {}) }
+		}),
 	albumCopies: (albumId: string) =>
 		v3('/api/v3/library/albums/{id}/copies', { path: { id: albumId } }),
 	albumTracks: (albumId: string, params: LibraryV3PageParams) =>
@@ -200,17 +209,13 @@ export const LibraryV3Api = {
 				...(params.offset !== undefined ? { offset: params.offset } : {})
 			}
 		}),
-	localSearch: (term: string, limit: number | null) =>
-		v3('/api/v3/local-library/search', {
-			query: limit === null ? { q: term } : { q: term, limit }
-		}),
 	// Identification reviews: list, read, and every way to settle one.
-	reviews: (params: LibraryReviewParams) =>
+	reviews: (params: LibraryReviewParams, cursor?: string) =>
 		v3('/api/v3/library/reviews', {
 			query: {
 				state: params.state ?? 'pending',
 				limit: params.limit,
-				offset: params.offset,
+				...(cursor ? { cursor } : {}),
 				...reviewFilterQuery(params)
 			}
 		}),
@@ -230,8 +235,8 @@ export const LibraryV3Api = {
 	bulkReviewApply: () => v3('/api/v3/library/reviews/bulk-apply'),
 	approveReview: (reviewId: string) =>
 		v3('/api/v3/library/reviews/{id}/approve', { path: { id: reviewId } }),
-	rejectReview: (reviewId: string) =>
-		v3('/api/v3/library/reviews/{id}/reject', { path: { id: reviewId } }),
+	keepTaggedReview: (reviewId: string) =>
+		v3('/api/v3/library/reviews/{id}/keep-tagged', { path: { id: reviewId } }),
 	operation: (jobId: string) =>
 		v3('/api/v3/library/operations/{job_id}', { path: { job_id: jobId } }),
 	pauseOperation: (jobId: string) =>
@@ -247,7 +252,6 @@ export const LibraryV3Api = {
 			artist: string;
 			release_group_mbid?: string;
 			limit: number;
-			offset: number;
 		}
 	) =>
 		v3('/api/v3/library/albums/{album_id}/reidentification/releases', {
@@ -298,10 +302,10 @@ export const LibraryV3Api = {
 		v3('/api/v3/library/scan/runs/estimate', {
 			query: scopeIds.length ? { scope_ids: scopeIds } : {}
 		}),
-	scanRunFailures: (runId: string, limit: number, cursor?: number) =>
+	scanRunFailures: (runId: string, limit: number, cursor?: string) =>
 		v3('/api/v3/library/scan/runs/{id}/failures', {
 			path: { id: runId },
-			query: { limit, ...(cursor !== undefined ? { cursor } : {}) }
+			query: { limit, ...(cursor ? { cursor } : {}) }
 		}),
 	scanDiagnostics: (runId: string) =>
 		v3('/api/v3/library/scan/runs/{id}/diagnostics', { path: { id: runId } }),

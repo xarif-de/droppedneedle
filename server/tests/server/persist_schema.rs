@@ -68,13 +68,13 @@ async fn fresh_migrate_marks_version_and_seeds() {
         .unwrap();
     assert_eq!(applied, migration_count());
 
-    assert_eq!(table_names(&pool).await.len(), 169);
+    assert_eq!(table_names(&pool).await.len(), 173);
     let triggers: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger'")
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(triggers, 65);
+    assert_eq!(triggers, 68);
 
     let catalog: (i64, i64) =
         sqlx::query_as("SELECT singleton, value FROM library_catalog_revision")
@@ -3931,10 +3931,12 @@ type StatementFiles = fn() -> Vec<StatementFile>;
 /// for the server crate), with the function that lists its files.
 const REGISTRIES: &[(&str, StatementFiles)] = &[
     ("kernel", droppedneedle_kernel::statement_files),
+    ("auth", droppedneedle_auth::statement_files),
     ("catalog", droppedneedle_catalog::statement_files),
     ("acquire", droppedneedle_acquire::statement_files),
     ("library", droppedneedle_library::statement_files),
     ("media", droppedneedle_media::statement_files),
+    ("compat", droppedneedle_compat::statement_files),
     ("tool", droppedneedle_tool::statement_files),
 ];
 
@@ -4118,7 +4120,14 @@ fn every_registered_statement_prepares() {
 /// the playable totals across every folder, and the player apps' track
 /// lists, totals and unplayed halves over the whole library (one album's
 /// or one exact title's are families of their own, checked here), and
-/// their lists of every track and genre.
+/// their lists of every track and genre. Also the upgrade worklist, which
+/// reads every identified track to find each album's worst file, and the
+/// quota's library total, which sums every indexed track (10 ms on 100k
+/// tracks). The acquire reads of one release group's or one recording's
+/// tracks (the album and recording quality checks and "the library holds
+/// it") walk only because no index covers lowered release-group or
+/// recording ids; the expression indexes that cover them take them off
+/// this list.
 const TRACK_WALKS: &[&str] = &[
     "droppedneedle_catalog::reads::library::sql::TRACK_PAGE_LIKE",
     "droppedneedle_catalog::reads::library::sql::TRACK_PAGE_WORDS",
@@ -4135,8 +4144,10 @@ const TRACK_WALKS: &[&str] = &[
     "droppedneedle_catalog::reads::library::sql::PLAYER_TRACK_COUNT",
     "droppedneedle_catalog::reads::library::sql::PLAYER_TRACKS_UNPLAYED",
     "droppedneedle_catalog::reads::library::sql::PLAYER_TRACKS_UNPLAYED_COUNT",
-    "droppedneedle_catalog::reads::library::sql::PLAYER_EVERY_TRACK",
-    "droppedneedle_catalog::reads::library::sql::PLAYER_EVERY_GENRE",
+    "droppedneedle_compat::adapters::jellyfin_ids::sql::NEW_TRACKS",
+    "droppedneedle_compat::adapters::jellyfin_ids::sql::GENRE_NAMES",
+    "droppedneedle_acquire::flows::sql::IDENTIFIED_TRACKS",
+    "droppedneedle_acquire::requests::sql::LIBRARY_BYTES",
 ];
 
 /// Before the first ANALYZE (a fresh install) the planner has no
@@ -5670,6 +5681,7 @@ async fn request_state_checks_list_exactly_the_code_values() {
         "request_history",
         "wanted_watches",
         "auto_download_approvals",
+        "personal_mix_approvals",
     ] {
         let sql: String = sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE name = ?")
             .bind(table)
@@ -5701,6 +5713,10 @@ async fn request_state_checks_list_exactly_the_code_values() {
     );
     assert_eq!(
         listed("auto_download_approvals", "state"),
+        ApprovalState::ALL.map(|state| state.as_str().to_owned())
+    );
+    assert_eq!(
+        listed("personal_mix_approvals", "state"),
         ApprovalState::ALL.map(|state| state.as_str().to_owned())
     );
     for status in RequestStatus::ALL {
@@ -5837,7 +5853,8 @@ async fn queued_downloads_take_an_empty_plan_on_upgrade() {
     let pool = scratch_pool().await;
     migrator_through(83).run(&pool).await.unwrap();
     sqlx::raw_sql(
-        "PRAGMA foreign_keys = OFF; \
+        "INSERT INTO auth_users (id, display_name, role, created_at) \
+         VALUES ('u1', 'U', 'user', 'now'); \
          INSERT INTO download_tasks (id, user_id, release_group_mbid, artist_name, \
              album_title, status, created_at, updated_at) \
          VALUES ('t-queued', 'u1', 'rg', 'A', 'B', 'queued', 1, 1);",
@@ -6310,6 +6327,117 @@ async fn tracks_gain_a_download_task_index_on_upgrade() {
     assert_eq!(kept, ("t1".to_owned(), Some("task-1".to_owned()), 1234));
 }
 
+/// Migration 0091 adds the stored Jellyfin ids. On a catalog that already
+/// holds an album, a track and a merged-away album (beside the artists the
+/// migrations seed), the table arrives
+/// empty, STRICT and with its partial unique index, and one fill pass then
+/// stores each item's current id and the aliases that still resolve.
+#[tokio::test]
+async fn jellyfin_ids_arrive_empty_and_fill_on_upgrade() {
+    use droppedneedle_compat::adapters::jellyfin_ids::JellyfinIds;
+
+    let dir = crate::common::ScratchDir::new("jellyfin-ids-upgrade");
+    let path = dir.join("app.db");
+    let pool = &SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect(&format!("sqlite://{}?mode=rwc", path.display()))
+        .await
+        .unwrap();
+    migrator_through(90).run(pool).await.unwrap();
+    sqlx::raw_sql(
+        "INSERT INTO local_artists (id, display_name, folded_name, kind, created_at, \
+             updated_at) VALUES ('ar1', 'A', 'a', 'person', 0, 0); \
+         INSERT INTO local_albums (id, root_id, grouping_key, title, title_folded, \
+             album_artist_id, album_artist_name, grouping_source, created_at, updated_at) \
+         VALUES ('al1', 'r1', 'al1', 'T', 't', 'ar1', 'A', 'automatic', 0, 0); \
+         INSERT INTO local_album_aliases (alias, local_album_id, kind, created_at) \
+         VALUES ('al0', 'al1', 'merged_album', 0); \
+         INSERT INTO local_tracks (id, local_album_id, root_id, file_path, relative_path, \
+             path_hash, file_size_bytes, file_mtime_ns, stat_revision, title, title_folded, \
+             album_title, album_title_folded, file_format, ingest_source, imported_at, \
+             membership_source, availability, genre) \
+         VALUES ('t1', 'al1', 'r1', '/m/1.mp3', '1.mp3', 'p1', 1234, 0, 's', 'T', 't', 'T', \
+             't', 'mp3', 'scan', 0, 'automatic', 'indexed', 'Trip Hop');",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+
+    apply_migrations(pool).await.unwrap();
+    assert_migrated(pool).await.unwrap();
+    let (table, index): (String, String) = sqlx::query_as(
+        "SELECT t.sql, i.sql FROM sqlite_master t, sqlite_master i \
+         WHERE t.name = 'compat_jellyfin_ids' AND i.name = 'idx_compat_jellyfin_ids_current'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert!(table.contains("STRICT"), "{table}");
+    assert!(
+        index.contains("UNIQUE") && index.contains("WHERE current = 1"),
+        "{index}"
+    );
+    let stored = || async {
+        sqlx::query_as::<_, (String, String, String, i64)>(
+            "SELECT jellyfin_id, kind, internal_id, current FROM compat_jellyfin_ids \
+             ORDER BY kind, internal_id, current, jellyfin_id",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    };
+    assert!(stored().await.is_empty(), "the table arrives empty");
+
+    let runtime = open_runtime(&DbConfig::new(&path))
+        .await
+        .expect("runtime opens");
+    let crypto = std::sync::Arc::new(
+        droppedneedle_kernel::runtime_config::Crypto::from_key_bytes(&[7; 32]).unwrap(),
+    );
+    let ids = JellyfinIds::new(runtime.db().clone(), crypto, std::time::Duration::ZERO);
+    ids.fill().pass().await.unwrap();
+    let row = |id: String, kind: &str, internal: &str, current: i64| {
+        (id, kind.to_owned(), internal.to_owned(), current)
+    };
+    let mut expected = vec![
+        row(ids.computed("album", "al0"), "album", "al0", 0),
+        row(JellyfinIds::derive("album", "al0"), "album", "al0", 0),
+        row(JellyfinIds::derive("album", "al1"), "album", "al1", 0),
+        row(ids.computed("album", "al1"), "album", "al1", 1),
+        row(JellyfinIds::derive("artist", "ar1"), "artist", "ar1", 0),
+        row(ids.computed("artist", "ar1"), "artist", "ar1", 1),
+        row(
+            JellyfinIds::derive("genre", "trip-hop"),
+            "genre",
+            "trip-hop",
+            1,
+        ),
+        row(
+            JellyfinIds::derive("library", "music"),
+            "library",
+            "music",
+            1,
+        ),
+        row(JellyfinIds::derive("track", "t1"), "track", "t1", 1),
+    ];
+    let seeded: Vec<String> = sqlx::query_scalar("SELECT id FROM local_artists WHERE id <> 'ar1'")
+        .fetch_all(pool)
+        .await
+        .unwrap();
+    for artist in &seeded {
+        expected.push(row(ids.computed("artist", artist), "artist", artist, 1));
+        expected.push(row(
+            JellyfinIds::derive("artist", artist),
+            "artist",
+            artist,
+            0,
+        ));
+    }
+    expected.sort_by(|a, b| (&a.1, &a.2, a.3, &a.0).cmp(&(&b.1, &b.2, b.3, &b.0)));
+    assert_eq!(stored().await, expected);
+    runtime.shutdown().await;
+}
+
 /// Wall time in milliseconds, for checks against "due now".
 fn now_ms() -> i64 {
     let elapsed = std::time::SystemTime::now()
@@ -6515,4 +6643,1152 @@ async fn placeholder_artist_ids_are_cleared_on_upgrade() {
             ("real".to_owned(), "stamp".to_owned()),
         ]
     );
+}
+
+/// Migration 0090 rebuilds the held files table so its reason CHECK takes
+/// `queue_gave_way`: a held file comes through with its reason, pairing
+/// and evidence, the new code is accepted, and the triggers still move the
+/// download activity revision. Download tasks gain `picked_by_person`:
+/// a task carried over reads 0, and only 0 or 1 is taken.
+#[tokio::test]
+async fn queued_copies_can_give_way_on_upgrade() {
+    let pool = scratch_pool().await;
+    migrator_through(89).run(&pool).await.unwrap();
+    sqlx::raw_sql(
+        "PRAGMA foreign_keys = OFF; \
+         INSERT INTO auth_users (id, display_name, role, created_at) \
+         VALUES ('u1', 'U', 'user', 'now'); \
+         INSERT INTO acquire_held_entries (id, user_id, origin, group_key, state, \
+             created_at, expires_at) \
+         VALUES (1, 'u1', 'download', 'album:rg', 'held', 1, 2); \
+         INSERT INTO acquire_held_files (id, entry_id, root, path, original_name, \
+             release_mbid, release_track_mbid, recording_mbid, disc_number, track_number, \
+             track_title, file_format, duration_seconds, expected_duration_seconds, \
+             evidence_title, evidence_artist, evidence_score, source, source_task_id, \
+             reason, reason_detail, state, created_at) \
+         VALUES (7, 1, 'held', 'aa_01.flac', 'CD1/01.flac', 'rel', 'rt', 'rec', 1, 1, \
+             'Mysterons', 'flac', 301.5, 302.0, 'Heard', 'Someone', 0.82, 'soulseek', 't1', \
+             'owned_elsewhere', 'another copy', 'held', 5); \
+         INSERT INTO download_tasks (id, user_id, release_group_mbid, artist_name, \
+             album_title, status, created_at, updated_at) \
+         VALUES ('t-linked', 'u1', 'rg', 'A', 'B', 'downloading', 1, 1);",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    apply_migrations(&pool).await.unwrap();
+    assert_migrated(&pool).await.unwrap();
+
+    let picked: (i64, String) =
+        sqlx::query_as("SELECT picked_by_person, status FROM download_tasks WHERE id = 't-linked'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        picked,
+        (0, "downloading".to_owned()),
+        "a carried-over task reads 0"
+    );
+    sqlx::raw_sql("UPDATE download_tasks SET picked_by_person = 1 WHERE id = 't-linked'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(
+        sqlx::raw_sql("UPDATE download_tasks SET picked_by_person = 2 WHERE id = 't-linked'")
+            .execute(&pool)
+            .await
+            .is_err(),
+        "only 0 or 1 is taken"
+    );
+
+    type Kept = (
+        i64,
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<f64>,
+        i64,
+    );
+    let kept: Kept = sqlx::query_as(
+        "SELECT entry_id, path, original_name, state, reason, reason_detail, \
+         release_track_mbid, evidence_score, created_at FROM acquire_held_files WHERE id = 7",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        kept,
+        (
+            1,
+            "aa_01.flac".to_owned(),
+            "CD1/01.flac".to_owned(),
+            "held".to_owned(),
+            "owned_elsewhere".to_owned(),
+            Some("another copy".to_owned()),
+            Some("rt".to_owned()),
+            Some(0.82),
+            5,
+        )
+    );
+    let revision = || async {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT revision FROM download_activity_global_revision WHERE singleton = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+    };
+    let before = revision().await;
+    sqlx::raw_sql("UPDATE acquire_held_files SET reason = 'queue_gave_way' WHERE id = 7")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        revision().await,
+        before + 1,
+        "the new reason is taken and the list moves"
+    );
+}
+
+/// Migration 0092 gives repair snapshots a `purpose` column filled from
+/// `scope_json`: a named purpose is kept, a scope naming none is an
+/// identity repair (v2's rule), and a scope that does not decode or names
+/// no known purpose is left without one. Only the four purposes are
+/// taken. The cleanup watermark is seeded at the newest finished
+/// identification job, or the start of time when there is none.
+#[tokio::test]
+async fn repair_purpose_becomes_a_column_on_upgrade() {
+    let pool = scratch_pool().await;
+    migrator_through(91).run(&pool).await.unwrap();
+    sqlx::raw_sql(
+        "PRAGMA foreign_keys = OFF; \
+         INSERT INTO library_repair_snapshots (job_id, scope_json, target_matcher_version, \
+             created_at) VALUES \
+             ('named', '{\"root_ids\":[],\"purpose\":\"management_readiness\"}', 'v', 1), \
+             ('none', '{\"root_ids\":[\"r\"]}', 'v', 1), \
+             ('null', '{\"purpose\":null}', 'v', 1), \
+             ('broken', 'not json', 'v', 1), \
+             ('unknown', '{\"purpose\":\"artist_identity_reconciliation\"}', 'v', 1), \
+             ('list', '[]', 'v', 1); \
+         INSERT INTO library_identify_jobs (id, local_album_id, kind, priority, state, \
+             input_revision, idempotency_key, created_ms, updated_ms) VALUES \
+             ('a', 'al', 'automatic', 0, 'succeeded', 'r', 'ka', 1, 5), \
+             ('b', 'al', 'automatic', 0, 'attention', 'r', 'kb', 1, 9), \
+             ('c', 'al', 'automatic', 0, 'queued', 'r', 'kc', 1, 20);",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    apply_migrations(&pool).await.unwrap();
+    assert_migrated(&pool).await.unwrap();
+
+    let purposes: Vec<(String, Option<String>)> =
+        sqlx::query_as("SELECT job_id, purpose FROM library_repair_snapshots ORDER BY job_id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    let purpose = |purpose: Option<&str>| purpose.map(str::to_owned);
+    assert_eq!(
+        purposes,
+        vec![
+            ("broken".to_owned(), None),
+            ("list".to_owned(), None),
+            ("named".to_owned(), purpose(Some("management_readiness"))),
+            ("none".to_owned(), purpose(Some("existing_matches"))),
+            ("null".to_owned(), purpose(Some("existing_matches"))),
+            ("unknown".to_owned(), None),
+        ]
+    );
+    assert!(
+        sqlx::raw_sql(
+            "UPDATE library_repair_snapshots SET purpose = 'bogus' WHERE job_id = 'none'"
+        )
+        .execute(&pool)
+        .await
+        .is_err(),
+        "only the four purposes are taken"
+    );
+
+    let mark: (i64, String) =
+        sqlx::query_as("SELECT identified_at, identified_job_id FROM library_repair_watermarks")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(mark, (9, "b".to_owned()), "the newest finished job");
+
+    let empty = scratch_pool().await;
+    apply_migrations(&empty).await.unwrap();
+    let mark: (i64, String) =
+        sqlx::query_as("SELECT identified_at, identified_job_id FROM library_repair_watermarks")
+            .fetch_one(&empty)
+            .await
+            .unwrap();
+    assert_eq!(mark, (0, String::new()), "no job: the start of time");
+}
+
+/// Migration 0093 indexes the lowered release group and recording ids of
+/// tracks, so the library's tracks of a group or a recording are reached
+/// by key. A track keeps its ids, in the case they were written in, and
+/// the three indexes are in place afterwards.
+#[tokio::test]
+async fn lowered_mbid_indexes_arrive_on_upgrade() {
+    let pool = scratch_pool().await;
+    migrator_through(92).run(&pool).await.unwrap();
+    sqlx::raw_sql(
+        "INSERT INTO local_artists (id, display_name, folded_name, kind, created_at, \
+             updated_at) VALUES ('ar1', 'A', 'a', 'person', 0, 0); \
+         INSERT INTO local_albums (id, root_id, grouping_key, title, title_folded, \
+             album_artist_id, album_artist_name, grouping_source, created_at, updated_at) \
+         VALUES ('al1', 'r1', 'al1', 'T', 't', 'ar1', 'A', 'automatic', 0, 0); \
+         INSERT INTO local_tracks (id, local_album_id, root_id, file_path, relative_path, \
+             path_hash, file_size_bytes, file_mtime_ns, stat_revision, title, title_folded, \
+             album_title, album_title_folded, file_format, bit_rate, ingest_source, \
+             imported_at, membership_source, availability, embedded_release_group_mbid, \
+             embedded_recording_mbid) \
+         VALUES ('t1', 'al1', 'r1', '/m/1.mp3', '1.mp3', 'p1', 1, 0, 's', 'T', 't', 'T', \
+             't', 'mp3', 320, 'scan', 0, 'automatic', 'indexed', 'GROUP-A', 'REC-A'); \
+         INSERT INTO local_track_external_identities (local_track_id, recording_mbid, \
+             decision_source, selected_at) VALUES ('t1', 'REC-B', 'embedded', 0);",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    apply_migrations(&pool).await.unwrap();
+    assert_migrated(&pool).await.unwrap();
+
+    let indexes: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master WHERE type = 'index' AND name IN \
+             ('idx_local_tracks_release_group_lower', 'idx_local_tracks_recording_lower', \
+              'idx_local_track_identity_recording_lower') ORDER BY name",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        indexes,
+        [
+            "idx_local_track_identity_recording_lower",
+            "idx_local_tracks_recording_lower",
+            "idx_local_tracks_release_group_lower",
+        ]
+    );
+
+    let kept: (String, String, String) = sqlx::query_as(
+        "SELECT t.embedded_release_group_mbid, t.embedded_recording_mbid, ti.recording_mbid \
+         FROM local_tracks t JOIN local_track_external_identities ti \
+           ON ti.local_track_id = t.id WHERE t.id = 't1'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        kept,
+        ("GROUP-A".to_owned(), "REC-A".to_owned(), "REC-B".to_owned())
+    );
+}
+
+/// Migration 0094 gives every track a search key equal to its rowid, so
+/// orders read from it stay as they were, and rebuilds the search index on
+/// that key: a catalog seeded before it, with gaps where tracks were
+/// deleted, finds the same tracks after. A track added later takes the
+/// next key and is found by its text.
+#[tokio::test]
+async fn tracks_gain_a_search_key_on_upgrade() {
+    let pool = scratch_pool().await;
+    migrator_through(93).run(&pool).await.unwrap();
+    sqlx::raw_sql(
+        "INSERT INTO local_artists (id, display_name, folded_name, kind, created_at, \
+             updated_at) VALUES ('ar1', 'A', 'a', 'person', 0, 0); \
+         INSERT INTO local_albums (id, root_id, grouping_key, title, title_folded, \
+             album_artist_id, album_artist_name, grouping_source, created_at, updated_at) \
+         VALUES ('al1', 'r1', 'al1', 'Blue Hour', 'blue hour', 'ar1', 'A', 'automatic', 0, 0);",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    for (step, title) in ["amber road", "cobalt sea", "amber sky", "dune", "amber"]
+        .iter()
+        .enumerate()
+    {
+        sqlx::query(
+            "INSERT INTO local_tracks (id, local_album_id, root_id, file_path, relative_path, \
+                 path_hash, file_size_bytes, file_mtime_ns, stat_revision, title, title_folded, \
+                 album_title, album_title_folded, file_format, ingest_source, imported_at, \
+                 membership_source) \
+             VALUES (?1, 'al1', 'r1', ?1, ?1, ?1, 1, 0, 's', ?2, ?2, 'Blue Hour', 'blue hour', \
+                 'mp3', 'scan', 0, 'automatic')",
+        )
+        .bind(format!("t{step}"))
+        .bind(title)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    sqlx::query("DELETE FROM local_tracks WHERE id = 't1'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let rowids: Vec<(String, i64)> =
+        sqlx::query_as("SELECT id, rowid FROM local_tracks ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+
+    apply_migrations(&pool).await.unwrap();
+    assert_migrated(&pool).await.unwrap();
+
+    let keys: Vec<(String, i64)> =
+        sqlx::query_as("SELECT id, search_key FROM local_tracks ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(keys, rowids, "the key is the rowid each track had");
+    let hits = |phrase: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, String>(
+                "SELECT id FROM local_tracks WHERE search_key IN \
+                 (SELECT rowid FROM local_tracks_fts WHERE local_tracks_fts MATCH ?) ORDER BY id",
+            )
+            .bind(phrase)
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    assert_eq!(hits("\"amber\"").await, ["t0", "t2", "t4"]);
+    assert_eq!(hits("\"blue hour\"").await, ["t0", "t2", "t3", "t4"]);
+    assert!(hits("\"cobalt\"").await.is_empty());
+
+    sqlx::query(
+        "INSERT INTO local_tracks (id, local_album_id, root_id, file_path, relative_path, \
+             path_hash, file_size_bytes, file_mtime_ns, stat_revision, title, title_folded, \
+             album_title, album_title_folded, file_format, ingest_source, imported_at, \
+             membership_source) \
+         VALUES ('t5', 'al1', 'r1', 't5', 't5', 't5', 1, 0, 's', 'Amber Late', 'amber late', \
+             'Blue Hour', 'blue hour', 'mp3', 'scan', 0, 'automatic')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let next: i64 = sqlx::query_scalar("SELECT search_key FROM local_tracks WHERE id = 't5'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(next, 6, "one more than the largest key");
+    assert_eq!(hits("\"amber\"").await, ["t0", "t2", "t4", "t5"]);
+    sqlx::query("UPDATE local_tracks SET title_folded = 'ember' WHERE id = 't0'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(hits("\"amber\"").await, ["t2", "t4", "t5"]);
+    sqlx::query(
+        "INSERT INTO local_tracks_fts(local_tracks_fts, rank) VALUES ('integrity-check', 1)",
+    )
+    .execute(&pool)
+    .await
+    .expect("the index matches the table");
+}
+
+/// Migration 0095 rebuilds discover's tables to the conventions. Each
+/// user's hidden releases carry over with their time in milliseconds and
+/// go with their user; a hidden release of a user who no longer exists
+/// does not. Remembered release-group answers carry over. Saved pages and
+/// activity are caches and start empty.
+#[tokio::test]
+async fn discover_tables_rebuild_and_hidden_releases_carry() {
+    let pool = scratch_pool().await;
+    migrator_through(94).run(&pool).await.unwrap();
+    sqlx::raw_sql(
+        "INSERT INTO auth_users (id, display_name, role, created_at) \
+         VALUES ('u1', 'T', 'user', 'now'); \
+         INSERT INTO ignored_releases (user_id, release_group_mbid_lower, release_group_mbid, \
+         artist_mbid, release_name, artist_name, ignored_at) VALUES \
+         ('u1', 'rg-1', 'RG-1', 'a-1', 'Hidden', 'Someone', 1700000800.25), \
+         ('gone', 'rg-2', 'RG-2', 'a-2', 'Orphan', 'Nobody', 1700000900.0); \
+         INSERT INTO mbid_resolution_map (source_mbid_lower, source_mbid, release_group_mbid) \
+         VALUES ('rel-1', 'REL-1', 'rg-1'), ('rel-2', 'REL-2', NULL); \
+         INSERT INTO discovery_snapshots (snapshot_key, user_id, payload, saved_at) \
+         VALUES ('discover_response:u1:True:False', 'u1', x'7b7d', 1700000000.5); \
+         INSERT INTO discovery_activity (user_id, feature, source, last_used) \
+         VALUES ('u1', 'home', '[\"official\",\"mb\",1]', 1700000000.5);",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    migrator_through(95).run(&pool).await.unwrap();
+
+    let ignores: Vec<(String, String, String, i64)> = sqlx::query_as(
+        "SELECT user_id, release_group_mbid, release_name, ignored_at \
+         FROM catalog_ignored_releases ORDER BY user_id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        ignores,
+        vec![(
+            "u1".to_owned(),
+            "RG-1".to_owned(),
+            "Hidden".to_owned(),
+            1_700_000_800_250
+        )]
+    );
+    let resolutions: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT source_mbid_lower, release_group_mbid FROM catalog_mbid_resolutions \
+         ORDER BY source_mbid_lower",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        resolutions,
+        vec![
+            ("rel-1".to_owned(), Some("rg-1".to_owned())),
+            ("rel-2".to_owned(), None)
+        ]
+    );
+    let tables = table_names(&pool).await;
+    for gone in [
+        "discovery_snapshots",
+        "discovery_activity",
+        "ignored_releases",
+        "mbid_resolution_map",
+    ] {
+        assert!(!tables.contains(&gone.to_owned()), "{gone} must be gone");
+    }
+    for empty in ["catalog_cached_pages", "catalog_discover_activity"] {
+        let rows: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {empty}"))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0, "{empty}");
+    }
+
+    sqlx::query("DELETE FROM auth_users WHERE id = 'u1'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM catalog_ignored_releases")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(left, 0, "hidden releases go with their user");
+}
+
+/// Migration 0096 rebuilds the remaining acquire tables as STRICT with
+/// millisecond times. A download mid-transfer, its attempt, a held upload
+/// of a drop job, a follow cursor and a seen candidate carry with equal
+/// meaning; rows whose parent is already gone drop; and the download then
+/// completes from its converted row, its triggers still moving the
+/// activity revision.
+#[tokio::test]
+async fn acquire_rows_carry_onto_strict_tables_on_upgrade() {
+    use droppedneedle_acquire::downloads::state::{AttemptState, TaskStatus};
+    use droppedneedle_acquire::downloads::store::DownloadStore;
+
+    let dir = crate::common::ScratchDir::new("acquire-0096");
+    let path = dir.join("app.db");
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&path)
+                .create_if_missing(true),
+        )
+        .await
+        .unwrap();
+    migrator_through(95).run(&pool).await.unwrap();
+    sqlx::raw_sql(
+        "INSERT INTO auth_users (id, display_name, role, created_at) \
+         VALUES ('u1', 'U', 'user', 'now'), ('admin', 'A', 'admin', 'now'); \
+         INSERT INTO download_tasks (id, user_id, release_group_mbid, artist_name, \
+             album_title, status, year, quality_snapshot_hash, remote_queued, created_at, \
+             started_at, last_polled_at, updated_at) \
+         VALUES ('t1', 'u1', 'rg', 'A', 'B', 'downloading', 'junk', 'h', 1, \
+             1700000000.123, 1700000000.5, 1700000002.25, 1700000002.25); \
+         INSERT INTO download_attempts (id, task_id, source, candidate_index, handle_json, \
+             state, next_retry_at, lease_expires_at, created_at, updated_at) \
+         VALUES ('a1', 't1', 'soulseek', 0, '{}', 'in_use', 0, 1700000060.0, \
+             1700000000.5, 1700000001.0); \
+         INSERT INTO download_idempotency_keys VALUES ('k1', 't1', 'dispatch', 1700000000.0); \
+         INSERT INTO download_import_decisions (task_id, attempt_id, outcome, decided_at) \
+         VALUES ('t1', 'a1', 'deferred', 1700000003.0); \
+         INSERT INTO download_quarantine (source, identity, reason, quarantined_at) \
+         VALUES ('soulseek', 'peer/x', 'corrupt', 1700000004.0); \
+         INSERT INTO drop_import_jobs (id, user_id, status, created_at, upload_name, \
+             staging_dir) VALUES ('j1', 'u1', 'failed', 1700000005.0, 'up', '/s'); \
+         INSERT INTO drop_import_items (id, job_id, folder_name, status, updated_at) \
+         VALUES (5, 'j1', 'f', 'needs_review', 1700000006.0); \
+         INSERT INTO acquire_held_entries (id, user_id, origin, group_key, drop_item_id, \
+             state, created_at, expires_at) \
+         VALUES (9, 'u1', 'upload', 'upload:5', 5, 'held', 1, 2); \
+         INSERT INTO acquire_held_files (id, entry_id, root, path, original_name, source, \
+             reason, state, created_at) \
+         VALUES (3, 9, 'drop', 'p', 'o', 'upload', 'weak_match', 'held', 1); \
+         INSERT INTO search_jobs (id, user_id, artist_name, album_title, search_query, \
+             quality_snapshot_summary, created_at, updated_at) \
+         VALUES ('s1', 'u1', 'A', 'B', 'A - B', 'x', 1700000007.0, 1700000007.5); \
+         INSERT INTO spotify_auth_requests VALUES ('st', 'u1', 'https://r', 1700000600); \
+         INSERT INTO acquire_edition_acquires VALUES ('rg', 't1', 1700000008); \
+         INSERT INTO personal_mix_approvals (user_id, state, requested_at, reviewed_by_id, \
+             reviewed_at) VALUES ('u1', 'approved', 1700000009.5, 'admin', 1700000010.0); \
+         INSERT INTO acquire_follow_cursors (artist_mbid_lower, baselined, next_poll_at, \
+             followers) VALUES ('ar', 1, 1700000011, '[]'); \
+         INSERT INTO wanted_watches (release_group_mbid_lower, release_group_mbid, user_id, \
+             artist_name, album_title, kind, created_at, next_check_at) \
+         VALUES ('w1', 'W1', 'u1', 'A', 'B', 'missing', 1, 2); \
+         INSERT INTO wanted_seen_candidates VALUES ('w1', 'soulseek', 'peer/B', 1700000012.0); \
+         PRAGMA foreign_keys = OFF; \
+         INSERT INTO download_idempotency_keys VALUES ('k2', 'gone', 'dispatch', 1); \
+         INSERT INTO download_import_decisions (task_id, outcome, decided_at) \
+         VALUES ('gone', 'rejected', 1); \
+         INSERT INTO search_jobs (id, user_id, artist_name, album_title, search_query, \
+             created_at, updated_at) VALUES ('s2', 'ghost', 'A', 'B', 'q', 1, 1); \
+         INSERT INTO acquire_edition_acquires VALUES ('rg2', 'gone', 1); \
+         INSERT INTO wanted_seen_candidates VALUES ('nowatch', 'soulseek', 'p', 1); \
+         PRAGMA foreign_keys = ON;",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    apply_migrations(&pool).await.unwrap();
+    assert_migrated(&pool).await.unwrap();
+
+    let ms = |sql: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(sql)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        }
+    };
+    let task: (i64, i64, i64, i64, Option<i64>, i64) = sqlx::query_as(
+        "SELECT created_at, started_at, last_polled_at, updated_at, year, remote_queued \
+         FROM download_tasks WHERE id = 't1'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        task,
+        (
+            1_700_000_000_123,
+            1_700_000_000_500,
+            1_700_000_002_250,
+            1_700_000_002_250,
+            None,
+            1
+        ),
+        "times are exact milliseconds and a year that is not a number reads none"
+    );
+    let attempt: (i64, i64, i64, String) = sqlx::query_as(
+        "SELECT next_retry_at, lease_expires_at, created_at, state FROM download_attempts",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        attempt,
+        (0, 1_700_000_060_000, 1_700_000_000_500, "in_use".to_owned())
+    );
+    assert_eq!(
+        ms("SELECT created_at FROM download_idempotency_keys").await,
+        1_700_000_000_000,
+        "the key of a missing download drops"
+    );
+    assert_eq!(
+        ms("SELECT decided_at FROM download_import_decisions").await,
+        1_700_000_003_000,
+        "the decision of a missing download drops"
+    );
+    assert_eq!(
+        ms("SELECT quarantined_at FROM download_quarantine").await,
+        1_700_000_004_000
+    );
+    assert_eq!(
+        ms("SELECT created_at FROM drop_import_jobs").await,
+        1_700_000_005_000
+    );
+    assert_eq!(
+        ms("SELECT updated_at FROM drop_import_items WHERE id = 5").await,
+        1_700_000_006_000
+    );
+    assert_eq!(
+        ms("SELECT COUNT(*) FROM acquire_held_entries e \
+            JOIN acquire_held_files f ON f.entry_id = e.id \
+            WHERE e.id = 9 AND e.drop_item_id = 5 AND f.id = 3")
+        .await,
+        1,
+        "the held upload of a drop item survives the rebuild"
+    );
+    assert_eq!(
+        ms("SELECT created_at + updated_at FROM search_jobs WHERE id = 's1'").await,
+        3_400_000_014_500
+    );
+    assert_eq!(
+        ms("SELECT COUNT(*) FROM search_jobs").await,
+        1,
+        "the search job of a missing user drops"
+    );
+    assert_eq!(
+        ms("SELECT expires_at FROM spotify_auth_requests").await,
+        1_700_000_600_000
+    );
+    assert_eq!(
+        ms("SELECT started_at FROM acquire_edition_acquires").await,
+        1_700_000_008_000,
+        "the mark of a missing download drops"
+    );
+    let mix: (String, i64, Option<String>, i64) = sqlx::query_as(
+        "SELECT state, requested_at, reviewed_by_id, reviewed_at FROM personal_mix_approvals",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        mix,
+        (
+            "approved".to_owned(),
+            1_700_000_009_500,
+            Some("admin".to_owned()),
+            1_700_000_010_000
+        )
+    );
+    assert_eq!(
+        ms("SELECT next_poll_at FROM acquire_follow_cursors").await,
+        1_700_000_011_000
+    );
+    assert_eq!(
+        ms("SELECT first_seen_at FROM wanted_seen_candidates").await,
+        1_700_000_012_000,
+        "the seen candidate of a missing watch drops"
+    );
+    for (table, column) in [
+        ("download_tasks", "quality_snapshot_hash"),
+        ("download_tasks", "quality_snapshot_summary"),
+        ("search_jobs", "quality_snapshot_hash"),
+        ("search_jobs", "quality_snapshot_summary"),
+        ("acquire_follow_cursors", "followers"),
+    ] {
+        assert!(
+            !column_names(&pool, table).await.iter().any(|c| c == column),
+            "{table}.{column} is gone"
+        );
+    }
+    for table in [
+        "download_tasks",
+        "download_attempts",
+        "download_idempotency_keys",
+        "download_import_decisions",
+        "download_quarantine",
+        "download_activity_global_revision",
+        "download_activity_user_revisions",
+        "drop_import_jobs",
+        "drop_import_items",
+        "search_jobs",
+        "spotify_auth_requests",
+        "acquire_edition_acquires",
+        "personal_mix_approvals",
+        "acquire_follow_cursors",
+        "artist_known_releases",
+        "user_quotas",
+        "wanted_seen_candidates",
+    ] {
+        let strict: i64 = sqlx::query_scalar("SELECT strict FROM pragma_table_list WHERE name = ?")
+            .bind(table)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(strict, 1, "{table} is STRICT");
+    }
+    assert!(
+        sqlx::raw_sql("UPDATE personal_mix_approvals SET state = 'dormant'")
+            .execute(&pool)
+            .await
+            .is_err(),
+        "only the approval states are taken"
+    );
+    let triggers: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' \
+         AND name LIKE 'download_activity_%'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(triggers, 15, "every activity trigger is back");
+    let violations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pragma_foreign_key_check")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(violations, 0);
+    pool.close().await;
+
+    // The download finishes from its converted row.
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+    let revision = || -> i64 {
+        conn.query_row(
+            "SELECT revision FROM download_activity_global_revision",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    let before = revision();
+    let store = DownloadStore::new(&conn);
+    let row = store.get_task("t1").unwrap().unwrap();
+    assert_eq!(row.status, TaskStatus::Downloading);
+    assert_eq!(row.created_at, 1_700_000_000.123);
+    assert_eq!(row.last_polled_at, Some(1_700_000_002.25));
+    let attempt = store.get_attempt("a1").unwrap().unwrap();
+    assert_eq!(attempt.lease_expires_at, Some(1_700_000_060.0));
+    store
+        .transition_task("t1", TaskStatus::Processing, 1_700_000_100.5, None)
+        .unwrap();
+    store
+        .finalize_task_and_attempt(
+            "t1",
+            TaskStatus::Completed,
+            1_700_000_200.25,
+            None,
+            Some("a1"),
+            false,
+        )
+        .unwrap();
+    let done = store.get_task("t1").unwrap().unwrap();
+    assert_eq!(done.status, TaskStatus::Completed);
+    assert_eq!(done.completed_at, Some(1_700_000_200.25));
+    let stored: i64 = conn
+        .query_row(
+            "SELECT completed_at FROM download_tasks WHERE id = 't1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored, 1_700_000_200_250);
+    assert_eq!(
+        store.get_attempt("a1").unwrap().unwrap().state,
+        AttemptState::CleanupPending
+    );
+    assert!(revision() > before, "the activity triggers still fire");
+}
+
+/// Migration 0097 replaces the journal's `mgmt_state` text with a checked
+/// `commit_as`, read as it always was (only an `imported:` value is an
+/// import), shortens the stored outcomes, and adds the generated-files
+/// table: backfilled with every output of a bundle that reached its
+/// commit, and none of one that did not or whose text does not read. No
+/// row's state, sequence or scan fence moves.
+#[tokio::test]
+async fn publish_journal_states_are_typed_and_outputs_backfilled() {
+    let pool = scratch_pool().await;
+    migrator_through(96).run(&pool).await.unwrap();
+    let bundle = |id: &str, track: &str, rel: &str, kind: &str| {
+        serde_json::json!({"id": id, "items": [{"track_id": track, "outputs": [
+            {"dest_root": "music", "dest_rel": rel, "sha256": format!("{id}-sha"),
+             "size": 3, "kind": kind}]}]})
+        .to_string()
+    };
+    let journal = |id: &str,
+                   bundle: &str,
+                   kind: &str,
+                   rel: &str,
+                   sha: &str,
+                   mgmt: Option<&str>,
+                   state: &str| {
+        format!(
+            "INSERT INTO library_publish_journal (id, bundle_id, kind, dest_root, dest_rel, \
+             staged, staged_sha256, mgmt_state, state, seq) VALUES ('{id}', '{bundle}', \
+             '{kind}', 'music', '{rel}', '/t', '{sha}', {}, '{state}', 5);",
+            mgmt.map_or("NULL".to_owned(), |mgmt| format!("'{mgmt}'"))
+        )
+    };
+    let mut setup = String::from("PRAGMA foreign_keys = OFF;");
+    for (id, rel, kind) in [
+        ("done", "a/cover.jpg", "artwork"),
+        ("flagged", "b/b.lrc", "lyrics"),
+        ("open", "c/cover.jpg", "artwork"),
+    ] {
+        setup.push_str(&format!(
+            "INSERT INTO library_publish_operations (bundle_id, bundle_json, created_day) \
+             VALUES ('{id}', '{}', 1);",
+            bundle(id, &format!("t-{id}"), rel, kind)
+        ));
+    }
+    setup.push_str(
+        "INSERT INTO library_publish_operations (bundle_id, bundle_json, created_day) \
+         VALUES ('damaged', '{\"items\": [', 1);",
+    );
+    for statement in [
+        journal(
+            "done-a",
+            "done",
+            "audio",
+            "a/a.flac",
+            "x",
+            Some("managed:6"),
+            "cleaned",
+        ),
+        journal(
+            "done-o",
+            "done",
+            "output",
+            "a/cover.jpg",
+            "done-sha",
+            None,
+            "cleaned",
+        ),
+        journal(
+            "flagged-a",
+            "flagged",
+            "audio",
+            "b/b.flac",
+            "x",
+            Some("imported:3"),
+            "committed",
+        ),
+        journal(
+            "flagged-o",
+            "flagged",
+            "output",
+            "b/b.lrc",
+            "flagged-sha",
+            None,
+            "needs_attention",
+        ),
+        journal(
+            "open-a",
+            "open",
+            "audio",
+            "c/c.flac",
+            "x",
+            Some("odd"),
+            "published",
+        ),
+        journal(
+            "open-o",
+            "open",
+            "output",
+            "c/cover.jpg",
+            "open-sha",
+            None,
+            "published",
+        ),
+        journal(
+            "damaged-o",
+            "damaged",
+            "output",
+            "d/cover.jpg",
+            "d",
+            None,
+            "cleaned",
+        ),
+    ] {
+        setup.push_str(&statement);
+    }
+    setup.push_str(
+        "INSERT INTO library_track_management_state (local_track_id, last_outcome) \
+         VALUES ('t1', 'managed:6'), ('t2', 'imported:3'), ('t3', 'succeeded');",
+    );
+    sqlx::raw_sql(&setup).execute(&pool).await.unwrap();
+    type Kept = Vec<(String, String, i64, Option<i64>)>;
+    let kept = || async {
+        sqlx::query_as::<_, (String, String, i64, Option<i64>)>(
+            "SELECT id, state, seq, fence_revision FROM library_publish_journal ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+    };
+    let before: Kept = kept().await;
+
+    apply_migrations(&pool).await.unwrap();
+    assert_migrated(&pool).await.unwrap();
+
+    assert_eq!(kept().await, before, "no state, sequence or fence moves");
+    let columns = column_names(&pool, "library_publish_journal").await;
+    assert!(columns.contains(&"commit_as".to_owned()), "{columns:?}");
+    assert!(!columns.contains(&"mgmt_state".to_owned()), "{columns:?}");
+    let commit_as: Vec<(String, Option<String>)> =
+        sqlx::query_as("SELECT id, commit_as FROM library_publish_journal ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    let commit_as: BTreeMap<String, Option<String>> = commit_as.into_iter().collect();
+    assert_eq!(commit_as["done-a"].as_deref(), Some("managed"));
+    assert_eq!(commit_as["flagged-a"].as_deref(), Some("imported"));
+    assert_eq!(
+        commit_as["open-a"].as_deref(),
+        Some("managed"),
+        "read as before"
+    );
+    assert_eq!(commit_as["done-o"], None);
+    let refused =
+        sqlx::raw_sql("UPDATE library_publish_journal SET commit_as = 'other' WHERE id = 'done-a'")
+            .execute(&pool)
+            .await;
+    assert!(refused.is_err(), "the check lists the two states");
+
+    let outcomes: Vec<String> = sqlx::query_scalar(
+        "SELECT last_outcome FROM library_track_management_state ORDER BY local_track_id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(outcomes, ["managed", "imported", "succeeded"]);
+
+    let sql: String = sqlx::query_scalar(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'library_publish_outputs'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(sql.trim_end().ends_with("STRICT"), "{sql}");
+    let outputs: Vec<(String, String, String, String)> = sqlx::query_as(
+        "SELECT journal_id, track_id, dest_rel, kind FROM library_publish_outputs \
+         ORDER BY journal_id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let row = |journal: &str, track: &str, rel: &str, kind: &str| {
+        (
+            journal.to_owned(),
+            track.to_owned(),
+            rel.to_owned(),
+            kind.to_owned(),
+        )
+    };
+    assert_eq!(
+        outputs,
+        [
+            row("done-o", "t-done", "a/cover.jpg", "artwork"),
+            row("flagged-o", "t-flagged", "b/b.lrc", "lyrics"),
+        ],
+        "a committed bundle's outputs, flagged ones included; none of an open \
+         bundle or of one whose text does not read"
+    );
+}
+
+/// Migration 0098 replaces v2's `artist_genres`, which nothing in v3
+/// wrote, with `catalog_artist_genres`: STRICT, one row per artist and
+/// folded genre, its time in integer milliseconds and indexed for the
+/// prune.
+#[tokio::test]
+async fn artist_genres_rebuild_to_the_conventions_on_upgrade() {
+    let pool = scratch_pool().await;
+    migrator_through(96).run(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO artist_genres (artist_mbid_lower, artist_mbid, genres_json) \
+         VALUES ('a-1', 'A-1', '[\"Shoegaze\"]')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    migrator_through(98).run(&pool).await.unwrap();
+
+    let tables = table_names(&pool).await;
+    assert!(!tables.contains(&"artist_genres".to_owned()));
+    let sql: String = sqlx::query_scalar(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'catalog_artist_genres'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(sql.trim_end().ends_with("STRICT"), "{sql}");
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM catalog_artist_genres")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0, "nothing is carried");
+    let insert = |artist: &'static str, genre: &'static str, at: f64| {
+        sqlx::query(
+            "INSERT INTO catalog_artist_genres (artist_mbid, genre_folded, genre, learned_at) \
+             VALUES (?1, lower(?2), ?2, ?3)",
+        )
+        .bind(artist)
+        .bind(genre)
+        .bind(at)
+        .execute(&pool)
+    };
+    insert("a-1", "Shoegaze", 1_700_000_000_000.0)
+        .await
+        .unwrap();
+    assert!(
+        insert("a-1", "shoegaze", 1_700_000_000_001.0)
+            .await
+            .is_err(),
+        "one row per artist and genre"
+    );
+    assert!(
+        insert("a-2", "Drone", 1_700_000_000.5).await.is_err(),
+        "times are integer milliseconds"
+    );
+    let index: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' \
+         AND name = 'idx_catalog_artist_genres_learned'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(index, 1);
+}
+
+/// Migration 0099 moves discovery batches to acquire, rebuilt as STRICT
+/// with millisecond times. A batch and its albums carry; a batch of a user
+/// who no longer exists, an album of a missing batch and an album with an
+/// unknown outcome do not; and a batch then goes with its user, its
+/// albums with it.
+#[tokio::test]
+async fn discovery_batches_move_to_acquire_with_their_rows() {
+    let pool = scratch_pool().await;
+    migrator_through(98).run(&pool).await.unwrap();
+    sqlx::raw_sql(
+        "INSERT INTO auth_users (id, display_name, role, created_at) \
+         VALUES ('u1', 'T', 'user', 'now'); \
+         INSERT INTO discovery_batches (id, user_id, name, source_section, created_at) VALUES \
+         ('b1', 'u1', 'Shelf', 'fresh_releases', '2026-10-01T12:00:00.25Z'), \
+         ('b-gone', 'gone', 'Orphan', '', '2026-10-01T12:00:00Z'); \
+         INSERT INTO discovery_batch_items (batch_id, release_group_mbid, artist_mbid, \
+         album_name, artist_name, outcome, added_at) VALUES \
+         ('b1', 'rg-1', 'a-1', 'One', 'Someone', 'requested', '2026-10-01T12:00:00.25Z'), \
+         ('b1', 'rg-2', '', 'Two', 'Someone', 'skipped_in_library', \
+          '2026-10-01T12:00:00+00:00'), \
+         ('b1', 'rg-3', '', 'Three', 'Someone', 'mystery', '2026-10-01T12:00:00Z'), \
+         ('b-gone', 'rg-4', '', 'Four', 'Nobody', 'requested', '2026-10-01T12:00:00Z'), \
+         ('b-none', 'rg-5', '', 'Five', 'Nobody', 'requested', '2026-10-01T12:00:00Z');",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    migrator_through(99).run(&pool).await.unwrap();
+
+    let tables = table_names(&pool).await;
+    for gone in ["discovery_batches", "discovery_batch_items"] {
+        assert!(!tables.contains(&gone.to_owned()), "{gone} must be gone");
+    }
+    for table in ["acquire_discovery_batches", "acquire_discovery_batch_items"] {
+        let sql: String =
+            sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1")
+                .bind(table)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(sql.trim_end().ends_with("STRICT"), "{sql}");
+    }
+    let batches: Vec<(String, String, String, String, i64)> = sqlx::query_as(
+        "SELECT id, user_id, name, source_section, created_at FROM acquire_discovery_batches",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        batches,
+        vec![(
+            "b1".to_owned(),
+            "u1".to_owned(),
+            "Shelf".to_owned(),
+            "fresh_releases".to_owned(),
+            1_790_856_000_250
+        )]
+    );
+    let items: Vec<(String, String, String, String, i64)> = sqlx::query_as(
+        "SELECT batch_id, release_group_mbid, album_name, outcome, added_at \
+         FROM acquire_discovery_batch_items ORDER BY release_group_mbid",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        items,
+        vec![
+            (
+                "b1".to_owned(),
+                "rg-1".to_owned(),
+                "One".to_owned(),
+                "requested".to_owned(),
+                1_790_856_000_250
+            ),
+            (
+                "b1".to_owned(),
+                "rg-2".to_owned(),
+                "Two".to_owned(),
+                "skipped_in_library".to_owned(),
+                1_790_856_000_000
+            ),
+        ]
+    );
+
+    sqlx::query("DELETE FROM auth_users WHERE id = 'u1'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let left: i64 = sqlx::query_scalar(
+        "SELECT (SELECT COUNT(*) FROM acquire_discovery_batches) \
+         + (SELECT COUNT(*) FROM acquire_discovery_batch_items)",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(left, 0, "a batch and its albums go with their user");
+}
+
+/// Migration 0100 gives identification reviews a revision. A review filed
+/// before it arrives at revision 1, and from then on a change to its
+/// state or candidates moves it on, while a write that only touches the
+/// time, or sets a state it already has, does not.
+#[tokio::test]
+async fn reviews_gain_a_revision_on_upgrade() {
+    let pool = scratch_pool().await;
+    migrator_through(99).run(&pool).await.unwrap();
+    sqlx::raw_sql(
+        "INSERT INTO local_artists (id, display_name, folded_name, kind, created_at, \
+             updated_at) VALUES ('ar1', 'A', 'a', 'person', 0, 0); \
+         INSERT INTO local_albums (id, root_id, grouping_key, title, title_folded, \
+             album_artist_id, album_artist_name, grouping_source, created_at, updated_at) \
+         VALUES ('al1', 'r1', 'al1', 'T', 't', 'ar1', 'A', 'automatic', 0, 0); \
+         INSERT INTO library_identify_reviews (id, local_album_id, reason_code, \
+             candidates_json, state, created_ms, updated_ms) \
+         VALUES ('rev-1', 'al1', 'WEAK_MATCH', '[]', 'pending', 5, 5);",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    apply_migrations(&pool).await.unwrap();
+    assert_migrated(&pool).await.unwrap();
+
+    let revision = || async {
+        sqlx::query_as::<_, (String, i64)>(
+            "SELECT state, row_revision FROM library_identify_reviews WHERE id = 'rev-1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+    };
+    assert_eq!(revision().await, ("pending".to_owned(), 1));
+    for (change, expected) in [
+        ("UPDATE library_identify_reviews SET updated_ms = 9", 1),
+        ("UPDATE library_identify_reviews SET state = 'pending'", 1),
+        (
+            "UPDATE library_identify_reviews SET candidates_json = '[1]'",
+            2,
+        ),
+        ("UPDATE library_identify_reviews SET state = 'dismissed'", 3),
+    ] {
+        sqlx::query(change).execute(&pool).await.unwrap();
+        assert_eq!(revision().await.1, expected, "{change}");
+    }
 }

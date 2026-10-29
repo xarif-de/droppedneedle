@@ -4,14 +4,21 @@ import { api } from '$lib/api/client';
 import type { components } from '$lib/api/v3/openapi';
 import { CACHE_TTL } from '$lib/constants';
 import { authStore } from '$lib/stores/authStore.svelte';
-import type { PluginSourceHealth, PluginSourceInfo, PluginSourcesResponse } from '$lib/types';
 
 import { PluginQueryKeyFactory } from './PluginQueryKeyFactory';
 import { PLUGIN_ENDPOINTS } from './endpoints';
 
-const HEALTH: readonly PluginSourceHealth[] = ['ok', 'degraded', 'error', 'unknown'];
+type PluginSource = components['schemas']['PluginSource'];
 
-function toSourceInfo(source: components['schemas']['PluginSource']): PluginSourceInfo {
+export type PluginSourceHealth = PluginSource['health'];
+// The server leaves a source's optional fields out; the screens read them
+// filled in.
+export type PluginSourceInfo = Required<PluginSource>;
+export interface PluginSourceList {
+	sources: PluginSourceInfo[];
+}
+
+function toSourceInfo(source: PluginSource): PluginSourceInfo {
 	return {
 		key: source.key,
 		plugin: source.plugin ?? '',
@@ -20,11 +27,12 @@ function toSourceInfo(source: components['schemas']['PluginSource']): PluginSour
 		has_indexer: source.has_indexer ?? false,
 		target_source: source.target_source ?? '',
 		configured: source.configured ?? false,
-		health: HEALTH.find((health) => health === source.health) ?? 'unknown'
+		health: source.health,
+		health_message: source.health_message ?? ''
 	};
 }
 
-export async function fetchPluginSources(signal?: AbortSignal): Promise<PluginSourcesResponse> {
+export async function fetchPluginSources(signal?: AbortSignal): Promise<PluginSourceList> {
 	const data = await api.global.v3.GET(PLUGIN_ENDPOINTS.sources(), { signal });
 	return { sources: data.sources.map(toSourceInfo) };
 }

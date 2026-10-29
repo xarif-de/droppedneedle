@@ -410,7 +410,7 @@ const USENET_FEED_MANIFEST: &str = r#"[plugin]
 name = "usenet-feed"
 display_name = "Usenet feed"
 version = "1.0.0"
-api_version = 1
+api_version = 2
 entrypoint = "plugin:UsenetFeed"
 capabilities = ["indexer"]
 description = "Answers one NZB release."
@@ -465,7 +465,7 @@ const FAULT_CLIENT_MANIFEST: &str = r#"[plugin]
 name = "fault-client"
 display_name = "Fault client"
 version = "1.0.0"
-api_version = 1
+api_version = 2
 entrypoint = "plugin:FaultClient"
 capabilities = ["download_client"]
 description = "Fails every poll."
@@ -560,9 +560,7 @@ async fn plugin_rig(tag: &str) -> PluginRig {
             repo().join("sdk/python"),
             platform.supervisor.clone(),
         )),
-        Arc::new(droppedneedle_plugins::ticks::TickStoreKind::Memory(
-            droppedneedle_kernel::jobs::plugin_ticks::MemoryTickStore::new(),
-        )),
+        droppedneedle_plugins::wiring::tick_store(&platform),
         library,
     );
     host.load_all();
@@ -633,6 +631,8 @@ fn plugin_client(rig: &PluginRig, name: &str, journal: Arc<Journal>) -> PluginDo
             usenet: UsenetPolicy::v2_defaults(),
             ignored_terms: Vec::new(),
             required_terms: Vec::new(),
+            auto_accept: 0.70,
+            manual_min: 0.50,
         },
     )
 }
@@ -670,9 +670,9 @@ async fn plugins_conform() {
 /// the source's, or one that says nothing, blocklists the release.
 #[tokio::test]
 async fn a_plugin_says_whose_fault_a_failed_download_was() {
+    use droppedneedle_acquire::downloads::worker::{DownloadWorker, WorkerConfig};
     use droppedneedle_acquire::downloads::{AttemptState, TaskStatus};
     use droppedneedle_acquire::reason::Reason;
-    use droppedneedle_acquire::worker::{DownloadWorker, WorkerConfig};
     use droppedneedle_providers::health::ServiceHealth;
 
     let rig = plugin_rig("fault").await;

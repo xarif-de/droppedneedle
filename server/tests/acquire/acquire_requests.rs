@@ -106,7 +106,7 @@ impl Downloads {
     /// Every task id, oldest first.
     async fn ids(&self) -> Vec<String> {
         sqlx::query_scalar("SELECT id FROM download_tasks ORDER BY created_at, rowid")
-            .fetch_all(self.dispatch.journal().db().pool())
+            .fetch_all(self.dispatch.journal().db().db().sqlx())
             .await
             .expect("task ids read")
     }
@@ -157,7 +157,7 @@ impl Downloads {
             "SELECT id FROM download_tasks WHERE status = 'cancelled' \
              ORDER BY updated_at, rowid",
         )
-        .fetch_all(self.dispatch.journal().db().pool())
+        .fetch_all(self.dispatch.journal().db().db().sqlx())
         .await
         .expect("cancelled tasks read");
         let mut seen = self.cancels.lock().unwrap();
@@ -418,6 +418,82 @@ async fn duplicate_ask_attaches_a_listener() {
     .await;
     assert_eq!(all["count"], 1);
     assert_eq!(all["items"][0]["task_id"], calls[0].id.as_str());
+}
+
+const REL_1: &str = "44444444-4444-4444-8444-444444444444";
+const REL_2: &str = "55555555-5555-4555-8555-555555555555";
+const REL_3: &str = "66666666-6666-4666-8666-666666666666";
+
+/// Ask for album `mbid` in edition `release` as `who`.
+async fn ask_edition(state: &RequestsState, who: Who, mbid: &str, release: &str) -> Value {
+    let body = json!({
+        "musicbrainz_id": mbid, "artist": "Artist", "album": "Album", "release_mbid": release
+    });
+    let uri = "/api/v3/requests/albums";
+    call(state, Method::POST, uri, Some(who), Some(body))
+        .await
+        .1
+}
+
+/// The edition album `mbid`'s live request fetches, as the album page reads it.
+async fn requested_edition(state: &RequestsState, mbid: &str) -> Value {
+    let (_, active) = call(
+        state,
+        Method::GET,
+        "/api/v3/requests/active",
+        Some(ADMIN),
+        None,
+    )
+    .await;
+    let items = active["items"].as_array().expect("active items");
+    let item = items.iter().find(|item| item["musicbrainz_id"] == mbid);
+    item.expect("live request")["release_mbid"].clone()
+}
+
+// An album the library does not hold is fetched in the edition the page
+// asked for, not the catalog's preferred one.
+#[tokio::test]
+async fn a_request_fetches_the_edition_it_asked_for() {
+    let (state, _db, dispatch) = setup().await;
+    assert_eq!(
+        ask_edition(&state, TRUSTED, MBID_A, REL_2).await["status"],
+        "pending"
+    );
+    let calls = dispatch.take_calls().await;
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].release_mbid.as_deref(), Some(REL_2));
+    assert_eq!(requested_edition(&state, MBID_A).await, REL_2);
+}
+
+// A curator's other edition switches a live request while no download
+// serves it; a plain user's ask never does, and once the download has
+// started the request keeps its edition.
+#[tokio::test]
+async fn a_request_switches_edition_only_before_its_download_starts() {
+    let (state, _db, dispatch) = setup().await;
+    ask_edition(&state, ADA, MBID_A, REL_1).await;
+    ask_edition(&state, BOB, MBID_A, REL_3).await;
+    assert_eq!(requested_edition(&state, MBID_A).await, REL_1);
+    let answer = ask_edition(&state, TRUSTED, MBID_A, REL_2).await;
+    assert_eq!(answer["status"], "awaiting_approval", "{answer}");
+    assert_eq!(answer["message"], "The request now gets this edition");
+    assert_eq!(requested_edition(&state, MBID_A).await, REL_2);
+
+    let uri = format!("/api/v3/requests/approvals/{MBID_A}/approve");
+    let (status, body) = call(&state, Method::POST, &uri, Some(ADMIN), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let calls = dispatch.take_calls().await;
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].release_mbid.as_deref(), Some(REL_2));
+
+    let answer = ask_edition(&state, TRUSTED, MBID_A, REL_3).await;
+    assert_eq!(answer["status"], "downloading", "{answer}");
+    assert_eq!(
+        answer["message"],
+        "Already downloading, so the edition stays as it is"
+    );
+    assert_eq!(requested_edition(&state, MBID_A).await, REL_2);
+    assert!(dispatch.take_calls().await.is_empty());
 }
 
 // A batch skips raw and live duplicates and dispatches the new rows.
@@ -891,7 +967,15 @@ async fn personal_mix_grant_build_and_refresh() {
         (2, 2, None)
     );
     let playlist = built.playlist_id.expect("mix playlist");
-    assert_eq!(playlists.tracks(&playlist).await.unwrap().len(), 2);
+    assert_eq!(
+        playlists
+            .owned_by("u-ada")
+            .tracks(&playlist)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
     assert_eq!(
         dispatch.take_calls().await.len(),
         2,
@@ -1397,7 +1481,7 @@ async fn edition_acquire_is_held_while_no_source_is_ready() {
     let staging = crate::common::ScratchDir::new("edition-held");
     state.readiness = Some(AcquireReadiness {
         sources: droppedneedle_acquire::readiness::SourceReadiness::unprobed(
-            droppedneedle_acquire::worker::SourceList::Fixed(Arc::new(Vec::new())),
+            droppedneedle_acquire::downloads::worker::SourceList::Fixed(Arc::new(Vec::new())),
         ),
         staging_root: staging.to_path_buf(),
     });
@@ -1412,6 +1496,226 @@ async fn edition_acquire_is_held_while_no_source_is_ready() {
         "{body}"
     );
     assert_eq!(dispatch.take_calls().await.len(), 1, "queued, not refused");
+}
+
+/// The library's plan for album "al1" as its files stand: tracks 1 to 4,
+/// each held by file "t{n}" once the library has it.
+struct LibraryPlan {
+    db: AcquireDb,
+}
+
+impl droppedneedle_library::operations::port::EditionPlans for LibraryPlan {
+    fn group_plan<'a>(
+        &'a self,
+        _album_id: Option<&'a str>,
+        _release_group_mbid: &'a str,
+    ) -> droppedneedle_library::operations::port::BoxFuture<
+        'a,
+        Result<
+            Option<droppedneedle_library::operations::plan::EditionPlan>,
+            droppedneedle_library::operations::models::OperationError,
+        >,
+    > {
+        use droppedneedle_library::operations::plan::{
+            EditionFacts, EditionPlan, FileFate, PlanFile, PlanTrack,
+        };
+        Box::pin(async move {
+            let files: Vec<String> =
+                sqlx::query_scalar("SELECT id FROM local_tracks WHERE local_album_id = 'al1'")
+                    .fetch_all(self.db.db().sqlx())
+                    .await
+                    .expect("library files read");
+            let tracks = (1..=4)
+                .map(|position: u32| {
+                    let file = format!("t{position}");
+                    PlanTrack {
+                        disc: 1,
+                        position,
+                        title: format!("T{position}"),
+                        recording_mbid: format!("rec-{position}"),
+                        release_track_mbid: format!("rt-{position}"),
+                        length_ms: Some(200_000),
+                        local_track_id: files.contains(&file).then_some(file),
+                    }
+                })
+                .collect();
+            let files = files
+                .into_iter()
+                .map(|id| PlanFile {
+                    local_track_id: id,
+                    title: String::new(),
+                    disc: 1,
+                    track: 0,
+                    length_ms: None,
+                    fate: FileFate::Keep,
+                    edition_track: None,
+                    note: None,
+                })
+                .collect();
+            Ok(Some(EditionPlan {
+                local_album_id: "al1".into(),
+                release_group_mbid: MBID_A.into(),
+                release_mbid: "rel-1".into(),
+                title: "Album".into(),
+                artist_name: "Artist".into(),
+                is_current: true,
+                same_album: true,
+                edition: EditionFacts::default(),
+                tracks,
+                files,
+            }))
+        })
+    }
+}
+
+/// A landing of `task_id` as the worker records it: `outcome` with the
+/// release positions still `missing`, file `t{landed}` joining album "al1",
+/// and the task settled at `status`.
+async fn land_edition(
+    db: &AcquireDb,
+    downloads: &Downloads,
+    task_id: &str,
+    (outcome, missing): (&str, &str),
+    landed: u32,
+    status: TaskStatus,
+) {
+    let row = droppedneedle_acquire::downloads::landing_rows::ImportDecisionRow {
+        task_id: task_id.to_owned(),
+        outcome: outcome.to_owned(),
+        files_total: 1,
+        files_imported: 1,
+        checks_json: "[]".to_owned(),
+        missing_positions: missing.to_owned(),
+        decided_at: 1_700_000_000.0,
+        ..Default::default()
+    };
+    downloads
+        .dispatch
+        .journal()
+        .run("test.landing", move |store| {
+            store.record_import_decision(&row)
+        })
+        .await
+        .expect("landing recorded");
+    let file = format!(
+        "INSERT INTO local_tracks (id, local_album_id, root_id, file_path, relative_path,
+           path_hash, file_size_bytes, file_mtime_ns, stat_revision, title, title_folded,
+           album_title, album_title_folded, file_format, bit_rate, ingest_source, imported_at,
+           membership_source)
+         VALUES ('t{landed}', 'al1', 'r1', '/m/{landed}.flac', '{landed}.flac', 'h{landed}', 1,
+           0, 's', 'T', 't', 'T', 't', 'flac', NULL, 'scan', 0, 'automatic');"
+    );
+    db.write("test.landed_file", move |tx| {
+        tx.execute_batch(&file)?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    downloads.settle(task_id, status).await;
+}
+
+/// `(disc, position, state)` of each track the edition fetch asked for.
+fn fetch_tracks(body: &Value) -> Vec<(u64, u64, String)> {
+    body["latest"]["tracks"]
+        .as_array()
+        .expect("tracks")
+        .iter()
+        .map(|track| {
+            (
+                track["disc"].as_u64().unwrap(),
+                track["position"].as_u64().unwrap(),
+                track["state"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect()
+}
+
+// The edition fetch shows each track it asked for, after the sheet that
+// started it is gone: a short landing leaves one track landed and one
+// failed, a retry asks only for the failed one, and once that lands the
+// album lacks nothing.
+#[tokio::test]
+async fn an_edition_fetch_shows_its_tracks_and_retries_what_failed() {
+    let (mut state, db, downloads) = setup().await;
+    seed_edition_album(&db).await;
+    state.edition_plans = Some(Arc::new(LibraryPlan { db: db.clone() }));
+    let uri = format!("/api/v3/albums/{MBID_A}/edition/acquire");
+    let (status, body) = call(&state, Method::GET, &uri, Some(ADMIN), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["latest"], Value::Null, "no fetch yet: {body}");
+
+    let asked = format!("{uri}?album_id=al1");
+    let (status, body) = call(&state, Method::POST, &asked, Some(ADMIN), None).await;
+    assert_eq!(
+        (status, &body["status"]),
+        (StatusCode::OK, &json!("started"))
+    );
+    let first = downloads.take_calls().await.remove(0);
+    assert_eq!(first.wanted, vec![(1, 2), (1, 4)]);
+
+    let (status, body) = call(&state, Method::GET, &uri, Some(TRUSTED), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["latest"]["task_id"], first.id.as_str());
+    assert_eq!(body["latest"]["state"], "waiting");
+    assert_eq!(
+        fetch_tracks(&body),
+        vec![(1, 2, "waiting".into()), (1, 4, "waiting".into())]
+    );
+    assert_eq!(
+        (&body["latest"]["can_stop"], &body["latest"]["can_retry"]),
+        (&json!(true), &json!(false))
+    );
+
+    // Track 2 lands; no source had track 4.
+    land_edition(
+        &db,
+        &downloads,
+        &first.id,
+        ("partial", "[[1,4]]"),
+        2,
+        TaskStatus::Partial,
+    )
+    .await;
+    let (_, body) = call(&state, Method::GET, &uri, Some(ADMIN), None).await;
+    assert_eq!(body["latest"]["state"], "failed", "{body}");
+    assert_eq!(
+        fetch_tracks(&body),
+        vec![(1, 2, "landed".into()), (1, 4, "failed".into())]
+    );
+    assert_eq!(
+        (&body["latest"]["can_stop"], &body["latest"]["can_retry"]),
+        (&json!(false), &json!(true))
+    );
+
+    // Retry is the same acquire again: it asks only for track 4.
+    let (status, body) = call(&state, Method::POST, &asked, Some(ADMIN), None).await;
+    assert_eq!(
+        (status, &body["status"]),
+        (StatusCode::OK, &json!("started"))
+    );
+    let retry = downloads.take_calls().await.remove(0);
+    assert_eq!(retry.wanted, vec![(1, 4)], "only what is still missing");
+    let (_, body) = call(&state, Method::GET, &uri, Some(ADMIN), None).await;
+    assert_eq!(body["latest"]["task_id"], retry.id.as_str());
+    assert_eq!(fetch_tracks(&body), vec![(1, 4, "waiting".into())]);
+
+    land_edition(
+        &db,
+        &downloads,
+        &retry.id,
+        ("imported", "[]"),
+        4,
+        TaskStatus::Completed,
+    )
+    .await;
+    let (_, body) = call(&state, Method::GET, &uri, Some(ADMIN), None).await;
+    assert_eq!(body["latest"]["state"], "done", "{body}");
+    assert_eq!(fetch_tracks(&body), vec![(1, 4, "landed".into())]);
+    let (_, body) = call(&state, Method::POST, &asked, Some(ADMIN), None).await;
+    assert_eq!(
+        body["status"], "already_complete",
+        "both tracks landed: {body}"
+    );
 }
 
 // The badge count reads without writing, even with a row whose task

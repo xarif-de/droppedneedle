@@ -206,8 +206,9 @@ report lists it too (`left_behind`). In short:
 - MusicBrainz contributions that were already linked, cancelled or out of
   date. A linked album keeps its match.
 - Caches, which v3 fills again on its own.
-- Plugins. Install them again from Settings > Plugins; their settings come
-  across.
+- Plugins. Their settings come across, switched off, and the report lists
+  each one as needing porting. Port it, install it again from Settings >
+  Plugins, then switch it on.
 
 ## What changed from v2
 
@@ -273,9 +274,10 @@ machine and its data folders can run it.
   your library. If Free Music was your only source, set up slskd, Usenet or
   a plugin source.
 - **v2 plugins.** v2 plugins do not load in v3. Only plugins written for
-  the current plugin API are accepted. Port yours first ("Porting a v2
-  plugin" in [PLUGINS.md](../PLUGINS.md)), or ask its author to, then
-  install it again from Settings > Plugins.
+  plugin API version 2 are accepted, and a manifest with `api_version` 0
+  or 1 is refused. Port yours first ("Porting a v2 plugin" in
+  [PLUGINS.md](../PLUGINS.md)), or ask its author to, then install it
+  again from Settings > Plugins.
 - **v2 profile share codes.** A Library Management profile share code made
   in v2 does not import into v3. Share the profile again from v3 to get a
   code v3 reads.
@@ -440,7 +442,9 @@ progress over that same single stream, so a rule for those can go.
 Then check:
 
 - You can log in with your v2 password.
-- Your Subsonic or Jellyfin app still connects with its app password.
+- Your Subsonic or Jellyfin app still connects with its app password. For
+  the first moments after each start, while the server records its
+  Jellyfin ids, Jellyfin apps are told the server is busy and try again.
 - Settings > Download Client and Settings > Indexers / Prowlarr look right.
 - Your library folders are listed under Settings > Library. They come across
   with your settings, so check them rather than adding them again: a folder
@@ -638,6 +642,34 @@ without it, v3 refuses to start on that database rather than lose the
 stored secrets. The database remembers which key it belongs to, so a key
 file from another instance or another backup is refused as well.
 
+The copies Undo and "Restore originals" need live in the `undo` folder
+beside the database, and each backup copies the ones it names into
+`cache/backups/undo`, which all kept backups share. Copy the whole
+`backups` folder when you move backups elsewhere, not only the `.db`
+files: `droppedneedle-tool restore` reads the copies from the `undo`
+folder next to the backup and puts them back beside the restored
+database. A copy that is missing there does not stop the restore; it is
+listed, and Undo then leaves out only the file that needed it.
+
+`droppedneedle-tool restore --backup <file> --target-dir <dir>` writes the
+database under the name the server uses: `library.db`, or the file name
+`LIBRARY_DB_PATH` gives, so run it with the same environment as the
+server. The target folder must be empty apart from the server's lock
+files. The restore refuses a folder holding anything it cannot read,
+saying which folder and why, so fix its permissions or pick a new folder.
+It never replaces a file: the database takes its name through a hard
+link, and on a filesystem without hard links (vfat, exFAT) through a
+rename that checks the name is free first; the report then has a `note`
+saying so. A restore that stops before the database is in place leaves
+its own marker and temporary files, which the next restore into that
+folder clears; once the database is in place, a later restore into that
+folder refuses. The server, the host commands and `import` refuse a
+folder holding that marker but no database, so run the restore again
+first; a marker left beside a finished database does not stop the
+server, which logs that it can be deleted. The restore also refuses a
+target folder on a network filesystem, as the server does, and a backup
+whose `-wal` file holds writes the copy would leave out.
+
 Backups leave out `metadata-cache.db` on purpose: it holds only provider
 answers that are fetched again when needed.
 
@@ -646,8 +678,12 @@ If that key is lost for good, stop the server and run
 clears every stored password and API key: the secrets in Settings, every
 app password, and every user's link to Plex, Jellyfin, Navidrome, Spotify,
 ListenBrainz and Last.fm. It prints the settings it cleared so you know
-what to enter again. Jellyfin album and artist ids change with the key, so
-Finamp and Jellify see a new library and lose their pins and downloads.
+what to enter again. It replaces a lost key and does not change the
+Jellyfin ids of what you already have: stored album and artist ids survive
+the reset, so Finamp and Jellify keep their pins and downloads, and only
+items added afterwards get ids under the new key. Whoever holds the old key
+can still work out the picture ids of albums and artists stored before the
+reset.
 The replaced key is kept as `config/data_enc.key.old`. The command refuses,
 changing nothing, while the key file still belongs to the database.
 

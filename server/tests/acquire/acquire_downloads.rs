@@ -13,13 +13,13 @@ use std::time::{Instant, SystemTime};
 
 use droppedneedle_acquire::db::AcquireDb;
 use droppedneedle_acquire::downloads::journal::Journal;
+use droppedneedle_acquire::downloads::worker::{
+    DownloadWorker, FixedSource, WorkerConfig, run_startup_recovery,
+};
 use droppedneedle_acquire::held::store::{
     EntryOrigin, GroupKey, HeldRoot, HeldRows, NewEntry, NewFile,
 };
 use droppedneedle_acquire::reason::Reason;
-use droppedneedle_acquire::worker::{
-    DownloadWorker, FixedSource, WorkerConfig, run_startup_recovery,
-};
 use droppedneedle_providers::health::ServiceHealth;
 
 use crate::common::bundles::quiet_ticks;
@@ -702,6 +702,7 @@ fn idempotency_keys_answer_the_original_task() {
     let conn = scratch_store(&dir);
     let store = DownloadStore::new(&conn);
     let now = 1_700_000_000.0;
+    store.insert_task(&new_task("task-a"), now).unwrap();
     assert!(
         store
             .claim_key("dispatch:k1", "task-a", "dispatch", now)
@@ -735,7 +736,7 @@ fn quarantine_hold_rejects_escaping_stamps() {
 
 // Reimport needs a failed or partial task whose attempt still names its
 // files; starting one moves the task to processing with its error cleared
-// (v2 reimport guard, keyed on the attempt journal).
+// (the guard is keyed on the attempt journal).
 #[test]
 fn reimport_starts_tasks_whose_files_remain() {
     let dir = scratch_dir("reimport");
@@ -849,13 +850,13 @@ fn kept_files_go_to_cleanup_without_racing_a_reimport() {
     }
     conn.execute(
         "UPDATE download_attempts SET completed_at = ?1 WHERE task_id = 'young'",
-        [now - 89.0 * 86_400.0],
+        [((now - 89.0 * 86_400.0) * 1000.0) as i64],
     )
     .unwrap();
     conn.execute(
         "UPDATE download_attempts SET lease_owner = 'cleaner', lease_expires_at = ?1 \
          WHERE task_id = 'leased'",
-        [now + 60.0],
+        [((now + 60.0) * 1000.0) as i64],
     )
     .unwrap();
     let state = |task: &str| {
@@ -916,7 +917,7 @@ fn kept_files_go_to_cleanup_without_racing_a_reimport() {
 }
 
 // A download whose temporary files keep failing to clear shows on service
-// health with v2's warning once its retried cleanup has failed three
+// health with a warning once its retried cleanup has failed three
 // times, and the warning clears as soon as a cleanup succeeds.
 #[tokio::test]
 async fn failing_cleanup_shows_on_service_health_until_it_clears() {
@@ -1179,7 +1180,7 @@ async fn seed_held_on(
 async fn retry_of(db: &AcquireDb, entry: i64) -> (String, i64, Option<i64>) {
     sqlx::query_as("SELECT state, retry_tries, retry_at FROM acquire_held_entries WHERE id = ?1")
         .bind(entry)
-        .fetch_one(db.pool())
+        .fetch_one(db.db().sqlx())
         .await
         .expect("entry")
 }
@@ -1188,7 +1189,7 @@ async fn retry_of(db: &AcquireDb, entry: i64) -> (String, i64, Option<i64>) {
 async fn held_file(db: &AcquireDb, path: &str) -> (String, String) {
     sqlx::query_as("SELECT state, reason FROM acquire_held_files WHERE path = ?1")
         .bind(path)
-        .fetch_one(db.pool())
+        .fetch_one(db.db().sqlx())
         .await
         .expect("held file")
 }
@@ -1234,6 +1235,7 @@ impl HeldRig {
         let music = dir.join("music");
         std::fs::create_dir_all(&music).expect("music root");
         library
+            .scans
             .add_root(
                 Some("music".to_owned()),
                 music.to_string_lossy().into_owned(),
@@ -1241,9 +1243,8 @@ impl HeldRig {
             )
             .expect("root adds");
         let landing = droppedneedle_acquire::landing::library::LibraryLanding::new(
-            library.clone(),
+            &library,
             crate::common::library::every_priority(Arc::new(Releases(releases))),
-            db.pool().clone(),
         );
         let acquire = droppedneedle_acquire::AcquireSetup::for_tests(
             db.clone(),

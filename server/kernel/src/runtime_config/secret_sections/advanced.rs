@@ -29,14 +29,13 @@ pub struct AdvancedSettings {
     pub discover_queue_albums_per_similar: i64,
     /// MusicBrainz lookups one Last.fm album batch may spend.
     pub discover_queue_lastfm_mbid_max_lookups: i64,
+    /// Whether Discover blends Last.fm and ListenBrainz for a user who
+    /// links both, instead of following only their primary service.
+    pub discover_blend_listening_services: bool,
     /// Discover picks count.
     pub discover_picks_count: i64,
     /// Discover genre-affinity weight.
     pub discover_picks_genre_affinity_weight: f64,
-    /// Blend the listening services: a user with Last.fm and ListenBrainz
-    /// linked gets seed artists and similar artists from both, duplicates
-    /// merged. Off, the primary service alone.
-    pub discover_blend_listening_services: bool,
     /// AudioDB master switch.
     pub audiodb_enabled: bool,
     /// AudioDB name-search fallback.
@@ -70,9 +69,9 @@ impl Default for AdvancedSettings {
             discover_queue_similar_artists_limit: 15,
             discover_queue_albums_per_similar: 5,
             discover_queue_lastfm_mbid_max_lookups: 10,
+            discover_blend_listening_services: true,
             discover_picks_count: 12,
             discover_picks_genre_affinity_weight: 0.7,
-            discover_blend_listening_services: false,
             audiodb_enabled: true,
             audiodb_name_search_fallback: false,
             direct_remote_images_enabled: true,

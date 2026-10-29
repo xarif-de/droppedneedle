@@ -1,6 +1,6 @@
 //! Identity repair, identity preparation and scan diagnostics routes, at
 //! v2's paths under `/api/v3/library`. Every route is admin-only, as in
-//! v2. Store work runs on `spawn_blocking`.
+//! v2. Store work runs on a blocking thread.
 
 use std::collections::BTreeMap;
 
@@ -14,18 +14,18 @@ use droppedneedle_kernel::db::DbError;
 use droppedneedle_kernel::error::{ApiError, Unavailable};
 use droppedneedle_kernel::extract::{ValidJson, ValidQuery};
 use droppedneedle_kernel::mount::{Routes, routes};
+use droppedneedle_kernel::page::{Page, PageRequest};
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 
-use super::operations::{
-    OperationControlBody, OperationView, ReasonView, blocking, detail_view, job_view,
-};
+use super::blocking;
+use super::operations::{OperationControlBody, OperationView, ReasonView, detail_view, job_view};
 use crate::operations::models::{Control, OperationJob};
 use crate::repairs::models::{
-    FindingRow, MANAGEMENT_MAPPING_VERSION, Purpose, REPAIR_TARGET_VERSION, Summary,
+    FindingRow, FindingState, MANAGEMENT_MAPPING_VERSION, Purpose, REPAIR_TARGET_VERSION,
 };
 use crate::repairs::reasons;
-use crate::repairs::service::{RepairDetail, Repairs};
+use crate::repairs::service::{FINDINGS_MAX, HISTORY_MAX, RepairDetail, Repairs};
 use crate::wiring::LibraryServices;
 use droppedneedle_auth::Admin;
 
@@ -51,63 +51,6 @@ pub fn routes() -> Routes<LibraryServices> {
 // ---------------------------------------------------------------------------
 // DTOs.
 // ---------------------------------------------------------------------------
-
-/// What a finished check found.
-#[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct RepairSummaryView {
-    /// Albums checked.
-    pub total_identities: i64,
-    pub remaining_identities: i64,
-    pub input_track_count: i64,
-    pub playable_after_detach_track_count: i64,
-    /// Albums Apply would change.
-    pub estimated_apply_changes: i64,
-    pub catalog_snapshot_revision: i64,
-    pub target_matcher_version: String,
-    pub counts_by_finding: BTreeMap<String, i64>,
-    pub counts_by_reason: BTreeMap<String, i64>,
-    pub album_counts_by_root: BTreeMap<String, i64>,
-    pub provider_deferred_count: i64,
-    pub failed_evidence_count: i64,
-    /// `existing_matches`, `management_readiness`, or
-    /// `catalog_identity_hygiene`.
-    pub purpose: String,
-    pub ready_album_count: i64,
-    pub mapping_candidate_count: i64,
-    pub exact_release_required_count: i64,
-    pub needs_review_count: i64,
-}
-
-impl From<Summary> for RepairSummaryView {
-    fn from(s: Summary) -> Self {
-        Self {
-            total_identities: s.total_identities,
-            remaining_identities: s.remaining_identities,
-            input_track_count: s.input_track_count,
-            playable_after_detach_track_count: s.playable_after_detach_track_count,
-            estimated_apply_changes: s.estimated_apply_changes,
-            catalog_snapshot_revision: s.catalog_snapshot_revision,
-            target_matcher_version: s.target_matcher_version,
-            counts_by_finding: s.counts_by_finding,
-            counts_by_reason: s.counts_by_reason,
-            album_counts_by_root: s.album_counts_by_root,
-            provider_deferred_count: s.provider_deferred_count,
-            failed_evidence_count: s.failed_evidence_count,
-            purpose: s.purpose,
-            ready_album_count: s.ready_album_count,
-            mapping_candidate_count: s.mapping_candidate_count,
-            exact_release_required_count: s.exact_release_required_count,
-            needs_review_count: s.needs_review_count,
-        }
-    }
-}
-
-/// One page of repair or preparation jobs, newest first.
-#[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct OperationListView {
-    pub items: Vec<OperationView>,
-    pub next_cursor: Option<String>,
-}
 
 /// Start an identity repair.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
@@ -169,7 +112,9 @@ pub struct PreparationEstimateView {
 #[derive(Debug, Clone, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct HistoryQuery {
-    pub limit: Option<usize>,
+    /// Page size, at most 50; more is read as 50.
+    pub limit: Option<u32>,
+    /// `next_cursor` from the previous page.
     pub cursor: Option<String>,
 }
 
@@ -177,7 +122,9 @@ pub struct HistoryQuery {
 #[derive(Debug, Clone, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct FindingsQuery {
-    pub limit: Option<usize>,
+    /// Page size, 1 to 200 (default 100); more is read as 200.
+    pub limit: Option<u32>,
+    /// `next_cursor` from the previous page.
     pub cursor: Option<String>,
     /// Repairs: `valid`, `safe_detach`, `needs_review`, `unverifiable`,
     /// `manual_identity`. Preparations: `ready`, `mapping_ready`,
@@ -213,39 +160,19 @@ pub struct AutomaticEditionUndoInfoView {
 /// One album's finding.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct RepairFindingView {
-    pub id: String,
-    pub local_album_id: String,
-    pub album_title: String,
-    pub album_artist_name: Option<String>,
-    pub album_year: Option<i64>,
-    pub cover_available: bool,
-    /// Always empty: v3 keeps no separate evidence rows.
-    pub evidence_id: Option<String>,
-    pub review_id: Option<String>,
-    pub finding_code: String,
-    pub reason_code: String,
+    #[serde(flatten)]
+    pub finding: FindingRow,
     /// What the finding means and what to do about it.
     pub reason: ReasonView,
-    /// `complete` when Apply may act on it, `bounded` otherwise.
-    pub confidence: String,
-    pub apply_eligible: bool,
-    /// `open`, `applied`, `skipped`, or `stale`.
-    pub state: String,
-    /// `DETACHED`, `MAPPINGS_ACCEPTED`, `EDITION_ACCEPTED`, or
-    /// `STALE_SUBJECT`.
-    pub apply_result: Option<String>,
     pub suggested_edition: Option<SuggestedEditionView>,
     pub automatic_undo: Option<AutomaticEditionUndoInfoView>,
-    pub updated_at: f64,
-    pub row_revision: i64,
 }
 
 /// One page of findings.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct RepairFindingListView {
-    pub items: Vec<RepairFindingView>,
-    pub next_cursor: Option<String>,
-    pub has_more: bool,
+    #[serde(flatten)]
+    pub page: Page<RepairFindingView>,
     /// Findings per code that still describe their album.
     pub current_counts_by_finding: BTreeMap<String, i64>,
     /// The report used older rules; run a fresh check before applying.
@@ -253,7 +180,7 @@ pub struct RepairFindingListView {
 }
 
 fn finding_view(row: FindingRow) -> RepairFindingView {
-    let reason = if row.state == "stale" {
+    let reason = if row.state == FindingState::Stale {
         reasons::finding("STALE_SUBJECT")
     } else {
         reasons::finding(&row.reason_code)
@@ -276,37 +203,23 @@ fn finding_view(row: FindingRow) -> RepairFindingView {
                 auto_gate: summary.auto_gate,
             }
         });
+    let automatic_undo = row
+        .automatic_undo
+        .map(|(album, identity)| AutomaticEditionUndoInfoView {
+            expected_album_revision: album,
+            expected_identity_revision: identity,
+        });
     RepairFindingView {
-        id: row.id,
-        local_album_id: row.local_album_id,
-        album_title: row.album_title,
-        album_artist_name: row.album_artist_name,
-        album_year: row.album_year,
-        cover_available: row.cover_available,
-        evidence_id: None,
-        review_id: row.review_id,
-        finding_code: row.finding_code,
-        reason_code: row.reason_code,
         reason: reason.into(),
-        confidence: row.confidence,
-        apply_eligible: row.apply_eligible,
-        state: row.state,
-        apply_result: row.apply_result,
         suggested_edition,
-        automatic_undo: row
-            .automatic_undo
-            .map(|(album, identity)| AutomaticEditionUndoInfoView {
-                expected_album_revision: album,
-                expected_identity_revision: identity,
-            }),
-        updated_at: row.updated_at,
-        row_revision: row.row_revision,
+        automatic_undo,
+        finding: row,
     }
 }
 
 fn repair_view(detail: &RepairDetail) -> OperationView {
     OperationView {
-        repair_summary: detail.summary.clone().map(Into::into),
+        repair_summary: detail.summary.clone(),
         ..detail_view(&detail.detail)
     }
 }
@@ -337,19 +250,19 @@ async fn list_jobs(
     query: HistoryQuery,
     purpose: Purpose,
     default_limit: usize,
-) -> Result<Json<OperationListView>, ApiError> {
-    let (items, next_cursor) = blocking(move || {
-        repairs.history(
-            purpose,
-            query.limit.unwrap_or(default_limit),
-            query.cursor.as_deref(),
-        )
-    })
-    .await?;
-    Ok(Json(OperationListView {
-        items: items.iter().map(repair_view).collect(),
-        next_cursor,
-    }))
+) -> Result<Json<Page<OperationView>>, ApiError> {
+    let paging = PageRequest::read(
+        query.limit,
+        query.cursor.as_deref(),
+        default_limit,
+        HISTORY_MAX,
+    )?;
+    let (items, next) =
+        blocking(move || repairs.history(purpose, paging.limit, paging.after)).await?;
+    Ok(Json(Page::new(
+        items.iter().map(repair_view).collect(),
+        next,
+    )))
 }
 
 async fn findings(
@@ -358,20 +271,22 @@ async fn findings(
     query: FindingsQuery,
     purpose: Purpose,
 ) -> Result<Json<RepairFindingListView>, ApiError> {
+    let paging = PageRequest::read(query.limit, query.cursor.as_deref(), 100, FINDINGS_MAX)?;
     let page = blocking(move || {
         repairs.findings(
             &job_id,
             purpose,
-            query.limit.unwrap_or(100),
-            query.cursor.as_deref(),
+            paging.limit,
+            paging.after,
             query.finding_category.as_deref(),
         )
     })
     .await?;
     Ok(Json(RepairFindingListView {
-        items: page.items.into_iter().map(finding_view).collect(),
-        next_cursor: page.next_cursor,
-        has_more: page.has_more,
+        page: Page::new(
+            page.items.into_iter().map(finding_view).collect(),
+            page.next,
+        ),
         current_counts_by_finding: page.current_counts_by_finding,
         refresh_required: page.refresh_required,
     }))
@@ -461,8 +376,8 @@ pub async fn create_repair(
     path = "/api/v3/library/identity-repairs",
     params(HistoryQuery),
     responses(
-        (status = 200, description = "Repair jobs, newest first", body = OperationListView),
-        (status = 400, description = "Bad page size or cursor"),
+        (status = 200, description = "Repair jobs, newest first", body = Page<OperationView>),
+        (status = 400, description = "Bad cursor"),
         (status = 401, description = "Not authenticated"),
         (status = 403, description = "Admin role required"),
     )
@@ -471,7 +386,7 @@ pub async fn list_repairs(
     State(repairs): State<Repairs>,
     _caller: Admin,
     ValidQuery(query): ValidQuery<HistoryQuery>,
-) -> Result<Json<OperationListView>, ApiError> {
+) -> Result<Json<Page<OperationView>>, ApiError> {
     list_jobs(repairs, query, Purpose::ExistingMatches, 50).await
 }
 
@@ -528,7 +443,7 @@ pub async fn get_repair(
     params(("job_id" = String, Path, description = "Repair job id"), FindingsQuery),
     responses(
         (status = 200, description = "Findings, newest change first", body = RepairFindingListView),
-        (status = 400, description = "Bad page size, cursor or category"),
+        (status = 400, description = "Bad cursor or category"),
         (status = 401, description = "Not authenticated"),
         (status = 403, description = "Admin role required"),
         (status = 404, description = "Unknown repair job"),
@@ -679,8 +594,8 @@ pub async fn create_preparation(
     path = "/api/v3/library/management/identity-preparations",
     params(HistoryQuery),
     responses(
-        (status = 200, description = "Preparation jobs, newest first", body = OperationListView),
-        (status = 400, description = "Bad page size or cursor"),
+        (status = 200, description = "Preparation jobs, newest first", body = Page<OperationView>),
+        (status = 400, description = "Bad cursor"),
         (status = 401, description = "Not authenticated"),
         (status = 403, description = "Admin role required"),
     )
@@ -689,7 +604,7 @@ pub async fn list_preparations(
     State(repairs): State<Repairs>,
     _caller: Admin,
     ValidQuery(query): ValidQuery<HistoryQuery>,
-) -> Result<Json<OperationListView>, ApiError> {
+) -> Result<Json<Page<OperationView>>, ApiError> {
     list_jobs(repairs, query, Purpose::ManagementReadiness, 20).await
 }
 
@@ -749,7 +664,7 @@ pub async fn get_preparation(
     params(("job_id" = String, Path, description = "Preparation job id"), FindingsQuery),
     responses(
         (status = 200, description = "Findings that still describe their album", body = RepairFindingListView),
-        (status = 400, description = "Bad page size, cursor or category"),
+        (status = 400, description = "Bad cursor or category"),
         (status = 401, description = "Not authenticated"),
         (status = 403, description = "Admin role required"),
         (status = 404, description = "Unknown preparation job"),
@@ -836,16 +751,14 @@ pub async fn scan_diagnostics(
 ) -> Result<Response, ApiError> {
     // One pooled read; a database too busy to hand out a connection
     // answers the server-busy 503.
-    let exported = tokio::task::spawn_blocking(move || repairs.scan_diagnostics(&run_id))
-        .await
-        .map_err(ApiError::internal)?;
-    let (filename, bytes) = match exported {
-        Ok(report) => report.map_err(ApiError::from)?,
+    let (filename, bytes) = blocking(move || match repairs.scan_diagnostics(&run_id) {
+        Ok(report) => report.map_err(ApiError::from),
         Err(error @ (DbError::Busy { .. } | DbError::LaneClosed)) => {
-            return Err(ApiError::unavailable(Unavailable::ServerBusy, error));
+            Err(ApiError::unavailable(Unavailable::ServerBusy, error))
         }
-        Err(error) => return Err(ApiError::internal(error)),
-    };
+        Err(error) => Err(ApiError::internal(error)),
+    })
+    .await?;
     let disposition = HeaderValue::from_str(&format!("attachment; filename=\"{filename}\""))
         .unwrap_or_else(|_| HeaderValue::from_static("attachment"));
     Ok((

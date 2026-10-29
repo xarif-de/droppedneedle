@@ -1,26 +1,22 @@
 //! Production auth wiring: live sign-in clients, config bridges, one bundle.
 //!
-//! The auth modules define ports and the adapters implement them. This
-//! module binds the live ones for serving traffic: the OIDC, Jellyfin,
-//! plex.tv and Last.fm clients over the shared HTTP client, bridges from
-//! the config store to the live-read policy traits, and [`AuthSetup`], the
+//! This module binds the live parts for serving traffic: the OIDC,
+//! Jellyfin, plex.tv, Last.fm and breach-check clients over the shared HTTP
+//! client, the live settings sections auth reads, and [`AuthSetup`], the
 //! single bundle `create_app` builds its routers from. The sign-in media
 //! links and the configured Plex server come in through the
 //! [`MediaLinks`] and [`PlexServerIdentity`] ports.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
+use super::federated::MediaLinks;
 use super::federated::jellyfin_http::JellyfinHttp;
-use super::federated::oidc::{EXCHANGE_TTL_SECS, OidcExchangeStore, OidcLogin};
+use super::federated::oidc::OidcLogin;
 use super::federated::oidc_http::OidcHttp;
 use super::federated::plex::PlexServerIdentity;
 use super::federated::plex_http::PlexTv;
 use super::federated::settings::SignInSettings;
-use super::federated::{FederatedError, MediaLinks};
-use super::prod::{
-    ProdAuth, SqliteFederatedStore, SqliteOidcStateStore, SqliteSessionIssuer, SqliteSessionStore,
-};
+use super::prod::ProdAuth;
 use super::routes::federated::{JellyfinRouteState, OidcRouteState, PlexRouteState};
 use super::routes::native::NativeAuthState;
 use super::session::middleware::SessionAuth;
@@ -28,166 +24,13 @@ use super::session::rate_limit::RateLimiter;
 use super::session::stated::StatedAddresses;
 use super::users::UsersDeps;
 use super::users::lastfm_http::LastFmAuthHttp;
-use super::users::stores::{
-    HibpPolicy, LastFmKeys, LastFmState, LastFmSwitch, LastFmUnreadable, SecurityPolicy,
-};
+use super::users::stores::LastFmSwitch;
 use axum::extract::FromRef;
-use droppedneedle_kernel::clock::Clock;
 use droppedneedle_kernel::config::TrustedProxies;
 use droppedneedle_kernel::mount::{Routes, routes};
 use droppedneedle_kernel::platform::Platform;
 use droppedneedle_kernel::runtime_config::Live;
-use droppedneedle_kernel::runtime_config::secret_sections::LastFmSettings;
 use droppedneedle_kernel::runtime_config::sections::SecuritySettings;
-
-/// One stored exchange code: owning user, sealed token, expiry in unix
-/// milliseconds.
-type StoredExchange = (String, String, i64);
-
-/// Process-local single-use OIDC exchange codes. There is no baseline table
-/// for these 60-second bridge codes: a restart drops in-flight logins and
-/// the SPA restarts the flow cleanly, so a mutex map is enough.
-///
-/// Inserts past [`EXCHANGE_PURGE_THRESHOLD`] entries sweep expired codes so
-/// abandoned logins cannot grow the map without bound.
-#[derive(Clone)]
-pub struct MemoryOidcExchangeStore {
-    codes: Arc<Mutex<HashMap<String, StoredExchange>>>,
-    clock: Arc<dyn Clock>,
-}
-
-impl std::fmt::Debug for MemoryOidcExchangeStore {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MemoryOidcExchangeStore")
-            .finish_non_exhaustive()
-    }
-}
-
-impl MemoryOidcExchangeStore {
-    /// An empty store whose codes expire by `clock`.
-    pub fn new(clock: Arc<dyn Clock>) -> Self {
-        Self {
-            codes: Arc::default(),
-            clock,
-        }
-    }
-}
-
-/// Insert count past which storing a code also sweeps expired ones.
-const EXCHANGE_PURGE_THRESHOLD: usize = 1024;
-
-impl OidcExchangeStore for MemoryOidcExchangeStore {
-    async fn store_exchange(
-        &self,
-        code: &str,
-        user_id: &str,
-        raw_token: &str,
-    ) -> Result<(), FederatedError> {
-        let now = self.clock.now_ms();
-        let expires =
-            now.saturating_add(i64::try_from(EXCHANGE_TTL_SECS * 1000).unwrap_or(i64::MAX));
-        let mut codes = self
-            .codes
-            .lock()
-            .map_err(|_| FederatedError::StoreUnavailable("exchange store lock".to_owned()))?;
-        codes.insert(
-            code.to_owned(),
-            (user_id.to_owned(), raw_token.to_owned(), expires),
-        );
-        if codes.len() > EXCHANGE_PURGE_THRESHOLD {
-            codes.retain(|_, (_, _, expires)| *expires > now);
-        }
-        Ok(())
-    }
-
-    async fn take_exchange(&self, code: &str) -> Result<Option<(String, String)>, FederatedError> {
-        let mut codes = self
-            .codes
-            .lock()
-            .map_err(|_| FederatedError::StoreUnavailable("exchange store lock".to_owned()))?;
-        let Some((user_id, raw_token, expires)) = codes.remove(code) else {
-            return Ok(None);
-        };
-        if self.clock.now_ms() > expires {
-            return Ok(None);
-        }
-        Ok(Some((user_id, raw_token)))
-    }
-}
-
-/// Live-read HIBP knobs. An unreadable section disables screening
-/// (advisory only; auth itself never depends on it).
-#[derive(Debug, Clone)]
-pub struct StoreSecurityPolicy {
-    settings: Live<SecuritySettings>,
-}
-
-impl StoreSecurityPolicy {
-    pub fn new(settings: Live<SecuritySettings>) -> Self {
-        Self { settings }
-    }
-}
-
-impl SecurityPolicy for StoreSecurityPolicy {
-    fn hibp(&self) -> HibpPolicy {
-        self.settings
-            .get()
-            .map(|section| HibpPolicy {
-                check: section.hibp_check,
-                local_path: section.hibp_local_path.clone(),
-            })
-            .unwrap_or(HibpPolicy {
-                check: false,
-                local_path: String::new(),
-            })
-    }
-}
-
-/// Live-read Last.fm switch and instance key pair.
-#[derive(Debug, Clone)]
-pub struct StoreLastFmSwitch {
-    settings: Live<LastFmSettings>,
-}
-
-impl StoreLastFmSwitch {
-    pub fn new(settings: Live<LastFmSettings>) -> Self {
-        Self { settings }
-    }
-}
-
-impl LastFmSwitch for StoreLastFmSwitch {
-    fn enabled(&self) -> bool {
-        // Fail closed: an unreadable section disables fan-out. Last.fm is
-        // optional enrichment, never auth-critical, so a broken read must
-        // degrade to off rather than guess at enabled.
-        self.settings
-            .get()
-            .map(|section| section.enabled)
-            .unwrap_or(false)
-    }
-
-    fn instance_keys(&self) -> Option<LastFmKeys> {
-        self.read()
-            .inspect_err(|_| tracing::warn!("cannot read the Last.fm app key pair"))
-            .ok()
-            .and_then(|state| state.instance_keys)
-    }
-
-    fn read(&self) -> Result<LastFmState, LastFmUnreadable> {
-        let section = self.settings.get().map_err(|error| {
-            tracing::warn!(%error, "cannot read the Last.fm settings");
-            LastFmUnreadable
-        })?;
-        let (api_key, shared_secret) = (section.api_key.expose(), section.shared_secret.expose());
-        Ok(LastFmState {
-            enabled: section.enabled,
-            instance_keys: (!api_key.is_empty() && !shared_secret.is_empty()).then(|| LastFmKeys {
-                api_key: api_key.to_owned(),
-                shared_secret: shared_secret.to_owned(),
-            }),
-        })
-    }
-}
 
 /// Where the plex.tv and breach-check clients send their calls.
 /// Production uses the real services; the integration tests point them at
@@ -201,24 +44,6 @@ pub struct Upstreams {
     pub pwned_passwords: String,
 }
 
-/// Production login, logout and setup route state.
-pub type ProdNativeAuth = NativeAuthState<super::prod::SqliteCredentialLookup>;
-/// Production OIDC route state.
-pub type ProdOidcRoutes = OidcRouteState<
-    SqliteFederatedStore,
-    OidcHttp,
-    SqliteOidcStateStore,
-    MemoryOidcExchangeStore,
-    SqliteSessionIssuer,
-    SignInSettings,
->;
-/// Production Jellyfin route state.
-pub type ProdJellyfinRoutes =
-    JellyfinRouteState<SqliteFederatedStore, JellyfinHttp, MediaLinks, SqliteSessionIssuer>;
-/// Production Plex route state.
-pub type ProdPlexRoutes =
-    PlexRouteState<SqliteFederatedStore, PlexTv, MediaLinks, SqliteSessionIssuer>;
-
 /// Everything `create_app` needs to mount the auth routes and the session
 /// gate, built once at boot.
 #[derive(Clone)]
@@ -226,17 +51,17 @@ pub struct AuthSetup {
     /// Account, device, recovery, and app-password routes.
     pub users: UsersDeps,
     /// Session gate state for the middleware layer.
-    pub session_auth: SessionAuth<SqliteSessionStore>,
+    pub session_auth: SessionAuth,
     /// Request limiter, mounted inside the session gate.
     pub limits: Arc<RateLimiter>,
     /// Login/logout/setup routes.
-    pub native: ProdNativeAuth,
+    pub native: NativeAuthState,
     /// OIDC routes.
-    pub oidc: ProdOidcRoutes,
+    pub oidc: OidcRouteState,
     /// Jellyfin login route.
-    pub jellyfin: ProdJellyfinRoutes,
+    pub jellyfin: JellyfinRouteState,
     /// Plex journey routes.
-    pub plex: ProdPlexRoutes,
+    pub plex: PlexRouteState,
     /// The sign-in sections, read by the provider list.
     pub sign_in: SignInSettings,
     /// The security section, read by the response security headers.
@@ -269,7 +94,7 @@ impl AuthSetup {
     /// client, which account linking goes through; `plex_server` reads
     /// the configured Plex server's machine id for the membership gate;
     /// `links` saves the media link a Plex or Jellyfin sign-in hands back.
-    pub fn build_with_upstreams(
+    pub fn build(
         platform: &Platform,
         auth: ProdAuth,
         upstreams: &Upstreams,
@@ -294,24 +119,26 @@ impl AuthSetup {
         );
         let jellyfin_http = JellyfinHttp::new(http.clone(), config_store.clone());
         let users = UsersDeps {
-            users: Arc::new(auth.users.clone()),
-            sessions: Arc::new(auth.session_manager.clone()),
-            app_passwords: Arc::new(auth.app_passwords.clone()),
-            lastfm: Arc::new(auth.lastfm.clone()),
-            recovery: Arc::new(auth.recovery.clone()),
-            avatars: Arc::new(auth.avatars.clone()),
+            users: auth.users.clone(),
+            sessions: auth.sessions.clone(),
+            app_passwords: auth.app_passwords.clone(),
+            lastfm: auth.lastfm.clone(),
+            recovery: auth.recovery.clone(),
+            avatars: auth.avatars.clone(),
             passwords: auth.passwords.clone(),
-            screen: Arc::new(HibpScreen::new(Arc::new(PwnedPasswordsHttp {
-                client: http.clone(),
-                range_url: upstreams.pwned_passwords.clone(),
-            }))),
+            screen: HibpScreen::new(
+                Arc::new(PwnedPasswordsHttp {
+                    client: http.clone(),
+                    range_url: upstreams.pwned_passwords.clone(),
+                }),
+                config_store.live(),
+            ),
             clock: clock.clone(),
             ids: ids.clone(),
             crypto: crypto.clone(),
             lastfm_client: Arc::new(LastFmAuthHttp::new(lastfm.clone())),
-            lastfm_switch: Arc::new(StoreLastFmSwitch::new(config_store.live())),
+            lastfm_switch: LastFmSwitch::new(config_store.live()),
             lastfm_pending: Arc::default(),
-            security: Arc::new(StoreSecurityPolicy::new(config_store.live())),
             jellyfin_directory: Arc::new(jellyfin_http.clone()),
             plex_directory: Arc::new(plex_tv.clone()),
         };
@@ -322,7 +149,6 @@ impl AuthSetup {
         let native = NativeAuthState::new(
             auth.sessions.clone(),
             auth.passwords.clone(),
-            auth.credentials.clone(),
             users.clone(),
             base_path,
         )
@@ -333,11 +159,11 @@ impl AuthSetup {
                 auth.federated.clone(),
                 OidcHttp::new(no_redirect),
                 auth.oidc_states.clone(),
-                MemoryOidcExchangeStore::new(clock.clone()),
-                auth.issuer.clone(),
+                auth.sessions.clone(),
                 clock.clone(),
             ),
             sign_in.clone(),
+            auth.users.clone(),
             base_path,
         )
         .with_stated_addresses(stated.clone());
@@ -345,7 +171,8 @@ impl AuthSetup {
             auth.federated.clone(),
             jellyfin_http,
             links.clone(),
-            auth.issuer.clone(),
+            auth.sessions.clone(),
+            auth.users.clone(),
             base_path,
         )
         .with_limits(limits.clone())
@@ -354,7 +181,7 @@ impl AuthSetup {
             auth.federated.clone(),
             plex_tv,
             links,
-            auth.issuer.clone(),
+            auth.sessions.clone(),
             base_path,
         )
         .with_stated_addresses(stated.clone());
@@ -449,7 +276,7 @@ impl FromRef<AuthSetup> for UsersDeps {
     }
 }
 
-impl FromRef<AuthSetup> for ProdNativeAuth {
+impl FromRef<AuthSetup> for NativeAuthState {
     fn from_ref(setup: &AuthSetup) -> Self {
         setup.native.clone()
     }
@@ -461,41 +288,20 @@ impl FromRef<AuthSetup> for SignInSettings {
     }
 }
 
-impl FromRef<AuthSetup> for ProdOidcRoutes {
+impl FromRef<AuthSetup> for OidcRouteState {
     fn from_ref(setup: &AuthSetup) -> Self {
         setup.oidc.clone()
     }
 }
 
-impl FromRef<AuthSetup> for ProdJellyfinRoutes {
+impl FromRef<AuthSetup> for JellyfinRouteState {
     fn from_ref(setup: &AuthSetup) -> Self {
         setup.jellyfin.clone()
     }
 }
 
-impl FromRef<AuthSetup> for ProdPlexRoutes {
+impl FromRef<AuthSetup> for PlexRouteState {
     fn from_ref(setup: &AuthSetup) -> Self {
         setup.plex.clone()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn exchange_inserts_past_threshold_keep_every_code() {
-        let store =
-            MemoryOidcExchangeStore::new(Arc::new(droppedneedle_kernel::clock::SystemClock));
-        for n in 0..EXCHANGE_PURGE_THRESHOLD + 50 {
-            store
-                .store_exchange(&format!("code-{n}"), "user-1", "raw")
-                .await
-                .unwrap();
-        }
-        for n in 0..EXCHANGE_PURGE_THRESHOLD + 50 {
-            let taken = store.take_exchange(&format!("code-{n}")).await.unwrap();
-            assert_eq!(taken, Some(("user-1".to_owned(), "raw".to_owned())));
-        }
     }
 }

@@ -1,7 +1,7 @@
 //! Local seams: the narrow traits contributions need from code they do not
 //! own, and the types their store takes.
 //!
-//! Owned elsewhere (implemented in `library::adapters`):
+//! Owned elsewhere (implemented in [`super::attachment`] and [`super::live`]):
 //! - [`AttachmentEvidence`] - the identification evidence decision for
 //!   attach/verify, from identify (v2 `AlbumEvidenceEngine`).
 //! - [`ContributionCatalog`] - catalog invalidation + identified hook, from
@@ -91,7 +91,7 @@ pub struct AlbumIdentificationContext {
 
 /// Catalog invalidation plus the post-identify hook.
 /// A trait because it cuts the dependency from contributions on
-/// identification; `library::adapters` implements it.
+/// identification; [`super::live::IdentifyFollowUp`] implements it.
 pub trait ContributionCatalog: Send + Sync {
     /// Delete exactly the touched identity-bearing keys before the
     /// commit path returns; lists still sweep.
@@ -287,6 +287,19 @@ pub struct ContributionRow {
     pub album_active: bool,
     pub current_input_revision: String,
     pub current_album_row_revision: i64,
+    /// What linking a release would meet on the album.
+    pub links: AlbumLinks,
+}
+
+/// The album's MusicBrainz links, read with the contribution row.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct AlbumLinks {
+    /// The live album's artist; `None` when the album is gone.
+    pub artist_id: Option<String>,
+    /// The album's release and release group, when it has a match.
+    pub identity: Option<(Option<String>, String)>,
+    /// The artist's MusicBrainz id when a person or v2 linked it.
+    pub chosen_artist_mbid: Option<String>,
 }
 
 /// The contribution a callback token belonged to; `None` when the token
@@ -319,49 +332,4 @@ pub struct FinishIdentities {
     pub artist_mbid: Option<String>,
     /// Per-file track identities the link writes.
     pub tracks: Vec<TrackEvidence>,
-}
-
-/// Store-side mutation applied under the row-revision guard.
-#[derive(Debug, Clone)]
-pub enum ContributionUpdate {
-    Draft {
-        draft: ReleaseDraft,
-        state: ContributionState,
-    },
-    SelectDiscogs {
-        release: DiscogsRelease,
-        selection: ContributionSourceSelection,
-        expires_at: f64,
-    },
-    RemoveDiscogs {
-        draft: ReleaseDraft,
-        state: ContributionState,
-    },
-    DuplicateResult {
-        result: DuplicateCheckResult,
-        state: ContributionState,
-    },
-    AttachExisting {
-        release_mbid: String,
-        release_group_mbid: String,
-        artist_mbid: Option<String>,
-        attempt: ContributionVerificationAttempt,
-        tracks: Vec<TrackEvidence>,
-    },
-    PrepareSeed {
-        token_hash: String,
-        token_expires_at: f64,
-        seed_snapshot_json: String,
-        seed_hash: String,
-    },
-    ManualResult {
-        release_mbid: String,
-        replace_existing: bool,
-    },
-    RequeueVerification,
-    Cancel,
-    PurgeProviderData {
-        draft: ReleaseDraft,
-        selection: ContributionSourceSelection,
-    },
 }

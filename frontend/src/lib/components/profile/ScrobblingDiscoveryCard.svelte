@@ -357,8 +357,8 @@
 								lfm?.username,
 								lfmLinked
 							)}
-							<div class="shrink-0">
-								{#if lfmLinked}
+							<div class="flex shrink-0 items-center gap-2">
+								{#if lfm}
 									<Button
 										variant="ghost"
 										size="xs"
@@ -368,7 +368,8 @@
 									>
 										Disconnect
 									</Button>
-								{:else if lfmPendingToken}
+								{/if}
+								{#if !lfmLinked && lfmPendingToken}
 									<div class="flex items-center gap-2">
 										<Button variant="ghost" size="xs" pill onclick={cancelLastFm}>Cancel</Button>
 										<Button
@@ -382,7 +383,7 @@
 											Finish
 										</Button>
 									</div>
-								{:else}
+								{:else if !lfmLinked}
 									<Button
 										variant="lastfm"
 										size="xs"

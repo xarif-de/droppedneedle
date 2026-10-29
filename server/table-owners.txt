@@ -81,6 +81,7 @@ user_section_prefs
 
 [compat]
 compat_bookmarks
+compat_jellyfin_ids
 compat_play_queue_items
 compat_play_queues
 
@@ -96,6 +97,8 @@ import_progress
 import_runs
 
 [acquire]
+acquire_discovery_batch_items
+acquire_discovery_batches
 acquire_edition_acquires
 acquire_follow_cursors
 acquire_held_entries
@@ -123,15 +126,15 @@ wanted_watches
 
 [catalog]
 artist_event_check
-artist_genres
 artist_skiddle_ids
 artist_skiddle_resolution
 artist_tm_attraction
-discovery_activity
-discovery_batch_items
-discovery_batches
-discovery_snapshots
-ignored_releases
+catalog_artist_genres
+catalog_cached_pages
+catalog_discover_activity
+catalog_ignored_releases
+catalog_mbid_resolutions
+catalog_page_generations
 library_artist_album_credits
 library_artist_counts
 library_genre_artwork_revisions
@@ -142,7 +145,6 @@ library_user_favorites
 library_user_play_marks
 library_user_ratings
 live_event_feed
-mbid_resolution_map
 new_release_feed
 playlist_covers
 playlist_tracks
@@ -198,6 +200,7 @@ library_publish_blobs
 library_publish_created_folders
 library_publish_journal
 library_publish_operations
+library_publish_outputs
 library_publish_replacements
 library_publish_resolutions
 library_publish_snapshots
@@ -206,6 +209,7 @@ library_reference_tombstones
 library_reidentification_snapshots
 library_repair_materialization
 library_repair_snapshots
+library_repair_watermarks
 library_retag_pairs
 library_review_exclusions
 library_scan_album_moves

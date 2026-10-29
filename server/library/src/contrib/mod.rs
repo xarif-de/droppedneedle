@@ -16,13 +16,18 @@
 //! - Provider contact is reads-only with explicit priorities; the submission
 //!   itself is a browser POST to the MusicBrainz release editor, which sends
 //!   the curator back to the callback route - no live provider writes, ever.
-//! - State lives in SQLite ([`sqlite::SqliteContributions`]), which also
-//!   reads the album identification context from the catalog.
+//! - Every change to a contribution is one pure function,
+//!   [`transition::transition`]. State lives in SQLite
+//!   ([`sqlite::SqliteContributions`]), which loads a row, runs the
+//!   transition, saves it and runs its effects in one transaction, and
+//!   also reads the album identification context from the catalog.
 //! - Verification is a job kind on the kernel's jobs table
 //!   ([`worker::VERIFY`]); the server registers [`worker::VerificationWorker`]
 //!   as its handler. [`worker::start_upkeep`] runs the hourly upkeep loop.
 
+pub mod attachment;
 pub mod error;
+pub mod live;
 pub mod models;
 pub mod reasons;
 pub mod rules;
@@ -32,6 +37,7 @@ pub mod seams;
 pub mod service;
 pub(crate) mod sql;
 pub mod sqlite;
+pub mod transition;
 pub mod worker;
 
 use std::sync::Arc;
@@ -61,19 +67,17 @@ pub fn assemble(
     Arc<worker::VerificationWorker>,
 ) {
     let store = Arc::new(sqlite::SqliteContributions::new(db.clone(), queue));
-    let service = Arc::new(
-        service::ContributionService::new(
-            store,
-            Arc::new(super::adapters::MatchingAttachmentEvidence),
-            clock,
-        )
-        .with_discogs(providers.discogs)
-        .with_musicbrainz(providers.musicbrainz.clone())
-        .with_catalog(catalog),
-    );
+    let musicbrainz = providers.musicbrainz.clone();
+    let service = Arc::new(service::ContributionService::new(
+        store,
+        Arc::new(attachment::MatchingAttachmentEvidence),
+        providers,
+        catalog,
+        clock,
+    ));
     let worker = Arc::new(worker::VerificationWorker::new(
         service.clone(),
-        providers.musicbrainz,
+        musicbrainz,
     ));
     (service, worker)
 }

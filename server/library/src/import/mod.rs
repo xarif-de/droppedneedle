@@ -65,12 +65,12 @@ pub mod naming;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use droppedneedle_kernel::db::Lane;
+use droppedneedle_kernel::db::{Db, Lane};
 
 use super::clock::LibraryClock as _;
 use super::matching::Release;
-use super::publish::PublishError;
 use super::publish::import_staging::{copy_in, remove_staging, staging_rel, staging_settled};
 use super::publish::paths::{ResolvedRoot, left_out};
 use super::publish::planner::{
@@ -80,9 +80,12 @@ use super::publish::planner::{
 use super::publish::publisher::{JoinedAlbum, joined_album};
 use super::publish::remove::{self, Probe, Refusal, Target};
 use super::publish::snapshots::sha256_hex;
+use super::publish::{PublishError, TagUpdates};
 use super::scan::models::EffectivePolicy;
 use super::scan::roots::{LibraryRoot, RootRegistry};
-use super::wiring::LibrarySetup;
+use super::settings::LibrarySettings;
+use super::tags::AudioFormat;
+use super::wiring::LibraryCore;
 
 /// Revisions the seal pins while profiles and naming have no store (the
 /// same constants manual management uses).
@@ -203,8 +206,8 @@ struct Placement {
     track: super::matching::ReleaseTrack,
     staged_rel: String,
     dest_rel: String,
-    format: String,
-    tags: BTreeMap<String, Vec<String>>,
+    format: AudioFormat,
+    tags: TagUpdates,
     /// The policy covering the final destination, set under the publish
     /// lock once a joined file's folder is known.
     policy: EffectivePolicy,
@@ -215,7 +218,27 @@ struct Placement {
     replaces: Result<Vec<Target>, String>,
 }
 
-impl LibrarySetup {
+/// Finished downloads brought into the library, and the MusicBrainz and
+/// AcoustID lookups the landing matches them with.
+#[derive(Clone)]
+pub struct Imports {
+    /// The application database the landing reads its choices from.
+    pub db: Db,
+    /// The roots and the publish cell the import opens over.
+    pub core: LibraryCore,
+    pub(crate) identify_store: Arc<super::identify::sqlite::SqliteIdentifyStore>,
+    pub(crate) settings: LibrarySettings,
+    /// MusicBrainz releases for importing finished downloads: search and
+    /// release lookups, identity-critical like identification, one source
+    /// for background work and one for a person waiting.
+    pub releases:
+        super::identify::sources::Prioritised<Arc<dyn super::identify::sources::ReleaseSource>>,
+    /// AcoustID for files being imported, keyed per call and keeping
+    /// nothing; off while no AcoustID key is set.
+    pub fingerprints: Arc<dyn super::identify::sources::FingerprintSource>,
+}
+
+impl Imports {
     /// Import a verified download as one staged bundle, filed by its
     /// tags. Blocking: callers run it off the async runtime.
     pub fn import_download(&self, import: &DownloadImport) -> Result<ImportedAlbum, ImportError> {
@@ -247,7 +270,7 @@ impl LibrarySetup {
         if import.files.is_empty() && import.extras.is_empty() {
             return Err(fault("nothing to import".to_owned()));
         }
-        let registry = self.live_registry();
+        let registry = self.core.live_registry();
         // Settings that do not read never mean the default layout.
         let script = self
             .settings
@@ -284,9 +307,7 @@ impl LibrarySetup {
         for (path, _, _) in &sources {
             formats.push(
                 super::tags::format_for_path(path)
-                    .map_err(|error| fault(format!("unsupported file: {error}")))?
-                    .as_str()
-                    .to_owned(),
+                    .map_err(|error| fault(format!("unsupported file: {error}")))?,
             );
         }
         let render = |root: &LibraryRoot| -> Result<Vec<String>, ImportError> {
@@ -301,7 +322,7 @@ impl LibrarySetup {
                     };
                     naming::render(
                         &script,
-                        &naming::variables(&import.release, &named, format),
+                        &naming::variables(&import.release, &named, format.as_str()),
                         &root_path,
                     )
                     .map_err(|error| ImportError::NamingScript(error.to_string()))
@@ -382,17 +403,16 @@ impl LibrarySetup {
                     super::tags::save::accepts(&super::tags::TagEdit::new(field, values.clone()))
                 })
             });
-            if !super::tags::save::writable(
-                super::tags::format_for_path(path)
-                    .map_err(|error| fault(format!("unsupported file: {error}")))?,
-            ) {
+            if !super::tags::save::writable(format) {
                 tags.clear();
             }
+            let tags = TagUpdates::from_fields(tags)
+                .map_err(|error| fault(format!("release tags: {error}")))?;
             placements.push(Placement {
                 index: ordinal,
                 source: path.clone(),
                 track: track.clone(),
-                staged_rel: format!("{task_dir}/{ordinal:03}.{format}"),
+                staged_rel: format!("{task_dir}/{ordinal:03}.{}", format.as_str()),
                 dest_rel,
                 format,
                 tags,
@@ -409,10 +429,11 @@ impl LibrarySetup {
             .map_err(|error| fault(format!("the release document was not kept: {error}")))?;
 
         let mut cell = self
+            .core
             .publish
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        cell.refresh(&registry, &self.root_dirs)
+        cell.refresh(&registry, &self.core.root_dirs)
             .map_err(|error| fault(error.to_string()))?;
         let open = cell.open().map_err(|error| fault(error.to_string()))?;
         let staged_dir = open
@@ -481,10 +502,10 @@ impl LibrarySetup {
         for placement in &mut placements {
             placement.policy = root.policy_for(&root.path.join(&placement.dest_rel));
             if placement.policy == EffectivePolicy::LocalMetadata {
-                placement.tags.clear();
+                placement.tags = TagUpdates::new();
             }
         }
-        let bundle_id = self.ids.new_id();
+        let bundle_id = self.core.ids.new_id();
         // A replaced track that left the catalog since it was read has no
         // file to take away.
         let wanted: Vec<String> = placements
@@ -589,7 +610,7 @@ impl LibrarySetup {
                     "FILE_RECYCLED",
                     import.actor.as_deref(),
                     None,
-                    self.clock.now_system(),
+                    self.core.clock.now_system(),
                 ) {
                     Ok(removal) => {
                         claimed_tracks.extend(targets.iter().map(|target| target.track_id.clone()));
@@ -685,7 +706,7 @@ impl LibrarySetup {
                     } else {
                         vec![Capability::Metadata, Capability::SameRootMove]
                     },
-                    format: placement.format.clone(),
+                    format: placement.format,
                     managed_updates: placement.tags.clone(),
                     sidecars: Vec::new(),
                     adopt: Some(super::publish::planner::Adoption {
@@ -738,19 +759,19 @@ impl LibrarySetup {
                 naming_revision: PINNED_REVISION,
                 policy_revision: bundle.policy_revision,
                 settings_revision: PINNED_REVISION,
-                today_day: self.clock.today_day(),
+                today_day: self.core.clock.today_day(),
                 token_hash: token_hash.clone(),
             };
             let sealed = SealedPreview::seal(
                 bundle,
                 token_hash,
                 PINNED_REVISION,
-                self.clock.today_day() + 1,
+                self.core.clock.today_day() + 1,
             );
             open.publisher
                 .publish(&sealed, &live, &BTreeMap::new())
                 .map_err(|error| match error {
-                    PublishError::Collision(message) => ImportError::Occupied(message),
+                    PublishError::Collision(detail) => ImportError::Occupied(detail.message),
                     other => fault(other.to_string()),
                 })?;
             Ok(sealed.bundle)
@@ -863,7 +884,7 @@ impl LibrarySetup {
         Ok(Ok(super::scan::sqlite_store::adoptable_track_id(
             conn, root_id, dest_rel, false,
         )?
-        .unwrap_or_else(|| self.ids.new_id())))
+        .unwrap_or_else(|| self.core.ids.new_id())))
     }
 
     /// The files of the indexed tracks in `replaces`, each read once before

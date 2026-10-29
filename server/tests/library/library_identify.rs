@@ -1429,6 +1429,7 @@ fn an_approval_without_its_document_waits_and_the_sweep_links_later() {
                 decision_source: DecisionSource::Manual,
                 row_revision: 1,
             },
+            expected_revision: None,
         })
         .expect("approval commits");
     assert!(approved);
@@ -2999,7 +3000,10 @@ fn the_existing_matches_repair_reports_a_v2_choice_as_a_persons() {
         unmatched_expected_tracks: Vec::new(),
     };
     let verdict = classify::existing_match(&identity, Some(&contradicted), 1, 1);
-    assert_eq!(verdict.finding_code, "manual_identity");
+    assert_eq!(
+        verdict.finding_code,
+        droppedneedle_library::repairs::models::FindingCode::ManualIdentity
+    );
 }
 
 /// A rescan changes the album's files while identification is recalling
@@ -3299,7 +3303,7 @@ async fn person_commands_leave_what_their_rule_says() {
                 .collect(),
             vec![format!(
                 "{:?}",
-                Ok::<_, String>("cleared_to_review".to_owned())
+                Ok::<_, String>(droppedneedle_library::identity::AutomaticUndone::ClearedToReview)
             )]
             .into_iter()
             .chain(flag)
@@ -3888,46 +3892,5 @@ async fn a_merged_recording_the_held_edition_resolves_keeps_the_album() {
     assert_eq!(
         kept.and_then(|row| row.release_mbid).as_deref(),
         Some(RELEASE_A1)
-    );
-}
-
-/// A failed attempt the album's later success settled is no failure the
-/// activity feed shows; one that nothing settled still is.
-#[test]
-fn a_failure_settled_by_a_later_success_needs_no_attention() {
-    let dir = ScratchDir::new("identify-settled-failure");
-    let path = dir.join("app.db");
-    migrated_db(&path);
-    let conn = rusqlite::Connection::open(&path).expect("opens");
-    conn.execute_batch(
-        "INSERT INTO local_artists (id, display_name, folded_name, kind, created_at, updated_at) \
-         VALUES ('artist', 'Artist', 'artist', 'unknown', 0, 0); \
-         INSERT INTO local_albums (id, root_id, grouping_key, title, title_folded, \
-         album_artist_id, grouping_source, created_at, updated_at) \
-         VALUES ('album-1', 'r', 'k1', 'One', 'one', 'artist', 'automatic', 0, 0), \
-         ('album-2', 'r', 'k2', 'Two', 'two', 'artist', 'automatic', 0, 0);",
-    )
-    .expect("albums seed");
-    let job = |id: &str, album: &str, state: &str, at: i64| {
-        conn.execute(
-            "INSERT INTO library_identify_jobs (id, local_album_id, kind, priority, state, \
-             attempts, not_before_ms, input_revision, idempotency_key, created_ms, updated_ms) \
-             VALUES (?1, ?2, 'automatic', 0, ?3, 1, ?4, 'rev', ?1, ?4, ?4)",
-            params![id, album, state, at],
-        )
-        .expect("job inserts");
-    };
-    job("moved", "album-1", "failed", 1_000);
-    job("retried", "album-1", "succeeded", 2_000);
-    let snapshot =
-        droppedneedle_library::activity::store::identification_snapshot(&conn, 10.0).unwrap();
-    assert_eq!(snapshot.failure, None);
-
-    job("broken", "album-2", "failed", 3_000);
-    let snapshot =
-        droppedneedle_library::activity::store::identification_snapshot(&conn, 10.0).unwrap();
-    assert_eq!(
-        snapshot.failure.map(|(id, _)| id),
-        Some("broken".to_owned())
     );
 }

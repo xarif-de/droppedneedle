@@ -18,7 +18,7 @@ use droppedneedle::bootstrap;
 use droppedneedle_acquire::wiring::RecoveryError;
 use droppedneedle_kernel::{
     config::AppConfig,
-    db::{DbConfig, Lane, open_runtime},
+    db::{DbConfig, Lane, backup::RESTORE_MARKER, open_runtime},
     runtime_config::{
         ConfigStore, Crypto, Section,
         sections::{PublicAddress, SecuritySettings},
@@ -245,6 +245,47 @@ async fn boot_refuses_a_v2_data_directory_and_leaves_it_alone() {
     );
 }
 
+/// A restore that stopped after placing the undo folder and before the
+/// database leaves its marker: boot refuses the folder, naming it and the
+/// way back, and creates no empty database over the restored undo copies.
+/// A marker left beside a placed database does not stop the boot and is
+/// left where it is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn boot_refuses_a_folder_an_unfinished_restore_left() {
+    let dir = scratch("unfinished-restore");
+    let config = AppConfig::with_root(0, &dir);
+    let db_dir = config.library_db_path.parent().unwrap().to_path_buf();
+    std::fs::create_dir_all(db_dir.join("undo")).unwrap();
+    std::fs::write(db_dir.join(RESTORE_MARKER), b"").unwrap();
+    let db_path = config.library_db_path.clone();
+
+    let Err(refused) = build(config).await else {
+        panic!("boot must refuse a folder an unfinished restore left");
+    };
+    let message = refused.to_string();
+    assert!(
+        message.contains("did not finish")
+            && message.contains(&db_dir.display().to_string())
+            && message.contains("droppedneedle-tool restore"),
+        "{message}"
+    );
+    assert!(!db_path.exists(), "a database was created");
+
+    let placed = scratch("restore-marker-left");
+    let config = config_in(&placed);
+    let marker = config
+        .library_db_path
+        .parent()
+        .unwrap()
+        .join(RESTORE_MARKER);
+    std::fs::write(&marker, b"").unwrap();
+    let (router, background) = build(config)
+        .await
+        .expect("a marker beside a placed database does not stop the boot");
+    start(router, background).await.shut_down().await;
+    assert!(marker.exists(), "boot removed the marker");
+}
+
 /// Startup recovery as boot runs it: a busy answer from the reader pool is
 /// waited out and the boot goes on once the reader frees, while a failure
 /// of any other kind stops the boot at once with the stage named.
@@ -272,14 +313,33 @@ async fn acquire_recovery_waits_out_a_busy_reader_and_stops_on_a_real_failure() 
     );
     // The test holds the only reader through the first run, as a swapping
     // host would, and gives it back once that run has answered.
+    // Both read pools: recovery reads through either.
     let held = Mutex::new(Some(runtime.db().sqlx().acquire().await.unwrap()));
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let reader_db = runtime.db().clone();
+    let holder = tokio::spawn(async move {
+        reader_db
+            .read("test.hold", move |_| {
+                started_tx.send(()).ok();
+                release_rx.recv().ok();
+                Ok::<_, droppedneedle_kernel::db::DbError>(())
+            })
+            .await
+    });
+    tokio::task::spawn_blocking(move || started_rx.recv())
+        .await
+        .unwrap()
+        .expect("the reader checks out");
+    let release = Mutex::new(Some(release_tx));
     let runs = AtomicUsize::new(0);
     let step = || {
-        let (acquire, runs, held) = (&acquire, &runs, &held);
+        let (acquire, runs, held, release) = (&acquire, &runs, &held, &release);
         async move {
             let outcome = acquire.run_recovery().await;
             runs.fetch_add(1, Ordering::SeqCst);
             held.lock().unwrap().take();
+            release.lock().unwrap().take();
             outcome
         }
     };
@@ -288,15 +348,13 @@ async fn acquire_recovery_waits_out_a_busy_reader_and_stops_on_a_real_failure() 
         bootstrap::wait_out_busy("acquire recovery", RecoveryError::is_busy, step).await;
     assert!(recovered.is_ok(), "{recovered:?}");
     assert_eq!(runs.load(Ordering::SeqCst), 2, "the busy run ran again");
+    holder.await.unwrap().unwrap();
 
-    runtime
-        .db()
-        .write(Lane::Background, "test.break", |tx| {
-            tx.execute_batch("ALTER TABLE request_history RENAME TO request_history_gone")?;
-            Ok::<_, droppedneedle_kernel::db::DbError>(())
-        })
-        .await
-        .unwrap();
+    crate::common::break_schema(
+        runtime.db(),
+        "ALTER TABLE request_history RENAME TO request_history_gone",
+    )
+    .await;
     runs.store(0, Ordering::SeqCst);
     let refused = bootstrap::wait_out_busy("acquire recovery", RecoveryError::is_busy, step).await;
     assert!(

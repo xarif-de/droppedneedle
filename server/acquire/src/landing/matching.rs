@@ -22,7 +22,7 @@ use droppedneedle_library::matching::decide::{ACCEPT_TRACK, EDITION_COHORT};
 use droppedneedle_library::matching::score::TrackPair;
 use droppedneedle_library::matching::strings::{fold, string_dist};
 use droppedneedle_library::matching::{
-    LocalAlbum, LocalTrack, Release, ReleaseMatch, ReleaseTrack,
+    LocalAlbum, LocalTrack, Release, ReleaseMatch, ReleaseTrack, usable_mbid,
 };
 use droppedneedle_library::matching::{match_release, unknown_recordings};
 use droppedneedle_providers::RequestPriority;
@@ -130,11 +130,12 @@ impl FoundRelease {
 
 /// The files as the matching engine sees them. Untagged files fall back
 /// to the file name ("03 - Title.flac") and the disc folder ("CD2"), and
-/// an untagged album takes the requested names, as v2's folder import did.
+/// an untagged album takes the requested names.
 /// Those names prove nothing: a download's untagged files import only with
 /// other evidence of their artist (`specs::artist_proof`).
 pub fn local_album(files: &[LandedFile], target: &Target) -> LocalAlbum {
-    let tracks = files
+    let mut dropped = 0;
+    let tracks: Vec<LocalTrack> = files
         .iter()
         .enumerate()
         .map(|(index, file)| {
@@ -159,13 +160,22 @@ pub fn local_album(files: &[LandedFile], target: &Target) -> LocalAlbum {
                     name_disc.or_else(|| disc_folder(file)).unwrap_or(1)
                 },
                 duration_secs: file.header.duration_seconds,
-                recording_mbid: clean(tag.musicbrainz_recording_id.as_deref()),
-                release_track_mbid: clean(tag.musicbrainz_release_track_id.as_deref()),
-                release_mbid: clean(tag.musicbrainz_release_id.as_deref()),
+                recording_mbid: usable_mbid(tag.musicbrainz_recording_id.as_deref(), &mut dropped),
+                release_track_mbid: usable_mbid(
+                    tag.musicbrainz_release_track_id.as_deref(),
+                    &mut dropped,
+                ),
+                release_mbid: usable_mbid(tag.musicbrainz_release_id.as_deref(), &mut dropped),
                 fingerprint_recordings: Vec::new(),
             }
         })
         .collect();
+    if dropped > 0 {
+        tracing::debug!(
+            dropped,
+            "malformed MusicBrainz ids in tags left out of matching"
+        );
+    }
     let album_tag = most_common(files.iter().map(|file| file.tag.album.trim()));
     let artist_tag = most_common(files.iter().map(|file| {
         file.tag
@@ -545,8 +555,8 @@ pub(super) fn file_name_parts(file: &LandedFile) -> (Option<u32>, Option<u32>, S
 }
 
 /// The leading number of a file name as `(disc, track)` plus the title
-/// after it. Three digits are disc then track, as v2's naming wrote them
-/// ("101 Title" is disc 1, track 1); a leading zero disc means none.
+/// after it. Three digits are disc then track, as older naming wrote
+/// them ("101 Title" is disc 1, track 1); a leading zero disc means none.
 fn number_and_title(stem: &str) -> (Option<u32>, Option<u32>, String) {
     let trimmed = stem.trim_start();
     let digits: String = trimmed.chars().take_while(char::is_ascii_digit).collect();
@@ -605,13 +615,6 @@ pub fn position_in_name(filename: &str) -> Option<(u32, u32)> {
         })
         .unwrap_or(1);
     Some((disc, track?))
-}
-
-fn clean(value: Option<&str>) -> Option<String> {
-    value
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_ascii_lowercase)
 }
 
 /// The most common non-empty value.

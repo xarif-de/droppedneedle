@@ -3,14 +3,19 @@
 use std::collections::HashSet;
 use std::sync::Mutex;
 
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 
 use super::super::error::RequestsError;
-use super::super::ledger::MixApproval;
-use super::{
-    APPROVAL_APPROVED, APPROVAL_PENDING, APPROVAL_REVOKED, epoch_from_real, lane_error, read_error,
-};
+use super::super::ledger::{ApprovalState, MixApproval};
+use super::super::sql;
+use super::{lane_error, ms_from_secs, read, secs_from_ms, unknown_value};
 use crate::db::AcquireDb;
+
+/// Decode a stored approval state; one outside the CHECK fails the read.
+fn approval_state(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<ApprovalState> {
+    let text: String = row.get(index)?;
+    ApprovalState::parse(&text).ok_or_else(|| unknown_value(index, "state", &text))
+}
 
 /// Durable personal-mix approvals over `personal_mix_approvals`, plus the
 /// in-process refresh guard (a build running in this process).
@@ -34,11 +39,8 @@ impl PersonalMixStore {
         self.db
             .write("mix.file", move |tx| {
                 tx.execute(
-                    "INSERT INTO personal_mix_approvals (user_id, state, requested_at) \
-                     VALUES (?1, ?2, ?3) ON CONFLICT (user_id) DO UPDATE SET \
-                     state = excluded.state, requested_at = excluded.requested_at, \
-                     reviewed_by_id = NULL, reviewed_by_name = NULL, reviewed_at = NULL",
-                    params![user_id, APPROVAL_PENDING, now as f64],
+                    sql::FILE_MIX_APPROVAL.text(),
+                    params![user_id, ApprovalState::Pending.as_str(), ms_from_secs(now)],
                 )?;
                 Ok(())
             })
@@ -48,32 +50,33 @@ impl PersonalMixStore {
 
     /// One user's approval state, if a row exists.
     pub async fn state(&self, user_id: &str) -> Result<Option<String>, RequestsError> {
-        sqlx::query_scalar("SELECT state FROM personal_mix_approvals WHERE user_id = ?")
-            .bind(user_id)
-            .fetch_optional(self.db.pool())
-            .await
-            .map_err(|error| read_error("mix.state", error))
+        let user_id = user_id.to_owned();
+        read(&self.db, "mix.state", move |conn| {
+            conn.query_row(sql::MIX_APPROVAL_STATE.text(), params![user_id], |row| {
+                Ok(approval_state(row, 0)?.as_str().to_owned())
+            })
+            .optional()
+        })
+        .await
     }
 
     /// Pending approvals, oldest first.
     pub async fn pending(&self) -> Result<Vec<MixApproval>, RequestsError> {
-        let rows: Vec<(String, Option<String>, String, f64)> = sqlx::query_as(
-            "SELECT m.user_id, u.display_name, m.state, m.requested_at \
-             FROM personal_mix_approvals m LEFT JOIN auth_users u ON u.id = m.user_id \
-             WHERE m.state = 'pending' ORDER BY m.requested_at ASC, m.user_id",
-        )
-        .fetch_all(self.db.pool())
+        read(&self.db, "mix.pending", |conn| {
+            let mut statement = conn.prepare_cached(sql::PENDING_MIX_APPROVALS.text())?;
+            let rows = statement.query_map([], |row| {
+                let user_id: String = row.get(0)?;
+                let user_name: Option<String> = row.get(1)?;
+                Ok(MixApproval {
+                    user_name: user_name.unwrap_or_else(|| user_id.clone()),
+                    user_id,
+                    state: approval_state(row, 2)?.as_str().to_owned(),
+                    requested_at: secs_from_ms(row.get(3)?),
+                })
+            })?;
+            rows.collect()
+        })
         .await
-        .map_err(|error| read_error("mix.pending", error))?;
-        Ok(rows
-            .into_iter()
-            .map(|(user_id, user_name, state, requested_at)| MixApproval {
-                user_name: user_name.unwrap_or_else(|| user_id.clone()),
-                user_id,
-                state,
-                requested_at: epoch_from_real(requested_at),
-            })
-            .collect())
     }
 
     /// Pending approval count for the badge.
@@ -85,11 +88,11 @@ impl PersonalMixStore {
     pub async fn decide(
         &self,
         user_id: &str,
-        state: &str,
+        state: ApprovalState,
         reviewer: (&str, Option<String>),
         now: u64,
     ) -> Result<bool, RequestsError> {
-        self.transition(user_id, APPROVAL_PENDING, state, reviewer, now)
+        self.transition(user_id, ApprovalState::Pending, state, reviewer, now)
             .await
     }
 
@@ -100,8 +103,14 @@ impl PersonalMixStore {
         reviewer: (&str, Option<String>),
         now: u64,
     ) -> Result<bool, RequestsError> {
-        self.transition(user_id, APPROVAL_APPROVED, APPROVAL_REVOKED, reviewer, now)
-            .await
+        self.transition(
+            user_id,
+            ApprovalState::Approved,
+            ApprovalState::Revoked,
+            reviewer,
+            now,
+        )
+        .await
     }
 
     /// Claim the refresh key. False means a build already holds it.
@@ -124,19 +133,25 @@ impl PersonalMixStore {
     async fn transition(
         &self,
         user_id: &str,
-        from: &'static str,
-        to: &str,
+        from: ApprovalState,
+        to: ApprovalState,
         reviewer: (&str, Option<String>),
         now: u64,
     ) -> Result<bool, RequestsError> {
-        let (user_id, to) = (user_id.to_owned(), to.to_owned());
+        let user_id = user_id.to_owned();
         let (reviewer_id, reviewer_name) = (reviewer.0.to_owned(), reviewer.1);
         self.db
             .write("mix.transition", move |tx| {
                 let changed = tx.execute(
-                    "UPDATE personal_mix_approvals SET state = ?2, reviewed_by_id = ?3, \
-                     reviewed_by_name = ?4, reviewed_at = ?5 WHERE user_id = ?1 AND state = ?6",
-                    params![user_id, to, reviewer_id, reviewer_name, now as f64, from],
+                    sql::MIX_APPROVAL_TRANSITION.text(),
+                    params![
+                        user_id,
+                        to.as_str(),
+                        reviewer_id,
+                        reviewer_name,
+                        ms_from_secs(now),
+                        from.as_str()
+                    ],
                 )?;
                 Ok(changed > 0)
             })

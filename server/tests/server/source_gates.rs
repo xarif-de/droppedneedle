@@ -288,10 +288,6 @@ const IDENTITY_RULES: &[Rule] = &[
                 ..IDENTITY
             },
             IDENTITY_TOOL,
-            place(
-                "auth/src/sqlite/users.rs",
-                "reads the manifests' sealer to refuse deleting an account history names",
-            ),
         ],
     },
 ];
@@ -473,9 +469,9 @@ const REQUEST: &str = "blocking file or store work, awaited by the request that 
 const CATALOG_WARM: &str =
     "a background catalog warm a read starts, once per key; it logs its own end";
 const DISCOVER_BUILD: &str = "a discover or home build a visit starts; it logs its own end";
+const SESSION_TOUCH: &str = "a session's last-seen touch, queued off the request path, one per session; it logs its own failure";
 const WARM_ENQUEUE: &str =
     "a page's image warm, queued off the request path; it logs its own failure";
-const FAN_OUT: &str = "enrichment calls fanned out and joined by their caller";
 const BENCHMARKS: &str = "the read benchmarks, a test-only module";
 const IMAGE_WORK: &str = "image work off the async workers, awaited by the request";
 const COVER_FLIGHT: &str =
@@ -506,42 +502,26 @@ const SPAWN_SITES: &[(&str, usize, &str)] = &[
     ("acquire/src/landing/library.rs", 2, AWAITED),
     ("acquire/src/landing/mod.rs", 2, AWAITED),
     ("acquire/src/probes.rs", 2, AWAITED),
-    ("acquire/src/requests/discovery.rs", 1, AWAITED),
+    ("acquire/src/requests/batches/mod.rs", 1, AWAITED),
     ("acquire/src/requests/mix.rs", 1, MIX_REFRESH),
     ("acquire/src/requests/service/edition.rs", 1, AWAITED),
     ("acquire/src/search_jobs/mod.rs", 1, SEARCH),
     ("acquire/src/slskd/repository.rs", 3, AWAITED),
     ("acquire/src/usenet/sabnzbd.rs", 6, AWAITED),
-    ("acquire/src/worker.rs", 1, LIBRARY_CHECK),
-    ("acquire/src/worker/landings.rs", 2, WORKER_CHILD),
-    ("acquire/src/worker/review.rs", 1, WORKER_CHILD),
+    ("acquire/src/downloads/worker/mod.rs", 1, LIBRARY_CHECK),
+    ("acquire/src/downloads/worker/landings.rs", 2, WORKER_CHILD),
+    ("acquire/src/downloads/worker/review.rs", 1, WORKER_CHILD),
     ("auth/src/avatars.rs", 2, REQUEST),
     ("auth/src/session/login.rs", 1, REQUEST),
+    ("auth/src/sqlite/sessions.rs", 1, SESSION_TOUCH),
     ("auth/src/users/hibp.rs", 1, REQUEST),
     ("auth/src/users/services.rs", 2, REQUEST),
     ("catalog/src/reads/catalog/artist.rs", 1, CATALOG_WARM),
     ("catalog/src/reads/catalog/discovery.rs", 1, CATALOG_WARM),
-    (
-        "catalog/src/reads/discover/adapters/content.rs",
-        1,
-        DISCOVER_BUILD,
-    ),
-    (
-        "catalog/src/reads/discover/adapters/home/mod.rs",
-        1,
-        DISCOVER_BUILD,
-    ),
-    (
-        "catalog/src/reads/discover/adapters/page/mod.rs",
-        2,
-        DISCOVER_BUILD,
-    ),
-    (
-        "catalog/src/reads/discover/adapters/queue/mod.rs",
-        1,
-        DISCOVER_BUILD,
-    ),
-    ("catalog/src/reads/enrichment/mod.rs", 1, FAN_OUT),
+    ("catalog/src/reads/discover/content.rs", 1, DISCOVER_BUILD),
+    ("catalog/src/reads/discover/home/mod.rs", 1, DISCOVER_BUILD),
+    ("catalog/src/reads/discover/page/mod.rs", 2, DISCOVER_BUILD),
+    ("catalog/src/reads/discover/queue/mod.rs", 1, DISCOVER_BUILD),
     ("catalog/src/reads/library/file_lyrics.rs", 1, REQUEST),
     ("catalog/src/reads/library/perf_tests.rs", 1, BENCHMARKS),
     ("catalog/src/reads/library/tags.rs", 1, REQUEST),
@@ -558,21 +538,12 @@ const SPAWN_SITES: &[(&str, usize, &str)] = &[
     ("compat/src/adapters/subsonic_store.rs", 1, REQUEST),
     ("kernel/src/runtime_config/store.rs", 4, AWAITED),
     ("kernel/src/schema/template.rs", 1, TEST_TEMPLATE),
-    ("library/src/adapters.rs", 1, LOOP_STEP),
-    ("library/src/http/corrections.rs", 1, REQUEST),
-    ("library/src/http/handlers.rs", 5, REQUEST),
-    ("library/src/http/management.rs", 1, REQUEST),
-    ("library/src/http/management_tools.rs", 1, REQUEST),
-    ("library/src/http/mutations.rs", 1, REQUEST),
-    ("library/src/http/operations.rs", 1, REQUEST),
-    ("library/src/http/reconcile.rs", 1, REQUEST),
-    ("library/src/http/recycle_bin.rs", 3, REQUEST),
-    ("library/src/http/repairs.rs", 1, REQUEST),
-    ("library/src/http/reviews.rs", 2, REQUEST),
-    ("library/src/http/scan.rs", 1, REQUEST),
+    ("library/src/contrib/live.rs", 1, LOOP_STEP),
+    ("library/src/http/mod.rs", 1, REQUEST),
     ("library/src/identify/sources.rs", 2, LOOP_STEP),
     ("library/src/identify/stores.rs", 2, LOOP_STEP),
-    ("library/src/loops.rs", 3, LOOP_STEP),
+    ("library/src/loops.rs", 4, LOOP_STEP),
+    ("library/src/manage.rs", 1, LOOP_STEP),
     ("library/src/management/mod.rs", 2, LOOP_STEP),
     ("library/src/mutations.rs", 1, REQUEST),
     ("library/src/operations/mod.rs", 2, LOOP_STEP),
@@ -582,7 +553,7 @@ const SPAWN_SITES: &[(&str, usize, &str)] = &[
     ("library/src/scan/coordinator.rs", 1, LOOP_STEP),
     ("library/src/scan/pool.rs", 1, LOOP_STEP),
     ("library/src/scan/walk.rs", 3, SCAN_WALK),
-    ("library/src/wiring.rs", 2, LOOP_STEP),
+    ("library/src/service.rs", 1, LOOP_STEP),
     ("media/src/stream/download.rs", 2, REQUEST),
     ("media/src/stream/local_files.rs", 1, REQUEST),
     ("media/src/stream/plugin_url.rs", 2, REQUEST),
