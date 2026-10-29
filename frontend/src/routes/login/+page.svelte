@@ -11,6 +11,7 @@
 		createOidcAuthorizeMutation
 	} from '$lib/queries/auth/AuthMutations.svelte';
 	import { withBasePath } from '$lib/utils/basePath';
+	import { takeSignInReturn } from '$lib/utils/signInReturn';
 	import { outsideLink } from '$lib/components/outsideLink';
 	import { createPlexStartMutation } from '$lib/queries/plex/PlexAuthMutations.svelte';
 	import { pollPlexFlow } from '$lib/queries/plex/PlexFlowApi';
@@ -85,7 +86,7 @@
 
 	function storeSession(data: { user: SessionUserLike }) {
 		authStore.setUser(toAuthUser(data.user));
-		goto(withBasePath('/'));
+		goto(withBasePath(takeSignInReturn()));
 	}
 
 	async function handleLocalLogin() {

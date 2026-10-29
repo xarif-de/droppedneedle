@@ -1,4 +1,7 @@
-import { v3 } from '$lib/api/v3/endpoint';
+import { v3, type V3QueryOf } from '$lib/api/v3/endpoint';
+
+/** What an app asks for at /connect, as its query. */
+export type AppConnectQuery = V3QueryOf<'/api/v3/auth/app-connect/request'>;
 
 /** v3 auth endpoints, built through the typed registry. Login/setup happen
  * before a session exists, so those go through `api.global`, whose requests
@@ -19,6 +22,10 @@ export const AUTH_ENDPOINTS = {
 	oidcCallback: v3('/api/v3/auth/oidc/callback'),
 	oidcExchange: v3('/api/v3/auth/oidc/exchange'),
 	passwordRecoveryReset: v3('/api/v3/auth/password-recovery/reset'),
+	// App connect runs signed in: the request read and the allow step use the
+	// navigation-scoped `api` client.
+	appConnectRequest: (query: AppConnectQuery) => v3('/api/v3/auth/app-connect/request', { query }),
+	appConnectAuthorize: v3('/api/v3/auth/app-connect/authorize'),
 	adminUsers: (limit: number, offset: number) =>
 		v3('/api/v3/admin/users', { query: { limit, offset } }),
 	adminCreateUser: v3('/api/v3/admin/users'),
