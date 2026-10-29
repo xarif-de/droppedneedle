@@ -8,3 +8,4 @@ metabrainz-shared-budget base=bd28ac7ac9dfd416ab1d985a5de96953a99d335d pr=local
 login-redirects-to-sso base=bd28ac7ac9dfd416ab1d985a5de96953a99d335d pr=local
 no-404-for-missing-art-and-unserved-subsonic base=bd28ac7ac9dfd416ab1d985a5de96953a99d335d pr=no-404-for-missing-art-and-unserved-subsonic pr-after=2026-11-05
 daily-mixes-get-their-own-budget base=bd28ac7ac9dfd416ab1d985a5de96953a99d335d pr=daily-mixes-get-their-own-budget pr-after=2026-11-05
+app-connect base=bd28ac7ac9dfd416ab1d985a5de96953a99d335d pr=app-connect pr-after=2026-11-05
