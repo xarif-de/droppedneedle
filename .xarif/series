@@ -1,0 +1,10 @@
+# Patch topics in stacking order: <topic> base=<upstream sha> pr=<user-fork branch>|local [pr-after=YYYY-MM-DD] [guard=<table>.<column>,…]
+# Each topic is the ref refs/xarif/patch/<topic> (.xarif/pr.sh get/save); fork-sync rebases them onto the target in this order.
+# pr=local: our own policy (rates, the shared MetaBrainz budget, SSO-only login, the User-Agent id slot of musicbrainz-user-agent-form), never sent upstream.
+# pr-after: meant for upstream, held back until that day — measured in production first, and upstream may solve it meanwhile.
+musicbrainz-user-agent-form base=bd28ac7ac9dfd416ab1d985a5de96953a99d335d pr=local
+metabrainz-rates base=bd28ac7ac9dfd416ab1d985a5de96953a99d335d pr=local
+metabrainz-shared-budget base=bd28ac7ac9dfd416ab1d985a5de96953a99d335d pr=local
+login-redirects-to-sso base=bd28ac7ac9dfd416ab1d985a5de96953a99d335d pr=local
+no-404-for-missing-art-and-unserved-subsonic base=bd28ac7ac9dfd416ab1d985a5de96953a99d335d pr=no-404-for-missing-art-and-unserved-subsonic pr-after=2026-11-05
+daily-mixes-get-their-own-budget base=bd28ac7ac9dfd416ab1d985a5de96953a99d335d pr=daily-mixes-get-their-own-budget pr-after=2026-11-05
