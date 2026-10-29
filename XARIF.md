@@ -6,8 +6,10 @@ This is a modified version of [DroppedNeedle](https://github.com/DroppedNeedle/D
 [`.xarif/series`](.xarif/series); each one is the ref `refs/xarif/patch/<topic>`.
 
 The fork exists for changes that the upstream project has not taken yet. Each change
-that is not our own policy (`pr=local`) is also offered upstream as a pull request. Once
-upstream ships it, the fork drops it again.
+that is not our own policy (`pr=local`) is also offered upstream as a pull request — one
+marked `pr-after=<day>` not before that day: it runs here first, and upstream may solve it
+meanwhile (`.xarif/pr.sh list` shows held and due ones). Once upstream ships a change, the
+fork drops it again.
 
 | Where | What |
 |---|---|

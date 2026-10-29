@@ -6,12 +6,14 @@
 # upstream's own .github/workflows on our runner. Locally it is the branch patch/<topic>.
 # First run from a checkout of the default branch: the script copies itself to
 # <git dir>/xarif-pr.sh, which keeps working while a topic (without .xarif/) is checked out.
-#   pr.sh list           the topics on Forgejo
+#   pr.sh list           the topics on Forgejo, each with its series status (local, PR, held back
+#                        by pr-after=YYYY-MM-DD, or due)
 #   pr.sh get <topic>    check out the topic as the local branch patch/<topic>
 #   pr.sh save <topic>   store the local branch patch/<topic> as the topic (refuses to drop commits
 #                        stored since your get; a rebase needs FORCE=1)
 #   pr.sh pull <topic>   take maintainer fixups from the PR head into the topic (fast-forward only)
-#   pr.sh push <topic>   publish the topic as the PR head (refuses to drop commits the PR head has)
+#   pr.sh push <topic>   publish the topic as the PR head (refuses to drop commits the PR head has;
+#                        before the day of its pr-after=, EARLY=1 overrides the hold)
 # .xarif/pr.env (KEY=value lines): FORGEJO (fork clone URL), USER_FORK (the GitHub fork the PRs come
 # from: "allow edits from maintainers" needs a user-owned fork), UPSTREAM (owner/repo),
 # UPSTREAM_BASE (the upstream PR base, default main). BRANCH (default xarif) may come from the env.
@@ -25,7 +27,25 @@ FORGEJO=${FORGEJO:-$(val FORGEJO)}; USER_FORK=${USER_FORK:-$(val USER_FORK)}
 UPSTREAM=${UPSTREAM:-$(val UPSTREAM)}; UPSTREAM_BASE=${UPSTREAM_BASE:-$(val UPSTREAM_BASE)}; UPSTREAM_BASE=${UPSTREAM_BASE:-main}
 [ -n "$FORGEJO" ] || { echo "no FORGEJO: .xarif/pr.env missing on origin/$BRANCH (run 'git fetch origin' once)" >&2; exit 2; }
 cmd=${1:?list|get|save|pull|push}
-if [ "$cmd" = list ]; then git ls-remote "$FORGEJO" 'refs/xarif/patch/*' | sed 's#refs/xarif/patch/##'; exit 0; fi
+series() { # the series as it is NOW (not a stale local remote-tracking ref)
+  git fetch -q "$FORGEJO" "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"
+  git show "origin/$BRANCH:.xarif/series"
+}
+field() { sed -n "s/.* $1=\([^ ]*\).*/\1/p" <<<" $2"; } # field <key> <series line>
+today=$(date -u +%F)
+if [ "$cmd" = list ]; then
+  s=$(series)
+  git ls-remote "$FORGEJO" 'refs/xarif/patch/*' | sed 's#refs/xarif/patch/##' | while read -r sha t; do
+    line=$(awk -v t="$t" '$1==t' <<<"$s"); pr=$(field pr "$line"); after=$(field pr-after "$line")
+    if [ -z "$line" ]; then st="not in the series"
+    elif [ "$pr" = local ]; then st="local (no upstream PR)"
+    elif [ -z "$after" ]; then st="PR $pr"
+    elif [[ $today < $after ]]; then st="PR $pr held back until $after"
+    else st="PR $pr due since $after: open it, then drop pr-after from the series"; fi
+    printf '%s %s  %s\n' "$sha" "$t" "$st"
+  done
+  exit 0
+fi
 topic=${2:?topic}
 [[ $topic =~ ^[a-z0-9][a-z0-9-]*$ ]] || { echo "bad topic name $topic" >&2; exit 2; }
 ours=refs/xarif-seen/patch/$topic # private: a plain `git fetch origin` (and its prune) never touches it
@@ -54,12 +74,13 @@ case "$cmd" in
   pull|push) ;;
   *) echo "usage: $self list|get|save|pull|push <topic>" >&2; exit 2 ;;
 esac
-# the series as it is NOW (not a stale local remote-tracking ref)
-git fetch -q "$FORGEJO" "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"
-line=$(git show "origin/$BRANCH:.xarif/series" | awk -v t="$topic" '$1==t')
+line=$(series | awk -v t="$topic" '$1==t')
 [ -n "$line" ] || { echo "topic $topic is not in the series" >&2; exit 1; }
-pr=$(sed -n 's/.* pr=\([^ ]*\).*/\1/p' <<<"$line")
+pr=$(field pr "$line"); after=$(field pr-after "$line")
 [ "$pr" != local ] || { echo "topic $topic is local (no upstream PR)" >&2; exit 1; }
+if [ "$cmd" = push ] && [ -n "$after" ] && [[ $today < $after ]] && [ -z "${EARLY:-}" ]; then
+  echo "topic $topic is held back until $after (pr-after in the series): EARLY=1 $self push $topic publishes it now" >&2; exit 1
+fi
 fetch_topic
 git rev-parse -q --verify "$ours" >/dev/null || { echo "no topic $topic on Forgejo" >&2; exit 1; }
 # the PR head, if the branch exists yet (exit 2 = no such branch; anything else is a real error)
