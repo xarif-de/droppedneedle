@@ -1,0 +1,43 @@
+# fork-sync for a maintained fork (docs/fork.md): copy this file VERBATIM to
+# .forgejo/workflows/fork-sync.yml of the fork. It is inline on purpose: Forgejo
+# disables a schedule for good when its workflow fails to expand at schedule
+# time (services/actions/schedule_tasks.go), and a reusable `uses:` is
+# expanded then. The install block is identical to dagger-ci.yml's
+# (tests/fork/workflows-tests.sh); refresh the copy when it changes.
+name: fork-sync
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      TARGET: { description: 'upstream tag (track release) or 40-hex commit of the upstream branch (track branch) instead of the automatic choice', required: false, default: '' }
+      DRY_RUN: { description: '1 = compose and report only', required: false, default: '0' }
+jobs:
+  sync:
+    runs-on: docker
+    container:
+      image: ghcr.io/catthehacker/ubuntu:act-22.04@sha256:f5f5c29208c4fd541704fe7b8df33d3bf620ce4ac46f36853b7abeb0159705c4
+    env:
+      DAGGER_NO_NAG: '1'
+      FORK_BOT_TOKEN: ${{ secrets.FORK_BOT_TOKEN }}
+      TARGET: ${{ github.event.inputs.TARGET }}
+      DRY_RUN: ${{ github.event.inputs.DRY_RUN }}
+    steps:
+      - name: dagger call fork-sync
+        run: |
+          set -eu
+          # >>> dagger-install (identical in every workflow that calls dagger; tests/fork/workflows-tests.sh)
+          # CLI version = dagger.json engineVersion: one pin, Renovate-managed.
+          # Three tries: one dropped download (curl 56 from dl.dagger.io, 2026-10-24) failed
+          # the run before any check, and a red Renovate PR waits 6 h for its retry.
+          for i in 1 2 3; do
+            v=$(curl -fsS "$GITHUB_SERVER_URL/base/dagger-modules/raw/branch/main/dagger.json" |
+              sed -n 's/.*"engineVersion": *"v\{0,1\}\([0-9][0-9.]*\)".*/\1/p') && test -n "$v" &&
+              curl -fsSL https://dl.dagger.io/dagger/install.sh | DAGGER_VERSION="$v" BIN_DIR=/usr/local/bin sh && break
+            [ "$i" -lt 3 ] || exit 1
+            sleep $((i * 10))
+          done
+          # <<< dagger-install
+          dagger call --progress=plain -m "${GITHUB_SERVER_URL#https://}/base/dagger-modules.git@main" fork-sync \
+            --server="$GITHUB_SERVER_URL" --repository="$GITHUB_REPOSITORY" --token=env://FORK_BOT_TOKEN \
+            --target="${TARGET:-}" --dry-run="$([ "${DRY_RUN:-0}" = 1 ] && echo true || echo false)"
