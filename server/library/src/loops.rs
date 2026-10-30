@@ -20,14 +20,12 @@ use super::publish::paths::{Root, Sandbox};
 use super::publish::snapshots::{self, BlobStore};
 use super::scan::ScanStoreError;
 use super::scan::coordinator::{ResolverSource as _, ScanRequestError};
-use super::scan::models::EffectivePolicy;
+use super::scan::models::{Disposition, EffectivePolicy};
 use super::scan::supervisor::SupervisorInputs;
 use super::scan::supervisor::{
     request_dirty_scopes, startup_recovery, supervise_once, supervise_once_with_shutdown,
 };
-use super::scan::watcher::{
-    WatcherAction, WatcherSettings, WatcherState, clear_pending, watcher_request,
-};
+use super::scan::watcher::{Asked, WatcherAction, WatcherSettings, WatcherState, ask_for_changes};
 use super::scans::Scans;
 use super::service::Identification;
 use super::wiring::{LibraryCore, LibraryServices};
@@ -189,11 +187,11 @@ impl Scans {
             .await
     }
 
-    /// One watcher tick that stops its tree snapshot once `stop` is
-    /// cancelled; an interrupted root keeps its previous baseline.
+    /// One watcher tick that stops its tree walk once `stop` is
+    /// cancelled; an interrupted root keeps what is on record.
     pub async fn watcher_tick_with_shutdown(&self, stop: &CancellationToken) -> WatcherAction {
         // The state swaps out and back so no mutex guard crosses the
-        // snapshot await.
+        // walk and store awaits.
         let mut state = {
             let mut guard = self
                 .watcher_state
@@ -209,25 +207,34 @@ impl Scans {
             &registry,
             &(self.core.root_dirs)(),
             &self.pool,
+            &self.scan_store,
             self.core.clock.now_secs(),
             stop,
         )
         .await;
         if matches!(action, WatcherAction::Due) {
             let rules = super::settings::inclusion_rules(&registry);
-            let asked = match watcher_request(&registry, &rules, state.changed_roots()) {
-                None => {
-                    tracing::debug!("filesystem watcher dropping pending scan: no scopes");
-                    true
-                }
-                Some(request) => match self.coordinator.request_run(&request) {
+            ask_for_changes(
+                &mut state,
+                &registry,
+                &rules,
+                &self.pool,
+                &self.scan_store,
+                |request| match self.coordinator.request_run(request) {
+                    Ok(result) if result.disposition == Disposition::Conflict => {
+                        tracing::info!(
+                            "folder watcher scan waits: another kind of scan is in the way"
+                        );
+                        Asked::Refused
+                    }
                     Ok(result) => {
                         tracing::info!(
                             disposition = ?result.disposition,
-                            "filesystem watcher requested incremental scan"
+                            scopes = request.scopes.len(),
+                            "folder watcher requested incremental scan"
                         );
                         self.core.wakeups.notify("scan");
-                        true
+                        Asked::Run(result.run_id)
                     }
                     // A busy database: the changes stay pending and the
                     // next poll asks again.
@@ -237,17 +244,15 @@ impl Scans {
                         ),
                     ) => {
                         tracing::warn!(%error, "watcher scan request waits: the database is busy");
-                        false
+                        Asked::Later
                     }
                     Err(error) => {
                         tracing::warn!(%error, "watcher scan request failed");
-                        true
+                        Asked::Refused
                     }
                 },
-            };
-            if asked {
-                clear_pending(&mut state);
-            }
+            )
+            .await;
         }
         {
             let mut guard = self
@@ -496,10 +501,10 @@ impl Publishing {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let registry = self.core.live_registry();
         // Reconcile-on-reopen (and the retry of held bundles) can resume
-        // renames.
+        // renames. Held bundles wait while the library is switched off.
         let session = cell.session(&registry);
         let reopen = cell.needs_refresh(&session);
-        let retry = !reopen && cell.has_held()?;
+        let retry = !reopen && !super::manage::switched_off(&registry) && cell.has_held()?;
         cell.refresh_to(session, &self.core.root_dirs)?;
         if retry {
             cell.retry_held()?;
@@ -535,7 +540,7 @@ impl Publishing {
 
     /// One recycle-bin expiry pass, on the retention the download settings
     /// give now. Skipped while those or the library settings cannot be
-    /// read. The deletes wait for the publish lock, so no put-back or
+    /// read, and while the library is switched off. The deletes wait for the publish lock, so no put-back or
     /// removal is reading a copy while it goes. `go_on` is asked between
     /// rows. Blocking.
     pub fn recycle_expiry_tick(
@@ -545,6 +550,9 @@ impl Publishing {
         let Some(policy) = self.settings.download_policy.read() else {
             return Ok(ExpiryReport::default());
         };
+        if self.core.switched_off() {
+            return Ok(ExpiryReport::default());
+        }
         let pass = ExpiryPass {
             retention_days: policy.recycle_retention_days,
             now_ms: self.core.clock.now_ms(),
@@ -801,14 +809,10 @@ impl Scans {
                 || self.core.wakeups.revision("scan") != revision
                 || (polls.get() % 32 == 0 && !self.coordinator.current().is_empty())
         };
-        let artwork = self.scan_store.refresh_album_artwork(&give_way);
-        let lyrics = self.scan_store.refresh_track_lyrics(&give_way);
-        match (artwork, lyrics) {
-            (Ok(artwork), Ok(lyrics)) => artwork.complete && lyrics.complete,
-            (artwork, lyrics) => {
-                for error in [artwork.err(), lyrics.err()].into_iter().flatten() {
-                    tracing::warn!(%error, "library sweep could not read the catalog");
-                }
+        match self.scan_store.refresh_album_sweeps(&give_way) {
+            Ok((artwork, lyrics)) => artwork.complete && lyrics.complete,
+            Err(error) => {
+                tracing::warn!(%error, "library sweep could not read the catalog");
                 false
             }
         }
@@ -837,7 +841,7 @@ fn identify_tick(
     }
 }
 
-/// The filesystem watcher's turn: snapshot, batch, request on due, then
+/// The folder watcher's turn: walk, batch, request on due, then
 /// wait as long as the saved settings say.
 struct WatcherTick {
     scans: Scans,
@@ -847,7 +851,7 @@ struct WatcherTick {
 impl Tick for WatcherTick {
     async fn tick(&mut self, ctx: &TickCtx) -> TickResult {
         let (scans, handle, stop) = (self.scans.clone(), self.handle.clone(), ctx.token().clone());
-        // A snapshot of a large tree takes a while; the stop does not wait
+        // A walk of a large tree takes a while; the stop does not wait
         // for it.
         let action = tokio::task::spawn_blocking(move || {
             drive(

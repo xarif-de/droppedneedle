@@ -389,6 +389,7 @@ async fn album_pages_match_the_fixture() {
             artist_id: artist.map(str::to_owned),
             decade,
             format: format.map(str::to_owned),
+            favorites_of: None,
         };
     let filters: [(AlbumFilter, &[&str]); 7] = [
         (AlbumFilter::default(), &["al1", "al2", "al3", "al4", "al5"]),
@@ -538,7 +539,7 @@ async fn walk_artists(
     loop {
         let (page, led, contributors) = fixture
             .catalog
-            .artist_list(scope, q, sort, descending, limit, &after)
+            .artist_list(scope, q, None, sort, descending, limit, &after)
             .await
             .expect("lists");
         ids.extend(page.items.iter().map(|artist| artist.id.clone()));
@@ -620,6 +621,7 @@ async fn artist_pages_match_the_fixture() {
             .artist_list(
                 ArtistScope::All,
                 Some(q),
+                None,
                 ArtistSort::Name,
                 false,
                 50,
@@ -637,6 +639,7 @@ async fn artist_pages_match_the_fixture() {
         .catalog
         .artist_list(
             ArtistScope::All,
+            None,
             None,
             ArtistSort::Name,
             false,
@@ -925,6 +928,7 @@ async fn track_search_matches_the_fixture() {
         album_id: album.map(str::to_owned),
         artist_id: artist.map(str::to_owned),
         genre: genre.map(str::to_owned),
+        favorites_of: None,
     };
     for filter in [
         narrowed(Some("al1"), None, None),
@@ -1521,7 +1525,7 @@ async fn seed_small_marks(fixture: &Fixture) {
     ];
     let mut sql = String::from(
         "INSERT INTO auth_users (id, display_name, role, created_at) VALUES \
-         ('u1', 'One', 'user', 'now'), ('u3', 'Three', 'user', 'now'); \
+         ('u1', 'One', 'user', 0), ('u3', 'Three', 'user', 0); \
          INSERT INTO library_play_history (id, user_id, local_track_id, local_album_id, \
          track_name, artist_name, played_at) VALUES \
          ('v2-1', 'u3', 't8', 'al5', 'x', 'x', '2026-01-05 12:00:00'), \
@@ -2080,7 +2084,7 @@ async fn album_play_summary_follows_every_write() {
         )
     };
     let sql = "INSERT INTO auth_users (id, display_name, role, created_at) \
-               VALUES ('u4', 'Four', 'user', 'now');"
+               VALUES ('u4', 'Four', 'user', 0);"
         .to_owned()
         + &marked("u3", &one("t4"), true, 1_800_000_000_000)
         + &marked("u1", &album("al2"), false, 1_800_000_001_000)
@@ -2964,7 +2968,7 @@ async fn history_plans_read_the_listeners_plays_first() {
         if user > 0 {
             marks.push_str(", ");
         }
-        marks.push_str(&format!("('u{user}', 'U', 'user', 'now')"));
+        marks.push_str(&format!("('u{user}', 'U', 'user', 0)"));
     }
     marks.push_str(
         "; INSERT INTO library_user_play_marks (user_id, local_track_id, marked_played_at, \
@@ -3172,7 +3176,7 @@ async fn seed_100k_plays(fixture: &Fixture) {
 async fn seed_100k_marks(fixture: &Fixture) {
     let mut sql = String::from(
         "INSERT INTO auth_users (id, display_name, role, created_at) \
-         VALUES ('p-u1', 'P', 'user', 'now'); \
+         VALUES ('p-u1', 'P', 'user', 0); \
          INSERT INTO library_user_play_marks (user_id, local_track_id, marked_played_at, \
          marked_unplayed_at) VALUES ",
     );
@@ -3432,7 +3436,7 @@ async fn read_endpoint(catalog: &LocalCatalog, name: &str, deep: &(After, After,
         q: Some("zzz-no-such-thing-zzz".to_owned()),
         ..Default::default()
     };
-    let artists = |scope, sort| catalog.artist_list(scope, None, sort, true, 48, &first);
+    let artists = |scope, sort| catalog.artist_list(scope, None, None, sort, true, 48, &first);
     match name {
         "library_albums" | "local_albums" => {
             catalog
@@ -3448,7 +3452,15 @@ async fn read_endpoint(catalog: &LocalCatalog, name: &str, deep: &(After, After,
         }
         "library_artists" => {
             catalog
-                .artist_list(ArtistScope::All, None, ArtistSort::Name, false, 50, &first)
+                .artist_list(
+                    ArtistScope::All,
+                    None,
+                    None,
+                    ArtistSort::Name,
+                    false,
+                    50,
+                    &first,
+                )
                 .await
                 .expect("lists");
         }

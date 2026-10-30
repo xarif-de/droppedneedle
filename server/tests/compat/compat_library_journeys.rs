@@ -176,11 +176,30 @@ async fn finamp_browse_stream_favorite_playlist_progress() {
         .await;
     assert_eq!(entries["Items"][0]["Id"], json!(track_id));
 
+    // The reports name Finamp, and a progress report keeps it as the
+    // presence entry's source.
+    let finamp_value = format!("MediaBrowser Client=\"Finamp\", Token=\"{}\"", rig.secret);
+    let finamp = [("X-Emby-Authorization", finamp_value.as_str())];
     for endpoint in ["Playing", "Playing/Progress"] {
         let uri = format!("/jellyfin/Sessions/{endpoint}");
-        let body = json!({ "ItemId": track_id });
-        trace.call("POST", &uri, &auth, Some(body)).await;
+        let body = json!({ "ItemId": track_id, "PositionTicks": -10_000_000_i64 });
+        trace.call("POST", &uri, &finamp, Some(body)).await;
     }
+    let admin = rig.app.login_admin().await;
+    let (status, feed) = rig
+        .app
+        .call(
+            "GET",
+            "/api/v3/now-playing",
+            &[("authorization", admin.as_str())],
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{feed}");
+    assert_eq!(feed["sessions"].as_array().map(Vec::len), Some(1), "{feed}");
+    let entry = &feed["sessions"][0];
+    assert_eq!(entry["source"], json!("finamp"), "{feed}");
+    assert_eq!(entry["progress_ms"], json!(0), "{feed}");
     let stopped = json!({
         "ItemId": track_id,
         "PositionTicks": 1_700_000_000_i64,
@@ -498,8 +517,7 @@ async fn an_album_sends_the_accepted_ids_else_its_tags() {
     assert_eq!(identity_rows(&rig), before, "reading wrote an identity");
 
     rig.app
-        .db()
-        .execute_batch(&format!(
+        .seed(&format!(
             "INSERT INTO local_album_external_identities (local_album_id, provider, \
              release_group_mbid, release_mbid, decision_source, selected_at) \
              VALUES ('{album}', 'musicbrainz', '{GROUP}', '{RELEASE}', 'manual', 1) \
@@ -508,7 +526,7 @@ async fn an_album_sends_the_accepted_ids_else_its_tags() {
              release_mbid = excluded.release_mbid, decision_source = 'manual'; \
              DELETE FROM library_album_match_state WHERE local_album_id = '{album}';"
         ))
-        .expect("match accepted");
+        .await;
     let before = identity_rows(&rig);
     let (subsonic, jellyfin) = album_ids_sent(&rig, &album, &airbag).await;
     assert_eq!(subsonic, json!(RELEASE));
@@ -519,13 +537,12 @@ async fn an_album_sends_the_accepted_ids_else_its_tags() {
     assert_eq!(identity_rows(&rig), before, "reading wrote an identity");
 
     rig.app
-        .db()
-        .execute(
+        .seed_with(
             "UPDATE local_album_external_identities SET release_mbid = NULL \
              WHERE local_album_id = ?1",
             [album.as_str()],
         )
-        .expect("release unknown");
+        .await;
     let (subsonic, jellyfin) = album_ids_sent(&rig, &album, &airbag).await;
     assert_eq!(subsonic, json!(GROUP));
     assert_eq!(jellyfin, json!({"MusicBrainzReleaseGroup": GROUP}));
@@ -1877,14 +1894,13 @@ async fn covered_jellyfin(tag: &str) -> (CompatApp, CoveredIds) {
         .expect("the covered song's catalog ids");
     let mbid = "5b11f4ce-a62d-471e-81fc-a69a8278c7da";
     rig.app
-        .db()
-        .execute(
+        .seed_with(
             "INSERT OR REPLACE INTO local_artist_external_identities \
              (local_artist_id, provider, provider_artist_id, decision_source, selected_at) \
              VALUES (?1, 'musicbrainz', ?2, 'manual', 1000)",
             [artist.as_str(), mbid],
         )
-        .expect("artist identity seeds");
+        .await;
     plant_artist_picture(&rig, mbid).await;
 
     let token = rig.jellyfin_auth();
@@ -2303,9 +2319,9 @@ fn rows_of(rig: &CompatApp, sql: &str) -> String {
 /// album's id, and starring the old id stars it. Jellyfin, signed in, for
 /// both ids the album was handed out under: the item answers with the
 /// current id and lists the album's tracks, also as the first request of
-/// a new process; with no token it is a 401. The picture address never
-/// opens an old id: an empty 404 in the process that listed it and as the
-/// first request after a restart.
+/// a new process; with no token it is a 401. The picture address answers
+/// the keyed id as the album that holds it now, in the process that listed
+/// it and as the first request after a restart, and never the unkeyed one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn merged_albums_keep_their_ids_in_player_apps() {
     let mut rig = CompatApp::start("compat-merged-albums").await;
@@ -2371,15 +2387,17 @@ async fn merged_albums_keep_their_ids_in_player_apps() {
             .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "{id}");
     }
-    let (status, _, body) = picture(&rig, &keyed, None).await;
+    let (status, _, body) = picture(&rig, &unkeyed, None).await;
     assert_eq!((status, body.len()), (StatusCode::NOT_FOUND, 0));
     // The survivor has no picture in this library, and its miss names it.
-    let (status, _, body) = picture(&rig, &ok_computer_id, None).await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
-    assert_eq!(
-        serde_json::from_slice::<Value>(&body).expect("a JSON answer"),
-        json!("OK Computer does not have an image of type Primary")
-    );
+    for id in [&ok_computer_id, &keyed] {
+        let (status, _, body) = picture(&rig, id, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).expect("a JSON answer"),
+            json!("OK Computer does not have an image of type Primary")
+        );
+    }
 
     merge_albums(&rig, &airbag, &achtung).await;
     let album = subsonic_ok(&rig, &format!("getAlbum?id={old}")).await;
@@ -2398,7 +2416,11 @@ async fn merged_albums_keep_their_ids_in_player_apps() {
     rig.app = rig.app.restart().await;
     rig.jellyfin_ids_caught_up().await;
     let (status, _, body) = picture(&rig, &keyed, None).await;
-    assert_eq!((status, body.len()), (StatusCode::NOT_FOUND, 0));
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).expect("a JSON answer"),
+        json!("Achtung Baby does not have an image of type Primary")
+    );
     rig.stop().await;
 }
 
@@ -2433,13 +2455,12 @@ async fn merged_artists_and_album_aliases_open_in_player_apps() {
 
     let legacy = "8c2a6c8e-61a3-4a31-9a0f-3a4c5e6b7d80";
     rig.app
-        .db()
-        .execute(
+        .seed_with(
             "INSERT INTO local_album_aliases (alias, local_album_id, kind, created_at) \
              VALUES (?1, ?2, 'legacy_release_group', 1)",
             [legacy, bokou.as_str()],
         )
-        .expect("legacy alias seeds");
+        .await;
     let album = subsonic_ok(&rig, &format!("getAlbum?id=al-{legacy}")).await;
     assert_eq!(album["album"]["id"], json!(format!("al-{bokou}")));
     let token = rig.jellyfin_auth();
@@ -2498,14 +2519,13 @@ async fn an_artist_merged_by_its_musicbrainz_id_opens_in_player_apps() {
     let survivor_id = jellyfin_artist_id(&rig, &teardrop).await;
 
     rig.app
-        .db()
-        .execute(
+        .seed_with(
             "INSERT INTO local_artist_external_identities (local_artist_id, provider, \
              provider_artist_id, decision_source, selected_at) \
              VALUES (?1, 'musicbrainz', ?2, 'manual', 1)",
             [linked.as_str(), ARTIST],
         )
-        .expect("link seeded");
+        .await;
     rig.app.scan_library().await;
 
     let artist = subsonic_ok(&rig, &format!("getArtist?id=ar-{merged}")).await;
@@ -2553,8 +2573,7 @@ async fn a_continued_track_opens_by_its_old_id() {
     assert_eq!(copy_album, album);
     let release = "33333333-3333-4333-8333-333333333333";
     rig.app
-        .db()
-        .execute_batch(&format!(
+        .seed(&format!(
             "INSERT INTO local_album_external_identities (local_album_id, provider, \
              release_group_mbid, release_mbid, decision_source, selected_at) \
              VALUES ('{album}', 'musicbrainz', 'rg-3', '{release}', 'manual', 1) \
@@ -2569,7 +2588,7 @@ async fn a_continued_track_opens_by_its_old_id() {
              release_mbid = excluded.release_mbid, \
              release_track_mbid = excluded.release_track_mbid;"
         ))
-        .expect("both copies mapped");
+        .await;
     let bytes = rig.file("one");
     std::fs::remove_file(music.join("U2/Achtung Baby/03 One.mp3")).expect("original deleted");
     rig.app.scan_library().await;
@@ -2733,7 +2752,9 @@ async fn ratings(rig: &CompatApp, call: &str, key: &str, auth: &str) -> (Value, 
 /// their own, and an average that counts both. It survives a restart, 0
 /// clears it, and a merged album's ratings move to the album it went
 /// into, where a user who rated both keeps the survivor's. A rating on an
-/// unknown id is 70, and nothing is stored without sign-in.
+/// unknown id is 70, and nothing is stored without sign-in or with a
+/// wrong password (40). A rated album that is gone leaves the highest
+/// list's pages full.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn subsonic_ratings_are_per_user_and_follow_a_merge() {
     let mut rig = CompatApp::start("compat-ratings").await;
@@ -2811,6 +2832,19 @@ async fn subsonic_ratings_are_per_user_and_follow_a_merge() {
         anonymous["subsonic-response"]["error"]["code"], 10,
         "{anonymous}"
     );
+    let wrong = theirs.replacen("&p=", "&p=wrong", 1);
+    let refused = subsonic(&rig, &rate(&kept, 1), &wrong).await;
+    assert_eq!(refused["error"]["code"], 40, "{refused}");
+    let stored: i64 = rig
+        .app
+        .db()
+        .query_row(
+            "SELECT COUNT(*) FROM library_user_ratings WHERE item_id = ?1",
+            [&kept[3..]],
+            |row| row.get(0),
+        )
+        .expect("ratings read");
+    assert_eq!(stored, 0, "no rating without sign-in");
 
     ok(&subsonic(&rig, &rate(&merged, 2), &mine).await);
     ok(&subsonic(&rig, &rate(&merged, 3), &theirs).await);
@@ -2853,6 +2887,20 @@ async fn subsonic_ratings_are_per_user_and_follow_a_merge() {
     );
     let highest = subsonic(&rig, "getAlbumList2?type=highest", &mine).await;
     assert_eq!(highest["albumList2"]["album"][0]["id"], json!(kept));
+    rig.app
+        .seed_with(
+            "INSERT INTO library_user_ratings (user_id, item_kind, item_id, rating, rated_at) \
+             SELECT user_id, 'album', 'album-gone', 5, rated_at FROM library_user_ratings \
+             WHERE item_id = ?1 AND rating = 2",
+            [local(&kept)],
+        )
+        .await;
+    let page = subsonic(&rig, "getAlbumList2?type=highest&size=1", &mine).await;
+    assert_eq!(
+        page["albumList2"]["album"],
+        json!([highest["albumList2"]["album"][0]]),
+        "a gone album leaves the page full"
+    );
     let left: i64 = rig
         .app
         .db()
@@ -3002,11 +3050,87 @@ async fn web_and_subsonic_apps_share_one_rating() {
     rig.stop().await;
 }
 
+/// One web favourite call as `session`: its status and answer.
+async fn favorite_on_web(
+    rig: &CompatApp,
+    session: &str,
+    kind: &str,
+    id: &str,
+    favorited: bool,
+) -> (StatusCode, Value) {
+    rig.app
+        .call(
+            "PUT",
+            &format!("/api/v3/favorites/{kind}/{id}"),
+            &[("authorization", session)],
+            Some(json!({ "favorited": favorited })),
+        )
+        .await
+}
+
+/// A heart set on the web is the star a Subsonic app shows, and the web's
+/// favourites list holds it. An unknown id is a 404 that stores nothing,
+/// and a merged album's old id acts on the album it went into.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn web_and_subsonic_apps_share_one_favorite() {
+    let rig = CompatApp::start("compat-web-favorites").await;
+    let (_, album, _) = catalog_ids(&rig, "Radiohead/OK Computer/01 Airbag.flac");
+    let (teardrop, mezzanine, _) = catalog_ids(&rig, "Massive Attack/Mezzanine/04 Teardrop.m4a");
+    let mine = rig.subsonic_auth("web-favorites");
+    let web = player_web_session(&rig).await;
+    let starred =
+        || async { subsonic(&rig, "getStarred2", &mine).await["starred2"]["album"].clone() };
+
+    let (status, body) = favorite_on_web(&rig, &web, "album", &album, true).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body,
+        json!({"kind": "album", "item_id": album, "favorited": true})
+    );
+    assert_eq!(starred().await[0]["id"], json!(format!("al-{album}")));
+    let (status, listed) = rig
+        .app
+        .call(
+            "GET",
+            "/api/v3/library/albums?favorites=true",
+            &[("authorization", web.as_str())],
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    assert_eq!(listed["total"], 1, "{listed}");
+    assert_eq!(listed["items"][0]["id"], json!(album), "{listed}");
+    assert_eq!(listed["items"][0]["favorite"], true, "{listed}");
+
+    for kind in ["album", "artist", "track"] {
+        let (status, body) = favorite_on_web(&rig, &web, kind, "no-such-item", true).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{kind}: {body}");
+    }
+    let stored: i64 = rig
+        .app
+        .db()
+        .query_row(
+            "SELECT COUNT(*) FROM library_user_favorites WHERE item_id = 'no-such-item'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("favourites read");
+    assert_eq!(stored, 0);
+
+    merge_albums(&rig, &teardrop, &album).await;
+    let (status, body) = favorite_on_web(&rig, &web, "album", &mezzanine, false).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["item_id"], json!(album));
+    let left = starred().await;
+    assert!(left.as_array().is_none_or(Vec::is_empty), "{left}");
+    rig.stop().await;
+}
+
 /// LRCLIB as the lyrics lookup sees it, counting every lookup: synced
 /// lyrics for "Paranoid Android", nothing for anything else.
 async fn counted_lyrics_server() -> (
     String,
-    tokio::task::JoinHandle<()>,
+    droppedneedle_testkit::usenet::ServerGuard,
     std::sync::Arc<std::sync::atomic::AtomicUsize>,
 ) {
     use axum::extract::Query;
@@ -3063,13 +3187,11 @@ async fn lyrics_come_from_the_file_first() {
     .await;
     // The lookup skips a track shorter than a second, as every fixture is.
     rig.app
-        .db()
-        .execute(
+        .seed(
             "UPDATE local_tracks SET duration_seconds = 200 \
              WHERE relative_path = 'Radiohead/OK Computer/02 Paranoid Android.flac'",
-            [],
         )
-        .expect("duration seeds");
+        .await;
     rig.set_lyrics_lookup(true).await;
     rig.wait_for_lyrics_mark("Airbag").await;
 
@@ -3124,6 +3246,7 @@ async fn lyrics_come_from_the_file_first() {
         "Lyrics": [
             {"Text": "Paper lanterns over the quiet field", "Start": 0},
             {"Text": "Velvet engines hum a borrowed tune", "Start": 4_000_000},
+            {"Text": "", "Start": 8_000_000},
             {"Text": "Every window counts the passing moon", "Start": 12_000_000},
         ],
     });
@@ -3368,12 +3491,8 @@ async fn jellyfin_played_marks_are_the_callers_and_leave_plays_alone() {
     // A stop after the mark counts again. A mark and a play both read the
     // clock, a play in whole seconds, so the mark moves back a minute.
     rig.app
-        .db()
-        .execute(
-            "UPDATE library_user_play_marks SET marked_unplayed_at = marked_unplayed_at - 60000",
-            [],
-        )
-        .expect("the mark moves back");
+        .seed("UPDATE library_user_play_marks SET marked_unplayed_at = marked_unplayed_at - 60000")
+        .await;
     let (status, _) = rig
         .app
         .call(

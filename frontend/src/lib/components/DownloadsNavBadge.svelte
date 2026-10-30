@@ -1,11 +1,9 @@
 <script lang="ts">
 	import { getDownloadActivitySummaryQuery } from '$lib/queries/downloads/DownloadQueries.svelte';
-	import { DownloadQueryKeyFactory } from '$lib/queries/downloads/DownloadQueryKeyFactory';
-	import { LibraryQueryKeyFactory } from '$lib/queries/library/LibraryQueryKeyFactory';
-	import { invalidateQueriesWithPersister } from '$lib/queries/QueryClient';
 	import {
 		createDownloadActivityObservation,
-		reconcileDownloadActivity
+		reconcileDownloadActivity,
+		refreshAfterDownloadActivity
 	} from '$lib/queries/downloads/downloadActivitySync';
 	import { authStore } from '$lib/stores/authStore.svelte';
 	import { libraryStore } from '$lib/stores/library';
@@ -20,18 +18,7 @@
 		const actions = reconcileDownloadActivity(observed, userId, query.data);
 		for (const mbid of actions.landedMbids) libraryStore.addMbid(mbid);
 
-		if (actions.refreshDetails && userId) {
-			void invalidateQueriesWithPersister({
-				queryKey: DownloadQueryKeyFactory.tasks(userId),
-				exact: true
-			});
-			void invalidateQueriesWithPersister({
-				queryKey: DownloadQueryKeyFactory.heldPrefix(userId)
-			});
-			if (actions.invalidateLibrary) {
-				void invalidateQueriesWithPersister({ queryKey: LibraryQueryKeyFactory.all });
-			}
-		}
+		if (actions.refreshDetails && userId) void refreshAfterDownloadActivity(userId, actions);
 	});
 </script>
 

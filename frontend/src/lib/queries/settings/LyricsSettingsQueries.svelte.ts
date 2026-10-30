@@ -1,39 +1,26 @@
-import { createMutation, createQuery } from '@tanstack/svelte-query';
+import { createQuery } from '@tanstack/svelte-query';
 import { api } from '$lib/api/client';
 import type { components } from '$lib/api/v3/openapi';
-import {
-	invalidateQueriesWithPersister,
-	setQueryDataWithPersister
-} from '$lib/queries/QueryClient';
-import { LyricsQueryKeyFactory } from '$lib/queries/lyrics/LyricsQueryKeyFactory';
+import { setQueryDataWithPersister } from '$lib/queries/QueryClient';
 import { authStore } from '$lib/stores/authStore.svelte';
-import { userIdSegment } from '../userKeySegment';
+import { SettingsQueryKeyFactory } from './SettingsQueryKeyFactory';
 import { SETTINGS_ENDPOINTS } from './endpoints';
+import { createAppMutation, lyricsChanged } from '$lib/queries/effects';
 
 export type LyricsSettings = components['schemas']['LyricsSettings'];
-
-export const LyricsSettingsQueryKeyFactory = {
-	prefix: ['settings', 'lyrics'] as const,
-	saved: (userId: string | null | undefined) =>
-		[...LyricsSettingsQueryKeyFactory.prefix, userIdSegment(userId)] as const
-};
 
 export const getLyricsSettingsQuery = () =>
 	createQuery(() => ({
 		enabled: authStore.isAdmin,
-		queryKey: LyricsSettingsQueryKeyFactory.saved(authStore.user?.id),
-		queryFn: ({ signal }) => api.global.v3.GET(SETTINGS_ENDPOINTS.lyrics(), { signal })
+		queryKey: SettingsQueryKeyFactory.lyrics(authStore.user?.id),
+		queryFn: ({ signal }) => api.v3.GET(SETTINGS_ENDPOINTS.lyrics(), { signal })
 	}));
 
 /** Saves the switch, then drops cached lyrics so an open panel asks again. */
 export const createSaveLyricsSettingsMutation = () =>
-	createMutation(() => ({
-		mutationFn: (body: LyricsSettings) => api.global.v3.PUT(SETTINGS_ENDPOINTS.lyrics(), body),
-		onSuccess: async (saved: LyricsSettings) => {
-			await setQueryDataWithPersister(
-				LyricsSettingsQueryKeyFactory.saved(authStore.user?.id),
-				saved
-			);
-			await invalidateQueriesWithPersister({ queryKey: LyricsQueryKeyFactory.prefix });
-		}
+	createAppMutation(() => ({
+		mutationFn: (body: LyricsSettings) => api.v3.PUT(SETTINGS_ENDPOINTS.lyrics(), body),
+		onSuccess: (saved: LyricsSettings) =>
+			setQueryDataWithPersister(SettingsQueryKeyFactory.lyrics(authStore.user?.id), saved),
+		effects: () => [lyricsChanged()]
 	}));

@@ -1,5 +1,3 @@
-import { browser } from '$app/environment';
-import { get } from 'svelte/store';
 import { untrack } from 'svelte';
 import { SvelteMap, SvelteSet } from 'svelte/reactivity';
 import { useQueryClient } from '@tanstack/svelte-query';
@@ -17,8 +15,8 @@ import type {
 } from '$lib/types';
 import type { RemoteTrack } from '$lib/queries/remotes/types';
 import { libraryStore } from '$lib/stores/library';
-import { integrationStore } from '$lib/stores/integration';
-import { ApiError } from '$lib/api/client';
+import { useIntegrationStatus } from '$lib/queries/HomeIntegrationStatusQuery.svelte';
+import { ApiError } from '$lib/api/errors';
 import { compareDiscTrack, getDiscTrackKey } from '$lib/player/queueHelpers';
 import type { QueueItem } from '$lib/player/types';
 import { launchRemotePlayback } from '$lib/player/launchRemotePlayback';
@@ -61,15 +59,10 @@ import {
 } from '$lib/queries/catalog/AlbumQueries.svelte';
 import { AlbumQueryKeyFactory } from '$lib/queries/catalog/AlbumQueryKeyFactory';
 import { refreshAlbum } from '$lib/queries/catalog/AlbumMutations.svelte';
-import {
-	AlbumMatchKeyFactory,
-	getLocalAlbumMatchQuery,
-	getRemoteAlbumMatchQuery
-} from '$lib/queries/albumMatch';
-import {
-	invalidateQueriesWithPersister,
-	setQueryDataWithPersister
-} from '$lib/queries/QueryClient';
+import { getLocalAlbumMatchQuery, getRemoteAlbumMatchQuery } from '$lib/queries/albumMatch';
+import { AlbumMatchKeyFactory } from '$lib/queries/AlbumMatchQueryKeyFactory';
+import { albumCopiesChanged, albumCopiesStale, applyEffectsIn } from '$lib/queries/effects';
+import { setQueryDataWithPersister } from '$lib/queries/QueryClient';
 
 /** An edition track row, with where the edition fetch is with it. */
 export interface FetchedEditionRow extends EditionTrackRow {
@@ -88,7 +81,8 @@ export interface SourceCallbacks {
 export function createAlbumPageState(albumIdGetter: () => string) {
 	const client = useQueryClient();
 	const userId = () => authStore.user?.id;
-	let integrations = $state(get(integrationStore));
+	const integrationStatus = useIntegrationStatus();
+	const integrations = $derived(integrationStatus.current);
 	let requesting = $state(false);
 	let showDeleteModal = $state(false);
 	let quota = $state<YouTubeQuotaStatus | null>(null);
@@ -99,10 +93,6 @@ export function createAlbumPageState(albumIdGetter: () => string) {
 	const seenActiveTaskIds = new SvelteSet<string>();
 	const settledTaskIds = new SvelteSet<string>();
 
-	$effect(() => integrationStore.subscribe((s) => (integrations = s)));
-	$effect(() => {
-		if (browser) void integrationStore.ensureLoaded();
-	});
 	const downloadClientConfigured = $derived(integrations.download_client);
 
 	const basicQuery = getAlbumBasicQuery(userId, albumIdGetter);
@@ -388,11 +378,7 @@ export function createAlbumPageState(albumIdGetter: () => string) {
 	function refreshSourcesAfterDownload(): void {
 		const albumId = albumIdGetter();
 		if (!albumId) return;
-		void invalidateQueriesWithPersister(
-			{ queryKey: AlbumMatchKeyFactory.album(userId(), albumId) },
-			undefined,
-			{ client }
-		);
+		void applyEffectsIn(client, [albumCopiesChanged(userId(), albumId)]);
 	}
 
 	// external servers (Jellyfin/Navidrome/Plex) index newly-imported files on their own schedule, so
@@ -523,11 +509,9 @@ export function createAlbumPageState(albumIdGetter: () => string) {
 		setShowDeleteModal: (v) => (showDeleteModal = v),
 		onRequestSuccess: () => {
 			// the sources' copies are read again on the next visit
-			void invalidateQueriesWithPersister(
-				{ queryKey: AlbumMatchKeyFactory.album(userId(), albumIdGetter()), refetchType: 'none' },
-				undefined,
-				{ client }
-			).catch(() => undefined);
+			void applyEffectsIn(client, [albumCopiesStale(userId(), albumIdGetter())]).catch(
+				() => undefined
+			);
 			// pick up the freshly-created download task so the header strip + polling kick in
 			void downloadsQuery.refetch();
 		}

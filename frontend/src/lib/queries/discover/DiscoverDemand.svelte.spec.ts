@@ -8,14 +8,17 @@ const h = vi.hoisted(() => ({
 	source: { source_mode: 'brainzmash', source_id: 'source-a', generation: 1 },
 	setSource: vi.fn()
 }));
-vi.mock('$lib/api/client', () => ({ api: { global: { v3: { POST: h.post } } } }));
+vi.mock('$lib/api/client', () => ({ api: { v3: { POST: h.post } } }));
 vi.mock('$lib/stores/authStore.svelte', () => ({ authStore: { user: h.user } }));
 vi.mock('$lib/queries/musicbrainz/sourceScope.svelte', () => ({
-	musicBrainzSourceKey: () => ({ user_id: h.user.id, ...h.source }),
+	musicBrainzSourceStamp: () =>
+		`${h.source.source_mode}:${h.source.source_id}:${h.source.generation}`,
 	setMusicBrainzSourceScope: h.setSource
 }));
-vi.mock('@tanstack/svelte-query', () => ({
-	createMutation: (factory: () => { mutationFn: (value: DiscoverActivity) => Promise<void> }) => ({
+vi.mock('$lib/queries/effects', () => ({
+	createAppMutation: (
+		factory: () => { mutationFn: (value: DiscoverActivity) => Promise<void> }
+	) => ({
 		mutate: (value: DiscoverActivity) => {
 			void factory().mutationFn(value);
 		}

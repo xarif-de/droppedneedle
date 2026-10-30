@@ -7,15 +7,18 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
+use super::error::ImportsError;
 use super::models::{SpotifyAuthUrlResponse, SpotifyPlaylistItem, SpotifyPlaylistListResponse};
 use super::spotify_albums::{AlbumResolver, SpotifyAlbum};
 use super::spotify_client::{
     SpotifyClient, SpotifyError, TokenRefresher, best_image_url, playlist_track_count,
 };
-use super::spotify_models::{EntryTrack, PlaylistInfo};
-use super::spotify_oauth::{SpotifyConnection, authorize_url};
+use super::spotify_oauth::SpotifyConnection;
 use super::spotify_store::{CollectionsPlaylistBridge, SqliteSpotifyLinks};
-use crate::settings::ConfigSpotifySettings;
+use crate::settings::{ConfigSpotifySettings, settings_failed};
+use droppedneedle_kernel::runtime_config::ConfigError;
+use droppedneedle_providers::RequestPriority;
+use droppedneedle_providers::spotify::models::{EntryTrack, PlaylistInfo};
 
 /// One imported track row.
 #[derive(Debug, Clone, PartialEq)]
@@ -38,6 +41,22 @@ pub struct ImportedTrack {
     pub duration: Option<i64>,
     /// MB cover URL when resolved, else the Spotify image pick.
     pub cover_url: Option<String>,
+}
+
+/// What a Spotify import step fails with.
+#[derive(Debug)]
+pub enum ImportFailure {
+    /// The Spotify app settings do not read: the work waits until they are
+    /// saved again.
+    Settings(ConfigError),
+    /// Spotify, the user's link or the store failed.
+    Spotify(SpotifyError),
+}
+
+impl From<SpotifyError> for ImportFailure {
+    fn from(error: SpotifyError) -> Self {
+        Self::Spotify(error)
+    }
 }
 
 /// Spotify import service: OAuth helpers, playlist listing, and the
@@ -85,36 +104,50 @@ impl SpotifyImportService {
         &self,
         redirect_uri: &str,
         state: &str,
-    ) -> Result<SpotifyAuthUrlResponse, String> {
-        let raw = self.settings.get_raw();
+    ) -> Result<SpotifyAuthUrlResponse, ImportsError> {
+        let raw = self.settings.get_raw().map_err(settings_failed)?;
         if !raw.enabled || raw.client_id.is_empty() || raw.client_secret.expose().is_empty() {
-            return Err("Spotify is not configured by the administrator".to_owned());
+            return Err(ImportsError::InvalidInput {
+                message: "Spotify is not configured by the administrator".to_owned(),
+            });
         }
-        Ok(SpotifyAuthUrlResponse {
-            auth_url: authorize_url(&raw.client_id, redirect_uri, state),
-        })
+        let auth_url = self
+            .client
+            .authorize_url(&raw.client_id, redirect_uri, state)
+            .ok_or_else(|| ImportsError::internal(&"the spotify accounts address is unusable"))?;
+        Ok(SpotifyAuthUrlResponse { auth_url })
+    }
+
+    /// Wakes after each saved change to the Spotify app settings.
+    pub fn settings_changes(&self) -> tokio::sync::watch::Receiver<i64> {
+        self.settings.subscribe()
     }
 
     /// One user's stored link, or `NotLinked`.
     async fn link(&self, user_id: &str) -> Result<SpotifyConnection, SpotifyError> {
         self.connections
             .get(user_id)
-            .await
-            .map_err(SpotifyError::Store)?
+            .await?
             .ok_or(SpotifyError::NotLinked)
     }
 
-    /// Refreshing API access over one user's link.
-    fn refresher(&self, user_id: &str, connection: SpotifyConnection) -> TokenRefresher<'_> {
-        let raw = self.settings.get_raw();
-        TokenRefresher::new(
+    /// Refreshing API access over one user's link for work at `priority`,
+    /// or the error the app settings do not read with.
+    fn refresher(
+        &self,
+        user_id: &str,
+        connection: SpotifyConnection,
+        priority: RequestPriority,
+    ) -> Result<TokenRefresher<'_>, ImportFailure> {
+        let raw = self.settings.get_raw().map_err(ImportFailure::Settings)?;
+        Ok(TokenRefresher::new(
             &self.client,
             self.connections.as_ref(),
             user_id,
-            &raw.client_id,
-            raw.client_secret.expose(),
+            (&raw.client_id, raw.client_secret.expose()),
             connection,
-        )
+            priority,
+        ))
     }
 
     /// Owned playlists annotated with the imported mapping. Only playlists
@@ -123,10 +156,11 @@ impl SpotifyImportService {
     pub async fn list_playlists(
         &self,
         user_id: &str,
-    ) -> Result<SpotifyPlaylistListResponse, SpotifyError> {
+    ) -> Result<SpotifyPlaylistListResponse, ImportFailure> {
         let stored = self.link(user_id).await?;
         let mut spotify_user_id = stored.spotify_user_id.clone();
-        let refresher = self.refresher(user_id, stored);
+        // The listing answers a person waiting on the page.
+        let refresher = self.refresher(user_id, stored, RequestPriority::UserInitiated)?;
         if spotify_user_id.is_empty() {
             spotify_user_id = self.client.current_user(&refresher).await?.id;
         }
@@ -197,8 +231,15 @@ impl SpotifyImportService {
         user_id: &str,
         spotify_playlist_id: &str,
         playlist_id: &str,
-    ) -> Result<usize, SpotifyError> {
-        let refresher = self.refresher(user_id, self.link(user_id).await?);
+    ) -> Result<usize, ImportFailure> {
+        // The import runs as a queued job after the route has answered, so
+        // it waits its turn on the rate row instead of failing when Spotify
+        // asks for a pause.
+        let refresher = self.refresher(
+            user_id,
+            self.link(user_id).await?,
+            RequestPriority::BackgroundSync,
+        )?;
         let (info, tracks) = tokio::join!(
             self.client.playlist(&refresher, spotify_playlist_id),
             self.client.playlist_tracks(&refresher, spotify_playlist_id)
@@ -315,7 +356,11 @@ impl SpotifyImportService {
         let Some(cover_url) = best_image_url(info.images.as_deref(), 250) else {
             return CoverOutcome::Skipped("no cover offered".to_owned());
         };
-        let fetched = match self.client.fetch_cover(&cover_url).await {
+        let fetched = match self
+            .client
+            .fetch_cover(&cover_url, RequestPriority::BackgroundSync)
+            .await
+        {
             Ok(fetched) => fetched,
             Err(cause) => {
                 return CoverOutcome::Skipped(format!(

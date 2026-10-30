@@ -2519,7 +2519,12 @@ export interface paths {
             cookie?: never;
         };
         get?: never;
-        /** Favorite or unfavorite one item. */
+        /**
+         * Favorite or unfavorite one item.
+         * @description Acts on the caller's own favourites, the ones Subsonic apps star and
+         *     Jellyfin apps mark. The old id of a merged item acts on the item it went
+         *     into, and the answer names that id.
+         */
         put: operations["set_favorite_handler"];
         post?: never;
         delete?: never;
@@ -3387,8 +3392,8 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * What the app did by itself to the album's tracks and to the albums it
-         *     is made of.
+         * What the app did by itself to the album, its tracks and the albums it
+         *     is made of, and the undos of those changes.
          */
         get: operations["get_album_history"];
         put?: never;
@@ -4826,10 +4831,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /**
-         * A new confirmation token for your own ready preview (the old one
-         *     stops working).
-         */
+        /** A new confirmation token for your own ready preview. */
         post: operations["reissue_management_preview"];
         delete?: never;
         options?: never;
@@ -5086,7 +5088,7 @@ export interface paths {
          * Empty the recycle bin of what it held at `before`, under the rules
          *     its expiry keeps: a copy that changed in the bin, one a put-back is
          *     using, and one in a bin that is or holds a library or download folder
-         *     stay. Runs in the background.
+         *     stay. Runs in the background. Refused while the library is off.
          */
         post: operations["empty_recycle_bin"];
         delete?: never;
@@ -5235,8 +5237,9 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Apply a previewed bulk change. Refused when the token is not the
-         *     caller's or is too old, or the selection changed since the preview.
+         * Apply a previewed bulk change as one background job that can be
+         *     paused, resumed and stopped. Refused when the token is not the caller's
+         *     or is too old, or the selection changed since the preview.
          */
         post: operations["apply_bulk_reviews"];
         delete?: never;
@@ -5256,10 +5259,51 @@ export interface paths {
         put?: never;
         /**
          * Preview a bulk change: how many reviews it changes, which it skips and
-         *     why, and the token that applies exactly this change. The token is good
-         *     for 15 minutes, and only for the person who previewed.
+         *     why, the releases every selected review shares, and the token that
+         *     applies exactly this change. The token is good for 15 minutes, and only
+         *     for the person who previewed.
          */
         post: operations["preview_bulk_reviews"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v3/library/reviews/jobs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Review jobs still running, queued or paused, and those that ended in
+         *     the last five minutes, newest first.
+         */
+        get: operations["list_review_jobs"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v3/library/reviews/jobs/{job_id}/control": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Pause, resume or stop a review job. A running job halts between
+         *     reviews.
+         */
+        post: operations["control_review_job"];
         delete?: never;
         options?: never;
         head?: never;
@@ -5277,8 +5321,9 @@ export interface paths {
         put?: never;
         /**
          * Start identification again for every pending review a filter selects
-         *     (all of them by default), or with `preview` count what would start.
-         *     Reviews whose album cannot start stay open and are counted by reason.
+         *     (all of them by default), as one background job that can be paused,
+         *     resumed and stopped. With `preview`, nothing starts: the answer counts
+         *     what would start and why the rest would not.
          */
         post: operations["retry_pending_reviews"];
         delete?: never;
@@ -10126,7 +10171,7 @@ export interface components {
             musicbrainz_id: string;
         };
         /**
-         * @description Who asked for a join.
+         * @description Who asked for a join or an undo.
          * @enum {string}
          */
         AlbumHistoryByView: "you" | "person";
@@ -10139,7 +10184,10 @@ export interface components {
             at: number;
             by?: null | components["schemas"]["AlbumHistoryByView"];
             kind: components["schemas"]["AlbumHistoryKindView"];
-            /** @description The other album's title, null when its row is gone. */
+            /**
+             * @description The other album's title, for a join, a fold or its undo; null when
+             *     its row is gone.
+             */
             other_album_title?: string | null;
             /** @description How many tracks the entry is about; 0 for album entries. */
             track_count: number;
@@ -10155,7 +10203,7 @@ export interface components {
          * @description What one history entry tells.
          * @enum {string}
          */
-        AlbumHistoryKindView: "tracks_continued" | "tracks_replaced" | "retag_joined" | "retag_half_left_alone" | "leftover_joined" | "tracks_other_music" | "tracks_new_copy" | "artist_from_tracks";
+        AlbumHistoryKindView: "tracks_continued" | "tracks_replaced" | "retag_joined" | "retag_half_left_alone" | "leftover_joined" | "tracks_other_music" | "tracks_new_copy" | "artist_from_tracks" | "edition_changed" | "edition_chosen" | "edition_change_undone" | "fold_undone" | "unfolded_from" | "hand_back_given_up";
         /**
          * @description An album's history, newest first: at most ten entries, none older than
          *     180 days.
@@ -11090,7 +11138,7 @@ export interface components {
          * @description Artist credit standardization.
          * @enum {string}
          */
-        ArtistStandardization: "credited" | "variations" | "canonical";
+        ArtistStandardization: "credited" | "canonical";
         /** @description One catalog artist. */
         ArtistView: {
             /**
@@ -11131,16 +11179,6 @@ export interface components {
             track_count: number;
         };
         /**
-         * @description Artwork download size.
-         * @enum {string}
-         */
-        ArtworkDownloadSize: "full" | "1200" | "500" | "250";
-        /**
-         * @description Artwork image type.
-         * @enum {string}
-         */
-        ArtworkImageType: "front" | "back" | "booklet" | "medium" | "tray" | "obi" | "spine" | "track" | "other";
-        /**
          * @description How a genre's mosaic art is drawn.
          * @enum {string}
          */
@@ -11148,24 +11186,12 @@ export interface components {
         /** @description Artwork management block. */
         ArtworkManagementSettings: {
             /**
-             * @description Approved art only.
-             * @default true
-             */
-            approved_only: boolean;
-            /** @default full */
-            download_size: components["schemas"]["ArtworkDownloadSize"];
-            /**
              * @description Embed art in files.
              * @default true
              */
             embedded_enabled: boolean;
             /** @default jpeg */
             embedded_format: components["schemas"]["ArtworkOutputFormat"];
-            /**
-             * @description Embedded front only.
-             * @default true
-             */
-            embedded_front_only: boolean;
             /**
              * Format: int64
              * @description Embedded size cap (0 uncapped).
@@ -11180,28 +11206,11 @@ export interface components {
             /** @default original */
             external_format: components["schemas"]["ArtworkOutputFormat"];
             /**
-             * @description External front only.
-             * @default true
-             */
-            external_front_only: boolean;
-            /**
              * Format: int64
              * @description External size cap (0 uncapped).
              * @default 0
              */
             external_maximum_size: number;
-            /**
-             * @description External naming script id.
-             * @default null
-             */
-            external_naming_script_id: string | null;
-            /**
-             * @description Image types to fetch.
-             * @default [
-             *       "front"
-             *     ]
-             */
-            image_types: components["schemas"]["ArtworkImageType"][];
             /**
              * @description Local filename patterns.
              * @default [
@@ -11217,53 +11226,16 @@ export interface components {
              */
             local_file_patterns: string[];
             /**
-             * Format: int64
-             * @description Minimum height (0 any).
-             * @default 0
-             */
-            minimum_height: number;
-            /**
-             * Format: int64
-             * @description Minimum width (0 any).
-             * @default 0
-             */
-            minimum_width: number;
-            /**
              * @description Never replace art with smaller art.
              * @default true
              */
             never_replace_with_smaller: boolean;
-            /**
-             * @description Overwrite external files.
-             * @default false
-             */
-            overwrite_external_files: boolean;
-            /**
-             * @description Existing types never replaced.
-             * @default []
-             */
-            preserve_existing_types: components["schemas"]["ArtworkImageType"][];
-            /**
-             * @description Provider order.
-             * @default [
-             *       "cover_art_archive_release",
-             *       "cover_art_archive_release_group",
-             *       "local_files",
-             *       "embedded"
-             *     ]
-             */
-            providers: components["schemas"]["ArtworkProvider"][];
         };
         /**
          * @description Artwork output format.
          * @enum {string}
          */
         ArtworkOutputFormat: "original" | "jpeg" | "png" | "webp";
-        /**
-         * @description Artwork provider.
-         * @enum {string}
-         */
-        ArtworkProvider: "cover_art_archive_release" | "cover_art_archive_release_group" | "local_files" | "embedded" | "audiodb";
         /** @description Link the album to a release already on MusicBrainz. */
         AttachExistingBody: {
             /**
@@ -11697,6 +11669,11 @@ export interface components {
             cover_images: number;
             /**
              * Format: int64
+             * @description Size of the database file in bytes, 0 when it cannot be read.
+             */
+            database_bytes: number;
+            /**
+             * Format: int64
              * @description Provider answers held.
              */
             entries: number;
@@ -11707,6 +11684,11 @@ export interface components {
             provider_data_on: boolean;
             /** @description Rows and bytes per provider. */
             sources: components["schemas"]["ProviderSourceStats"][];
+            /**
+             * Format: int64
+             * @description Size of its write-ahead log in bytes, 0 when there is none.
+             */
+            wal_bytes: number;
         };
         /** @description `POST /cache/sync/cancel` answer. */
         CacheSyncCancelResponse: {
@@ -14039,7 +14021,6 @@ export interface components {
              * @default {
              *       "enabled": false,
              *       "preserve_existing": false,
-             *       "provider": "lrclib",
              *       "required": false,
              *       "write_plain": true,
              *       "write_synced": true
@@ -14214,6 +14195,22 @@ export interface components {
             /** @description The URL. */
             url: string;
         };
+        /** @description One media server's rescan after a run, as the run's page shows it. */
+        ExternalRefresh: {
+            /**
+             * Format: int32
+             * @description Tries so far.
+             */
+            attempts: number;
+            code?: null | components["schemas"]["RefreshCode"];
+            /**
+             * Format: int64
+             * @description When it ended, unix ms.
+             */
+            finished_at?: number | null;
+            state: components["schemas"]["RefreshState"];
+            target: components["schemas"]["RefreshTarget"];
+        };
         /** @description External-server refresh after publishing. */
         ExternalRefreshSettings: {
             /**
@@ -14236,18 +14233,6 @@ export interface components {
              * @default false
              */
             plex_enabled: boolean;
-            /**
-             * Format: int64
-             * @description Retry attempts.
-             * @default 3
-             */
-            retry_attempts: number;
-            /**
-             * Format: int64
-             * @description Retry delay in seconds.
-             * @default 30
-             */
-            retry_delay_seconds: number;
         };
         /**
          * @description Why a scan skipped or failed a path, or why a run ended early. The
@@ -14290,7 +14275,10 @@ export interface components {
         FavoriteStatusResponse: {
             /** @description Current state. */
             favorited: boolean;
-            /** @description Favorited item id. */
+            /**
+             * @description The id the favourite is stored under: the item's current id, which
+             *     differs from the one sent after a merge.
+             */
             item_id: string;
             /** @description Favorited kind. */
             kind: string;
@@ -14329,39 +14317,6 @@ export interface components {
          * @enum {string}
          */
         FieldMode: "disabled" | "replace" | "fill_missing" | "merge" | "preserve";
-        /** @description File-behavior gates. */
-        FileBehaviorSettings: {
-            /**
-             * @description Preserve permission bits.
-             * @default true
-             */
-            preserve_permissions: boolean;
-            /**
-             * @description Preserve mtimes.
-             * @default true
-             */
-            preserve_timestamps: boolean;
-            /**
-             * @description Refuse symlinked media.
-             * @default true
-             */
-            reject_symlinks: boolean;
-            /**
-             * @description Refuse writes the format cannot hold.
-             * @default true
-             */
-            strict_capability_gate: boolean;
-            /**
-             * @description Re-probe audio after writing.
-             * @default true
-             */
-            validate_technical_audio: boolean;
-            /**
-             * @description Re-read tags after writing.
-             * @default true
-             */
-            validate_written_metadata: boolean;
-        };
         /** @description Zero-dependency filesystem poller knobs. */
         FilesystemWatcher: {
             /**
@@ -14480,34 +14435,6 @@ export interface components {
         FollowedArtistListResponse: {
             /** @description Followed artists. */
             artists: components["schemas"]["FollowedArtist"][];
-        };
-        /** @description Format-compatibility handling. */
-        FormatCompatibilitySettings: {
-            /**
-             * @description Primary genre only for constrained formats.
-             * @default false
-             */
-            constrained_genres_primary_only: boolean;
-            /** @default utf8 */
-            id3_text_encoding: components["schemas"]["Id3TextEncoding"];
-            /** @default 2.4 */
-            id3_version: components["schemas"]["Id3Version"];
-            /**
-             * @description ID3v2.3 multi-value join delimiter.
-             * @default ;
-             */
-            id3v23_join_delimiter: string;
-            /** @default preserve */
-            mp3_apev2_policy: components["schemas"]["Mp3ApePolicy"];
-            /** @default save_apev2 */
-            raw_aac_tag_policy: components["schemas"]["RawAacTagPolicy"];
-            /**
-             * @description Strip ID3 chunks from FLAC.
-             * @default false
-             */
-            remove_id3_from_flac: boolean;
-            /** @default id3 */
-            wav_tag_policy: components["schemas"]["WavTagPolicy"];
         };
         /**
          * @description The advanced settings the web app reads at start. The browser's cache
@@ -14641,12 +14568,6 @@ export interface components {
              * @default 1
              */
             listenbrainz_minimum_count: number;
-            /**
-             * Format: int64
-             * @description Max genre-ancestry depth.
-             * @default 4
-             */
-            maximum_ancestry_depth: number;
             /**
              * Format: int64
              * @description Max genres written.
@@ -15020,16 +14941,6 @@ export interface components {
             source: components["schemas"]["SourceName"];
             stats?: null | components["schemas"]["RemotesStatsView"];
         };
-        /**
-         * @description ID3 text encoding.
-         * @enum {string}
-         */
-        Id3TextEncoding: "utf8" | "utf16";
-        /**
-         * @description ID3 version for MP3 writes.
-         * @enum {string}
-         */
-        Id3Version: "2.4" | "2.3";
         /** @description A pause or resume of identification. */
         IdentificationControlBody: {
             /**
@@ -15589,20 +15500,12 @@ export interface components {
         LibraryManagementProfile: {
             /**
              * @default {
-             *       "approved_only": true,
-             *       "download_size": "full",
              *       "embedded_enabled": true,
              *       "embedded_format": "jpeg",
-             *       "embedded_front_only": true,
              *       "embedded_maximum_size": 1200,
              *       "external_enabled": true,
              *       "external_format": "original",
-             *       "external_front_only": true,
              *       "external_maximum_size": 0,
-             *       "external_naming_script_id": null,
-             *       "image_types": [
-             *         "front"
-             *       ],
              *       "local_file_patterns": [
              *         "cover.jpg",
              *         "cover.jpeg",
@@ -15613,17 +15516,7 @@ export interface components {
              *         "front.jpg",
              *         "front.png"
              *       ],
-             *       "minimum_height": 0,
-             *       "minimum_width": 0,
-             *       "never_replace_with_smaller": true,
-             *       "overwrite_external_files": false,
-             *       "preserve_existing_types": [],
-             *       "providers": [
-             *         "cover_art_archive_release",
-             *         "cover_art_archive_release_group",
-             *         "local_files",
-             *         "embedded"
-             *       ]
+             *       "never_replace_with_smaller": true
              *     }
              */
             artwork: components["schemas"]["ArtworkManagementSettings"];
@@ -15637,7 +15530,6 @@ export interface components {
              *       "lyrics": {
              *         "enabled": false,
              *         "preserve_existing": false,
-             *         "provider": "lrclib",
              *         "required": false,
              *         "write_plain": true,
              *         "write_synced": true
@@ -15653,17 +15545,6 @@ export interface components {
             enrichment: components["schemas"]["EnrichmentManagementSettings"];
             /**
              * @default {
-             *       "preserve_permissions": true,
-             *       "preserve_timestamps": true,
-             *       "reject_symlinks": true,
-             *       "strict_capability_gate": true,
-             *       "validate_technical_audio": true,
-             *       "validate_written_metadata": true
-             *     }
-             */
-            file_behavior: components["schemas"]["FileBehaviorSettings"];
-            /**
-             * @default {
              *       "aliases": [],
              *       "allowlist": [],
              *       "canonicalize": true,
@@ -15673,7 +15554,6 @@ export interface components {
              *       "lastfm_whitelist_only": true,
              *       "listenbrainz_curated_only": true,
              *       "listenbrainz_minimum_count": 1,
-             *       "maximum_ancestry_depth": 4,
              *       "maximum_count": 5,
              *       "mode": "replace",
              *       "musicbrainz_minimum_count": 1,
@@ -15706,16 +15586,6 @@ export interface components {
              *       },
              *       "enabled": true,
              *       "fields": [],
-             *       "format_compatibility": {
-             *         "constrained_genres_primary_only": false,
-             *         "id3_text_encoding": "utf8",
-             *         "id3_version": "2.4",
-             *         "id3v23_join_delimiter": "; ",
-             *         "mp3_apev2_policy": "preserve",
-             *         "raw_aac_tag_policy": "save_apev2",
-             *         "remove_id3_from_flac": false,
-             *         "wav_tag_policy": "id3"
-             *       },
              *       "preserve_embedded_art_during_scrub": true,
              *       "preserve_fields": [],
              *       "relationships": {
@@ -15742,7 +15612,6 @@ export interface components {
             name: string;
             /**
              * @default {
-             *       "refresh_droppedneedle": true,
              *       "refresh_external_servers": false
              *     }
              */
@@ -15764,7 +15633,6 @@ export interface components {
              *       "move_sidecars": true,
              *       "multi_disc_naming_script_id": null,
              *       "naming_script_id": "69202666-cb88-52b0-bac2-0afc62b1e909",
-             *       "remove_empty_directories": true,
              *       "rename_enabled": true,
              *       "sidecar_patterns": [
              *         "cover.jpg",
@@ -15794,8 +15662,7 @@ export interface components {
              *         "*.m3u",
              *         "*.m3u8",
              *         "*.pls"
-             *       ],
-             *       "source_cleanup": "remove_after_confirmed_move"
+             *       ]
              *     }
              */
             organization: components["schemas"]["OrganizationManagementSettings"];
@@ -16019,11 +15886,6 @@ export interface components {
         /** @description Per-root profile overrides (`None` inherits the profile). */
         LibraryManagementRootOverrides: {
             /**
-             * @description Automatic edition acceptance.
-             * @default null
-             */
-            automatic_edition_acceptance_enabled: boolean | null;
-            /**
              * @description Embedded-artwork switch.
              * @default null
              */
@@ -16066,17 +15928,10 @@ export interface components {
              */
             naming_script_id: string | null;
             /**
-             * @description Timestamp preservation.
-             * @default null
-             */
-            preserve_timestamps: boolean | null;
-            /**
              * @description Rename switch.
              * @default null
              */
             rename_enabled: boolean | null;
-            /** @default null */
-            source_cleanup: null | components["schemas"]["SourceCleanupMode"];
         };
         /** @description PUT body: full settings plus the required CAS token. */
         LibraryManagementSaveRequest: {
@@ -16097,9 +15952,7 @@ export interface components {
              *       "enabled": false,
              *       "jellyfin_enabled": false,
              *       "navidrome_enabled": false,
-             *       "plex_enabled": false,
-             *       "retry_attempts": 3,
-             *       "retry_delay_seconds": 30
+             *       "plex_enabled": false
              *     }
              */
             external_refresh: components["schemas"]["ExternalRefreshSettings"];
@@ -16125,11 +15978,6 @@ export interface components {
              * @default []
              */
             profiles: components["schemas"]["LibraryManagementProfile"][];
-            /**
-             * @description Recycle-bin path ("" disables).
-             * @default
-             */
-            recycle_bin_path: string;
             /**
              * @description Root assignments.
              * @default []
@@ -16668,6 +16516,19 @@ export interface components {
          * @enum {string}
          */
         ListenSource: "listenbrainz" | "lastfm";
+        /**
+         * @description One linked listening account. Never carries the secret, only the name.
+         *     Named apart from the remotes `ConnectionStatus` in the one OpenAPI
+         *     document.
+         */
+        ListeningLinkStatus: {
+            /** @description Whether the link is active. */
+            enabled?: boolean;
+            /** @description Service name (`listenbrainz` here). */
+            service: string;
+            /** @description Linked username. */
+            username?: string;
+        };
         /** @description Set the first local password on an account without one. */
         LocalPasswordSet: {
             /** @description New password, at least 12 chars. */
@@ -16732,11 +16593,6 @@ export interface components {
              * @default false
              */
             preserve_existing: boolean;
-            /**
-             * @description Lyrics provider.
-             * @default lrclib
-             */
-            provider: string;
             /**
              * @description Lyrics required for completion.
              * @default false
@@ -16854,6 +16710,12 @@ export interface components {
             /** Format: int64 */
             file_count: number;
             sample_paths: string[];
+            /**
+             * @description The folders the write took its files from, relative to their
+             *     library folder. For a download that is the hidden import folder
+             *     holding the downloaded files.
+             */
+            source_folders: string[];
         };
         /** @description Catalog filter for a `filter` selection; empty matches everything. */
         ManagementCatalogFilterBody: {
@@ -16960,7 +16822,8 @@ export interface components {
             expired: boolean;
             /** Format: double */
             expires_at?: number | null;
-            external_refreshes: Record<string, never>[];
+            /** @description Media servers asked to rescan after the apply, and how it went. */
+            external_refreshes: components["schemas"]["ExternalRefresh"][];
             /** Format: int64 */
             failed_count: number;
             job_id: string;
@@ -17511,19 +17374,6 @@ export interface components {
              */
             fields: components["schemas"]["ManagedField"][];
             /**
-             * @default {
-             *       "constrained_genres_primary_only": false,
-             *       "id3_text_encoding": "utf8",
-             *       "id3_version": "2.4",
-             *       "id3v23_join_delimiter": "; ",
-             *       "mp3_apev2_policy": "preserve",
-             *       "raw_aac_tag_policy": "save_apev2",
-             *       "remove_id3_from_flac": false,
-             *       "wav_tag_policy": "id3"
-             *     }
-             */
-            format_compatibility: components["schemas"]["FormatCompatibilitySettings"];
-            /**
              * @description Keep embedded art during a scrub.
              * @default true
              */
@@ -17566,11 +17416,6 @@ export interface components {
             /** @description The artist's name, empty when MusicBrainz had nothing. */
             artist_name: string;
         };
-        /**
-         * @description APEv2 policy for MP3 writes.
-         * @enum {string}
-         */
-        Mp3ApePolicy: "preserve" | "remove";
         /**
          * @description Multi-disc naming mode for a root override.
          * @enum {string}
@@ -18150,11 +17995,6 @@ export interface components {
              */
             naming_script_id: string;
             /**
-             * @description Remove newly empty directories.
-             * @default true
-             */
-            remove_empty_directories: boolean;
-            /**
              * @description Rename files.
              * @default true
              */
@@ -18192,8 +18032,6 @@ export interface components {
              *     ]
              */
             sidecar_patterns: string[];
-            /** @default remove_after_confirmed_move */
-            source_cleanup: components["schemas"]["SourceCleanupMode"];
         };
         /** @description One section of a page. */
         PageSection: {
@@ -19252,20 +19090,6 @@ export interface components {
          */
         PluginCapability: "scrobbler" | "purchase_links" | "download_client" | "indexer" | "subscriber" | "publisher" | "metadata_provider" | "scheduler" | "streaming_source" | "library_writer";
         /**
-         * @description One linked external account. Never carries the secret, only the name.
-         *     The schema rename keeps this distinct from the remotes
-         *     `ConnectionStatus` in the one OpenAPI document; the wire shape is
-         *     unchanged.
-         */
-        PluginConnectionStatus: {
-            /** @description Whether the link is active. */
-            enabled?: boolean;
-            /** @description Service name (`listenbrainz` here). */
-            service: string;
-            /** @description Linked username. */
-            username?: string;
-        };
-        /**
          * @description `GET /albums/{album_id}/plugin-details`: what metadata plugins add
          *     about an album. Each field is the first plugin's answer (plugins asked
          *     in name order); links and tags gather every plugin's, without repeats.
@@ -19626,11 +19450,6 @@ export interface components {
         };
         /** @description Post-publish notifications. */
         ProfileNotificationSettings: {
-            /**
-             * @description Refresh DroppedNeedle views.
-             * @default true
-             */
-            refresh_droppedneedle: boolean;
             /**
              * @description Refresh external servers.
              * @default false
@@ -20227,11 +20046,6 @@ export interface components {
             rating: number;
         };
         /**
-         * @description Raw-AAC tag policy.
-         * @enum {string}
-         */
-        RawAacTagPolicy: "save_apev2" | "do_not_write" | "remove_apev2";
-        /**
          * @description One reason, stored and sent by its snake_case spelling.
          * @enum {string}
          */
@@ -20340,6 +20154,12 @@ export interface components {
             /** @description False when the album was not excluded. */
             reenabled: boolean;
         };
+        /**
+         * @description Why a rescan did not go through. The handler stores these as the
+         *     job's code; the run's page shows them.
+         * @enum {string}
+         */
+        RefreshCode: "EXTERNAL_REFRESH_NOT_CONFIGURED" | "EXTERNAL_REFRESH_AUTH_FAILED" | "EXTERNAL_REFRESH_NOT_FOUND" | "EXTERNAL_REFRESH_UNREACHABLE" | "EXTERNAL_REFRESH_FAILED" | "EXTERNAL_REFRESH_INTERRUPTED";
         /** @description Acknowledgement of a triggered background refresh. */
         RefreshResponse: {
             /** @description Human message. */
@@ -20347,6 +20167,16 @@ export interface components {
             /** @description Always `ok` when the trigger lands. */
             status: string;
         };
+        /**
+         * @description Where a rescan stands.
+         * @enum {string}
+         */
+        RefreshState: "queued" | "running" | "done" | "failed" | "no_record";
+        /**
+         * @description A media server Library Management can ask to rescan.
+         * @enum {string}
+         */
+        RefreshTarget: "jellyfin" | "plex" | "navidrome";
         /** @description One candidate a re-identification offers. */
         ReidentificationCandidateView: {
             /**
@@ -21326,18 +21156,49 @@ export interface components {
             matched: number;
             /** @description Pass back to apply exactly this change. */
             preview_token: string;
+            /**
+             * @description Releases every selected pending, unpinned review lists, best
+             *     weakest score first; accept one for them all with its
+             *     `candidate_key`. Empty when they share none.
+             */
+            shared_candidates: components["schemas"]["SharedCandidateView"][];
             /** @description Reviews it would leave alone, grouped by why. */
             skipped: components["schemas"]["SkippedReviews"][];
         };
-        /** @description What a bulk review change did. */
+        /** @description What a bulk review change started. */
         ReviewBulkResponse: {
+            job?: null | components["schemas"]["OperationView"];
             /**
              * Format: int32
-             * @description Reviews changed.
+             * @description Reviews the job will change, each checked again when it is reached.
              */
-            applied: number;
-            /** @description Reviews left alone, grouped by why. */
+            queued: number;
+            /** @description Reviews the preview left alone, grouped by why. */
             skipped: components["schemas"]["SkippedReviews"][];
+        };
+        /**
+         * @description What a review job does to each of its reviews.
+         * @enum {string}
+         */
+        ReviewJobAction: "keep_tagged" | "exclude" | "accept" | "retry";
+        /**
+         * @description What to do with a review job.
+         * @enum {string}
+         */
+        ReviewJobControl: "pause" | "resume" | "stop";
+        /** @description Pause, resume or stop a review job. */
+        ReviewJobControlBody: {
+            control: components["schemas"]["ReviewJobControl"];
+        };
+        /** @description A review job: a bulk change or retry running in the background. */
+        ReviewJobView: components["schemas"]["OperationView"] & {
+            action?: null | components["schemas"]["ReviewJobAction"];
+            /** @description Reviews it left alone so far, grouped by why. */
+            skipped: components["schemas"]["SkippedReviews"][];
+        };
+        /** @description The review jobs to show. */
+        ReviewJobsResponse: {
+            jobs: components["schemas"]["ReviewJobView"][];
         };
         /** @description Review resolution answer. */
         ReviewResolveResponse: {
@@ -21356,18 +21217,22 @@ export interface components {
             filter?: components["schemas"]["ReviewsQuery"];
             /** @description Count what would start and why the rest would not; start nothing. */
             preview?: boolean;
-            /** @description Albums in these library folders (overrides the filter's folder). */
-            root_ids?: string[];
+            /**
+             * @description Albums in these library folders and sub-folder rules, picked the
+             *     way a scan picks them (overrides the filter's folder).
+             */
+            scope_ids?: string[];
         };
-        /** @description What a "retry all" started. */
+        /** @description What a "retry all" started, or with `preview` would start. */
         ReviewRetryAllResponse: {
+            job?: null | components["schemas"]["OperationView"];
             /** @description True when nothing started: the counts are what a real run would do. */
             preview: boolean;
-            /** @description Reviews that stayed open, grouped by why. */
+            /** @description Preview only: reviews that would stay open, grouped by why. */
             skipped: components["schemas"]["SkippedReviews"][];
             /**
              * Format: int32
-             * @description Albums whose identification started again (or would).
+             * @description Albums whose identification would start, or that the job will try.
              */
             started: number;
         };
@@ -21386,8 +21251,26 @@ export interface components {
             /** @description Makes a retried request return the same job (single review only). */
             idempotency_key?: string | null;
         };
+        /**
+         * @description How the review list is sorted.
+         * @enum {string}
+         */
+        ReviewSort: "newest" | "oldest" | "tracks" | "title" | "artist" | "root" | "reason";
         /** @enum {string} */
         ReviewState: "pending" | "approved" | "rejected" | "dismissed" | "excluded";
+        /** @description Reviews matching a filter apart from its state, by state. */
+        ReviewStateCounts: {
+            /** Format: int64 */
+            approved: number;
+            /** Format: int64 */
+            dismissed: number;
+            /** Format: int64 */
+            excluded: number;
+            /** Format: int64 */
+            pending: number;
+            /** Format: int64 */
+            rejected: number;
+        };
         /** @description One identification review and the album it is about. */
         ReviewView: {
             /** @description Local album id. */
@@ -21469,14 +21352,10 @@ export interface components {
             root_id?: string | null;
             /** @description Album title or artist contains this, ignoring case. */
             search?: string | null;
-            /**
-             * @description `newest` (default) or `oldest` change first, or `tracks` for the
-             *     albums with the most files first.
-             */
-            sort?: string | null;
+            sort?: null | components["schemas"]["ReviewSort"];
             /**
              * @description `pending` (default), `approved`, `rejected`, `dismissed`,
-             *     `excluded` or `all`.
+             *     `excluded`, `resolved` (approved or dismissed) or `all`.
              */
             state?: string | null;
             /**
@@ -21499,6 +21378,8 @@ export interface components {
         ReviewsResponse: components["schemas"]["Page_ReviewView"] & {
             /** @description Reviews matching the filter apart from its reason, by reason. */
             reason_counts: components["schemas"]["ReasonCount"][];
+            /** @description Reviews matching the filter apart from its state, by state. */
+            state_counts: components["schemas"]["ReviewStateCounts"];
         };
         /**
          * @description Account role. Meanings are unchanged from v2: `user` requests await
@@ -22492,6 +22373,20 @@ export interface components {
             /** @description True when no users exist yet and setup must run. */
             setup_required: boolean;
         };
+        /** @description A release every selected review lists. */
+        SharedCandidateView: {
+            album_artist_name: string;
+            album_title: string;
+            /** @description Accept the selection with this key. */
+            candidate_key: string;
+            /**
+             * Format: double
+             * @description Its weakest match score across the selected reviews.
+             */
+            lowest_score: number;
+            release_group_mbid: string;
+            release_mbid?: string | null;
+        };
         /**
          * @description Where a shelf's rows came from.
          * @enum {string}
@@ -22582,11 +22477,6 @@ export interface components {
             /** @description slskd version, when the probe reached it. */
             version?: string | null;
         };
-        /**
-         * @description Source-tree cleanup after a confirmed move.
-         * @enum {string}
-         */
-        SourceCleanupMode: "keep" | "remove_after_confirmed_move";
         /**
          * @description Per-source release gate verdict. Each source gates independently: one
          *     red gate never flips another.
@@ -23148,6 +23038,10 @@ export interface components {
             /** @description What the verdict rests on (`recording_id`, `title`, `length`, ...). */
             evidence_kinds: string[];
             local_track_id: string;
+            /** @description The MusicBrainz recording the file matched, when it matched one. */
+            recording_mbid?: string | null;
+            /** @description The release's track it matched, when it matched one. */
+            release_track_mbid?: string | null;
             /** @description The file's title as the library shows it. */
             title: string;
         };
@@ -23822,11 +23716,6 @@ export interface components {
          * @enum {string}
          */
         WatchState: "watching" | "stopped" | "fulfilled";
-        /**
-         * @description WAV tag policy.
-         * @enum {string}
-         */
-        WavTagPolicy: "id3" | "riff_info" | "preserve_existing";
         /** @description The weekly exploration playlist shelf. */
         WeeklyExploration: {
             /** @description Playlist date (`YYYY-MM-DD`). */
@@ -24144,7 +24033,7 @@ export interface components {
         };
         /** @description Today's YouTube search budget. */
         YouTubeQuotaStatus: {
-            /** @description UTC date the numbers belong to, YYYY-MM-DD. */
+            /** @description Quota day the numbers belong to (it starts at 08:00 UTC), YYYY-MM-DD. */
             date: string;
             /**
              * Format: int64
@@ -25534,6 +25423,15 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
+            /** @description Last.fm is down (PROVIDER_UNAVAILABLE, with retry_after when known) */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
         };
     };
     more_by_artist: {
@@ -25778,6 +25676,15 @@ export interface operations {
             };
             /** @description Not authenticated */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description ListenBrainz is down (PROVIDER_UNAVAILABLE, with retry_after when known) */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -26121,6 +26028,15 @@ export interface operations {
             };
             /** @description Not authenticated */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Last.fm is down (PROVIDER_UNAVAILABLE, with retry_after when known) */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -27550,6 +27466,15 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
+            /** @description A source is down (PROVIDER_UNAVAILABLE names an outside one, with retry_after when known) */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
         };
     };
     album_preview: {
@@ -27597,6 +27522,15 @@ export interface operations {
             };
             /** @description Not configured (NOT_CONFIGURED) or not built in this version yet (NOT_AVAILABLE) */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description A source is down (PROVIDER_UNAVAILABLE names an outside one, with retry_after when known) */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -27856,8 +27790,8 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
-            /** @description A music provider failed */
-            502: {
+            /** @description A source is down (PROVIDER_UNAVAILABLE names an outside one, with retry_after when known) */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -27915,6 +27849,15 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
+            /** @description A source is down (PROVIDER_UNAVAILABLE names an outside one, with retry_after when known) */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
         };
     };
     enrich_queue_item: {
@@ -27949,6 +27892,15 @@ export interface operations {
             };
             /** @description Not authenticated */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description A source is down (PROVIDER_UNAVAILABLE names an outside one, with retry_after when known) */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -28047,6 +27999,15 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
+            /** @description A source is down (PROVIDER_UNAVAILABLE names an outside one, with retry_after when known) */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
         };
     };
     ignored_releases: {
@@ -28126,8 +28087,8 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
-            /** @description MusicBrainz or YouTube failed */
-            502: {
+            /** @description A source is down (PROVIDER_UNAVAILABLE names an outside one, with retry_after when known) */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -28356,6 +28317,15 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
+            /** @description A source is down (PROVIDER_UNAVAILABLE names an outside one, with retry_after when known) */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
         };
     };
     youtube_track_search: {
@@ -28417,6 +28387,15 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
+            /** @description A source is down (PROVIDER_UNAVAILABLE names an outside one, with retry_after when known) */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
         };
     };
     discover_radio: {
@@ -28468,8 +28447,8 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
-            /** @description A music provider failed */
-            502: {
+            /** @description A source is down (PROVIDER_UNAVAILABLE names an outside one, with retry_after when known) */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -28528,8 +28507,8 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
-            /** @description A music provider failed */
-            502: {
+            /** @description A source is down (PROVIDER_UNAVAILABLE names an outside one, with retry_after when known) */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -28559,6 +28538,15 @@ export interface operations {
             };
             /** @description Not authenticated */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description A source is down (PROVIDER_UNAVAILABLE names an outside one, with retry_after when known) */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -28611,6 +28599,15 @@ export interface operations {
             };
             /** @description Not configured (NOT_CONFIGURED) or not built in this version yet (NOT_AVAILABLE) */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description A source is down (PROVIDER_UNAVAILABLE names an outside one, with retry_after when known) */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -29360,7 +29357,7 @@ export interface operations {
             path: {
                 /** @description Kind: album, artist, or track */
                 kind: string;
-                /** @description Favorited item id */
+                /** @description Local id of the item */
                 item_id: string;
             };
             cookie?: never;
@@ -29391,6 +29388,15 @@ export interface operations {
             };
             /** @description Not authenticated */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No live item holds the id */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -30074,6 +30080,15 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
+            /** @description A source is down (PROVIDER_UNAVAILABLE names an outside one, with retry_after when known) */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
         };
     };
     integration_status: {
@@ -30105,6 +30120,15 @@ export interface operations {
             };
             /** @description Not configured (NOT_CONFIGURED) or not built in this version yet (NOT_AVAILABLE) */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description A source is down (PROVIDER_UNAVAILABLE names an outside one, with retry_after when known) */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -30168,6 +30192,15 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
+            /** @description A source is down (PROVIDER_UNAVAILABLE names an outside one, with retry_after when known) */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
         };
     };
     trending_artists: {
@@ -30224,6 +30257,15 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
+            /** @description A source is down (PROVIDER_UNAVAILABLE names an outside one, with retry_after when known) */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
         };
     };
     your_top_albums: {
@@ -30273,6 +30315,15 @@ export interface operations {
             };
             /** @description Not configured (NOT_CONFIGURED) or not built in this version yet (NOT_AVAILABLE) */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description A source is down (PROVIDER_UNAVAILABLE names an outside one, with retry_after when known) */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -30407,6 +30458,11 @@ export interface operations {
                  *     absent; matching is case-insensitive.
                  */
                 format?: string;
+                /**
+                 * @description Only the caller's favourites. Without `sort`, the newest favourite
+                 *     comes first, and `order=asc` puts the oldest first.
+                 */
+                favorites?: boolean;
             };
             header?: never;
             path?: never;
@@ -31034,7 +31090,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
-            /** @description The edition changed since the plan was read (STALE_REVISION), the library is busy, or a file is outside the library folders */
+            /** @description The edition changed since the plan was read (STALE_REVISION), the library is busy or off, or a file is outside the library folders */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -31504,7 +31560,7 @@ export interface operations {
                     "application/json": components["schemas"]["EditionTagsJobView"];
                 };
             };
-            /** @description Wrong token or no request key */
+            /** @description Wrong token, another curator's tag write, or no request key */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -32042,7 +32098,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
-            /** @description Another file now sits at an old path, a file or track changed, none of the files are left in the recycle bin, or the library is busy; nothing was put back */
+            /** @description Another file now sits at an old path, a file or track changed, none of the files are left in the recycle bin, the library is busy, or the library is off; nothing was put back */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -32119,7 +32175,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
-            /** @description The library could not start a scan */
+            /** @description The library could not start a scan, or the library is off */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -32590,7 +32646,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
-            /** @description Library busy or a file is outside the library folders */
+            /** @description Library busy or off, or a file is outside the library folders */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -32933,6 +32989,11 @@ export interface operations {
                 q?: string;
                 /** @description `all`, `album_artists`, or `contributors`. Default `all`. */
                 scope?: string;
+                /**
+                 * @description Only the caller's favourites. Without `sort`, the newest favourite
+                 *     comes first, and `order=asc` puts the oldest first.
+                 */
+                favorites?: boolean;
             };
             header?: never;
             path?: never;
@@ -35286,7 +35347,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
-            /** @description Undo blocked for a file */
+            /** @description Undo blocked for a file, or the library is off */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -35482,7 +35543,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
-            /** @description Settings or library folders changed */
+            /** @description Settings or library folders changed, or the library is off */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -35551,7 +35612,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
-            /** @description The preview or settings changed */
+            /** @description The preview or settings changed, or the library is off */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -36243,7 +36304,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
-            /** @description Not a finished apply, or nothing to undo */
+            /** @description Not a finished apply, nothing to undo, or the library is off */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -36303,7 +36364,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
-            /** @description Settings or library policy changed since the page loaded */
+            /** @description Settings or library policy changed since the page loaded, or the library is off */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -36425,7 +36486,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
-            /** @description Preview expired, stale, or nothing to write */
+            /** @description Preview expired, stale, or nothing to write, or the library is off */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -36846,7 +36907,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
-            /** @description Settings or library folders changed */
+            /** @description Settings or library folders changed, or the library is off */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -37442,6 +37503,15 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
+            /** @description The library is off */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
             /** @description The server is busy; try again */
             503: {
                 headers: {
@@ -37758,7 +37828,7 @@ export interface operations {
             query?: {
                 /**
                  * @description `pending` (default), `approved`, `rejected`, `dismissed`,
-                 *     `excluded` or `all`.
+                 *     `excluded`, `resolved` (approved or dismissed) or `all`.
                  */
                 state?: string;
                 /** @description Only this album's reviews. */
@@ -37791,11 +37861,8 @@ export interface operations {
                 updated_to?: number;
                 /** @description Only reviews that list at least one release. */
                 with_candidates?: boolean;
-                /**
-                 * @description `newest` (default) or `oldest` change first, or `tracks` for the
-                 *     albums with the most files first.
-                 */
-                sort?: string;
+                /** @description Sort order; newest change first by default. */
+                sort?: components["schemas"]["ReviewSort"];
                 /** @description Page size, 1 to 200 (default 50); more is read as 200. */
                 limit?: number;
                 /** @description `next_cursor` from the previous page. */
@@ -37849,7 +37916,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description What changed and what did not */
+            /** @description The job, and the reviews the preview left alone */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -37947,6 +38014,116 @@ export interface operations {
             };
         };
     };
+    list_review_jobs: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Review jobs */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ReviewJobsResponse"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Curator role required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    control_review_job: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Review job id */
+                job_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ReviewJobControlBody"];
+            };
+        };
+        responses: {
+            /** @description The review job */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OperationView"];
+                };
+            };
+            /** @description Bad body */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Curator role required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Unknown review job */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description A stopped job can't be resumed (REVIEW_JOB_STOPPED) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
     retry_pending_reviews: {
         parameters: {
             query?: never;
@@ -37960,13 +38137,22 @@ export interface operations {
             };
         };
         responses: {
-            /** @description What started and what did not */
+            /** @description The job, or what would start */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
                     "application/json": components["schemas"]["ReviewRetryAllResponse"];
+                };
+            };
+            /** @description Unknown filter value, folder or sub-folder */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
             /** @description Not authenticated */
@@ -38469,7 +38655,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
-            /** @description Review already settled or changed since it was read (STALE_REVISION), album excluded, or needs the Local metadata confirmation */
+            /** @description Review already settled or changed since it was read (STALE_REVISION), album excluded (ALBUM_EXCLUDED), needs the Local metadata confirmation (LOCAL_METADATA_NEEDS_CONFIRMATION), keeps its own tags in a managed folder (LOCAL_METADATA_MANAGED), has an edition someone chose (EDITION_IS_CHOSEN), or the idempotency key started another album's job (CONTROL_KEY_REUSED) */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -39160,6 +39346,11 @@ export interface operations {
                 artist_id?: string;
                 /** @description Restrict to one genre tag, case folded. */
                 genre?: string;
+                /**
+                 * @description Only the caller's favourites. Without `sort`, the newest favourite
+                 *     comes first, and `order=asc` puts the oldest first.
+                 */
+                favorites?: boolean;
             };
             header?: never;
             path?: never;
@@ -39429,7 +39620,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
-            /** @description Library busy or the file is outside the library folders */
+            /** @description Library busy or off, or the file is outside the library folders */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -39868,7 +40059,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["PluginConnectionStatus"];
+                    "application/json": components["schemas"]["ListeningLinkStatus"];
                 };
             };
             /** @description Not authenticated */
@@ -39910,7 +40101,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["PluginConnectionStatus"];
+                    "application/json": components["schemas"]["ListeningLinkStatus"];
                 };
             };
             /** @description Username required or credential rejected */
@@ -39933,6 +40124,15 @@ export interface operations {
             };
             /** @description ListenBrainz is rate-limiting */
             429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description The server is busy; try again */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -39971,6 +40171,15 @@ export interface operations {
             };
             /** @description No link */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description The server is busy; try again */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -40141,6 +40350,15 @@ export interface operations {
             };
             /** @description Not authenticated */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description The server is busy; try again */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -43594,7 +43812,10 @@ export interface operations {
                 page?: number;
                 /** @description Rows per page (1..=100). */
                 page_size?: number;
-                /** @description Status filter. */
+                /**
+                 * @description Status filter: a request status, or `reimportable` (admins only)
+                 *     for the failed requests whose downloaded files can be imported again.
+                 */
                 status?: string;
                 /** @description `newest` (default), `oldest`, or `status`. */
                 sort?: string;
@@ -45299,7 +45520,7 @@ export interface operations {
                     "application/json": components["schemas"]["LibraryManagementSettingsResponse"];
                 };
             };
-            /** @description Missing confirmation or proof */
+            /** @description Missing confirmation or proof, or a dry run token that is not valid */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -45415,7 +45636,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
-            /** @description Settings or library folders changed */
+            /** @description Settings or library folders changed, or the library is off */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -46546,6 +46767,15 @@ export interface operations {
             };
             /** @description Probe failed */
             502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description MusicBrainz is down (PROVIDER_UNAVAILABLE, with retry_after when known) */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -47715,6 +47945,15 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
+            /** @description YouTube is down or its daily quota is spent (PROVIDER_UNAVAILABLE, with retry_after) */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
         };
     };
     generate_track_link: {
@@ -47786,6 +48025,15 @@ export interface operations {
             };
             /** @description YouTube failed */
             502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description YouTube is down or its daily quota is spent (PROVIDER_UNAVAILABLE, with retry_after) */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };

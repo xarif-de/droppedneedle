@@ -13,8 +13,8 @@ use droppedneedle_library::corrections::continuation::CURRENT_TRACK;
 use rusqlite::types::Value;
 
 use super::definitions::{
-    copy_order, live_album, musicbrainz, owned_album, owned_artist, owned_release_groups,
-    recording_mbid,
+    copy_order, listed_album, live_album, live_track, musicbrainz, owned_album, owned_artist,
+    owned_release_groups, recording_mbid,
 };
 use super::player::{
     AlbumKey, AlbumSequence, AlbumShape, HistoryKey, ItemKind, KeyedBy, PlayedFilter, TextMatch,
@@ -57,11 +57,11 @@ droppedneedle_kernel::sql! {
         " LEFT JOIN local_album_artwork w ON w.local_album_id = a.id \
          LEFT JOIN local_tracks t ON t.local_album_id = a.id AND t.availability = 'indexed'"
     ));
-    /// The album list's filters, shared by its page and its count: live
+    /// The album list's filters, shared by its page and its count: listed
     /// albums, with or without files. Binds: the pattern three times, the
     /// artist twice, the decade three times, the format twice.
     pub(crate) fragment ALBUM_FILTER = (concat!(
-        live_album!("a"),
+        listed_album!("a"),
         " AND (? IS NULL OR a.title_folded LIKE ? ESCAPE '\\' \
          OR a.album_artist_name_folded LIKE ? ESCAPE '\\') \
          AND (? IS NULL OR a.album_artist_id = ?) \
@@ -80,6 +80,17 @@ droppedneedle_kernel::sql! {
     family ALBUM_ROWS = album_rows;
     /// The album list's total.
     pub(crate) ALBUM_COUNT = "SELECT COUNT(*) FROM local_albums a WHERE " + ALBUM_FILTER;
+    /// One user's (bound) favourite albums `a`, read from the favourites
+    /// `fav` first: a handful of hearts never walks the whole catalog.
+    pub(crate) fragment FAVORITE_ALBUMS = "library_user_favorites fav CROSS JOIN local_albums a \
+        ON a.id = fav.item_id AND fav.item_kind = 'album' AND fav.user_id = ?";
+    /// One page of a user's favourite albums, as [`ALBUM_PAGE`] with the
+    /// user bound first.
+    family FAVORITE_ALBUM_PAGE = favorite_album_page;
+    /// How many of the album list a user favorited: the user, then the
+    /// filter.
+    pub(crate) FAVORITE_ALBUM_COUNT = "SELECT COUNT(*) FROM " + FAVORITE_ALBUMS + " WHERE "
+        + ALBUM_FILTER;
     /// One live album by id.
     pub(crate) ALBUM_BY_ID = "SELECT " + ALBUM_COLUMNS + " " + ALBUM_JOINS
         + " WHERE a.id = ? AND " + (live_album!("a")) + " GROUP BY a.id";
@@ -99,18 +110,18 @@ droppedneedle_kernel::sql! {
     pub(crate) ALBUM_BY_GROUP = "SELECT " + ALBUM_COLUMNS + " " + ALBUM_JOINS
         + " WHERE ae.release_group_mbid = ? AND " + (live_album!("a"))
         + " GROUP BY a.id ORDER BY " + (copy_order!("a")) + " LIMIT 1";
-    /// Other live albums of an album's release group, oldest first.
+    /// Other listed albums of an album's release group, oldest first.
     pub(crate) ALBUM_COPIES = "SELECT " + ALBUM_COLUMNS + " " + ALBUM_JOINS
         + " WHERE ae.release_group_mbid = \
         (SELECT i.release_group_mbid FROM local_album_external_identities i \
          WHERE i.local_album_id = ? AND " + (musicbrainz!("i")) + ") \
-        AND a.id != ? AND " + (live_album!("a"))
+        AND a.id != ? AND " + (listed_album!("a"))
         + " GROUP BY a.id ORDER BY a.created_at ASC, a.id ASC";
-    /// A page of the live albums an artist leads, by title.
+    /// A page of the listed albums an artist leads, by title.
     family LED_ALBUM_PAGE = led_album_page;
-    /// How many live albums an artist leads.
+    /// How many listed albums an artist leads.
     pub(crate) LED_ALBUM_COUNT = "SELECT COUNT(*) FROM local_albums a \
-        WHERE a.album_artist_id = ? AND " + (live_album!("a"));
+        WHERE a.album_artist_id = ? AND " + (listed_album!("a"));
     /// Live albums an artist (bound twice) appears on without leading,
     /// reached from the artist's credits.
     pub(crate) fragment APPEARANCE_FILTER = (concat!(
@@ -158,8 +169,9 @@ droppedneedle_kernel::sql! {
     /// row, so pages keep walking their driving index. The track artist's
     /// MusicBrainz id falls back to the album artist's when the track
     /// carries no credit.
-    pub(crate) fragment TRACK_JOINS = "FROM local_tracks t \
-        LEFT JOIN local_track_artists ta \
+    pub(crate) fragment TRACK_JOINS = "FROM local_tracks t " + TRACK_LOOKUPS;
+    /// The lookups of [`TRACK_JOINS`] after the track table `t`.
+    pub(crate) fragment TRACK_LOOKUPS = "LEFT JOIN local_track_artists ta \
             ON ta.local_track_id = t.id AND ta.position = 0 \
         LEFT JOIN local_album_artwork w ON w.local_album_id = t.local_album_id \
         LEFT JOIN local_albums tal ON tal.id = t.local_album_id \
@@ -180,9 +192,11 @@ droppedneedle_kernel::sql! {
         AND (? IS NULL OR EXISTS (SELECT 1 FROM local_track_genres g \
         WHERE g.local_track_id = t.id AND g.folded_name = ?) \
         OR t.genre_folded = ?)";
+    /// A live track `t`: indexed, on a live album.
+    pub(crate) fragment LIVE_TRACK = (live_track!("t"));
     /// The track list's text filter as a substring match: the pattern four
     /// times.
-    pub(crate) fragment TRACK_LIKE = "t.availability = 'indexed' \
+    pub(crate) fragment TRACK_LIKE = LIVE_TRACK + " \
         AND (? IS NULL OR t.title_folded LIKE ? ESCAPE '\\' \
         OR t.artist_name_folded LIKE ? ESCAPE '\\' \
         OR t.album_title_folded LIKE ? ESCAPE '\\')";
@@ -207,16 +221,31 @@ droppedneedle_kernel::sql! {
         + TRACK_SCOPE;
     /// The track list's total on the FTS index.
     family TRACK_COUNT_WORDS = track_count_words;
+    /// One user's (bound) favourite tracks `t`, read from the favourites
+    /// `fav` first: a handful of hearts never walks the whole catalog.
+    pub(crate) fragment FAVORITE_TRACKS = "library_user_favorites fav CROSS JOIN local_tracks t \
+        ON t.id = fav.item_id AND fav.item_kind = 'track' AND fav.user_id = ?";
+    /// A page of a user's favourite tracks on the substring match, the user
+    /// bound first.
+    family FAVORITE_TRACK_PAGE_LIKE = favorite_track_page_like;
+    /// A page of a user's favourite tracks on the FTS index, the user bound
+    /// first.
+    family FAVORITE_TRACK_PAGE_WORDS = favorite_track_page_words;
+    /// How many of the track list a user favorited on the substring match.
+    pub(crate) FAVORITE_TRACK_COUNT_LIKE = "SELECT COUNT(*) FROM " + FAVORITE_TRACKS + " WHERE "
+        + TRACK_LIKE + TRACK_SCOPE;
+    /// How many of the track list a user favorited on the FTS index.
+    family FAVORITE_TRACK_COUNT_WORDS = favorite_track_count_words;
     /// Every indexed track, from the maintained per-format totals.
     pub(crate) TRACK_TOTAL = "SELECT COALESCE(SUM(indexed_tracks), 0) \
         FROM library_track_format_stats";
-    /// One indexed track by the id it has now.
+    /// One live track by the id it has now.
     pub(crate) TRACK_BY_ID = "SELECT " + TRACK_COLUMNS + " " + TRACK_JOINS
-        + " WHERE t.id = (" + CURRENT_TRACK + ") AND t.availability = 'indexed'";
-    /// Whether one indexed track's file carries lyrics.
+        + " WHERE t.id = (" + CURRENT_TRACK + ") AND " + LIVE_TRACK;
+    /// Whether one live track's file carries lyrics.
     pub(crate) TRACK_HAS_LYRICS = "SELECT EXISTS (SELECT 1 FROM local_tracks t \
         JOIN local_track_lyrics l ON l.local_track_id = t.id \
-        WHERE t.id = (" + CURRENT_TRACK + ") AND t.availability = 'indexed')";
+        WHERE t.id = (" + CURRENT_TRACK + ") AND " + LIVE_TRACK + ")";
     /// A page of an album's indexed tracks, disc and track order.
     pub(crate) ALBUM_TRACKS = "SELECT " + TRACK_COLUMNS + " " + TRACK_JOINS
         + " WHERE t.local_album_id = ? AND t.availability = 'indexed' \
@@ -226,8 +255,8 @@ droppedneedle_kernel::sql! {
         WHERE t.local_album_id = ? AND t.availability = 'indexed'";
     /// The indexed tracks of several albums, by album, disc and track.
     family ALBUM_TRACKS_IN = album_tracks_in;
-    /// One genre (bound twice) on indexed tracks.
-    pub(crate) fragment GENRE_FILTER = "t.availability = 'indexed' AND \
+    /// One genre (bound twice) on live tracks.
+    pub(crate) fragment GENRE_FILTER = LIVE_TRACK + " AND \
         (EXISTS (SELECT 1 FROM local_track_genres g \
          WHERE g.local_track_id = t.id AND g.folded_name = ?) \
          OR t.genre_folded = ?)";
@@ -247,19 +276,18 @@ droppedneedle_kernel::sql! {
         COUNT(DISTINCT t.id) AS track_count, \
         COUNT(DISTINCT t.local_album_id) AS album_count \
         FROM tagged g JOIN local_tracks t ON t.id = g.track_id \
-        AND t.availability = 'indexed' \
+        AND " + LIVE_TRACK + " \
         GROUP BY g.folded ORDER BY track_count DESC, name ASC";
     /// The newest imports.
     pub(crate) NEWEST_TRACKS = "SELECT " + TRACK_COLUMNS + " " + TRACK_JOINS
-        + " WHERE t.availability = 'indexed' ORDER BY t.imported_at DESC, t.id ASC LIMIT ?";
+        + " WHERE " + LIVE_TRACK + " ORDER BY t.imported_at DESC, t.id ASC LIMIT ?";
     /// The oldest imports.
     pub(crate) OLDEST_TRACKS = "SELECT " + TRACK_COLUMNS + " " + TRACK_JOINS
-        + " WHERE t.availability = 'indexed' ORDER BY t.imported_at ASC, t.id ASC LIMIT ?";
-    /// A uniform random pick of indexed track ids, optionally from one
+        + " WHERE " + LIVE_TRACK + " ORDER BY t.imported_at ASC, t.id ASC LIMIT ?";
+    /// A uniform random pick of live track ids, optionally from one
     /// decade (bound three times).
-    pub(crate) RANDOM_TRACK_IDS = "SELECT t.id FROM local_tracks t \
-        WHERE t.availability = 'indexed' \
-        AND (? IS NULL OR (t.year >= ? AND t.year < ? + 10)) \
+    pub(crate) RANDOM_TRACK_IDS = "SELECT t.id FROM local_tracks t WHERE " + LIVE_TRACK
+        + " AND (? IS NULL OR (t.year >= ? AND t.year < ? + 10)) \
         ORDER BY RANDOM() LIMIT ?";
     /// The track projection for picked ids.
     family TRACKS_IN = tracks_in;
@@ -271,9 +299,10 @@ droppedneedle_kernel::sql! {
         e.provider_artist_id AS artist_mbid, (e.local_artist_id IS NOT NULL) AS linked, \
         r.created_at AS date_added";
     /// The artist projection's joins.
-    pub(crate) fragment ARTIST_JOINS = (concat!(
-        "FROM local_artists r \
-         LEFT JOIN local_artist_external_identities e ON e.local_artist_id = r.id AND ",
+    pub(crate) fragment ARTIST_JOINS = "FROM local_artists r " + ARTIST_IDENTITY;
+    /// The artist `r`'s MusicBrainz link, `e`.
+    pub(crate) fragment ARTIST_IDENTITY = (concat!(
+        "LEFT JOIN local_artist_external_identities e ON e.local_artist_id = r.id AND ",
         musicbrainz!("e")
     ));
     /// Artists leading at least one owned album.
@@ -301,11 +330,15 @@ droppedneedle_kernel::sql! {
         owned_album!("la"),
         "))"
     ));
-    /// Artists leading an album or credited on an indexed track, with the
+    /// Artists leading an album or credited on a live track, with the
     /// leading half written `(LED)`.
-    pub(crate) fragment WITH_MUSIC_PREDICATE = "((LED) OR EXISTS (SELECT 1 \
-        FROM local_track_artists lta JOIN local_tracks lt ON lt.id = lta.local_track_id \
-        WHERE lta.local_artist_id = r.id AND lt.availability = 'indexed'))";
+    pub(crate) fragment WITH_MUSIC_PREDICATE = (concat!(
+        "((LED) OR EXISTS (SELECT 1 \
+         FROM local_track_artists lta JOIN local_tracks lt ON lt.id = lta.local_track_id \
+         WHERE lta.local_artist_id = r.id AND ",
+        live_track!("lt"),
+        "))"
+    ));
     /// One page of artist keys in a scope, one statement per scope, sort
     /// and direction, from the start or after a cursor.
     family ARTIST_PAGE = artist_page;
@@ -319,15 +352,31 @@ droppedneedle_kernel::sql! {
     /// Indexed credited tracks, appearance albums and appearance tracks per
     /// artist id.
     family ARTIST_CREDIT_COUNTS = artist_credit_counts;
-    /// The artist list's totals: credited, leading and contributing artists
-    /// matching the name filter (bound twice).
-    pub(crate) ARTIST_TOTALS = "SELECT \
+    /// Credited, leading and contributing artists among the rows read.
+    pub(crate) fragment ARTIST_TOTAL_COLUMNS = "SELECT \
         COALESCE(SUM(CASE WHEN " + CREDITED_PREDICATE + " THEN 1 ELSE 0 END), 0) AS total, \
         COALESCE(SUM(CASE WHEN " + LED_PREDICATE + " THEN 1 ELSE 0 END), 0) AS led, \
         COALESCE(SUM(CASE WHEN NOT (" + LED_PREDICATE + ") AND (" + CREDITED_PREDICATE
-        + ") THEN 1 ELSE 0 END), 0) AS contributors " + ARTIST_JOINS
-        + " WHERE r.retired_into_artist_id IS NULL \
+        + ") THEN 1 ELSE 0 END), 0) AS contributors ";
+    /// Live artists matching the name filter (bound twice).
+    pub(crate) fragment ARTIST_NAME_FILTER = " WHERE r.retired_into_artist_id IS NULL \
         AND (? IS NULL OR r.folded_name LIKE ? ESCAPE '\\')";
+    /// The artist list's totals: credited, leading and contributing artists
+    /// matching the name filter (bound twice).
+    pub(crate) ARTIST_TOTALS = ARTIST_TOTAL_COLUMNS + ARTIST_JOINS + ARTIST_NAME_FILTER;
+    /// One user's (bound) favourite artists `r`, read from the favourites
+    /// `fav` first.
+    pub(crate) fragment FAVORITE_ARTISTS = "library_user_favorites fav CROSS JOIN local_artists r \
+        ON r.id = fav.item_id AND fav.item_kind = 'artist' AND fav.user_id = ?";
+    /// The artist list's totals among a user's favourites: the user, then
+    /// the name filter.
+    pub(crate) FAVORITE_ARTIST_TOTALS = ARTIST_TOTAL_COLUMNS + "FROM " + FAVORITE_ARTISTS + " "
+        + ARTIST_IDENTITY + ARTIST_NAME_FILTER;
+    /// One page of a user's favourite artists in a scope, the user bound
+    /// first.
+    family FAVORITE_ARTIST_PAGE = favorite_artist_page;
+    /// How many of a user's favourite artists one scope holds.
+    family FAVORITE_ARTIST_SCOPE_COUNT = favorite_artist_scope_count;
     /// How many artists of one scope match the name filter.
     family ARTIST_SCOPE_COUNT = artist_scope_count;
     /// One live artist by id.
@@ -907,21 +956,42 @@ pub(crate) fn album_keys(sort: AlbumSort, descending: bool) -> Vec<OrderKey> {
             ("a.id", d),
         ],
         AlbumSort::Random => vec![(shuffle_key!("a.rowid"), false), ("a.id", false)],
+        AlbumSort::Favorited => vec![("fav.created_at", d), ("a.id", d)],
     }
 }
 
 /// One page of album keys: filtering and ordering touch albums only, so the
 /// track aggregation runs over the page, never the catalog. A random page
-/// binds the seed first, then the filter, the cursor and the limit.
+/// binds the seed first, then the filter, the cursor and the limit; the
+/// favourites order binds the user first.
 pub(crate) fn album_page(sort: AlbumSort, descending: bool, after_cursor: bool) -> String {
+    album_list_page(sort, descending, after_cursor, false)
+}
+
+/// [`album_page`] over one user's favourites, the user bound first.
+pub(crate) fn favorite_album_page(sort: AlbumSort, descending: bool, after_cursor: bool) -> String {
+    album_list_page(sort, descending, after_cursor, true)
+}
+
+fn album_list_page(
+    sort: AlbumSort,
+    descending: bool,
+    after_cursor: bool,
+    favorites: bool,
+) -> String {
     let keys = album_keys(sort, descending);
+    let albums = if favorites || sort == AlbumSort::Favorited {
+        FAVORITE_ALBUMS
+    } else {
+        "local_albums a"
+    };
     let seed = if sort == AlbumSort::Random {
         SHUFFLE_SEED
     } else {
         ""
     };
     format!(
-        "SELECT {} FROM local_albums a{seed} WHERE {ALBUM_FILTER}{} ORDER BY {} LIMIT ?",
+        "SELECT {} FROM {albums}{seed} WHERE {ALBUM_FILTER}{} ORDER BY {} LIMIT ?",
         key_columns(&keys),
         after(&keys, after_cursor),
         order_by(&keys)
@@ -933,15 +1003,15 @@ pub(crate) fn title_keys() -> Vec<OrderKey> {
     vec![("a.title_folded", false), ("a.id", false)]
 }
 
-/// A page of the live albums an artist leads: the artist, the cursor, the
-/// limit.
+/// A page of the listed albums an artist leads: the artist, the cursor,
+/// the limit.
 pub(crate) fn led_album_page(after_cursor: bool) -> String {
     let keys = title_keys();
     format!(
         "SELECT {} FROM local_albums a WHERE a.album_artist_id = ? AND {}{} \
          ORDER BY {} LIMIT ?",
         key_columns(&keys),
-        live_album!("a"),
+        listed_album!("a"),
         after(&keys, after_cursor),
         order_by(&keys)
     )
@@ -990,15 +1060,22 @@ pub(crate) fn track_keys(sort: TrackSort, descending: bool) -> Vec<OrderKey> {
             ("t.id", false),
         ],
         TrackSort::Random => vec![(shuffle_key!("t.search_key"), false), ("t.id", false)],
+        TrackSort::Favorited => vec![("fav.created_at", d), ("t.id", d)],
     }
 }
 
-/// The track joins, with the seed row for a random order.
-fn track_from(sort: TrackSort) -> String {
-    if sort == TrackSort::Random {
-        format!("{TRACK_JOINS}{SHUFFLE_SEED}")
+/// The track joins, narrowed to one user's favourites when asked or when
+/// the order needs them, with the seed row for a random order.
+fn track_from(sort: TrackSort, favorites: bool) -> String {
+    let seed = if sort == TrackSort::Random {
+        SHUFFLE_SEED
     } else {
-        TRACK_JOINS.to_owned()
+        ""
+    };
+    if favorites || sort == TrackSort::Favorited {
+        format!("FROM {FAVORITE_TRACKS} {TRACK_LOOKUPS}{seed}")
+    } else {
+        format!("{TRACK_JOINS}{seed}")
     }
 }
 
@@ -1006,19 +1083,38 @@ fn track_from(sort: TrackSort) -> String {
 /// each of `short` words three times.
 fn track_words(short: ListLen) -> String {
     format!(
-        "t.availability = 'indexed' AND {TRACK_TEXT_MATCH}{}",
+        "{LIVE_TRACK} AND {TRACK_TEXT_MATCH}{}",
         TRACK_WORD_LIKE.repeat(short.get())
     )
 }
 
-/// A page of the track list on the substring match: the seed of a random
-/// order, the filter, the cursor, the limit.
+/// A page of the track list on the substring match: the user of the
+/// favourites order, the seed of a random order, the filter, the cursor,
+/// the limit.
 pub(crate) fn track_page_like(sort: TrackSort, descending: bool, after_cursor: bool) -> String {
+    track_list_like(sort, descending, after_cursor, false)
+}
+
+/// [`track_page_like`] over one user's favourites, the user bound first.
+pub(crate) fn favorite_track_page_like(
+    sort: TrackSort,
+    descending: bool,
+    after_cursor: bool,
+) -> String {
+    track_list_like(sort, descending, after_cursor, true)
+}
+
+fn track_list_like(
+    sort: TrackSort,
+    descending: bool,
+    after_cursor: bool,
+    favorites: bool,
+) -> String {
     let keys = track_keys(sort, descending);
     format!(
         "SELECT {TRACK_COLUMNS}, {} {} WHERE {TRACK_LIKE}{TRACK_SCOPE}{} ORDER BY {} LIMIT ?",
         key_columns(&keys),
-        track_from(sort),
+        track_from(sort, favorites),
         after(&keys, after_cursor),
         order_by(&keys)
     )
@@ -1031,11 +1127,31 @@ pub(crate) fn track_page_words(
     descending: bool,
     after_cursor: bool,
 ) -> String {
+    track_list_words(short, sort, descending, after_cursor, false)
+}
+
+/// [`track_page_words`] over one user's favourites, the user bound first.
+pub(crate) fn favorite_track_page_words(
+    short: ListLen,
+    sort: TrackSort,
+    descending: bool,
+    after_cursor: bool,
+) -> String {
+    track_list_words(short, sort, descending, after_cursor, true)
+}
+
+fn track_list_words(
+    short: ListLen,
+    sort: TrackSort,
+    descending: bool,
+    after_cursor: bool,
+    favorites: bool,
+) -> String {
     let keys = track_keys(sort, descending);
     format!(
         "SELECT {TRACK_COLUMNS}, {} {} WHERE {}{TRACK_SCOPE}{} ORDER BY {} LIMIT ?",
         key_columns(&keys),
-        track_from(sort),
+        track_from(sort, favorites),
         track_words(short),
         after(&keys, after_cursor),
         order_by(&keys)
@@ -1050,6 +1166,14 @@ pub(crate) fn track_count_words(short: ListLen) -> String {
     )
 }
 
+/// [`track_count_words`] over one user's favourites, the user bound first.
+pub(crate) fn favorite_track_count_words(short: ListLen) -> String {
+    format!(
+        "SELECT COUNT(*) FROM {FAVORITE_TRACKS} WHERE {}{TRACK_SCOPE}",
+        track_words(short)
+    )
+}
+
 /// The indexed tracks of `ids` albums, by album, disc and track.
 pub(crate) fn album_tracks_in(ids: ListLen) -> String {
     format!(
@@ -1060,11 +1184,11 @@ pub(crate) fn album_tracks_in(ids: ListLen) -> String {
     )
 }
 
-/// The track projection for `ids` indexed tracks.
+/// The track projection for `ids` live tracks.
 pub(crate) fn tracks_in(ids: ListLen) -> String {
     format!(
         "SELECT {TRACK_COLUMNS} {TRACK_JOINS} \
-         WHERE t.availability = 'indexed' AND t.id IN ({})",
+         WHERE {LIVE_TRACK} AND t.id IN ({})",
         marks(ids)
     )
 }
@@ -1100,6 +1224,7 @@ pub(crate) fn artist_keys(scope: ArtistScope, sort: ArtistSort, descending: bool
     let count = match (sort, d, walk) {
         (ArtistSort::Name, ..) => return vec![("r.folded_name", d), ("r.id", d)],
         (ArtistSort::DateAdded, ..) => return vec![("r.created_at", d), ("r.id", d)],
+        (ArtistSort::Favorited, ..) => return vec![("fav.created_at", d), ("r.id", d)],
         (ArtistSort::AlbumCount, true, true) => "s.album_count_neg",
         (ArtistSort::AlbumCount, false, true) => "s.album_count",
         (ArtistSort::AppearanceCount, true, true) => "s.appearance_count_neg",
@@ -1161,12 +1286,45 @@ pub(crate) fn artist_page(
             order_by(&keys)
         );
     }
+    artist_list_page(scope, sort, descending, after_cursor, false)
+}
+
+/// The order of a user's favourite artists: [`artist_keys`] off the kept
+/// counts, since the favourites drive the walk.
+pub(crate) fn favorite_artist_keys(sort: ArtistSort, descending: bool) -> Vec<OrderKey> {
+    artist_keys(ArtistScope::WithMusic, sort, descending)
+}
+
+/// One page of a user's favourite artists in a scope: the user, the name
+/// filter (bound twice), the cursor, the limit. Ordered by
+/// [`favorite_artist_keys`].
+pub(crate) fn favorite_artist_page(
+    scope: ArtistScope,
+    sort: ArtistSort,
+    descending: bool,
+    after_cursor: bool,
+) -> String {
+    artist_list_page(scope, sort, descending, after_cursor, true)
+}
+
+fn artist_list_page(
+    scope: ArtistScope,
+    sort: ArtistSort,
+    descending: bool,
+    after_cursor: bool,
+    favorites: bool,
+) -> String {
+    let keys = if favorites {
+        favorite_artist_keys(sort, descending)
+    } else {
+        artist_keys(scope, sort, descending)
+    };
     format!(
-        "SELECT {} FROM local_artists r{} \
+        "SELECT {} FROM {} \
          WHERE r.retired_into_artist_id IS NULL AND ({}) \
          AND (? IS NULL OR r.folded_name LIKE ? ESCAPE '\\'){} ORDER BY {} LIMIT ?",
         key_columns(&keys),
-        counts_join(sort),
+        artist_from(sort, favorites),
         artist_scope_predicate(scope),
         after(&keys, after_cursor),
         order_by(&keys)
@@ -1177,32 +1335,46 @@ pub(crate) fn artist_page(
 /// the name filter (bound twice), the limit, the offset.
 pub(crate) fn artist_offset_page(scope: ArtistScope, sort: ArtistSort, descending: bool) -> String {
     format!(
-        "SELECT r.id FROM local_artists r{} \
+        "SELECT r.id FROM {} \
          WHERE r.retired_into_artist_id IS NULL AND ({}) \
          AND (? IS NULL OR r.folded_name LIKE ? ESCAPE '\\') ORDER BY {} LIMIT ? OFFSET ?",
-        counts_join(sort),
+        artist_from(sort, false),
         artist_scope_predicate(scope),
         order_by(&artist_keys(ArtistScope::WithMusic, sort, descending))
     )
 }
 
-/// The kept counts joined to the artist `r`, for a count sort that does
+/// The artists `r` a page reads: one user's favourites when asked or when
+/// the order needs them, with the kept counts for a count sort that does
 /// not walk them.
-fn counts_join(sort: ArtistSort) -> &'static str {
-    match sort {
+fn artist_from(sort: ArtistSort, favorites: bool) -> String {
+    let artists = if favorites || sort == ArtistSort::Favorited {
+        FAVORITE_ARTISTS
+    } else {
+        "local_artists r"
+    };
+    let counts = match sort {
         ArtistSort::AlbumCount | ArtistSort::AppearanceCount => {
             " LEFT JOIN library_artist_counts s ON s.local_artist_id = r.id"
         }
-        ArtistSort::Name | ArtistSort::DateAdded => "",
-    }
+        ArtistSort::Name | ArtistSort::DateAdded | ArtistSort::Favorited => "",
+    };
+    format!("{artists}{counts}")
 }
 
 /// How many artists of one scope match the name filter (bound twice).
 pub(crate) fn artist_scope_count(scope: ArtistScope) -> String {
     format!(
-        "SELECT COUNT(*) {ARTIST_JOINS} \
-         WHERE r.retired_into_artist_id IS NULL AND ({}) \
-         AND (? IS NULL OR r.folded_name LIKE ? ESCAPE '\\')",
+        "SELECT COUNT(*) {ARTIST_JOINS}{ARTIST_NAME_FILTER} AND ({})",
+        artist_scope_predicate(scope)
+    )
+}
+
+/// [`artist_scope_count`] among one user's favourites, the user bound
+/// first.
+pub(crate) fn favorite_artist_scope_count(scope: ArtistScope) -> String {
+    format!(
+        "SELECT COUNT(*) FROM {FAVORITE_ARTISTS} {ARTIST_IDENTITY}{ARTIST_NAME_FILTER} AND ({})",
         artist_scope_predicate(scope)
     )
 }
@@ -1485,11 +1657,11 @@ fn track_count(shape: TrackShape, key: TrackKey) -> String {
     )
 }
 
-/// The player projection for `ids` streamable tracks.
+/// The player projection for `ids` streamable tracks on live albums.
 pub(crate) fn player_tracks_in(ids: ListLen) -> String {
     format!(
         "SELECT {PLAYER_TRACK_COLUMNS} {PLAYER_TRACK_JOINS} \
-         WHERE t.availability = 'indexed' AND t.id IN ({})",
+         WHERE {LIVE_TRACK} AND t.id IN ({})",
         marks(ids)
     )
 }
@@ -1937,21 +2109,22 @@ pub(crate) fn player_artist_ids(ids: ListLen) -> String {
 }
 
 /// Tag ids of `ids` artists (the ids bound twice): the id each credit of
-/// an indexed track or a live album took from its file, set by the scan
+/// a live track or a live album took from its file, set by the scan
 /// only where the file pairs its artist names and ids one for one. The
 /// credits lead, so a chunk never walks the tracks.
 pub(crate) fn artist_tag_ids(ids: ListLen) -> String {
+    let live_album = live_album!("a");
     let ids = marks(ids);
     format!(
         "SELECT ta.local_artist_id, ta.artist_mbid \
          FROM local_track_artists ta CROSS JOIN local_tracks t \
          WHERE ta.local_artist_id IN ({ids}) AND ta.artist_mbid IS NOT NULL \
-         AND t.id = ta.local_track_id AND t.availability = 'indexed' \
+         AND t.id = ta.local_track_id AND {LIVE_TRACK} \
          UNION ALL \
          SELECT aa.local_artist_id, aa.artist_mbid \
          FROM local_album_artists aa CROSS JOIN local_albums a \
          WHERE aa.local_artist_id IN ({ids}) AND aa.artist_mbid IS NOT NULL \
-         AND a.id = aa.local_album_id AND a.retired_into_album_id IS NULL"
+         AND a.id = aa.local_album_id AND {live_album}"
     )
 }
 

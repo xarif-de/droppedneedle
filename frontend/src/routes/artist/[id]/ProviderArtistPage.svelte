@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { ApiError } from '$lib/api/client';
+	import { ApiError } from '$lib/api/errors';
 	import { useDiscoverActivity } from '$lib/queries/discover/DiscoverDemand.svelte';
 	import ArtistHeaderSkeleton from '$lib/components/ArtistHeaderSkeleton.svelte';
 	import AlbumGridSkeleton from '$lib/components/AlbumGridSkeleton.svelte';
@@ -29,11 +29,10 @@
 		getBasicArtistQuery,
 		getExtendedArtistQuery,
 		getSimilarArtistsQuery,
+		refreshArtist,
 		updateArtistReleaseInCache
 	} from '$lib/queries/artist/ArtistQueries.svelte';
 	import { getConnectionsQuery } from '$lib/queries/connections/ConnectionsQuery.svelte';
-	import { invalidateQueriesWithPersister } from '$lib/queries/QueryClient';
-	import { ArtistQueryKeyFactory } from '$lib/queries/artist/ArtistQueryKeyFactory';
 	import { PAGE_SOURCE_KEYS } from '$lib/constants';
 	import { PersistedState } from 'runed';
 	import SimpleSourceSwitcher from '$lib/components/SimpleSourceSwitcher.svelte';
@@ -47,6 +46,7 @@
 	import { mergeArtistReleasePages } from '$lib/queries/artist/artistReleasePages';
 	import { mergeArtistImages } from '$lib/queries/catalog/catalogAdapters';
 	import { getRatingsQuery, ratingOf, setRating } from '$lib/queries/ratings/RatingQueries.svelte';
+	import { setFavorite } from '$lib/queries/library/FavoriteMutations.svelte';
 
 	interface Props {
 		data: { artistId: string; primarySource: MusicSource };
@@ -60,6 +60,7 @@
 		localArtist ? { artistIds: [localArtist.id] } : null
 	);
 	const rate = setRating();
+	const heart = setFavorite();
 
 	// svelte-ignore state_referenced_locally
 	let activeSource = new PersistedState<MusicSource>(
@@ -236,7 +237,7 @@
 	);
 
 	async function handleRefreshClick() {
-		invalidateQueriesWithPersister({ queryKey: ArtistQueryKeyFactory.basic(data.artistId) });
+		void refreshArtist(data.artistId);
 	}
 
 	const providerReleaseRequest = requestAlbum();
@@ -267,7 +268,7 @@
 	}
 
 	function handleReleaseRemoved() {
-		void invalidateQueriesWithPersister({ queryKey: ArtistQueryKeyFactory.basic(data.artistId) });
+		void refreshArtist(data.artistId);
 	}
 
 	function handleLoadMoreReleases() {
@@ -381,6 +382,10 @@
 						rating={localArtist ? ratingOf(ratingsQuery.data, 'artist', localArtist.id) : 0}
 						onrate={localArtist
 							? (rating) => rate.mutate({ kind: 'artist', itemId: localArtist.id, rating })
+							: undefined}
+						favorite={localArtist?.favorite ?? false}
+						onfavorite={localArtist
+							? (favorited) => heart.mutate({ kind: 'artist', itemId: localArtist.id, favorited })
 							: undefined}
 					/>
 

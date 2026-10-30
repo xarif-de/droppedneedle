@@ -33,16 +33,11 @@ export type ArtistCreditSettings = components['schemas']['ArtistCreditSettings']
 
 export type RelationshipCreditSettings = components['schemas']['RelationshipCreditSettings'];
 
-export type FormatCompatibilitySettings = components['schemas']['FormatCompatibilitySettings'];
-
 export type MetadataManagementSettings = components['schemas']['MetadataManagementSettings'];
 
 export type GenreAliasSettings = components['schemas']['GenreAlias'];
 
 export type GenreManagementSettings = components['schemas']['GenreManagementSettings'];
-
-export type ArtworkProvider = components['schemas']['ArtworkProvider'];
-export type ArtworkImageType = components['schemas']['ArtworkImageType'];
 
 export type ArtworkManagementSettings = components['schemas']['ArtworkManagementSettings'];
 
@@ -50,8 +45,6 @@ export type PathCompatibilitySettings = components['schemas']['PathCompatibility
 
 export type OrganizationManagementSettings =
 	components['schemas']['OrganizationManagementSettings'];
-
-export type FileBehaviorSettings = components['schemas']['FileBehaviorSettings'];
 
 export type EnrichmentManagementSettings = components['schemas']['EnrichmentManagementSettings'];
 
@@ -214,18 +207,10 @@ export interface LibraryManagementPreviewDetailResponse {
 	undo_expired_count: number;
 	undo_expires_at: number | null;
 	baseline_available_count: number;
-	external_refreshes: LibraryManagementExternalRefreshDelivery[];
+	external_refreshes: LibraryManagementExternalRefresh[];
 }
 
-export interface LibraryManagementExternalRefreshDelivery {
-	target: 'plex' | 'jellyfin' | 'navidrome';
-	state: 'pending' | 'delivering' | 'retry_wait' | 'succeeded' | 'failed' | 'unavailable';
-	attempts: number;
-	max_attempts: number;
-	failure_code: string | null;
-	updated_at: number;
-	completed_at: number | null;
-}
+export type LibraryManagementExternalRefresh = components['schemas']['ExternalRefresh'];
 
 export interface LibraryManagementPlanItem {
 	ordinal: number;
@@ -459,6 +444,8 @@ export interface LibraryManagementNeedsAttentionBundle {
 	file_count?: number;
 	// A few of the paths the write was putting files at.
 	sample_paths?: string[];
+	// The folders it took its files from, relative to their library folder.
+	source_folders?: string[];
 }
 
 export interface LibraryManagementImportBundleResolveResponse {

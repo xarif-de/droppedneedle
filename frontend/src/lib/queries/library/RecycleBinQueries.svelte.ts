@@ -1,11 +1,17 @@
-import { createInfiniteQuery, createMutation, createQuery } from '@tanstack/svelte-query';
+import { createInfiniteQuery, createQuery } from '@tanstack/svelte-query';
 
 import { api } from '$lib/api/client';
 import type { components } from '$lib/api/v3/openapi';
-import { invalidateQueriesWithPersister } from '$lib/queries/QueryClient';
 import { authStore } from '$lib/stores/authStore.svelte';
 import { LibraryQueryKeyFactory } from './LibraryQueryKeyFactory';
 import { LibraryV3Api } from './LibraryV3Api';
+import { STALE_LIVE } from '$lib/queries/staleTime';
+import {
+	applyEffects,
+	createAppMutation,
+	recycleBinChanged,
+	recycleBinStatusChanged
+} from '$lib/queries/effects';
 
 export type BinRemoval = components['schemas']['Page_BinRemovalView']['items'][number];
 export type RecycleBinPage = components['schemas']['RecycleBinPage'];
@@ -23,7 +29,7 @@ export const getRecycleBinQuery = () =>
 		enabled: authStore.isAdmin,
 		initialPageParam: null as string | null,
 		queryFn: ({ pageParam, signal }) =>
-			api.global.v3.GET(LibraryV3Api.recycleBin(pageParam, PAGE_SIZE), { signal }),
+			api.v3.GET(LibraryV3Api.recycleBin(pageParam, PAGE_SIZE), { signal }),
 		getNextPageParam: (lastPage: RecycleBinPage) => lastPage.next_cursor ?? undefined
 	}));
 
@@ -34,10 +40,10 @@ export const getRecycleBinSummaryQuery = (getOpen: () => boolean) =>
 	createQuery(() => ({
 		queryKey: LibraryQueryKeyFactory.catalog.recycleBinSummary(authStore.user?.id),
 		enabled: authStore.isAdmin && getOpen(),
-		staleTime: 0,
+		staleTime: STALE_LIVE,
 		gcTime: 0,
 		refetchOnWindowFocus: false,
-		queryFn: ({ signal }) => api.global.v3.GET(LibraryV3Api.recycleBinSummary(), { signal })
+		queryFn: ({ signal }) => api.v3.GET(LibraryV3Api.recycleBinSummary(), { signal })
 	}));
 
 // Whether the bin is emptying; polled while it is.
@@ -47,24 +53,20 @@ export const getRecycleBinStatusQuery = () =>
 		enabled: authStore.isAdmin,
 		refetchInterval: (query: { state: { data?: RecycleBinStatus } }) =>
 			query.state.data?.state === 'emptying' ? POLL_MS : false,
-		queryFn: ({ signal }) => api.global.v3.GET(LibraryV3Api.recycleBinStatus(), { signal })
+		queryFn: ({ signal }) => api.v3.GET(LibraryV3Api.recycleBinStatus(), { signal })
 	}));
 
 /** Read the bin's page, summary and status again. */
 export function invalidateRecycleBin(): Promise<void> {
-	return invalidateQueriesWithPersister({
-		queryKey: LibraryQueryKeyFactory.catalog.recycleBinPrefix(authStore.user?.id)
-	});
+	return applyEffects(recycleBinChanged(authStore.user?.id));
 }
 
 // Start emptying the bin of what it held at `before` (the summary's
 // `as_of`). It runs in the background; the status says when it is done.
 export function emptyRecycleBin() {
-	return createMutation(() => ({
-		mutationFn: (before: number) => api.global.v3.POST(LibraryV3Api.emptyRecycleBin(), { before }),
-		onSettled: () =>
-			invalidateQueriesWithPersister({
-				queryKey: LibraryQueryKeyFactory.catalog.recycleBinStatus(authStore.user?.id)
-			})
+	return createAppMutation(() => ({
+		mutationFn: (before: number) => api.v3.POST(LibraryV3Api.emptyRecycleBin(), { before }),
+		effects: () => [recycleBinStatusChanged(authStore.user?.id)],
+		onError: () => applyEffects(recycleBinStatusChanged(authStore.user?.id))
 	}));
 }

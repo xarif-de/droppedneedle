@@ -9,6 +9,7 @@ import type {
 	ScanRunFailuresResponse,
 	ScanRunHistoryResponse
 } from './LibraryOperationsTypes';
+import { STALE_LIVE } from '$lib/queries/staleTime';
 
 // Scan runs and operation jobs read the v3 routes.
 
@@ -19,8 +20,8 @@ export const getCurrentLibraryRunsQueryOptions = () =>
 	queryOptions({
 		queryKey: LibraryQueryKeyFactory.currentRuns(),
 		queryFn: async ({ signal }) =>
-			toCurrentRuns(await api.global.v3.GET(LibraryV3Api.currentScanRuns(), { signal })),
-		staleTime: 2_000
+			toCurrentRuns(await api.v3.GET(LibraryV3Api.currentScanRuns(), { signal })),
+		staleTime: STALE_LIVE
 	});
 
 export const getCurrentLibraryRunsQuery = (enabled: Getter<boolean> = () => true) =>
@@ -33,7 +34,7 @@ export const getLibraryRunQuery = (getRunId: Getter<string | null>) =>
 			enabled: Boolean(runId),
 			queryKey: LibraryQueryKeyFactory.run(runId ?? ''),
 			queryFn: async ({ signal }) =>
-				toRunDetail(await api.global.v3.GET(LibraryV3Api.scanRun(runId ?? ''), { signal }))
+				toRunDetail(await api.v3.GET(LibraryV3Api.scanRun(runId ?? ''), { signal }))
 		};
 	});
 
@@ -43,7 +44,7 @@ export const getLibraryRunHistoryQuery = (enabled: Getter<boolean> = () => true)
 		queryKey: LibraryQueryKeyFactory.runHistory(undefined),
 		initialPageParam: undefined as string | undefined,
 		queryFn: async ({ pageParam, signal }): Promise<ScanRunHistoryResponse> => {
-			const page = await api.global.v3.GET(LibraryV3Api.scanRunHistory(HISTORY_PAGE, pageParam), {
+			const page = await api.v3.GET(LibraryV3Api.scanRunHistory(HISTORY_PAGE, pageParam), {
 				signal
 			});
 			return { items: page.items.map(toScanRun), next_cursor: page.next_cursor ?? null };
@@ -59,7 +60,7 @@ export const getLibraryRunFailuresQuery = (getRunId: Getter<string | null>) =>
 			queryKey: LibraryQueryKeyFactory.runFailures(runId ?? ''),
 			initialPageParam: undefined as string | undefined,
 			queryFn: async ({ pageParam, signal }): Promise<ScanRunFailuresResponse> => {
-				const page = await api.global.v3.GET(
+				const page = await api.v3.GET(
 					LibraryV3Api.scanRunFailures(runId ?? '', FAILURES_PAGE, pageParam),
 					{ signal }
 				);
@@ -85,7 +86,7 @@ export const getLibraryRunEstimateQuery = (
 			enabled: enabled(),
 			queryKey: LibraryQueryKeyFactory.runEstimate(scopeIds),
 			queryFn: async ({ signal }): Promise<ScanEstimateResponse> => {
-				const estimate = await api.global.v3.GET(LibraryV3Api.scanRunEstimate(scopeIds), {
+				const estimate = await api.v3.GET(LibraryV3Api.scanRunEstimate(scopeIds), {
 					signal
 				});
 				return {

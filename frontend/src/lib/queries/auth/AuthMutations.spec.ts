@@ -1,35 +1,33 @@
 import { describe, expect, it, vi, beforeEach, type Mock } from 'vitest';
-import { AuthQueryKeyFactory } from './AuthQueryKeyFactory';
 import { AUTH_ENDPOINTS } from './endpoints';
 import { toAuthUser } from './types';
 
 vi.mock('@tanstack/svelte-query', () => ({
-	createMutation: vi.fn((factory: () => Record<string, unknown>) => factory()),
 	createQuery: vi.fn((factory: () => Record<string, unknown>) => factory())
 }));
 
+vi.mock('$lib/queries/effects', () => ({
+	createAppMutation: vi.fn((factory: () => Record<string, unknown>) => factory())
+}));
+
 vi.mock('$lib/api/client', () => ({
-	api: {
-		v3: { POST: vi.fn() },
-		global: {
-			v3: { GET: vi.fn(), POST: vi.fn() }
-		}
-	}
+	api: { v3: { GET: vi.fn(), POST: vi.fn() } }
 }));
 
 import { api } from '$lib/api/client';
-import { createMutation, createQuery } from '@tanstack/svelte-query';
+import { createQuery } from '@tanstack/svelte-query';
+import { createAppMutation } from '$lib/queries/effects';
 
-const mockV3Get = vi.mocked(api.global.v3.GET) as unknown as Mock<
+const mockV3Get = vi.mocked(api.v3.GET) as unknown as Mock<
 	(...args: unknown[]) => Promise<unknown>
 >;
-const mockV3Post = vi.mocked(api.global.v3.POST) as unknown as Mock<
+const mockV3Post = vi.mocked(api.v3.POST) as unknown as Mock<
 	(...args: unknown[]) => Promise<unknown>
 >;
 const mockAuthenticatedV3Post = vi.mocked(api.v3.POST) as unknown as Mock<
 	(...args: unknown[]) => Promise<unknown>
 >;
-const mockCreateMutation = vi.mocked(createMutation);
+const mockCreateMutation = vi.mocked(createAppMutation);
 const mockCreateQuery = vi.mocked(createQuery);
 
 beforeEach(() => {
@@ -43,12 +41,6 @@ function lastMutationFn(): (vars: unknown) => Promise<unknown> {
 	][0] as unknown as () => { mutationFn: (vars: unknown) => Promise<unknown> };
 	return factory().mutationFn;
 }
-
-describe('AuthQueryKeyFactory', () => {
-	it('providers key is [auth, providers]', () => {
-		expect(AuthQueryKeyFactory.providers()).toEqual(['auth', 'providers']);
-	});
-});
 
 describe('toAuthUser', () => {
 	it('maps a session user (incl. username fields) onto the auth store shape', () => {
@@ -74,7 +66,7 @@ describe('toAuthUser', () => {
 	});
 });
 
-describe('auth mutations route through api.global', () => {
+describe('auth mutations', () => {
 	it('local login posts username + password to the login endpoint', async () => {
 		mockV3Post.mockResolvedValue({ user: {} });
 		const { createLocalLoginMutation } = await import('./AuthMutations.svelte');

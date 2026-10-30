@@ -22,7 +22,6 @@ const state = vi.hoisted(() => ({
 	resetQueryCache: vi.fn(),
 	sessionCleanup: vi.fn(),
 	musicSourceReset: vi.fn(),
-	musicSourceSet: vi.fn(),
 	scrobbleReset: vi.fn()
 }));
 
@@ -36,23 +35,7 @@ vi.stubGlobal('localStorage', {
 vi.mock('$app/environment', () => ({ browser: true }));
 // imported for its side effect (applying the theme), which needs a DOM
 vi.mock('$lib/stores/theme.svelte', () => ({}));
-vi.mock('$lib/api/client', () => {
-	class ApiError extends Error {
-		constructor(
-			readonly status: number,
-			message: string,
-			readonly code = ''
-		) {
-			super(message);
-		}
-	}
-	class TransportError extends ApiError {
-		constructor(code: string) {
-			super(0, 'The request failed', code);
-		}
-	}
-	return { ApiError, TransportError, api: { global: { v3: { GET: state.apiGet } } } };
-});
+vi.mock('$lib/api/client', () => ({ api: { v3: { GET: state.apiGet } } }));
 vi.mock('$lib/constants', () => ({
 	AUTH_FREE_PATHS: ['/login', '/setup']
 }));
@@ -60,18 +43,20 @@ vi.mock('$lib/queries/auth/endpoints', () => ({
 	AUTH_ENDPOINTS: { setupStatus: '/setup-status' }
 }));
 vi.mock('$lib/queries/QueryClient', () => ({
-	queryClient: { ensureQueryData: state.ensureQueryData },
-	resetQueryCacheForUserSwitch: state.resetQueryCache
+	queryClient: {
+		ensureQueryData: state.ensureQueryData,
+		getQueryData: () => undefined,
+		prefetchQuery: vi.fn()
+	},
+	resetQueryCacheForUserSwitch: state.resetQueryCache,
+	collectPersistedGarbage: vi.fn()
 }));
 vi.mock('$lib/queries/scrobble-preferences/ScrobblePreferencesQuery.svelte', () => ({
-	getScrobblePreferencesQueryOptions: (userId: string | undefined) => ({
-		queryKey: ['me', 'scrobble-preferences', userId]
-	})
+	getScrobblePreferencesQueryOptions: (userId: string | undefined) => ({ userId })
 }));
 vi.mock('$lib/stores/musicSource', () => ({
 	DEFAULT_SOURCE: 'listenbrainz',
-	isMusicSource: (value: unknown) => value === 'listenbrainz' || value === 'lastfm',
-	musicSourceStore: { reset: state.musicSourceReset, setSource: state.musicSourceSet }
+	isMusicSource: (value: unknown) => value === 'listenbrainz' || value === 'lastfm'
 }));
 vi.mock('$lib/stores/scrobble.svelte', () => ({
 	scrobbleManager: { reset: state.scrobbleReset }
@@ -79,7 +64,6 @@ vi.mock('$lib/stores/scrobble.svelte', () => ({
 vi.mock('$lib/utils/userSessionCleanup', () => ({
 	clearUserSessionState: state.sessionCleanup
 }));
-vi.mock('$lib/utils/userScopedCaches', () => ({ clearUserScopedLocalCaches: vi.fn() }));
 vi.mock('$lib/stores/authStore.svelte', () => ({
 	LAST_USER_ID_KEY: 'test:last-user',
 	authStore: {
@@ -112,7 +96,7 @@ vi.mock('$lib/stores/authStore.svelte', () => ({
 	}
 }));
 
-import { ApiError, TransportError } from '$lib/api/client';
+import { ApiError, TransportError } from '$lib/api/errors';
 import { load } from './+layout';
 
 const user: TestUser = {
@@ -150,7 +134,6 @@ describe('+layout load session bootstrap', () => {
 			}
 		});
 		state.musicSourceReset.mockClear();
-		state.musicSourceSet.mockClear();
 		state.scrobbleReset.mockClear();
 		storage.clear();
 		state.user = null;
@@ -207,9 +190,7 @@ describe('+layout load session bootstrap', () => {
 		state.ensureQueryData.mockRejectedValueOnce(new DOMException('Timed out', 'TimeoutError'));
 
 		await expect(loadPage()).resolves.toEqual({ primarySource: 'listenbrainz', user });
-		expect(state.ensureQueryData).toHaveBeenNthCalledWith(1, {
-			queryKey: ['me', 'scrobble-preferences', 'user-1']
-		});
+		expect(state.ensureQueryData).toHaveBeenNthCalledWith(1, { userId: 'user-1' });
 		expect(state.clear).not.toHaveBeenCalled();
 		expect(state.user).toBe(user);
 	});
@@ -220,9 +201,7 @@ describe('+layout load session bootstrap', () => {
 		state.ensureQueryData.mockResolvedValueOnce({ primary_music_source: 'lastfm' });
 
 		await expect(loadPage('/library')).resolves.toEqual({ primarySource: 'lastfm', user });
-		expect(state.ensureQueryData).toHaveBeenCalledWith({
-			queryKey: ['me', 'scrobble-preferences', 'user-1']
-		});
+		expect(state.ensureQueryData).toHaveBeenCalledWith({ userId: 'user-1' });
 		expect(state.apiGet).not.toHaveBeenCalled();
 	});
 
@@ -249,7 +228,6 @@ describe('+layout load session bootstrap', () => {
 		expect(state.musicSourceReset).toHaveBeenCalledOnce();
 		expect(state.scrobbleReset).toHaveBeenCalledOnce();
 		expect(state.clear).not.toHaveBeenCalled();
-		expect(state.musicSourceSet).toHaveBeenCalledWith('lastfm');
 		expect(storage.get('test:last-user')).toBe('user-1');
 	});
 

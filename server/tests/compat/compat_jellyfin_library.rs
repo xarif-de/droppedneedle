@@ -730,14 +730,13 @@ async fn an_identified_artist_sends_its_musicbrainz_id() {
         )
         .expect("the album artist");
     rig.app
-        .db()
-        .execute(
+        .seed_with(
             "INSERT OR REPLACE INTO local_artist_external_identities \
              (local_artist_id, provider, provider_artist_id, decision_source, selected_at) \
              VALUES (?1, 'musicbrainz', ?2, 'manual', 1000)",
             [local.as_str(), MBID],
         )
-        .expect("artist identified");
+        .await;
 
     let artists = json(&rig, "/jellyfin/Artists", &auth).await;
     let radiohead = named(&artists["Items"], "Name", "Radiohead");
@@ -813,16 +812,14 @@ async fn a_failed_read_is_a_server_error_not_an_empty_answer() {
     );
 
     rig.app
-        .db()
-        .execute_batch("ALTER TABLE local_albums RENAME TO local_albums_gone;")
-        .expect("albums table renames");
+        .seed("ALTER TABLE local_albums RENAME TO local_albums_gone;")
+        .await;
     let items = get(&rig, "/jellyfin/Items", Some(&auth)).await;
     assert_eq!(items.bare(), (500, 0));
 
     rig.app
-        .db()
-        .execute_batch("ALTER TABLE compat_jellyfin_ids RENAME TO compat_jellyfin_ids_gone;")
-        .expect("ids table renames");
+        .seed("ALTER TABLE compat_jellyfin_ids RENAME TO compat_jellyfin_ids_gone;")
+        .await;
     assert_eq!(get(&rig, &picture, None).await.bare(), (500, 0));
 
     // A playlist write reads every id first, so a failed read writes
@@ -847,7 +844,7 @@ async fn an_unlinked_artist_shows_their_album_mosaic() {
     use crate::compat_subsonic_library::{GREEN, RED, assert_quadrants, two_covers_for_radiohead};
     let rig = CompatApp::start("jf-artist-mosaic").await;
     let auth = finamp(&rig.secret);
-    two_covers_for_radiohead(&rig);
+    two_covers_for_radiohead(&rig).await;
     let artists = json(&rig, "/jellyfin/Artists", &auth).await;
     let radiohead = named(&artists["Items"], "Name", "Radiohead");
     assert!(radiohead["ImageTags"]["Primary"].is_string(), "{radiohead}");
@@ -865,6 +862,73 @@ async fn an_unlinked_artist_shows_their_album_mosaic() {
         (StatusCode::OK, "image/jpeg")
     );
     assert_quadrants(&reply.body, 250, [RED, GREEN, GREEN, RED]);
+    rig.stop().await;
+}
+
+/// An app that listed an album before it was merged into another asks for
+/// its picture by the old id, with no credentials, and gets the picture of
+/// the album that holds it now.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_merged_album_shows_the_picture_of_the_album_that_holds_it() {
+    use crate::compat_subsonic_library::two_covers_for_radiohead;
+    let rig = CompatApp::start("jf-merged-picture").await;
+    let auth = finamp(&rig.secret);
+    two_covers_for_radiohead(&rig).await;
+    let mezzanine = album_id(&rig, &auth, "Mezzanine").await;
+    let ok_computer = album_id(&rig, &auth, "OK Computer").await;
+    rig.jellyfin_ids_caught_up().await;
+    let (teardrop, survivor): (String, String) = rig
+        .app
+        .db()
+        .query_row(
+            "SELECT t.id, (SELECT local_album_id FROM local_tracks \
+             WHERE relative_path = 'Radiohead/OK Computer/01 Airbag.flac') \
+             FROM local_tracks t WHERE t.relative_path = 'Massive Attack/Mezzanine/04 Teardrop.m4a'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("the track and the album it joins");
+    let admin = rig.app.login_admin().await;
+    let admin = [("authorization", admin.as_str())];
+    let mut selection = json!({"track_ids": [teardrop], "target_album_id": survivor});
+    let (status, preview) = rig
+        .app
+        .call(
+            "POST",
+            "/api/v3/library/albums/merge-preview",
+            &admin,
+            Some(selection.clone()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{preview}");
+    selection["preview_token"] = preview["preview_token"].clone();
+    let (status, merged) = rig
+        .app
+        .call(
+            "POST",
+            "/api/v3/library/albums/merge",
+            &admin,
+            Some(selection),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{merged}");
+
+    let current = get(
+        &rig,
+        &format!("/jellyfin/Items/{ok_computer}/Images/Primary"),
+        None,
+    )
+    .await;
+    assert_eq!(current.status, StatusCode::OK);
+    let old = get(
+        &rig,
+        &format!("/jellyfin/Items/{mezzanine}/Images/Primary"),
+        None,
+    )
+    .await;
+    assert_eq!(old.status, StatusCode::OK);
+    assert_eq!(old.header("content-type"), current.header("content-type"));
+    assert_eq!(old.body, current.body);
     rig.stop().await;
 }
 
@@ -1555,17 +1619,16 @@ async fn token_transports_and_the_older_item_address() {
 
 /// Point the app password `secret` at the token `token` instead, as one
 /// made elsewhere could be: the Jellyfin API finds a token by its hash.
-fn retoken(rig: &CompatApp, secret: &str, token: &str) {
+async fn retoken(rig: &CompatApp, secret: &str, token: &str) {
     use sha2::{Digest, Sha256};
     let hash = |raw: &str| format!("{:x}", Sha256::digest(raw.as_bytes()));
     let changed = rig
         .app
-        .db()
-        .execute(
-            "UPDATE connect_app_passwords SET secret_sha256 = ?1 WHERE secret_sha256 = ?2",
+        .seed_with(
+            "UPDATE auth_app_passwords SET secret_sha256 = ?1 WHERE secret_sha256 = ?2",
             [hash(token), hash(secret)],
         )
-        .expect("token changes");
+        .await;
     assert_eq!(changed, 1);
 }
 
@@ -1648,9 +1711,9 @@ async fn query_tokens_are_percent_decoded_exactly_once() {
 
     // Plus and space: the player's token becomes `d+s=`, the admin's
     // `d s=`.
-    retoken(&rig, &secret, "d+s=");
+    retoken(&rig, &secret, "d+s=").await;
     let admin = rig.admin_secret().await;
-    retoken(&rig, &admin, "d s=");
+    retoken(&rig, &admin, "d s=").await;
     for (token, name) in [
         ("d+s=", PLAYER),
         ("d%2Bs%3D", PLAYER),
@@ -1768,7 +1831,37 @@ async fn every_route_is_public_or_signed_in_by_the_table() {
         let reply = raw(&rig, verb, &path, headers, None, None).await;
         assert_eq!(reply.bare(), (404, 0), "{verb} {path} with the API off");
     }
+    for (unserved, path) in unserved_methods() {
+        let from = walker_address();
+        let headers = vec![("x-forwarded-for", from.as_str())];
+        let reply = raw(&rig, unserved, &path, headers, None, None).await;
+        let what = format!("{unserved} {path} with the API off");
+        assert_eq!(reply.bare(), (404, 0), "{what}");
+        assert_eq!(reply.header("access-control-allow-origin"), "*", "{what}");
+    }
     rig.stop().await;
+}
+
+/// One method each template of the route table does not serve, with its
+/// path parameters filled as [`walk`] fills them.
+fn unserved_methods() -> Vec<(&'static str, String)> {
+    let mut out: Vec<(&'static str, String)> = Vec::new();
+    for (_, path, _, template) in walk() {
+        if out.iter().any(|(_, seen)| *seen == path) {
+            continue;
+        }
+        let served = |method: &str| {
+            ROUTES
+                .iter()
+                .any(|row| row.template == template && row.verb.as_str() == method)
+        };
+        let unserved = ["PATCH", "PUT", "DELETE", "POST"]
+            .into_iter()
+            .find(|method| !served(method))
+            .expect("a method the template does not serve");
+        out.push((unserved, path));
+    }
+    out
 }
 
 /// Wrong app passwords at sign-in still lock the address out; asking who
@@ -1800,6 +1893,71 @@ async fn failed_sign_ins_lock_out_and_public_routes_do_not() {
         .await;
         assert_eq!(reply.status, StatusCode::OK);
     }
+    rig.stop().await;
+}
+
+/// A device still sending a revoked app password is refused every time
+/// without locking out its address: another app behind the same address
+/// signs in and reads as normal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_revoked_app_password_does_not_lock_out_its_address() {
+    let rig = CompatApp::start("jf-revoked-lockout").await;
+    let dave = rig.app.login_user("dave").await;
+    let dave = [("authorization", dave.authorization.as_str())];
+    let (status, created) = rig
+        .app
+        .call_through_busy(
+            "POST",
+            "/api/v3/me/app-passwords",
+            &dave,
+            Some(json!({"name": "Old phone"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id = created["id"].as_str().expect("id");
+    let revoked = created["secret"].as_str().expect("secret");
+    let uri = format!("/api/v3/me/app-passwords/{id}");
+    let revoke = crate::common::through_busy(|| rig.app.raw("DELETE", &uri, &dave, None)).await;
+    assert_eq!(revoke.0, StatusCode::NO_CONTENT);
+
+    let household = vec![("x-forwarded-for", "10.78.1.1")];
+    let old_phone = finamp(revoked);
+    for _ in 0..50 {
+        let reply = raw(
+            &rig,
+            "GET",
+            "/jellyfin/Users/Me",
+            household.clone(),
+            Some(&old_phone),
+            None,
+        )
+        .await;
+        assert_eq!(reply.bare(), (401, 0));
+    }
+    let login = "/jellyfin/Users/AuthenticateByName";
+    for _ in 0..5 {
+        let body = json!({"Username": "dave", "Pw": revoked});
+        let reply = raw(&rig, "POST", login, household.clone(), None, Some(body)).await;
+        assert_eq!(reply.bare(), (401, 0));
+    }
+
+    let body = json!({"Username": PLAYER, "Pw": rig.secret});
+    let signed_in = raw(&rig, "POST", login, household.clone(), None, Some(body)).await;
+    assert_eq!(signed_in.status, StatusCode::OK);
+    let token = signed_in.json()["AccessToken"]
+        .as_str()
+        .expect("access token")
+        .to_owned();
+    let me = raw(
+        &rig,
+        "GET",
+        "/jellyfin/Users/Me",
+        household,
+        Some(&finamp(&token)),
+        None,
+    )
+    .await;
+    assert_eq!(me.status, StatusCode::OK);
     rig.stop().await;
 }
 

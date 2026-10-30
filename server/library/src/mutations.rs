@@ -79,6 +79,11 @@ pub const LIBRARY_FOLDER_MISSING: Reason = reason(
     "The library folder isn't there, so nothing was removed.",
     "Check that its drive or share is mounted, then try again.",
 );
+pub const LIBRARY_FOLDER_LEFT_OUT: Reason = reason(
+    "LIBRARY_FOLDER_LEFT_OUT",
+    "This library folder links into another library folder, so it takes no file changes.",
+    "Point the library folder at its own folder under Settings > Library.",
+);
 pub const RECYCLE_FAILED: Reason = reason(
     "RECYCLE_FAILED",
     "A file could not be moved into the recycle bin, so nothing was removed.",
@@ -124,11 +129,29 @@ pub const SCAN_REFUSED: Reason = reason(
     "The library folders changed while the rescan was being set up.",
     "Reload the album page and try again.",
 );
+macro_rules! library_off_message {
+    () => {
+        "The local library is switched off, so no files can be changed."
+    };
+}
+macro_rules! library_off_action {
+    () => {
+        "Turn it on under Settings > Library."
+    };
+}
+
+/// The library-wide switch is off. Its code is the `CONFLICT` a scan and
+/// Library Management answer with while the library is off.
 pub const LIBRARY_DISABLED: Reason = reason(
-    "LIBRARY_DISABLED",
+    "CONFLICT",
     "The local library is switched off, so nothing can be rescanned.",
     "Turn the library on under Settings > Library, then try again.",
 );
+/// A file change refused while the library-wide switch is off, in the
+/// words Library Management uses.
+pub const LIBRARY_OFF: Reason = reason("CONFLICT", library_off_message!(), library_off_action!());
+/// [`LIBRARY_OFF`] as one text, for answers that carry no action.
+pub const LIBRARY_OFF_TEXT: &str = concat!(library_off_message!(), " ", library_off_action!());
 
 pub const HAND_BACK_UNREADABLE: Reason = reason(
     "HAND_BACK_UNREADABLE",
@@ -792,6 +815,10 @@ impl Mutations {
             });
         }
         let registry = self.setup.core.live_registry();
+        let left_out = super::manage::left_out_now(&registry);
+        if tracks.iter().any(|track| left_out.contains(&track.root_id)) {
+            return Err(MutationError::Conflict(LIBRARY_FOLDER_LEFT_OUT));
+        }
         let mut targets = Vec::with_capacity(tracks.len());
         for track in tracks {
             let root = registry
@@ -809,11 +836,13 @@ impl Mutations {
                 expect_sha256: removal.expect_sha256.map(str::to_owned),
             });
         }
+        let sidecars = self.sidecars(tracks, &registry);
         let done = self
             .setup
             .publishing
             .publish_removal(
                 &targets,
+                &sidecars,
                 removal.reason_code,
                 Some(removal.actor),
                 removal.undo_album.map(|album_id| UndoRecord {
@@ -829,6 +858,94 @@ impl Mutations {
             "library removal"
         );
         Ok(done)
+    }
+
+    /// The sidecars that go with removing `tracks` (see
+    /// [`remove::sidecars`]), read before the publish lock. None for a
+    /// library folder whose sidecar patterns don't read.
+    fn sidecars(
+        &self,
+        tracks: &[TrackFile],
+        registry: &RootRegistry,
+    ) -> Vec<remove::SidecarTarget> {
+        let mut by_root: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        for track in tracks {
+            by_root
+                .entry(track.root_id.as_str())
+                .or_default()
+                .push(track.relative_path.as_str());
+        }
+        let mut found = Vec::new();
+        for (root_id, removed) in by_root {
+            let Some(root) = registry.resolve(root_id) else {
+                continue;
+            };
+            let patterns = self.sidecar_patterns(root_id);
+            if patterns.is_empty() {
+                continue;
+            }
+            let listed_below = |folder: &str| {
+                let prefix = format!("{folder}/");
+                let removed_below = removed
+                    .iter()
+                    .filter(|rel| rel.starts_with(&prefix))
+                    .count() as u64;
+                self.setup
+                    .db
+                    .read_blocking("mutations.sidecar_folder", |conn| {
+                        Ok::<_, MutationError>(remove::tracks_listed_below(conn, root_id, folder)?)
+                    })
+                    .map_or(true, |listed| listed > removed_below)
+            };
+            found.extend(remove::sidecars(&remove::SidecarScope {
+                root_id,
+                root: &root.path,
+                removed: &removed,
+                patterns: &patterns,
+                listed_below: &listed_below,
+            }));
+        }
+        found
+    }
+
+    /// The files Library Management moves with an album in library folder
+    /// `root_id`, case-folded: its profile's sidecar patterns, or a new
+    /// profile's while no profile is set up. Empty while the settings
+    /// don't read.
+    fn sidecar_patterns(&self, root_id: &str) -> Vec<Vec<char>> {
+        use droppedneedle_kernel::runtime_config::sections::{
+            LibraryManagement, OrganizationManagementSettings,
+        };
+        let Some(stored) = self.setup.settings.management.read() else {
+            return Vec::new();
+        };
+        let mut settings = LibraryManagement::clone(&stored);
+        super::management::settings::complete_fields(&mut settings);
+        let assignment = super::management::profile::root_assignment(&settings, root_id);
+        let unset = assignment
+            .profile_id
+            .as_deref()
+            .unwrap_or(&settings.default_profile_id)
+            .is_empty();
+        let patterns = if unset {
+            OrganizationManagementSettings::default().sidecar_patterns
+        } else {
+            match super::management::settings::pin_profile(&settings, &assignment) {
+                Ok(profile) => profile.organization.sidecar_patterns,
+                Err(error) => {
+                    tracing::warn!(
+                        root_id,
+                        ?error,
+                        "a library folder's sidecar patterns don't read; a removal takes none"
+                    );
+                    Vec::new()
+                }
+            }
+        };
+        patterns
+            .iter()
+            .map(|pattern| caseless::default_case_fold_str(pattern).chars().collect())
+            .collect()
     }
 
     /// The recycle bins now, chosen as the publisher's sessions choose
@@ -975,6 +1092,7 @@ struct Removal<'a> {
 fn refusal(refused: Refusal) -> MutationError {
     match refused {
         Refusal::Busy => MutationError::Conflict(LIBRARY_BUSY),
+        Refusal::LibraryOff => MutationError::Conflict(LIBRARY_OFF),
         Refusal::Changed => MutationError::Conflict(REMOVAL_CHANGED),
         Refusal::OutsideRoot => MutationError::Conflict(FILE_OUTSIDE_ROOT),
         Refusal::BinsUnknown(cause) => {
@@ -1032,6 +1150,7 @@ fn refusal(refused: Refusal) -> MutationError {
 fn put_back_refusal(refused: PutBackRefusal) -> MutationError {
     match refused {
         PutBackRefusal::Busy => MutationError::Conflict(LIBRARY_BUSY),
+        PutBackRefusal::LibraryOff => MutationError::Conflict(LIBRARY_OFF),
         PutBackRefusal::NothingToRestore => MutationError::NotFound(NOTHING_TO_RESTORE),
         PutBackRefusal::Changed => MutationError::Conflict(RESTORE_CHANGED),
         PutBackRefusal::OutsideRoot => MutationError::Conflict(FILE_OUTSIDE_ROOT),

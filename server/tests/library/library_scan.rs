@@ -28,7 +28,7 @@ use droppedneedle_library::scan::{
     LibraryScanCoordinator, NullTagReader, Phase, RootRegistry, RootSeamError, RunState, ScanKind,
     ScanPhase, ScanRequest, ScanRun, ScanScope, ScanState, ScanStoreError, ScanTrigger,
     ScannedTags, SqliteScanStore, StaticResolver, StreamRootSeam, TagReadError, TagReader,
-    WorkWakeups,
+    WatcherAction, WorkWakeups,
 };
 use droppedneedle_library::wiring::LibrarySetup;
 use sha2::{Digest, Sha256};
@@ -1233,6 +1233,246 @@ async fn a_request_write_during_indexing_is_answered_quickly() {
     assert_eq!(ended.state.scan_state(), ScanState::Completed);
 }
 
+/// Two roots whose real folders overlap index each shared file once,
+/// under the root that takes file changes: a root reached through a link
+/// to a folder that holds another root walks everything but that root's
+/// folder, and the settings page warns about both.
+#[tokio::test]
+async fn overlapping_roots_index_a_shared_file_once() {
+    use droppedneedle_kernel::runtime_config::secret_sections::{
+        IdentificationPolicy, LibraryPathRule, LibraryRoot as SavedRoot, TypedLibrary,
+    };
+
+    let scratch = ScratchDir::new("scan-overlap");
+    plant(&scratch.join("music"), "Band/a.flac", "flac_full_01.flac");
+    plant(&scratch.join("loose"), "b.flac", "flac_full_01.flac");
+    // The outer root's configured path goes through a link (`door`, to the
+    // folder that holds the scratch folder), and its real folder is the
+    // scratch folder, which holds the `music` root.
+    let door = scratch.join("door");
+    std::os::unix::fs::symlink(scratch.parent().expect("parent"), &door).expect("door link");
+    let outer = door.join(scratch.file_name().expect("name"));
+    let library = bundle(&scratch).await;
+    library
+        .scans
+        .add_root(
+            Some("outer".to_owned()),
+            outer.to_string_lossy().into_owned(),
+            EffectivePolicy::Automatic,
+        )
+        .expect("root adds");
+
+    let run = scan(&library).await;
+    assert_eq!(run.state.scan_state(), ScanState::Completed);
+    assert_eq!(
+        query(
+            &library,
+            "SELECT COUNT(*) FROM local_tracks WHERE relative_path LIKE '%a.flac'"
+        ),
+        1,
+        "the shared file has one row"
+    );
+    assert_eq!(
+        query(
+            &library,
+            "SELECT COUNT(*) FROM local_tracks \
+             WHERE root_id = 'music' AND relative_path = 'Band/a.flac'"
+        ),
+        1,
+        "under the root that takes file changes"
+    );
+    assert_eq!(
+        query(
+            &library,
+            "SELECT COUNT(*) FROM local_tracks \
+             WHERE root_id = 'outer' AND relative_path = 'loose/b.flac'"
+        ),
+        1,
+        "the linked root still indexes the rest of its folder"
+    );
+
+    let saved = |id: &str, path: &Path, policy: IdentificationPolicy| SavedRoot {
+        id: id.to_owned(),
+        path: path.to_string_lossy().into_owned(),
+        label: id.to_owned(),
+        policy,
+        rules: Vec::new(),
+    };
+    let warnings = |music: IdentificationPolicy| {
+        droppedneedle_library::policy::availability_warnings(&TypedLibrary {
+            library_roots: vec![
+                saved("music", &scratch.join("music"), music),
+                saved("outer", &outer, IdentificationPolicy::Automatic),
+            ],
+            ..TypedLibrary::default()
+        })
+    };
+    let automatic = warnings(IdentificationPolicy::Automatic);
+    assert!(
+        automatic
+            .iter()
+            .any(|warning| warning.starts_with("Library root outer shares files with music")),
+        "{automatic:?}"
+    );
+    // An excluded root is walked only for its included subfolders, so
+    // the shared files go to the root that is not excluded.
+    let excluded = warnings(IdentificationPolicy::Excluded);
+    assert!(
+        excluded
+            .iter()
+            .any(|warning| warning.starts_with("Library root music shares files with outer")),
+        "{excluded:?}"
+    );
+    // The same when only a rule excludes the shared folder: a root that
+    // takes file changes but excludes `Band` gives it to a linked root.
+    let band = scratch.join("band");
+    std::os::unix::fs::symlink(scratch.join("music/Band"), &band).expect("band link");
+    let mut music = saved(
+        "music",
+        &scratch.join("music"),
+        IdentificationPolicy::Automatic,
+    );
+    music.rules = vec![LibraryPathRule {
+        id: "classical".to_owned(),
+        relative_path: "Band".to_owned(),
+        policy: IdentificationPolicy::Excluded,
+    }];
+    let ruled = droppedneedle_library::policy::availability_warnings(&TypedLibrary {
+        library_roots: vec![music, saved("band", &band, IdentificationPolicy::Automatic)],
+        ..TypedLibrary::default()
+    });
+    assert!(
+        ruled
+            .iter()
+            .any(|warning| warning.starts_with("Library root music shares files with band")),
+        "{ruled:?}"
+    );
+}
+
+/// A library whose `outer` root reaches the scratch folder, which holds
+/// `music/Band/a.flac`, through a linked parent folder, and has indexed
+/// that file. No `music` root yet.
+async fn outer_library(scratch: &ScratchDir) -> LibrarySetup {
+    plant(&scratch.join("music"), "Band/a.flac", "flac_full_01.flac");
+    let door = scratch.join("door");
+    std::os::unix::fs::symlink(scratch.parent().expect("parent"), &door).expect("door link");
+    let outer = door.join(scratch.file_name().expect("name"));
+    migrated_db(&scratch.join("app.db"));
+    let db = Db::open_for_tests(&scratch.join("app.db")).expect("database opens");
+    let platform = TestPlatform::on(&db, scratch)
+        .settings(config_store(scratch))
+        .build()
+        .await;
+    let (library, _) = library_at(&platform);
+    add_root(&library, "outer", &outer);
+    scan(&library).await;
+    library
+}
+
+fn add_root(library: &LibrarySetup, id: &str, path: &Path) {
+    library
+        .scans
+        .add_root(
+            Some(id.to_owned()),
+            path.to_string_lossy().into_owned(),
+            EffectivePolicy::Automatic,
+        )
+        .expect("root adds");
+}
+
+/// A row of a losing root whose file went before the winner indexed it
+/// is marked missing like any other row whose file went.
+#[tokio::test]
+async fn a_yielded_row_whose_file_went_is_marked_missing() {
+    let scratch = ScratchDir::new("scan-overlap-gone");
+    let library = outer_library(&scratch).await;
+    add_root(&library, "music", &scratch.join("music"));
+    std::fs::remove_file(scratch.join("music/Band/a.flac")).expect("file removed");
+
+    scan(&library).await;
+    assert_eq!(
+        query(
+            &library,
+            "SELECT COUNT(*) FROM local_tracks \
+             WHERE relative_path LIKE '%a.flac' AND availability = 'indexed'"
+        ),
+        0,
+        "no row is left indexed for a file that went"
+    );
+}
+
+/// A file an existing install indexed under two overlapping roots keeps
+/// one row once the overlap rule applies: the scan retires the losing
+/// root's row into the winner's row for the same file, what people made
+/// on it moves there, and the skipped files never trip the mass-missing
+/// guard, nor the guard for a remembered mount at the shared folder.
+#[tokio::test]
+async fn a_double_from_overlapping_roots_retires_into_one_row() {
+    let scratch = ScratchDir::new("scan-overlap-double");
+    // The double: the outer root indexed the file first, then `music`
+    // was added and only it was scanned.
+    let library = outer_library(&scratch).await;
+    add_root(&library, "music", &scratch.join("music"));
+    let registry = library.core.live_registry();
+    let only_music: Vec<ScanScope> = registry
+        .scheduled_root_scopes()
+        .into_iter()
+        .filter(|scope| scope.root_id == "music")
+        .collect();
+    let first = library
+        .coordinator
+        .request_run(&ScanRequest {
+            kind: ScanKind::Incremental,
+            trigger: ScanTrigger::Manual,
+            scopes: only_music,
+            requested_by_user_id: None,
+            policy_revision: registry.policy_revision().to_owned(),
+        })
+        .expect("scan requested");
+    for _ in 0..50 {
+        library.scans.supervisor_tick().await;
+        if library.coordinator.current().is_empty() {
+            break;
+        }
+    }
+    library
+        .coordinator
+        .snapshot(&first.run_id)
+        .expect("music scanned");
+    let indexed = "SELECT COUNT(*) FROM local_tracks \
+        WHERE relative_path LIKE '%a.flac' AND availability = 'indexed'";
+    assert_eq!(query(&library, indexed), 2, "the double is there");
+    library
+        .scan_store
+        .db()
+        .run_sql(
+            "INSERT INTO auth_users (id, display_name, role, created_at) \
+             VALUES ('listener', 'Listener', 'user', 0); \
+             INSERT INTO library_user_favorites (user_id, item_kind, item_id, created_at) \
+             SELECT 'listener', 'track', id, 0 FROM local_tracks WHERE root_id = 'outer'; \
+             INSERT INTO library_scan_mounts (root_id, relative_path) VALUES ('outer', 'music')",
+        )
+        .expect("favourite and a remembered mount at the shared folder");
+
+    let run = scan(&library).await;
+    assert_eq!(query(&library, indexed), 1, "one row is left");
+    assert_eq!(
+        query(
+            &library,
+            "SELECT COUNT(*) FROM library_user_favorites f JOIN local_tracks t \
+             ON t.id = f.item_id WHERE f.item_kind = 'track' AND t.root_id = 'music' \
+             AND t.relative_path = 'Band/a.flac' AND t.availability = 'indexed'",
+        ),
+        1,
+        "the favourite moved to the row that is left"
+    );
+    let failures = library.coordinator.store().failures(&run.id).unwrap();
+    assert!(
+        failures.is_empty(),
+        "skipped files are not a vanished share: {failures:?}"
+    );
+}
+
 /// Symlinks never lead out of a root: the walk audits them and the stream
 /// seam refuses them. A root reached through a symlink still treats its
 /// own in-root links as inside.
@@ -1922,7 +2162,7 @@ async fn a_folded_v2_split_comes_back_on_undo() {
          ('s1', 'musicbrainz', 'rec-1', 'release-split', 'rt-1', 'legacy_import', 5, 1), \
          ('s2', 'musicbrainz', 'rec-2', 'release-split', NULL, 'legacy_import', 5, 1); \
          INSERT INTO auth_users (id, display_name, role, created_at) \
-         VALUES ('curator', 'Curator', 'admin', '2026-01-01T00:00:00Z'); \
+         VALUES ('curator', 'Curator', 'admin', 0); \
          INSERT INTO library_management_exclusions (local_album_id, reason, \
          excluded_by_user_id, excluded_at) VALUES ('split', 'administrator_choice', \
          'curator', 3); \
@@ -2025,7 +2265,30 @@ async fn a_folded_v2_split_comes_back_on_undo() {
     let again = hygiene::clean_album(&tx, "split", "cleanup", now).expect("cleanup runs");
     tx.commit().expect("commit");
     assert_eq!(again, None, "an undone fold stays undone");
-    assert_eq!(undo_ids(), [None], "the entry stays, without Undo");
+    assert_eq!(undo_ids(), [None, None], "the entry stays, without Undo");
+    let told = |album: &str| {
+        let items = album_history_view(&ops, album, "curator")
+            .expect("history reads")
+            .items;
+        let told: Vec<_> = items
+            .iter()
+            .map(|entry| (entry.kind, entry.by, entry.other_album_title.clone()))
+            .collect();
+        serde_json::to_value(told).expect("history serializes")
+    };
+    assert_eq!(
+        told("kept"),
+        serde_json::json!([
+            ["fold_undone", "you", "album"],
+            ["leftover_joined", null, "album"]
+        ]),
+        "the undo has its own entry"
+    );
+    assert_eq!(
+        told("split"),
+        serde_json::json!([["unfolded_from", "you", "album"]]),
+        "the album brought back tells where from"
+    );
     assert_eq!(undo(&action), "STALE_REVISION", "an undo runs once");
 }
 
@@ -3125,7 +3388,7 @@ async fn no_release_choice_and_a_chosen_release_stay_apart() {
 
 /// A user for rows that must name a person.
 const PERSON: &str = "INSERT OR IGNORE INTO auth_users (id, display_name, role, created_at) \
-                      VALUES ('u1', 'Person', 'admin', 'now');";
+                      VALUES ('u1', 'Person', 'admin', 0);";
 
 impl RegroupRig {
     /// One text value read by SQL, `None` for no row or NULL.
@@ -4814,7 +5077,7 @@ async fn a_missing_track_does_not_continue_without_proof() {
                     + &map_track(&t[1], Some(REL_R), Some(TRACK_X))
                     + &format!(
                         "INSERT INTO auth_users (id, display_name, role, created_at) \
-                         VALUES ('curator', 'Curator', 'admin', '2026-01-01T00:00:00Z'); \
+                         VALUES ('curator', 'Curator', 'admin', 0); \
                          INSERT INTO library_custom_edition_manifests (id, local_album_id, \
                          version, release_group_mbid, album_title, album_artist_name, \
                          source_album_revision, input_revision, content_hash, \
@@ -5335,7 +5598,7 @@ async fn tell(name: &str, story: Story) -> (RegroupRig, String, String, String, 
     if story.custom_on_old {
         rig.run(&format!(
             "INSERT INTO auth_users (id, display_name, role, created_at) \
-             VALUES ('curator', 'Curator', 'admin', '2026-01-01T00:00:00Z'); \
+             VALUES ('curator', 'Curator', 'admin', 0); \
              INSERT INTO library_custom_edition_manifests (id, local_album_id, version, \
              release_group_mbid, album_title, album_artist_name, source_album_revision, \
              input_revision, content_hash, sealed_by_user_id, sealed_at) VALUES ('m1', \
@@ -6228,7 +6491,7 @@ async fn a_scanned_file_is_placed_by_its_own_ids() {
             setup: |album, _| {
                 format!(
                     "INSERT INTO auth_users (id, display_name, role, created_at) \
-                     VALUES ('curator', 'Curator', 'admin', '2026-01-01T00:00:00Z'); \
+                     VALUES ('curator', 'Curator', 'admin', 0); \
                      INSERT INTO library_custom_edition_manifests (id, local_album_id, \
                      version, release_group_mbid, album_title, album_artist_name, \
                      source_album_revision, input_revision, content_hash, \
@@ -7038,7 +7301,7 @@ async fn a_group_marked_distinct_is_not_merged() {
          UPDATE local_album_artists SET artist_mbid = '{MBID_X}' \
          WHERE local_artist_id IN ('{left}', '{right}'); \
          INSERT INTO auth_users (id, display_name, role, created_at) \
-         VALUES ('admin', 'Admin', 'admin', '2026-01-01T00:00:00Z'); \
+         VALUES ('admin', 'Admin', 'admin', 0); \
          INSERT INTO library_artist_reconciliation_dismissals (left_artist_id, \
          right_artist_id, left_artist_revision, right_artist_revision, dismissed_by_user_id, \
          created_at, updated_at) VALUES ('{left}', '{right}', 1, 1, 'admin', 1, 1);"
@@ -9337,4 +9600,126 @@ async fn a_new_copy_at_a_path_needs_the_same_recording_and_new_audio() {
             );
         }
     }
+}
+
+/// A library with `scratch/music` as its one root, on `clock`, and the
+/// platform it runs on: a second library built on that platform is the
+/// same server after a restart.
+async fn watched(
+    scratch: &Path,
+    clock: Arc<droppedneedle_kernel::clock::ManualClock>,
+) -> (droppedneedle_kernel::platform::Platform, LibrarySetup) {
+    migrated_db(&scratch.join("app.db"));
+    let db = Db::open_for_tests(&scratch.join("app.db")).expect("database opens");
+    let platform = TestPlatform::on(&db, scratch)
+        .settings(config_store(scratch))
+        .clock(clock)
+        .build()
+        .await;
+    let (library, _) = library_at(&platform);
+    library
+        .scans
+        .add_root(
+            Some("music".to_owned()),
+            scratch.join("music").to_string_lossy().into_owned(),
+            EffectivePolicy::Automatic,
+        )
+        .expect("root adds");
+    (platform, library)
+}
+
+/// The scopes of the one scan waiting or running, as (root, folder).
+fn waiting_scopes(library: &LibrarySetup) -> Vec<(String, String)> {
+    let runs = library.coordinator.current();
+    assert_eq!(runs.len(), 1, "one scan asked for");
+    let (_, scopes, _) = library.coordinator.snapshot(&runs[0].id).expect("run");
+    scopes
+        .into_iter()
+        .map(|scope| (scope.root_id, scope.relative_path))
+        .collect()
+}
+
+/// Changing a file in one of a thousand folders asks, once the batching
+/// window has passed, for one scan of that folder alone, however many
+/// changes the burst held.
+#[tokio::test]
+async fn the_folder_watcher_scans_only_the_folder_that_changed() {
+    let scratch = ScratchDir::new("watch-one-folder");
+    let music = scratch.join("music");
+    for n in 0..1000 {
+        let folder = music.join(format!("Artist/{n:04}"));
+        std::fs::create_dir_all(&folder).expect("mkdir");
+        std::fs::write(folder.join("cover.jpg"), b"x").expect("write");
+    }
+    let clock = Arc::new(droppedneedle_kernel::clock::ManualClock::at(
+        1_700_000_000_000,
+    ));
+    let (_platform, library) = watched(&scratch, clock.clone()).await;
+    let first = library.scans.watcher_tick().await;
+    assert!(matches!(first, WatcherAction::Idle { .. }), "{first:?}");
+
+    std::fs::write(music.join("Artist/0537/cover.jpg"), b"changed").expect("change");
+    let batching = library.scans.watcher_tick().await;
+    assert!(
+        matches!(batching, WatcherAction::Batching { .. }),
+        "{batching:?}"
+    );
+    std::fs::write(music.join("Artist/0537/notes.txt"), b"more").expect("change");
+    clock.advance(61_000);
+    assert_eq!(library.scans.watcher_tick().await, WatcherAction::Due);
+    assert_eq!(
+        waiting_scopes(&library),
+        [("music".to_owned(), "Artist/0537".to_owned())]
+    );
+}
+
+/// What the watcher saw outlives a restart: with nothing changed the first
+/// poll asks for no scan, and a change made while the server was down is
+/// still found.
+#[tokio::test]
+async fn the_folder_watcher_remembers_the_tree_across_a_restart() {
+    let scratch = ScratchDir::new("watch-restart");
+    let music = scratch.join("music");
+    std::fs::create_dir_all(music.join("A")).expect("mkdir");
+    std::fs::write(music.join("A/notes.txt"), b"x").expect("write");
+    let clock = Arc::new(droppedneedle_kernel::clock::ManualClock::at(
+        1_700_000_000_000,
+    ));
+    let (platform, library) = watched(&scratch, clock.clone()).await;
+    library.scans.watcher_tick().await;
+    std::fs::write(music.join("A/notes.txt"), b"changed").expect("change");
+    library.scans.watcher_tick().await;
+    clock.advance(61_000);
+    assert_eq!(library.scans.watcher_tick().await, WatcherAction::Due);
+    for _ in 0..50 {
+        library.scans.supervisor_tick().await;
+        if library.coordinator.current().is_empty() {
+            break;
+        }
+    }
+    assert!(library.coordinator.current().is_empty(), "the scan settles");
+    // The poll after the scan settled puts what it asked for on record.
+    library.scans.watcher_tick().await;
+
+    let (library, _) = library_at(&platform);
+    let first = library.scans.watcher_tick().await;
+    assert!(matches!(first, WatcherAction::Idle { .. }), "{first:?}");
+    clock.advance(61_000);
+    let second = library.scans.watcher_tick().await;
+    assert!(matches!(second, WatcherAction::Idle { .. }), "{second:?}");
+    assert!(
+        library.coordinator.current().is_empty(),
+        "no scan asked for"
+    );
+
+    std::fs::write(music.join("A/more.txt"), b"y").expect("change while down");
+    let (library, _) = library_at(&platform);
+    let first = library.scans.watcher_tick().await;
+    assert!(matches!(first, WatcherAction::Batching { .. }), "{first:?}");
+    clock.advance(61_000);
+    assert_eq!(library.scans.watcher_tick().await, WatcherAction::Due);
+    assert_eq!(
+        waiting_scopes(&library),
+        [("music".to_owned(), "A".to_owned())]
+    );
 }

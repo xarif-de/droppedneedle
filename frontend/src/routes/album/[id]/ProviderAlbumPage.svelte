@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
-	import { integrationStore } from '$lib/stores/integration';
+	import { useIntegrationStatus } from '$lib/queries/HomeIntegrationStatusQuery.svelte';
 	import BackButton from '$lib/components/BackButton.svelte';
 	import Button from '$lib/ui/Button.svelte';
 	import Card from '$lib/ui/Card.svelte';
@@ -8,7 +8,7 @@
 	import DeleteAlbumModal from '$lib/components/DeleteAlbumModal.svelte';
 	import RemoveTrackFileDialog from './RemoveTrackFileDialog.svelte';
 	import AddToPlaylistModal from '$lib/components/AddToPlaylistModal.svelte';
-	import { ApiError } from '$lib/api/client';
+	import { ApiError } from '$lib/api/errors';
 	import { createAlbumPageState } from './albumPageState.svelte';
 	import AlbumHeader from './AlbumHeader.svelte';
 	import UnmatchedFilesSection from './UnmatchedFilesSection.svelte';
@@ -32,6 +32,9 @@
 	} from '$lib/queries/library/LibraryQueries.svelte';
 	import LocalAlbumPage from './LocalAlbumPage.svelte';
 	import { getRatingsQuery, ratingOf, setRating } from '$lib/queries/ratings/RatingQueries.svelte';
+	import { setFavorite } from '$lib/queries/library/FavoriteMutations.svelte';
+
+	const integrations = useIntegrationStatus();
 
 	// The outage fallback only needs the local id; the v3 album view the
 	// route gate passes satisfies this, as does the v1 detail shape.
@@ -70,6 +73,7 @@
 			: null
 	);
 	const rate = setRating();
+	const heart = setFavorite();
 	const retagPairsQuery = getRetagPairsQuery(() => authStore.isAdmin);
 	const retagPairs = $derived(
 		localAlbumId
@@ -162,7 +166,7 @@
 				refreshing={state.refreshing}
 				headerDownloadTask={state.headerDownloadTask}
 				heldFiles={state.headerHeldFiles}
-				downloadClientConfigured={$integrationStore.download_client}
+				downloadClientConfigured={integrations.current.download_client}
 				libraryInLibrary={state.libraryInLibrary}
 				libraryTrackCount={state.libraryTrackCount}
 				libraryBelowCutoff={state.libraryBelowCutoff}
@@ -175,6 +179,10 @@
 				rating={ratingOf(ratingsQuery.data, 'album', localAlbumId)}
 				onrate={localAlbumId
 					? (rating) => rate.mutate({ kind: 'album', itemId: localAlbumId, rating })
+					: undefined}
+				favorite={localAlbumQuery.data?.favorite ?? false}
+				onfavorite={localAlbumQuery.data
+					? (favorited) => heart.mutate({ kind: 'album', itemId: localAlbumId, favorited })
 					: undefined}
 				onrequest={state.handleRequest}
 				ondelete={state.handleDeleteClick}
@@ -261,12 +269,12 @@
 						loadingLocal={state.loadingLocal}
 						loadingNavidrome={state.loadingNavidrome}
 						loadingPlex={state.loadingPlex}
-						youtubeEnabled={$integrationStore.youtube}
-						youtubeApiConfigured={$integrationStore.youtube_api}
-						jellyfinEnabled={$integrationStore.jellyfin}
-						localfilesEnabled={$integrationStore.localfiles}
-						navidromeEnabled={$integrationStore.navidrome}
-						plexEnabled={$integrationStore.plex}
+						youtubeEnabled={integrations.current.youtube}
+						youtubeApiConfigured={integrations.current.youtube_api}
+						jellyfinEnabled={integrations.current.jellyfin}
+						localfilesEnabled={integrations.current.localfiles}
+						navidromeEnabled={integrations.current.navidrome}
+						plexEnabled={integrations.current.plex}
 						jellyfinCallbacks={state.jellyfinCallbacks}
 						localCallbacks={state.localCallbacks}
 						localDownloadCallback={state.localDownloadCallback}
@@ -294,12 +302,12 @@
 						navidromeTracks={state.navidromeTracks}
 						plexTracks={state.plexTracks}
 						trackLinks={state.trackLinks}
-						youtubeEnabled={$integrationStore.youtube}
-						youtubeApiConfigured={$integrationStore.youtube_api}
-						jellyfinEnabled={$integrationStore.jellyfin}
-						localfilesEnabled={$integrationStore.localfiles}
-						navidromeEnabled={$integrationStore.navidrome}
-						plexEnabled={$integrationStore.plex}
+						youtubeEnabled={integrations.current.youtube}
+						youtubeApiConfigured={integrations.current.youtube_api}
+						jellyfinEnabled={integrations.current.jellyfin}
+						localfilesEnabled={integrations.current.localfiles}
+						navidromeEnabled={integrations.current.navidrome}
+						plexEnabled={integrations.current.plex}
 						libraryTracksByRecording={state.libraryTracksByRecording}
 						libraryTracksByPosition={state.libraryTracksByPosition}
 						heldByRecording={state.heldByRecording}
@@ -311,6 +319,8 @@
 						trackRatings={ratingsQuery.data?.tracks}
 						onRateTrack={(trackId, rating) =>
 							rate.mutate({ kind: 'track', itemId: trackId, rating })}
+						onFavoriteTrack={(trackId, favorited) =>
+							heart.mutate({ kind: 'track', itemId: trackId, favorited })}
 						onPlaySourceTrack={state.playSourceTrack}
 						onTrackGenerated={state.handleTrackGenerated}
 						onQuotaUpdate={state.handleQuotaUpdate}

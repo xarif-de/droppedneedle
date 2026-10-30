@@ -171,6 +171,23 @@ pub struct TrackEvidenceView {
     pub classification: EvidenceClass,
     /// What the verdict rests on (`recording_id`, `title`, `length`, ...).
     pub evidence_kinds: Vec<String>,
+    /// The MusicBrainz recording the file matched, when it matched one.
+    pub recording_mbid: Option<String>,
+    /// The release's track it matched, when it matched one.
+    pub release_track_mbid: Option<String>,
+}
+
+/// A release every selected review lists.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct SharedCandidateView {
+    /// Accept the selection with this key.
+    pub candidate_key: String,
+    pub release_group_mbid: String,
+    pub release_mbid: Option<String>,
+    pub album_title: String,
+    pub album_artist_name: String,
+    /// Its weakest match score across the selected reviews.
+    pub lowest_score: f64,
 }
 
 /// How many reviews one reason holds.
@@ -226,6 +243,16 @@ pub struct ReviewView {
     pub row_revision: i64,
 }
 
+/// Reviews matching a filter apart from its state, by state.
+#[derive(Debug, Clone, Copy, Default, Serialize, ToSchema)]
+pub struct ReviewStateCounts {
+    pub pending: u64,
+    pub approved: u64,
+    pub rejected: u64,
+    pub dismissed: u64,
+    pub excluded: u64,
+}
+
 /// One page of reviews, with the reviews matching the filter as its
 /// total.
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -234,17 +261,8 @@ pub struct ReviewsResponse {
     pub page: Page<ReviewView>,
     /// Reviews matching the filter apart from its reason, by reason.
     pub reason_counts: Vec<ReasonCount>,
-}
-
-/// What a "retry all" started.
-#[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct ReviewRetryAllResponse {
-    /// True when nothing started: the counts are what a real run would do.
-    pub preview: bool,
-    /// Albums whose identification started again (or would).
-    pub started: u32,
-    /// Reviews that stayed open, grouped by why.
-    pub skipped: Vec<SkippedReviews>,
+    /// Reviews matching the filter apart from its state, by state.
+    pub state_counts: ReviewStateCounts,
 }
 
 /// What a bulk review change would do.
@@ -258,15 +276,10 @@ pub struct ReviewBulkPreviewResponse {
     pub skipped: Vec<SkippedReviews>,
     /// Pass back to apply exactly this change.
     pub preview_token: String,
-}
-
-/// What a bulk review change did.
-#[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct ReviewBulkResponse {
-    /// Reviews changed.
-    pub applied: u32,
-    /// Reviews left alone, grouped by why.
-    pub skipped: Vec<SkippedReviews>,
+    /// Releases every selected pending, unpinned review lists, best
+    /// weakest score first; accept one for them all with its
+    /// `candidate_key`. Empty when they share none.
+    pub shared_candidates: Vec<SharedCandidateView>,
 }
 
 /// Reviews one reason held back.

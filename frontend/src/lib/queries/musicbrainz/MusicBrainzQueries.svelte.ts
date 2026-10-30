@@ -10,13 +10,12 @@ import { toMusicBrainzSettings } from './MusicBrainzAdapters';
 
 export const getMusicBrainzSettingsQuery = () =>
 	createQuery(() => {
-		const queryKey = MusicBrainzQueryKeyFactory.settings();
-		const userId = queryKey[2].user_id;
+		const userId = authStore.user?.id ?? null;
 		return {
-			queryKey,
+			queryKey: MusicBrainzQueryKeyFactory.settings(userId),
 			queryFn: async ({ signal }) => {
 				const data = toMusicBrainzSettings(
-					await api.global.v3.GET(MUSICBRAINZ_ENDPOINTS.settings(), { signal })
+					await api.v3.GET(MUSICBRAINZ_ENDPOINTS.settings(), { signal })
 				);
 				if ((authStore.user?.id ?? null) === userId) {
 					setMusicBrainzSourceScope(data, userId);

@@ -2,11 +2,13 @@ import { page } from 'vitest/browser';
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import { render } from 'vitest-browser-svelte';
 import type { PlaylistDetailV3 } from '$lib/queries/playlists/PlaylistV3Queries.svelte';
+import { PlaylistQueryKeyFactory } from '$lib/queries/playlists/PlaylistQueryKeyFactory';
 
 const mockShareMutate = vi.fn();
 const mockDeleteMutate = vi.fn();
 const mockResolveMutate = vi.fn();
 const mockRenameMutate = vi.fn();
+const mockForgetSources = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 
 vi.mock('$lib/api/playlists', () => ({
 	isRedactedPlaylist: (p: { is_redacted?: boolean } | null | undefined) => p?.is_redacted === true,
@@ -33,73 +35,37 @@ vi.mock('$lib/queries/playlists/PlaylistV3Queries.svelte', () => ({
 		error: null,
 		refetch: vi.fn()
 	}),
-	isRedactedPlaylistV3: () => false
+	isRedactedPlaylistV3: () => false,
+	getPlaylistSourcesV3QueryOptions: (userId: string | undefined, id: string) => ({
+		queryKey: PlaylistQueryKeyFactory.sources(userId, id),
+		queryFn: async () => (await mockResolveMutate(id)).sources
+	})
 }));
 
 vi.mock('$lib/queries/playlists/PlaylistV3Mutations.svelte', () => ({
 	setPlaylistVisibilityV3: () => ({ mutateAsync: mockShareMutate, isPending: false }),
 	deletePlaylistV3: () => ({ mutateAsync: mockDeleteMutate, isPending: false }),
-	resolvePlaylistSourcesV3: () => ({ mutateAsync: mockResolveMutate, isPending: false }),
 	updatePlaylistV3: () => ({ mutateAsync: mockRenameMutate, isPending: false }),
 	uploadPlaylistCoverV3: () => ({ mutateAsync: vi.fn(), isPending: false }),
 	deletePlaylistCoverV3: () => ({ mutateAsync: vi.fn(), isPending: false }),
 	removePlaylistTrackV3: () => ({ mutateAsync: vi.fn(), isPending: false }),
 	removePlaylistTracksV3: () => ({ mutateAsync: vi.fn(), isPending: false }),
 	updatePlaylistTrackV3: () => ({ mutateAsync: vi.fn(), isPending: false }),
-	reorderPlaylistTrackV3: () => ({ mutateAsync: vi.fn(), isPending: false })
+	reorderPlaylistTrackV3: () => ({ mutateAsync: vi.fn(), isPending: false }),
+	refreshPlaylist: vi.fn().mockResolvedValue(undefined),
+	forgetPlaylistSources: mockForgetSources
 }));
 
-vi.mock('$lib/queries/QueryClient', () => {
-	// musicSource/userSessionCleanup ride along via $lib/constants and import
-	// the client value + setter; they only run at call time, so a small
-	// in-memory client is enough.
-	const store = new Map<string, unknown>();
-	const keyOf = (key: unknown) => JSON.stringify(key);
-	const fakeClient = {
-		getQueryData: (key: unknown) => store.get(keyOf(key)),
-		setQueryData: (key: unknown, updater: unknown) => {
-			const next =
-				typeof updater === 'function'
-					? (updater as (old: unknown) => unknown)(store.get(keyOf(key)))
-					: updater;
-			store.set(keyOf(key), next);
-			return next;
-		},
-		removeQueries: (filters?: { queryKey?: unknown }) => {
-			if (filters?.queryKey === undefined) {
-				store.clear();
-				return;
-			}
-			const prefix = keyOf(filters.queryKey).slice(0, -1);
-			for (const k of [...store.keys()]) {
-				if (k.startsWith(prefix)) store.delete(k);
-			}
-		},
-		invalidateQueries: vi.fn(async () => undefined),
-		cancelQueries: vi.fn(async () => undefined),
-		clear: () => store.clear(),
-		ensureQueryData: async (opts: {
-			queryKey: unknown;
-			queryFn: (ctx: { queryKey: unknown; signal: AbortSignal }) => Promise<unknown>;
-		}) => {
-			const k = keyOf(opts.queryKey);
-			if (!store.has(k)) {
-				store.set(
-					k,
-					await opts.queryFn({
-						queryKey: opts.queryKey,
-						signal: new AbortController().signal
-					})
-				);
-			}
-			return store.get(k);
-		}
-	};
+// A real client with no persister.
+vi.mock('$lib/queries/QueryClient', async () => {
+	const { QueryClient } = await import('@tanstack/svelte-query');
+	const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 	return {
-		queryClient: fakeClient,
+		queryClient,
 		invalidateQueriesWithPersister: vi.fn(),
-		setQueryDataWithPersister: async (key: unknown, updater: unknown): Promise<void> => {
-			fakeClient.setQueryData(key, updater);
+		setQueryDataWithPersister: async (key: readonly unknown[], data: unknown): Promise<void> => {
+			// eslint-disable-next-line no-restricted-syntax -- this stands in for the helper itself
+			queryClient.setQueryData(key, data);
 		}
 	};
 });
@@ -288,9 +254,9 @@ describe('Playlist detail page', () => {
 		await vi.waitFor(() => {
 			expect(mockResolveMutate).toHaveBeenCalledWith('pl-1');
 		});
-		// Let the resolve promise chain settle, then assert nothing was cached.
-		await new Promise((r) => setTimeout(r, 100));
-		// Empty resolve maps are never fresh, so no per-user cache entry is stored.
-		expect(localStorage.getItem('droppedneedle_playlist_sources_anon_pl-1')).toBeNull();
+		// Empty resolve maps are never fresh, so the kept answer is dropped.
+		await vi.waitFor(() => {
+			expect(mockForgetSources).toHaveBeenCalledWith('pl-1');
+		});
 	});
 });

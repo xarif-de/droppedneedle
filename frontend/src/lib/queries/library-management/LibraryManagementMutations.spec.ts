@@ -1,24 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const captured = vi.hoisted(() => ({ current: null as Record<string, unknown> | null }));
-const invalidate = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
-
-vi.mock('@tanstack/svelte-query', async (importOriginal) => ({
-	...(await importOriginal<typeof import('@tanstack/svelte-query')>()),
-	createMutation: vi.fn((factory: () => Record<string, unknown>) => {
-		captured.current = factory();
-		return captured.current;
-	})
-}));
 
 vi.mock('$lib/api/client', () => ({
 	api: {
-		global: {
-			v3: {
-				POST: vi.fn().mockResolvedValue({}),
-				PUT: vi.fn().mockResolvedValue({}),
-				DELETE: vi.fn().mockResolvedValue({})
-			}
+		v3: {
+			POST: vi.fn().mockResolvedValue({}),
+			PUT: vi.fn().mockResolvedValue({}),
+			DELETE: vi.fn().mockResolvedValue({})
 		}
 	}
 }));
@@ -27,11 +16,16 @@ vi.mock('$lib/stores/toast', () => ({
 	toastStore: { show: vi.fn() }
 }));
 
-vi.mock('./LibraryManagementInvalidation', () => ({
-	invalidateLibraryManagementSurfaces: invalidate
+vi.mock('$lib/queries/effects', async (importOriginal) => ({
+	...(await importOriginal<typeof import('$lib/queries/effects')>()),
+	createAppMutation: vi.fn((factory: () => Record<string, unknown>) => {
+		captured.current = factory();
+		return captured.current;
+	})
 }));
 
 import { api } from '$lib/api/client';
+import type { Effect } from '$lib/queries/effects';
 import {
 	createLibraryManagementDuplicateResolutionMutation,
 	createLibraryManagementTagEditPreviewMutation,
@@ -49,6 +43,7 @@ function currentMutation<TInput, TOutput = unknown>() {
 	return captured.current as {
 		mutationFn: (input: TInput) => Promise<TOutput>;
 		onSuccess?: (data: TOutput, input: TInput) => Promise<void> | void;
+		effects: (data: TOutput, input: TInput) => Effect[];
 	};
 }
 
@@ -57,7 +52,7 @@ beforeEach(() => {
 });
 
 describe('Library Management mutations', () => {
-	it('updates revision-guarded settings and invalidates persisted surfaces', async () => {
+	it('updates revision-guarded settings and declares the catalog changed', async () => {
 		updateLibraryManagementSettingsMutation();
 		const mutation = currentMutation<{
 			settings: Record<string, unknown>;
@@ -66,10 +61,9 @@ describe('Library Management mutations', () => {
 		const request = { settings: { schema_version: 1 }, expected_settings_revision: 'rev-1' };
 
 		await mutation.mutationFn(request);
-		await mutation.onSuccess?.({}, request);
 
-		expect(api.global.v3.PUT).toHaveBeenCalledWith('/api/v3/settings/library-management', request);
-		expect(invalidate).toHaveBeenCalledOnce();
+		expect(api.v3.PUT).toHaveBeenCalledWith('/api/v3/settings/library-management', request);
+		expect(mutation.effects({}, request).map((effect) => effect.name)).toEqual(['catalogChanged']);
 	});
 
 	it('sends profile delete revisions in the DELETE JSON body', async () => {
@@ -85,7 +79,7 @@ describe('Library Management mutations', () => {
 
 		await mutation.mutationFn(input);
 
-		expect(api.global.v3.DELETE).toHaveBeenCalledWith(
+		expect(api.v3.DELETE).toHaveBeenCalledWith(
 			'/api/v3/settings/library-management/profiles/profile%2F1',
 			input.request
 		);
@@ -101,7 +95,7 @@ describe('Library Management mutations', () => {
 			profileId: 'profile/1',
 			request: { expected_settings_revision: 'rev-1' }
 		});
-		expect(api.global.v3.POST).toHaveBeenLastCalledWith(
+		expect(api.v3.POST).toHaveBeenLastCalledWith(
 			'/api/v3/settings/library-management/profiles/profile%2F1/export',
 			{ expected_settings_revision: 'rev-1' }
 		);
@@ -110,7 +104,7 @@ describe('Library Management mutations', () => {
 		const previewMutation = currentMutation<Record<string, unknown>>();
 		const previewRequest = { content: 'DNLP1:code', expected_settings_revision: 'rev-1' };
 		await previewMutation.mutationFn(previewRequest);
-		expect(api.global.v3.POST).toHaveBeenLastCalledWith(
+		expect(api.v3.POST).toHaveBeenLastCalledWith(
 			'/api/v3/settings/library-management/profile-imports/preview',
 			previewRequest
 		);
@@ -124,12 +118,13 @@ describe('Library Management mutations', () => {
 			expected_settings_revision: 'rev-1'
 		};
 		await importMutation.mutationFn(importRequest);
-		await importMutation.onSuccess?.({}, importRequest);
-		expect(api.global.v3.POST).toHaveBeenLastCalledWith(
+		expect(api.v3.POST).toHaveBeenLastCalledWith(
 			'/api/v3/settings/library-management/profile-imports',
 			importRequest
 		);
-		expect(invalidate).toHaveBeenCalledOnce();
+		expect(importMutation.effects({}, importRequest).map((effect) => effect.name)).toEqual([
+			'catalogChanged'
+		]);
 	});
 
 	it('posts the complete explicit duplicate choice without adding a default', async () => {
@@ -151,7 +146,7 @@ describe('Library Management mutations', () => {
 
 		await mutation.mutationFn(request);
 
-		expect(api.global.v3.POST).toHaveBeenCalledWith(
+		expect(api.v3.POST).toHaveBeenCalledWith(
 			'/api/v3/library/management/duplicate-resolution-previews',
 			request
 		);
@@ -174,7 +169,7 @@ describe('Library Management mutations', () => {
 
 		await mutation.mutationFn(request);
 
-		expect(api.global.v3.POST).toHaveBeenCalledWith(
+		expect(api.v3.POST).toHaveBeenCalledWith(
 			'/api/v3/library/management/tag-edit-previews',
 			request
 		);
@@ -193,7 +188,7 @@ describe('Library Management mutations', () => {
 
 		await mutation.mutationFn(input);
 
-		expect(api.global.v3.POST).toHaveBeenCalledWith(
+		expect(api.v3.POST).toHaveBeenCalledWith(
 			'/api/v3/library/management/previews/preview%2F1/discard',
 			input.request
 		);
@@ -205,7 +200,7 @@ describe('Library Management mutations', () => {
 
 		await mutation.mutationFn({ jobId: 'preview/1' });
 
-		expect(api.global.v3.POST).toHaveBeenCalledWith(
+		expect(api.v3.POST).toHaveBeenCalledWith(
 			'/api/v3/library/management/previews/preview%2F1/reissue'
 		);
 	});
@@ -216,7 +211,7 @@ describe('Library Management mutations', () => {
 
 		await mutation.mutationFn({ bundleId: 'bundle/1' });
 
-		expect(api.global.v3.POST).toHaveBeenCalledWith(
+		expect(api.v3.POST).toHaveBeenCalledWith(
 			'/api/v3/library/management/recovery/import-bundles/bundle%2F1/resolve'
 		);
 	});
@@ -232,7 +227,7 @@ describe('Library Management mutations', () => {
 				total_files: number;
 			}
 		>();
-		vi.mocked(api.global.v3.POST).mockResolvedValue({
+		vi.mocked(api.v3.POST).mockResolvedValue({
 			bundle_id: 'bundle-1',
 			state: 'resolved',
 			verified_files: 4,
@@ -241,7 +236,7 @@ describe('Library Management mutations', () => {
 
 		const result = await mutation.mutationFn({ bundleId: 'bundle-1' });
 
-		expect(api.global.v3.POST).toHaveBeenCalledWith(
+		expect(api.v3.POST).toHaveBeenCalledWith(
 			'/api/v3/library/management/recovery/import-bundles/bundle-1/resolve'
 		);
 		expect(result.verified_files).toBe(4);

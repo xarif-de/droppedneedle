@@ -2,7 +2,7 @@
 //! maybe dispatch; duplicate asks attach to the live row.
 
 use super::{Dispatched, RequestsService, dispatch_fault, fresh_record, stored_dispatch};
-use crate::dispatch::DispatchOrigin;
+use crate::dispatch::{DispatchError, DispatchOrigin};
 use crate::follows::FollowAsk;
 use crate::follows::cursors::Follower;
 use crate::requests::auth::auto_approves;
@@ -132,7 +132,8 @@ impl RequestsService {
     /// Ask for a followed artist's new release on the follower's behalf.
     /// The follower's auto-download approval stands in for a per-request
     /// one. Quotas apply, but a full one never refuses: the row waits as
-    /// queued and [`Self::start_waiting`] starts it once there is room.
+    /// queued and [`Self::start_waiting`] starts it once there is room. A
+    /// busy database leaves it waiting the same way.
     pub async fn request_follow(
         &self,
         release: &FollowRelease,
@@ -156,7 +157,7 @@ impl RequestsService {
             artist_name: release.artist_name.clone(),
             album_title: release.title.clone(),
             artist_mbid: Some(release.artist_mbid.clone()),
-            release_mbid: self.chosen_release(&key).await,
+            release_mbid: self.chosen_release_or_none(&key).await,
             ..fresh_record(
                 RequestKind::Album,
                 key.clone(),
@@ -173,10 +174,15 @@ impl RequestsService {
                 if won.waits_for_quota() {
                     return Ok(FollowIntake::Waiting);
                 }
-                let task_id = self
-                    .dispatch_won(&won, DispatchOrigin::Follow, owner)
-                    .await?;
-                Ok(FollowIntake::Started { task_id })
+                Ok(
+                    match self
+                        .dispatch_won(&won, DispatchOrigin::Follow, owner)
+                        .await?
+                    {
+                        Some(task_id) => FollowIntake::Started { task_id },
+                        None => FollowIntake::Waiting,
+                    },
+                )
             }
         }
     }
@@ -216,10 +222,11 @@ impl RequestsService {
         })
     }
 
-    /// Start every row waiting for quota room whose owner has room now.
-    /// Answers the rows started with their tasks. A row whose owner no
-    /// longer exists is cancelled. One row's failure is logged and leaves
-    /// the others to run.
+    /// Start every waiting row (one waiting for quota room, or one a busy
+    /// database kept from starting) whose owner has room now. Answers the
+    /// follow rows started, with their tasks, for the follower's notice. A
+    /// row whose owner no longer exists is cancelled. One row's failure is
+    /// logged and leaves the others to run.
     pub async fn start_waiting(
         &self,
         now: u64,
@@ -231,7 +238,7 @@ impl RequestsService {
                 if let Err(error) = self
                     .store
                     .update_status(
-                        RequestKind::Album,
+                        record.kind,
                         &record.key,
                         RequestStatus::Cancelled,
                         Some(now),
@@ -245,8 +252,10 @@ impl RequestsService {
             };
             let principal = Principal::acting_for(owner, role, record.requested_by_name.clone());
             match self.start_one(&record, &principal, now).await {
-                Ok(Some(task_id)) => started.push((record, task_id)),
-                Ok(None) => {}
+                Ok(Some(task_id)) if record.origin == DispatchOrigin::Follow => {
+                    started.push((record, task_id));
+                }
+                Ok(_) => {}
                 Err(error) => {
                     tracing::warn!(key = %record.key, ?error, "waiting request could not start");
                 }
@@ -274,7 +283,7 @@ impl RequestsService {
             .request_gate(principal.user_id(), principal.role(), 1)?;
         let Some(admitted) = self
             .store
-            .admit_waiting(&record.key, principal.user_id(), gate, now)
+            .admit_waiting(record.kind, &record.key, principal.user_id(), gate, now)
             .await?
         else {
             return Ok(None);
@@ -282,12 +291,7 @@ impl RequestsService {
         let owner = admitted.user_id.clone().unwrap_or_default();
         let request = stored_dispatch(&admitted, admitted.origin, &owner);
         match self
-            .dispatch_and_link(
-                RequestKind::Album,
-                &admitted.key,
-                &request,
-                admitted.generation,
-            )
+            .dispatch_and_link(admitted.kind, &admitted.key, &request, admitted.generation)
             .await?
         {
             Dispatched::Linked(task_id) => Ok(Some(task_id)),
@@ -297,7 +301,7 @@ impl RequestsService {
             ))),
             Dispatched::Failed(cause) => {
                 self.store
-                    .requeue_waiting(&admitted.key, admitted.generation)
+                    .requeue_waiting(admitted.kind, &admitted.key, admitted.generation)
                     .await?;
                 Err(dispatch_fault(cause))
             }
@@ -401,7 +405,7 @@ impl RequestsService {
             .check_storage_admission(principal.user_id(), role, DispatchOrigin::User)
             .await?;
 
-        let release_mbid = self.chosen_release(&mbid).await.or(asked.clone());
+        let release_mbid = self.chosen_release(&mbid).await?.or(asked.clone());
         let needs_approval = !granted && !auto_approves(role);
         let record = RequestRecord {
             artist_name,
@@ -560,7 +564,7 @@ impl RequestsService {
                 let task_id = self.dispatch_won(&won, DispatchOrigin::User, "").await?;
                 Ok(TrackIntakeResponse {
                     status: RequestStatus::Queued.as_str().to_owned(),
-                    task_id: Some(task_id),
+                    task_id,
                 })
             }
         }
@@ -691,7 +695,7 @@ impl RequestsService {
 
         let mut records = Vec::with_capacity(resolvable.len());
         for (mbid, item, artist_name, album_title) in &resolvable {
-            let release_mbid = self.chosen_release(mbid).await;
+            let release_mbid = self.chosen_release_or_none(mbid).await;
             let record = RequestRecord {
                 artist_name: artist_name.clone(),
                 album_title: album_title.clone(),
@@ -841,7 +845,7 @@ impl RequestsService {
             ) else {
                 continue;
             };
-            let release_mbid = self.chosen_release(&item.release_group_mbid).await;
+            let release_mbid = self.chosen_release_or_none(&item.release_group_mbid).await;
             let artist_mbid = Some(item.artist_mbid.trim().to_owned()).filter(|id| !id.is_empty());
             records.push(RequestRecord {
                 artist_name,
@@ -889,7 +893,7 @@ impl RequestsService {
     }
 
     /// Start the downloads of rows a batch ask won. One row's fault never
-    /// fails its siblings. Answers how many started.
+    /// fails its siblings. Answers how many started or wait to start.
     async fn dispatch_created(&self, created: &[RequestRecord], actor_id: &str) -> u32 {
         let mut dispatched = 0_u32;
         for won in created {
@@ -929,7 +933,7 @@ impl RequestsService {
                 follow,
             )
             .await?;
-        let switch = self.edition_switch(principal, existing, asked).await;
+        let switch = self.edition_switch(principal, existing, asked).await?;
         if let Some(release) = switch
             && !self
                 .store
@@ -952,7 +956,7 @@ impl RequestsService {
                 .start_one(existing, principal, self.now_epoch())
                 .await?
         {
-            return Ok(accepted(&existing.key, task_id));
+            return Ok(accepted(&existing.key, Some(task_id)));
         }
         let message = if switch.is_some() {
             "The request now gets this edition"
@@ -974,36 +978,41 @@ impl RequestsService {
 
     /// The edition a curator's ask would switch a live row to: the asked
     /// one, when it differs from the row's and the library has not chosen
-    /// one of its own (that edition always wins).
+    /// one of its own (that edition always wins). A chosen edition that
+    /// does not read switches nothing and answers the error.
     async fn edition_switch<'a>(
         &self,
         principal: &Principal,
         existing: &RequestRecord,
         asked: Option<&'a str>,
-    ) -> Option<&'a str> {
-        let release = asked?;
+    ) -> Result<Option<&'a str>, RequestsError> {
+        let Some(release) = asked else {
+            return Ok(None);
+        };
         if !principal.role().is_curator()
             || existing.kind != RequestKind::Album
             || existing.status == RequestStatus::Cancelling
             || existing.release_mbid.as_deref() == Some(release)
         {
-            return None;
+            return Ok(None);
         }
-        match self.chosen_release(&existing.key).await {
+        Ok(match self.chosen_release(&existing.key).await? {
             Some(_) => None,
             None => Some(release),
-        }
+        })
     }
 
     /// Dispatch one won row and link its task, cancelling the
-    /// orphan when the generation moved on. A dispatch that fails
-    /// marks the row failed. Answers the task.
+    /// orphan when the generation moved on. A busy database puts the row
+    /// back to waiting, and [`Self::start_waiting`] starts it on its next
+    /// pass; any other failure marks the row failed. Answers the task, or
+    /// `None` while the row waits.
     async fn dispatch_won(
         &self,
         won: &RequestRecord,
         origin: DispatchOrigin,
         actor_id: &str,
-    ) -> Result<String, RequestsError> {
+    ) -> Result<Option<String>, RequestsError> {
         let owner = won.user_id.clone().unwrap_or_else(|| actor_id.to_owned());
         let request = stored_dispatch(won, origin, &owner);
         let now = self.now_epoch();
@@ -1012,11 +1021,18 @@ impl RequestsService {
             .dispatch_and_link(won.kind, &won.key, &request, won.generation)
             .await?
         {
-            Dispatched::Linked(task_id) => Ok(task_id),
+            Dispatched::Linked(task_id) => Ok(Some(task_id)),
             Dispatched::Stale => Err(RequestsError::internal(&format_args!(
                 "{kind} link lost its generation for {}",
                 won.key
             ))),
+            Dispatched::Failed(DispatchError::Busy { operation }) => {
+                tracing::info!(key = %won.key, %operation, "database busy; the request waits to start");
+                self.store
+                    .requeue_waiting(won.kind, &won.key, won.generation)
+                    .await?;
+                Ok(None)
+            }
             Dispatched::Failed(cause) => {
                 self.store
                     .update_status(
@@ -1035,13 +1051,19 @@ impl RequestsService {
     }
 }
 
-/// The reply to an album ask whose download started.
-fn accepted(key: &str, task_id: String) -> IntakeResponse {
+/// The reply to an album ask whose download started, or waits to start
+/// while the database is busy.
+fn accepted(key: &str, task_id: Option<String>) -> IntakeResponse {
+    let status = if task_id.is_some() {
+        RequestStatus::Pending
+    } else {
+        RequestStatus::Queued
+    };
     IntakeResponse {
         success: true,
         message: "Request accepted".to_owned(),
         musicbrainz_id: key.to_owned(),
-        status: RequestStatus::Pending.as_str().to_owned(),
-        task_id: Some(task_id),
+        status: status.as_str().to_owned(),
+        task_id,
     }
 }

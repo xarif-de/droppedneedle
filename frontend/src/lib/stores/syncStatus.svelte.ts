@@ -2,10 +2,11 @@ import { browser } from '$app/environment';
 import { api } from '$lib/api/client';
 import { CACHE_SYNC_ENDPOINTS } from '$lib/queries/settings/endpoints';
 import {
-	muxEventStream,
-	type MuxEventStream,
-	type MuxUnsubscribe
-} from '$lib/queries/events/MuxEventStream';
+	serverEvents,
+	type EventDispatcher,
+	type ServerEventData
+} from '$lib/queries/events/dispatcher';
+import type { MuxUnsubscribe } from '$lib/queries/events/MuxEventStream';
 
 type SyncStatus = {
 	is_syncing: boolean;
@@ -47,7 +48,7 @@ const EMPTY_STATUS: SyncStatus = {
 const AUTO_HIDE_SUCCESS_MS = 4000;
 const AUTO_HIDE_ERROR_MS = 6000;
 
-export function createSyncStatusStore(mux: MuxEventStream = muxEventStream) {
+export function createSyncStatusStore(events: EventDispatcher = serverEvents) {
 	let status = $state<SyncStatus>({ ...EMPTY_STATUS });
 	let isDismissed = $state(false);
 	let isMinimized = $state(false);
@@ -95,22 +96,15 @@ export function createSyncStatusStore(mux: MuxEventStream = muxEventStream) {
 		}
 	}
 
-	function onCacheSync(event: Event): void {
-		if (!(event instanceof MessageEvent) || typeof event.data !== 'string') return;
-		try {
-			applyStatus(JSON.parse(event.data) as SyncStatus);
-		} catch {
-			// ignore malformed messages without bumping the generation, so a
-			// bad frame never kills an in-flight seed without applying anything
-			return;
-		}
+	function onCacheSync(data: ServerEventData<'cache.sync'>): void {
+		applyStatus({ ...EMPTY_STATUS, ...data });
 		liveGeneration += 1;
 	}
 
 	async function fetchStatus(): Promise<void> {
 		const basis = liveGeneration;
 		try {
-			const data = await api.global.v3.GET(CACHE_SYNC_ENDPOINTS.status());
+			const data = await api.v3.GET(CACHE_SYNC_ENDPOINTS.status());
 			// A live frame that landed mid-fetch is fresher than this seed.
 			if (basis !== liveGeneration) return;
 			applyStatus({ ...EMPTY_STATUS, ...data });
@@ -168,7 +162,7 @@ export function createSyncStatusStore(mux: MuxEventStream = muxEventStream) {
 		connect(): void {
 			if (!browser || connected) return;
 			connected = true;
-			unsubCacheSync = mux.on('cache.sync', onCacheSync);
+			unsubCacheSync = events.on('cache.sync', onCacheSync);
 			// The mux yields its initial snapshot once per connection, which
 			// may predate this registration (connect runs deferred), so seed
 			// directly. Drops reconnect natively at the server's retry frame;
@@ -209,7 +203,7 @@ export function createSyncStatusStore(mux: MuxEventStream = muxEventStream) {
 
 		async cancelSync(): Promise<void> {
 			try {
-				await api.global.v3.POST(CACHE_SYNC_ENDPOINTS.cancel());
+				await api.v3.POST(CACHE_SYNC_ENDPOINTS.cancel());
 			} catch {
 				// ignore errors, sync may already be stopped
 			}

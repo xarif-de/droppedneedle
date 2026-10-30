@@ -5,11 +5,14 @@
 
 use std::sync::Arc;
 
+use crate::common::ScratchDir;
+use droppedneedle_kernel::clock::ManualClock;
 use droppedneedle_providers::coverart::{DownloadSize, EntityKind};
-use droppedneedle_providers::executor::ScriptedWire;
+use droppedneedle_providers::executor::{Method, Scripted, ScriptedWire};
 use droppedneedle_providers::geocoding::DEFAULT_CITY_COUNT;
-use droppedneedle_providers::lastfm::LastFmCredentials;
+use droppedneedle_providers::lastfm::{ArtistInfo, LastFmCredentials};
 use droppedneedle_providers::musicbrainz::{self, Criticality, MbSource};
+use droppedneedle_providers::youtube::{YouTubeClient, YouTubeSettings, YoutubeError};
 use droppedneedle_providers::{
     PayloadKind, ProviderEndpoints, ProviderError, Providers, RequestPriority,
 };
@@ -58,7 +61,10 @@ enum Provider {
     MusicBrainzBrowse(&'static str),
     TicketmasterAttractions,
     TicketmasterEvents,
+    AcoustIdLookup,
     LastFm(LastFmRead),
+    YouTubeSearch,
+    YouTubeVideos,
 }
 
 /// The Last.fm read a row's answer goes through.
@@ -696,6 +702,41 @@ const ROWS: &[Row] = &[
         kind: PayloadKind::Decode,
         identity: "/_embedded/events/0/_embedded/attractions/0/id",
     },
+    Row {
+        name: "acoustid /v2/lookup, result id",
+        provider: Provider::AcoustIdLookup,
+        body: include_str!("../fixtures/acoustid/single_lookup.json"),
+        kind: PayloadKind::Decode,
+        identity: "/results/0/id",
+    },
+    Row {
+        name: "acoustid /v2/lookup, recording id",
+        provider: Provider::AcoustIdLookup,
+        body: include_str!("../fixtures/acoustid/single_lookup.json"),
+        kind: PayloadKind::Decode,
+        identity: "/results/0/recordings/0/id",
+    },
+    Row {
+        name: "youtube /search, video id",
+        provider: Provider::YouTubeSearch,
+        body: include_str!("../fixtures/youtube/search_found.json"),
+        kind: PayloadKind::Decode,
+        identity: "/items/0/id/videoId",
+    },
+    Row {
+        name: "youtube /videos, video id",
+        provider: Provider::YouTubeVideos,
+        body: include_str!("../fixtures/youtube/videos_found.json"),
+        kind: PayloadKind::Decode,
+        identity: "/items/0/id",
+    },
+    Row {
+        name: "youtube /videos, unknown id (empty list)",
+        provider: Provider::YouTubeVideos,
+        body: include_str!("../fixtures/youtube/videos_unknown_id.json"),
+        kind: PayloadKind::Decode,
+        identity: "/items",
+    },
 ];
 
 /// Serves `body` from the provider's address and reads it through the
@@ -1135,7 +1176,73 @@ async fn read(provider: Provider, body: &str) -> Result<bool, ProviderError> {
                 .await?;
             Ok(!page.items.is_empty())
         }
+        Provider::AcoustIdLookup => {
+            let wire = Arc::new(ScriptedWire::new());
+            wire.on(
+                Method::Post,
+                "http://fake/acoustid/v2/lookup",
+                Scripted::Answer {
+                    status: 200,
+                    headers: vec![("content-type".to_owned(), "application/json".to_owned())],
+                    body: body.as_bytes().to_vec(),
+                },
+            );
+            let providers = Providers::unpaced_at(
+                wire,
+                ProviderEndpoints {
+                    acoustid: "http://fake/acoustid".to_owned(),
+                    ..ProviderEndpoints::closed()
+                },
+            );
+            let found = providers
+                .acoustid
+                .lookup("key", "print", 218, PRIORITY)
+                .await?;
+            Ok(found.is_some())
+        }
         Provider::LastFm(read) => lastfm(read, body).await,
+        Provider::YouTubeSearch => {
+            let scratch = ScratchDir::new("youtube-search-row");
+            let wire = Arc::new(ScriptedWire::new());
+            wire.answer(
+                "http://fake/youtube/youtube/v3/search",
+                200,
+                &[],
+                body.as_bytes().to_vec(),
+            );
+            let providers = Providers::unpaced_at(
+                wire,
+                ProviderEndpoints {
+                    youtube: "http://fake/youtube".to_owned(),
+                    ..ProviderEndpoints::closed()
+                },
+            );
+            let client = YouTubeClient::new(
+                providers.youtube.clone(),
+                scratch.join("youtube_quota.json"),
+                YouTubeSettings {
+                    api_key: "k".to_owned(),
+                    enabled: true,
+                    api_enabled: true,
+                    daily_quota_limit: 80,
+                },
+                Arc::new(ManualClock::at(0)),
+                providers.cache.clone(),
+            )
+            .expect("the settings are valid");
+            let found = client
+                .search_video("Portishead", "Dummy", PRIORITY)
+                .await
+                .map_err(|error| match error {
+                    YoutubeError::Provider(error) => error,
+                    other => panic!("only a provider failure is possible here: {other}"),
+                })?;
+            Ok(found.is_some())
+        }
+        Provider::YouTubeVideos => {
+            youtube_check(200, body).await?;
+            Ok(true)
+        }
     }
 }
 
@@ -1344,4 +1451,122 @@ async fn recorded_answers_decode_and_need_their_identity() {
             row.kind
         );
     }
+}
+
+/// Serves `body` at `status` as the one answer of a YouTube key check.
+async fn youtube_check(status: u16, body: &str) -> Result<(), ProviderError> {
+    let wire = Arc::new(ScriptedWire::new());
+    wire.answer(
+        "http://fake/youtube/youtube/v3/videos",
+        status,
+        &[],
+        body.as_bytes().to_vec(),
+    );
+    let providers = Providers::unpaced_at(
+        wire,
+        ProviderEndpoints {
+            youtube: "http://fake/youtube".to_owned(),
+            ..ProviderEndpoints::closed()
+        },
+    );
+    providers.youtube.check_key("k", PRIORITY).await
+}
+
+/// The refusals a YouTube answer carries. The forbidden part and the bad key
+/// are recorded answers. A spent quota is not recorded, since reaching it
+/// spends the day's quota, so its body names the reason Google's error
+/// reference gives for it.
+#[tokio::test]
+async fn youtube_refusals_map_to_their_variants() {
+    assert!(matches!(
+        youtube_check(
+            403,
+            include_str!("../fixtures/youtube/videos_forbidden_part.json")
+        )
+        .await,
+        Err(ProviderError::Forbidden { .. })
+    ));
+    assert!(matches!(
+        youtube_check(
+            400,
+            include_str!("../fixtures/youtube/search_invalid_key.json")
+        )
+        .await,
+        Err(ProviderError::Unauthorized { .. })
+    ));
+    assert!(matches!(
+        youtube_check(
+            403,
+            r#"{"error":{"code":403,"errors":[{"reason":"quotaExceeded"}]}}"#
+        )
+        .await,
+        Err(ProviderError::Disabled { .. })
+    ));
+}
+
+/// Serves `body` as Last.fm's answer to `artist.getInfo` and reads it.
+async fn lastfm_artist_info(body: &str) -> Result<Option<ArtistInfo>, ProviderError> {
+    let wire = Arc::new(ScriptedWire::new());
+    wire.answer("http://fake/lastfm/", 200, &[], body.as_bytes().to_vec());
+    let providers = Providers::unpaced_at(
+        wire,
+        ProviderEndpoints {
+            lastfm: "http://fake/lastfm/".to_owned(),
+            ..ProviderEndpoints::closed()
+        },
+    );
+    let creds = LastFmCredentials {
+        api_key: "key".to_owned(),
+        ..LastFmCredentials::default()
+    };
+    providers
+        .lastfm
+        .artist_info(&creds, "Radiohead", None, PRIORITY)
+        .await
+}
+
+/// A page link the web UI would bind as an href is http or https or
+/// nothing: a recorded answer whose links are scripts keeps the artist and
+/// drops those links.
+#[tokio::test]
+async fn a_lastfm_link_that_is_not_a_web_address_reads_as_none() {
+    let mut answer: serde_json::Value =
+        serde_json::from_str(include_str!("../fixtures/lastfm/artist_getinfo.json"))
+            .expect("recorded body parses");
+    for pointer in [
+        "/artist/url",
+        "/artist/tags/tag/0/url",
+        "/artist/similar/artist/0/url",
+    ] {
+        *answer.pointer_mut(pointer).expect(pointer) = "javascript:alert(1)".into();
+    }
+    let artist = lastfm_artist_info(&answer.to_string())
+        .await
+        .expect("the answer still decodes")
+        .expect("the artist is kept");
+    assert_eq!(artist.url, "");
+    assert_eq!(artist.tags[0].url, "");
+    assert_eq!(artist.similar[0].url, "");
+    assert_eq!(artist.tags[1].url, "https://www.last.fm/tag/alternative");
+}
+
+/// A decode failure says where and how the answer broke, never what it
+/// held: a value from the answer can be a key or a token.
+#[tokio::test]
+async fn a_decode_failure_never_quotes_the_answer() {
+    let secret = "sk-0123456789abcdef";
+    let error = lastfm_artist_info(&format!(r#"{{"artist": "{secret}"}}"#))
+        .await
+        .expect_err("a string is not an artist");
+    assert!(
+        matches!(
+            &error,
+            ProviderError::Payload {
+                kind: PayloadKind::Decode,
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    assert!(!format!("{error} {error:?}").contains(secret), "{error:?}");
 }

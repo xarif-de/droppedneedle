@@ -195,9 +195,7 @@ pub(super) fn commit_bundle(
         .map(|track| (track.track_id.as_str(), track.sealed.as_ref()))
         .collect();
     if let Some(moved) = super::planner::first_moved(conn, &sealed)? {
-        return Err(PublishError::Catalog(
-            format!("track {moved} changed under bundle {}", commit.bundle_id).into(),
-        ));
+        return Err(changed_under(moved, &commit.bundle_id));
     }
     crate::catalog_revision::bump_catalog(conn)?;
     let now = clock.now_secs();
@@ -228,7 +226,7 @@ pub(super) fn commit_bundle(
     let mut imported = Vec::new();
     for (track, written) in commit.tracks.iter().zip(&written) {
         if let Some((replaced, recycle_to)) = &track.replaces {
-            retire_replaced(conn, track, replaced, recycle_to, now)?;
+            retire_replaced(conn, &commit.bundle_id, track, replaced, recycle_to, now)?;
         }
         if let Some(adoption) = &track.adopt {
             let joined = adopt_track(conn, track, adoption)?;
@@ -305,9 +303,11 @@ pub(super) fn mark_missing(
 /// release track, the end of the next scan moves its plays, favorites and
 /// playlist entries to that track and its id opens it. Its path
 /// moves to a hidden name under the bundle, so the new file can hold the
-/// real one.
+/// real one. A track no longer where the plan saw it changed under the
+/// bundle, and the commit fails.
 fn retire_replaced(
     conn: &Connection,
+    bundle_id: &str,
     track: &TrackCommit,
     replaced: &str,
     recycle_to: &str,
@@ -319,7 +319,7 @@ fn retire_replaced(
         track.track_id,
         track.rel_path
     );
-    conn.execute(
+    let retired_rows = conn.execute(
         "UPDATE local_tracks SET availability = 'missing', missing_since = ?5, \
          relative_path = ?4, file_path = ?6, path_hash = ?7, \
          row_revision = row_revision + 1 \
@@ -334,6 +334,9 @@ fn retire_replaced(
             sha256_hex(retired.as_bytes())
         ],
     )?;
+    if retired_rows == 0 {
+        return Err(changed_under(replaced, bundle_id));
+    }
     // Its file is in the recycle bin: no record of it may make a file on
     // its album look like it took its place.
     conn.execute(
@@ -343,6 +346,11 @@ fn retire_replaced(
         rusqlite::params![replaced],
     )?;
     Ok(())
+}
+
+/// The commit's refusal of a track whose rows changed since the plan.
+fn changed_under(track_id: &str, bundle_id: &str) -> PublishError {
+    PublishError::Catalog(format!("track {track_id} changed under bundle {bundle_id}").into())
 }
 
 /// Free the destination of a track the commit moves. The file is already
@@ -1162,10 +1170,14 @@ impl<P: SpaceProbe> Publisher<P> {
                             "the removal was already put back".into(),
                         ));
                     }
-                    for item in &put_back.items {
+                    let tracks = put_back
+                        .items
+                        .iter()
+                        .filter_map(|item| Some((item, item.track_id.as_deref()?)));
+                    for (item, track_id) in tracks {
                         let place: Option<(String, String, String)> = conn
                             .prepare_cached(super::sql::TRACK_PLACE.text())?
-                            .query_row(rusqlite::params![item.track_id], |row| {
+                            .query_row(rusqlite::params![track_id], |row| {
                                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))
                             })
                             .optional()?;
@@ -1176,16 +1188,15 @@ impl<P: SpaceProbe> Publisher<P> {
                         });
                         if !ready {
                             return Err(PublishError::Validation(
-                                format!("track {} changed under the preview", item.track_id).into(),
+                                format!("track {track_id} changed under the preview").into(),
                             ));
                         }
-                        if let Some(held) = journals
-                            .unsettled_bundle_for_track(&item.track_id, &sealed.bundle.id)?
+                        if let Some(held) =
+                            journals.unsettled_bundle_for_track(track_id, &sealed.bundle.id)?
                         {
                             return Err(PublishError::Journal(format!(
-                            "track {} has an unfinished managed write (bundle {held}) waiting \
-                             for recovery",
-                            item.track_id
+                            "track {track_id} has an unfinished managed write (bundle {held}) \
+                             waiting for recovery"
                         ).into()));
                         }
                     }
@@ -1234,9 +1245,8 @@ impl<P: SpaceProbe> Publisher<P> {
             .chain(
                 removal
                     .into_iter()
-                    .flat_map(|removal| &removal.items)
-                    .filter_map(|item| item.file.as_ref())
-                    .map(|file| file.recycle_to.as_str()),
+                    .flat_map(|removal| super::remove::files(&sealed.bundle.id, removal))
+                    .map(|(_, file)| file.recycle_to.as_str()),
             );
         for recycle_to in entries {
             if let Some(cause) = self.sandbox.bins_unknown() {
@@ -1286,18 +1296,35 @@ impl<P: SpaceProbe> Publisher<P> {
         docs: &BTreeMap<String, TagDocument>,
     ) -> Result<(), PublishError> {
         if let Some(removal) = &bundle.removal {
-            let files: Vec<(
-                usize,
-                &super::planner::RemoveItem,
-                &super::planner::RemoveFile,
-            )> = removal
+            let tracks = removal
                 .items
                 .iter()
                 .enumerate()
-                .filter_map(|(index, item)| item.file.as_ref().map(|file| (index, item, file)))
-                .collect();
-            for (count, (index, item, file)) in files.iter().enumerate() {
-                self.prepare_remove(bundle, *index, item, file)?;
+                .filter_map(|(index, item)| {
+                    let file = item.file.as_ref()?;
+                    Some(RemovedFile {
+                        journal_id: super::remove::journal_id(&bundle.id, index),
+                        root_id: &item.seal.root_id,
+                        rel: &item.seal.relative_path,
+                        track_id: Some(&item.track_id),
+                        file,
+                    })
+                });
+            let sidecars =
+                removal
+                    .sidecars
+                    .iter()
+                    .enumerate()
+                    .map(|(index, sidecar)| RemovedFile {
+                        journal_id: super::remove::sidecar_journal_id(&bundle.id, index),
+                        root_id: &sidecar.root_id,
+                        rel: &sidecar.relative_path,
+                        track_id: None,
+                        file: &sidecar.file,
+                    });
+            let files: Vec<RemovedFile<'_>> = tracks.chain(sidecars).collect();
+            for (count, file) in files.iter().enumerate() {
+                self.prepare_remove(bundle, file)?;
                 if count == 0 && (files.len() > 1 || !bundle.items.is_empty()) {
                     self.maybe_crash(CrashPoint::AfterFirstFileStaged)?;
                 }
@@ -1752,14 +1779,17 @@ impl<P: SpaceProbe> Publisher<P> {
     fn prepare_remove(
         &mut self,
         bundle: &PlanBundle,
-        index: usize,
-        item: &super::planner::RemoveItem,
-        file: &super::planner::RemoveFile,
+        removed: &RemovedFile<'_>,
     ) -> Result<(), PublishError> {
-        let journal_id = super::remove::journal_id(&bundle.id, index);
-        let dest = self
-            .sandbox
-            .resolve_removal(&item.seal.root_id, &item.seal.relative_path)?;
+        let RemovedFile {
+            journal_id,
+            root_id,
+            rel,
+            track_id,
+            file,
+        } = removed;
+        let journal_id = journal_id.clone();
+        let dest = self.sandbox.resolve_removal(root_id, rel)?;
         let aside = self.sandbox.backup_path_for(&dest, &journal_id)?;
         self.sandbox.ensure_under_removal_roots(&aside)?;
         let journal = FileJournal {
@@ -1767,8 +1797,8 @@ impl<P: SpaceProbe> Publisher<P> {
             bundle_id: bundle.id.clone(),
             kind: JournalKind::Remove,
             source: None,
-            dest_root: item.seal.root_id.clone(),
-            dest_rel: item.seal.relative_path.clone(),
+            dest_root: (*root_id).to_owned(),
+            dest_rel: (*rel).to_owned(),
             staged: aside.to_string_lossy().to_string(),
             backup: None,
             source_sha256: Some(file.fingerprint.sha256.clone()),
@@ -1778,9 +1808,9 @@ impl<P: SpaceProbe> Publisher<P> {
             state: JournalState::Prepared,
             seq: 0,
             replaces: Some(JournalReplacement {
-                rel: item.seal.relative_path.clone(),
+                rel: (*rel).to_owned(),
                 sha256: file.fingerprint.sha256.clone(),
-                track_id: Some(item.track_id.clone()),
+                track_id: track_id.map(str::to_owned),
                 recycle_to: file.recycle_to.clone(),
             }),
         };
@@ -1885,7 +1915,7 @@ impl<P: SpaceProbe> Publisher<P> {
             backup: None,
             source_sha256: Some(item.fingerprint.sha256.clone()),
             staged_sha256: item.fingerprint.sha256.clone(),
-            track_id: Some(item.track_id.clone()),
+            track_id: item.track_id.clone(),
             commit_as: None,
             state: JournalState::Prepared,
             seq: 0,
@@ -2032,6 +2062,15 @@ fn write_staged_temp(temp: &Path, bytes: &[u8], mode: Option<u32>) -> Result<(),
     written
 }
 
+/// One file a removal moves, with its row's id and its track, if any.
+struct RemovedFile<'a> {
+    journal_id: String,
+    root_id: &'a str,
+    rel: &'a str,
+    track_id: Option<&'a str>,
+    file: &'a super::planner::RemoveFile,
+}
+
 /// Prune newly empty source parents up to (not including) the root,
 /// after a moved file's source went. Each folder goes only while empty and
 /// never through a link below the root. An empty folder left behind is not
@@ -2040,6 +2079,19 @@ pub(super) fn prune_empty_parents(sandbox: &Sandbox, root_id: &str, source: &Pat
     let Ok(root) = sandbox.root_dir(root_id) else {
         return;
     };
+    prune_below(root, source);
+}
+
+/// [`prune_empty_parents`] after a removed file left for the recycle bin,
+/// in any folder a removal may take files from.
+pub(super) fn prune_removed_parents(sandbox: &Sandbox, root_id: &str, removed: &Path) {
+    let Ok(root) = sandbox.removal_root_dir(root_id) else {
+        return;
+    };
+    prune_below(root, removed);
+}
+
+fn prune_below(root: &Path, source: &Path) {
     let mut cursor = source.parent();
     while let Some(dir) = cursor {
         if dir == root || !dir.starts_with(root) {

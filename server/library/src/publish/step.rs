@@ -659,6 +659,11 @@ impl Run<'_> {
         let gathered = self.gather(&journals, plan)?;
         let step = decide(bundle_id, &journals, gathered, plan);
         if let BundleStep::Attention(reason) = step {
+            // A folder unmounted while the rows were inspected reads as
+            // odd evidence: wait for it rather than hand the bundle over.
+            if let Some(root) = unusable_root(self.sandbox, &journals) {
+                return Ok(Advanced::Waiting(root));
+            }
             flag_attention(self.db, &journals)?;
             remove_folders(self.db, self.sandbox, bundle_id);
             return Ok(Advanced::Attention(reason));
@@ -1005,6 +1010,10 @@ impl Run<'_> {
                     .known_removals
                     .then(|| removal_stat(Some(plan), journal))
                     .flatten();
+                let linked_earlier = plan
+                    .removal
+                    .as_ref()
+                    .is_some_and(|removal| super::remove::linked_to_earlier(removal, journal));
                 let set_aside = super::remove::set_aside(
                     self.sandbox.placement_mode(root),
                     self.root_dev(root),
@@ -1013,6 +1022,7 @@ impl Run<'_> {
                     aside,
                     &journal.staged_sha256,
                     known,
+                    linked_earlier,
                     self.seams,
                     self.hooks.before_set_aside,
                 );
@@ -1501,6 +1511,11 @@ impl Run<'_> {
                 )?;
                 if !moved {
                     tracing::warn!(journal_id = %journal.id, "the file to recycle is gone; nothing was moved");
+                }
+                // The folders the removal emptied go with it, once the
+                // last of its files left.
+                if let Ok(home) = sandbox.resolve_removal(&journal.dest_root, &journal.dest_rel) {
+                    super::publisher::prune_removed_parents(sandbox, &journal.dest_root, &home);
                 }
                 return Ok(());
             }

@@ -2,6 +2,7 @@
 
 use super::{DownloadWorker, Pass};
 use crate::downloads::recovery::plan_retry;
+use crate::downloads::state::TaskStatus;
 use crate::downloads::store::{NewTask, TaskRow};
 
 /// The retry successor row for a settled task: same ask, one generation
@@ -16,7 +17,7 @@ pub(super) fn successor_row(task: &TaskRow) -> Option<NewTask> {
         artist_name: task.artist_name.clone(),
         album_title: task.album_title.clone(),
         release_group_mbid: task.release_group_mbid.clone(),
-        origin: spawn.origin,
+        origin: spawn.origin.as_str().to_owned(),
         retry_count: spawn.retry_count,
     })
 }
@@ -75,6 +76,13 @@ impl DownloadWorker {
             let source = task.clone();
             let spawned = self
                 .step("downloads.retry", move |store| {
+                    // A cancel since the read stopped its retries.
+                    let still_failed = store.get_task(&source.id)?.is_some_and(|task| {
+                        matches!(task.status, TaskStatus::Failed | TaskStatus::Partial)
+                    });
+                    if !still_failed {
+                        return Ok(false);
+                    }
                     // Held tracks gate their task: re-downloading a held
                     // track loops.
                     if crate::held::store::HeldRows::new(store.conn()).task_holds(&source.id)? {

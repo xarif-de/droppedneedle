@@ -1,4 +1,4 @@
-import { CACHE_TTL } from '$lib/constants';
+import { STALE_SLOW } from '$lib/queries/staleTime';
 import { createInfiniteQuery, createQuery, queryOptions } from '@tanstack/svelte-query';
 import type { Getter } from 'runed';
 import { ArtistQueryKeyFactory } from './ArtistQueryKeyFactory';
@@ -6,24 +6,20 @@ import { api } from '$lib/api/client';
 import type { ReleaseGroup } from '$lib/types';
 import type { MusicSource } from '$lib/stores/musicSource';
 import { authStore } from '$lib/stores/authStore.svelte';
-import { extractServiceStatus } from '$lib/utils/serviceStatus';
 import { setQueryDataWithPersister } from '../QueryClient';
+import { applyEffects, artistChanged } from '../effects';
+import { readNow } from '../readNow';
 import { toArtistInfoBasic, toArtistReleases } from '../catalog/catalogAdapters';
 import { CATALOG_ENDPOINTS } from '../catalog/endpoints';
+import { PERSIST, PERSIST_PROVIDER } from '$lib/queries/persistedCache';
 
 export const getBasicArtistQueryOptions = (artistId: string) =>
 	queryOptions({
-		staleTime: CACHE_TTL.ARTIST_DETAIL_BASIC,
+		staleTime: STALE_SLOW,
+		meta: PERSIST_PROVIDER,
 		queryKey: ArtistQueryKeyFactory.basic(artistId),
 		queryFn: async ({ signal }) => {
-			const data = toArtistInfoBasic(
-				await api.global.v3.GET(CATALOG_ENDPOINTS.artist(artistId), { signal })
-			);
-			// mirrors albumPageState: the degraded payload carries
-			// service_status and api.global bypasses the header-recording
-			// fetch wrapper
-			extractServiceStatus(data);
-			return data;
+			return toArtistInfoBasic(await api.v3.GET(CATALOG_ENDPOINTS.artist(artistId), { signal }));
 		}
 	});
 
@@ -32,12 +28,12 @@ export const getBasicArtistQuery = (getArtistId: Getter<string>) =>
 
 export const getExtendedArtistQueryOptions = (artistId: string) =>
 	queryOptions({
-		staleTime: CACHE_TTL.ARTIST_DETAIL_EXTENDED,
+		staleTime: STALE_SLOW,
+		meta: PERSIST_PROVIDER,
 		queryKey: ArtistQueryKeyFactory.extended(artistId),
 		// A fast extended query can finish before the provider page observes its lazy fields.
 		notifyOnChangeProps: 'all',
-		queryFn: ({ signal }) =>
-			api.global.v3.GET(CATALOG_ENDPOINTS.artistExtended(artistId), { signal })
+		queryFn: ({ signal }) => api.v3.GET(CATALOG_ENDPOINTS.artistExtended(artistId), { signal })
 	});
 
 export const getExtendedArtistQuery = (getArtistId: Getter<string>) =>
@@ -50,10 +46,11 @@ export const getSimilarArtistsQuery = (
 		const { artistId, source, enabled = true } = getParams();
 		return {
 			enabled,
-			staleTime: CACHE_TTL.ARTIST_DISCOVERY,
+			staleTime: STALE_SLOW,
+			meta: PERSIST_PROVIDER,
 			queryKey: ArtistQueryKeyFactory.similarArtists(authStore.user?.id, artistId, source),
 			queryFn: ({ signal }) =>
-				api.global.v3.GET(CATALOG_ENDPOINTS.similarArtists(artistId, source), {
+				api.v3.GET(CATALOG_ENDPOINTS.similarArtists(artistId, source), {
 					signal
 				})
 		};
@@ -66,10 +63,11 @@ export const getArtistTopAlbumsQuery = (
 		const { artistId, source, enabled = true } = getParams();
 		return {
 			enabled,
-			staleTime: CACHE_TTL.ARTIST_DISCOVERY,
+			staleTime: STALE_SLOW,
+			meta: PERSIST_PROVIDER,
 			queryKey: ArtistQueryKeyFactory.topAlbums(authStore.user?.id, artistId, source),
 			queryFn: ({ signal }) =>
-				api.global.v3.GET(CATALOG_ENDPOINTS.topAlbums(artistId, source), {
+				api.v3.GET(CATALOG_ENDPOINTS.topAlbums(artistId, source), {
 					signal
 				})
 		};
@@ -82,10 +80,11 @@ export const getArtistTopSongsQuery = (
 		const { artistId, source, enabled = true } = getParams();
 		return {
 			enabled,
-			staleTime: CACHE_TTL.ARTIST_DISCOVERY,
+			staleTime: STALE_SLOW,
+			meta: PERSIST_PROVIDER,
 			queryKey: ArtistQueryKeyFactory.topSongs(authStore.user?.id, artistId, source),
 			queryFn: ({ signal }) =>
-				api.global.v3.GET(CATALOG_ENDPOINTS.topSongs(artistId, source), {
+				api.v3.GET(CATALOG_ENDPOINTS.topSongs(artistId, source), {
 					signal
 				})
 		};
@@ -97,10 +96,11 @@ export const getArtistLastFmEnrichmentQuery = (
 	createQuery(() => {
 		const { artistId, artistName } = getParams();
 		return {
-			staleTime: CACHE_TTL.ARTIST_DETAIL_LASTFM,
+			staleTime: STALE_SLOW,
+			meta: PERSIST,
 			queryKey: ArtistQueryKeyFactory.lastFmEnrichment(artistId, artistName),
 			queryFn: ({ signal }) =>
-				api.global.v3.GET(CATALOG_ENDPOINTS.artistLastFm(artistId, artistName!), {
+				api.v3.GET(CATALOG_ENDPOINTS.artistLastFm(artistId, artistName!), {
 					signal
 				}),
 			enabled: () => !!artistName
@@ -123,20 +123,16 @@ export const getArtistReleasesInfiniteQuery = (getArtistId: Getter<string>) =>
 		let warmingPolls = 0;
 		let lastKey: string | null = null;
 		return {
-			staleTime: CACHE_TTL.ARTIST_DETAIL_BASIC,
+			staleTime: STALE_SLOW,
+			meta: PERSIST_PROVIDER,
 			queryKey: ArtistQueryKeyFactory.releases(getArtistId()),
 			initialPageParam: 0,
 			queryFn: async ({ pageParam = 0, signal }) => {
 				const response = toArtistReleases(
-					await api.global.v3.GET(
-						CATALOG_ENDPOINTS.artistReleases(getArtistId(), pageParam, BATCH_SIZE),
-						{ signal }
-					)
+					await api.v3.GET(CATALOG_ENDPOINTS.artistReleases(getArtistId(), pageParam, BATCH_SIZE), {
+						signal
+					})
 				);
-				// mirrors the basic query: the degraded discography payload
-				// carries service_status and api.global bypasses the
-				// header-recording fetch wrapper
-				extractServiceStatus(response);
 				return response;
 			},
 			getNextPageParam: (lastPage) => {
@@ -163,6 +159,9 @@ export const getArtistReleasesInfiniteQuery = (getArtistId: Getter<string>) =>
 			}
 		};
 	});
+
+/** Reads one artist's header again. */
+export const refreshArtist = (artistId: string) => applyEffects(artistChanged(artistId));
 
 type ArtistReleasesInfiniteQuery = ReturnType<typeof getArtistReleasesInfiniteQuery>;
 
@@ -191,3 +190,11 @@ export const updateArtistReleaseInCache = (
 		return { ...prevData, pages: updatedPages };
 	});
 };
+
+/** An artist's first 200 releases, for the card's discography download. */
+export const fetchArtistDiscography = (artistMbid: string) =>
+	readNow([...ArtistQueryKeyFactory.releases(artistMbid), 'all'], async (signal) =>
+		toArtistReleases(
+			await api.v3.GET(CATALOG_ENDPOINTS.artistReleases(artistMbid, 0, 200), { signal })
+		)
+	);

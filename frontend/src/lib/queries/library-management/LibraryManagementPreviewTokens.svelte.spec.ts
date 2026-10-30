@@ -20,14 +20,11 @@ const session: LibraryManagementActivationSession = {
 		tagging_scripts: [],
 		undo_retention_days: 90,
 		preview_retention_hours: 24,
-		recycle_bin_path: '',
 		external_refresh: {
 			enabled: false,
 			plex_enabled: false,
 			jellyfin_enabled: false,
-			navidrome_enabled: false,
-			retry_attempts: 3,
-			retry_delay_seconds: 30
+			navidrome_enabled: false
 		}
 	},
 	activationDraft: {
@@ -40,14 +37,11 @@ const session: LibraryManagementActivationSession = {
 		tagging_scripts: [],
 		undo_retention_days: 90,
 		preview_retention_hours: 24,
-		recycle_bin_path: '',
 		external_refresh: {
 			enabled: false,
 			plex_enabled: false,
 			jellyfin_enabled: false,
-			navidrome_enabled: false,
-			retry_attempts: 3,
-			retry_delay_seconds: 30
+			navidrome_enabled: false
 		}
 	},
 	rootIds: ['root-1'],

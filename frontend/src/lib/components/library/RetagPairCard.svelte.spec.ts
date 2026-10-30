@@ -2,31 +2,19 @@ import { page } from 'vitest/browser';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { render } from 'vitest-browser-svelte';
 
+import { ApiError } from '$lib/api/errors';
 import type { RetagPair } from '$lib/queries/library/LibraryRetagPairQueries.svelte';
 
 const h = vi.hoisted(() => {
-	class ApiError extends Error {
-		constructor(
-			readonly status: number,
-			message: string,
-			readonly code = ''
-		) {
-			super(message);
-		}
-	}
 	return {
-		ApiError,
 		join: vi.fn(),
 		dismiss: vi.fn(),
-		goto: vi.fn(),
-		invalidate: vi.fn()
+		goto: vi.fn()
 	};
 });
 
 vi.mock('$app/navigation', () => ({ goto: h.goto }));
-vi.mock('$lib/api/client', () => ({ ApiError: h.ApiError }));
 vi.mock('$lib/stores/authStore.svelte', () => ({ authStore: { user: { id: 'admin-1' } } }));
-vi.mock('$lib/queries/QueryClient', () => ({ invalidateQueriesWithPersister: h.invalidate }));
 vi.mock('$lib/queries/albums/EditionQueries.svelte', () => ({
 	getAlbumEditionsQuery: (_user: () => string, group: () => string) => ({
 		get data() {
@@ -83,7 +71,6 @@ beforeEach(() => {
 	h.join.mockReset().mockResolvedValue({ album_id: 'new' });
 	h.dismiss.mockReset().mockResolvedValue({ dismissed: true });
 	h.goto.mockReset();
-	h.invalidate.mockReset();
 });
 
 describe('RetagPairCard', () => {
@@ -190,9 +177,9 @@ describe('RetagPairCard', () => {
 		expect(h.join).not.toHaveBeenCalled();
 	});
 
-	it('shows a 409 in place and refetches the pairs', async () => {
+	it('shows a 409 in place', async () => {
 		h.join.mockRejectedValue(
-			new h.ApiError(
+			new ApiError(
 				409,
 				"An album's edition changed since this was shown. Look again.",
 				'STALE_REVISION'
@@ -205,9 +192,6 @@ describe('RetagPairCard', () => {
 		await expect
 			.element(page.getByRole('alert'))
 			.toHaveTextContent("An album's edition changed since this was shown. Look again.");
-		expect(h.invalidate).toHaveBeenCalledWith({
-			queryKey: expect.arrayContaining(['retag-pairs'])
-		});
 	});
 
 	it('goes to the album that stays when the page showed the other one', async () => {

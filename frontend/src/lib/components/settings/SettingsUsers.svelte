@@ -1,6 +1,12 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
-	import { api } from '$lib/api/client';
+	import {
+		createAdminUserMutation,
+		createDeleteUserMutation,
+		createRevokeUserSessionsMutation,
+		createSetUserRoleMutation,
+		getAdminUsersQuery,
+		type AdminUser
+	} from '$lib/queries/auth/AdminUsersQueries.svelte';
 	import { authStore } from '$lib/stores/authStore.svelte';
 	import JellyfinIcon from '$lib/components/JellyfinIcon.svelte';
 	import PlexIcon from '$lib/components/PlexIcon.svelte';
@@ -21,7 +27,8 @@
 		Gauge,
 		Copy,
 		Check,
-		Clock3
+		Clock3,
+		LogOut
 	} from 'lucide-svelte';
 	import UserQuotaEditor from '$lib/components/settings/UserQuotaEditor.svelte';
 	import {
@@ -32,8 +39,6 @@
 	import { SvelteSet } from 'svelte/reactivity';
 	import { createPasswordRecoveryCodeMutation } from '$lib/queries/auth/AuthMutations.svelte';
 	import { getApiUrl } from '$lib/api/api-utils';
-	import type { components } from '$lib/api/v3/openapi';
-	import { AUTH_ENDPOINTS } from '$lib/queries/auth/endpoints';
 	import Button from '$lib/ui/Button.svelte';
 	import Card from '$lib/ui/Card.svelte';
 	import ConfirmDialog from '$lib/ui/ConfirmDialog.svelte';
@@ -44,17 +49,26 @@
 	import SelectField from '$lib/ui/SelectField.svelte';
 	import TextField from '$lib/ui/TextField.svelte';
 
-	type UserRecord = components['schemas']['UserResponse'];
+	type UserRecord = AdminUser;
 
 	const PAGE_SIZE = 20;
 
-	let users = $state<UserRecord[]>([]);
-	let loading = $state(true);
-	let error = $state<string | null>(null);
 	let savingRole = $state<string | null>(null);
 	let roleError = $state<string | null>(null);
 	let page = $state(1);
-	let total = $state(0);
+
+	const usersQuery = getAdminUsersQuery(() => ({
+		limit: PAGE_SIZE,
+		offset: (page - 1) * PAGE_SIZE
+	}));
+	const setUserRole = createSetUserRoleMutation();
+	const createUser = createAdminUserMutation();
+	const deleteUser = createDeleteUserMutation();
+	const revokeSessions = createRevokeUserSessionsMutation();
+	const users = $derived(usersQuery.data?.users ?? []);
+	const total = $derived(usersQuery.data?.total ?? 0);
+	const loading = $derived(usersQuery.isFetching);
+	const error = $derived(usersQuery.isError ? "Couldn't load users" : null);
 
 	let userToDelete = $state<UserRecord | null>(null);
 	let deleteOpen = $state(false);
@@ -126,28 +140,16 @@
 	let createError = $state<string | null>(null);
 	let createSuccess = $state<string | null>(null);
 
-	async function loadUsers(targetPage = page) {
-		loading = true;
-		error = null;
-		try {
-			const offset = (targetPage - 1) * PAGE_SIZE;
-			const data = await api.v3.GET(AUTH_ENDPOINTS.adminUsers(PAGE_SIZE, offset));
-			users = data.users;
-			total = data.total;
-			page = targetPage;
-		} catch {
-			error = "Couldn't load users";
-		} finally {
-			loading = false;
-		}
+	function loadUsers(targetPage = page) {
+		if (targetPage !== page) page = targetPage;
+		else void usersQuery.refetch();
 	}
 
 	async function setRole(userId: string, role: 'admin' | 'trusted' | 'user') {
 		savingRole = userId;
 		roleError = null;
 		try {
-			await api.v3.PUT(AUTH_ENDPOINTS.adminUserRole(userId), { role });
-			users = users.map((u) => (u.id === userId ? { ...u, role } : u));
+			await setUserRole.mutateAsync({ userId, role });
 		} catch (e: unknown) {
 			roleError = (e as { message?: string })?.message ?? 'Could not update role';
 		} finally {
@@ -164,7 +166,7 @@
 		}
 		creating = true;
 		try {
-			const user = await api.v3.POST(AUTH_ENDPOINTS.adminCreateUser, {
+			const user = await createUser.mutateAsync({
 				display_name: newName,
 				username: newUsername,
 				email: newEmail || undefined,
@@ -178,21 +180,30 @@
 			newPassword = '';
 			newRole = 'user';
 			showCreateForm = false;
-			total += 1;
-			const lastPage = Math.ceil(total / PAGE_SIZE);
-			if (lastPage === page && users.length < PAGE_SIZE) {
-				// Admin-created users always get a local (email/password) login
-				users = [...users, { ...user, providers: ['local'] }];
-			} else {
-				// New user landed on a different page (sorted by created_at ASC)
-				await loadUsers(lastPage);
-			}
+			// The list is oldest first, so the new account is on the last page.
+			page = Math.max(1, Math.ceil(total / PAGE_SIZE));
 		} catch (e: unknown) {
 			const msg = (e as { message?: string })?.message;
 			createError = msg ?? 'Could not create user';
 		} finally {
 			creating = false;
 		}
+	}
+
+	let userToSignOut = $state<UserRecord | null>(null);
+	let signOutOpen = $state(false);
+
+	function confirmSignOut(user: UserRecord) {
+		userToSignOut = user;
+		signOutOpen = true;
+	}
+
+	async function handleSignOut() {
+		const user = userToSignOut;
+		if (!user) return;
+		await revokeSessions.mutateAsync(user.id);
+		toastStore.show({ message: `Signed out ${user.display_name} everywhere`, type: 'success' });
+		userToSignOut = null;
 	}
 
 	function confirmDelete(user: UserRecord) {
@@ -203,15 +214,15 @@
 	// Throws on failure, so the dialog stays open and shows why.
 	async function handleDeleteUser() {
 		if (!userToDelete) return;
+		const wasLastOnPage = users.length === 1 && page > 1;
 		try {
-			await api.v3.DELETE(AUTH_ENDPOINTS.adminUser(userToDelete.id));
+			await deleteUser.mutateAsync(userToDelete.id);
 		} catch (e: unknown) {
 			const msg = (e as { message?: string })?.message;
 			throw new Error(msg ?? 'Could not delete user', { cause: e });
 		}
-		const wasLastOnPage = users.length === 1 && page > 1;
 		userToDelete = null;
-		await loadUsers(wasLastOnPage ? page - 1 : page);
+		if (wasLastOnPage) page -= 1;
 	}
 
 	function openRecoveryDialog(user: UserRecord) {
@@ -301,15 +312,11 @@
 		if (role === 'trusted') return 'badge-info';
 		return 'badge-ghost';
 	}
-
-	onMount(() => {
-		void loadUsers();
-	});
 </script>
 
 <Card>
 	<div class="space-y-6">
-		<div class="flex items-center justify-between">
+		<div class="flex flex-wrap items-center justify-between gap-3">
 			<div>
 				<h2 class="text-lg font-semibold">User Management</h2>
 				<p class="text-sm text-base-content/50 mt-0.5">Manage accounts and roles.</p>
@@ -428,7 +435,7 @@
 					{@const canRecover = user.providers.includes('local')}
 					{@const isSelf = user.id === authStore.user?.id}
 					<div
-						class="flex items-center gap-3 p-3 bg-base-300/30 rounded-box hover:bg-base-300/50 transition-colors"
+						class="flex flex-wrap items-center gap-3 p-3 bg-base-300/30 rounded-box hover:bg-base-300/50 transition-colors"
 					>
 						<div
 							class="w-9 h-9 rounded-full bg-primary/10 flex items-center justify-center shrink-0 overflow-hidden"
@@ -443,7 +450,7 @@
 								<UserRound class="h-5 w-5 text-primary/60" />
 							{/if}
 						</div>
-						<div class="flex-1 min-w-0">
+						<div class="flex-1 min-w-32">
 							<p class="text-sm font-medium truncate">{user.display_name}</p>
 							{#if user.username_display ?? user.username}
 								<p class="text-xs text-base-content/40 truncate">
@@ -471,8 +478,8 @@
 								{/each}
 							</div>
 						{/if}
-						<div class="flex items-center gap-2 shrink-0">
-							<span class="badge {roleBadgeClass(user.role)} badge-sm gap-1">
+						<div class="flex w-full items-center justify-end gap-2 sm:w-auto sm:shrink-0">
+							<span class="badge {roleBadgeClass(user.role)} badge-sm hidden gap-1 sm:inline-flex">
 								<RoleIcon class="h-3 w-3" />
 								{roleLabel[user.role]}
 							</span>
@@ -480,7 +487,7 @@
 								<span class="loading loading-spinner loading-xs"></span>
 							{:else}
 								<select
-									class="select select-sm"
+									class="select select-sm w-28 shrink-0"
 									value={user.role}
 									onchange={(e) =>
 										void setRole(
@@ -509,6 +516,15 @@
 									label={`Create recovery code for ${user.display_name}`}
 									disabled={!canRecover}
 									onclick={() => openRecoveryDialog(user)}
+								/>
+							</span>
+							<span title={isSelf ? 'Sign yourself out from your profile' : undefined}>
+								<IconButton
+									size="sm"
+									icon={LogOut}
+									label="Sign out everywhere"
+									disabled={isSelf}
+									onclick={() => confirmSignOut(user)}
 								/>
 							</span>
 							<span title={isSelf ? 'You cannot delete your own account' : undefined}>
@@ -653,6 +669,20 @@
 	<p class="text-base-content/70">
 		Delete <span class="font-semibold text-base-content">{userToDelete?.display_name}</span>? This
 		permanently removes their account, login methods, and sessions. This cannot be undone.
+	</p>
+</ConfirmDialog>
+
+<ConfirmDialog
+	bind:open={signOutOpen}
+	title="Sign out everywhere?"
+	confirmLabel="Sign out"
+	tone="danger"
+	onconfirm={handleSignOut}
+	oncancel={() => (userToSignOut = null)}
+>
+	<p class="text-base-content/70">
+		Signs <span class="font-semibold text-base-content">{userToSignOut?.display_name}</span> out of every
+		browser and device. Their app passwords keep working.
 	</p>
 </ConfirmDialog>
 

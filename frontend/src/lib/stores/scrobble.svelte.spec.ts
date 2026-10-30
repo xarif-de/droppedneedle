@@ -12,7 +12,7 @@ const h = vi.hoisted(() => ({
 const player = $state<{ now: NowPlaying | null; playing: boolean }>({ now: null, playing: false });
 let progress = 0;
 
-vi.mock('$lib/api/client', () => ({ api: { global: { v3: { GET: h.settings } } } }));
+vi.mock('$lib/api/client', () => ({ api: { v3: { GET: h.settings } } }));
 vi.mock('$lib/player/playbackGateway', () => ({
 	submitScrobble: h.submit,
 	sendScrobbleNowPlaying: h.nowPlaying
@@ -86,6 +86,12 @@ describe('web player plays with forwarding off', () => {
 		expect(h.submit).toHaveBeenCalledTimes(1);
 		expect(h.submit.mock.calls[0][0]).toMatchObject({ track_id: 'track-1', source: 'local' });
 		expect(h.nowPlaying).not.toHaveBeenCalled();
+	});
+
+	it('retries a failed submit three times with growing pauses, not every second', async () => {
+		h.submit.mockRejectedValue(new Error('server unreachable'));
+		await listen(200);
+		expect(h.submit).toHaveBeenCalledTimes(4);
 	});
 
 	it('drops the play when the user signs out mid-play', async () => {

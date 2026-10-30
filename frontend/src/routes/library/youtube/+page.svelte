@@ -1,10 +1,7 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
-	import { YOUTUBE_ENDPOINTS } from '$lib/queries/youtube/endpoints';
-	import { integrationStore } from '$lib/stores/integration';
-	import { api } from '$lib/api/client';
+	import { getYouTubeLinksQuery } from '$lib/queries/youtube/YouTubeQueries.svelte';
+	import { useIntegrationStatus } from '$lib/queries/HomeIntegrationStatusQuery.svelte';
 	import { withBasePath } from '$lib/utils/basePath';
-	import { isAbortError } from '$lib/utils/errorHandling';
 	import YouTubeIcon from '$lib/components/YouTubeIcon.svelte';
 	import AlbumImage from '$lib/components/AlbumImage.svelte';
 	import YouTubeLinkModal from '$lib/components/YouTubeLinkModal.svelte';
@@ -25,8 +22,11 @@
 		ytCardAddToPlaylist
 	} from '$lib/utils/youtubeCardPlayback';
 
-	let links = $state<YouTubeLink[]>([]);
-	let loading = $state(true);
+	const integrations = useIntegrationStatus();
+
+	const linksQuery = getYouTubeLinksQuery();
+	const links = $derived(linksQuery.data ?? []);
+	const loading = $derived(linksQuery.isPending);
 	let searchQuery = $state('');
 	let playingAlbumId = $state<string | null>(null);
 	let shufflingAlbumId = $state<string | null>(null);
@@ -47,17 +47,6 @@
 	let detailLink = $state<YouTubeLink | null>(null);
 	let returnToDetailAfterEdit = $state<YouTubeLink | null>(null);
 
-	async function fetchLinks(): Promise<void> {
-		loading = true;
-		try {
-			links = await api.v3.GET(YOUTUBE_ENDPOINTS.links());
-		} catch (e) {
-			if (isAbortError(e)) return;
-		} finally {
-			loading = false;
-		}
-	}
-
 	function openAddModal(): void {
 		editingLink = null;
 		editModalOpen = true;
@@ -75,8 +64,8 @@
 		editModalOpen = true;
 	}
 
-	function handleDetailDelete(albumId: string): void {
-		links = links.filter((l) => l.album_id !== albumId);
+	// The delete and save mutations keep the cached list in step.
+	function handleDetailDelete(): void {
 		detailLink = null;
 	}
 
@@ -85,17 +74,9 @@
 	}
 
 	function handleEditModalSave(link: YouTubeLink): void {
-		if (editingLink) {
-			links = links.map((l) => (l.album_id === link.album_id ? link : l));
-		} else {
-			links = [link, ...links];
-		}
 		if (returnToDetailAfterEdit) {
-			const updated = links.find((l) => l.album_id === link.album_id);
-			if (updated) {
-				detailLink = updated;
-				detailModalOpen = true;
-			}
+			detailLink = link;
+			detailModalOpen = true;
 			returnToDetailAfterEdit = null;
 		}
 		editingLink = null;
@@ -156,10 +137,6 @@
 			shufflingAlbumId = null;
 		}
 	}
-
-	onMount(() => {
-		fetchLinks();
-	});
 </script>
 
 <div class="container mx-auto p-6">
@@ -169,7 +146,7 @@
 		<span class="badge badge-neutral">{links.length}</span>
 	</div>
 
-	{#if !$integrationStore.youtube}
+	{#if !integrations.current.youtube}
 		<div class="alert alert-warning mb-4">
 			<Info class="h-4 w-4" />
 			<span
@@ -178,7 +155,7 @@
 				> to use YouTube features.</span
 			>
 		</div>
-	{:else if !$integrationStore.youtube_api}
+	{:else if !integrations.current.youtube_api}
 		<div class="alert alert-info mb-4">
 			<Info class="h-4 w-4" />
 			<span

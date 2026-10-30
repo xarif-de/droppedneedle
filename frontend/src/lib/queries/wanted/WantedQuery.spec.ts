@@ -83,7 +83,7 @@ vi.mock('idb-keyval', () => ({
 }));
 
 vi.mock('$lib/api/client', () => ({
-	api: { global: { v3: { GET: vi.fn(), POST: vi.fn() } } }
+	api: { v3: { GET: vi.fn(), POST: vi.fn() } }
 }));
 
 vi.mock('$lib/stores/authStore.svelte', () => ({
@@ -98,14 +98,11 @@ vi.mock('$lib/stores/toast', () => ({
 import { api } from '$lib/api/client';
 import { authStore } from '$lib/stores/authStore.svelte';
 import { queryClient } from '../QueryClient';
-import { WantedQueryKeyFactory } from './WantedQueryKeyFactory';
 import { getWantedWatchesQuery } from './WantedQuery.svelte';
 import { type WantedActionVars } from './WantedMutations.svelte';
 
-const mockGet = vi.mocked(api.global.v3.GET) as unknown as Mock<
-	(...args: unknown[]) => Promise<unknown>
->;
-const mockPost = vi.mocked(api.global.v3.POST) as unknown as Mock<
+const mockGet = vi.mocked(api.v3.GET) as unknown as Mock<(...args: unknown[]) => Promise<unknown>>;
+const mockPost = vi.mocked(api.v3.POST) as unknown as Mock<
 	(...args: unknown[]) => Promise<unknown>
 >;
 type Opts = {
@@ -126,14 +123,6 @@ beforeEach(() => {
 	mockGet.mockResolvedValue({ items: [], count: 0, retrying: [] });
 	mockPost.mockResolvedValue({ success: true, state: 'stopped' });
 	queryClient.clear();
-});
-
-describe('WantedQueryKeyFactory', () => {
-	it('scopes the list key by userId and falls back to null', () => {
-		expect(WantedQueryKeyFactory.list('userA')).toEqual(['wanted', 'list', 'userA']);
-		expect(WantedQueryKeyFactory.list(undefined)).toEqual(['wanted', 'list', null]);
-		expect(WantedQueryKeyFactory.list('userB')).not.toEqual(WantedQueryKeyFactory.list('userA'));
-	});
 });
 
 describe('getWantedWatchesQuery', () => {

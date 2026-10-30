@@ -293,6 +293,15 @@ pub enum Backoff {
         /// The longest wait.
         max: Duration,
     },
+    /// Doubling from `base` like [`Backoff::Exponential`], jittered upward
+    /// (between one and two times the doubled wait), so no rest is shorter
+    /// than the doubled wait; never longer than `max`.
+    ExponentialAtLeast {
+        /// The shortest first wait.
+        base: Duration,
+        /// The longest wait.
+        max: Duration,
+    },
 }
 
 /// One answer as the classifier sees it, with the kernel clock's time for
@@ -391,9 +400,25 @@ impl Reply {
         serde_json::from_slice(&self.body).map_err(|error| ProviderError::Payload {
             provider: self.provider,
             kind: PayloadKind::Decode,
-            message: short(&error.to_string()),
+            message: decode_failure(&error),
         })
     }
+}
+
+/// Where and how an answer failed to decode: the decoder's kind, line and
+/// column. Never its text, which can quote values from the answer.
+#[must_use]
+pub fn decode_failure(error: &serde_json::Error) -> String {
+    let kind = match error.classify() {
+        serde_json::error::Category::Io => "read error",
+        serde_json::error::Category::Syntax => "not JSON",
+        serde_json::error::Category::Data => "unexpected shape",
+        serde_json::error::Category::Eof => "cut short",
+    };
+    if error.line() == 0 {
+        return kind.to_owned();
+    }
+    format!("{kind} at line {}, column {}", error.line(), error.column())
 }
 
 /// `text` cut to a log-safe length.
@@ -845,6 +870,11 @@ impl Executor {
                 let run = self.limiter.note_headerless_limit();
                 let doubled = base.saturating_mul(1u32 << run.saturating_sub(1).min(10));
                 doubled.min(max).mul_f64(0.5 + 0.5 * unit_random())
+            }
+            Backoff::ExponentialAtLeast { base, max } => {
+                let run = self.limiter.note_headerless_limit();
+                let doubled = base.saturating_mul(1u32 << run.saturating_sub(1).min(10));
+                doubled.mul_f64(1.0 + unit_random()).min(max)
             }
         })
     }

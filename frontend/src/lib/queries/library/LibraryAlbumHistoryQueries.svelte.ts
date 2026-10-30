@@ -1,9 +1,10 @@
-import { createMutation, createQuery } from '@tanstack/svelte-query';
+import { applyEffects, catalogChanged, createAppMutation } from '$lib/queries/effects';
+import { authStore } from '$lib/stores/authStore.svelte';
+import { createQuery } from '@tanstack/svelte-query';
 import type { Getter } from 'runed';
 
 import { api } from '$lib/api/client';
 import type { components } from '$lib/api/v3/openapi';
-import { invalidateLibraryCatalog } from './LibraryCatalogInvalidation';
 import { LibraryQueryKeyFactory } from './LibraryQueryKeyFactory';
 import { LibraryV3Api } from './LibraryV3Api';
 
@@ -23,7 +24,7 @@ export const getAlbumHistoryQuery = (
 			queryKey: LibraryQueryKeyFactory.catalog.albumHistory(user, album ?? ''),
 			enabled: Boolean(user && album),
 			queryFn: ({ signal }: { signal: AbortSignal }) =>
-				api.global.v3.GET(LibraryV3Api.albumHistory(album ?? ''), { signal })
+				api.v3.GET(LibraryV3Api.albumHistory(album ?? ''), { signal })
 		};
 	});
 
@@ -31,9 +32,10 @@ export const getAlbumHistoryQuery = (
 // album comes back as its own, so every catalog view refreshes; a refusal
 // refreshes too, as the history it was offered from is stale.
 export function undoAlbumFold() {
-	return createMutation(() => ({
-		mutationFn: (undoId: string) => api.global.v3.POST(LibraryV3Api.undoAlbumFold(undoId)),
-		onSettled: () => invalidateLibraryCatalog()
+	return createAppMutation(() => ({
+		mutationFn: (undoId: string) => api.v3.POST(LibraryV3Api.undoAlbumFold(undoId)),
+		effects: () => [catalogChanged(authStore.user?.id)],
+		onError: () => applyEffects(catalogChanged(authStore.user?.id))
 	}));
 }
 
@@ -41,8 +43,9 @@ export function undoAlbumFold() {
 // by its history entry's undo_id. The album's artist changes everywhere
 // it shows, so every catalog view refreshes, on a refusal too.
 export function undoArtistRepair() {
-	return createMutation(() => ({
-		mutationFn: (undoId: string) => api.global.v3.POST(LibraryV3Api.undoArtistRepair(undoId)),
-		onSettled: () => invalidateLibraryCatalog()
+	return createAppMutation(() => ({
+		mutationFn: (undoId: string) => api.v3.POST(LibraryV3Api.undoArtistRepair(undoId)),
+		effects: () => [catalogChanged(authStore.user?.id)],
+		onError: () => applyEffects(catalogChanged(authStore.user?.id))
 	}));
 }

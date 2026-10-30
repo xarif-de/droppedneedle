@@ -16,7 +16,7 @@ export const getLibraryReviewsQuery = (getParams: Getter<LibraryReviewParams>) =
 			queryKey: LibraryQueryKeyFactory.reviews(params),
 			initialPageParam: undefined as string | undefined,
 			queryFn: ({ pageParam, signal }): Promise<LibraryReviewPage> =>
-				api.global.v3.GET(LibraryV3Api.reviews(params, pageParam), { signal }),
+				api.v3.GET(LibraryV3Api.reviews(params, pageParam), { signal }),
 			getNextPageParam: (lastPage: LibraryReviewPage) => lastPage.next_cursor ?? undefined
 		};
 	});
@@ -27,10 +27,26 @@ export const getPendingReviewCountQuery = () =>
 		const params: LibraryReviewParams = { state: 'pending', limit: 1 };
 		return {
 			queryKey: LibraryQueryKeyFactory.reviewCount(params),
-			queryFn: ({ signal }) => api.global.v3.GET(LibraryV3Api.reviews(params), { signal }),
+			queryFn: ({ signal }) => api.v3.GET(LibraryV3Api.reviews(params), { signal }),
 			select: (page: LibraryReviewPage) => page.total ?? 0
 		};
 	});
+
+export type LibraryReviewJob = components['schemas']['ReviewJobView'];
+
+const WORKING_JOB = ['queued', 'running'];
+
+/** Bulk review changes and retries running in the background, and ones that just ended. */
+export const getLibraryReviewJobsQuery = (getEnabled: Getter<boolean>) =>
+	createQuery(() => ({
+		enabled: getEnabled(),
+		queryKey: LibraryQueryKeyFactory.reviewJobs(),
+		queryFn: ({ signal }) => api.v3.GET(LibraryV3Api.reviewJobs(), { signal }),
+		select: (answer: components['schemas']['ReviewJobsResponse']) => answer.jobs,
+		// Progress moves only while a job waits or works; a paused job holds still.
+		refetchInterval: (query) =>
+			query.state.data?.jobs.some((job) => WORKING_JOB.includes(job.state)) ? 2000 : false
+	}));
 
 export const getLibraryReviewQuery = (getReviewId: Getter<string | null>) =>
 	createQuery(() => {
@@ -38,6 +54,6 @@ export const getLibraryReviewQuery = (getReviewId: Getter<string | null>) =>
 		return {
 			enabled: Boolean(reviewId),
 			queryKey: LibraryQueryKeyFactory.review(reviewId ?? ''),
-			queryFn: ({ signal }) => api.global.v3.GET(LibraryV3Api.review(reviewId ?? ''), { signal })
+			queryFn: ({ signal }) => api.v3.GET(LibraryV3Api.review(reviewId ?? ''), { signal })
 		};
 	});

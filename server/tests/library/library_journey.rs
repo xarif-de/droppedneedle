@@ -55,12 +55,25 @@ struct Rig {
 
 impl Rig {
     async fn start(tag: &str) -> Self {
+        Self::launch(tag, false).await
+    }
+
+    /// As [`Rig::start`], with the jobs table on a manual clock.
+    async fn start_hooked(tag: &str) -> Self {
+        Self::launch(tag, true).await
+    }
+
+    async fn launch(tag: &str, hooked: bool) -> Self {
         let identify = ScriptedIdentify::new();
         let contrib = ScriptedContrib::default();
         let mut outbound = closed_outbound();
         outbound.identify_providers = Port::given(identify.clone());
         outbound.contribution_providers = Port::given(contrib.providers());
-        let app = TestApp::start_with(tag, outbound).await;
+        let app = if hooked {
+            TestApp::start_hooked_with(tag, outbound).await
+        } else {
+            TestApp::start_with(tag, outbound).await
+        };
         let db = droppedneedle_kernel::db::Db::open_for_tests(&app.config.library_db_path)
             .expect("database opens");
         Self {
@@ -818,7 +831,7 @@ async fn an_artist_renamed_by_a_managed_run_keeps_its_row() {
     let user = text("SELECT id FROM auth_users WHERE role = 'admin'")[0].clone();
     // The app linked the artist from its files' id by now; v2's link of
     // the same id takes its place.
-    db.execute_batch(&format!(
+    app.seed(&format!(
         "INSERT OR REPLACE INTO local_artist_external_identities (local_artist_id, provider, \
          provider_artist_id, decision_source, selected_at) \
          VALUES ('{artist}', 'musicbrainz', '{ARTIST}', 'legacy_import', 1); \
@@ -828,7 +841,7 @@ async fn an_artist_renamed_by_a_managed_run_keeps_its_row() {
          artist_name, played_at) VALUES ('play-1', '{user}', '{artist}', 'Song 1', 'Alpha', \
          '2026-01-01T00:00:00Z');"
     ))
-    .expect("link, favorite and play seeded");
+    .await;
 
     let (tags, job) = rig.write_edition_tags(&headers, &album).await;
     let written = read_fields(&music.join("album/02.flac")).expect("fields read");
@@ -995,6 +1008,143 @@ async fn a_managed_change_is_undone_only_by_its_writer_or_an_admin() {
     rig.stop().await;
 }
 
+/// A management run with every media server switched on asks each one to
+/// rescan through the jobs table, a little after the run: Jellyfin signed
+/// with the MediaBrowser header, Plex on each music section with its token,
+/// Navidrome through `startScan`. A run and its undo, ending close
+/// together, share one rescan per server, and both runs' pages show it.
+#[tokio::test]
+async fn a_management_run_asks_each_media_server_to_rescan_once() {
+    use droppedneedle_kernel::runtime_config::Secret;
+    use droppedneedle_kernel::runtime_config::secret_sections::{
+        JellyfinConnection, NavidromeConnection, PlexConnection,
+    };
+    use droppedneedle_testkit::remotes::{
+        JELLYFIN_KEY, NAVIDROME_USER, PLEX_TOKEN, RecordedCalls, serve_jellyfin, serve_navidrome,
+        serve_plex,
+    };
+
+    let rig = Rig::start_hooked("lib-media-rescan").await;
+    rig.identify.recall_from(ambiguous_from);
+    let app = &rig.app;
+    let auth = app.login_admin().await;
+    let admin = [("authorization", auth.as_str())];
+    let (jellyfin, plex, navidrome) = (
+        serve_jellyfin().await.expect("mock Jellyfin starts"),
+        serve_plex().await.expect("mock Plex starts"),
+        serve_navidrome().await.expect("mock Navidrome starts"),
+    );
+    let store = app.state().library_services.setup.settings.store().clone();
+    store
+        .save_secret_blocking(JellyfinConnection {
+            jellyfin_url: jellyfin.base_url.clone(),
+            api_key: Secret::new(JELLYFIN_KEY),
+            enabled: true,
+            ..JellyfinConnection::default()
+        })
+        .expect("Jellyfin saves");
+    store
+        .save_secret_blocking(PlexConnection {
+            plex_url: plex.base_url.clone(),
+            plex_token: Secret::new(PLEX_TOKEN),
+            enabled: true,
+            ..PlexConnection::default()
+        })
+        .expect("Plex saves");
+    store
+        .save_secret_blocking(NavidromeConnection {
+            navidrome_url: navidrome.base_url.clone(),
+            username: NAVIDROME_USER.to_owned(),
+            password: Secret::new("nd-password"),
+            enabled: true,
+            ..NavidromeConnection::default()
+        })
+        .expect("Navidrome saves");
+    let page = "/api/v3/settings/library-management";
+    let (status, saved) = app.call("GET", page, &admin, None).await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    let mut settings = saved.clone();
+    settings
+        .as_object_mut()
+        .expect("settings")
+        .remove("settings_revision");
+    settings["external_refresh"] = json!({
+        "enabled": true, "jellyfin_enabled": true, "plex_enabled": true, "navidrome_enabled": true,
+    });
+    for profile in settings["profiles"].as_array_mut().expect("profiles") {
+        profile["notification"]["refresh_external_servers"] = json!(true);
+    }
+    let (status, body) = app
+        .call(
+            "PUT",
+            page,
+            &admin,
+            Some(json!({
+                "settings": settings,
+                "expected_settings_revision": saved["settings_revision"],
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let music = app.config.root_app_dir.join("music");
+    plant(&music, "album/01.flac", "management_full.flac");
+    app.add_library_folder("music", &music).await;
+    let track = rig
+        .scan_store
+        .track_at("music", "album/01.flac")
+        .unwrap()
+        .expect("track indexed");
+    let album = rig
+        .scan_store
+        .album_for_track(&track)
+        .unwrap()
+        .expect("album");
+    rig.identified(&album, 1).await;
+    rig.choose_first_edition(&album).await;
+    rig.edition_settled(&album).await;
+
+    // A run and its undo, both ended before the rescan is due.
+    let (tags, job) = rig.write_edition_tags(&admin, &album).await;
+    undo_written(app, &admin, &tags, &job).await;
+    let scans = |calls: &RecordedCalls| {
+        calls
+            .navidrome_queries
+            .iter()
+            .filter(|(endpoint, _)| endpoint == "startScan")
+            .count()
+    };
+    assert_eq!(jellyfin.recorder.snapshot().jellyfin_refreshes, 0);
+    assert!(plex.recorder.snapshot().plex_refreshes.is_empty());
+    assert_eq!(scans(&navidrome.recorder.snapshot()), 0);
+
+    let jobs = app.state().jobs.scripted().expect("test hooks are on");
+    jobs.clock().advance(60 * 60 * 1000);
+    app.state().jobs.queue().expect("jobs table").wake();
+    let run = format!("/api/v3/library/management/previews/{job}");
+    let shown = app
+        .until("every server's rescan is done", || {
+            let (run, admin) = (&run, &admin);
+            async move {
+                let (status, body) = app.call("GET", run, admin, None).await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                let refreshes = body["external_refreshes"].as_array()?.clone();
+                (refreshes.len() == 3 && refreshes.iter().all(|refresh| refresh["state"] == "done"))
+                    .then_some(refreshes)
+            }
+        })
+        .await;
+    let targets: Vec<&str> = shown
+        .iter()
+        .map(|refresh| refresh["target"].as_str().expect("target"))
+        .collect();
+    assert_eq!(targets, ["jellyfin", "plex", "navidrome"]);
+    assert_eq!(jellyfin.recorder.snapshot().jellyfin_refreshes, 1);
+    assert_eq!(plex.recorder.snapshot().plex_refreshes, ["1", "2"]);
+    assert_eq!(scans(&navidrome.recorder.snapshot()), 1);
+    rig.stop().await;
+}
+
 /// Read an edition's tag write until it is planned, written or failed.
 async fn settled_tag_write(app: &TestApp, headers: &[(&str, &str)], uri: &str) -> Value {
     app.until("the tag write settles", || async move {
@@ -1065,7 +1215,7 @@ async fn undo_written(app: &TestApp, headers: &[(&str, &str)], tags: &str, job: 
 /// anything, though the profile renames. The writer's undo puts every tag
 /// back and leaves no record a wider preview would read as a change made
 /// outside the app. Another trusted user is told none of it exists; an
-/// admin reaches all of it. A held album, a custom edition and an album
+/// admin reaches all of it but applies only their own. A held album, a custom edition and an album
 /// still being placed are refused before any job is made.
 #[tokio::test]
 async fn an_editions_tags_are_written_as_the_folders_profile_says() {
@@ -1179,13 +1329,13 @@ async fn an_editions_tags_are_written_as_the_folders_profile_says() {
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    db.execute(
+    app.seed_with(
         "INSERT INTO library_management_overrides (id, subject_kind, local_track_id, \
          field_name, value_json, mode, subject_revision, created_at, updated_at) \
          VALUES ('ov-title', 'track', ?1, 'title', '\"Kept Title\"', 'replace', 1, 1, 1)",
         [&track],
     )
-    .expect("override saved");
+    .await;
 
     // Refused with a reason, and no job made: a stale revision, a held
     // album, one still being placed, and a custom edition.
@@ -1210,29 +1360,29 @@ async fn an_editions_tags_are_written_as_the_folders_profile_says() {
     };
     let revision = edition_status(app, &tris, &edition).await["identity_revision"].clone();
     assert_eq!(refused(ask(&json!(999))).await, json!("STALE_REVISION"));
-    exclude_by_hand(&db, &album);
+    app.seed_with(EXCLUDE_BY_HAND, [&album]).await;
     assert_eq!(refused(ask(&revision)).await, json!("EDITION_TAGS_HELD"));
-    db.execute(
+    app.seed_with(
         "DELETE FROM library_management_exclusions WHERE local_album_id = ?1",
         [&album],
     )
-    .expect("hold lifted");
-    db.execute(
+    .await;
+    app.seed_with(
         "INSERT INTO library_edition_remap_queue \
          (local_album_id, release_mbid, queued_at, attempts, not_before, origin) \
          VALUES (?1, ?2, 0, 0, 1e12, 'album_pin')",
         rusqlite::params![album, fit.id],
     )
-    .expect("remap row queued");
+    .await;
     assert_eq!(
         refused(ask(&revision)).await,
         json!("EDITION_REMAP_PENDING")
     );
-    db.execute(
+    app.seed_with(
         "DELETE FROM library_edition_remap_queue WHERE local_album_id = ?1",
         [&album],
     )
-    .expect("remap row removed");
+    .await;
     let (status, body) = app
         .call(
             "POST",
@@ -1352,17 +1502,28 @@ async fn an_editions_tags_are_written_as_the_folders_profile_says() {
         "the writer's undo puts every tag back"
     );
 
-    // An admin applies and undoes a trusted user's write.
+    // Only the writer applies their write: an admin holding its token is
+    // refused, though an admin can undo it.
     let (status, queued) = app.call("POST", &tags, &tris, Some(ask(&revision))).await;
     assert_eq!(status, StatusCode::OK, "{queued}");
     let job = queued["job_id"].as_str().expect("job id").to_owned();
-    write_planned(
-        app,
-        &admin,
-        &format!("{tags}/{job}"),
-        &queued["preview_token"],
-    )
-    .await;
+    let uri = format!("{tags}/{job}");
+    let planned = settled_tag_write(app, &admin, &uri).await;
+    let (status, body) = app
+        .call(
+            "POST",
+            &format!("{uri}/apply"),
+            &admin,
+            Some(json!({
+                "preview_token": queued["preview_token"],
+                "expected_row_revision": planned["row_revision"],
+                "idempotency_key": "apply-as-admin",
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["code"], json!("PREVIEW_TOKEN_INVALID"));
+    write_planned(app, &tris, &uri, &queued["preview_token"]).await;
     assert_ne!(file_sha256(&files[0]), originals[0]);
     undo_written(app, &admin, &tags, &job).await;
     assert_eq!(
@@ -1518,6 +1679,7 @@ async fn an_edition_tag_write_planned_after_another_choice_writes_nothing() {
             idempotency_key: "apply-pinned".to_owned(),
             confirmation: true,
         },
+        "admin",
     );
     assert!(applied.is_err(), "nothing can be written");
     while management_step(&managed.library).await {}
@@ -1867,14 +2029,14 @@ async fn a_run_in_an_unknown_state_is_not_read_as_another() {
     let auth = app.login_admin().await;
     // The database's own check is set aside to store a state no release
     // wrote, as a damaged or foreign file could hold it.
-    app.db()
-        .execute_batch(
-            "PRAGMA ignore_check_constraints = ON;
+    app.seed(
+        "PRAGMA ignore_check_constraints = ON;
              INSERT INTO library_scan_runs (id, kind, trigger, state, phase, aggregate_scope,
                  queued_at, updated_at, terminal_at) VALUES
-                 ('strange', 'incremental', 'manual', 'resting', 'queued', 'all', 1.0, 1.0, 1.0);",
-        )
-        .expect("row stored");
+                 ('strange', 'incremental', 'manual', 'resting', 'queued', 'all', 1.0, 1.0, 1.0);
+             PRAGMA ignore_check_constraints = OFF;",
+    )
+    .await;
     let (status, body) = app
         .call(
             "GET",
@@ -1992,6 +2154,20 @@ async fn bare_library_with(
     tag: &str,
     enrichment: Option<Arc<dyn droppedneedle_library::management::enrich::EnrichmentPort>>,
 ) -> (Scratch, LibrarySetup, PathBuf) {
+    bare_library_at(
+        tag,
+        enrichment,
+        Arc::new(droppedneedle_kernel::clock::SystemClock),
+    )
+    .await
+}
+
+/// As [`bare_library_with`], with the platform on `clock`.
+async fn bare_library_at(
+    tag: &str,
+    enrichment: Option<Arc<dyn droppedneedle_library::management::enrich::EnrichmentPort>>,
+    clock: Arc<dyn droppedneedle_kernel::clock::Clock>,
+) -> (Scratch, LibrarySetup, PathBuf) {
     let scratch = Scratch {
         dir: ScratchDir::new(tag),
         identify: Arc::new(FakeProviders::default()),
@@ -2001,7 +2177,7 @@ async fn bare_library_with(
         .expect("scratch db opens");
     droppedneedle_kernel::schema::apply_migrations_blocking(&connection).expect("migrations apply");
     drop(connection);
-    let library = open_library(&scratch).await;
+    let library = open_library_on(&scratch, clock).await;
     let music = scratch.join("music");
     (scratch, library, music)
 }
@@ -2009,6 +2185,14 @@ async fn bare_library_with(
 /// A library bundle over the database and settings in `scratch`, as a
 /// restart would build it.
 async fn open_library(scratch: &Scratch) -> LibrarySetup {
+    open_library_on(scratch, Arc::new(droppedneedle_kernel::clock::SystemClock)).await
+}
+
+/// As [`open_library`], with the platform on `clock`.
+async fn open_library_on(
+    scratch: &Scratch,
+    clock: Arc<dyn droppedneedle_kernel::clock::Clock>,
+) -> LibrarySetup {
     let config = Arc::new(
         ConfigStore::scratch(
             scratch,
@@ -2025,6 +2209,7 @@ async fn open_library(scratch: &Scratch) -> LibrarySetup {
     let platform = crate::common::TestPlatform::on(&db, scratch)
         .settings(config)
         .config(app_config)
+        .clock(clock)
         .build()
         .await;
     library_with(
@@ -3103,7 +3288,7 @@ async fn library_contribution_seed_callback_verify_links_album() {
 
     // One indexed two-track album, as a scan leaves it.
     let db = app.db();
-    db.execute_batch(
+    app.seed(
         "INSERT INTO local_artists (id, display_name, folded_name, kind, created_at, updated_at) \
          VALUES ('artist-1', 'Test Artist', 'test artist', 'person', 1, 1); \
          INSERT INTO local_albums (id, root_id, grouping_key, title, title_folded, \
@@ -3111,9 +3296,9 @@ async fn library_contribution_seed_callback_verify_links_album() {
          VALUES ('album-1', 'music', 'k', 'Test Album', 'test album', 'Test Artist', \
          'artist-1', 2024, 'automatic', 1, 1);",
     )
-    .expect("album seeds");
+    .await;
     for (id, number, title) in [("t1", 1, "First Song"), ("t2", 2, "Second Song")] {
-        db.execute(
+        app.seed_with(
             "INSERT INTO local_tracks (id, local_album_id, root_id, file_path, relative_path, \
              path_hash, file_size_bytes, file_mtime_ns, stat_revision, tag_revision, title, \
              title_folded, artist_name, album_title, album_title_folded, track_number, \
@@ -3123,7 +3308,7 @@ async fn library_contribution_seed_callback_verify_links_album() {
              'automatic')",
             rusqlite::params![id, format!("album/{id}.flac"), title, number],
         )
-        .expect("track seeds");
+        .await;
     }
 
     let (status, created) = app
@@ -3472,17 +3657,15 @@ async fn library_journey_undo_automatic_edition() {
         "automatic".to_owned(),
     );
     {
-        let conn = droppedneedle_kernel::db::open_connection(&app.config.library_db_path)
-            .expect("db opens");
         for (track, row) in [(&manual_track, &manual_row), (&auto_track, &prior_auto_row)] {
-            conn.execute(
+            app.seed_with(
                 "INSERT INTO local_track_external_identities (local_track_id, provider, \
                  recording_mbid, release_mbid, release_track_mbid, medium_position, \
                  release_track_position, decision_source, selected_at, row_revision) \
                  VALUES (?1, 'musicbrainz', ?2, ?3, ?4, ?5, ?6, ?7, 1.0, 3)",
                 rusqlite::params![track, row.0, row.1, row.2, row.3, row.4, row.5],
             )
-            .expect("prior track row");
+            .await;
         }
     }
     let scripted = &rig.identify;
@@ -3556,17 +3739,29 @@ async fn library_journey_undo_automatic_edition() {
     assert_eq!(status, StatusCode::NOT_FOUND, "an undo is used once");
 
     // Retrying the review identifies the album again, as a scan would,
-    // and the job that asked for it finishes.
+    // and the job that asked for it finishes. The same request sent again
+    // answers the job the first one started.
+    let retry = json!({"expected_revision": revision, "idempotency_key": "retry-1"});
     let (status, job) = app
         .call(
             "POST",
             &format!("/api/v3/library/reviews/{review}/retry"),
             &headers,
-            Some(json!({"expected_revision": revision})),
+            Some(retry.clone()),
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{job}");
     assert_eq!(job["kind"], json!("explicit_reidentification"));
+    let (status, again) = app
+        .call(
+            "POST",
+            &format!("/api/v3/library/reviews/{review}/retry"),
+            &headers,
+            Some(retry),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    assert_eq!(again["id"], job["id"]);
     rig.identified(&album, 1).await;
     let db = app.db();
     let identity: (Option<String>, String) = db
@@ -3613,19 +3808,19 @@ async fn library_journey_undo_automatic_edition() {
     assert_eq!(parked, 0, "no retry waits on a choice");
 
     // An edition someone chose is never retried: the review stays open.
-    db.execute(
+    app.seed_with(
         "UPDATE local_album_external_identities SET decision_source = 'manual' \
          WHERE local_album_id = ?1",
         [&album],
     )
-    .expect("edition chosen");
-    db.execute(
+    .await;
+    app.seed_with(
         "INSERT INTO library_identify_reviews (id, local_album_id, reason_code, \
          candidates_json, state, created_ms, updated_ms) \
          VALUES ('rev-chosen', ?1, 'EDITION_KEPT_OVER_CONFLICT', '[]', 'pending', 5, 5)",
         [&album],
     )
-    .expect("review filed");
+    .await;
     let (status, tally) = app
         .call(
             "POST",
@@ -3686,11 +3881,11 @@ async fn library_journey_undo_automatic_edition() {
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    db.execute(
+    app.seed_with(
         "UPDATE local_tracks SET applied_policy = 'local_metadata' WHERE local_album_id = ?1",
         [&album],
     )
-    .expect("policy set");
+    .await;
     let (status, body) = app
         .call(
             "POST",
@@ -3716,10 +3911,8 @@ async fn artist_duplicate_groups_list_open_and_dismiss() {
     let auth = app.login_admin().await;
     let headers = [("authorization", auth.as_str())];
     {
-        let conn = droppedneedle_kernel::db::open_connection(&app.config.library_db_path)
-            .expect("db opens");
         for n in ["1", "2"] {
-            conn.execute_batch(&format!(
+            app.seed(&format!(
                 "INSERT INTO local_artists (id, display_name, folded_name, kind, created_at, \
                  updated_at) VALUES ('low-{n}', 'Low', 'low', 'group', {n}, {n});
                  INSERT INTO local_albums (id, root_id, grouping_key, title, title_folded, \
@@ -3735,7 +3928,7 @@ async fn artist_duplicate_groups_list_open_and_dismiss() {
                  '{n}.flac', 'h{n}', 1, 0, 's', 'Song', 'song', 'Album {n}', 'album {n}', \
                  'flac', 'scan', 0, 'manual');"
             ))
-            .expect("seed artist");
+            .await;
         }
     }
 
@@ -3815,7 +4008,7 @@ async fn removal_recycles_files_and_rescan_targets_the_album() {
         .db()
         .run_sql(
             "INSERT INTO auth_users (id, display_name, role, created_at) \
-             VALUES ('admin', 'Admin', 'admin', '2026-01-01T00:00:00Z')",
+             VALUES ('admin', 'Admin', 'admin', 0)",
         )
         .expect("admin row");
 
@@ -3860,6 +4053,190 @@ async fn removal_recycles_files_and_rescan_targets_the_album() {
     );
 }
 
+/// Removing an album takes its sidecars (the tracks' lyrics, the folder's
+/// art and cue sheet) to the recycle bin with its music and removes the
+/// folders that leaves empty, up to the first that still holds music. Put
+/// back brings every file home, folders included, and emptying the bin
+/// leaves nothing of the removal behind.
+#[tokio::test]
+async fn an_album_removal_takes_its_sidecars_and_leaves_no_folder_behind() {
+    use droppedneedle_library::mutations::Mutations;
+
+    let (scratch, library, music) = bare_library("lib-remove-sidecars").await;
+    plant(&music, "Artist/LP/01.flac", "flac_no_tags.flac");
+    plant(&music, "Artist/LP/02.flac", "flac_no_tags.flac");
+    plant(&music, "Other/EP/01.flac", "flac_no_tags.flac");
+    let sidecars = [
+        ("Artist/LP/01.lrc", b"[00:01.00]one".as_slice()),
+        ("Artist/LP/02.lrc", b"[00:01.00]two".as_slice()),
+        ("Artist/LP/cover.jpg", b"jpeg bytes".as_slice()),
+        ("Artist/LP/LP.cue", b"FILE \"01.flac\" WAVE".as_slice()),
+    ];
+    for (rel, bytes) in sidecars {
+        std::fs::write(music.join(rel), bytes).expect("sidecar written");
+    }
+    add_music_root(&library, &music).await;
+    add_admin(&library);
+    let conn = scratch_db(&scratch);
+    let track = library
+        .scan_store
+        .track_at("music", "Artist/LP/01.flac")
+        .unwrap()
+        .expect("track indexed");
+    let album: String = conn
+        .query_row(
+            "SELECT local_album_id FROM local_tracks WHERE id = ?1",
+            [&track],
+            |row| row.get(0),
+        )
+        .expect("album id");
+    let mutations = Mutations::new(&library);
+
+    let removed = mutations
+        .remove_album(&album, true, true, "admin")
+        .expect("album removed");
+    assert_eq!(removed.track_ids.len(), 2);
+    assert_eq!(removed.recycled.len(), 6, "{:?}", removed.recycled);
+    assert!(
+        !music.join("Artist").exists(),
+        "the emptied album and artist folders are gone"
+    );
+    assert!(
+        music.join("Other/EP/01.flac").is_file(),
+        "other music stays"
+    );
+    let bin = music.join(".recycle");
+    assert_eq!(std::fs::read_dir(&bin).expect("bin").count(), 6);
+
+    let removal = removed.removal_id.expect("removal id");
+    let missing = mutations
+        .put_back(&album, &removal, "admin")
+        .expect("album put back");
+    assert!(missing.is_empty(), "{missing:?}");
+    for (rel, bytes) in sidecars {
+        assert_eq!(
+            std::fs::read(music.join(rel)).expect("home"),
+            bytes,
+            "{rel}"
+        );
+    }
+    assert_eq!(availability_of(&conn, &track), "indexed");
+    assert_eq!(std::fs::read_dir(&bin).expect("bin").count(), 0);
+
+    let removed = mutations
+        .remove_album(&album, true, true, "admin")
+        .expect("album removed again");
+    assert_eq!(removed.recycled.len(), 6);
+    let report = library
+        .publishing
+        .empty_recycle_bin(library.clock.now_ms() + 1_000, &|| true)
+        .expect("the bin empties");
+    assert_eq!(report.deleted, 6);
+    assert_eq!(std::fs::read_dir(&bin).expect("bin").count(), 0);
+    assert!(!music.join("Artist").exists());
+    let open: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM library_publish_replacements WHERE expired_at IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count");
+    assert_eq!(open, 0, "every copy of the removal left the bin");
+}
+
+/// A track takes only its own sidecars while music stays in its folder.
+/// The folder's other sidecars go with the last music file, and a file no
+/// sidecar pattern names stays, with its folder.
+#[tokio::test]
+async fn a_track_removal_takes_its_own_sidecars_and_the_last_takes_the_folders() {
+    use droppedneedle_library::mutations::Mutations;
+
+    let (_scratch, library, music) = bare_library("lib-remove-track-sidecars").await;
+    plant(&music, "Band/LP/01.flac", "flac_no_tags.flac");
+    plant(&music, "Band/LP/02.flac", "flac_no_tags.flac");
+    for rel in ["Band/LP/01.lrc", "Band/LP/02.lrc", "Band/LP/cover.jpg"] {
+        std::fs::write(music.join(rel), rel.as_bytes()).expect("sidecar written");
+    }
+    std::fs::write(music.join("Band/LP/notes.txt"), b"mine").expect("note written");
+    add_music_root(&library, &music).await;
+    add_admin(&library);
+    let track_at = |rel: &str| -> String {
+        library
+            .scan_store
+            .track_at("music", rel)
+            .unwrap()
+            .expect("track indexed")
+    };
+    let (first, second) = (track_at("Band/LP/01.flac"), track_at("Band/LP/02.flac"));
+    let mutations = Mutations::new(&library);
+
+    let removed = mutations
+        .remove_track_now(&first, true, "admin")
+        .expect("first track removed");
+    assert_eq!(removed.recycled.len(), 2, "{:?}", removed.recycled);
+    assert!(!music.join("Band/LP/01.lrc").exists(), "its lyrics went");
+    for rel in ["Band/LP/02.lrc", "Band/LP/cover.jpg"] {
+        assert!(music.join(rel).is_file(), "{rel} stays with the music");
+    }
+
+    let removed = mutations
+        .remove_track_now(&second, true, "admin")
+        .expect("last track removed");
+    assert_eq!(removed.recycled.len(), 3, "{:?}", removed.recycled);
+    for rel in ["Band/LP/02.lrc", "Band/LP/cover.jpg"] {
+        assert!(!music.join(rel).exists(), "{rel} went with the last track");
+    }
+    assert_eq!(
+        std::fs::read_dir(music.join("Band/LP"))
+            .expect("folder stays")
+            .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+            .collect::<Vec<_>>(),
+        ["notes.txt"],
+        "a file no pattern names keeps its folder"
+    );
+}
+
+/// In a folder two albums share, removing one album takes its tracks' own
+/// lyrics but leaves the folder's art to the album still there.
+#[tokio::test]
+async fn a_shared_folder_keeps_its_art_for_the_album_still_there() {
+    use droppedneedle_library::mutations::Mutations;
+
+    let (scratch, library, music) = bare_library("lib-remove-shared-folder").await;
+    plant(&music, "Mixed/a.flac", "flac_full_01.flac");
+    plant(&music, "Mixed/b.flac", "flac_no_tags.flac");
+    for rel in ["Mixed/a.lrc", "Mixed/b.lrc", "Mixed/cover.jpg"] {
+        std::fs::write(music.join(rel), rel.as_bytes()).expect("sidecar written");
+    }
+    add_music_root(&library, &music).await;
+    add_admin(&library);
+    let conn = scratch_db(&scratch);
+    let album_at = |rel: &str| -> String {
+        let track = library
+            .scan_store
+            .track_at("music", rel)
+            .unwrap()
+            .expect("track indexed");
+        conn.query_row(
+            "SELECT local_album_id FROM local_tracks WHERE id = ?1",
+            [&track],
+            |row| row.get(0),
+        )
+        .expect("album id")
+    };
+    let (album, other) = (album_at("Mixed/a.flac"), album_at("Mixed/b.flac"));
+    assert_ne!(album, other, "the folder holds two albums");
+
+    let removed = Mutations::new(&library)
+        .remove_album(&album, true, true, "admin")
+        .expect("album removed");
+    assert_eq!(removed.recycled.len(), 2, "{:?}", removed.recycled);
+    assert!(!music.join("Mixed/a.lrc").exists());
+    for rel in ["Mixed/b.flac", "Mixed/b.lrc", "Mixed/cover.jpg"] {
+        assert!(music.join(rel).is_file(), "{rel} stays");
+    }
+}
+
 /// A removed album's download and wanted clean-up is written with the
 /// removal itself: when the process stops right after the removal's
 /// commit, the clean-up still runs once after the restart.
@@ -3891,7 +4268,7 @@ async fn album_cleanup_survives_a_stop_after_the_removal() {
              release_group_mbid, decision_source, selected_at) \
              VALUES ('{album}', 'musicbrainz', 'rg-gone', 'manual', 0); \
              INSERT INTO auth_users (id, display_name, role, created_at) \
-             VALUES ('fan', 'Fan', 'user', '2026-01-01T00:00:00Z'); \
+             VALUES ('fan', 'Fan', 'user', 0); \
              INSERT INTO download_tasks (id, user_id, release_group_mbid, artist_name, \
              album_title, status, created_at, updated_at) \
              VALUES ('task-old', 'fan', 'rg-gone', 'Band', 'LP', 'failed', 1767225600000, \
@@ -4129,7 +4506,7 @@ async fn put_back_refuses_an_occupied_path() {
         .db()
         .run_sql(
             "INSERT INTO auth_users (id, display_name, role, created_at) \
-             VALUES ('admin', 'Admin', 'admin', '2026-01-01T00:00:00Z')",
+             VALUES ('admin', 'Admin', 'admin', 0)",
         )
         .expect("admin row");
 
@@ -4212,7 +4589,7 @@ async fn a_stopped_removal_keeps_each_file_with_its_track() {
         .db()
         .run_sql(
             "INSERT INTO auth_users (id, display_name, role, created_at) \
-             VALUES ('admin', 'Admin', 'admin', '2026-01-01T00:00:00Z')",
+             VALUES ('admin', 'Admin', 'admin', 0)",
         )
         .expect("admin row");
     let conn = droppedneedle_kernel::db::open_connection(&scratch.to_path_buf().join("app.db"))
@@ -4374,7 +4751,7 @@ fn add_admin(library: &LibrarySetup) {
         .db()
         .run_sql(
             "INSERT INTO auth_users (id, display_name, role, created_at) \
-             VALUES ('admin', 'Admin', 'admin', '2026-01-01T00:00:00Z')",
+             VALUES ('admin', 'Admin', 'admin', 0)",
         )
         .expect("admin row");
 }
@@ -4544,6 +4921,135 @@ async fn a_removed_album_is_put_back_from_its_page() {
         "{refused:?}"
     );
     assert_eq!(availability_of(&conn, &gone_track), "missing");
+}
+
+/// While the library-wide switch is off nothing writes to a library
+/// folder: removing an album to the recycle bin, putting one back and a
+/// plugin's new file are refused with the library-off 409 and leave the
+/// files where they are, and a finished download waits as it does for a
+/// missing folder. Once the library is back on the same download goes in.
+#[tokio::test]
+async fn a_switched_off_library_takes_no_file_changes() {
+    use droppedneedle_kernel::runtime_config::secret_sections::TypedLibrary;
+    use droppedneedle_library::import::{DownloadImport, ImportError, ImportOrigin, ImportSource};
+    use droppedneedle_library::manage::PluginFileRefusal;
+    use droppedneedle_library::mutations::{MutationError, Mutations};
+
+    let (scratch, library, music) = bare_library("lib-switched-off").await;
+    plant(&music, "Kept/01.flac", "flac_no_tags.flac");
+    plant(&music, "Binned/01.flac", "flac_no_tags.flac");
+    add_music_root(&library, &music).await;
+    add_admin(&library);
+    let conn = scratch_db(&scratch);
+    let album_at = |rel: &str| -> String {
+        let track = indexed_at(&library, rel);
+        conn.query_row(
+            "SELECT local_album_id FROM local_tracks WHERE id = ?1",
+            [&track],
+            |row| row.get(0),
+        )
+        .expect("album id")
+    };
+    let (kept, binned) = (album_at("Kept/01.flac"), album_at("Binned/01.flac"));
+    let mutations = Mutations::new(&library);
+    let removal = mutations
+        .remove_album(&binned, true, true, "admin")
+        .expect("removed while on")
+        .removal_id
+        .expect("removal id");
+    let switch = |on: bool| {
+        library
+            .settings
+            .store()
+            .update_secret_blocking::<TypedLibrary, String, _>(move |stored| {
+                let mut settings = stored.into_inner();
+                settings.enabled = on;
+                Ok(settings)
+            })
+            .expect("library switch saved");
+        library.core.refresh_registry();
+    };
+    fn library_off<T: std::fmt::Debug>(result: Result<T, MutationError>) {
+        match result {
+            Err(MutationError::Conflict(reason)) => {
+                assert_eq!(reason.code, "CONFLICT");
+                assert!(reason.message.contains("switched off"), "{reason:?}");
+            }
+            other => panic!("expected the library-off refusal, got {other:?}"),
+        }
+    }
+    let release = Release {
+        id: "20000000-0000-4000-8000-00000000000d".to_owned(),
+        release_group_id: "20000000-0000-4000-8000-00000000000e".to_owned(),
+        title: "Landed".to_owned(),
+        artists: vec![CreditedArtist {
+            id: "20000000-0000-4000-8000-00000000000a".to_owned(),
+            name: "The Band".to_owned(),
+            sort_name: None,
+            join: String::new(),
+        }],
+        tracks: vec![ReleaseTrack {
+            id: "20000000-0000-4000-8000-00000000000b".to_owned(),
+            recording_id: "20000000-0000-4000-8000-00000000000c".to_owned(),
+            title: "Song".to_owned(),
+            disc: 1,
+            position: 1,
+            absolute_position: 1,
+            ..ReleaseTrack::default()
+        }],
+        ..Release::default()
+    };
+    let download = scratch.join("incoming/task-off/01.mp3");
+    std::fs::create_dir_all(download.parent().expect("parent")).expect("mkdir");
+    std::fs::copy(fixtures_dir().join("management_full.mp3"), &download).expect("download");
+    let land = || {
+        library.imports.import_download(&DownloadImport {
+            task_id: "task-off".to_owned(),
+            origin: ImportOrigin::Download,
+            staging: None,
+            release: release.clone(),
+            files: vec![ImportSource {
+                path: download.clone(),
+                track: 0,
+                replaces: Vec::new(),
+            }],
+            extras: Vec::new(),
+            actor: None,
+        })
+    };
+    let before = snapshot_tree(&music);
+
+    switch(false);
+    library_off(mutations.remove_album(&kept, true, true, "admin"));
+    library_off(mutations.put_back(&binned, &removal, "admin"));
+    let added = library.core.add_plugin_file(
+        "notes",
+        "plugin/new.txt",
+        b"hello".to_vec(),
+        std::time::Instant::now() + std::time::Duration::from_secs(5),
+        &Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        &|_, _, _| Ok(()),
+    );
+    match added {
+        Err(PluginFileRefusal::FolderUnusable(why)) => assert!(why.contains("switched off")),
+        other => panic!("expected the library-off refusal, got {other:?}"),
+    }
+    match land() {
+        Err(ImportError::LibraryOff) => {}
+        other => panic!("a landing while off waits, got {other:?}"),
+    }
+    assert_eq!(snapshot_tree(&music), before, "nothing was written");
+    assert!(download.is_file(), "the download waits where it is");
+    assert_eq!(
+        mutations.album_removals(&binned).expect("removals").len(),
+        1,
+        "the removal can still be put back"
+    );
+
+    switch(true);
+    let landed = land().expect("the waiting download goes in once the library is on");
+    assert_eq!(landed.paths.len(), 1);
+    assert!(landed.paths[0].starts_with(&music) && landed.paths[0].is_file());
 }
 
 /// A removed track's copy in the bin, and its row.
@@ -4899,6 +5405,8 @@ async fn putting_back_files_already_home_lists_them_again() {
             .into_iter()
             .find(|copy| copy.file_name() == Some(name))
             .expect("its copy");
+        // The removal took the folder it emptied.
+        std::fs::create_dir_all(path.parent().expect("folder")).expect("folder made");
         std::fs::rename(&copy, path).expect("moved home by hand");
     }
 
@@ -5211,7 +5719,11 @@ async fn put_back_never_follows_a_link_in_the_library() {
     let outside = scratch.to_path_buf().join("outside");
     std::fs::create_dir_all(&outside).expect("outside folder");
     let folder = music.join("Linked/LP");
-    std::fs::remove_dir_all(&folder).expect("folder goes");
+    assert!(
+        !music.join("Linked").exists(),
+        "the removal took the folders it emptied"
+    );
+    std::fs::create_dir_all(music.join("Linked")).expect("artist folder made");
     std::os::unix::fs::symlink(&outside, &folder).expect("link made");
 
     let refused = Mutations::new(&library).put_back(&album, &action, "admin");
@@ -5276,7 +5788,7 @@ async fn a_library_folder_reached_through_a_symlink_takes_writes() {
         .db()
         .run_sql(
             "INSERT INTO auth_users (id, display_name, role, created_at) \
-             VALUES ('admin', 'Admin', 'admin', '2026-01-01T00:00:00Z')",
+             VALUES ('admin', 'Admin', 'admin', 0)",
         )
         .expect("admin row");
     crate::common::library::operations(&library)
@@ -5351,8 +5863,10 @@ async fn a_library_folder_reached_through_a_symlink_takes_writes() {
             .expect("track row");
     assert_eq!(availability, "missing");
 
-    // A second folder reached through a link into the first takes no
-    // managed writes: two ids would manage one set of files.
+    // A second folder reached through a link into the first leaves both
+    // without managed writes: two ids would manage one set of files. Its
+    // files are indexed once, under the folder saved first, and a removal
+    // says why it is refused.
     let second = plant(&real, "music/Band/LP2/02.flac", "flac_full_02.flac");
     let other = scratch.to_path_buf().join("other");
     std::os::unix::fs::symlink(real.join("music"), &other).expect("link made");
@@ -5366,9 +5880,17 @@ async fn a_library_folder_reached_through_a_symlink_takes_writes() {
         )
         .expect("root adds");
     drain_scans(&library).await;
+    assert!(
+        library
+            .scan_store
+            .track_at("inner", "LP2/02.flac")
+            .unwrap()
+            .is_none(),
+        "the shared file is not indexed twice"
+    );
     let through_link = library
         .scan_store
-        .track_at("inner", "LP2/02.flac")
+        .track_at("music", "Band/LP2/02.flac")
         .unwrap()
         .expect("track indexed");
     let refused = Mutations::new(&library).remove_track_now(&through_link, true, "admin");
@@ -5376,7 +5898,7 @@ async fn a_library_folder_reached_through_a_symlink_takes_writes() {
         matches!(
             &refused,
             Err(droppedneedle_library::mutations::MutationError::Conflict(reason))
-                if reason.code == "FILE_OUTSIDE_ROOT"
+                if reason.code == "LIBRARY_FOLDER_LEFT_OUT"
         ),
         "{refused:?}"
     );
@@ -5584,14 +6106,14 @@ async fn management_hold(app: &TestApp, headers: &[(&str, &str)], album: &str) -
 
 /// Leave the album unmanaged by a person's own hand, as the album page
 /// would have it.
+/// Leave the album `?1` unmanaged, by the admin's hand.
+const EXCLUDE_BY_HAND: &str = "INSERT INTO library_management_exclusions (local_album_id, \
+     reason, excluded_by_user_id, excluded_at) \
+     SELECT ?1, 'manual', id, 5 FROM auth_users WHERE role = 'admin' LIMIT 1";
+
 fn exclude_by_hand(db: &rusqlite::Connection, album: &str) {
-    db.execute(
-        "INSERT INTO library_management_exclusions (local_album_id, reason, \
-         excluded_by_user_id, excluded_at) \
-         SELECT ?1, 'manual', id, 5 FROM auth_users WHERE role = 'admin' LIMIT 1",
-        [album],
-    )
-    .expect("album left unmanaged");
+    db.execute(EXCLUDE_BY_HAND, [album])
+        .expect("album left unmanaged");
 }
 
 fn catalog_actions(db: &rusqlite::Connection, album: &str, kind: &str) -> i64 {
@@ -5716,7 +6238,7 @@ async fn custom_edition_is_sealed_on_the_album_and_undone() {
 
     // With a person's "leave unmanaged": sealing and then choosing a
     // release both keep it.
-    exclude_by_hand(&db, &album);
+    app.seed_with(EXCLUDE_BY_HAND, [&album]).await;
     let revision = edition_status(app, &headers, &edition).await["identity_revision"].clone();
     let (status, body) = app
         .call(
@@ -5826,13 +6348,13 @@ async fn leave_unmanaged_on_the_album_and_undo() {
     assert_eq!(management_hold(app, &headers, &album).await, Value::Null);
     assert_eq!(catalog_actions(&db, &album, "leave_unmanaged"), 0);
 
-    db.execute(
+    app.seed_with(
         "INSERT INTO library_edition_remap_queue \
          (local_album_id, release_mbid, queued_at, attempts, not_before, origin) \
          VALUES (?1, ?2, 0, 0, 1e12, 'album_pin')",
         rusqlite::params![album, fit.id],
     )
-    .expect("remap row queued");
+    .await;
     // The match waits in Unconfirmed matches; the person's word settles it.
     let match_state = || {
         use rusqlite::OptionalExtension as _;
@@ -5844,13 +6366,13 @@ async fn leave_unmanaged_on_the_album_and_undo() {
         .optional()
         .expect("match state reads")
     };
-    db.execute(
+    app.seed_with(
         "INSERT INTO library_album_match_state (local_album_id, state, reason_code, \
          release_mbid, candidates_json, updated_at) \
          VALUES (?1, 'unconfirmed', 'CLOSE_CALL', ?2, '[]', 1)",
         rusqlite::params![album, fit.id],
     )
-    .expect("match left unconfirmed");
+    .await;
     let (status, body) = app
         .call(
             "POST",
@@ -5896,7 +6418,7 @@ async fn leave_unmanaged_on_the_album_and_undo() {
 
     // A hold the person set before stays through the undo, and "Manage it
     // again" lifts it.
-    exclude_by_hand(&db, &album);
+    app.seed_with(EXCLUDE_BY_HAND, [&album]).await;
     let (status, body) = app
         .call(
             "POST",
@@ -6003,26 +6525,25 @@ async fn edition_status_says_what_happens_next() {
 
     // A remap row seeded with a far-off `not_before`, so the loop never
     // takes it: placing, then waiting on MusicBrainz, then done.
-    let db = app.db();
-    db.execute(
+    app.seed_with(
         "INSERT INTO library_edition_remap_queue \
          (local_album_id, release_mbid, queued_at, attempts, not_before, origin) \
          VALUES (?1, ?2, 0, 0, 1e12, 'album_pin')",
         rusqlite::params![album, fit.id],
     )
-    .expect("remap row queued");
+    .await;
     assert_eq!(status().await["placing"], json!({"attempts": 0}));
-    db.execute(
+    app.seed_with(
         "UPDATE library_edition_remap_queue SET attempts = 1 WHERE local_album_id = ?1",
         [&album],
     )
-    .expect("row updated");
+    .await;
     assert_eq!(status().await["placing"], json!({"attempts": 1}));
-    db.execute(
+    app.seed_with(
         "DELETE FROM library_edition_remap_queue WHERE local_album_id = ?1",
         [&album],
     )
-    .expect("row removed");
+    .await;
     assert_eq!(status().await["placing"], Value::Null);
 
     // "Let DroppedNeedle choose" while identification is paused: the job
@@ -6074,22 +6595,21 @@ async fn edition_status_says_when_the_app_writes_the_files() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["files_by_itself"], json!(true), "{body}");
 
-    let db = app.db();
-    db.execute(
+    app.seed_with(
         "INSERT INTO library_management_exclusions \
          (local_album_id, reason, excluded_by_user_id, excluded_at) \
          SELECT ?1, 'user', id, 0 FROM auth_users WHERE role = 'admin' LIMIT 1",
         [&album],
     )
-    .expect("album left unmanaged");
+    .await;
     let (_, body) = app.call("GET", &edition, &headers, None).await;
     assert_eq!(body["files_by_itself"], json!(false), "{body}");
     assert_eq!(body["writing"], json!(false));
-    db.execute(
+    app.seed_with(
         "DELETE FROM library_management_exclusions WHERE local_album_id = ?1",
         [&album],
     )
-    .expect("exclusion removed");
+    .await;
 
     let (status, body) = app
         .call(
@@ -6114,46 +6634,45 @@ async fn edition_status_says_when_the_app_writes_the_files() {
 
     // Parked, or waiting on a preview a person must look at: nothing is
     // about to be written.
-    db.execute(
+    app.seed_with(
         "UPDATE library_management_automatic_queue SET not_before = 1e15, \
          last_reason_code = 'MANAGEMENT_FAILED' WHERE local_album_id = ?1",
         [&album],
     )
-    .expect("row parked");
+    .await;
     assert_eq!(writes(&status().await), (json!(true), json!(false)));
-    db.execute(
+    app.seed_with(
         "UPDATE library_management_automatic_queue SET not_before = 1e12, \
          last_reason_code = 'PREVIEW_BLOCKED' WHERE local_album_id = ?1",
         [&album],
     )
-    .expect("row waits on a blocked preview");
+    .await;
     assert_eq!(writes(&status().await), (json!(true), json!(false)));
 
     // The app stepped back from the album: it writes nothing until the
     // album is handed back, and a hand-back on its way counts as done.
-    db.execute(
+    app.seed_with(
         "INSERT INTO library_album_takeovers (local_album_id, cause, noticed_at) \
          VALUES (?1, 'files_changed', 0)",
         [&album],
     )
-    .expect("album taken over");
+    .await;
     assert_eq!(writes(&status().await), (json!(false), json!(false)));
-    db.execute(
+    app.seed_with(
         "UPDATE library_album_takeovers SET handed_back_at = 1, hand_back_retry_at = 1000000000000000 \
          WHERE local_album_id = ?1",
         [&album],
-    )
-    .expect("hand-back stamped");
+    ).await;
     assert_eq!(status().await["files_by_itself"], json!(true));
-    db.execute(
+    app.seed_with(
         "DELETE FROM library_album_takeovers WHERE local_album_id = ?1",
         [&album],
     )
-    .expect("mark lifted");
+    .await;
 
     // A custom edition, where the folder does not manage custom editions
     // by itself.
-    db.execute_batch(&format!(
+    app.seed(&format!(
         "UPDATE local_album_external_identities SET release_mbid = NULL, \
          row_revision = row_revision + 1 WHERE local_album_id = '{album}'; \
          INSERT INTO library_custom_edition_manifests (id, local_album_id, version, \
@@ -6170,7 +6689,7 @@ async fn edition_status_says_when_the_app_writes_the_files() {
          VALUES ('{album}', 'manifest-1', 0);",
         group = fit.release_group_id,
     ))
-    .expect("custom edition sealed");
+    .await;
     let body = status().await;
     assert_eq!(body["edition_kind"], json!("custom"), "{body}");
     assert_eq!(writes(&body), (json!(false), json!(false)));
@@ -6179,7 +6698,7 @@ async fn edition_status_says_when_the_app_writes_the_files() {
     assert_eq!(status().await["files_by_itself"], json!(true));
     // A manifest that lists only some of the album's files is no custom
     // edition to the worker: it waits for a release, and so does the status.
-    db.execute_batch(&format!(
+    app.seed(&format!(
         "INSERT INTO library_custom_edition_manifests (id, local_album_id, version, \
          release_group_mbid, album_title, album_artist_name, source_album_revision, \
          input_revision, content_hash, sealed_by_user_id, sealed_at) \
@@ -6194,40 +6713,40 @@ async fn edition_status_says_when_the_app_writes_the_files() {
          WHERE local_album_id = '{album}';",
         group = fit.release_group_id,
     ))
-    .expect("manifest gone stale");
+    .await;
     let body = status().await;
     assert_eq!(body["edition_kind"], json!("custom"), "{body}");
     assert_eq!(writes(&body), (json!(false), json!(false)));
-    db.execute(
+    app.seed_with(
         "DELETE FROM library_custom_edition_active WHERE local_album_id = ?1",
         [&album],
     )
-    .expect("custom edition let go");
+    .await;
     // Only a release group: nothing is written until a release is chosen.
     let body = status().await;
     assert_eq!(body["edition_kind"], json!("group_only"), "{body}");
     assert_eq!(writes(&body), (json!(false), json!(false)));
 
     // An unconfirmed match waits for a person before anything is written.
-    db.execute(
+    app.seed_with(
         "UPDATE local_album_external_identities SET release_mbid = ?2, \
          row_revision = row_revision + 1 WHERE local_album_id = ?1",
         [&album, &fit.id],
     )
-    .expect("release back");
+    .await;
     assert_eq!(status().await["files_by_itself"], json!(true));
-    db.execute(
+    app.seed_with(
         "INSERT INTO library_album_match_state (local_album_id, state, reason_code, updated_at) \
          VALUES (?1, 'unconfirmed', 'LOOSE_MATCH', 0)",
         [&album],
     )
-    .expect("match unconfirmed");
+    .await;
     assert_eq!(writes(&status().await), (json!(false), json!(false)));
-    db.execute(
+    app.seed_with(
         "DELETE FROM library_album_match_state WHERE local_album_id = ?1",
         [&album],
     )
-    .expect("match confirmed");
+    .await;
 
     // An edition with no track for one of the files: that file can never
     // be written from it, so once the files are placed nothing is written
@@ -6518,12 +7037,11 @@ async fn an_unmatched_album_in_a_keep_tags_folder_says_why() {
         rig.scan_store.album_for_track(&second).unwrap().as_ref(),
         Some(&album)
     );
-    app.db()
-        .execute(
-            "UPDATE local_tracks SET applied_policy = 'automatic' WHERE id = ?1",
-            [&second],
-        )
-        .expect("one file identifies");
+    app.seed_with(
+        "UPDATE local_tracks SET applied_policy = 'automatic' WHERE id = ?1",
+        [&second],
+    )
+    .await;
     let (_, body) = app
         .call(
             "GET",
@@ -6864,7 +7382,7 @@ async fn library_journey_catalog_corrections() {
         store.album_for_track(&a2).unwrap().as_deref(),
         Some(album_a.as_str())
     );
-    let db = rusqlite::Connection::open(&app.config.library_db_path).expect("db opens");
+    let db = app.db();
     let retired_into = |album: &str| -> Option<String> {
         db.query_row(
             "SELECT retired_into_album_id FROM local_albums WHERE id = ?1",
@@ -6878,16 +7396,16 @@ async fn library_journey_catalog_corrections() {
     // Album B carries a chosen edition, album A none: merging B into A
     // moves the edition onto A.
     const CHOSEN: &str = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
-    db.execute_batch(&format!(
+    app.seed(&format!(
         "DELETE FROM local_track_external_identities; \
          DELETE FROM local_album_external_identities; \
          INSERT INTO local_album_external_identities (local_album_id, release_group_mbid, \
          release_mbid, decision_source, selected_at) VALUES ('{album_b}', \
          '11111111-2222-4333-8444-555555555555', '{CHOSEN}', 'manual', 1);"
     ))
-    .expect("pin album b");
+    .await;
     // Someone favorited album B and played it; both follow the merge.
-    db.execute_batch(&format!(
+    app.seed(&format!(
         "INSERT INTO library_user_favorites (user_id, item_kind, item_id, created_at) \
          VALUES ('listener', 'album', '{album_b}', 1); \
          INSERT INTO library_user_favorite_names (user_id, item_kind, item_id, display_name) \
@@ -6896,7 +7414,7 @@ async fn library_journey_catalog_corrections() {
          artist_name, played_at) VALUES ('play-1', 'listener', '{album_b}', 'Song', \
          'Artist', '2026-01-01T00:00:00Z');"
     ))
-    .expect("favorite and play album b");
+    .await;
     let selection = json!({"track_ids": [b1], "target_album_id": album_a});
     let (status, preview) = app
         .call(
@@ -7006,14 +7524,14 @@ async fn library_journey_catalog_corrections() {
     );
 
     // Two artists that are the same person: merge one into the other.
-    db.execute_batch(
+    app.seed(
         "INSERT INTO local_artists (id, display_name, folded_name, kind, created_at, updated_at) \
          VALUES ('artist-keep', 'Same', 'same', 'person', 1, 1), \
          ('artist-dupe', 'Same.', 'same.', 'person', 1, 1); \
          INSERT INTO library_user_favorites (user_id, item_kind, item_id, created_at) \
          VALUES ('someone', 'artist', 'artist-dupe', 1);",
     )
-    .expect("artists");
+    .await;
     let selection = json!({
         "source_artist_ids": ["artist-keep", "artist-dupe"],
         "surviving_artist_id": "artist-keep",
@@ -7091,6 +7609,175 @@ async fn automatic_next(library: &LibrarySetup) -> bool {
         .expect("automatic step")
 }
 
+/// A management preview's token and an activation dry run's token confirm
+/// only for the administrator who made them: another administrator who
+/// sends them is refused as an invalid token. They stay good until the
+/// preview's own expiry, not for a fixed 15 minutes.
+#[tokio::test]
+async fn a_management_token_confirms_only_for_its_admin_until_the_preview_expires() {
+    use crate::common::auth::{test_principal, with_test_principal};
+    use axum::body::Body;
+    use axum::http::Request;
+    use droppedneedle_auth::users::roles::{Role, SessionKind};
+    use droppedneedle_kernel::clock::{Clock, ManualClock};
+    use droppedneedle_kernel::runtime_config::sections::LibraryManagementRootAssignment;
+    use droppedneedle_library::management::service::Management;
+    use droppedneedle_library::management::settings as lm;
+    use tower::ServiceExt as _;
+
+    let clock = Arc::new(ManualClock::at(
+        droppedneedle_kernel::clock::SystemClock.now_ms(),
+    ));
+    let (scratch, library, music) =
+        bare_library_at("lib-management-tokens", None, clock.clone()).await;
+    plant(&music, "incoming/track.flac", "management_full.flac");
+    add_music_root(&library, &music).await;
+    let track = library
+        .scan_store
+        .track_at("music", "incoming/track.flac")
+        .unwrap()
+        .expect("track indexed");
+    let album = library
+        .scan_store
+        .album_for_track(&track)
+        .unwrap()
+        .expect("album");
+    scratch
+        .identify
+        .set_recall(ambiguous_recall(&library.identify_store, &album));
+    assert_eq!(library.identification.identify_tick().await, 1);
+    library
+        .scan_store
+        .db()
+        .run_sql(
+            "INSERT INTO auth_users (id, display_name, role, created_at) VALUES \
+             ('admin-a', 'Ann', 'admin', 0), ('admin-b', 'Bob', 'admin', 0)",
+        )
+        .expect("admin rows");
+    crate::common::library::operations(&library)
+        .confirm_match(&album, shown_revision(&library, &album), "admin-a")
+        .expect("match confirmed");
+    let shown = library
+        .management_settings
+        .get_settings()
+        .expect("settings read");
+    let (settings, revision) = (shown.settings, shown.settings_revision);
+    let policy = library.core.policy_revision().expect("policy revision");
+
+    let services = crate::common::library::services(&library);
+    let signed_in = |user: &str| {
+        with_test_principal(
+            droppedneedle_library::http::management::routes()
+                .merge(droppedneedle_library::http::management_tools::routes())
+                .with_state(services.clone())
+                .into_router(),
+            test_principal(
+                user,
+                Role::Admin,
+                &format!("sess-{user}"),
+                SessionKind::Standard,
+            ),
+        )
+    };
+    let (ann, bob) = (signed_in("admin-a"), signed_in("admin-b"));
+    let call = |app: &axum::Router, uri: &str, body: Value| {
+        let request = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .expect("request builds");
+        let app = app.clone();
+        async move {
+            let response = app.oneshot(request).await.expect("router answers");
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body reads");
+            let json: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+            (status, json)
+        }
+    };
+
+    let (status, preview) = call(
+        &ann,
+        "/api/v3/library/management/previews",
+        json!({
+            "selection": {"kind": "albums", "ids": [album]},
+            "profile_id": lm::PICARD_ORGANIZER_PROFILE_ID,
+            "expected_settings_revision": revision,
+            "expected_policy_revision": policy,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{preview}");
+    assert!(management_step(&library).await, "planning runs");
+    let job = preview["job_id"].as_str().expect("job").to_owned();
+
+    let mut proposed = settings;
+    proposed
+        .root_assignments
+        .retain(|assignment| assignment.root_id != "music");
+    proposed
+        .root_assignments
+        .push(LibraryManagementRootAssignment {
+            root_id: "music".to_owned(),
+            profile_id: Some(lm::PICARD_ORGANIZER_PROFILE_ID.to_owned()),
+            enabled: true,
+            automatic_scan_discovered: true,
+            ..Default::default()
+        });
+    let (status, dry_run) = call(
+        &ann,
+        "/api/v3/settings/library-management/activation-previews",
+        json!({
+            "root_id": "music",
+            "settings": proposed,
+            "expected_settings_revision": revision,
+            "expected_policy_revision": policy,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{dry_run}");
+    assert!(management_step(&library).await, "dry run planning runs");
+
+    let management = Management::new(&library);
+    let apply = format!("/api/v3/library/management/previews/{job}/apply");
+    let apply_body = || {
+        json!({
+            "preview_token": preview["preview_token"],
+            "expected_operation_row_revision":
+                management.detail(&job).expect("detail").job.row_revision,
+            "idempotency_key": "apply-1",
+            "confirmation": true,
+        })
+    };
+    let confirm = "/api/v3/settings/library-management/activation-confirmations";
+    let confirm_body = json!({
+        "settings": proposed,
+        "proofs": [{
+            "root_id": "music",
+            "job_id": dry_run["job_id"],
+            "preview_token": dry_run["preview_token"],
+        }],
+        "expected_settings_revision": revision,
+        "confirmation": true,
+    });
+
+    let (status, body) = call(&bob, &apply, apply_body()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["code"], json!("PREVIEW_TOKEN_INVALID"));
+    let (status, body) = call(&bob, confirm, confirm_body.clone()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["code"], json!("PREVIEW_TOKEN_INVALID"));
+
+    clock.advance(20 * 60 * 1000);
+    let (status, body) = call(&ann, &apply, apply_body()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = call(&ann, confirm, confirm_body).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
 async fn management_step(library: &LibrarySetup) -> bool {
     let management = droppedneedle_library::management::service::Management::new(library);
     tokio::task::spawn_blocking(move || management.run_next("test-worker"))
@@ -7122,6 +7809,7 @@ async fn management_run(
                 idempotency_key: format!("apply-{}", handle.job_id),
                 confirmation: true,
             },
+            "admin",
         )
         .expect("apply queued");
     assert!(management_step(library).await, "apply runs");
@@ -7180,7 +7868,7 @@ async fn a_busy_database_leaves_a_management_job_runnable() {
         .db()
         .run_sql(
             "INSERT INTO auth_users (id, display_name, role, created_at) \
-             VALUES ('admin', 'Admin', 'admin', '2026-01-01T00:00:00Z')",
+             VALUES ('admin', 'Admin', 'admin', 0)",
         )
         .expect("admin row");
     let settings = library
@@ -7269,7 +7957,7 @@ async fn a_management_job_whose_worker_died_is_finished_by_its_own_worker() {
         .db()
         .run_sql(
             "INSERT INTO auth_users (id, display_name, role, created_at) \
-             VALUES ('admin', 'Admin', 'admin', '2026-01-01T00:00:00Z')",
+             VALUES ('admin', 'Admin', 'admin', 0)",
         )
         .expect("admin row");
     let settings = library
@@ -7359,7 +8047,7 @@ async fn the_management_loop_recovers_at_start_and_wakes_on_enqueue() {
         .expect("album");
     db.run_sql(
         "INSERT INTO auth_users (id, display_name, role, created_at) \
-         VALUES ('admin', 'Admin', 'admin', '2026-01-01T00:00:00Z')",
+         VALUES ('admin', 'Admin', 'admin', 0)",
     )
     .expect("admin row");
     let settings = library
@@ -7618,7 +8306,7 @@ async fn library_management_preview_apply_undo() {
         .db()
         .run_sql(
             "INSERT INTO auth_users (id, display_name, role, created_at) \
-             VALUES ('admin', 'Admin', 'admin', '2026-01-01T00:00:00Z')",
+             VALUES ('admin', 'Admin', 'admin', 0)",
         )
         .expect("admin row");
     // A second profile names files after their title in place, so the
@@ -7752,6 +8440,7 @@ async fn library_management_preview_apply_undo() {
             idempotency_key: "apply-1".to_owned(),
             confirmation: true,
         },
+        "admin",
     );
     assert!(wrong.is_err());
     management
@@ -7763,6 +8452,7 @@ async fn library_management_preview_apply_undo() {
                 idempotency_key: "apply-1".to_owned(),
                 confirmation: true,
             },
+            "admin",
         )
         .expect("apply queued");
     assert!(management_step(&library).await, "apply runs");
@@ -7800,6 +8490,7 @@ async fn library_management_preview_apply_undo() {
                 idempotency_key: "undo-apply-1".to_owned(),
                 confirmation: true,
             },
+            "admin",
         )
         .expect("undo queued");
     assert!(management_step(&library).await, "undo runs");
@@ -8104,26 +8795,24 @@ async fn library_journey_identity_repair_and_preparation() {
             )
             .await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        let conn = droppedneedle_kernel::db::open_connection(&app.config.library_db_path)
-            .expect("db opens");
-        conn.execute(
+        app.seed_with(
             "DELETE FROM local_track_external_identities WHERE local_track_id IN \
              (SELECT id FROM local_tracks WHERE local_album_id = ?1)",
             [&album],
         )
-        .expect("track rows cleared");
-        conn.execute(
+        .await;
+        app.seed_with(
             "DELETE FROM local_album_external_identities WHERE local_album_id = ?1",
             [&album],
         )
-        .expect("album identity cleared");
-        conn.execute(
+        .await;
+        app.seed_with(
             "INSERT OR REPLACE INTO library_album_match_state (local_album_id, state, \
              reason_code, candidates_json, updated_at) \
              VALUES (?1, 'unmatched', 'NO_CANDIDATE', '[]', 1.0)",
             [&album],
         )
-        .expect("match state planted");
+        .await;
     }
     let (_, job) = app
         .call(
@@ -8207,6 +8896,7 @@ async fn management_apply(
                 idempotency_key: format!("apply-{}", handle.job_id),
                 confirmation: true,
             },
+            "admin",
         )
         .expect("apply queued");
     // Other queued work may go first; run the worker until this job ends.
@@ -8310,7 +9000,7 @@ async fn library_management_tools_journey() {
         .db()
         .run_sql(
             "INSERT INTO auth_users (id, display_name, role, created_at) \
-             VALUES ('admin', 'Admin', 'admin', '2026-01-01T00:00:00Z')",
+             VALUES ('admin', 'Admin', 'admin', 0)",
         )
         .expect("admin row");
     crate::common::library::operations(&library)
@@ -8595,12 +9285,71 @@ async fn library_management_tools_journey() {
     assert_eq!(reset.job.state.as_str(), "succeeded");
     assert_eq!(overrides(&library), 0, "the kept value is gone");
 
-    // Write once, then back to the original.
+    use droppedneedle_kernel::runtime_config::secret_sections::TypedLibrary;
+    let switch = |on: bool| {
+        library
+            .settings
+            .store()
+            .update_secret_blocking::<TypedLibrary, String, _>(move |stored| {
+                let mut settings = stored.into_inner();
+                settings.enabled = on;
+                Ok(settings)
+            })
+            .expect("library switch saved");
+        library.core.refresh_registry();
+    };
+    fn refused_while_off<T: std::fmt::Debug>(
+        result: Result<T, droppedneedle_library::management::models::ManagementError>,
+    ) {
+        match result {
+            Err(droppedneedle_library::management::models::ManagementError::Conflict(message)) => {
+                assert!(message.contains("switched off"), "{message}");
+            }
+            other => panic!("expected the library-off refusal, got {other:?}"),
+        }
+    }
+
+    // Write once, then back to the original. The apply, queued before the
+    // library is switched off, writes nothing while it is off and
+    // finishes once it is back on.
     let once = management
         .create_tag_edit(edit(TagEditMode::WriteOnce, "Once", "edit-once"), "admin")
         .expect("write-once preview");
     assert!(management_step(&library).await, "write-once planning runs");
-    management_apply(&library, &once).await;
+    let queued = management
+        .apply(
+            &once.job_id,
+            droppedneedle_library::management::service::ApplyRequest {
+                preview_token: once.preview_token.clone(),
+                expected_row_revision: management
+                    .detail(&once.job_id)
+                    .expect("detail")
+                    .job
+                    .row_revision,
+                idempotency_key: "apply-once".to_owned(),
+                confirmation: true,
+            },
+            "admin",
+        )
+        .expect("apply queued");
+    assert_eq!(queued.state.as_str(), "queued");
+    switch(false);
+    assert!(
+        !management_step(&library).await,
+        "a queued apply waits while the library is off"
+    );
+    assert_eq!(title(&file), original[&TagField::Title]);
+    switch(true);
+    while management_step(&library).await {}
+    assert_eq!(
+        management
+            .detail(&once.job_id)
+            .expect("detail")
+            .job
+            .state
+            .as_str(),
+        "succeeded"
+    );
     assert_eq!(title(&file), vec!["Once".to_owned()]);
     let restore = management
         .create_restore_preview(
@@ -8643,6 +9392,69 @@ async fn library_management_tools_journey() {
             .needs_attention_count,
         0
     );
+
+    // With the library switched off, a preview, an apply and an undo are
+    // refused as a scan is (409 CONFLICT), and nothing is written.
+    let album_preview = |key: &str| droppedneedle_library::management::service::PreviewRequest {
+        selection: Selection {
+            kind: SelectionKind::Albums,
+            ids: vec![album.clone()],
+            catalog_filter: None,
+        },
+        profile_id: lm::PICARD_ORGANIZER_PROFILE_ID.to_owned(),
+        expected_settings_revision: revision(),
+        expected_policy_revision: policy.clone(),
+        idempotency_key: Some(key.to_owned()),
+        target_root_id: None,
+        overrides: None,
+    };
+    let ready = management
+        .create_preview(album_preview("before-off"), "admin")
+        .expect("preview while on");
+    assert!(management_step(&library).await, "planning runs");
+    let ready_revision = management
+        .detail(&ready.job_id)
+        .expect("detail")
+        .job
+        .row_revision;
+    switch(false);
+    refused_while_off(management.create_preview(album_preview("while-off"), "admin"));
+    refused_while_off(management.apply(
+        &ready.job_id,
+        droppedneedle_library::management::service::ApplyRequest {
+            preview_token: ready.preview_token.clone(),
+            expected_row_revision: ready_revision,
+            idempotency_key: "apply-while-off".to_owned(),
+            confirmation: true,
+        },
+        "admin",
+    ));
+    let once_revision = management
+        .detail(&once.job_id)
+        .expect("detail")
+        .job
+        .row_revision;
+    refused_while_off(management.undo_preview(
+        &once.job_id,
+        once_revision,
+        "undo-while-off",
+        "admin",
+    ));
+    assert!(!management_step(&library).await, "nothing was queued");
+    assert_eq!(
+        management
+            .detail(&ready.job_id)
+            .expect("detail")
+            .job
+            .state
+            .as_str(),
+        "ready"
+    );
+    assert_eq!(read_fields(&file).expect("tags"), original);
+    switch(true);
+    management
+        .discard(&ready.job_id, ready_revision)
+        .expect("preview discarded");
 
     // A confirmed dry run turns automatic management on for the folder.
     let mut proposed = library
@@ -8702,6 +9514,7 @@ async fn library_management_tools_journey() {
             idempotency_key: "apply-dry-run".to_owned(),
             confirmation: true,
         },
+        "admin",
     );
     assert!(refused.is_err(), "an activation preview cannot be applied");
     management
@@ -8725,6 +9538,14 @@ async fn library_management_tools_journey() {
         ("succeeded", Some("ACTIVATION_CONFIRMED")),
         "a confirmed dry run is done"
     );
+
+    // While the library is switched off the worker plans nothing; the
+    // album waits and is managed on the first look after it is back on.
+    switch(false);
+    library.identification.queue_automatic_management(&album);
+    assert!(!automatic_next(&library).await, "no look while off");
+    assert!(!management_step(&library).await, "nothing was planned");
+    switch(true);
 
     // The album is then managed without asking: moved by the profile.
     library.identification.queue_automatic_management(&album);
@@ -8891,7 +9712,7 @@ async fn library_management_tools_journey() {
 
     // A stop before the worker starts touches nothing.
     management
-        .apply(&resolve.job_id, apply_request(&resolve))
+        .apply(&resolve.job_id, apply_request(&resolve), "admin")
         .expect("resolution queued");
     assert_eq!(stop(&resolve.job_id).state.as_str(), "stopped");
     management_step(&library).await;
@@ -8918,7 +9739,7 @@ async fn library_management_tools_journey() {
         droppedneedle_library::publish::CrashPoint::AfterFirstRename,
     ));
     management
-        .apply(&resolve.job_id, apply_request(&resolve))
+        .apply(&resolve.job_id, apply_request(&resolve), "admin")
         .expect("resolution queued");
     management_step(&library).await;
     library.publishing.arm_publish_crash(None);
@@ -9034,7 +9855,7 @@ async fn library_management_custom_edition_journey() {
         .db()
         .run_sql(
             "INSERT INTO auth_users (id, display_name, role, created_at) \
-             VALUES ('admin', 'Admin', 'admin', '2026-01-01T00:00:00Z')",
+             VALUES ('admin', 'Admin', 'admin', 0)",
         )
         .expect("admin row");
     crate::common::library::operations(&library)
@@ -9222,7 +10043,7 @@ async fn library_management_artwork_journey() {
         .db()
         .run_sql(
             "INSERT INTO auth_users (id, display_name, role, created_at) \
-             VALUES ('admin', 'Admin', 'admin', '2026-01-01T00:00:00Z')",
+             VALUES ('admin', 'Admin', 'admin', 0)",
         )
         .expect("admin row");
     crate::common::library::operations(&library)
@@ -9469,7 +10290,7 @@ impl ManagedLibrary {
             .db()
             .run_sql(
                 "INSERT INTO auth_users (id, display_name, role, created_at) \
-                 VALUES ('admin', 'Admin', 'admin', '2026-01-01T00:00:00Z')",
+                 VALUES ('admin', 'Admin', 'admin', 0)",
             )
             .expect("admin row");
         let mut settings = lm::initial_settings("");
@@ -11232,12 +12053,12 @@ async fn a_merge_and_a_split_carry_the_step_back() {
     let album_a = store.album_for_track(&a2).unwrap().expect("album a");
     let album_b = store.album_for_track(&b1).unwrap().expect("album b");
     let db = app.db();
-    db.execute(
+    app.seed_with(
         "INSERT INTO library_album_takeovers (local_album_id, cause, noticed_at) \
          VALUES (?1, 'retag_followed', 1234)",
         [&album_b],
     )
-    .expect("album b marked");
+    .await;
     let marks = || -> Vec<(String, String, i64)> {
         let mut statement = db
             .prepare(
@@ -11453,7 +12274,7 @@ async fn handing_every_album_back_takes_one_step_each() {
         .expect("db");
     db.execute_batch(
         "INSERT INTO auth_users (id, display_name, role, created_at) \
-         VALUES ('admin', 'Admin', 'admin', '2026-01-01T00:00:00Z'); \
+         VALUES ('admin', 'Admin', 'admin', 0); \
          INSERT INTO library_album_takeovers (local_album_id, cause, noticed_at) \
          SELECT id, 'files_changed', 1000 FROM local_albums; \
          DELETE FROM library_management_automatic_queue;",
@@ -11544,12 +12365,11 @@ async fn left_unmanaged_albums_read_back_and_hand_back() {
         .expect("album");
     let db = app.db();
     let mark = || {
-        db.execute(
+        app.seed_with(
             "INSERT INTO library_album_takeovers (local_album_id, cause, noticed_at) \
              VALUES (?1, 'files_changed', 1234)",
             [&album],
         )
-        .expect("album marked");
     };
     let album_url = format!("/api/v3/library/albums/{album}");
     let hold = || async {
@@ -11560,7 +12380,7 @@ async fn left_unmanaged_albums_read_back_and_hand_back() {
     };
     assert_eq!(hold().await, Value::Null);
 
-    mark();
+    mark().await;
     assert_eq!(
         hold().await,
         json!({
@@ -11586,18 +12406,17 @@ async fn left_unmanaged_albums_read_back_and_hand_back() {
     assert_eq!(list["items"][0]["noticed_at"], json!(1234));
 
     // A person's own choice is what the page shows when both are there.
-    db.execute(
+    app.seed_with(
         "INSERT INTO library_management_exclusions (local_album_id, reason, \
          excluded_by_user_id, excluded_at) SELECT ?1, 'manual', id, 5 FROM auth_users LIMIT 1",
         [&album],
     )
-    .expect("album excluded");
+    .await;
     let own = hold().await;
     assert_eq!(own["kind"], json!("your_choice"));
     assert_eq!(own["held_at"], json!(5000));
     assert_eq!(own["exclusion_revision"], json!(1));
-    db.execute("DELETE FROM library_management_exclusions", [])
-        .expect("exclusion lifted");
+    app.seed("DELETE FROM library_management_exclusions").await;
 
     let hand_back = format!("/api/v3/library/albums/{album}/management/hand-back");
     let (status, body) = app.call("POST", &hand_back, &headers, None).await;
@@ -11610,7 +12429,7 @@ async fn left_unmanaged_albums_read_back_and_hand_back() {
 
     // All at once: the route answers the count and the worker does the
     // rest.
-    mark();
+    mark().await;
     let (status, body) = app
         .call(
             "POST",
@@ -11652,7 +12471,7 @@ async fn a_hand_back_that_cannot_read_the_files_keeps_the_mark() {
         .expect("db");
     db.execute_batch(
         "INSERT INTO auth_users (id, display_name, role, created_at) \
-         VALUES ('admin', 'Admin', 'admin', '2026-01-01T00:00:00Z'); \
+         VALUES ('admin', 'Admin', 'admin', 0); \
          INSERT INTO library_album_takeovers (local_album_id, cause, noticed_at) \
          SELECT id, 'files_changed', 1000 FROM local_albums;",
     )
@@ -12675,7 +13494,7 @@ async fn import_and_management_name_a_file_alike() {
         .db()
         .run_sql(
             "INSERT INTO auth_users (id, display_name, role, created_at) \
-             VALUES ('admin', 'Admin', 'admin', '2026-01-01T00:00:00Z')",
+             VALUES ('admin', 'Admin', 'admin', 0)",
         )
         .expect("admin row");
     let mut settings = lm::initial_settings("");
@@ -13244,15 +14063,14 @@ async fn library_journey_review_exclude_restore_dismiss() {
         .album_for_track(&track)
         .unwrap()
         .expect("album");
-    let conn =
-        droppedneedle_kernel::db::open_connection(&app.config.library_db_path).expect("db opens");
-    conn.execute(
+    let conn = app.db();
+    app.seed_with(
         "INSERT INTO library_identify_reviews (id, local_album_id, reason_code, \
          candidates_json, state, created_ms, updated_ms) \
          VALUES ('rev-1', ?1, 'AUTOMATIC_EDITION_CLEARED_TO_REVIEW', '[]', 'pending', 1, 1)",
         [&album],
     )
-    .expect("review filed");
+    .await;
     let availability = |conn: &rusqlite::Connection| -> Vec<String> {
         let mut statement = conn
             .prepare("SELECT availability FROM local_tracks WHERE local_album_id = ?1")
@@ -13326,15 +14144,29 @@ async fn library_journey_review_exclude_restore_dismiss() {
         .call("GET", "/api/v3/library/reviews?state=all", &headers, None)
         .await;
     assert_eq!(body["total"], json!(1));
+    // The resolved view holds the dismissed review, and every view's count
+    // comes with any page.
+    let (status, body) = app
+        .call(
+            "GET",
+            "/api/v3/library/reviews?state=resolved&sort=reason",
+            &headers,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["total"], json!(1));
+    assert_eq!(body["state_counts"]["dismissed"], json!(1));
+    assert_eq!(body["state_counts"]["pending"], json!(0));
 
     // A bulk keep-as-tagged previews first, and applies only that preview.
-    conn.execute(
+    app.seed_with(
         "INSERT INTO library_identify_reviews (id, local_album_id, reason_code, \
          candidates_json, state, created_ms, updated_ms) \
          VALUES ('rev-2', ?1, 'EDITION_CLEARED_CONFLICT', '[]', 'pending', 2, 2)",
         [&album],
     )
-    .expect("second review filed");
+    .await;
     let selection = json!({"action": "keep_tagged", "filter": {"root_id": "music"}});
     let (status, preview) = app
         .call(
@@ -13396,32 +14228,35 @@ async fn library_journey_review_exclude_restore_dismiss() {
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["applied"], json!(1));
-    let (_, body) = app
-        .call("GET", "/api/v3/library/reviews/rev-2", &headers, None)
-        .await;
-    assert_eq!(body["state"], json!("rejected"));
+    assert_eq!(body["queued"], json!(1));
+    app.until("the bulk keep settles its review", || async {
+        let (_, body) = app
+            .call("GET", "/api/v3/library/reviews/rev-2", &headers, None)
+            .await;
+        (body["state"] == json!("rejected")).then_some(())
+    })
+    .await;
 
     // A bulk accept never replaces an edition someone picked by hand.
-    conn.execute(
+    app.seed_with(
         "INSERT INTO local_album_external_identities (local_album_id, provider, \
          release_group_mbid, decision_source, selected_at) \
          VALUES (?1, 'musicbrainz', 'rg-pinned', 'manual', 1.0)",
         [&album],
     )
-    .expect("pinned");
+    .await;
     let candidates = json!([{
         "candidate_key": "rg-other:", "release_group_mbid": "rg-other", "release_mbid": null,
         "album_title": "Other", "album_artist_name": "Someone", "track_evidence": [],
         "score": 0.9, "reason_code": "WEAK_MATCH"
     }]);
-    conn.execute(
+    app.seed_with(
         "INSERT INTO library_identify_reviews (id, local_album_id, reason_code, \
          candidates_json, state, created_ms, updated_ms) \
          VALUES ('rev-3', ?1, 'WEAK_MATCH', ?2, 'pending', 3, 3)",
         rusqlite::params![album, candidates.to_string()],
     )
-    .expect("third review filed");
+    .await;
     let (status, preview) = app
         .call(
             "POST",
@@ -13436,6 +14271,473 @@ async fn library_journey_review_exclude_restore_dismiss() {
         preview["skipped"][0]["reason"]["code"],
         json!("REVIEW_ALBUM_PINNED")
     );
+    rig.stop().await;
+}
+
+/// A bulk keep over 30 reviews is one review job, not 30 changes in one
+/// request: a pause holds it between reviews, a resume finishes it, and
+/// every review ends kept as tagged. A retry scoped to one sub-folder
+/// rule is one job over that folder's albums only. The operations loop is
+/// stopped so the journey takes each step itself.
+#[tokio::test]
+async fn bulk_review_changes_and_folder_retries_run_as_one_pausable_job() {
+    use droppedneedle_library::operations::service::ReviewStep;
+
+    let rig = Rig::start("lib-review-jobs").await;
+    let app = &rig.app;
+    let auth = app.login_admin().await;
+    let headers = [("authorization", auth.as_str())];
+    let music = app.config.root_app_dir.join("music");
+    plant(&music, "inside/01.flac", "flac_full_01.flac");
+    plant(&music, "outside/01.flac", "flac_cjk_01.flac");
+    rig.pause_identification().await;
+    app.add_library_folder("music", &music).await;
+    let album_at = |relative: &str| {
+        let track = rig
+            .scan_store
+            .track_at("music", relative)
+            .unwrap()
+            .expect("track indexed");
+        rig.scan_store
+            .album_for_track(&track)
+            .unwrap()
+            .expect("album")
+    };
+    let (inside, outside) = (album_at("inside/01.flac"), album_at("outside/01.flac"));
+    assert_ne!(inside, outside);
+    app.state()
+        .jobs
+        .supervisor()
+        .cancel(
+            droppedneedle_library::operations::JOB_NAME,
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+    let ops = app.state().library_services.operations.clone();
+    let step = || {
+        let ops = ops.clone();
+        async move {
+            tokio::task::spawn_blocking(move || ops.run_review_step("journey"))
+                .await
+                .expect("step joins")
+                .expect("step runs")
+        }
+    };
+    let db = app.db();
+    let file = |id: String, album: String| {
+        app.seed_with(
+            "INSERT INTO library_identify_reviews (id, local_album_id, reason_code, \
+             candidates_json, state, created_ms, updated_ms) \
+             VALUES (?1, ?2, 'AUTOMATIC_EDITION_CLEARED_TO_REVIEW', '[]', 'pending', 1, 1)",
+            [id, album],
+        )
+    };
+    let states = || -> Vec<(String, i64)> {
+        db.prepare("SELECT state, COUNT(*) FROM library_identify_reviews GROUP BY state")
+            .expect("prepare")
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("query")
+            .collect::<Result<_, _>>()
+            .expect("rows")
+    };
+    for n in 0..30 {
+        file(format!("keep-{n:02}"), inside.clone()).await;
+    }
+
+    let selection = json!({"action": "keep_tagged", "filter": {}});
+    let (status, preview) = app
+        .call(
+            "POST",
+            "/api/v3/library/reviews/bulk-preview",
+            &headers,
+            Some(selection.clone()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{preview}");
+    assert_eq!(preview["eligible"], json!(30));
+    let mut apply = selection;
+    apply["preview_token"] = preview["preview_token"].clone();
+    let (status, body) = app
+        .call(
+            "POST",
+            "/api/v3/library/reviews/bulk-apply",
+            &headers,
+            Some(apply),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["queued"], json!(30));
+    assert_eq!(body["job"]["kind"], json!("bulk_review_apply"));
+    assert_eq!(body["job"]["state"], json!("queued"));
+    let job_id = body["job"]["id"].as_str().expect("job id").to_owned();
+    assert_eq!(states(), vec![("pending".to_owned(), 30)], "nothing yet");
+
+    for _ in 0..10 {
+        assert!(matches!(step().await, ReviewStep::Worked(_)));
+    }
+    let (status, body) = app
+        .call(
+            "POST",
+            &format!("/api/v3/library/reviews/jobs/{job_id}/control"),
+            &headers,
+            Some(json!({"control": "pause"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["control_request"], json!("pause"));
+    let ReviewStep::Ended(paused) = step().await else {
+        panic!("the pause is honoured before the next review");
+    };
+    assert_eq!(paused.state.as_str(), "paused");
+    assert!(
+        matches!(step().await, ReviewStep::Idle),
+        "a paused job waits"
+    );
+    assert_eq!(
+        states(),
+        vec![("pending".to_owned(), 20), ("rejected".to_owned(), 10)]
+    );
+    let (status, body) = app
+        .call("GET", "/api/v3/library/reviews/jobs", &headers, None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["jobs"][0]["id"], json!(job_id));
+    assert_eq!(body["jobs"][0]["action"], json!("keep_tagged"));
+    assert_eq!(body["jobs"][0]["state"], json!("paused"));
+    assert_eq!(body["jobs"][0]["completed_count"], json!(10));
+
+    let (status, body) = app
+        .call(
+            "POST",
+            &format!("/api/v3/library/reviews/jobs/{job_id}/control"),
+            &headers,
+            Some(json!({"control": "resume"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let finished = loop {
+        match step().await {
+            ReviewStep::Worked(_) => {}
+            ReviewStep::Ended(job) => break job,
+            ReviewStep::Idle => panic!("the resumed job is taken again"),
+        }
+    };
+    assert_eq!(finished.state.as_str(), "succeeded");
+    assert_eq!(
+        (finished.completed_count, finished.succeeded_count),
+        (30, 30)
+    );
+    assert_eq!(states(), vec![("rejected".to_owned(), 30)]);
+
+    // A retry of one sub-folder rule picks only the albums inside it.
+    let (status, mut settings) = app
+        .call("GET", "/api/v3/settings/library", &headers, None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{settings}");
+    let revision = settings["policy_revision"].clone();
+    settings["library_roots"][0]["rules"] = json!([
+        {"id": "inside-rule", "relative_path": "inside", "policy": "automatic"}
+    ]);
+    let (status, body) = app
+        .call(
+            "PUT",
+            "/api/v3/settings/library",
+            &headers,
+            Some(json!({"settings": settings, "expected_policy_revision": revision})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    file("retry-inside".to_owned(), inside.clone()).await;
+    file("retry-outside".to_owned(), outside.clone()).await;
+    let (status, body) = app
+        .call(
+            "POST",
+            "/api/v3/library/reviews/retry-pending",
+            &headers,
+            Some(json!({"scope_ids": ["inside-rule"]})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["started"], json!(1));
+    let retry_job = body["job"]["id"].as_str().expect("job id").to_owned();
+    let albums: Vec<String> = db
+        .prepare("SELECT local_album_id FROM library_operation_work WHERE job_id = ?1")
+        .expect("prepare")
+        .query_map([&retry_job], |row| row.get(0))
+        .expect("query")
+        .collect::<Result<_, _>>()
+        .expect("rows");
+    assert_eq!(albums, vec![inside.clone()]);
+    let per_album: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM library_operation_jobs \
+             WHERE kind = 'explicit_reidentification'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("jobs read");
+    assert_eq!(per_album, 0, "no job per album");
+    while !matches!(step().await, ReviewStep::Ended(_)) {}
+    let state_of = |id: &str| -> String {
+        db.query_row(
+            "SELECT state FROM library_identify_reviews WHERE id = ?1",
+            [id],
+            |row| row.get(0),
+        )
+        .expect("review reads")
+    };
+    assert_eq!(state_of("retry-inside"), "dismissed");
+    assert_eq!(state_of("retry-outside"), "pending");
+    rig.stop().await;
+}
+
+/// A review job whose step fails to record a review's outcome puts that
+/// review back to pending and does it on a later step, so the job never
+/// ends with a review it skipped over.
+#[tokio::test]
+async fn a_review_job_step_that_fails_to_record_does_the_review_again() {
+    use droppedneedle_library::operations::service::ReviewStep;
+
+    let rig = Rig::start("lib-review-job-retake").await;
+    let app = &rig.app;
+    let auth = app.login_admin().await;
+    let headers = [("authorization", auth.as_str())];
+    let music = app.config.root_app_dir.join("music");
+    plant(&music, "album/01.flac", "flac_full_01.flac");
+    rig.pause_identification().await;
+    app.add_library_folder("music", &music).await;
+    let track = rig
+        .scan_store
+        .track_at("music", "album/01.flac")
+        .unwrap()
+        .expect("track indexed");
+    let album = rig
+        .scan_store
+        .album_for_track(&track)
+        .unwrap()
+        .expect("album");
+    app.state()
+        .jobs
+        .supervisor()
+        .cancel(
+            droppedneedle_library::operations::JOB_NAME,
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+    let ops = app.state().library_services.operations.clone();
+    let step = || {
+        let ops = ops.clone();
+        async move {
+            tokio::task::spawn_blocking(move || ops.run_review_step("journey"))
+                .await
+                .expect("step joins")
+        }
+    };
+    let db = app.db();
+    for n in 0..3 {
+        app.seed_with(
+            "INSERT INTO library_identify_reviews (id, local_album_id, reason_code, \
+             candidates_json, state, created_ms, updated_ms) \
+             VALUES (?1, ?2, 'AUTOMATIC_EDITION_CLEARED_TO_REVIEW', '[]', 'pending', 1, 1)",
+            [format!("keep-{n}"), album.clone()],
+        )
+        .await;
+    }
+    let selection = json!({"action": "keep_tagged", "filter": {}});
+    let (status, preview) = app
+        .call(
+            "POST",
+            "/api/v3/library/reviews/bulk-preview",
+            &headers,
+            Some(selection.clone()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{preview}");
+    let mut apply = selection;
+    apply["preview_token"] = preview["preview_token"].clone();
+    let (status, body) = app
+        .call(
+            "POST",
+            "/api/v3/library/reviews/bulk-apply",
+            &headers,
+            Some(apply),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let job_id = body["job"]["id"].as_str().expect("job id").to_owned();
+
+    // Recording the second review's outcome fails once.
+    app.seed(
+        "CREATE TRIGGER fail_second_outcome BEFORE UPDATE OF state ON library_operation_work \
+         WHEN NEW.ordinal = 1 AND NEW.state = 'succeeded' \
+         BEGIN SELECT RAISE(ABORT, 'outcome write failed'); END;",
+    )
+    .await;
+    assert!(matches!(step().await, Ok(ReviewStep::Worked(_))));
+    assert!(step().await.is_err(), "the outcome write fails");
+    let state_of = |ordinal: i64| -> String {
+        db.query_row(
+            "SELECT state FROM library_operation_work WHERE job_id = ?1 AND ordinal = ?2",
+            rusqlite::params![job_id, ordinal],
+            |row| row.get(0),
+        )
+        .expect("work reads")
+    };
+    assert_eq!(state_of(1), "pending", "the review goes back to pending");
+    app.seed("DROP TRIGGER fail_second_outcome").await;
+
+    let finished = loop {
+        match step().await.expect("step runs") {
+            ReviewStep::Worked(_) => {}
+            ReviewStep::Ended(job) => break job,
+            ReviewStep::Idle => panic!("the released job is taken again"),
+        }
+    };
+    assert_eq!(finished.state.as_str(), "succeeded");
+    assert_eq!((finished.completed_count, finished.succeeded_count), (3, 3));
+    let rejected: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM library_identify_reviews WHERE state = 'rejected'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("reviews read");
+    assert_eq!(rejected, 3);
+    rig.stop().await;
+}
+
+/// A review job a stopped process held part way through goes back to the
+/// queue at start, with the review it was on pending again, and the next
+/// worker finishes every review.
+#[tokio::test]
+async fn a_review_job_left_running_by_a_restart_finishes_its_reviews() {
+    use droppedneedle_library::operations::service::ReviewStep;
+
+    let rig = Rig::start("lib-review-job-recovery").await;
+    let app = &rig.app;
+    let auth = app.login_admin().await;
+    let headers = [("authorization", auth.as_str())];
+    let music = app.config.root_app_dir.join("music");
+    plant(&music, "album/01.flac", "flac_full_01.flac");
+    rig.pause_identification().await;
+    app.add_library_folder("music", &music).await;
+    let track = rig
+        .scan_store
+        .track_at("music", "album/01.flac")
+        .unwrap()
+        .expect("track indexed");
+    let album = rig
+        .scan_store
+        .album_for_track(&track)
+        .unwrap()
+        .expect("album");
+    app.state()
+        .jobs
+        .supervisor()
+        .cancel(
+            droppedneedle_library::operations::JOB_NAME,
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+    let ops = app.state().library_services.operations.clone();
+    let step = |owner: &'static str| {
+        let ops = ops.clone();
+        async move {
+            tokio::task::spawn_blocking(move || ops.run_review_step(owner))
+                .await
+                .expect("step joins")
+                .expect("step runs")
+        }
+    };
+    let db = app.db();
+    for n in 0..3 {
+        app.seed_with(
+            "INSERT INTO library_identify_reviews (id, local_album_id, reason_code, \
+             candidates_json, state, created_ms, updated_ms) \
+             VALUES (?1, ?2, 'AUTOMATIC_EDITION_CLEARED_TO_REVIEW', '[]', 'pending', 1, 1)",
+            [format!("keep-{n}"), album.clone()],
+        )
+        .await;
+    }
+    let selection = json!({"action": "keep_tagged", "filter": {}});
+    let (status, preview) = app
+        .call(
+            "POST",
+            "/api/v3/library/reviews/bulk-preview",
+            &headers,
+            Some(selection.clone()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{preview}");
+    let mut apply = selection;
+    apply["preview_token"] = preview["preview_token"].clone();
+    let (status, body) = app
+        .call(
+            "POST",
+            "/api/v3/library/reviews/bulk-apply",
+            &headers,
+            Some(apply),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let job_id = body["job"]["id"].as_str().expect("job id").to_owned();
+
+    // The old process settled one review and was taking the next when it
+    // stopped, its lease still current.
+    assert!(matches!(step("stopped").await, ReviewStep::Worked(_)));
+    app.seed_with(
+        "UPDATE library_operation_work SET state = 'running' \
+         WHERE job_id = ?1 AND ordinal = 1",
+        [&job_id],
+    )
+    .await;
+    let work_state = |ordinal: i64| -> String {
+        db.query_row(
+            "SELECT state FROM library_operation_work WHERE job_id = ?1 AND ordinal = ?2",
+            rusqlite::params![job_id, ordinal],
+            |row| row.get(0),
+        )
+        .expect("work reads")
+    };
+    let job_state = || -> String {
+        db.query_row(
+            "SELECT state FROM library_operation_jobs WHERE id = ?1",
+            [&job_id],
+            |row| row.get(0),
+        )
+        .expect("job reads")
+    };
+    assert!(
+        matches!(step("started").await, ReviewStep::Idle),
+        "a held job is not taken while its lease runs"
+    );
+
+    let recover = ops.clone();
+    tokio::task::spawn_blocking(move || recover.recover_at_start())
+        .await
+        .expect("recovery joins")
+        .expect("recovery runs");
+    assert_eq!(job_state(), "queued");
+    assert_eq!(work_state(0), "succeeded");
+    assert_eq!(work_state(1), "pending", "the review it was on is pending");
+
+    let finished = loop {
+        match step("started").await {
+            ReviewStep::Worked(_) => {}
+            ReviewStep::Ended(job) => break job,
+            ReviewStep::Idle => panic!("the recovered job is taken again"),
+        }
+    };
+    assert_eq!(finished.state.as_str(), "succeeded");
+    assert_eq!((finished.completed_count, finished.succeeded_count), (3, 3));
+    let rejected: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM library_identify_reviews WHERE state = 'rejected'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("reviews read");
+    assert_eq!(rejected, 3);
     rig.stop().await;
 }
 
@@ -13462,14 +14764,13 @@ async fn a_review_action_on_a_stale_revision_is_refused() {
         .album_for_track(&track)
         .unwrap()
         .expect("album");
-    app.db()
-        .execute(
-            "INSERT INTO library_identify_reviews (id, local_album_id, reason_code, \
+    app.seed_with(
+        "INSERT INTO library_identify_reviews (id, local_album_id, reason_code, \
              candidates_json, state, created_ms, updated_ms) \
              VALUES ('rev-s', ?1, 'WEAK_MATCH', '[]', 'pending', 1, 1)",
-            [&album],
-        )
-        .expect("review filed");
+        [&album],
+    )
+    .await;
     let curator = app.login_user("cora").await;
     let (status, body) = app
         .call(
@@ -13773,9 +15074,9 @@ async fn a_merge_places_files_on_the_edition_the_album_has() {
         );
 
         let db = app.db();
-        db.execute_batch(&format!(
+        app.seed(&format!(
             "INSERT INTO auth_users (id, display_name, role, created_at) \
-             VALUES ('curator', 'Curator', 'admin', '2026-01-01T00:00:00Z'); \
+             VALUES ('curator', 'Curator', 'admin', 0); \
              INSERT INTO local_album_external_identities (local_album_id, provider, \
              release_group_mbid, release_mbid, decision_source, selected_by_user_id, \
              selected_at, row_revision) VALUES ('{album_a}', 'musicbrainz', 'rg-1', '{REL_1}', \
@@ -13795,7 +15096,7 @@ async fn a_merge_places_files_on_the_edition_the_album_has() {
              INSERT INTO library_management_automatic_queue (local_album_id, queued_at, \
              not_before, retag_followed_at) VALUES ('{album_a}', 1, 1, 5678);"
         ))
-        .expect("album a chosen and left unmanaged");
+        .await;
         let chosen = choice_row(&db, &album_a);
         let held = [placement(&db, &a1), placement(&db, &a2)];
 
@@ -13906,9 +15207,9 @@ async fn a_file_that_joins_while_musicbrainz_is_asked_is_placed_next() {
     let (a1, a2, b3) = (track("a/01.flac"), track("a/02.flac"), track("b/03.flac"));
     let album = store.album_for_track(&a1).unwrap().expect("album");
     let db = app.db();
-    db.execute_batch(&format!(
+    app.seed(&format!(
         "INSERT INTO auth_users (id, display_name, role, created_at) \
-         VALUES ('curator', 'Curator', 'admin', '2026-01-01T00:00:00Z'); \
+         VALUES ('curator', 'Curator', 'admin', 0); \
          INSERT INTO local_album_external_identities (local_album_id, provider, \
          release_group_mbid, release_mbid, decision_source, selected_by_user_id, \
          selected_at, row_revision) VALUES ('{album}', 'musicbrainz', 'rg-1', '{REL_1}', \
@@ -13920,7 +15221,7 @@ async fn a_file_that_joins_while_musicbrainz_is_asked_is_placed_next() {
          ('{a2}', 'musicbrainz', 'rec-a2', '{REL_1}', 'rt-2', 1, 2, 'manual', 1), \
          ('{b3}', 'musicbrainz', 'rec-b3', '{REL_2}', 'other-3', 1, 3, 'automatic', 1);"
     ))
-    .expect("edition chosen");
+    .await;
     let held = [placement(&db, &a1), placement(&db, &a2)];
     // The first answer is made from the album as it was asked about; the
     // third file joins the album while that answer is on its way.
@@ -13939,12 +15240,12 @@ async fn a_file_that_joins_while_musicbrainz_is_asked_is_placed_next() {
         }
         one_track_per_title(facts)
     });
-    db.execute(
+    app.seed_with(
         "INSERT INTO library_edition_remap_queue (local_album_id, release_mbid, queued_at, \
          origin) VALUES (?1, ?2, 1, 'place_only')",
         rusqlite::params![album, REL_1],
     )
-    .expect("files queued");
+    .await;
     rig.edition_settled(&album).await;
 
     let (release, release_track, _) = placement(&db, &b3);
@@ -13985,7 +15286,7 @@ async fn chosen_album_at_rest(tag: &str) -> (Scratch, LibrarySetup, String, Vec<
         .db()
         .run_sql(&format!(
             "INSERT INTO auth_users (id, display_name, role, created_at) \
-             VALUES ('curator', 'Curator', 'admin', '2026-01-01T00:00:00Z'); \
+             VALUES ('curator', 'Curator', 'admin', 0); \
              INSERT INTO local_album_external_identities (local_album_id, provider, \
              release_group_mbid, release_mbid, decision_source, selected_by_user_id, \
              selected_at, row_revision) VALUES ('{album}', 'musicbrainz', 'rg-1', '{REL_1}', \
@@ -14696,8 +15997,8 @@ async fn a_retagged_and_renamed_album_keeps_what_people_made() {
     let db = scratch_db(&scratch);
     db.execute_batch(&format!(
         "INSERT INTO auth_users (id, display_name, role, created_at) VALUES \
-         ('curator', 'Curator', 'admin', '2026-01-01T00:00:00Z'), \
-         ('listener', 'Listener', 'user', '2026-01-01T00:00:00Z'); \
+         ('curator', 'Curator', 'admin', 0), \
+         ('listener', 'Listener', 'user', 0); \
          INSERT INTO local_album_external_identities (local_album_id, provider, \
          release_group_mbid, release_mbid, decision_source, selected_by_user_id, \
          selected_at, row_revision) VALUES ('{album}', 'musicbrainz', 'rg-1', '{REL_1}', \
@@ -15032,8 +16333,8 @@ async fn a_rated_track_continues_with_its_ratings() {
     let db = scratch_db(&scratch);
     db.execute_batch(&format!(
         "INSERT INTO auth_users (id, display_name, role, created_at) VALUES \
-         ('curator', 'Curator', 'admin', '2026-01-01T00:00:00Z'), \
-         ('listener', 'Listener', 'user', '2026-01-01T00:00:00Z'); \
+         ('curator', 'Curator', 'admin', 0), \
+         ('listener', 'Listener', 'user', 0); \
          INSERT INTO local_album_external_identities (local_album_id, provider, \
          release_group_mbid, release_mbid, decision_source, selected_by_user_id, \
          selected_at, row_revision) VALUES ('{album}', 'musicbrainz', 'rg-1', '{REL_1}', \
@@ -15204,7 +16505,7 @@ async fn retagged_without_ids(
     while library.identification.identify_tick().await > 0 {}
     db.execute_batch(&format!(
         "INSERT INTO auth_users (id, display_name, role, created_at) \
-         VALUES ('curator', 'Curator', 'admin', '2026-01-01T00:00:00Z'); \
+         VALUES ('curator', 'Curator', 'admin', 0); \
          INSERT INTO library_user_favorites (user_id, item_kind, item_id, created_at) \
          VALUES ('listener', 'track', '{}', 1);",
         old[0]
@@ -17074,7 +18375,7 @@ async fn an_approval_continues_a_track_once_its_files_are_placed() {
     assert_eq!(placement(&db, &copy).1, None, "the copy is not mapped yet");
     db.execute_batch(&format!(
         "INSERT INTO auth_users (id, display_name, role, created_at) \
-         VALUES ('curator', 'Curator', 'admin', '2026-01-01T00:00:00Z'); \
+         VALUES ('curator', 'Curator', 'admin', 0); \
          INSERT INTO library_user_favorites (user_id, item_kind, item_id, created_at) \
          VALUES ('listener', 'track', '{}', 1);",
         old[1]
@@ -17256,10 +18557,10 @@ async fn retag_pairs_list_join_and_dismiss() {
         )
     };
     let db = app.db();
-    db.execute_batch(
+    app.seed(
         &[
             "INSERT INTO auth_users (id, display_name, role, created_at) \
-             VALUES ('curator', 'Curator', 'admin', '2026-01-01T00:00:00Z');"
+             VALUES ('curator', 'Curator', 'admin', 0);"
                 .to_owned(),
             choose("a-old", "rg-a", "'rel-a-old'"),
             choose("a-new", "rg-a", "'rel-a-new'"),
@@ -17321,7 +18622,7 @@ async fn retag_pairs_list_join_and_dismiss() {
         ]
         .join("\n"),
     )
-    .expect("pairs seeded");
+    .await;
 
     // Only an admin reaches the routes.
     let (a_old, a_new) = (id("a-old"), id("a-new"));
@@ -17577,11 +18878,8 @@ async fn retag_pairs_list_join_and_dismiss() {
         )
     );
     assert_eq!(pair_snapshot(&db, &c_old, &c_new), before);
-    db.execute(
-        "UPDATE library_contribution_drafts SET state = 'cancelled' WHERE id = 'draft-c'",
-        [],
-    )
-    .expect("draft closed");
+    app.seed("UPDATE library_contribution_drafts SET state = 'cancelled' WHERE id = 'draft-c'")
+        .await;
     let (status, body) = app.call("POST", &join_c, &headers, Some(plain)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["album_id"], json!(c_new));
@@ -17695,7 +18993,7 @@ async fn retag_pairs_list_join_and_dismiss() {
     // chosen release, leaves the custom edition's review. A refusal after
     // an edition was dropped puts the edition back.
     let (h_old, h_new, i_old, i_new) = (id("h-old"), id("h-new"), id("i-old"), id("i-new"));
-    db.execute_batch(
+    app.seed(
         &[
             choose("h-old", "rg-h", "'rel-h-old'"),
             choose("h-new", "rg-h", "NULL"),
@@ -17721,7 +19019,7 @@ async fn retag_pairs_list_join_and_dismiss() {
         ]
         .join("\n"),
     )
-    .expect("more pairs seeded");
+    .await;
     let (status, body) = app
         .call(
             "POST",
@@ -18532,12 +19830,14 @@ fn carried_from_v2(db: &rusqlite::Connection) {
 /// After an upgrade, albums the old rule may have left on the wrong
 /// edition because one file's track id named another are identified once
 /// more, by themselves: an automatic identity on another edition (A)
-/// moves to the edition its files name, keeping its album and tracks, and
-/// the edition it replaced can be undone. A person's edition (B), a match
-/// a person took off (C) and an album already on its files' edition (D)
-/// are left alone. It happens once.
+/// moves to the edition its files name, keeping its album and tracks, its
+/// history tells the move, and the edition it replaced can be undone. A
+/// person's edition (B), a match a person took off (C) and an album
+/// already on its files' edition (D) are left alone. It happens once.
 #[tokio::test]
 async fn albums_an_older_matcher_misplaced_are_looked_at_once() {
+    use droppedneedle_library::http::history::album_history_view;
+
     let (scratch, library, music) = bare_library("lib-track-id-relook").await;
     let editions: Vec<(Release, Release)> = (1..=4)
         .map(|n| sibling_editions(n, &format!("Relook {n}")))
@@ -18713,6 +20013,20 @@ async fn albums_an_older_matcher_misplaced_are_looked_at_once() {
         )
         .expect("undo reads");
     assert_eq!(undo, 1, "the replaced edition can be undone");
+    // The album's history tells the move; a first match is no change.
+    let ops = crate::common::library::operations(&library);
+    let history = |album: &str| {
+        let view = album_history_view(&ops, album, "listener").expect("history reads");
+        serde_json::to_value(
+            view.items
+                .iter()
+                .map(|entry| entry.kind)
+                .collect::<Vec<_>>(),
+        )
+        .expect("history serializes")
+    };
+    assert_eq!(history(&a), json!(["edition_changed"]));
+    assert_eq!(history(&d), json!([]));
 
     // The next start looks no more.
     let restarted = crate::common::library::repair_worker(&library);
@@ -20083,7 +21397,7 @@ impl ManagedLibrary {
             .expect("album");
         let mut sql = format!(
             "INSERT OR IGNORE INTO auth_users (id, display_name, role, created_at) \
-             VALUES ('curator', 'Curator', 'admin', '2026-01-01T00:00:00Z'); \
+             VALUES ('curator', 'Curator', 'admin', 0); \
              INSERT OR REPLACE INTO local_album_external_identities (local_album_id, provider, \
              release_group_mbid, release_mbid, decision_source, selected_by_user_id, \
              selected_at, row_revision) VALUES ('{album}', 'musicbrainz', 'rg-chosen', \
@@ -20660,6 +21974,7 @@ async fn a_translating_profile_writes_english_artist_names() {
                 idempotency_key: "names-undo-apply".to_owned(),
                 confirmation: true,
             },
+            "admin",
         )
         .expect("undo queued");
     assert!(management_step(&managed.library).await, "undo runs");
@@ -20988,14 +22303,14 @@ async fn an_artist_whose_files_carry_a_merged_id_is_linked_and_kept() {
     ))[0]
         .clone();
     let user = text("SELECT id FROM auth_users WHERE role = 'admin'")[0].clone();
-    db.execute_batch(&format!(
+    app.seed(&format!(
         "INSERT INTO library_user_favorites (user_id, item_kind, item_id, created_at) \
          VALUES ('{user}', 'artist', '{artist}', 1); \
          INSERT INTO library_play_history (id, user_id, local_artist_id, track_name, \
          artist_name, played_at) VALUES ('play-1', '{user}', '{artist}', 'First 1', \
          'Artist X', '2026-01-01T00:00:00Z');"
     ))
-    .expect("favorite and play seeded");
+    .await;
 
     tag(
         &plant(&music, "later/01.flac", "management_full.flac"),
@@ -21754,16 +23069,15 @@ async fn hand_match_album(rig: &Rig, folder: &str) -> HandMatchAlbum {
     assert_eq!(status, StatusCode::OK, "{body}");
 
     let listener = app.login_user("listener").await.user_id;
-    app.db()
-        .execute_batch(&format!(
-            "INSERT INTO library_user_favorites (user_id, item_kind, item_id, created_at) \
+    app.seed(&format!(
+        "INSERT INTO library_user_favorites (user_id, item_kind, item_id, created_at) \
              VALUES ('{listener}', 'track', '{}', 0); \
              INSERT INTO library_play_history (id, user_id, local_track_id, track_name, \
              artist_name, played_at) VALUES ('play-3', '{listener}', '{}', 'Track 3', \
              'Artist', '2026-01-01T00:00:00Z');",
-            tracks[2], tracks[2]
-        ))
-        .expect("play and star seeded");
+        tracks[2], tracks[2]
+    ))
+    .await;
 
     std::fs::remove_file(&third).expect("third file goes");
     let odd = plant(&music, &format!("{folder}/odd.flac"), "flac_full_02.flac");
@@ -21971,11 +23285,11 @@ async fn a_file_matched_by_hand_counts_as_its_track() {
             |row| row.get(0),
         )
         .expect("album release");
-    db.execute(
+    app.seed_with(
         "DELETE FROM library_management_automatic_queue WHERE local_album_id = ?1",
         [album],
     )
-    .expect("queue cleared");
+    .await;
     let carries = continuations(&db);
 
     let (status, body) = app
@@ -22191,7 +23505,7 @@ async fn a_file_matched_by_hand_counts_as_its_track() {
     assert_eq!(body["error"]["code"], json!("NO_HAND_MATCH"));
 
     // An edition the app picked, left as a best guess.
-    db.execute_batch(&format!(
+    app.seed(&format!(
         "UPDATE local_album_external_identities SET decision_source = 'automatic', \
          selected_by_user_id = NULL, row_revision = row_revision + 1 \
          WHERE local_album_id = '{album}'; \
@@ -22201,7 +23515,7 @@ async fn a_file_matched_by_hand_counts_as_its_track() {
          release_mbid, candidates_json, updated_at) \
          VALUES ('{album}', 'unconfirmed', 'CLOSE_CALL', '{release}', '[]', 1);"
     ))
-    .expect("the app's best guess");
+    .await;
     let guessed = album_choice(&db, album);
     let before_guess = identity_of(&db, &h.odd);
     let revision = plan(plan_uri.clone()).await["identity_revision"].clone();
@@ -22245,13 +23559,13 @@ async fn a_file_matched_by_hand_counts_as_its_track() {
     );
 
     // An edition carried from v2.
-    db.execute_batch(&format!(
+    app.seed(&format!(
         "UPDATE local_album_external_identities SET decision_source = 'legacy_import', \
          selected_by_user_id = NULL, row_revision = row_revision + 1 \
          WHERE local_album_id = '{album}'; \
          DELETE FROM library_album_match_state WHERE local_album_id = '{album}';"
     ))
-    .expect("v2's edition");
+    .await;
     let revision = plan(plan_uri.clone()).await["identity_revision"].clone();
     let (status, body) = app
         .call(
@@ -22310,8 +23624,8 @@ fn hand_match_world(db: &rusqlite::Connection, album: &str) -> (String, Vec<Stri
 /// track the matcher places another file on that has no stored row; a file
 /// already on a track; another album's file and a missing file; a track
 /// not on the edition; a custom edition; "Leave unmanaged". A track only a
-/// missing file holds can be taken. Its undo is refused once another
-/// edition was chosen, and the record stays.
+/// missing file holds can be taken. Choosing another edition ends the
+/// match, so its undo then finds none to take back.
 #[tokio::test]
 async fn a_match_by_hand_is_refused_with_nothing_changed() {
     let rig = Rig::start("lib-hand-match-refusals").await;
@@ -22353,11 +23667,11 @@ async fn a_match_by_hand_is_refused_with_nothing_changed() {
     };
     let tracks = |n: usize| h.fit.tracks[n].id.clone();
     // The second file loses its stored row: the matcher still places it.
-    db.execute(
+    app.seed_with(
         "DELETE FROM local_track_external_identities WHERE local_track_id = ?1",
         [&h.tracks[1]],
     )
-    .expect("second file's row gone");
+    .await;
 
     let current = revision().await;
     let refusals: [(&str, String, String, i64, StatusCode, &str); 7] = [
@@ -22474,7 +23788,7 @@ async fn a_match_by_hand_is_refused_with_nothing_changed() {
     assert_eq!(status, StatusCode::OK, "{body}");
     let file_uri = format!("{edition}/files/{}", h.odd);
 
-    // Another edition chosen since: the match no longer stands.
+    // Another edition chosen since: the match and its record end.
     let mut other = h.fit.clone();
     other.id = REL_2.to_owned();
     rig.identify.set_recall(RecallResult {
@@ -22503,10 +23817,10 @@ async fn a_match_by_hand_is_refused_with_nothing_changed() {
             None,
         )
         .await;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert_eq!(body["error"]["code"], json!("STALE_REVISION"));
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"]["code"], json!("NO_HAND_MATCH"));
     assert_eq!(hand_match_world(&db, album), world, "nothing changed");
-    assert!(hand_match_row(&db, &h.odd).is_some(), "the record stays");
+    assert!(hand_match_row(&db, &h.odd).is_none(), "the record ended");
     rig.stop().await;
 }
 

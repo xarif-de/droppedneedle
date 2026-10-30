@@ -184,7 +184,7 @@ pub async fn get_management_tag_editor(
         (status = 401, description = "Not authenticated"),
         (status = 403, description = "Admin role required"),
         (status = 404, description = "Unknown track"),
-        (status = 409, description = "Settings or library folders changed"),
+        (status = 409, description = "Settings or library folders changed, or the library is off"),
     )
 )]
 pub async fn create_management_tag_edit_preview(
@@ -287,7 +287,7 @@ impl From<PurgeOutcome> for ManagementPurgeView {
         (status = 400, description = "Invalid selection"),
         (status = 401, description = "Not authenticated"),
         (status = 403, description = "Admin role required"),
-        (status = 409, description = "Settings or library folders changed"),
+        (status = 409, description = "Settings or library folders changed, or the library is off"),
     )
 )]
 pub async fn create_management_restore_preview(
@@ -389,7 +389,7 @@ pub struct ManagementDuplicateBody {
         (status = 401, description = "Not authenticated"),
         (status = 403, description = "Admin role required"),
         (status = 404, description = "Unknown preview or file"),
-        (status = 409, description = "The preview or settings changed"),
+        (status = 409, description = "The preview or settings changed, or the library is off"),
     )
 )]
 pub async fn create_management_duplicate_preview(
@@ -428,6 +428,10 @@ pub struct ManagementAttentionBundleView {
     pub bundle_id: String,
     pub file_count: i64,
     pub sample_paths: Vec<String>,
+    /// The folders the write took its files from, relative to their
+    /// library folder. For a download that is the hidden import folder
+    /// holding the downloaded files.
+    pub source_folders: Vec<String>,
 }
 
 /// The publish journal at a glance.
@@ -469,6 +473,7 @@ impl From<AttentionBundle> for ManagementAttentionBundleView {
             bundle_id: bundle.bundle_id,
             file_count: bundle.file_count,
             sample_paths: bundle.sample_paths,
+            source_folders: bundle.source_folders,
         }
     }
 }
@@ -838,7 +843,7 @@ pub struct ManagementActivationConfirmBody {
         (status = 400, description = "The folder has no automatic trigger, or invalid settings"),
         (status = 401, description = "Not authenticated"),
         (status = 403, description = "Admin role required"),
-        (status = 409, description = "Settings or library folders changed"),
+        (status = 409, description = "Settings or library folders changed, or the library is off"),
     )
 )]
 pub async fn create_management_activation_preview(
@@ -888,7 +893,7 @@ pub async fn get_management_activation_preview(
     request_body = ManagementActivationConfirmBody,
     responses(
         (status = 200, description = "Settings saved", body = LibraryManagementSettingsResponse),
-        (status = 400, description = "Missing confirmation or proof"),
+        (status = 400, description = "Missing confirmation or proof, or a dry run token that is not valid"),
         (status = 401, description = "Not authenticated"),
         (status = 403, description = "Admin role required"),
         (status = 404, description = "Unknown dry run"),

@@ -95,15 +95,20 @@ impl Repairs {
         }
     }
 
-    /// A repair job's report summary for the generic operation view, or
-    /// `None` when `job` is not a repair. Blocking.
-    pub fn summary_of(&self, job: &OperationJob) -> Result<Option<Summary>, OperationError> {
-        if OperationKind::parse(&job.kind) != Some(OperationKind::Repair) {
-            return Ok(None);
-        }
-        self.db.read_blocking("repairs.summary", |conn| {
-            let snap = store::snapshot(conn, &job.id)?.transpose()?;
-            Ok::<_, OperationError>(snap.and_then(|snap| snap.summary))
+    /// Any operation job for the generic operation view, with its report
+    /// summary when it is a repair. One read: read apart, a commit between
+    /// them shows a ready job with no summary. Blocking.
+    pub fn operation(
+        &self,
+        job_id: &str,
+    ) -> Result<(OperationDetail, Option<Summary>), OperationError> {
+        self.db.read_blocking("repairs.operation", |conn| {
+            let detail = job_detail(conn, job_id)?;
+            if OperationKind::parse(&detail.job.kind) != Some(OperationKind::Repair) {
+                return Ok((detail, None));
+            }
+            let snap = store::snapshot(conn, job_id)?.transpose()?;
+            Ok::<_, OperationError>((detail, snap.and_then(|snap| snap.summary)))
         })
     }
 
@@ -480,7 +485,8 @@ impl RepairWorker {
     /// [`store::edition_id_albums`]). Only a database a v2 import was
     /// committed into has such albums; any other is never looked at. Each
     /// set is looked at once per server start and after each scan until it
-    /// first holds an album, so a library that arrives later (a first scan
+    /// first holds an album (the edition set: until a look could tell for
+    /// every album it saw), so a library that arrives later (a first scan
     /// after the import) still gets it; then never again.
     fn queue_backfills_once(&self) -> Result<(), OperationError> {
         let (run, carried) = self.db.read_blocking("repairs.latest_ended_scan", |conn| {
@@ -508,7 +514,7 @@ impl RepairWorker {
                 store::TRACK_ID_BACKFILL_KEY,
                 self.queue_backfill(
                     store::TRACK_ID_BACKFILL_KEY,
-                    store::track_id_backfill_albums,
+                    |conn| store::track_id_backfill_albums(conn).map(store::Backfill::found),
                     "queued albums for re-identification after the track id rule changed",
                 ),
             ),
@@ -516,7 +522,7 @@ impl RepairWorker {
                 store::GROUP_ONLY_BACKFILL_KEY,
                 self.queue_backfill(
                     store::GROUP_ONLY_BACKFILL_KEY,
-                    store::group_only_backfill_albums,
+                    |conn| store::group_only_backfill_albums(conn).map(store::Backfill::found),
                     "queued albums matched to a release group only, to find their edition",
                 ),
             ),
@@ -524,7 +530,7 @@ impl RepairWorker {
                 store::OLDER_CONFIRMATIONS_BACKFILL_KEY,
                 self.queue_backfill(
                     store::OLDER_CONFIRMATIONS_BACKFILL_KEY,
-                    store::older_confirmation_albums,
+                    |conn| store::older_confirmation_albums(conn).map(store::Backfill::found),
                     "queued confirmed albums outside the release group their files name",
                 ),
             ),
@@ -557,25 +563,27 @@ impl RepairWorker {
     }
 
     /// Queue identification for the albums `set` lists, unless the
-    /// marker under `key` says it was done, then write that marker.
+    /// marker under `key` says it was done, then write that marker when
+    /// the set says it is settled.
     fn queue_backfill(
         &self,
         key: &'static str,
-        set: fn(&rusqlite::Connection) -> rusqlite::Result<Vec<String>>,
+        set: fn(&rusqlite::Connection) -> rusqlite::Result<store::Backfill>,
         message: &'static str,
     ) -> Result<(), OperationError> {
-        let albums = self.db.read_blocking("repairs.backfill_albums", |conn| {
+        let (albums, settled) = self.db.read_blocking("repairs.backfill_albums", |conn| {
             if store::queued(conn, key)? {
-                return Ok::<_, OperationError>(Vec::new());
+                return Ok::<_, OperationError>((Vec::new(), false));
             }
+            let found = set(conn)?;
             let mut albums = Vec::new();
-            for album in set(conn)? {
+            for album in found.albums {
                 let revision = album_input_revision(conn, &album)?;
                 albums.push((album, revision));
             }
-            Ok(albums)
+            Ok((albums, found.settled))
         })?;
-        if albums.is_empty() {
+        if albums.is_empty() && !settled {
             return Ok(());
         }
         // Each album is queued in a write of its own. One that fails stops
@@ -592,7 +600,12 @@ impl RepairWorker {
                 Lane::Background,
             )?;
         }
-        tracing::info!(albums = albums.len(), key, "{message}");
+        if !albums.is_empty() {
+            tracing::info!(albums = albums.len(), key, "{message}");
+        }
+        if !settled {
+            return Ok(());
+        }
         self.db
             .write_blocking(Lane::Background, "repairs.mark_backfill", |tx| {
                 Ok(store::mark_backfill(

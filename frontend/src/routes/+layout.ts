@@ -1,12 +1,13 @@
 import { browser } from '$app/environment';
-import { ApiError, TransportError, api } from '$lib/api/client';
-import { queryClient } from '$lib/queries/QueryClient';
+import { api } from '$lib/api/client';
+import { ApiError, TransportError } from '$lib/api/errors';
+import { collectPersistedGarbage, queryClient } from '$lib/queries/QueryClient';
 import { AUTH_FREE_PATHS } from '$lib/constants';
 import { AUTH_ENDPOINTS } from '$lib/queries/auth/endpoints';
 import { PROFILE_ENDPOINTS } from '$lib/queries/profile/endpoints';
 import { toAuthUser } from '$lib/queries/auth/types';
 import { getScrobblePreferencesQueryOptions } from '$lib/queries/scrobble-preferences/ScrobblePreferencesQuery.svelte';
-import { DEFAULT_SOURCE, isMusicSource, musicSourceStore } from '$lib/stores/musicSource';
+import { DEFAULT_SOURCE, isMusicSource } from '$lib/stores/musicSource';
 import { authStore, LAST_USER_ID_KEY } from '$lib/stores/authStore.svelte';
 import { clearUserSessionState } from '$lib/utils/userSessionCleanup';
 import { rememberSignInReturn } from '$lib/utils/signInReturn';
@@ -55,7 +56,7 @@ export const load: LayoutLoad = async ({ url }) => {
 	if (!authStore.initialized) {
 		try {
 			const status = await retryUnreached(() =>
-				api.global.v3.GET(AUTH_ENDPOINTS.setupStatus, { timeoutMs: BOOTSTRAP_TIMEOUT_MS })
+				api.v3.GET(AUTH_ENDPOINTS.setupStatus, { timeoutMs: BOOTSTRAP_TIMEOUT_MS })
 			);
 			setupRequired = status.setup_required;
 			authStore.setSetupRequired(setupRequired);
@@ -65,7 +66,7 @@ export const load: LayoutLoad = async ({ url }) => {
 
 		try {
 			const user = await retryUnreached(() =>
-				api.global.v3.GET(PROFILE_ENDPOINTS.get(), { timeoutMs: BOOTSTRAP_TIMEOUT_MS })
+				api.v3.GET(PROFILE_ENDPOINTS.get(), { timeoutMs: BOOTSTRAP_TIMEOUT_MS })
 			);
 			authStore.setUser(toAuthUser(user));
 		} catch (cause) {
@@ -92,6 +93,7 @@ export const load: LayoutLoad = async ({ url }) => {
 			await clearUserSessionState({ clearAuth: false }).catch(() => undefined);
 		}
 		localStorage.setItem(LAST_USER_ID_KEY, authStore.user.id);
+		collectPersistedGarbage(authStore.user.id);
 	}
 
 	if (!setupRequired && !isAuthFree && !authStore.isAuthenticated) {
@@ -100,17 +102,16 @@ export const load: LayoutLoad = async ({ url }) => {
 		throw redirect(302, withBasePath('/login'));
 	}
 
-	// the primary source is user-specific; connection defaults are global
+	// The primary source is the user's scrobble preference. Once it is cached a
+	// navigation reads it and refreshes it in the background.
 	let primarySource = DEFAULT_SOURCE;
 	if (authStore.isAuthenticated) {
+		const options = getScrobblePreferencesQueryOptions(authStore.user?.id);
 		try {
-			const data = await queryClient.ensureQueryData(
-				getScrobblePreferencesQueryOptions(authStore.user?.id)
-			);
-			if (isMusicSource(data.primary_music_source)) {
-				primarySource = data.primary_music_source;
-				musicSourceStore.setSource(primarySource);
-			}
+			const cached = queryClient.getQueryData(options.queryKey);
+			if (cached) void queryClient.prefetchQuery(options);
+			const data = cached ?? (await queryClient.ensureQueryData(options));
+			if (isMusicSource(data.primary_music_source)) primarySource = data.primary_music_source;
 		} catch {
 			primarySource = DEFAULT_SOURCE;
 		}

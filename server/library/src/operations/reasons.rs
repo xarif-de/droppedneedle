@@ -24,6 +24,8 @@ const fn reason(code: &'static str, message: &'static str, action: &'static str)
 }
 
 const STALE: &str = "STALE_REVISION";
+/// How a review job ends once every review in it was handled.
+pub const REVIEW_JOB_DONE: &str = "REVIEW_JOB_DONE";
 const NOT_SEALABLE: &str = "CUSTOM_EDITION_NOT_SEALABLE";
 
 // Not found.
@@ -319,6 +321,16 @@ pub const REVIEW_ACTION_FAILED: Reason = reason(
     "The change could not be saved for this review.",
     "Try it again from the review; if it keeps failing, check the server log.",
 );
+pub const REVIEW_JOB_STOPPED: Reason = reason(
+    "REVIEW_JOB_STOPPED",
+    "This change was stopped, so it can't be resumed.",
+    "Select the reviews still pending and start the change again.",
+);
+pub const REVIEW_REQUESTER_NOT_ADMIN: Reason = reason(
+    "REVIEW_REQUESTER_NOT_ADMIN",
+    "The person who started this change is no longer an admin, so the rest was left alone.",
+    "An admin can start it again.",
+);
 pub const REVIEW_ALBUM_PINNED: Reason = reason(
     "REVIEW_ALBUM_PINNED",
     "Someone picked this album's edition by hand, so a bulk accept leaves it alone.",
@@ -337,7 +349,7 @@ pub const REVIEW_FILTER_INVALID: Reason = reason(
 pub const REVIEW_STATE_INVALID: Reason = reason(
     "REVIEW_STATE_INVALID",
     "That is not a review state.",
-    "Use pending, approved, rejected, dismissed, excluded or all.",
+    "Use pending, approved, rejected, dismissed, excluded, resolved or all.",
 );
 
 /// Why a review was opened, by the code it was filed with. Edition
@@ -382,6 +394,11 @@ pub fn terminal(code: &str) -> Reason {
         "HANDED_TO_IDENTIFICATION" => reason(
             "HANDED_TO_IDENTIFICATION",
             "The album was queued for identification.",
+            "Nothing to do.",
+        ),
+        REVIEW_JOB_DONE => reason(
+            REVIEW_JOB_DONE,
+            "Every review in this change was handled.",
             "Nothing to do.",
         ),
         "ALBUM_NOT_FOUND" => ALBUM_NOT_FOUND,

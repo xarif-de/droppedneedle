@@ -171,30 +171,16 @@ export function resetMusicBrainzSourceScope(): void {
 	updateCurrentScope({ ...EMPTY_SCOPE });
 }
 
-export interface MusicBrainzSourceKey {
-	user_id: string | null;
-	source_mode: MusicBrainzSourceMode;
-	source_id: string;
-	generation: number;
+/** Forgets every account's stored scope, for a sign-out or a change of account. */
+export function forgetStoredMusicBrainzSourceScopes(): void {
+	if (!browser) return;
+	for (const key of Object.keys(localStorage)) {
+		if (key.startsWith(STORAGE_PREFIX)) localStorage.removeItem(key);
+	}
 }
 
-export function musicBrainzSourceKey(userId?: string | null): MusicBrainzSourceKey {
-	if (userId === undefined) {
-		return { ...musicBrainzSourceKeyForScope(getMusicBrainzSourceScope()) };
-	}
-	const normalizedUserId = userId ?? null;
-	const activeUserId = authStore.user?.id ?? null;
-	const scope =
-		normalizedUserId === activeUserId
-			? getMusicBrainzSourceScope()
-			: scopeForUser(normalizedUserId);
-	return { ...musicBrainzSourceKeyForScope(scope) };
-}
-function musicBrainzSourceKeyForScope(scope: MusicBrainzSourceScope) {
-	return {
-		user_id: scope.userId,
-		source_mode: scope.sourceMode,
-		source_id: scope.sourceId,
-		generation: scope.generation
-	};
+/** The current user's source as one string, for telling answers from two sources apart. */
+export function musicBrainzSourceStamp(): string {
+	const scope = getMusicBrainzSourceScope();
+	return `${scope.sourceMode}:${scope.sourceId}:${scope.generation}`;
 }

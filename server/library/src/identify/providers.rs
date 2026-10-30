@@ -55,10 +55,14 @@ use super::sqlite::SqliteIdentifyStore;
 use super::stores::fresh_release;
 use crate::matching::decide::STRONG;
 use crate::matching::score::NAME_GATE;
-use crate::matching::strings::{fold, string_dist, strip_edition_words, without_brackets};
-use crate::matching::{LocalAlbum, Release, match_release, should_fingerprint, unknown_recordings};
+use crate::matching::strings::{
+    before_featuring, fold, string_dist, strip_edition_words, without_brackets,
+};
+use crate::matching::{
+    LocalAlbum, Release, ReleaseMatch, match_release, should_fingerprint, unknown_recordings,
+};
+use crate::scan::pool::BlockingPool;
 use droppedneedle_providers::RequestPriority;
-use droppedneedle_providers::musicbrainz::Criticality;
 
 /// Tracklists fetched per album after a search.
 pub const FETCH_LIMIT: usize = 5;
@@ -146,28 +150,79 @@ pub const RELEASES_UNREADABLE: &str = "releases_unreadable";
 /// [`RELEASES_UNREADABLE`] does, that a release was refused.
 pub const TAGGED_RELEASE_UNREADABLE: &str = "TAGGED_RELEASE_UNREADABLE";
 
-/// Recall result with the criticality each call ran under.
+/// The failure code of a recall whose release matching failed (a job on
+/// the CPU pool panicked). The job waits and retries, as for an outage.
+pub const MATCHING_FAILED: &str = "matching_failed";
+
+/// Why a recall stopped before it could answer.
+enum Stopped {
+    /// A provider could not answer.
+    Provider(SourceError),
+    /// Matching the releases against the files failed.
+    Matching,
+}
+
+impl From<SourceError> for Stopped {
+    fn from(error: SourceError) -> Self {
+        Self::Provider(error)
+    }
+}
+
+/// Recall result, with the matches recall scored on the way.
 #[derive(Debug, Clone, Default)]
 pub struct RecallOutcome {
     pub result: RecallResult,
-    /// Criticality used for the MusicBrainz recall calls.
-    pub recall_criticality: Option<Criticality>,
+    /// Releases recall already matched against the files, so they are not
+    /// scored again.
+    pub scored: Scored,
+}
+
+/// Matches recall worked out, by release id, against the files with no
+/// fingerprint support and under `aliases`. One stands in only for a
+/// scoring with those same inputs.
+#[derive(Debug, Clone, Default)]
+pub struct Scored {
+    aliases: HashMap<String, String>,
+    matches: HashMap<String, ReleaseMatch>,
+}
+
+impl Scored {
+    /// Take recall's match for `release` when the scoring asked for has
+    /// recall's inputs: no fingerprint support and the same aliases.
+    pub fn take(
+        &mut self,
+        release: &Release,
+        fingerprints: &HashMap<String, Vec<String>>,
+        aliases: &HashMap<String, String>,
+    ) -> Option<ReleaseMatch> {
+        if !fingerprints.is_empty() || *aliases != self.aliases {
+            return None;
+        }
+        self.matches.remove(&release.id)
+    }
 }
 
 /// Live recall over a release source for each priority, the release
-/// store, and a fingerprint source.
+/// store, a fingerprint source, and the CPU pool releases are matched on.
 pub struct LiveProviders<R, F> {
     releases: Prioritised<R>,
     store: Arc<SqliteIdentifyStore>,
     audio: F,
+    cpu: BlockingPool,
 }
 
 impl<R: ReleaseSource, F: FingerprintSource> LiveProviders<R, F> {
-    pub fn new(releases: Prioritised<R>, store: Arc<SqliteIdentifyStore>, audio: F) -> Self {
+    pub fn new(
+        releases: Prioritised<R>,
+        store: Arc<SqliteIdentifyStore>,
+        audio: F,
+        cpu: BlockingPool,
+    ) -> Self {
         Self {
             releases,
             store,
             audio,
+            cpu,
         }
     }
 
@@ -178,6 +233,7 @@ impl<R: ReleaseSource, F: FingerprintSource> LiveProviders<R, F> {
             releases: self.releases.at(priority),
             store: &self.store,
             audio: &self.audio,
+            cpu: &self.cpu,
             refused: Mutex::new(HashSet::new()),
         }
     }
@@ -190,6 +246,7 @@ struct Recall<'a, R, F> {
     releases: &'a R,
     store: &'a Arc<SqliteIdentifyStore>,
     audio: &'a F,
+    cpu: &'a BlockingPool,
     /// Release ids (lowercase) MusicBrainz refused in this recall.
     refused: Mutex<HashSet<String>>,
 }
@@ -199,10 +256,14 @@ impl<R: ReleaseSource, F: FingerprintSource> Recall<'_, R, F> {
         &self,
         facts: &LocalAlbumFacts,
         named: Option<&str>,
-    ) -> Result<RecallResult, SourceError> {
+    ) -> Result<RecallOutcome, Stopped> {
         let local = local_album(facts, &HashMap::new());
         let mut named = named.map(|group| group.trim().to_ascii_lowercase());
         let mut releases: Vec<Release> = Vec::new();
+        // Matches of `releases`, in order, scored without aliases until
+        // the aliases are known.
+        let mut scored: Vec<ReleaseMatch> = Vec::new();
+        let no_aliases = HashMap::new();
         let tagged = local.tagged_release();
         if let Some(tagged) = tagged.as_deref()
             && let Some(release) = self.release(tagged, None).await?
@@ -213,14 +274,21 @@ impl<R: ReleaseSource, F: FingerprintSource> Recall<'_, R, F> {
             {
                 *group = release.release_group_id.to_ascii_lowercase();
             }
-            let matched = match_release(&local, &release, &HashMap::new());
-            let strong = matched.conflicts.is_empty() && matched.library_distance() <= STRONG;
             releases.push(release);
+            self.score_new(&local, &releases, &mut scored, &no_aliases)
+                .await?;
+            let strong = scored.first().is_some_and(|matched| {
+                matched.conflicts.is_empty() && matched.library_distance() <= STRONG
+            });
             if strong {
-                return Ok(RecallResult {
-                    releases,
-                    named_group: named,
-                    ..RecallResult::default()
+                let scored = keyed(&releases, scored, no_aliases);
+                return Ok(RecallOutcome {
+                    result: RecallResult {
+                        releases,
+                        named_group: named,
+                        ..RecallResult::default()
+                    },
+                    scored,
                 });
             }
         }
@@ -242,7 +310,9 @@ impl<R: ReleaseSource, F: FingerprintSource> Recall<'_, R, F> {
             }
         }
 
-        if let Some(group) = best_group(&local, &releases)
+        self.score_new(&local, &releases, &mut scored, &no_aliases)
+            .await?;
+        if let Some(group) = best_group(&releases, &scored)
             && listed.as_deref() != Some(group.as_str())
         {
             let editions = group_editions(self.releases, &group).await?;
@@ -250,12 +320,13 @@ impl<R: ReleaseSource, F: FingerprintSource> Recall<'_, R, F> {
                 .await?;
         }
         let recording_aliases = self.resolve_aliases(&local, &releases).await?;
-        let matches: Vec<_> = releases
-            .iter()
-            .map(|release| match_release(&local, release, &recording_aliases))
-            .collect();
+        if !recording_aliases.is_empty() {
+            scored.clear();
+        }
+        self.score_new(&local, &releases, &mut scored, &recording_aliases)
+            .await?;
         let mut fingerprint_support = HashMap::new();
-        if should_fingerprint(&local, &matches) {
+        if should_fingerprint(&local, &scored) {
             let heard = self.audio.identify(&facts.tracks).await;
             for id in common_releases(&heard.releases, heard.recordings.len().max(1)) {
                 if releases.iter().any(|release| release.answers_to(&id)) {
@@ -272,10 +343,13 @@ impl<R: ReleaseSource, F: FingerprintSource> Recall<'_, R, F> {
                 album = self.album,
                 "MusicBrainz refused every candidate release; identification waits"
             );
-            return Ok(RecallResult {
-                provider_deferred: true,
-                failure_code: Some(RELEASES_UNREADABLE.to_owned()),
-                ..RecallResult::default()
+            return Ok(RecallOutcome {
+                result: RecallResult {
+                    provider_deferred: true,
+                    failure_code: Some(RELEASES_UNREADABLE.to_owned()),
+                    ..RecallResult::default()
+                },
+                scored: Scored::default(),
             });
         }
         let failure_code = if tagged.is_some_and(|tagged| self.was_refused(&tagged)) {
@@ -285,14 +359,48 @@ impl<R: ReleaseSource, F: FingerprintSource> Recall<'_, R, F> {
         } else {
             None
         };
-        Ok(RecallResult {
-            releases,
-            fingerprint_support,
-            recording_aliases,
-            named_group: named,
-            failure_code,
-            ..RecallResult::default()
+        let scored = keyed(&releases, scored, recording_aliases.clone());
+        Ok(RecallOutcome {
+            result: RecallResult {
+                releases,
+                fingerprint_support,
+                recording_aliases,
+                named_group: named,
+                failure_code,
+                ..RecallResult::default()
+            },
+            scored,
         })
+    }
+
+    /// Match the releases past the end of `scored` against `local` under
+    /// `aliases`, on the CPU pool, and add their matches to `scored`. A
+    /// matching job that panicked stops the recall.
+    async fn score_new(
+        &self,
+        local: &LocalAlbum,
+        releases: &[Release],
+        scored: &mut Vec<ReleaseMatch>,
+        aliases: &HashMap<String, String>,
+    ) -> Result<(), Stopped> {
+        let fresh: Vec<Release> = releases.iter().skip(scored.len()).cloned().collect();
+        if fresh.is_empty() {
+            return Ok(());
+        }
+        let local = local.clone();
+        let aliases = aliases.clone();
+        let matches = self
+            .cpu
+            .run(move || {
+                fresh
+                    .iter()
+                    .map(|release| match_release(&local, release, &aliases))
+                    .collect::<Vec<_>>()
+            })
+            .await
+            .map_err(|_| Stopped::Matching)?;
+        scored.extend(matches);
+        Ok(())
     }
 
     /// Fetch the editions of the group the files name, and say which group
@@ -353,18 +461,24 @@ impl<R: ReleaseSource, F: FingerprintSource> Recall<'_, R, F> {
     /// 4. the first track's title as a recording, with the artist, which
     ///    finds the releases that carry it.
     ///
-    /// The artist is the album artist, none for a compilation, and the
-    /// most common track artist when the album row names a placeholder.
-    /// The last tier needs an artist. An album no tier finds costs at most
-    /// four searches and no release lookups; each search goes through the
-    /// source's own client and priority.
+    /// The artist is the album artist, none for a compilation, and, when
+    /// the album row names a placeholder, the artist more than half the
+    /// tracks name. Tracks of several artists with none over half search
+    /// as Various Artists: no artist, and the various flag, which only
+    /// ranks Various Artists releases first. The last tier needs an
+    /// artist: for such an album, the first track's own. An album no tier
+    /// finds costs at most four searches and no release lookups; each
+    /// search goes through the source's own client and priority.
     async fn search(
         &self,
         facts: &LocalAlbumFacts,
         track_count: usize,
     ) -> Result<Vec<ReleaseHit>, SourceError> {
-        let various = is_various(&facts.album_artist_name);
-        let artist = search_artist(facts, various);
+        let SearchArtist {
+            artist,
+            various,
+            per_track,
+        } = search_artist(facts);
         let query = |title, words| AlbumQuery {
             title,
             artist,
@@ -402,17 +516,26 @@ impl<R: ReleaseSource, F: FingerprintSource> Recall<'_, R, F> {
                 return Ok(near);
             }
         }
-        if artist.is_empty() {
+        if artist.is_empty() && !per_track {
             return Ok(Vec::new());
         }
         let mut tracks: Vec<_> = facts.tracks.iter().collect();
         tracks.sort_by_key(|track| (track.disc_number, track.track_number));
-        let Some(recording) = tracks
+        let Some((recording, track)) = tracks
             .iter()
-            .map(|track| without_brackets(&track.title))
-            .find(|title| !title.is_empty())
+            .map(|track| (without_brackets(&track.title), track))
+            .find(|(title, _)| !title.is_empty())
         else {
             return Ok(Vec::new());
+        };
+        let artist = if per_track {
+            let own = before_featuring(track.artist_name.trim());
+            if is_placeholder(own) || is_various(own) {
+                return Ok(Vec::new());
+            }
+            own
+        } else {
+            artist
         };
         self.releases.search_recording(&recording, artist).await
     }
@@ -603,10 +726,12 @@ impl<R: ReleaseSource, F: FingerprintSource> Recall<'_, R, F> {
         !self.refused_ids().is_empty()
     }
 
-    /// Map file recording MBIDs that no candidate carries to the ids
-    /// MusicBrainz merged them into, when it did. Every such id is looked
-    /// up (at most [`MERGE_LOOKUPS`](crate::matching::score::MERGE_LOOKUPS)):
-    /// one left out would veto the release the files are.
+    /// Map file recording MBIDs to the ids MusicBrainz merged them into,
+    /// when it did. An id is looked up when no candidate carries it, or
+    /// when the release its file names was fetched and lacks it (another
+    /// release may still list the old id). Every such id is looked up (at
+    /// most [`MERGE_LOOKUPS`](crate::matching::score::MERGE_LOOKUPS)): one
+    /// left out would veto the release the files are.
     async fn resolve_aliases(
         &self,
         local: &LocalAlbum,
@@ -636,15 +761,26 @@ impl<R: ReleaseSource, F: FingerprintSource> IdentifyProviders for LiveProviders
         Box::pin(async move {
             let source = self.at(&facts.local_album_id, priority);
             let result = match source.recall(&facts, named_group.as_deref()).await {
-                Ok(result) => result,
-                Err(SourceError(error)) => {
+                Ok(outcome) => return outcome,
+                Err(Stopped::Provider(SourceError(error))) => {
                     tracing::info!(album = facts.local_album_id, %error, "identify recall deferred");
                     deferred()
+                }
+                Err(Stopped::Matching) => {
+                    tracing::warn!(
+                        album = facts.local_album_id,
+                        "release matching failed; identification waits"
+                    );
+                    RecallResult {
+                        provider_deferred: true,
+                        failure_code: Some(MATCHING_FAILED.to_owned()),
+                        ..RecallResult::default()
+                    }
                 }
             };
             RecallOutcome {
                 result,
-                recall_criticality: Some(Criticality::IdentityCritical),
+                scored: Scored::default(),
             }
         })
     }
@@ -668,7 +804,7 @@ impl<R: ReleaseSource, F: FingerprintSource> IdentifyProviders for LiveProviders
             };
             RecallOutcome {
                 result,
-                recall_criticality: Some(Criticality::IdentityCritical),
+                scored: Scored::default(),
             }
         })
     }
@@ -710,12 +846,29 @@ fn deferred() -> RecallResult {
     }
 }
 
+/// Recall's matches by release id, scored under `aliases`.
+fn keyed(
+    releases: &[Release],
+    scored: Vec<ReleaseMatch>,
+    aliases: HashMap<String, String>,
+) -> Scored {
+    Scored {
+        aliases,
+        matches: releases
+            .iter()
+            .map(|release| release.id.clone())
+            .zip(scored)
+            .collect(),
+    }
+}
+
 /// The release group the files fit best: the closest release that
-/// nothing vetoes and whose names agree.
-fn best_group(local: &LocalAlbum, releases: &[Release]) -> Option<String> {
+/// nothing vetoes and whose names agree. `matches` are the releases'
+/// matches, in order.
+fn best_group(releases: &[Release], matches: &[ReleaseMatch]) -> Option<String> {
     releases
         .iter()
-        .map(|release| (release, match_release(local, release, &HashMap::new())))
+        .zip(matches)
         .filter(|(_, matched)| matched.conflicts.is_empty() && matched.names_agree)
         .min_by(|a, b| a.1.library_distance().total_cmp(&b.1.library_distance()))
         .map(|(release, _)| release.release_group_id.to_ascii_lowercase())
@@ -732,25 +885,64 @@ fn is_various(name: &str) -> bool {
 }
 
 /// An artist name that stands for no artist: blank, "Unknown Artist",
-/// or MusicBrainz's "[unknown]".
+/// MusicBrainz's "[unknown]", or junk a tagger left ("?", "????", "-",
+/// "...", "_"). Any other name of symbols only ("!!!", "†††", "+/-") is
+/// an artist: an artist phrase of `\!\!\!` finds the band's releases
+/// (verified 2026-10-29 against the BrainzMash mirror,
+/// api.brainzmash.cc/ws/2). That probe's title may be unique, so it shows
+/// "!!!" works, not how the index treats every symbol.
 fn is_placeholder(name: &str) -> bool {
-    matches!(fold(name).as_str(), "" | "unknownartist" | "unknown")
+    let folded = fold(name);
+    if folded.is_empty() {
+        return name.chars().all(|character| {
+            character.is_whitespace()
+                || matches!(
+                    character,
+                    '?' | '-' | '–' | '—' | '_' | '.' | '…' | '*' | '/' | '\\'
+                )
+        });
+    }
+    matches!(folded.as_str(), "unknownartist" | "unknown")
+}
+
+/// Whom an album's searches name.
+#[derive(Debug, PartialEq, Eq)]
+struct SearchArtist<'a> {
+    /// The artist phrase for the album searches; empty for none.
+    artist: &'a str,
+    /// Rank Various Artists releases first. A search filter only, never
+    /// proof of anything.
+    various: bool,
+    /// The recording search names the first track's own artist.
+    per_track: bool,
 }
 
 /// The artist to search with: none for a compilation, the album artist,
-/// or, when the album row names a placeholder, the artist most of the
-/// tracks name (the earliest on a tie). Searching for a placeholder
-/// finds nothing, or only other placeholder albums.
-fn search_artist(facts: &LocalAlbumFacts, various: bool) -> &str {
-    if facts.is_compilation || various {
-        return "";
+/// or, when the album row names a placeholder, the artist more than half
+/// the tracks name, counted by the credit before any "feat." tail. With
+/// several artists and none over half, the album searches as Various
+/// Artists. Searching for a placeholder finds nothing, or only other
+/// placeholder albums.
+fn search_artist(facts: &LocalAlbumFacts) -> SearchArtist<'_> {
+    let named_various = is_various(&facts.album_artist_name);
+    let none = |various: bool, per_track: bool| SearchArtist {
+        artist: "",
+        various,
+        per_track,
+    };
+    if facts.is_compilation || named_various {
+        return none(named_various, false);
     }
     if !is_placeholder(&facts.album_artist_name) {
-        return facts.album_artist_name.as_str();
+        return SearchArtist {
+            artist: facts.album_artist_name.as_str(),
+            various: false,
+            per_track: false,
+        };
     }
     let mut counts: Vec<(String, usize, &str)> = Vec::new();
     for track in &facts.tracks {
-        let name = track.artist_name.trim();
+        let name = before_featuring(track.artist_name.trim());
         if is_placeholder(name) {
             continue;
         }
@@ -761,12 +953,23 @@ fn search_artist(facts: &LocalAlbumFacts, various: bool) -> &str {
         }
     }
     let mut best: Option<(usize, &str)> = None;
-    for (_, count, name) in counts {
-        if best.is_none_or(|(most, _)| count > most) {
-            best = Some((count, name));
+    for (_, count, name) in &counts {
+        if best.is_none_or(|(most, _)| *count > most) {
+            best = Some((*count, name));
         }
     }
-    best.map_or("", |(_, name)| if is_various(name) { "" } else { name })
+    match best {
+        None => none(false, false),
+        Some((_, name)) if is_various(name) => none(true, true),
+        Some((count, name)) if counts.len() == 1 || count * 2 > facts.tracks.len() => {
+            SearchArtist {
+                artist: name,
+                various: false,
+                per_track: false,
+            }
+        }
+        Some(_) => none(true, true),
+    }
 }
 
 /// The title before a trailing "(...)" or "[...]", when something is left.
@@ -906,7 +1109,7 @@ impl IdentifyProviders for FakeProviders {
         Box::pin(async move {
             RecallOutcome {
                 result,
-                recall_criticality: Some(Criticality::IdentityCritical),
+                scored: Scored::default(),
             }
         })
     }
@@ -924,7 +1127,7 @@ impl IdentifyProviders for FakeProviders {
         Box::pin(async move {
             RecallOutcome {
                 result,
-                recall_criticality: Some(Criticality::IdentityCritical),
+                scored: Scored::default(),
             }
         })
     }
@@ -940,5 +1143,41 @@ impl IdentifyProviders for FakeProviders {
             .map(|slot| slot.clone().unwrap_or_default())
             .unwrap_or_default();
         Box::pin(async move { Ok(page) })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A stored match stands in only for a scoring with recall's inputs:
+    /// fingerprint support or other aliases would change the score.
+    #[test]
+    fn scored_matches_are_reused_only_for_the_same_inputs() {
+        let release = Release {
+            id: "release-1".to_owned(),
+            ..Release::default()
+        };
+        let local = LocalAlbum::default();
+        let aliases = HashMap::from([("old".to_owned(), "new".to_owned())]);
+        let matched = match_release(&local, &release, &aliases);
+        let scored = keyed(
+            std::slice::from_ref(&release),
+            vec![matched.clone()],
+            aliases.clone(),
+        );
+        let none = HashMap::new();
+        let no_aliases = HashMap::new();
+        let heard = HashMap::from([("t1".to_owned(), vec!["rec".to_owned()])]);
+
+        assert_eq!(scored.clone().take(&release, &heard, &aliases), None);
+        assert_eq!(scored.clone().take(&release, &none, &no_aliases), None);
+        assert_eq!(
+            scored.clone().take(&release, &none, &aliases),
+            Some(matched)
+        );
+        // Junk symbols stand for no artist; a band's symbols do not.
+        assert!(is_placeholder("????"));
+        assert!(!is_placeholder("!!!"));
     }
 }

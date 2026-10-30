@@ -1,8 +1,5 @@
-import { createMutation } from '@tanstack/svelte-query';
 import { api } from '$lib/api/client';
-import { invalidateQueriesWithPersister } from '$lib/queries/QueryClient';
 import { toastStore } from '$lib/stores/toast';
-import { LibraryQueryKeyFactory } from './LibraryQueryKeyFactory';
 import { LibraryV3Api } from './LibraryV3Api';
 import { toOperationResponse } from './libraryOperationAdapters';
 import type {
@@ -13,22 +10,22 @@ import type {
 	ScanKind,
 	ScanRunRequestedResponse
 } from './LibraryOperationsTypes';
+import {
+	anyLibraryActivityChanged,
+	createAppMutation,
+	libraryOperationsChanged
+} from '$lib/queries/effects';
 
-async function invalidateWork(): Promise<void> {
-	await Promise.all([
-		invalidateQueriesWithPersister({ queryKey: LibraryQueryKeyFactory.activityPrefix() }),
-		invalidateQueriesWithPersister({ queryKey: LibraryQueryKeyFactory.operationsPrefix() })
-	]);
-}
+const work = () => [anyLibraryActivityChanged(), libraryOperationsChanged()];
 
 export function requestLibraryRun() {
-	return createMutation(() => ({
+	return createAppMutation(() => ({
 		mutationFn: async (input: {
 			kind: ScanKind;
 			scope_ids: string[];
 			expected_policy_revision: string;
 		}): Promise<ScanRunRequestedResponse> => {
-			const response = await api.global.v3.POST(LibraryV3Api.scanRuns(), input);
+			const response = await api.v3.POST(LibraryV3Api.scanRuns(), input);
 			return {
 				run_id: response.run_id,
 				disposition: response.disposition,
@@ -39,8 +36,8 @@ export function requestLibraryRun() {
 				estimated_file_count: null
 			};
 		},
-		onSuccess: async () => {
-			await invalidateWork();
+		effects: work,
+		onSuccess: () => {
 			toastStore.show({ message: 'Library work queued', type: 'success' });
 		},
 		onError: () => toastStore.show({ message: 'Could not queue library work', type: 'error' })
@@ -48,7 +45,7 @@ export function requestLibraryRun() {
 }
 
 export function controlLibraryRun(action: 'pause' | 'resume' | 'stop') {
-	return createMutation(() => ({
+	return createAppMutation(() => ({
 		mutationFn: async (input: {
 			runId: string;
 			expectedRevision: number;
@@ -59,26 +56,26 @@ export function controlLibraryRun(action: 'pause' | 'resume' | 'stop') {
 					: action === 'resume'
 						? LibraryV3Api.resumeScanRun(input.runId)
 						: LibraryV3Api.stopScanRun(input.runId);
-			const response = await api.global.v3.POST(url, {
+			const response = await api.v3.POST(url, {
 				expected_revision: input.expectedRevision
 			});
 			return { ...response, state: response.state as LibraryWorkState };
 		},
-		onSuccess: invalidateWork,
+		effects: work,
 		onError: () => toastStore.show({ message: `Could not ${action} the scan`, type: 'error' })
 	}));
 }
 
 export function controlIdentification(action: 'pause' | 'resume') {
-	return createMutation(() => ({
+	return createAppMutation(() => ({
 		mutationFn: (expectedRevision: number): Promise<IdentificationControlResponse> =>
-			api.global.v3.POST(
+			api.v3.POST(
 				action === 'pause'
 					? LibraryV3Api.pauseIdentification()
 					: LibraryV3Api.resumeIdentification(),
 				{ expected_revision: expectedRevision }
 			),
-		onSuccess: invalidateWork,
+		effects: work,
 		onError: () => toastStore.show({ message: `Could not ${action} identification`, type: 'error' })
 	}));
 }
@@ -90,17 +87,32 @@ export function operationControlUrl(action: 'pause' | 'resume' | 'stop', jobId: 
 }
 
 export function controlLibraryOperation(action: 'pause' | 'resume' | 'stop') {
-	return createMutation(() => ({
+	return createAppMutation(() => ({
 		mutationFn: async (input: {
 			jobId: string;
 			expectedRevision: number;
 		}): Promise<OperationResponse> =>
 			toOperationResponse(
-				await api.global.v3.POST(operationControlUrl(action, input.jobId), {
+				await api.v3.POST(operationControlUrl(action, input.jobId), {
 					expected_row_revision: input.expectedRevision
 				})
 			),
-		onSuccess: invalidateWork,
+		effects: work,
 		onError: () => toastStore.show({ message: `Could not ${action} this job`, type: 'error' })
 	}));
 }
+
+/** A run's diagnostic report, as a file to save, and the name the server gave it. */
+export const createScanDiagnosticsExportMutation = () =>
+	createAppMutation(() => ({
+		effects: () => [],
+		mutationFn: async (runId: string): Promise<{ blob: Blob; filename: string }> => {
+			const response = await api.raw(LibraryV3Api.scanDiagnostics(runId));
+			if (!response.ok) throw new Error('Diagnostic export failed');
+			const disposition = response.headers.get('content-disposition') ?? '';
+			return {
+				blob: await response.blob(),
+				filename: disposition.match(/filename="([^"]+)"/)?.[1] ?? 'droppedneedle-library-run.json'
+			};
+		}
+	}));

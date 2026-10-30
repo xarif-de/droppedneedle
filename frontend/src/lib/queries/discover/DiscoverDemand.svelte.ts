@@ -1,13 +1,13 @@
-import { createMutation } from '@tanstack/svelte-query';
 import { untrack } from 'svelte';
 import { api } from '$lib/api/client';
 import {
-	musicBrainzSourceKey,
+	musicBrainzSourceStamp,
 	setMusicBrainzSourceScope
 } from '$lib/queries/musicbrainz/sourceScope.svelte';
 import type { MusicBrainzSourceMode } from '$lib/queries/musicbrainz/types';
 import { authStore } from '$lib/stores/authStore.svelte';
 import type { DiscoverActivity } from '$lib/types';
+import { createAppMutation } from '../effects';
 import { DiscoverV3Api } from './DiscoverV3Api';
 
 // Discover demand: the server records which discovery surfaces a user
@@ -25,13 +25,13 @@ export async function recordDiscoverActivity(
 	signal?: AbortSignal
 ): Promise<void> {
 	const userId = authStore.user?.id;
-	const before = JSON.stringify(musicBrainzSourceKey());
-	const source = await api.global.v3.POST(DiscoverV3Api.activity(), activity, { signal });
+	const before = musicBrainzSourceStamp();
+	const source = await api.v3.POST(DiscoverV3Api.activity(), activity, { signal });
 	const knownMode = KNOWN_SOURCE_MODES.find((mode) => mode === source.source_mode);
 	if (
 		!signal?.aborted &&
 		userId === authStore.user?.id &&
-		before === JSON.stringify(musicBrainzSourceKey()) &&
+		before === musicBrainzSourceStamp() &&
 		knownMode !== undefined
 	) {
 		setMusicBrainzSourceScope(
@@ -45,8 +45,9 @@ export function useDiscoverActivity(
 	getActivity: () => DiscoverActivity | null,
 	getElement?: () => HTMLElement | undefined
 ): void {
-	const mutation = createMutation(() => ({
+	const mutation = createAppMutation(() => ({
 		retry: false,
+		effects: () => [],
 		mutationFn: (activity: DiscoverActivity) => recordDiscoverActivity(activity)
 	}));
 	$effect(() => {

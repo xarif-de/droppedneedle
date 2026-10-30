@@ -1,8 +1,8 @@
 <script lang="ts">
+	import { applyEffects, catalogChanged } from '$lib/queries/effects';
 	import '$lib/components/library/library-management.css';
 	import { replaceState } from '$app/navigation';
 	import { page } from '$app/state';
-	import { onMount } from 'svelte';
 	import { SvelteURL } from 'svelte/reactivity';
 	import {
 		TriangleAlert,
@@ -20,7 +20,6 @@
 	import OperationJobStrip from './OperationJobStrip.svelte';
 	import RetagPairCard from './RetagPairCard.svelte';
 	import { toastStore } from '$lib/stores/toast';
-	import { invalidateLibraryManagementSurfaces } from '$lib/queries/library-management/LibraryManagementInvalidation';
 	import {
 		STALE_INPUT_HINT,
 		groupFailedOperationsByAlbum,
@@ -28,7 +27,6 @@
 	} from './LibraryWorkPresentation';
 	import { getTargetLibrarySettingsQuery } from '$lib/queries/library/LibraryPolicyQueries.svelte';
 	import { authStore } from '$lib/stores/authStore.svelte';
-	import { createLibraryManagementEvents } from '$lib/queries/library-management/LibraryManagementEvents';
 	import { withBasePath } from '$lib/utils/basePath';
 	import {
 		controlLibraryManagementOperationMutation,
@@ -68,6 +66,16 @@
 	const recoveryQuery = getLibraryManagementRecoveryQuery(
 		() => authStore.user?.id,
 		() => authStore.isAdmin
+	);
+	// Every flag is read on each pass. A flag skipped by `||` is not tracked, so a
+	// query that answered meanwhile could leave the skeleton up for good.
+	const loading = $derived(
+		[
+			settingsQuery.isLoading,
+			policyQuery.isLoading,
+			operationsQuery.isLoading,
+			recoveryQuery.isLoading
+		].some(Boolean)
 	);
 	const pauseOperation = controlLibraryManagementOperationMutation('pause');
 	const resumeOperation = controlLibraryManagementOperationMutation('resume');
@@ -160,12 +168,6 @@
 		return new Date(millis).toLocaleDateString(undefined, { dateStyle: 'medium' });
 	}
 
-	onMount(() => {
-		const events = createLibraryManagementEvents();
-		events.start();
-		return events.stop;
-	});
-
 	function runnerModeFromUrl(): RunnerMode | null {
 		const requested = page.url.searchParams.get('runner');
 		return requested === 'manage' || requested === 'baseline_restore' ? requested : null;
@@ -233,7 +235,7 @@
 				failed += 1;
 			}
 		}
-		await invalidateLibraryManagementSurfaces().catch(() => undefined);
+		await applyEffects(catalogChanged(authStore.user?.id)).catch(() => undefined);
 		bulkPending = false;
 		const summary =
 			`Retried ${succeeded} of ${targets.length} stale ${targets.length === 1 ? 'preview' : 'previews'}` +
@@ -248,7 +250,7 @@
 		resolvingBundleId = bundleId;
 		try {
 			const result = await resolveImportBundle.mutateAsync({ bundleId });
-			await invalidateLibraryManagementSurfaces().catch(() => undefined);
+			await applyEffects(catalogChanged(authStore.user?.id)).catch(() => undefined);
 			toastStore.show({
 				message: result.note,
 				type: 'success'
@@ -286,7 +288,7 @@
 				failed += 1;
 			}
 		}
-		await invalidateLibraryManagementSurfaces().catch(() => undefined);
+		await applyEffects(catalogChanged(authStore.user?.id)).catch(() => undefined);
 		bulkPending = false;
 		const summary =
 			`Dismissed ${succeeded} of ${targets.length} stale ${targets.length === 1 ? 'preview' : 'previews'}` +
@@ -335,7 +337,7 @@
 		</div>
 	</div>
 
-	{#if settingsQuery.isLoading || policyQuery.isLoading || operationsQuery.isLoading || recoveryQuery.isLoading}
+	{#if loading}
 		<div class="space-y-3" role="status" aria-label="Loading file-organization state">
 			<div class="skeleton h-28 rounded-xl"></div>
 			<div class="skeleton h-44 rounded-xl"></div>
@@ -645,6 +647,11 @@
 									<span class="min-w-0 text-sm"
 										>{bundle.file_count ?? 0} files{#if bundle.sample_paths?.length}: <span
 												class="font-mono text-xs break-all">{bundle.sample_paths.join(', ')}</span
+											>{/if}{#if bundle.source_folders?.length}<span
+												class="block text-xs text-base-content/70"
+												>From <span class="font-mono break-all"
+													>{bundle.source_folders.join(', ')}</span
+												></span
 											>{/if}</span
 									><Button
 										variant="warning"
@@ -677,6 +684,10 @@
 							>
 								{bundle.file_count ?? 0} files{#if bundle.sample_paths?.length}: <span
 										class="font-mono text-xs break-all">{bundle.sample_paths.join(', ')}</span
+									>{/if}{#if bundle.source_folders?.length}<span
+										class="block text-xs text-base-content/70"
+										>From <span class="font-mono break-all">{bundle.source_folders.join(', ')}</span
+										></span
 									>{/if}
 							</li>{/each}
 					</ul>

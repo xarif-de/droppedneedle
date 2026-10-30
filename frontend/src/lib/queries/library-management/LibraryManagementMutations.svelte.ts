@@ -1,16 +1,15 @@
-import { createMutation } from '@tanstack/svelte-query';
+import { catalogChanged, createAppMutation, libraryPlacementChanged } from '$lib/queries/effects';
+import { authStore } from '$lib/stores/authStore.svelte';
 
-import { ApiError, api } from '$lib/api/client';
+import { api } from '$lib/api/client';
+import { ApiError } from '$lib/api/errors';
 import { LIBRARY_MANAGEMENT_ENDPOINTS } from './endpoints';
 import { toPreviewDetail } from './libraryManagementAdapters';
 import type { OperationResponse } from '$lib/queries/library/LibraryOperationsTypes';
 import { operationControlUrl } from '$lib/queries/library/LibraryOperationMutations.svelte';
 import { toOperationResponse } from '$lib/queries/library/libraryOperationAdapters';
-import { invalidateQueriesWithPersister } from '$lib/queries/QueryClient';
 import { toastStore } from '$lib/stores/toast';
 
-import { invalidateLibraryManagementSurfaces } from './LibraryManagementInvalidation';
-import { LibraryManagementQueryKeyFactory } from './LibraryManagementQueryKeyFactory';
 import type {
 	LibraryManagementActivationConfirmRequest,
 	LibraryManagementActivationPreviewRequest,
@@ -38,150 +37,165 @@ const showActionError = (fallback: string) => (error: Error) => {
 	toastStore.show({ message: error.message || fallback, type: 'error' });
 };
 
-const showQueued = (message: string) => async () => {
-	await invalidateLibraryManagementSurfaces();
+const showQueued = (message: string) => () => {
 	toastStore.show({ message, type: 'success' });
 };
 
+const catalog = () => [catalogChanged(authStore.user?.id)];
+
 export const updateLibraryManagementSettingsMutation = () =>
-	createMutation(() => ({
+	createAppMutation(() => ({
 		mutationFn: (request: LibraryManagementSettingsUpdateRequest) =>
-			api.global.v3.PUT(LIBRARY_MANAGEMENT_ENDPOINTS.settings(), request),
-		onSuccess: invalidateLibraryManagementSurfaces
+			api.v3.PUT(LIBRARY_MANAGEMENT_ENDPOINTS.settings(), request),
+		effects: catalog
 	}));
 
 export const previewLibraryManagementSettingsImpactMutation = () =>
-	createMutation(() => ({
+	createAppMutation(() => ({
+		effects: () => [],
 		mutationFn: (request: LibraryManagementSettingsImpactRequest) =>
-			api.global.v3.POST(LIBRARY_MANAGEMENT_ENDPOINTS.impact(), request)
+			api.v3.POST(LIBRARY_MANAGEMENT_ENDPOINTS.impact(), request)
 	}));
 
 export const validateLibraryManagementSettingsMutation = () =>
-	createMutation(() => ({
+	createAppMutation(() => ({
+		effects: () => [],
 		mutationFn: (request: LibraryManagementSettingsImpactRequest) =>
-			api.global.v3.POST(LIBRARY_MANAGEMENT_ENDPOINTS.validate(), request)
+			api.v3.POST(LIBRARY_MANAGEMENT_ENDPOINTS.validate(), request)
 	}));
 
 export const copyLibraryManagementProfileMutation = () =>
-	createMutation(() => ({
+	createAppMutation(() => ({
 		mutationFn: (input: { profileId: string; request: LibraryManagementProfileCopyRequest }) =>
-			api.global.v3.POST(LIBRARY_MANAGEMENT_ENDPOINTS.copyProfile(input.profileId), input.request),
-		onSuccess: invalidateLibraryManagementSurfaces
+			api.v3.POST(LIBRARY_MANAGEMENT_ENDPOINTS.copyProfile(input.profileId), input.request),
+		effects: catalog
 	}));
 
 export const deleteLibraryManagementProfileMutation = () =>
-	createMutation(() => ({
+	createAppMutation(() => ({
 		mutationFn: (input: { profileId: string; request: LibraryManagementProfileDeleteRequest }) =>
-			api.global.v3.DELETE(LIBRARY_MANAGEMENT_ENDPOINTS.profile(input.profileId), input.request),
-		onSuccess: invalidateLibraryManagementSurfaces
+			api.v3.DELETE(LIBRARY_MANAGEMENT_ENDPOINTS.profile(input.profileId), input.request),
+		effects: catalog
 	}));
 
 export const exportLibraryManagementProfileMutation = () =>
-	createMutation(() => ({
+	createAppMutation(() => ({
+		effects: () => [],
 		mutationFn: (input: { profileId: string; request: LibraryManagementProfileExportRequest }) =>
-			api.global.v3.POST(LIBRARY_MANAGEMENT_ENDPOINTS.exportProfile(input.profileId), input.request)
+			api.v3.POST(LIBRARY_MANAGEMENT_ENDPOINTS.exportProfile(input.profileId), input.request)
 	}));
 
 export const previewLibraryManagementProfileImportMutation = () =>
-	createMutation(() => ({
+	createAppMutation(() => ({
+		effects: () => [],
 		mutationFn: (request: LibraryManagementProfileImportPreviewRequest) =>
-			api.global.v3.POST(LIBRARY_MANAGEMENT_ENDPOINTS.profileImportPreview(), request)
+			api.v3.POST(LIBRARY_MANAGEMENT_ENDPOINTS.profileImportPreview(), request)
 	}));
 
 export const importLibraryManagementProfileMutation = () =>
-	createMutation(() => ({
+	createAppMutation(() => ({
 		mutationFn: (request: LibraryManagementProfileImportRequest) =>
-			api.global.v3.POST(LIBRARY_MANAGEMENT_ENDPOINTS.profileImports(), request),
-		onSuccess: invalidateLibraryManagementSurfaces
+			api.v3.POST(LIBRARY_MANAGEMENT_ENDPOINTS.profileImports(), request),
+		effects: catalog
 	}));
 
 export const createLibraryManagementActivationPreviewMutation = () =>
-	createMutation(() => ({
+	createAppMutation(() => ({
 		mutationFn: (request: LibraryManagementActivationPreviewRequest) =>
-			api.global.v3.POST(LIBRARY_MANAGEMENT_ENDPOINTS.activationPreviews(), request),
-		onSuccess: async (result) => {
-			await invalidateLibraryManagementSurfaces();
+			api.v3.POST(LIBRARY_MANAGEMENT_ENDPOINTS.activationPreviews(), request),
+		onSuccess: (result) => {
 			toastStore.show({
 				message: result.existing ? 'Active dry run resumed' : 'Activation dry run queued',
 				type: 'success'
 			});
 		},
+		effects: catalog,
 		onError: showActionError('Could not queue the activation preview')
 	}));
 
 export const confirmLibraryManagementActivationMutation = () =>
-	createMutation(() => ({
+	createAppMutation(() => ({
 		mutationFn: (request: LibraryManagementActivationConfirmRequest) =>
-			api.global.v3.POST(LIBRARY_MANAGEMENT_ENDPOINTS.activationConfirmations(), request),
+			api.v3.POST(LIBRARY_MANAGEMENT_ENDPOINTS.activationConfirmations(), request),
+		effects: catalog,
 		onSuccess: showQueued('File organization activated'),
 		onError: showActionError('Could not activate file organization')
 	}));
 
 export const createLibraryManagementPreviewMutation = () =>
-	createMutation(() => ({
+	createAppMutation(() => ({
 		mutationFn: (
 			request: LibraryManagementPreviewCreateRequest
 		): Promise<LibraryManagementPreviewCreatedResponse> =>
-			api.global.v3.POST(LIBRARY_MANAGEMENT_ENDPOINTS.previews(), request),
+			api.v3.POST(LIBRARY_MANAGEMENT_ENDPOINTS.previews(), request),
+		effects: catalog,
 		onSuccess: showQueued('Organization preview queued'),
 		onError: showActionError('Could not queue the management preview')
 	}));
 
 export const createLibraryManagementTagEditPreviewMutation = () =>
-	createMutation(() => ({
+	createAppMutation(() => ({
 		mutationFn: (request: LibraryManagementTagEditPreviewRequest) =>
-			api.global.v3.POST(LIBRARY_MANAGEMENT_ENDPOINTS.tagEditPreviews(), request),
+			api.v3.POST(LIBRARY_MANAGEMENT_ENDPOINTS.tagEditPreviews(), request),
+		effects: catalog,
 		onSuccess: showQueued('Tag edit preview queued'),
 		onError: showActionError('Could not queue the tag edit preview')
 	}));
 
 export const applyLibraryManagementPreviewMutation = () =>
-	createMutation(() => ({
+	createAppMutation(() => ({
 		mutationFn: async (input: {
 			jobId: string;
 			request: LibraryManagementApplyRequest;
 		}): Promise<OperationResponse> =>
 			toOperationResponse(
-				await api.global.v3.POST(LIBRARY_MANAGEMENT_ENDPOINTS.applyPreview(input.jobId), {
+				await api.v3.POST(LIBRARY_MANAGEMENT_ENDPOINTS.applyPreview(input.jobId), {
 					...input.request,
 					confirmation: input.request.confirmation ?? false
 				})
 			),
+		effects: catalog,
 		onSuccess: showQueued('Organization work queued'),
-		onError: showActionError('Could not apply this management preview')
+		onError: (error: Error) => {
+			// The apply dialog replaces a refused token and tries once more.
+			if (error instanceof ApiError && error.code === 'PREVIEW_TOKEN_INVALID') return;
+			showActionError('Could not apply this management preview')(error);
+		}
 	}));
 
 export const reissueLibraryManagementPreviewMutation = () =>
-	createMutation(() => ({
+	createAppMutation(() => ({
+		effects: () => [],
 		mutationFn: (input: {
 			jobId: string;
 			silent?: boolean;
 		}): Promise<LibraryManagementPreviewReissueResponse> =>
-			api.global.v3.POST(LIBRARY_MANAGEMENT_ENDPOINTS.reissuePreview(input.jobId)),
+			api.v3.POST(LIBRARY_MANAGEMENT_ENDPOINTS.reissuePreview(input.jobId)),
 		onError: (error: Error, input: { jobId: string; silent?: boolean }) => {
 			if (!input.silent) showActionError('Could not resume this management preview')(error);
 		}
 	}));
 
 export const discardLibraryManagementPreviewMutation = () =>
-	createMutation(() => ({
+	createAppMutation(() => ({
 		mutationFn: async (input: {
 			jobId: string;
 			request: LibraryManagementDiscardRequest;
 			silent?: boolean;
 		}): Promise<LibraryManagementPreviewDetailResponse> =>
 			toPreviewDetail(
-				await api.global.v3.POST(
-					LIBRARY_MANAGEMENT_ENDPOINTS.discardPreview(input.jobId),
-					input.request
-				)
+				await api.v3.POST(LIBRARY_MANAGEMENT_ENDPOINTS.discardPreview(input.jobId), input.request)
 			),
-		onSuccess: async (
+		onSuccess: (
 			_response: LibraryManagementPreviewDetailResponse,
 			input: { jobId: string; request: LibraryManagementDiscardRequest; silent?: boolean }
 		) => {
-			if (!input.silent) await showQueued('Organization preview discarded')();
+			if (!input.silent) showQueued('Organization preview discarded')();
 		},
+		effects: (
+			_response: LibraryManagementPreviewDetailResponse,
+			input: { jobId: string; request: LibraryManagementDiscardRequest; silent?: boolean }
+		) => (input.silent ? [] : catalog()),
 		onError: (
 			error: Error,
 			input: { jobId: string; request: LibraryManagementDiscardRequest; silent?: boolean }
@@ -191,49 +205,55 @@ export const discardLibraryManagementPreviewMutation = () =>
 	}));
 
 export const createLibraryManagementUndoPreviewMutation = () =>
-	createMutation(() => ({
+	createAppMutation(() => ({
 		mutationFn: (input: {
 			jobId: string;
 			request: LibraryManagementUndoPreviewRequest;
 		}): Promise<LibraryManagementPreviewCreatedResponse> =>
-			api.global.v3.POST(LIBRARY_MANAGEMENT_ENDPOINTS.undoPreview(input.jobId), input.request),
+			api.v3.POST(LIBRARY_MANAGEMENT_ENDPOINTS.undoPreview(input.jobId), input.request),
+		effects: catalog,
 		onSuccess: showQueued('Undo preview queued'),
 		onError: showActionError('Could not queue the undo preview')
 	}));
 
 export const createLibraryManagementBaselineRestorePreviewMutation = () =>
-	createMutation(() => ({
+	createAppMutation(() => ({
 		mutationFn: (request: LibraryManagementBaselineRestorePreviewRequest) =>
-			api.global.v3.POST(LIBRARY_MANAGEMENT_ENDPOINTS.baselineRestorePreviews(), request),
+			api.v3.POST(LIBRARY_MANAGEMENT_ENDPOINTS.baselineRestorePreviews(), request),
+		effects: catalog,
 		onSuccess: showQueued('Baseline restore preview queued'),
 		onError: showActionError('Could not queue the baseline restore preview')
 	}));
 
 export const createLibraryManagementDuplicateResolutionMutation = () =>
-	createMutation(() => ({
+	createAppMutation(() => ({
 		mutationFn: (request: LibraryManagementDuplicateResolutionPreviewRequest) =>
-			api.global.v3.POST(LIBRARY_MANAGEMENT_ENDPOINTS.duplicateResolutionPreviews(), request),
+			api.v3.POST(LIBRARY_MANAGEMENT_ENDPOINTS.duplicateResolutionPreviews(), request),
+		effects: catalog,
 		onSuccess: showQueued('Duplicate resolution preview queued'),
 		onError: showActionError('Could not queue the duplicate resolution preview')
 	}));
 
 export const previewLibraryManagementBaselinePurgeMutation = () =>
-	createMutation(() => ({
-		mutationFn: () => api.global.v3.POST(LIBRARY_MANAGEMENT_ENDPOINTS.baselinePurgeImpact())
+	createAppMutation(() => ({
+		effects: () => [],
+		mutationFn: () => api.v3.POST(LIBRARY_MANAGEMENT_ENDPOINTS.baselinePurgeImpact())
 	}));
 
 export const purgeLibraryManagementBaselinesMutation = () =>
-	createMutation(() => ({
+	createAppMutation(() => ({
 		mutationFn: (request: LibraryManagementBaselinePurgeRequest) =>
-			api.global.v3.POST(LIBRARY_MANAGEMENT_ENDPOINTS.purgeBaselines(), request),
+			api.v3.POST(LIBRARY_MANAGEMENT_ENDPOINTS.purgeBaselines(), request),
+		effects: catalog,
 		onSuccess: showQueued('Organization baselines purged'),
 		onError: showActionError('Could not purge organization baselines')
 	}));
 
 export const resolveLibraryManagementImportBundleMutation = () =>
-	createMutation(() => ({
+	createAppMutation(() => ({
+		effects: () => [],
 		mutationFn: (input: { bundleId: string }) =>
-			api.global.v3.POST(LIBRARY_MANAGEMENT_ENDPOINTS.resolveImportBundle(input.bundleId))
+			api.v3.POST(LIBRARY_MANAGEMENT_ENDPOINTS.resolveImportBundle(input.bundleId))
 	}));
 
 const HAND_BACK_UNREADABLE = 'HAND_BACK_UNREADABLE';
@@ -249,10 +269,10 @@ export function handBackRefusalMessage(error: unknown): string | null {
 // Hands one album the app stepped back from to automatic management again.
 // Its files are then retagged and renamed from its edition.
 export const handBackLibraryAlbumMutation = () =>
-	createMutation(() => ({
+	createAppMutation(() => ({
 		mutationFn: (input: { albumId: string }) =>
-			api.global.v3.POST(LIBRARY_MANAGEMENT_ENDPOINTS.handBackAlbum(input.albumId)),
-		onSuccess: invalidateLibraryManagementSurfaces,
+			api.v3.POST(LIBRARY_MANAGEMENT_ENDPOINTS.handBackAlbum(input.albumId)),
+		effects: catalog,
 		// Unreadable files are a state the page shows beside the button, not a toast.
 		onError: (error: Error) => {
 			if (handBackRefusalMessage(error) !== null) return;
@@ -263,27 +283,27 @@ export const handBackLibraryAlbumMutation = () =>
 // Hands back every album the app stepped back from. The server works
 // through them in the background.
 export const handBackAllLibraryAlbumsMutation = () =>
-	createMutation(() => ({
-		mutationFn: () => api.global.v3.POST(LIBRARY_MANAGEMENT_ENDPOINTS.handBackAll()),
-		onSuccess: invalidateLibraryManagementSurfaces,
+	createAppMutation(() => ({
+		mutationFn: () => api.v3.POST(LIBRARY_MANAGEMENT_ENDPOINTS.handBackAll()),
+		effects: catalog,
 		onError: showActionError('Could not hand these albums back')
 	}));
 
 export const controlLibraryManagementOperationMutation = (action: 'pause' | 'resume' | 'stop') =>
-	createMutation(() => ({
+	createAppMutation(() => ({
 		mutationFn: async (input: {
 			jobId: string;
 			expectedRevision: number;
 		}): Promise<OperationResponse> =>
 			toOperationResponse(
-				await api.global.v3.POST(operationControlUrl(action, input.jobId), {
+				await api.v3.POST(operationControlUrl(action, input.jobId), {
 					expected_row_revision: input.expectedRevision
 				})
 			),
-		onSuccess: async () => {
-			await invalidateLibraryManagementSurfaces();
+		onSuccess: () => {
 			toastStore.show({ message: `Organization ${action} requested`, type: 'success' });
 		},
+		effects: catalog,
 		onError: showActionError(`Could not ${action} this organization operation`)
 	}));
 
@@ -292,13 +312,11 @@ export const controlLibraryManagementOperationMutation = (action: 'pause' | 'res
 export const checkLibraryManagementPlacementMutation = (
 	getUserId: () => string | null | undefined
 ) =>
-	createMutation(() => ({
+	createAppMutation(() => ({
 		mutationFn: (rootId: string) =>
-			api.global.v3.POST(LIBRARY_MANAGEMENT_ENDPOINTS.checkPlacement(rootId)),
-		onSuccess: async (result) => {
-			await invalidateQueriesWithPersister({
-				queryKey: LibraryManagementQueryKeyFactory.placement(getUserId())
-			});
+			api.v3.POST(LIBRARY_MANAGEMENT_ENDPOINTS.checkPlacement(rootId)),
+		effects: () => [libraryPlacementChanged(getUserId())],
+		onSuccess: (result) => {
 			if (!result.answered) {
 				toastStore.show({
 					message:

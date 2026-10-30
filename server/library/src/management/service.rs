@@ -24,8 +24,9 @@ use crate::clock::LibraryClock as _;
 use crate::jobs::{self, ManagementPhase, OperationKind, OperationState};
 use crate::manage::SealPins;
 use crate::operations::models::OperationJob;
+use crate::preview::{self, TokenFault};
+use crate::publish::JournalStore;
 use crate::publish::publisher::read_revision;
-use crate::publish::{JournalStore, snapshots::sha256_hex};
 use crate::scan::roots::RootRegistry;
 use crate::wiring::LibrarySetup;
 use droppedneedle_kernel::page::TimeKey;
@@ -91,6 +92,10 @@ pub(super) fn stale(message: &str) -> ManagementError {
     ManagementError::Conflict(message.to_owned())
 }
 
+/// The refusal while the library-wide switch is off: the same answer a
+/// scan gets (409 `CONFLICT`).
+pub(super) const LIBRARY_OFF: &str = crate::mutations::LIBRARY_OFF_TEXT;
+
 impl Management {
     pub fn new(setup: &LibrarySetup) -> Self {
         Self {
@@ -106,6 +111,21 @@ impl Management {
     ) -> Self {
         self.shutdown = Some(shutdown);
         self
+    }
+
+    /// Whether the library-wide switch is off. Nothing new is planned or
+    /// written while it is; recovery and read-only views still run.
+    pub(super) fn library_off(&self) -> bool {
+        !self.setup.core.live_registry().enabled()
+    }
+
+    /// Refuse new file work while the library is switched off, as a scan
+    /// request is refused.
+    pub(super) fn refuse_while_off(&self) -> Result<(), ManagementError> {
+        if self.library_off() {
+            return Err(ManagementError::Conflict(LIBRARY_OFF.to_owned()));
+        }
+        Ok(())
     }
 
     /// The stored settings, with every profile's field list complete even
@@ -139,12 +159,50 @@ impl Management {
         })
     }
 
-    /// A random preview token and its hash.
-    pub(super) fn token(&self) -> (String, String) {
-        let token =
-            format!("{}{}", self.setup.ids.new_id(), self.setup.ids.new_id()).replace('-', "");
-        let hash = sha256_hex(token.as_bytes());
-        (token, hash)
+    /// The token that confirms `job_id` for `actor`, the person who asked
+    /// for it, until the preview expires. A job no person asked for has
+    /// none.
+    pub(super) fn issue_token(&self, job_id: &str, actor: Option<&str>, expires_at: f64) -> String {
+        let Some(actor) = actor else {
+            return String::new();
+        };
+        preview::issue_until(
+            &self.setup.settings,
+            preview::MANAGEMENT,
+            actor,
+            job_id,
+            self.setup.clock.now_secs() as i64,
+            token_expiry(expires_at),
+        )
+    }
+
+    /// Refuse `token` unless it is the one issued for this job to `actor`,
+    /// who must be the person who asked for the job. A genuine token past
+    /// the preview's expiry passes here: the caller's own expiry check
+    /// answers it.
+    pub(super) fn check_token(
+        &self,
+        snapshot: &Snapshot,
+        actor: &str,
+        token: &str,
+    ) -> Result<(), ManagementError> {
+        let invalid = || ManagementError::Refused(preview::TOKEN_INVALID);
+        if snapshot.job.requested_by_user_id.as_deref() != Some(actor) {
+            return Err(invalid());
+        }
+        let expires_at = snapshot.preview_expires_at.ok_or_else(invalid)?;
+        match preview::verify_until(
+            &self.setup.settings,
+            preview::MANAGEMENT,
+            actor,
+            token,
+            &snapshot.job.id,
+            token_expiry(expires_at),
+            self.setup.clock.now_secs() as i64,
+        ) {
+            Ok(()) | Err(TokenFault::Expired) => Ok(()),
+            Err(TokenFault::Invalid | TokenFault::Stale) => Err(invalid()),
+        }
     }
 
     // -----------------------------------------------------------------
@@ -244,9 +302,9 @@ impl Management {
     /// same idempotency key made (with a fresh token) when it asked for
     /// the same thing. Blocking.
     pub(super) fn start_job(&self, spec: JobSpec<'_>) -> Result<PreviewHandle, ManagementError> {
+        self.refuse_while_off()?;
         let profile_json = serde_json::to_string(spec.pinned)?;
         let now = self.setup.clock.now_secs();
-        let (token, token_hash) = self.token();
         // A job no person asked for is the automatic worker's.
         let lane = if spec.actor.is_some() {
             Lane::Foreground
@@ -277,25 +335,16 @@ impl Management {
                     "This request key was already used for a different preview. Make the preview again.",
                 ));
             }
-            self.setup
-                .db
-                .write_blocking(lane, "management.rotate_token", |conn| {
-                    Ok::<_, ManagementError>(store::rotate_token(
-                        conn,
-                        &existing,
-                        &token_hash,
-                        now,
-                    )?)
-                })?;
+            let expires_at = snapshot
+                .preview_expires_at
+                .unwrap_or(snapshot.job.created_at);
             return Ok(PreviewHandle {
+                preview_token: self.issue_token(&existing, spec.actor, expires_at),
                 job_id: existing,
-                preview_token: token,
                 created_at: snapshot
                     .preview_created_at
                     .unwrap_or(snapshot.job.created_at),
-                expires_at: snapshot
-                    .preview_expires_at
-                    .unwrap_or(snapshot.job.created_at),
+                expires_at,
                 existing: true,
             });
         }
@@ -322,7 +371,6 @@ impl Management {
                         profile_snapshot_json: &profile_json,
                         revisions: &spec.revisions,
                         catalog_revision: i64::try_from(catalog_revision).unwrap_or(i64::MAX),
-                        token_hash: &token_hash,
                         now,
                         expires_at,
                         target_root_id: spec.target_root_id,
@@ -336,8 +384,8 @@ impl Management {
             })?;
         jobs::wake(&self.setup.wakeups, OperationKind::LibraryManagement);
         Ok(PreviewHandle {
+            preview_token: self.issue_token(&job_id, spec.actor, expires_at),
             job_id,
-            preview_token: token,
             created_at: now,
             expires_at,
             existing: false,
@@ -400,11 +448,11 @@ impl Management {
             .read_blocking("management.baseline_available", |conn| {
                 Ok::<_, ManagementError>(store::baseline_available(conn, job_id)?)
             })?;
-        let external_refreshes = self
+        let refresh_jobs = self
             .setup
             .db
-            .read_blocking("management.external_refreshes", |conn| {
-                Ok::<_, ManagementError>(store::external_refreshes(conn, job_id)?)
+            .read_blocking("management.refresh_jobs", |conn| {
+                Ok::<_, ManagementError>(store::refresh_jobs(conn, job_id)?)
             })?;
         let (profile_id, profile_name) = snapshot.profile_label();
         let worker_stalled = snapshot.job.state == OperationState::Running
@@ -436,7 +484,7 @@ impl Management {
             undo_expires_at: undo.first_expiry_day.map(|day| day as f64 * 86_400.0),
             baseline_available_count,
             proposed_settings_revision: snapshot.proposed_settings_revision,
-            external_refreshes,
+            refresh_jobs,
             job: snapshot.job,
         })
     }
@@ -533,7 +581,8 @@ impl Management {
     }
 
     /// A new token for a ready preview, for its owner whose browser lost
-    /// the first one. The old token stops working. Blocking.
+    /// the first one. Earlier tokens stay good, for the same person, until
+    /// the preview expires. Blocking.
     pub fn reissue(&self, job_id: &str, actor: &str) -> Result<PreviewHandle, ManagementError> {
         let snapshot = self.snapshot(job_id)?;
         if snapshot.job.requested_by_user_id.as_deref() != Some(actor) {
@@ -552,32 +601,28 @@ impl Management {
                 "This preview is no longer ready to apply. Make a new preview.",
             ));
         }
-        let (token, token_hash) = self.token();
-        let now = self.setup.clock.now_secs();
-        self.setup
-            .db
-            .write_blocking(Lane::Foreground, "management.reissue", |conn| {
-                Ok::<_, ManagementError>(store::rotate_token(conn, job_id, &token_hash, now)?)
-            })?;
+        let expires_at = snapshot
+            .preview_expires_at
+            .unwrap_or(snapshot.job.created_at);
         tracing::info!(job_id, "preview token reissued");
         Ok(PreviewHandle {
             job_id: job_id.to_owned(),
-            preview_token: token,
+            preview_token: self.issue_token(job_id, Some(actor), expires_at),
             created_at: snapshot
                 .preview_created_at
                 .unwrap_or(snapshot.job.created_at),
-            expires_at: snapshot
-                .preview_expires_at
-                .unwrap_or(snapshot.job.created_at),
+            expires_at,
             existing: false,
         })
     }
 
-    /// Queue a ready preview's albums for writing. Blocking.
+    /// Queue a ready preview's albums for writing, for the person who
+    /// asked for the preview, with its token. Blocking.
     pub fn apply(
         &self,
         job_id: &str,
         request: ApplyRequest,
+        actor: &str,
     ) -> Result<OperationJob, ManagementError> {
         if !request.confirmation {
             return Err(ManagementError::Invalid(
@@ -589,18 +634,9 @@ impl Management {
                 "An apply request key is required.".to_owned(),
             ));
         }
+        self.refuse_while_off()?;
         let snapshot = self.snapshot(job_id)?;
-        let presented = sha256_hex(request.preview_token.as_bytes());
-        let matches = snapshot
-            .token_hash
-            .as_deref()
-            .is_some_and(|stored| constant_time_eq(stored.as_bytes(), presented.as_bytes()));
-        if !matches {
-            return Err(ManagementError::Invalid(
-                "This preview's confirmation token is not valid. Reopen the preview to get a new one."
-                    .to_owned(),
-            ));
-        }
+        self.check_token(&snapshot, actor, &request.preview_token)?;
         refuse_activation(&snapshot)?;
         // The same apply sent again answers with the job as it is now.
         if self
@@ -771,6 +807,7 @@ impl Management {
         idempotency_key: &str,
         actor: &str,
     ) -> Result<PreviewHandle, ManagementError> {
+        self.refuse_while_off()?;
         let source = self.snapshot(job_id)?;
         if source.job.row_revision != expected_row_revision {
             return Err(stale(
@@ -811,28 +848,16 @@ impl Management {
                     "This request key was already used for something else.",
                 ));
             }
-            let (token, token_hash) = self.token();
-            self.setup.db.write_blocking(
-                Lane::Foreground,
-                "management.undo_preview_rotate_token",
-                |conn| {
-                    Ok::<_, ManagementError>(store::rotate_token(
-                        conn,
-                        &existing,
-                        &token_hash,
-                        now,
-                    )?)
-                },
-            )?;
+            let expires_at = snapshot
+                .preview_expires_at
+                .unwrap_or(snapshot.job.created_at);
             return Ok(PreviewHandle {
+                preview_token: self.issue_token(&existing, Some(actor), expires_at),
                 job_id: existing,
-                preview_token: token,
                 created_at: snapshot
                     .preview_created_at
                     .unwrap_or(snapshot.job.created_at),
-                expires_at: snapshot
-                    .preview_expires_at
-                    .unwrap_or(snapshot.job.created_at),
+                expires_at,
                 existing: true,
             });
         }
@@ -856,7 +881,6 @@ impl Management {
         }
         let stored = self.settings()?;
         let expires_at = now + stored.preview_retention_hours.max(1) as f64 * 3600.0;
-        let (token, token_hash) = self.token();
         let new_id = self.setup.ids.new_id();
         let revisions = super::models::Revisions {
             profile: source.profile_revision.clone(),
@@ -881,7 +905,6 @@ impl Management {
                         profile_snapshot_json: &source.profile_snapshot_json,
                         revisions: &revisions,
                         catalog_revision: source.catalog_revision,
-                        token_hash: &token_hash,
                         now,
                         expires_at,
                         target_root_id: source.target_root_id.as_deref(),
@@ -896,8 +919,8 @@ impl Management {
         )?;
         jobs::wake(&self.setup.wakeups, OperationKind::LibraryManagement);
         Ok(PreviewHandle {
+            preview_token: self.issue_token(&new_id, Some(actor), expires_at),
             job_id: new_id,
-            preview_token: token,
             created_at: now,
             expires_at,
             existing: false,
@@ -940,10 +963,11 @@ impl Management {
     }
 
     /// Requeue the management jobs whose worker vanished, then claim and
-    /// run the next queued one under `worker`, never while a scan runs.
-    /// True when a job was worked on. Blocking.
+    /// run the next queued one under `worker`, never while a scan runs or
+    /// the library is switched off. True when a job was worked on.
+    /// Blocking.
     pub fn run_next(&self, worker: &str) -> Result<bool, ManagementError> {
-        if !self.setup.coordinator.current().is_empty() {
+        if !self.setup.coordinator.current().is_empty() || self.library_off() {
             return Ok(false);
         }
         let now = self.setup.clock.now_secs();
@@ -972,12 +996,17 @@ impl Management {
             // shutdown, with why it waits on its work, and the worker waits
             // before it takes it again. A put-back that fails leaves it to
             // its lease.
-            Err(ManagementError::Busy(cause)) => {
-                if super::logged_elsewhere(&cause) {
-                    tracing::debug!(job_id, "management job waits: {cause}");
-                } else {
-                    tracing::warn!(job_id, "management job waits: {cause}");
-                }
+            Err(error @ (ManagementError::Busy(_) | ManagementError::BinsUnknown)) => {
+                let cause = match &error {
+                    ManagementError::Busy(cause) => {
+                        tracing::warn!(job_id, "management job waits: {cause}");
+                        cause.clone()
+                    }
+                    other => {
+                        tracing::debug!(job_id, "management job waits: {other}");
+                        other.to_string()
+                    }
+                };
                 let released =
                     self.setup
                         .db
@@ -995,7 +1024,7 @@ impl Management {
                 if let Err(error) = released {
                     tracing::warn!(%error, job_id, "management job not put back; its lease brings it back");
                 }
-                Err(ManagementError::Busy(cause))
+                Err(error)
             }
             Err(error) => {
                 tracing::error!(%error, job_id, "management job failed");
@@ -1163,6 +1192,20 @@ impl Management {
                 files = changed.len(),
                 "automatic management stepped back from the album"
             );
+        } else if finished && automatic && self.library_off() {
+            // The automatic worker looks at the albums again once the
+            // library is back on and applies the preview then.
+            tracing::info!(
+                job_id,
+                "the library is switched off; the automatic preview waits for it"
+            );
+            for album in &albums {
+                super::automatic::queue_automatic_management(
+                    &self.setup.db,
+                    &*self.setup.clock,
+                    album,
+                );
+            }
         } else if finished
             && automatic
             && let Err(error) = self.apply_automatic(job_id, &summary)
@@ -1222,6 +1265,13 @@ impl Management {
                 job_id,
                 blocked = summary.blocked_count,
                 "automatic management preview has blocked files; it waits for review"
+            );
+            return Ok(false);
+        }
+        if self.library_off() {
+            tracing::info!(
+                job_id,
+                "the library is switched off; the automatic preview waits for review"
             );
             return Ok(false);
         }
@@ -1726,8 +1776,8 @@ impl Management {
     }
 
     /// Write the queued albums of an applying job one at a time. A scan
-    /// that starts in between hands the job back to the queue until the
-    /// scan is done.
+    /// that starts in between, or the library being switched off, hands
+    /// the job back to the queue until that is over.
     fn apply_work(&self, job_id: &str, worker: &str) -> Result<(), ManagementError> {
         let snapshot = self.snapshot(job_id)?;
         let undo = snapshot.job_mode().is_some_and(JobMode::restores);
@@ -1749,7 +1799,9 @@ impl Management {
             if self.checkpoint(job_id, worker)? {
                 return Ok(());
             }
-            if !self.setup.coordinator.current().is_empty() {
+            // A scan starting or the library being switched off hands the
+            // job back between albums; it goes on when that is over.
+            if !self.setup.coordinator.current().is_empty() || self.library_off() {
                 self.setup.db.write_blocking(
                     Lane::Background,
                     "management.apply_work_release",
@@ -1772,21 +1824,17 @@ impl Management {
                         Ok::<_, ManagementError>(jobs::claim_work(tx, job_id, now)?)
                     })?
             else {
-                let finished = self.setup.db.write_blocking(
+                let refreshes = self.refresh_targets(&snapshot);
+                self.setup.db.write_blocking(
                     Lane::Background,
                     "management.finish_apply",
                     |tx| {
-                        Ok::<_, ManagementError>(store::finish_apply(
-                            tx,
-                            job_id,
-                            worker,
-                            self.setup.clock.now_secs(),
-                        )?)
+                        if store::finish_apply(tx, job_id, worker, self.setup.clock.now_secs())? {
+                            self.queue_refreshes(tx, job_id, &refreshes)?;
+                        }
+                        Ok::<_, ManagementError>(())
                     },
                 )?;
-                if finished {
-                    self.queue_external_refreshes(&snapshot);
-                }
                 return Ok(());
             };
             let Some((failure, bundle_id, mut result)) =
@@ -2174,14 +2222,10 @@ fn refuse_activation(snapshot: &Snapshot) -> Result<(), ManagementError> {
     Ok(())
 }
 
-/// Compare two secrets without leaking where they differ.
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    left.len() == right.len()
-        && left
-            .iter()
-            .zip(right)
-            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-            == 0
+/// A preview's expiry as its token carries it: whole seconds, rounded
+/// down, so the token never outlasts the preview.
+fn token_expiry(expires_at: f64) -> i64 {
+    expires_at.floor() as i64
 }
 
 #[cfg(test)]

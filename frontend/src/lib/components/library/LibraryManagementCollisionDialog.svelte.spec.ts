@@ -21,10 +21,6 @@ vi.mock(
 	async () => (await import('./libraryManagementPreviewTestFixtures')).libraryQueriesMock
 );
 vi.mock(
-	'$lib/queries/library-management/LibraryManagementEvents',
-	async () => (await import('./libraryManagementPreviewTestFixtures')).eventsMock
-);
-vi.mock(
 	'$lib/queries/library-management/LibraryManagementQueries.svelte',
 	async () => (await import('./libraryManagementPreviewTestFixtures')).queriesMock
 );
@@ -38,7 +34,7 @@ import LibraryManagementPreviewPage from './LibraryManagementPreviewPage.svelte'
 beforeEach(resetPreviewMocks);
 
 describe('LibraryManagementCollisionDialog', () => {
-	it('never preselects a collision action and disables recycling without a configured path', async () => {
+	it('never preselects a collision action', async () => {
 		await render(LibraryManagementPreviewPage, { jobId: 'preview-1' });
 		await page.getByText('Inspect exact diff').click();
 		await page.getByRole('button', { name: 'Choose resolution...' }).click();
@@ -50,7 +46,7 @@ describe('LibraryManagementCollisionDialog', () => {
 		await expect
 			.element(page.getByRole('radio', { name: /Keep incoming at an alternate/ }))
 			.not.toBeChecked();
-		await expect.element(page.getByRole('radio', { name: /Recycle existing/ })).toBeDisabled();
+		await expect.element(page.getByRole('radio', { name: /Recycle existing/ })).not.toBeChecked();
 		await expect
 			.element(page.getByRole('button', { name: 'Generate resolution preview' }))
 			.toBeDisabled();

@@ -24,6 +24,10 @@ droppedneedle_kernel::sql! {
     pub(super) NEWEST_ACTIVE_FOR_ALBUM = TASK_ROW + " WHERE release_group_mbid = ?1 \
              AND download_type = 'album' AND status IN ('queued', 'downloading', 'processing') \
              ORDER BY created_at DESC, rowid DESC LIMIT 1";
+    /// Any live task, album or track, in release group `?1` (lowercase).
+    pub(super) LIVE_IN_GROUP = "SELECT id FROM download_tasks \
+             WHERE lower(release_group_mbid) = ?1 \
+             AND status IN ('queued', 'downloading', 'processing') LIMIT 1";
     /// Stamp the optional detail columns; NULL keeps a column.
     pub(super) SET_TASK_DETAILS = "UPDATE download_tasks \
              SET release_mbid = COALESCE(?1, release_mbid), \
@@ -32,12 +36,13 @@ droppedneedle_kernel::sql! {
                  track_title = COALESCE(?4, track_title), \
                  updated_at = ?5 \
              WHERE id = ?6";
-    /// The album a single-track task resolved to.
+    /// The album a single-track task resolved to. The year is the album's,
+    /// so an undated album clears the year the request carried.
     pub(super) SET_TRACK_ALBUM = "UPDATE download_tasks \
              SET release_group_mbid = ?1, release_mbid = ?2, album_title = ?3, \
                  release_track_mbid = ?4, track_number = ?5, disc_number = ?6, \
                  track_count = ?7, track_duration_seconds = COALESCE(?8, track_duration_seconds), \
-                 year = COALESCE(?9, year), updated_at = ?10 \
+                 year = ?9, updated_at = ?10 \
              WHERE id = ?11 AND download_type = 'track'";
     /// The optional detail columns of one task (`?1`).
     pub(super) TASK_DETAILS = "SELECT release_mbid, artist_mbid, year, track_title \
@@ -67,6 +72,7 @@ droppedneedle_kernel::sql! {
              picked_by_person = ?7 WHERE id = ?6";
     /// Reimport guard: a failed or partial task with an attempt whose handle
     /// still names its files and whose cleanup has not run.
+    /// The request history's `reimportable` filter repeats this test.
     pub(super) REIMPORTABLE = "SELECT EXISTS (SELECT 1 FROM download_tasks t \
              WHERE t.id = ?1 AND t.status IN ('failed', 'partial') \
                AND EXISTS (SELECT 1 FROM download_attempts a WHERE a.task_id = t.id \

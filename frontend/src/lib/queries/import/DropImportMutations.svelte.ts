@@ -1,15 +1,11 @@
-import { createMutation } from '@tanstack/svelte-query';
-
-import { api, ApiError, TransportError } from '$lib/api/client';
-import { invalidateQueriesWithPersister } from '$lib/queries/QueryClient';
+import { api } from '$lib/api/client';
+import { ApiError, TransportError } from '$lib/api/errors';
+import { authStore } from '$lib/stores/authStore.svelte';
 import { toastStore } from '$lib/stores/toast';
 
-import { DropImportQueryKeyFactory } from './DropImportQueryKeyFactory';
 import { DROP_IMPORT_ENDPOINTS } from './endpoints';
 import type { DropImportJob } from './types';
-
-const invalidateJobs = () =>
-	invalidateQueriesWithPersister({ queryKey: DropImportQueryKeyFactory.prefix });
+import { createAppMutation, dropImportsChanged } from '$lib/queries/effects';
 
 /** An upload that sends nothing for this long has stalled. */
 const STALL_MS = 60_000;
@@ -38,19 +34,19 @@ export interface DropUpload {
 }
 
 export const uploadDropMutation = () =>
-	createMutation(() => ({
+	createAppMutation(() => ({
 		mutationFn: ({ files, onProgress }: DropUpload) => {
 			const form = new FormData();
 			for (const file of files) form.append('files', file, file.name);
-			return api.global.upload<DropImportJob>(DROP_IMPORT_ENDPOINTS.uploads(), form, {
+			return api.upload<DropImportJob>(DROP_IMPORT_ENDPOINTS.uploads(), form, {
 				onProgress,
 				stallMs: STALL_MS
 			});
 		},
-		onSuccess: async () => {
+		onSuccess: () => {
 			toastStore.show({ message: 'Import started - identifying your files.', type: 'success' });
-			await invalidateJobs();
 		},
+		effects: () => [dropImportsChanged(authStore.user?.id)],
 		onError: (error: Error) => {
 			toastStore.show({ message: uploadFailure(error), type: 'error', duration: 8000 });
 		}

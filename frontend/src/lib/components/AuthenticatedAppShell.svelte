@@ -7,12 +7,11 @@
 	import { migratePageSourceKeys } from '$lib/stores/musicSource';
 	import { watchMusicBrainzSourceScope } from '$lib/queries/musicbrainz/sourceScope.svelte';
 	import { libraryStore } from '$lib/stores/library';
-	import { integrationStore } from '$lib/stores/integration';
-	import { initCacheTTLs } from '$lib/stores/cacheTtl.svelte';
+	import { getIntegrationStatusQuery } from '$lib/queries/HomeIntegrationStatusQuery.svelte';
+	import { loadAdvancedSettings } from '$lib/queries/AdvancedSettingsReads.svelte';
 	import { playerStore } from '$lib/stores/player.svelte';
 	import { playbackToast } from '$lib/stores/playbackToast.svelte';
 	import { scrobbleManager } from '$lib/stores/scrobble.svelte';
-	import { imageSettingsStore } from '$lib/stores/imageSettings';
 	import { serviceStatusStore } from '$lib/stores/serviceStatus';
 	import { resumeAudioEngine, setAudioElement } from '$lib/player/audioElement';
 	import { eqStore } from '$lib/stores/eq.svelte';
@@ -37,15 +36,11 @@
 	import Toaster from '$lib/ui/Toaster.svelte';
 	import { onMount, onDestroy, untrack } from 'svelte';
 	import { cancelPendingImages } from '$lib/utils/lazyImage';
-	import { abortAllPageRequests } from '$lib/utils/navigationAbort';
 	import { nowPlayingStore } from '$lib/stores/nowPlayingSessions.svelte';
 	import { nowPlayingReporter } from '$lib/stores/nowPlayingReporter.svelte';
 	import { createNavigationProgressController } from '$lib/utils/navigationProgress';
-	import { fromStore } from 'svelte/store';
 	import type { Component, Snippet } from 'svelte';
-	import { createFollowingEvents } from '$lib/queries/following/FollowingEvents';
-	import { createLibraryActivityEvents } from '$lib/queries/library/LibraryActivityEvents';
-	import { createDownloadEvents } from '$lib/queries/downloads/DownloadEvents';
+	import { serverEvents } from '$lib/queries/events/dispatcher';
 	import { muxEventStream } from '$lib/queries/events/MuxEventStream';
 	import LibraryActivityStrip from '$lib/components/library/LibraryActivityStrip.svelte';
 	import TopBar from '$lib/components/shell/TopBar.svelte';
@@ -62,10 +57,6 @@
 	let { children }: { children: Snippet } = $props();
 	type PlaylistModalComponent = Component<Record<string, never>, PlaylistModalHandle>;
 
-	const followingEvents = createFollowingEvents();
-	const libraryActivityEvents = createLibraryActivityEvents();
-	const downloadEvents = createDownloadEvents();
-
 	let audioElement = $state<HTMLAudioElement | undefined>(undefined);
 	let PlaylistModal = $state<PlaylistModalComponent | null>(null);
 	let DiscographyModal = $state<Component | null>(null);
@@ -79,11 +70,10 @@
 	// pane scroll, the document itself must not.
 	const isSettingsPane = $derived(currentPath.startsWith('/settings'));
 
-	const integrations = fromStore(integrationStore);
-	const viewer = $derived({
-		isAdmin: authStore.isAdmin,
-		downloadClient: integrations.current.download_client || !integrations.current.loaded
-	});
+	// Session-wide reads: the sidebar, page gates, album cards and images use them.
+	getIntegrationStatusQuery();
+	loadAdvancedSettings();
+	const viewer = $derived({ isAdmin: authStore.isAdmin });
 
 	const NAV_PROGRESS_DELAY_MS = 120;
 	const NAV_PROGRESS_MIN_VISIBLE_MS = 220;
@@ -98,10 +88,7 @@
 	beforeNavigate((navigation) => {
 		const fromPath = navigation.from?.url.pathname;
 		const toPath = navigation.to?.url.pathname;
-		if (fromPath !== toPath) {
-			abortAllPageRequests();
-			serviceStatusStore.clear();
-		}
+		if (fromPath !== toPath) serviceStatusStore.clear();
 		navigationProgress.start();
 		cancelPendingImages();
 	});
@@ -206,12 +193,7 @@
 		});
 		if (sessionUserId) {
 			const cancelDeferred = untrack(() => {
-				// integration status feeds the home entry cards and the services panel
-				// (only some pages call ensureLoaded themselves)
-				void integrationStore.ensureLoaded();
 				return deferInit(() => {
-					initCacheTTLs();
-					void imageSettingsStore.load();
 					void restorePlayerSession();
 					void scrobbleManager.init();
 					syncStatus.connect();
@@ -223,7 +205,6 @@
 			};
 		} else {
 			untrack(() => {
-				integrationStore.reset();
 				syncStatus.disconnect();
 			});
 		}
@@ -237,25 +218,20 @@
 		const sessionUserId = authStore.user?.id;
 		if (!sessionUserId) return;
 		untrack(() => {
-			followingEvents.start();
-			libraryActivityEvents.start(authStore.isAdmin, sessionUserId);
-			downloadEvents.start();
+			serverEvents.start({ userId: sessionUserId, isAdmin: authStore.isAdmin });
 			// presence is server-driven now (the backend polls upstream servers itself),
 			// so it no longer waits on integration status
 			nowPlayingStore.start();
 			nowPlayingReporter.start();
-			// The tab's single multiplexed stream; connect last so the gated
-			// consumer starts (library activity's admin direct-refresh gate)
-			// see a disconnected mux and refresh exactly once via the first
-			// open instead of doubling with a direct refresh. syncStatus
-			// connects deferred after this on purpose - it has no gate and its
+			// The tab's single multiplexed stream; connect last so the
+			// dispatcher starts on a disconnected stream and refreshes exactly
+			// once via the first open instead of doubling with a direct
+			// refresh. syncStatus connects deferred after this on purpose - its
 			// seed/generation guard covers either order.
 			muxEventStream.connect();
 		});
 		return () => {
-			followingEvents.stop();
-			libraryActivityEvents.stop();
-			downloadEvents.stop();
+			serverEvents.stop();
 			nowPlayingStore.stop();
 			nowPlayingReporter.stop();
 			muxEventStream.disconnect();

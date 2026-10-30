@@ -240,27 +240,6 @@ impl WantedStore {
         .await
     }
 
-    /// Mark a watch fulfilled (the album reached the library).
-    pub async fn mark_fulfilled(
-        &self,
-        key: &str,
-        outcome: &str,
-        now: u64,
-    ) -> Result<(), RequestsError> {
-        let key = key.to_lowercase();
-        let outcome = outcome.to_owned();
-        self.db
-            .write_background("wanted.fulfilled", move |tx| {
-                tx.execute(
-                    sql::MARK_FULFILLED.text(),
-                    params![key, WatchState::Fulfilled, outcome, ms_from_secs(now)],
-                )?;
-                Ok(())
-            })
-            .await
-            .map_err(|error| lane_error("wanted.fulfilled", error))
-    }
-
     /// Stop one watch: watching becomes stopped. Owners
     /// and admins only.
     pub async fn stop(
@@ -398,8 +377,16 @@ impl WantedStore {
     }
 }
 
+/// The last stored watch time that counts as armed before a removal at
+/// `removed_at` (unix seconds). An enrolled watch is stamped in whole
+/// seconds, so one armed in the removal's own second may have come after
+/// it: only a watch armed in an earlier second counts.
+fn armed_before(removed_at: f64) -> i64 {
+    ms_from_secs_f64(removed_at.floor()) - 1
+}
+
 /// After an admin removed the album at `removed_at` (unix seconds): stop a
-/// watching watch armed at or before then. A watch armed since, by a new
+/// watching watch armed before then. A watch armed since, by a new
 /// request, is left alone. Answers whether it changed.
 pub(crate) fn stop_after_removal(
     tx: &Transaction<'_>,
@@ -412,7 +399,7 @@ pub(crate) fn stop_after_removal(
             key.to_lowercase(),
             WatchState::Stopped,
             WatchState::Watching,
-            ms_from_secs_f64(removed_at)
+            armed_before(removed_at)
         ],
     )?;
     Ok(changed > 0)
@@ -437,7 +424,7 @@ pub(crate) fn rearm_after_removal(
             WatchState::Watching,
             ms_from_secs_f64(now),
             WatchState::Fulfilled,
-            ms_from_secs_f64(removed_at)
+            armed_before(removed_at)
         ],
     )?;
     Ok(changed > 0)

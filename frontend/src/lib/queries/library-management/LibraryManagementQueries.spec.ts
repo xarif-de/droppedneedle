@@ -7,14 +7,14 @@ vi.mock('@tanstack/svelte-query', () => ({
 }));
 
 vi.mock('$lib/api/client', () => ({
-	api: { global: { v3: { GET: vi.fn().mockResolvedValue({}) } } }
+	api: { v3: { GET: vi.fn().mockResolvedValue({}) } }
 }));
 
 import { api } from '$lib/api/client';
 import { LibraryManagementQueryKeyFactory } from './LibraryManagementQueryKeyFactory';
 import { getLibraryManagementActivationPreviewQuery } from './LibraryManagementQueries.svelte';
 
-const mockGet = vi.mocked(api.global.v3.GET) as unknown as Mock;
+const mockGet = vi.mocked(api.v3.GET) as unknown as Mock;
 
 beforeEach(() => {
 	vi.clearAllMocks();
@@ -27,8 +27,8 @@ describe('LibraryManagementQueryKeyFactory', () => {
 			LibraryManagementQueryKeyFactory.settings('admin-b')
 		);
 		expect(LibraryManagementQueryKeyFactory.preview('admin-a', 'job-1')).toEqual([
+			'user:admin-a',
 			'library-management',
-			'admin-a',
 			'previews',
 			'job-1'
 		]);
@@ -69,8 +69,8 @@ describe('LibraryManagementQueryKeyFactory', () => {
 			})
 		);
 		expect(LibraryManagementQueryKeyFactory.tagEditor('admin-a', 'track-1')).toEqual([
+			'user:admin-a',
 			'library-management',
-			'admin-a',
 			'tag-editor',
 			'track-1'
 		]);

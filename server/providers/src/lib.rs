@@ -4,8 +4,8 @@
 //! [`Providers`] is built once at boot and handed to every area. It holds
 //! one client per service (MusicBrainz, the Cover Art Archive,
 //! ListenBrainz, Last.fm, TheAudioDB, AcoustID, Discogs, iTunes, Deezer,
-//! LRCLIB, Wikidata, Ticketmaster, Skiddle, Open-Meteo, YouTube, GitHub
-//! and the image hosts), the limiters, the provider answer cache and the
+//! LRCLIB, Wikidata, Ticketmaster, Skiddle, Open-Meteo, YouTube, GitHub,
+//! Spotify and the image hosts), the limiters, the provider answer cache and the
 //! service health registry. Each client sends through its own [`Executor`].
 //!
 //! - [`executor`]: sends one request. It waits for a token at the caller's
@@ -27,6 +27,8 @@
 //! - [`singleflight`]: one fetch for many identical callers.
 //! - [`calls`]: the outbound calls each row has sent since start, by
 //!   priority and outcome, for the admin view.
+//! - [`web_address`]: the http-or-https rule for every link address an
+//!   answer carries.
 //!
 //! Each client is reached by its module path
 //! (`providers::musicbrainz::MusicBrainzClient`). The names are not
@@ -60,7 +62,9 @@ pub mod preview;
 pub mod rates;
 pub mod singleflight;
 pub mod skiddle;
+pub mod spotify;
 pub mod ticketmaster;
+pub mod web_address;
 pub mod wikidata;
 pub mod youtube;
 
@@ -77,6 +81,7 @@ pub use error::{MAX_RETRY_AFTER, PayloadKind, ProviderError, TransportKind};
 pub use executor::{Executor, ReqwestWire, Wire};
 pub use limiter::{LimiterSet, OverCapacity, RateLimiter, RatePolicy, RequestPriority};
 pub use singleflight::Singleflight;
+pub use web_address::WebAddress;
 
 /// Where the providers on the executor live. Filled from the server's one
 /// list of outside addresses; tests point it at loopback or scripted
@@ -121,6 +126,19 @@ pub struct ProviderEndpoints {
     pub youtube: String,
     /// The releases list behind the version check.
     pub github_releases: String,
+    /// GitHub API origin, which plugin installs read.
+    pub github_api: String,
+    /// GitHub archive download origin for plugin installs.
+    pub github_codeload: String,
+    /// Spotify Web API root.
+    pub spotify_api: String,
+    /// Spotify accounts origin: the authorize page and the token grants.
+    pub spotify_accounts: String,
+    /// A playlist cover origin allowed beside Spotify's CDN: the tests'
+    /// mock CDN. `None` in production.
+    pub spotify_cover_cdn: Option<String>,
+    /// The origin Deezer serves artist pictures from.
+    pub deezer_images: String,
 }
 
 impl ProviderEndpoints {
@@ -149,6 +167,12 @@ impl ProviderEndpoints {
             geocoding: "http://127.0.0.1:9/geocoding".to_owned(),
             youtube: "http://127.0.0.1:9/youtube".to_owned(),
             github_releases: "http://127.0.0.1:9/releases".to_owned(),
+            github_api: "http://127.0.0.1:9/github".to_owned(),
+            github_codeload: "http://127.0.0.1:9/codeload".to_owned(),
+            spotify_api: "http://127.0.0.1:9/spotify".to_owned(),
+            spotify_accounts: "http://127.0.0.1:9/spotify-accounts".to_owned(),
+            spotify_cover_cdn: None,
+            deezer_images: "http://127.0.0.1:9".to_owned(),
         }
     }
 }
@@ -180,7 +204,8 @@ pub struct Providers {
     /// AcoustID lookups for identification, imports and Library
     /// Management, on one bucket.
     pub acoustid: acoustid::AcoustIdClient,
-    /// Artist images and TheAudioDB thumbnails by URL.
+    /// Artist images, TheAudioDB thumbnails and Spotify playlist covers by
+    /// URL.
     pub images: images::ImageClient,
     /// Discogs releases for contributions.
     pub discogs: discogs::DiscogsClient,
@@ -203,6 +228,11 @@ pub struct Providers {
     pub youtube: youtube::YouTubeApi,
     /// GitHub releases for the version check.
     pub github: github::GitHubClient,
+    /// GitHub repository reads for plugin installs, on the version
+    /// check's row.
+    pub github_repos: github::GitHubRepos,
+    /// Spotify: the token grants and the playlist reads of an import.
+    pub spotify: spotify::SpotifyClient,
 }
 
 impl Providers {
@@ -305,9 +335,16 @@ impl Providers {
             &endpoints.acoustid,
         );
         let images = images::ImageClient::new(
-            executor(&images::AUDIODB_SPEC, images::AUDIODB_MEDIA),
-            executor(&images::WIKIMEDIA_SPEC, images::WIKIMEDIA_MEDIA),
-            executor(&images::DEEZER_SPEC, preview::DEEZER),
+            images::ImageExecutors {
+                audiodb: executor(&images::AUDIODB_SPEC, images::AUDIODB_MEDIA),
+                wikimedia: executor(&images::WIKIMEDIA_SPEC, images::WIKIMEDIA_MEDIA),
+                deezer: executor(&images::DEEZER_SPEC, preview::DEEZER),
+                spotify: executor(&images::SPOTIFY_SPEC, spotify::SOURCE),
+            },
+            images::ImageHosts::new(
+                &endpoints.deezer_images,
+                endpoints.spotify_cover_cdn.as_deref(),
+            ),
         );
         let discogs = discogs::DiscogsClient::new(
             executor(&discogs::SPEC, discogs::SOURCE),
@@ -344,9 +381,18 @@ impl Providers {
             executor(&youtube::SPEC, youtube::SOURCE),
             &endpoints.youtube,
         );
-        let github = github::GitHubClient::new(
-            executor(&github::SPEC, github::SOURCE),
-            &endpoints.github_releases,
+        let github_api = executor(&github::SPEC, github::SOURCE);
+        let github = github::GitHubClient::new(github_api.clone(), &endpoints.github_releases);
+        let github_repos = github::GitHubRepos::new(
+            github_api,
+            executor(&github::ARCHIVE_SPEC, github::SOURCE),
+            &endpoints.github_api,
+            &endpoints.github_codeload,
+        );
+        let spotify = spotify::SpotifyClient::new(
+            executor(&spotify::SPEC, spotify::SOURCE),
+            &endpoints.spotify_api,
+            &endpoints.spotify_accounts,
         );
         Self {
             limiters,
@@ -369,6 +415,8 @@ impl Providers {
             geocoding,
             youtube,
             github,
+            github_repos,
+            spotify,
         }
     }
 

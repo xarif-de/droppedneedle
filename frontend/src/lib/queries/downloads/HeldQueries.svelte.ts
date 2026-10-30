@@ -1,23 +1,27 @@
-import { createMutation, createQuery } from '@tanstack/svelte-query';
+import { createQuery } from '@tanstack/svelte-query';
 import type { Getter } from 'runed';
 
 import { api } from '$lib/api/client';
-import { HomeQueryKeyFactory } from '$lib/queries/HomeQueryKeyFactory';
-import { invalidateQueriesWithPersister } from '$lib/queries/QueryClient';
-import { DropImportQueryKeyFactory } from '$lib/queries/import/DropImportQueryKeyFactory';
-import { LibraryQueryKeyFactory } from '$lib/queries/library/LibraryQueryKeyFactory';
-import { LOCAL_KEYS } from '$lib/queries/local/LocalV3Keys';
 import { authStore } from '$lib/stores/authStore.svelte';
 import { toastStore } from '$lib/stores/toast';
 import type { HeldActionResult, HeldRecheckAllResult } from '$lib/types';
 
 import { DownloadQueryKeyFactory } from './DownloadQueryKeyFactory';
 import { HELD_ENDPOINTS, type HeldListFilters } from './endpoints';
+import {
+	albumStatusChanged,
+	applyEffects,
+	createAppMutation,
+	downloadsChanged,
+	dropImportsChanged,
+	type Effect,
+	libraryChanged
+} from '$lib/queries/effects';
 
 // Held files waiting for a decision, one entry per download or upload. Three
 // callers: the Downloads queue (every entry), the import tab (an upload's
 // entry inside its job) and the album page (one album's). Keyed under tasks()
-// so a download mutation's invalidateTasks() refreshes it too; the activity
+// so a download mutation's refresh of the tasks reaches it too; the activity
 // revision invalidates this prefix after held rows change.
 export const getHeldEntriesQuery = (
 	getFilters: Getter<HeldListFilters> = () => ({}),
@@ -25,9 +29,8 @@ export const getHeldEntriesQuery = (
 ) =>
 	createQuery(() => ({
 		enabled: getEnabled(),
-		staleTime: 30_000,
 		queryKey: DownloadQueryKeyFactory.held(authStore.user?.id, getFilters()),
-		queryFn: ({ signal }) => api.global.v3.GET(HELD_ENDPOINTS.list(getFilters()), { signal })
+		queryFn: ({ signal }) => api.v3.GET(HELD_ENDPOINTS.list(getFilters()), { signal })
 	}));
 
 function errorMessage(err: unknown, fallback: string): string {
@@ -53,25 +56,14 @@ function actionSummary(result: HeldActionResult): string {
 // A held action can move files into the library, end a download's hold and
 // settle a drop item: refresh the queue (which holds the held lists), the
 // import jobs, and, when files went in, the library surfaces that show them.
-async function invalidateAfterAction(imported: boolean, albums: (string | null | undefined)[]) {
+function afterAction(imported: boolean, albums: (string | null | undefined)[]): Effect[] {
 	const userId = authStore.user?.id;
-	const work: Promise<unknown>[] = [
-		invalidateQueriesWithPersister({ queryKey: DownloadQueryKeyFactory.tasksPrefix(userId) }),
-		invalidateQueriesWithPersister({ queryKey: DropImportQueryKeyFactory.prefix })
-	];
+	const effects = [downloadsChanged(userId), dropImportsChanged(userId)];
 	for (const mbid of albums) {
-		if (mbid) {
-			work.push(invalidateQueriesWithPersister({ queryKey: LibraryQueryKeyFactory.album(mbid) }));
-		}
+		if (mbid) effects.push(albumStatusChanged(userId, mbid));
 	}
-	if (imported) {
-		work.push(
-			invalidateQueriesWithPersister({ queryKey: LibraryQueryKeyFactory.all }),
-			invalidateQueriesWithPersister({ queryKey: LOCAL_KEYS.root }),
-			invalidateQueriesWithPersister({ queryKey: HomeQueryKeyFactory.prefix })
-		);
-	}
-	await Promise.all(work);
+	if (imported) effects.push(libraryChanged());
+	return effects;
 }
 
 export interface HeldFilesInput {
@@ -90,19 +82,21 @@ function heldMutation<I extends HeldFilesInput>(
 	post: (input: I) => Promise<HeldActionResult>,
 	failure: string
 ) {
-	return createMutation(() => ({
+	return createAppMutation(() => ({
 		mutationFn: post,
-		onSuccess: async (result: HeldActionResult, input: I) => {
+		onSuccess: (result: HeldActionResult) => {
 			toastStore.show({
 				message: actionSummary(result),
 				type: result.imported > 0 ? 'success' : 'info'
 			});
+		},
+		effects: (result: HeldActionResult, input: I) => {
 			const match = (input as Partial<HeldMatchInput>).matchMbid;
-			await invalidateAfterAction(result.imported > 0, [input.releaseGroupMbid, match]);
+			return afterAction(result.imported > 0, [input.releaseGroupMbid, match]);
 		},
 		onError: (err: unknown, input: I) => {
 			toastStore.show({ message: errorMessage(err, failure), type: 'error' });
-			void invalidateAfterAction(false, [input.releaseGroupMbid]);
+			void applyEffects(...afterAction(false, [input.releaseGroupMbid]));
 		}
 	}));
 }
@@ -112,8 +106,7 @@ const fileBody = (input: HeldFilesInput) => ({ file_ids: input.fileIds ?? null }
 /** Import, Retry, "Use this version" and "Use this file" all place files this way. */
 export const importHeldMutation = () =>
 	heldMutation(
-		(input: HeldFilesInput) =>
-			api.global.v3.POST(HELD_ENDPOINTS.import(input.entryId), fileBody(input)),
+		(input: HeldFilesInput) => api.v3.POST(HELD_ENDPOINTS.import(input.entryId), fileBody(input)),
 		'Could not import the held files'
 	);
 
@@ -121,7 +114,7 @@ export const importHeldMutation = () =>
 export const matchHeldMutation = () =>
 	heldMutation(
 		(input: HeldMatchInput) =>
-			api.global.v3.POST(HELD_ENDPOINTS.match(input.entryId), {
+			api.v3.POST(HELD_ENDPOINTS.match(input.entryId), {
 				release_group_mbid: input.matchMbid,
 				file_ids: input.fileIds ?? null
 			}),
@@ -130,25 +123,23 @@ export const matchHeldMutation = () =>
 
 export const recheckHeldMutation = () =>
 	heldMutation(
-		(input: HeldFilesInput) =>
-			api.global.v3.POST(HELD_ENDPOINTS.recheck(input.entryId), fileBody(input)),
+		(input: HeldFilesInput) => api.v3.POST(HELD_ENDPOINTS.recheck(input.entryId), fileBody(input)),
 		'Could not re-check the held files'
 	);
 
 export const discardHeldMutation = () =>
 	heldMutation(
-		(input: HeldFilesInput) =>
-			api.global.v3.POST(HELD_ENDPOINTS.discard(input.entryId), fileBody(input)),
+		(input: HeldFilesInput) => api.v3.POST(HELD_ENDPOINTS.discard(input.entryId), fileBody(input)),
 		'Could not discard the held files'
 	);
 
 // Re-check AcoustID holds across entries. The server takes at most 25 checks a
 // call, so entry ids pass through untouched.
 export const recheckAllHeldMutation = () =>
-	createMutation(() => ({
+	createAppMutation(() => ({
 		mutationFn: (entryIds: number[] | null) =>
-			api.global.v3.POST(HELD_ENDPOINTS.recheckAll(), { entry_ids: entryIds }),
-		onSuccess: async (data: HeldRecheckAllResult) => {
+			api.v3.POST(HELD_ENDPOINTS.recheckAll(), { entry_ids: entryIds }),
+		onSuccess: (data: HeldRecheckAllResult) => {
 			const imported = data.results.filter((r) => r.status === 'imported').length;
 			const stillHeld = data.results.filter((r) => r.status === 'still_held').length;
 			const failed = data.results.length - imported - stillHeld;
@@ -165,8 +156,12 @@ export const recheckAllHeldMutation = () =>
 					type: imported > 0 ? 'success' : 'info'
 				});
 			}
-			await invalidateAfterAction(imported > 0, []);
 		},
+		effects: (data: HeldRecheckAllResult) =>
+			afterAction(
+				data.results.some((r) => r.status === 'imported'),
+				[]
+			),
 		onError: (err: unknown) =>
 			toastStore.show({ message: errorMessage(err, 'Could not re-check'), type: 'error' })
 	}));

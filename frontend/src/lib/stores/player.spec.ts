@@ -40,10 +40,11 @@ vi.mock('$lib/player/createSource', () => ({
 	})
 }));
 
-vi.mock('$lib/player/jellyfinPlaybackApi', () => ({
-	startSession: vi.fn(async () => 'mock-session'),
-	reportProgress: vi.fn(async () => true),
-	reportStop: vi.fn(async () => true)
+vi.mock('$lib/player/playbackGateway', async (importActual) => ({
+	...(await importActual<typeof import('$lib/player/playbackGateway')>()),
+	startPlaybackSession: vi.fn(async () => ({ session: 'mock-session' })),
+	reportPlaybackProgress: vi.fn(async () => undefined),
+	stopPlaybackSession: vi.fn(async () => undefined)
 }));
 
 const storage = new Map<string, string>();
@@ -80,27 +81,17 @@ const mockApiGet = vi.fn();
 const mockApiHead = vi.fn();
 vi.mock('$lib/api/client', () => ({
 	api: {
-		global: {
-			get: (...args: unknown[]) => mockApiGet(...args),
-			head: (...args: unknown[]) => mockApiHead(...args)
-		}
-	},
-	ApiError: class extends Error {
-		status: number;
-		code: string;
-		details: unknown;
-		constructor(s: number, c: string, m: string, d?: unknown) {
-			super(m);
-			this.status = s;
-			this.code = c;
-			this.details = d;
-		}
+		get: (...args: unknown[]) => mockApiGet(...args),
+		head: (...args: unknown[]) => mockApiHead(...args)
 	}
 }));
 
 import { playerStore } from './player.svelte';
 import { playbackToast } from '$lib/stores/playbackToast.svelte';
 import { radioSession } from '$lib/stores/radioSession.svelte';
+import { authStore } from '$lib/stores/authStore.svelte';
+import { startPlaybackSession, stopPlaybackSession } from '$lib/player/playbackGateway';
+import { streamUrlFor } from '$lib/player/streamUrl';
 
 function makeItem(overrides: Partial<QueueItem> = {}): QueueItem {
 	const id = overrides.trackSourceId ?? `vid-${Math.random().toString(36).slice(2, 6)}`;
@@ -113,7 +104,6 @@ function makeItem(overrides: Partial<QueueItem> = {}): QueueItem {
 		albumName: overrides.albumName ?? 'Test Album',
 		coverUrl: overrides.coverUrl ?? null,
 		sourceType: overrides.sourceType ?? 'local',
-		streamUrl: overrides.streamUrl ?? 'http://localhost/test.mp3',
 		availableSources: overrides.availableSources ?? ['local', 'jellyfin'],
 		sourceIds: overrides.sourceIds ?? { local: id, jellyfin: id },
 		duration: overrides.duration,
@@ -245,7 +235,7 @@ describe('playerStore queue methods', () => {
 		it('updates streamUrl for target source', () => {
 			playerStore.playQueue(makeItems(3));
 			playerStore.changeTrackSource(1, 'jellyfin');
-			expect(playerStore.queue[1].streamUrl).toBe('/api/v3/stream/jellyfin/vid-1');
+			expect(streamUrlFor(playerStore.queue[1])).toBe('/api/v3/stream/jellyfin/vid-1');
 		});
 	});
 
@@ -257,7 +247,7 @@ describe('playerStore queue methods', () => {
 			playerStore.updateQueueItemByPlaylistTrackId('pt-2', 'jellyfin', 'jf-new', 'opus');
 			expect(playerStore.queue[2].sourceType).toBe('jellyfin');
 			expect(playerStore.queue[2].trackSourceId).toBe('jf-new');
-			expect(playerStore.queue[2].streamUrl).toBe('/api/v3/stream/jellyfin/jf-new');
+			expect(streamUrlFor(playerStore.queue[2])).toBe('/api/v3/stream/jellyfin/jf-new');
 		});
 
 		it('skips currently playing track', () => {
@@ -268,46 +258,6 @@ describe('playerStore queue methods', () => {
 			const before = playerStore.queue[currentIdx].sourceType;
 			playerStore.updateQueueItemByPlaylistTrackId(`pt-${currentIdx}`, 'jellyfin', 'jf-new');
 			expect(playerStore.queue[currentIdx].sourceType).toBe(before);
-		});
-	});
-
-	describe('session migration', () => {
-		it('maps legacy howler source type to local during resume', () => {
-			const legacySession = {
-				nowPlaying: {
-					albumId: 'album-1',
-					albumName: 'Album',
-					artistName: 'Artist',
-					coverUrl: null,
-					sourceType: 'howler',
-					trackSourceId: '1',
-					trackName: 'Track'
-				},
-				queue: [
-					{
-						trackSourceId: '1',
-						trackName: 'Track',
-						artistName: 'Artist',
-						trackNumber: 1,
-						albumId: 'album-1',
-						albumName: 'Album',
-						coverUrl: null,
-						sourceType: 'howler',
-						streamUrl: '/api/v3/stream/local/1',
-						availableSources: ['howler', 'jellyfin']
-					}
-				],
-				currentIndex: 0,
-				progress: 0,
-				shuffleEnabled: false,
-				shuffleOrder: []
-			};
-
-			localStorage.setItem('droppedneedle_player_session', JSON.stringify(legacySession));
-			playerStore.resumeSession();
-
-			expect(playerStore.queue[0].sourceType).toBe('local');
-			expect(playerStore.queue[0].availableSources).toEqual(['local', 'jellyfin']);
 		});
 	});
 
@@ -421,7 +371,18 @@ describe('playerStore queue methods', () => {
 
 	describe('session migration with queueOrigin', () => {
 		it('defaults missing queueOrigin to context during resume', () => {
+			authStore.setUser({
+				id: 'user-1',
+				display_name: 'User',
+				role: 'user',
+				email: null,
+				avatar_url: null,
+				username: 'user',
+				username_display: 'User',
+				providers: ['local']
+			});
 			const session = {
+				userId: 'user-1',
 				nowPlaying: {
 					albumId: 'album-1',
 					albumName: 'Album',
@@ -441,7 +402,6 @@ describe('playerStore queue methods', () => {
 						albumName: 'Album',
 						coverUrl: null,
 						sourceType: 'local',
-						streamUrl: '/api/v3/stream/local/1',
 						availableSources: ['local']
 					}
 				],
@@ -451,7 +411,7 @@ describe('playerStore queue methods', () => {
 				shuffleOrder: []
 			};
 
-			localStorage.setItem('droppedneedle_player_session', JSON.stringify(session));
+			localStorage.setItem('droppedneedle_player_session_v3', JSON.stringify(session));
 			playerStore.resumeSession();
 
 			expect(playerStore.queue[0].queueOrigin).toBe('context');
@@ -484,26 +444,15 @@ describe('playerStore queue methods', () => {
 });
 
 describe('Jellyfin session lifecycle', () => {
-	let jellyfinApi: {
-		startSession: ReturnType<typeof vi.fn>;
-		reportProgress: ReturnType<typeof vi.fn>;
-		reportStop: ReturnType<typeof vi.fn>;
-	};
-
-	beforeEach(async () => {
+	beforeEach(() => {
 		localStorage.clear();
 		playerStore.stop();
 		vi.clearAllMocks();
 		vi.useFakeTimers();
 
-		jellyfinApi =
-			(await import('$lib/player/jellyfinPlaybackApi')) as unknown as typeof jellyfinApi;
-		jellyfinApi.startSession.mockResolvedValue('ps-123');
-
 		mockApiGet.mockResolvedValue({
 			url: 'http://jf/Audio/1/stream?static=true',
-			seekable: true,
-			playSessionId: 'ps-123'
+			seekable: true
 		});
 		mockApiHead.mockResolvedValue(new Response(null, { status: 200 }));
 	});
@@ -529,7 +478,6 @@ describe('Jellyfin session lifecycle', () => {
 		return makeItem({
 			sourceType: 'jellyfin',
 			trackSourceId: 'jf-1',
-			streamUrl: undefined,
 			...overrides
 		});
 	}
@@ -538,7 +486,7 @@ describe('Jellyfin session lifecycle', () => {
 		playerStore.playQueue([makeJellyfinItem()]);
 		await vi.advanceTimersByTimeAsync(0);
 
-		expect(jellyfinApi.startSession).toHaveBeenCalledWith('jf-1', undefined);
+		expect(startPlaybackSession).toHaveBeenCalledWith({ source: 'jellyfin', track_id: 'jf-1' });
 	});
 
 	it('calls reportStop when switching tracks', async () => {
@@ -555,33 +503,27 @@ describe('Jellyfin session lifecycle', () => {
 		playerStore.nextTrack();
 		await vi.advanceTimersByTimeAsync(0);
 
-		expect(jellyfinApi.reportStop).toHaveBeenCalledWith('jf-1', 'ps-123', expect.any(Number));
+		expect(stopPlaybackSession).toHaveBeenCalledWith({
+			source: 'jellyfin',
+			track_id: 'jf-1',
+			position_ms: expect.any(Number)
+		});
 	});
 });
 
 describe('beforeunload beacon', () => {
 	let addEventListenerSpy: ReturnType<typeof vi.fn>;
 	let sendBeaconMock: ReturnType<typeof vi.fn>;
-	let jellyfinApi: {
-		startSession: ReturnType<typeof vi.fn>;
-		reportProgress: ReturnType<typeof vi.fn>;
-		reportStop: ReturnType<typeof vi.fn>;
-	};
 
-	beforeEach(async () => {
+	beforeEach(() => {
 		localStorage.clear();
 		playerStore.stop();
 		vi.clearAllMocks();
 		vi.useFakeTimers();
 
-		jellyfinApi =
-			(await import('$lib/player/jellyfinPlaybackApi')) as unknown as typeof jellyfinApi;
-		jellyfinApi.startSession.mockResolvedValue('ps-beacon');
-
 		mockApiGet.mockResolvedValue({
 			url: 'http://jf/Audio/1/stream?static=true',
-			seekable: true,
-			playSessionId: 'ps-beacon'
+			seekable: true
 		});
 		mockApiHead.mockResolvedValue(new Response(null, { status: 200 }));
 
@@ -624,7 +566,6 @@ describe('beforeunload beacon', () => {
 		return makeItem({
 			sourceType: 'jellyfin',
 			trackSourceId: 'jf-beacon',
-			streamUrl: undefined,
 			...overrides
 		});
 	}
@@ -756,5 +697,60 @@ describe('track failure reporting', () => {
 			'"Plex Track" failed on local (stream failed), skipping...',
 			'warning'
 		);
+	});
+
+	it('drops a local track the library no longer has, with one notice', async () => {
+		mockApiHead.mockResolvedValue(new Response(null, { status: 404 }));
+		playerStore.playQueue(singleSourceItems(3));
+		await vi.advanceTimersByTimeAsync(0);
+
+		// One failed load reports more than once.
+		fireCurrentTrackError();
+		fireCurrentTrackError();
+		await vi.advanceTimersByTimeAsync(0);
+
+		expect(mockApiHead).toHaveBeenCalledTimes(1);
+		expect(playerStore.queue.map((item) => item.trackSourceId)).toEqual(['vid-1', 'vid-2']);
+		expect(playerStore.nowPlaying?.trackName).toBe('Track 2');
+		expect(playbackToast.show).toHaveBeenCalledWith(
+			'"Track 1" is no longer in the library',
+			'info'
+		);
+		expect(playbackToast.show).not.toHaveBeenCalledWith(
+			expect.stringContaining('retrying'),
+			'warning'
+		);
+	});
+
+	it('resumes the next track paused when the saved one left the library', async () => {
+		playerStore.playQueue(singleSourceItems(2));
+		await vi.advanceTimersByTimeAsync(0);
+		vi.clearAllMocks();
+		mockApiHead.mockResolvedValue(new Response(null, { status: 404 }));
+
+		playerStore.resumeSession();
+		await vi.advanceTimersByTimeAsync(0);
+		fireCurrentTrackError();
+		await vi.advanceTimersByTimeAsync(0);
+
+		expect(playerStore.queue.map((item) => item.trackSourceId)).toEqual(['vid-1']);
+		expect(playerStore.nowPlaying?.trackName).toBe('Track 2');
+		expect(playerStore.isPlaying).toBe(false);
+		expect(playbackToast.show).toHaveBeenCalledWith(
+			'"Track 1" is no longer in the library',
+			'info'
+		);
+	});
+
+	it('takes the tracks a removal took out of the queue', async () => {
+		playerStore.playQueue(singleSourceItems(3));
+		await vi.advanceTimersByTimeAsync(0);
+
+		playerStore.dropTracks(['vid-0', 'vid-2', 'not-queued']);
+		await vi.advanceTimersByTimeAsync(0);
+
+		expect(playerStore.queue.map((item) => item.trackSourceId)).toEqual(['vid-1']);
+		expect(playerStore.currentIndex).toBe(0);
+		expect(playerStore.nowPlaying?.trackName).toBe('Track 2');
 	});
 });

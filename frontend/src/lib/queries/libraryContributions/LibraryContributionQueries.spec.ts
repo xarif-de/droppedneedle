@@ -5,23 +5,24 @@ vi.mock('@tanstack/svelte-query', () => ({
 }));
 
 vi.mock('$lib/api/client', () => ({
-	api: { global: { v3: { GET: vi.fn() } } }
+	api: { v3: { GET: vi.fn() } }
 }));
 
 vi.mock('$lib/stores/authStore.svelte', () => ({
 	authStore: { user: { id: 'user-1' } }
 }));
 
-vi.mock('$lib/queries/library/LibraryCatalogInvalidation', () => ({
-	invalidateLibraryCatalog: vi.fn()
+vi.mock('$lib/queries/effects', () => ({
+	applyEffects: vi.fn(),
+	catalogChanged: vi.fn()
 }));
 
 import { api } from '$lib/api/client';
-import { invalidateLibraryCatalog } from '$lib/queries/library/LibraryCatalogInvalidation';
+import { applyEffects } from '$lib/queries/effects';
 import { LibraryContributionQueryKeyFactory } from './LibraryContributionQueryKeyFactory';
 import { getLibraryContributionQuery } from './LibraryContributionQueries.svelte';
 
-const mockGet = vi.mocked(api.global.v3.GET) as unknown as Mock;
+const mockGet = vi.mocked(api.v3.GET) as unknown as Mock;
 
 beforeEach(() => {
 	vi.clearAllMocks();
@@ -31,8 +32,8 @@ beforeEach(() => {
 describe('library contribution queries', () => {
 	it('keeps every key scoped to the signed-in user', () => {
 		expect(LibraryContributionQueryKeyFactory.detail('user-1', 'draft-1')).toEqual([
+			'user:user-1',
 			'library-contributions',
-			'user-1',
 			'detail',
 			'draft-1'
 		]);
@@ -65,7 +66,7 @@ describe('library contribution queries', () => {
 
 		await query.queryFn({ signal: new AbortController().signal });
 
-		expect(invalidateLibraryCatalog).not.toHaveBeenCalled();
+		expect(applyEffects).not.toHaveBeenCalled();
 		// default refetch semantics - the old 'always' re-triggered the sweep loop
 		expect(query.refetchOnMount).toBeUndefined();
 	});

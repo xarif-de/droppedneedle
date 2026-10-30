@@ -5,9 +5,7 @@ vi.mock('@tanstack/svelte-query', () => ({
 }));
 
 vi.mock('$lib/api/client', () => ({
-	api: {
-		global: { v3: { GET: vi.fn() } }
-	}
+	api: { v3: { GET: vi.fn() } }
 }));
 vi.mock('$app/environment', () => ({ browser: true }));
 
@@ -18,7 +16,7 @@ import { MusicBrainzQueryKeyFactory } from './MusicBrainzQueryKeyFactory';
 import { getMusicBrainzSourceScope, resetMusicBrainzSourceScope } from './sourceScope.svelte';
 import type { MusicBrainzSettingsResponse } from './types';
 
-const mockGet = vi.mocked(api.global.v3.GET) as unknown as Mock;
+const mockGet = vi.mocked(api.v3.GET) as unknown as Mock;
 
 const storage = new Map<string, string>();
 
@@ -74,31 +72,12 @@ beforeEach(() => {
 afterEach(() => {
 	authStore.clear();
 });
-describe('MusicBrainzQueryKeyFactory', () => {
-	it('scopes settings by user and source identity', () => {
-		const key = MusicBrainzQueryKeyFactory.settings();
-		expect(key.slice(0, 2)).toEqual(['musicbrainz', 'settings']);
-		expect(key[2]).toEqual(
-			expect.objectContaining({
-				user_id: null,
-				source_mode: 'brainzmash',
-				source_id: '',
-				generation: 0
-			})
-		);
-	});
-});
-
 describe('getMusicBrainzSettingsQuery', () => {
 	it('uses the registry endpoint, forwards the abort signal, and updates source scope', async () => {
 		const options = getMusicBrainzSettingsQuery() as unknown as QueryOptions;
 		const signal = new AbortController().signal;
-		expect(options.queryKey).toHaveLength(3);
-		expect(options.queryKey.slice(0, 2)).toEqual(['musicbrainz', 'settings']);
+		expect(options.queryKey).toEqual(MusicBrainzQueryKeyFactory.settings(null));
 		await options.queryFn({ signal });
-		expect(MusicBrainzQueryKeyFactory.settings()[2]).toEqual(
-			expect.objectContaining({ source_id: 'source-a', generation: 1 })
-		);
 		expect(mockGet).toHaveBeenCalledWith('/api/v3/settings/musicbrainz', { signal });
 	});
 	it('does not publish a response to a different active user', async () => {
@@ -116,7 +95,7 @@ describe('getMusicBrainzSettingsQuery', () => {
 
 		authStore.setUser(user('user-a'));
 		const options = getMusicBrainzSettingsQuery() as unknown as QueryOptions;
-		expect(options.queryKey[2]).toEqual(expect.objectContaining({ user_id: 'user-a' }));
+		expect(options.queryKey).toEqual(MusicBrainzQueryKeyFactory.settings('user-a'));
 		const request = options.queryFn({ signal: new AbortController().signal });
 
 		authStore.setUser(user('user-b'));

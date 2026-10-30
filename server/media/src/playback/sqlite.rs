@@ -5,8 +5,8 @@
 //! forms of [`Db`]: reads go through the request read pool and a play is
 //! one background write on the writer lane. Catalog reads hit
 //! `local_tracks`, plays land in `library_play_history`, preferences and
-//! the scrobble credentials come from the [`ListeningStore`], links read
-//! `user_connections`, and display names resolve from `auth_users`. The
+//! the scrobble credentials and links come from the [`ListeningStore`],
+//! and display names resolve from `auth_users`. The
 //! statements are in `sql.rs`.
 //!
 //! Every call runs through [`off_worker`], which moves a multi-threaded
@@ -23,11 +23,9 @@ use std::sync::Arc;
 
 use droppedneedle_auth::times::{parse_iso, to_iso};
 use droppedneedle_auth::users::stores::{LastFmKeys, LastFmSwitch};
-use droppedneedle_kernel::clock::Clock;
 use droppedneedle_kernel::db::{Db, DbError, Lane};
 use droppedneedle_kernel::ids::IdGenerator;
 use droppedneedle_kernel::jobs::queue::{JobError, JobQueue};
-use droppedneedle_kernel::runtime_config::crypto::Crypto;
 use droppedneedle_library::repairs::plays::{Matched, PlayKeys, match_play};
 use rusqlite::OptionalExtension;
 
@@ -60,22 +58,20 @@ pub struct StoredPlay {
     pub recording_mbid: Option<String>,
     /// Track length in milliseconds (0 when unknown).
     pub duration_ms: i64,
-    /// Play time, unix seconds.
-    pub played_at: i64,
+    /// Play time, unix seconds; `None` when the stored time does not read.
+    pub played_at: Option<i64>,
 }
 
 impl PlaybackStore {
     /// Playback reads and writes on `db`: plays take their ids from `ids`,
-    /// links open under `crypto`, preference saves are dated by `clock`,
-    /// and scrobble jobs go on `jobs`.
+    /// preferences and links come from `listening`, and scrobble jobs go
+    /// on `jobs`.
     pub fn new(
         db: Db,
         ids: Arc<dyn IdGenerator>,
-        crypto: Arc<Crypto>,
-        clock: Arc<dyn Clock>,
+        listening: ListeningStore,
         jobs: JobQueue,
     ) -> Self {
-        let listening = ListeningStore::new(db.clone(), crypto, clock);
         Self {
             db,
             ids,
@@ -119,7 +115,7 @@ impl PlaybackStore {
                                 album_name: row.get(3)?,
                                 recording_mbid: row.get(4)?,
                                 duration_ms: row.get::<_, Option<i64>>(5)?.unwrap_or(0),
-                                played_at: 0,
+                                played_at: None,
                             },
                             row.get::<_, String>(6)?,
                         ))
@@ -128,9 +124,9 @@ impl PlaybackStore {
             })
             .await
             .map(|found| {
-                found.and_then(|(play, played_at)| {
-                    let played_at = parse_iso(&played_at)?;
-                    Some(StoredPlay { played_at, ..play })
+                found.map(|(play, played_at)| StoredPlay {
+                    played_at: parse_iso(&played_at),
+                    ..play
                 })
             })
     }
@@ -162,7 +158,7 @@ impl PlaybackStore {
         off_worker(|| {
             Ok((
                 self.listening.prefs_blocking(user_id)?,
-                self.read_links(user_id)?,
+                self.listening.scrobble_links_blocking(user_id)?,
             ))
         })
     }
@@ -211,7 +207,7 @@ impl PlaybackStore {
         off_worker(|| {
             or_logged(
                 "playback-scrobble-links",
-                self.read_links(user_id),
+                self.listening.scrobble_links_blocking(user_id),
                 ScrobbleTargets::default,
             )
         })
@@ -279,6 +275,7 @@ impl PlaybackStore {
                         rg_mbid: row
                             .get::<_, Option<String>>("rg_mbid")?
                             .filter(|mbid| !mbid.is_empty()),
+                        album_id: row.get("local_album_id")?,
                     })
                 })
                 .optional()?;
@@ -389,40 +386,6 @@ fn remote_match(conn: &rusqlite::Connection, record: &PlayRecord) -> Option<Stri
 }
 
 impl PlaybackStore {
-    /// Linked scrobble services from `user_connections`: a ListenBrainz
-    /// row (its document is sealed whole, so presence is the signal) and
-    /// a Last.fm row whose plain document carries a session key. A failed
-    /// read reads as unlinked.
-    fn read_links(&self, user_id: &str) -> Result<ScrobbleTargets, DbError> {
-        let rows = self.db.read_blocking("playback-scrobble-links", |conn| {
-            let mut query = conn.prepare(sql::SCROBBLE_LINKS.text())?;
-            let rows = query
-                .query_map([user_id], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok::<_, DbError>(rows)
-        })?;
-        let mut targets = ScrobbleTargets::default();
-        for (service, data) in rows {
-            match service.as_str() {
-                "listenbrainz" => targets.listenbrainz = true,
-                "lastfm" => {
-                    targets.lastfm = serde_json::from_str::<serde_json::Value>(&data)
-                        .ok()
-                        .and_then(|doc| {
-                            doc.get("session_key")
-                                .and_then(serde_json::Value::as_str)
-                                .map(|key| !key.is_empty())
-                        })
-                        .unwrap_or(false);
-                }
-                _ => {}
-            }
-        }
-        Ok(targets)
-    }
-
     /// The user's display name, else their username; `None` when neither
     /// is set or the user is gone.
     fn read_display_name(&self, user_id: &str) -> Result<Option<String>, DbError> {

@@ -62,6 +62,17 @@ In **Settings > Plugins**, paste the repository URL and press **Preview**.
   tag) as it is now.
 - `https://github.com/owner/repo/commit/<sha>` installs that commit.
 
+DroppedNeedle keeps its GitHub requests under GitHub's limit for servers
+without an account: 10 at once, then about 50 an hour, shared by installs,
+updates and DroppedNeedle's own update check. A preview uses 4 requests
+from a plain repository URL and 3 from the other kinds. An install uses
+4 from a plain URL and 2 from the others, and an update 3 or 4. So
+after the first preview and install, about six plain-URL installs fit in
+an hour. When a preview, install or update would not fit, it stops before
+sending anything and says how long to wait, for example "GitHub requests
+are paced. Try again in 3 minutes." That wait covers the whole operation,
+and it is usually DroppedNeedle's own pacing, not a limit from GitHub.
+
 The preview lists the plugin's name, version, author, the exact commit, and
 what the plugin asks to do. Press **Install** to write it. The plugin arrives
 disabled; enable it, fill in its settings, and save.
@@ -210,10 +221,10 @@ server carries on as if the plugin had said nothing.
 | Capability | Methods | Time limit | When a plugin fails |
 |---|---|---|---|
 | `scrobbler` | `on_scrobble(event)` | 10 s | the play is still recorded |
-| `purchase_links` | `purchase_links(artist, album, release_group_mbid)` | 10 s | no links from it |
+| `purchase_links` | `purchase_links(artist, album, release_group_mbid)` | 10 s | no links from it, and the album asks again next time |
 | `subscriber` | `on_event(event)` | 5 s | that event is skipped |
 | `publisher` | `handle_route(method, subpath, query, body)` for `[[route]]`s; `await ctx.publish(kind, payload)` | 5 s | the route answers 502 |
-| `metadata_provider` | `enrich_artist(...)`, `enrich_album(...)` | 15 s | nothing is filled in |
+| `metadata_provider` | `enrich_artist(...)`, `enrich_album(...)` | 15 s | nothing is filled in, and the page asks again next time |
 | `scheduler` | `on_tick()` | the interval | the next tick runs as normal |
 | `library_writer` | none; allows `await ctx.write_library_file(rel_path, data)` | 8 s per write | the call fails with the reason |
 | `streaming_source` | `resolve_stream(recording_mbid, user_id)` | 5 s | the next plugin is asked |
@@ -351,8 +362,11 @@ one new file under your first library folder and answers the full path. The path
 in lowercase letters, digits, `_`, `-`, `.` and `/`, without hidden or `..`
 parts. A file that already exists is never replaced, nor is a file whose
 name differs only in letter case: the call fails instead. A first library
-folder set to Excluded, or one on a disk that can only add a file by
-checking first and then renaming, takes no plugin files. Each plugin may
+folder set to Excluded, one that isn't there (a share not mounted), one
+reached through a link into another library folder, or one on a disk that
+can only add a file by checking first and then renaming, takes no plugin
+files: the call fails. While the library is switched off, the call fails
+with `the library is switched off; try again once it is on`. Each plugin may
 write 100 MiB and 1000 files a day; past either the call fails until older
 writes are a day old. The allowance is kept in the database, so a restart
 does not reset it, and a write that failed or was undone by itself does not
@@ -646,7 +660,7 @@ server does not know, reads as `unknown`.
 | `host.publish` | `{kind, payload, causation_id?}` | `{ok, status, retry_after, error}` |
 | `host.state.get` | `{key}` | `{value}` (`null` when unset) |
 | `host.state.set` | `{key, value}` | `{}` |
-| `host.library.write` | `{rel_path, data_base64}` | `{path, bundle_id}`; refused (-32001) for a bad path, a file over 6,288,384 bytes, an existing file, a library that stays busy for 8 s or over the daily allowance |
+| `host.library.write` | `{rel_path, data_base64}` | `{path, bundle_id}`; refused (-32001) for a bad path, a file over 6,288,384 bytes, an existing file, a library that is switched off or stays busy for 8 s, or over the daily allowance |
 
 State keys are 1-64 lowercase letters, digits, `_`, `-` or `/`, starting
 with a letter or digit; values are strings up to 1 MiB. One plugin may keep

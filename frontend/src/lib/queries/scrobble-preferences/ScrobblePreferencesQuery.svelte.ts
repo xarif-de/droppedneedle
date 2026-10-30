@@ -10,11 +10,11 @@ export const getScrobblePreferencesQueryOptions = (userId: string | undefined) =
 	queryOptions({
 		queryKey: ScrobblePreferencesQueryKeyFactory.get(userId),
 		queryFn: ({ signal }) =>
-			api.global.v3.GET(SCROBBLE_PREFERENCES_ENDPOINTS.get(), {
+			api.v3.GET(SCROBBLE_PREFERENCES_ENDPOINTS.get(), {
 				signal,
 				timeoutMs: SCROBBLE_PREFERENCES_TIMEOUT_MS
 			}),
-		staleTime: Infinity,
+		// Kept in memory for the whole session: every navigation reads it.
 		gcTime: Infinity
 	});
 

@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { coverSrc } from '$lib/api/covers';
-	import { imageSettingsStore } from '$lib/stores/imageSettings';
+	import { useDirectRemoteImages } from '$lib/queries/AdvancedSettingsReads.svelte';
 	import { Check, MicVocal, RefreshCw } from 'lucide-svelte';
 	import type { ArtistInfo } from '$lib/types';
 	import { extractDominantColor, DEFAULT_GRADIENT } from '$lib/utils/colors';
@@ -11,8 +11,11 @@
 	import HeroBackdrop from './HeroBackdrop.svelte';
 	import IconButton from '$lib/ui/IconButton.svelte';
 	import RatingStars from '$lib/ui/RatingStars.svelte';
+	import FavoriteHeart from './FavoriteHeart.svelte';
 	import { outsideLink } from './outsideLink';
 	import { getArtistImageCreditQuery } from '$lib/queries/artist/ArtistImageCreditQuery.svelte';
+
+	const directRemoteImages = useDirectRemoteImages();
 
 	interface Props {
 		artist: ArtistInfo;
@@ -23,6 +26,10 @@
 		rating?: number;
 		/** Rate the library artist, or clear it with 0. The stars show only with this. */
 		onrate?: (rating: number) => void;
+		/** Whether the caller favorited the library artist. */
+		favorite?: boolean;
+		/** Heart or unheart the library artist. The heart shows beside the stars. */
+		onfavorite?: (favorite: boolean) => void;
 	}
 
 	let {
@@ -31,14 +38,16 @@
 		refreshing = false,
 		onrefresh,
 		rating = 0,
-		onrate
+		onrate,
+		favorite = false,
+		onfavorite
 	}: Props = $props();
 
 	let heroGradient = $state(DEFAULT_GRADIENT);
 	let heroImageLoaded = $state(false);
 
 	let resolvedBackdropUrl = $derived.by(() => {
-		if ($imageSettingsStore.directRemoteImagesEnabled) {
+		if (directRemoteImages.current) {
 			if (artist.banner_url) return artist.banner_url;
 			if (artist.wide_thumb_url) return artist.wide_thumb_url;
 			if (artist.fanart_url) return artist.fanart_url;
@@ -48,7 +57,7 @@
 	});
 
 	let hasDistinctBackdrop = $derived(
-		$imageSettingsStore.directRemoteImagesEnabled &&
+		directRemoteImages.current &&
 			!!(artist.banner_url || artist.wide_thumb_url || artist.fanart_url)
 	);
 
@@ -155,8 +164,11 @@
 					{/if}
 
 					{#if onrate}
-						<div class="mt-2">
+						<div class="mt-2 flex items-center">
 							<RatingStars size="md" value={rating} label={artist.name} onchange={onrate} />
+							{#if onfavorite}
+								<FavoriteHeart size="md" {favorite} onchange={onfavorite} />
+							{/if}
 						</div>
 					{/if}
 

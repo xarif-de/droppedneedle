@@ -1,14 +1,15 @@
-import { createMutation, createQuery, type QueryKey } from '@tanstack/svelte-query';
+import {
+	applyEffects,
+	catalogChanged,
+	createAppMutation,
+	ratingsChanged
+} from '$lib/queries/effects';
+import { createQuery, type QueryKey } from '@tanstack/svelte-query';
 import { api } from '$lib/api/client';
 import type { components } from '$lib/api/v3/openapi';
 import { authStore } from '$lib/stores/authStore.svelte';
 import { toastStore } from '$lib/stores/toast';
-import { invalidateLibraryCatalog } from '$lib/queries/library/LibraryCatalogInvalidation';
-import {
-	invalidateQueriesWithPersister,
-	queryClient,
-	setQueryDataWithPersister
-} from '../QueryClient';
+import { queryClient, setQueryDataWithPersister } from '../QueryClient';
 import { RatingQueryKeyFactory, type RatingKind } from './RatingQueryKeyFactory';
 import { RatingV3Api } from './RatingV3Api';
 
@@ -49,7 +50,7 @@ export const getRatingsQuery = (getIds: () => RatingIds | null) =>
 			queryKey: key,
 			enabled: Boolean(userId && (albumIds.length || trackIds.length || artistIds.length)),
 			queryFn: ({ signal }) =>
-				api.global.v3.POST(
+				api.v3.POST(
 					RatingV3Api.lookup(),
 					{ album_ids: albumIds, track_ids: trackIds, artist_ids: artistIds },
 					{ signal }
@@ -82,12 +83,14 @@ function withRating(lookup: RatingLookup, { kind, itemId, rating }: RateVars): R
  * once and go back if the save fails. Ratings save one at a time, so quick
  * clicks end on the last one.
  */
+const SET_RATING = ['set-rating'] as const;
+
 export function setRating() {
-	return createMutation(() => ({
-		mutationKey: RatingQueryKeyFactory.prefix,
+	return createAppMutation(() => ({
+		mutationKey: SET_RATING,
 		scope: { id: 'ratings' },
 		mutationFn: ({ kind, itemId, rating }: RateVars) =>
-			api.global.v3.PUT(RatingV3Api.rating(kind, itemId), { rating }),
+			api.v3.PUT(RatingV3Api.rating(kind, itemId), { rating }),
 		onMutate: async (vars: RateVars) => {
 			const root = RatingQueryKeyFactory.user(authStore.user?.id);
 			await queryClient.cancelQueries({ queryKey: root });
@@ -105,16 +108,13 @@ export function setRating() {
 			}
 			toastStore.show({ message: "Couldn't save the rating.", type: 'error' });
 		},
-		onSuccess: (answer, vars) => {
-			// The item was merged: move the page to its current ids.
-			if (answer.item_id !== vars.itemId) void invalidateLibraryCatalog();
-		},
+		// The item was merged: move the page to its current ids.
+		effects: (answer, vars) =>
+			answer.item_id !== vars.itemId ? [catalogChanged(authStore.user?.id)] : [],
 		onSettled: () => {
 			// A later click is still saving: its own settle reads the result.
-			if (queryClient.isMutating({ mutationKey: RatingQueryKeyFactory.prefix }) > 1) return;
-			void invalidateQueriesWithPersister({
-				queryKey: RatingQueryKeyFactory.user(authStore.user?.id)
-			});
+			if (queryClient.isMutating({ mutationKey: SET_RATING }) > 1) return;
+			void applyEffects(ratingsChanged(authStore.user?.id));
 		}
 	}));
 }

@@ -1,45 +1,39 @@
-import { createMutation } from '@tanstack/svelte-query';
 import { api } from '$lib/api/client';
-import { invalidateQueriesWithPersister } from '$lib/queries/QueryClient';
 import { toastStore } from '$lib/stores/toast';
-import { searchStore } from '$lib/stores/search';
-import { ArtistQueryKeyFactory } from '$lib/queries/artist/ArtistQueryKeyFactory';
-import { DiscoverQueryKeyFactory } from '$lib/queries/discover/DiscoverQueryKeyFactory';
-import { HomeQueryKeyFactory } from '$lib/queries/HomeQueryKeyFactory';
-import { LibraryQueryKeyFactory } from './LibraryQueryKeyFactory';
+import { authStore } from '$lib/stores/authStore.svelte';
 import { LibraryV3Api } from './LibraryV3Api';
 import { toOperationResponse } from './libraryOperationAdapters';
 import { createUuid } from '$lib/utils/uuid';
+import {
+	anyLibraryActivityChanged,
+	catalogChanged,
+	createAppMutation,
+	type Effect,
+	repairsChanged,
+	reviewsChanged
+} from '$lib/queries/effects';
 
-async function invalidateRepairs(catalogChanged = false): Promise<void> {
-	if (catalogChanged) searchStore.clear();
-	await Promise.all([
-		invalidateQueriesWithPersister({ queryKey: LibraryQueryKeyFactory.repairsPrefix() }),
-		invalidateQueriesWithPersister({ queryKey: LibraryQueryKeyFactory.activityPrefix() }),
-		invalidateQueriesWithPersister({ queryKey: LibraryQueryKeyFactory.reviewsPrefix() }),
-		...(catalogChanged
-			? [
-					invalidateQueriesWithPersister({ queryKey: LibraryQueryKeyFactory.all }),
-					invalidateQueriesWithPersister({ queryKey: ArtistQueryKeyFactory.prefix }),
-					invalidateQueriesWithPersister({ queryKey: HomeQueryKeyFactory.prefix }),
-					invalidateQueriesWithPersister({ queryKey: DiscoverQueryKeyFactory.prefix })
-				]
-			: [])
-	]);
+function repairs(catalog = false): Effect[] {
+	return [
+		repairsChanged(),
+		anyLibraryActivityChanged(),
+		reviewsChanged(),
+		...(catalog ? [catalogChanged(authStore.user?.id)] : [])
+	];
 }
 
 export function createLibraryRepair() {
-	return createMutation(() => ({
+	return createAppMutation(() => ({
 		mutationFn: async (rootIds: string[]) =>
 			toOperationResponse(
-				await api.global.v3.POST(LibraryV3Api.identityRepairs(), {
+				await api.v3.POST(LibraryV3Api.identityRepairs(), {
 					idempotency_key: createUuid(),
 					root_ids: rootIds,
 					target_matcher_version: 'quiet-reconfirm-v1'
 				})
 			),
-		onSuccess: async () => {
-			await invalidateRepairs();
+		effects: () => repairs(),
+		onSuccess: () => {
 			toastStore.show({ message: 'Identity recheck started', type: 'success' });
 		},
 		onError: () =>
@@ -48,15 +42,15 @@ export function createLibraryRepair() {
 }
 
 export function applyLibraryRepair() {
-	return createMutation(() => ({
+	return createAppMutation(() => ({
 		mutationFn: async (input: { jobId: string; expectedRevision: number }) =>
 			toOperationResponse(
-				await api.global.v3.POST(LibraryV3Api.applyIdentityRepair(input.jobId), {
+				await api.v3.POST(LibraryV3Api.applyIdentityRepair(input.jobId), {
 					expected_row_revision: input.expectedRevision,
 					confirmation: true
 				})
 			),
-		onSuccess: () => invalidateRepairs(true),
+		effects: () => repairs(true),
 		onError: () => toastStore.show({ message: 'Could not apply the repair', type: 'error' })
 	}));
 }

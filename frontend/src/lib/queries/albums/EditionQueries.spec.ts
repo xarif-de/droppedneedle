@@ -17,27 +17,12 @@ vi.mock('@tanstack/svelte-query', () => ({
 }));
 
 vi.mock('$lib/api/client', () => ({
-	api: { global: { v3: h.v3 } }
-}));
-
-vi.mock('$lib/constants', () => ({
-	CACHE_TTL: { ALBUM_DETAIL_EDITIONS: 60_000 }
+	api: { v3: h.v3 }
 }));
 
 vi.mock('$lib/queries/QueryClient', () => ({
 	invalidateQueriesWithPersister: h.invalidate,
 	queryClient: { getQueryData: () => h.cached }
-}));
-
-vi.mock('$lib/queries/library-management/LibraryManagementInvalidation', () => ({
-	invalidateLibraryManagementSurfaces: h.invalidate
-}));
-
-vi.mock('$lib/queries/downloads/DownloadQueryKeyFactory', () => ({
-	DownloadQueryKeyFactory: {
-		tasks: (userId: string | undefined) => ['downloads', 'tasks', userId, 'user', 0],
-		tasksPrefix: (userId: string | undefined) => ['downloads', 'tasks', userId]
-	}
 }));
 
 vi.mock('$lib/stores/authStore.svelte', () => ({
@@ -47,7 +32,6 @@ vi.mock('$lib/stores/authStore.svelte', () => ({
 import {
 	acquireEdition,
 	chooseAlbumEdition,
-	editionsKey,
 	getAlbumEditionStatusQuery,
 	getAlbumEditionsQuery,
 	handBackAlbumEdition,
@@ -66,7 +50,7 @@ type EditionQueryOptions = {
 type EditionMutationOptions = {
 	mutationFn: (variables: Record<string, unknown>) => Promise<unknown>;
 	onSuccess: (data: unknown, variables: Record<string, unknown>) => Promise<unknown>;
-	onSettled: (data: unknown, error: unknown, variables: Record<string, unknown>) => unknown;
+	onError: (error: unknown, variables: Record<string, unknown>) => unknown;
 };
 
 beforeEach(() => {
@@ -75,17 +59,10 @@ beforeEach(() => {
 	h.cached = undefined;
 });
 
-it('includes the authenticated user in every editions query key', () => {
-	const userA = editionsKey('user-a', 'release-group');
-	const userB = editionsKey('user-b', 'release-group');
+it('keys the editions by user and drops them on a source switch', () => {
+	const userA = AlbumQueryKeyFactory.editions('user-a', 'release-group');
+	const userB = AlbumQueryKeyFactory.editions('user-b', 'release-group');
 
-	expect(userA).toEqual([
-		'albums',
-		'editions',
-		'user-a',
-		{ user_id: 'user-a', source_mode: 'brainzmash', source_id: '', generation: 0 },
-		'release-group'
-	]);
 	expect(userA).not.toEqual(userB);
 
 	const queryA = getAlbumEditionsQuery(
@@ -101,6 +78,7 @@ it('includes the authenticated user in every editions query key', () => {
 
 	expect(queryA.queryKey).toEqual(userA);
 	expect(queryB.queryKey).toEqual(userB);
+	expect((queryA as unknown as { meta: unknown }).meta).toEqual({ provider: 'musicbrainz' });
 	expect(queryA.enabled).toBe(true);
 });
 
@@ -124,13 +102,13 @@ it('refreshes the copy, its plans and pages and both groups after a choice', asy
 	const invalidated = h.invalidate.mock.calls.map(([arg]) => arg.queryKey);
 	expect(invalidated).toEqual(
 		expect.arrayContaining([
-			['library', 'catalog', 'user-a', 'edition', 'local-1'],
-			['library', 'catalog', 'user-a', 'album-detail', 'local-1'],
-			['library', 'catalog', 'user-a', 'album-tracks', 'local-1'],
-			['library', 'catalog', 'user-a', 'album-copies'],
-			['library', 'album'],
-			editionsKey('user-a', 'old-group'),
-			editionsKey('user-a', 'new-group'),
+			['user:user-a', 'library', 'catalog', 'edition', 'local-1'],
+			['user:user-a', 'library', 'catalog', 'album-detail', 'local-1'],
+			['user:user-a', 'library', 'catalog', 'album-tracks', 'local-1'],
+			['user:user-a', 'library', 'catalog', 'album-copies'],
+			['user:user-a', 'library', 'album'],
+			AlbumQueryKeyFactory.editions('user-a', 'old-group'),
+			AlbumQueryKeyFactory.editions('user-a', 'new-group'),
 			AlbumQueryKeyFactory.basic('user-a', 'old-group'),
 			AlbumQueryKeyFactory.basic('user-a', 'new-group'),
 			AlbumQueryKeyFactory.tracks('user-a', 'new-group')
@@ -156,7 +134,7 @@ it('marks the plans stale once the files are placed', async () => {
 		() => 'user-a',
 		() => 'local-1'
 	) as unknown as EditionQueryOptions;
-	const plans = ['library', 'catalog', 'user-a', 'edition', 'local-1', 'plan'];
+	const plans = ['user:user-a', 'library', 'catalog', 'edition', 'local-1', 'plan'];
 	const plansInvalidated = () =>
 		h.invalidate.mock.calls.some(([arg]) => JSON.stringify(arg.queryKey) === JSON.stringify(plans));
 
@@ -184,8 +162,8 @@ it('refreshes the download queue and the album after an acquire, for this user o
 
 	await acquire.onSuccess({}, { mbid: 'release-group' });
 	const keys = h.invalidate.mock.calls.map(([arg]) => JSON.stringify(arg.queryKey));
-	expect(keys).toContain(JSON.stringify(['downloads', 'tasks', 'user-a']));
-	expect(keys).toContain(JSON.stringify(['library', 'album', 'release-group']));
+	expect(keys).toContain(JSON.stringify(['user:user-a', 'downloads', 'tasks']));
+	expect(keys).toContain(JSON.stringify(['user:user-a', 'library', 'album', 'release-group']));
 });
 
 it('reads one copy edition by local id and scopes the key by user', () => {
@@ -197,9 +175,9 @@ it('reads one copy edition by local id and scopes the key by user', () => {
 		) as unknown as EditionQueryOptions;
 
 	expect(queryFor('user-a', 'local-1').queryKey).toEqual([
+		'user:user-a',
 		'library',
 		'catalog',
-		'user-a',
 		'edition',
 		'local-1'
 	]);
@@ -235,17 +213,18 @@ it('matches a file by hand and undoes it, refreshing what the carry can move, re
 		[unmatch, new Error('refused')]
 	] as const) {
 		h.invalidate.mockClear();
-		await done.onSettled(error ? undefined : {}, error, variables);
+		if (error) await done.onError(error, variables);
+		else await done.onSuccess({}, variables);
 		const invalidated = h.invalidate.mock.calls.map(([arg]) => arg.queryKey);
 		expect(invalidated).toEqual(
 			expect.arrayContaining([
-				['library', 'catalog', 'user-a', 'edition', 'local-1'],
-				['library', 'catalog', 'user-a', 'album-detail', 'local-1'],
-				['library', 'catalog', 'user-a', 'album-tracks', 'local-1'],
-				['library', 'catalog', 'user-a', 'album-copies'],
-				['library', 'catalog', 'user-a', 'album-history', 'local-1'],
-				['favorites'],
-				['playlists']
+				['user:user-a', 'library', 'catalog', 'edition', 'local-1'],
+				['user:user-a', 'library', 'catalog', 'album-detail', 'local-1'],
+				['user:user-a', 'library', 'catalog', 'album-tracks', 'local-1'],
+				['user:user-a', 'library', 'catalog', 'album-copies'],
+				['user:user-a', 'library', 'catalog', 'album-history', 'local-1'],
+				['user:user-a', 'library', 'catalog'],
+				['user:user-a', 'playlists']
 			])
 		);
 	}

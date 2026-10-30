@@ -1,13 +1,9 @@
 <script lang="ts">
 	import { Pause, Play, Trash2, TriangleAlert, X } from 'lucide-svelte';
 
-	import { getApiUrl } from '$lib/api/api-utils';
-	import { gatewayStreamUrl } from '$lib/player/playbackGateway';
+	import { streamUrlFor } from '$lib/player/streamUrl';
 	import { removeLibraryTrack } from '$lib/queries/library/LibraryMutations.svelte';
-	import { LibraryQueryKeyFactory } from '$lib/queries/library/LibraryQueryKeyFactory';
-	import { invalidateQueriesWithPersister } from '$lib/queries/QueryClient';
 	import { formatCountdown } from '$lib/queries/downloads/downloadStatus';
-	import { authStore } from '$lib/stores/authStore.svelte';
 	import { toastStore } from '$lib/stores/toast';
 	import type { UnmatchedFile } from './albumEdition';
 	import Button from '$lib/ui/Button.svelte';
@@ -36,12 +32,9 @@
 		confirmingId = null;
 		if (activeId === file.id) stopPreview();
 		remove.mutate(
-			{ fileId: file.id, albumMbid },
+			{ fileId: file.id, albumMbid, albumId },
 			{
 				onSuccess: () => {
-					void invalidateQueriesWithPersister({
-						queryKey: LibraryQueryKeyFactory.catalog.editionPlanPrefix(authStore.user?.id, albumId)
-					});
 					toastStore.show({ message: 'File removed', type: 'success' });
 				},
 				onError: () => toastStore.show({ message: "Couldn't remove this file", type: 'error' })
@@ -78,7 +71,7 @@
 		activeId = file.id;
 		currentTime = 0;
 		mediaDuration = 0;
-		audioEl.src = getApiUrl(gatewayStreamUrl('local', file.id));
+		audioEl.src = streamUrlFor({ sourceType: 'local', trackSourceId: file.id });
 		void audioEl.play().catch(() => (failed = true));
 	}
 

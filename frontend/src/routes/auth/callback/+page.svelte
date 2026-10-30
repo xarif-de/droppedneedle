@@ -4,7 +4,7 @@
 	import { withBasePath } from '$lib/utils/basePath';
 	import { takeSignInReturn } from '$lib/utils/signInReturn';
 	import { authStore } from '$lib/stores/authStore.svelte';
-	import { ApiError } from '$lib/api/client';
+	import { ApiError } from '$lib/api/errors';
 	import { createOidcExchangeMutation } from '$lib/queries/auth/AuthMutations.svelte';
 	import { toAuthUser } from '$lib/queries/auth/types';
 	import { onMount } from 'svelte';

@@ -24,6 +24,7 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
+use droppedneedle_auth::User;
 use droppedneedle_kernel::error::ApiError;
 use droppedneedle_kernel::extract::ValidQuery;
 use droppedneedle_kernel::mount::{Routes, routes};
@@ -470,6 +471,7 @@ fn lookup_response(lookup: CoverLookup, headers: &HeaderMap) -> Response {
 )]
 pub async fn cover_from_release_group(
     State(state): State<CoversState>,
+    _user: User,
     Path(release_group_id): Path<String>,
     headers: HeaderMap,
     ValidQuery(query): ValidQuery<SizeQuery>,
@@ -505,6 +507,7 @@ pub async fn cover_from_release_group(
 )]
 pub async fn cover_from_release(
     State(state): State<CoversState>,
+    _user: User,
     Path(release_id): Path<String>,
     headers: HeaderMap,
     ValidQuery(query): ValidQuery<SizeQuery>,
@@ -540,6 +543,7 @@ pub async fn cover_from_release(
 )]
 pub async fn artist_cover(
     State(state): State<CoversState>,
+    _user: User,
     Path(artist_id): Path<String>,
     headers: HeaderMap,
     ValidQuery(query): ValidQuery<ArtistSizeQuery>,
@@ -565,6 +569,7 @@ pub async fn artist_cover(
 )]
 pub async fn artist_cover_credit(
     State(state): State<CoversState>,
+    _user: User,
     Path(artist_id): Path<String>,
 ) -> axum::Json<ArtistImageCredit> {
     let credit = state
@@ -603,6 +608,7 @@ pub async fn artist_cover_credit(
 )]
 pub async fn album_artwork(
     State(state): State<CoversState>,
+    _user: User,
     Path(album_id): Path<String>,
     headers: HeaderMap,
     ValidQuery(query): ValidQuery<AlbumArtQuery>,
@@ -652,6 +658,7 @@ pub async fn album_artwork(
 )]
 pub async fn library_artist_artwork(
     State(state): State<CoversState>,
+    _user: User,
     Path(artist_id): Path<String>,
     headers: HeaderMap,
     ValidQuery(query): ValidQuery<ArtistArtQuery>,

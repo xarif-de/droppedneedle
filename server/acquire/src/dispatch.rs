@@ -300,15 +300,14 @@ impl DownloadDispatch {
         let now = self.journal.db().now_unix_f64();
         // An album ask without a release fetches the edition the library
         // has chosen for that album (a single track resolves its album
-        // when it is searched for).
+        // when it is searched for). An edition that does not read is never
+        // taken as none: nothing is queued, and a busy read is put back
+        // for a later pass.
         let chosen = match release_mbid {
-            None if !is_track => match chosen_edition(self.journal.db().db(), key).await {
-                Ok(chosen) => chosen.map(|edition| edition.release_mbid),
-                Err(error) => {
-                    tracing::warn!(key, %error, "chosen edition unreadable; dispatching the album");
-                    None
-                }
-            },
+            None if !is_track => chosen_edition(self.journal.db().db(), key)
+                .await
+                .map_err(|error| DispatchError::from(StoreError::Db(error)))?
+                .map(|edition| edition.release_mbid),
             _ => None,
         };
         let release_mbid = release_mbid.or(chosen.as_deref());
@@ -395,7 +394,9 @@ impl DownloadDispatch {
     /// Cancel one task: it goes terminal and its live attempts move to
     /// cleanup with a discard disposition in the same transaction, so the
     /// worker's cleanup pass aborts the transfer and discards the client
-    /// record. Unknown or finished ids are a no-op success.
+    /// record. A failed or partial task is marked cancelled so it is not
+    /// retried by itself. Unknown, completed or cancelled ids are a no-op
+    /// success.
     pub async fn cancel(&self, task_id: &str) -> Result<(), DispatchError> {
         let task_id = task_id.to_owned();
         let clock = self.journal.db().clock().clone();
@@ -424,6 +425,20 @@ impl DownloadDispatch {
             .read_active_for_album(release_group_mbid)
             .await?
             .map(TaskView::from))
+    }
+
+    /// Any live task, album or track, in one release group, across users.
+    pub async fn live_task_in_group(
+        &self,
+        release_group_mbid: &str,
+    ) -> Result<Option<String>, DispatchError> {
+        let group = release_group_mbid.to_owned();
+        Ok(self
+            .journal
+            .read("downloads.live_in_group", move |store| {
+                store.live_task_in_group(&group)
+            })
+            .await?)
     }
 
     /// Whether one task can be reimported (failed or short-landed with

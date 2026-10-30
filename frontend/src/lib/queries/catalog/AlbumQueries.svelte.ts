@@ -2,14 +2,14 @@ import { createQuery } from '@tanstack/svelte-query';
 import type { Getter } from 'runed';
 
 import { api } from '$lib/api/client';
-import { CACHE_TTL } from '$lib/constants';
+import { STALE_SLOW } from '$lib/queries/staleTime';
 import { compareDiscTrack } from '$lib/player/queueHelpers';
 import { YOUTUBE_ENDPOINTS } from '$lib/queries/youtube/endpoints';
 import type { AlbumBasicInfo, YouTubeLink, YouTubeTrackLink } from '$lib/types';
-import { extractServiceStatus } from '$lib/utils/serviceStatus';
 import { AlbumQueryKeyFactory } from './AlbumQueryKeyFactory';
 import { fetchAlbumTracks } from './albumTracks';
 import { CATALOG_ENDPOINTS } from './endpoints';
+import { PERSIST, PERSIST_PROVIDER } from '$lib/queries/persistedCache';
 
 type UserId = string | null | undefined;
 
@@ -20,14 +20,12 @@ export const getAlbumBasicQuery = (getUserId: Getter<UserId>, getAlbumId: Getter
 	createQuery(() => {
 		const albumId = getAlbumId();
 		return {
+			meta: PERSIST_PROVIDER,
 			queryKey: AlbumQueryKeyFactory.basic(getUserId(), albumId),
 			enabled: !!albumId,
-			staleTime: CACHE_TTL.ALBUM_DETAIL_BASIC,
-			queryFn: async ({ signal }: { signal: AbortSignal }): Promise<AlbumBasicInfo> => {
-				const album = await api.global.v3.GET(CATALOG_ENDPOINTS.albumBasic(albumId), { signal });
-				extractServiceStatus(album);
-				return album;
-			}
+			staleTime: STALE_SLOW,
+			queryFn: ({ signal }: { signal: AbortSignal }): Promise<AlbumBasicInfo> =>
+				api.v3.GET(CATALOG_ENDPOINTS.albumBasic(albumId), { signal })
 		};
 	});
 
@@ -35,9 +33,10 @@ export const getAlbumTracksQuery = (getUserId: Getter<UserId>, getAlbumId: Gette
 	createQuery(() => {
 		const albumId = getAlbumId();
 		return {
+			meta: PERSIST_PROVIDER,
 			queryKey: AlbumQueryKeyFactory.tracks(getUserId(), albumId),
 			enabled: !!albumId,
-			staleTime: CACHE_TTL.ALBUM_DETAIL_TRACKS,
+			staleTime: STALE_SLOW,
 			queryFn: ({ signal }: { signal: AbortSignal }) => fetchAlbumTracks(albumId, signal)
 		};
 	});
@@ -56,11 +55,12 @@ export const getMoreByArtistQuery = (
 	createQuery(() => {
 		const { albumId, artistId, enabled } = getParams();
 		return {
+			meta: PERSIST_PROVIDER,
 			queryKey: AlbumQueryKeyFactory.moreByArtist(getUserId(), albumId, artistId),
 			enabled: enabled && !!albumId && !!artistId,
-			staleTime: CACHE_TTL.ALBUM_DETAIL_DISCOVERY,
+			staleTime: STALE_SLOW,
 			queryFn: ({ signal }: { signal: AbortSignal }) =>
-				api.global.v3.GET(CATALOG_ENDPOINTS.moreByArtist(albumId, artistId), { signal })
+				api.v3.GET(CATALOG_ENDPOINTS.moreByArtist(albumId, artistId), { signal })
 		};
 	});
 
@@ -71,11 +71,12 @@ export const getSimilarAlbumsQuery = (
 	createQuery(() => {
 		const { albumId, artistId, enabled } = getParams();
 		return {
+			meta: PERSIST_PROVIDER,
 			queryKey: AlbumQueryKeyFactory.similar(getUserId(), albumId, artistId),
 			enabled: enabled && !!albumId && !!artistId,
-			staleTime: CACHE_TTL.ALBUM_DETAIL_DISCOVERY,
+			staleTime: STALE_SLOW,
 			queryFn: ({ signal }: { signal: AbortSignal }) =>
-				api.global.v3.GET(CATALOG_ENDPOINTS.similarAlbums(albumId, artistId), { signal })
+				api.v3.GET(CATALOG_ENDPOINTS.similarAlbums(albumId, artistId), { signal })
 		};
 	});
 
@@ -89,11 +90,12 @@ export const getAlbumLastFmQuery = (
 		const artistName = params?.artistName ?? '';
 		const albumName = params?.albumName ?? '';
 		return {
+			meta: PERSIST,
 			queryKey: AlbumQueryKeyFactory.lastFm(albumId, artistName, albumName),
 			enabled: !!albumId,
-			staleTime: CACHE_TTL.ALBUM_DETAIL_LASTFM,
+			staleTime: STALE_SLOW,
 			queryFn: async ({ signal }: { signal: AbortSignal }) =>
-				(await api.global.v3.GET(CATALOG_ENDPOINTS.albumLastFm(albumId, artistName, albumName), {
+				(await api.v3.GET(CATALOG_ENDPOINTS.albumLastFm(albumId, artistName, albumName), {
 					signal
 				})) ?? null
 		};
@@ -104,11 +106,12 @@ export const getAlbumYouTubeLinkQuery = (getAlbumId: Getter<string>) =>
 	createQuery(() => {
 		const albumId = getAlbumId();
 		return {
+			meta: PERSIST,
 			queryKey: AlbumQueryKeyFactory.youtubeLink(albumId),
 			enabled: !!albumId,
-			staleTime: CACHE_TTL.ALBUM_DETAIL_YOUTUBE,
+			staleTime: STALE_SLOW,
 			queryFn: async ({ signal }: { signal: AbortSignal }): Promise<YouTubeLink | null> =>
-				(await api.global.v3.GET(YOUTUBE_ENDPOINTS.link(albumId), { signal })) ?? null
+				(await api.v3.GET(YOUTUBE_ENDPOINTS.link(albumId), { signal })) ?? null
 		};
 	});
 
@@ -116,11 +119,12 @@ export const getAlbumYouTubeTrackLinksQuery = (getAlbumId: Getter<string>) =>
 	createQuery(() => {
 		const albumId = getAlbumId();
 		return {
+			meta: PERSIST,
 			queryKey: AlbumQueryKeyFactory.youtubeTrackLinks(albumId),
 			enabled: !!albumId,
-			staleTime: CACHE_TTL.ALBUM_DETAIL_YOUTUBE,
+			staleTime: STALE_SLOW,
 			queryFn: async ({ signal }: { signal: AbortSignal }): Promise<YouTubeTrackLink[]> =>
-				[...(await api.global.v3.GET(YOUTUBE_ENDPOINTS.trackLinks(albumId), { signal }))].sort(
+				[...(await api.v3.GET(YOUTUBE_ENDPOINTS.trackLinks(albumId), { signal }))].sort(
 					compareDiscTrack
 				)
 		};

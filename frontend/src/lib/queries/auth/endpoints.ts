@@ -3,12 +3,7 @@ import { v3, type V3QueryOf } from '$lib/api/v3/endpoint';
 /** What an app asks for at /connect, as its query. */
 export type AppConnectQuery = V3QueryOf<'/api/v3/auth/app-connect/request'>;
 
-/** v3 auth endpoints, built through the typed registry. Login/setup happen
- * before a session exists, so those go through `api.global`, whose requests
- * survive page navigation; both clients share `createClient` and send the
- * session cookie alike, so this is about request lifetime, not credentials.
- * The `adminImport*` endpoints are post-session admin actions and use the
- * navigation-scoped `api` client instead. */
+/** v3 auth endpoints, built through the typed registry. */
 export const AUTH_ENDPOINTS = {
 	providers: v3('/api/v3/auth/providers'),
 	login: v3('/api/v3/auth/login'),
@@ -31,6 +26,8 @@ export const AUTH_ENDPOINTS = {
 	adminCreateUser: v3('/api/v3/admin/users'),
 	adminUser: (userId: string) => v3('/api/v3/admin/users/{id}', { path: { id: userId } }),
 	adminUserRole: (userId: string) => v3('/api/v3/admin/users/{id}/role', { path: { id: userId } }),
+	adminUserSessions: (userId: string) =>
+		v3('/api/v3/admin/users/{id}/sessions', { path: { id: userId } }),
 	adminPasswordRecovery: (userId: string) =>
 		v3('/api/v3/admin/users/{id}/recovery-code', { path: { id: userId } }),
 	adminImportJellyfin: v3('/api/v3/admin/import/jellyfin'),

@@ -3,8 +3,10 @@ import type { Getter } from 'runed';
 
 import { api } from '$lib/api/client';
 import type { components } from '$lib/api/v3/openapi';
-import { CACHE_TTL } from '$lib/constants';
+import { STALE_SLOW } from '$lib/queries/staleTime';
 import { authStore } from '$lib/stores/authStore.svelte';
+import { readNow } from '../readNow';
+import { applyEffects, discoverRadioChanged } from '../effects';
 import { DiscoverV3Api } from './DiscoverV3Api';
 import {
 	DiscoverQueryKeyFactory,
@@ -13,20 +15,17 @@ import {
 } from './DiscoverQueryKeyFactory';
 
 import type { ListenSource, RadioSeedKind } from './types';
+import { PERSIST_PROVIDER, PROVIDER } from '$lib/queries/persistedCache';
 
 export type DiscoverResponseV3 = components['schemas']['DiscoverResponse'];
 export type DiscoveryBatchDetailV3 = components['schemas']['DiscoveryBatchDetail'];
 export type DiscoveryBatchItemStatusV3 = components['schemas']['DiscoveryBatchItemStatus'];
-// Floor between intentional revalidates; active rebuilds stream via the
-// refreshing-poll lane below; tab switches never revalidate.
-const DISCOVER_REVALIDATE_MS = 60_000;
-
 // Keep the persisted recommendations while the server finishes its SWR rebuild.
 async function fetchDiscoverHome(
 	userId: DiscoverV3UserId,
 	signal?: AbortSignal
 ): Promise<DiscoverResponseV3> {
-	const fresh = await api.global.v3.GET(DiscoverV3Api.home(), {
+	const fresh = await api.v3.GET(DiscoverV3Api.home(), {
 		signal,
 		timeoutMs: 15_000
 	});
@@ -50,8 +49,9 @@ async function fetchDiscoverHome(
 export const getDiscoverHomeV3QueryOptions = (userId: DiscoverV3UserId) =>
 	queryOptions({
 		enabled: Boolean(userId),
-		staleTime: DISCOVER_REVALIDATE_MS,
+		staleTime: STALE_SLOW,
 		refetchOnWindowFocus: false,
+		meta: PERSIST_PROVIDER,
 		queryKey: DiscoverQueryKeyFactory.v3.home(userId),
 		queryFn: ({ signal }) => fetchDiscoverHome(userId, signal),
 		refetchInterval: (query: { state: { data?: DiscoverResponseV3 | undefined } }) =>
@@ -64,9 +64,8 @@ export const getDiscoverHomeV3Query = () =>
 export const getDiscoveryBatchesV3Query = (getEnabled: Getter<boolean> = () => true) =>
 	createQuery(() => ({
 		enabled: getEnabled() && Boolean(authStore.user?.id),
-		staleTime: 15_000,
 		queryKey: DiscoverQueryKeyFactory.v3.batches(authStore.user?.id),
-		queryFn: ({ signal }) => api.global.v3.GET(DiscoverV3Api.batches(), { signal })
+		queryFn: ({ signal }) => api.v3.GET(DiscoverV3Api.batches(), { signal })
 	}));
 
 export interface DiscoverV3RadioInput {
@@ -77,6 +76,10 @@ export interface DiscoverV3RadioInput {
 	enabled?: boolean;
 }
 
+/** Reads one radio station again, every page of it. */
+export const refreshDiscoverRadio = (seedType: string, seedId: string) =>
+	applyEffects(discoverRadioChanged(authStore.user?.id, seedType, seedId));
+
 export const getDiscoverRadioV3Query = (getParams: Getter<DiscoverV3RadioInput>) =>
 	createQuery(() => {
 		const params = getParams();
@@ -84,7 +87,8 @@ export const getDiscoverRadioV3Query = (getParams: Getter<DiscoverV3RadioInput>)
 		if (params.count !== undefined) radioParams.count = params.count;
 		if (params.source !== undefined) radioParams.source = params.source;
 		return {
-			staleTime: CACHE_TTL.DISCOVER,
+			staleTime: STALE_SLOW,
+			meta: PROVIDER,
 			queryKey: DiscoverQueryKeyFactory.v3.radio(
 				authStore.user?.id,
 				params.seedType,
@@ -92,7 +96,7 @@ export const getDiscoverRadioV3Query = (getParams: Getter<DiscoverV3RadioInput>)
 				radioParams
 			),
 			queryFn: ({ signal }: { signal?: AbortSignal }) =>
-				api.global.v3.POST(
+				api.v3.POST(
 					DiscoverV3Api.radio(),
 					{
 						seed_type: params.seedType,
@@ -119,14 +123,15 @@ export const getDiscoverPlaylistSuggestionsV3Query = (
 	createQuery(() => {
 		const params = getParams();
 		return {
-			staleTime: CACHE_TTL.DISCOVER,
+			staleTime: STALE_SLOW,
+			meta: PROVIDER,
 			queryKey: DiscoverQueryKeyFactory.v3.playlistSuggestions(
 				authStore.user?.id,
 				params.playlistId,
 				params.count ?? 15
 			),
 			queryFn: ({ signal }: { signal?: AbortSignal }) =>
-				api.global.v3.POST(
+				api.v3.POST(
 					DiscoverV3Api.playlistSuggestions(),
 					{
 						playlist_id: params.playlistId,
@@ -138,3 +143,9 @@ export const getDiscoverPlaylistSuggestionsV3Query = (
 			enabled: (params.enabled ?? true) && !!params.playlistId
 		};
 	});
+
+/** One batch's albums and their progress, read when its row opens. */
+export const fetchDiscoveryBatchV3 = (batchId: string) =>
+	readNow(DiscoverQueryKeyFactory.v3.batch(authStore.user?.id, batchId), (signal) =>
+		api.v3.GET(DiscoverV3Api.batch(batchId), { signal })
+	);

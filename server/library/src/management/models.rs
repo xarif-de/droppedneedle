@@ -597,8 +597,9 @@ pub struct JobDetail {
     pub baseline_available_count: i64,
     /// For an activation dry run: the settings revision it proves.
     pub proposed_settings_revision: Option<String>,
-    /// Media servers told to rescan after the apply.
-    pub external_refreshes: Vec<serde_json::Value>,
+    /// The rescans the apply queued, by media server: their jobs-table
+    /// rows.
+    pub refresh_jobs: Vec<(super::after_apply::RefreshTarget, i64)>,
 }
 
 /// One page of planned files.
@@ -715,11 +716,19 @@ pub enum ManagementError {
     Conflict(String),
     #[error("{0}")]
     Forbidden(&'static str),
+    /// A request that cannot be acted on as sent, with its own code (400).
+    #[error("{}", .0.message)]
+    Refused(crate::operations::reasons::Reason),
     #[error("store: {0}")]
     Store(String),
     /// The database was too busy to answer, or is shutting down.
     #[error("busy: {0}")]
     Busy(String),
+    /// No recycle bin is known while a setting cannot be read: the work
+    /// waits, as on a busy database. The bins' source logs this once per
+    /// change, so a wait on it is not logged again.
+    #[error("{}", crate::mutations::RECYCLE_BIN_UNKNOWN.message)]
+    BinsUnknown,
 }
 
 impl From<droppedneedle_kernel::db::DbError> for ManagementError {

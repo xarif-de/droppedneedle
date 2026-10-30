@@ -10,6 +10,7 @@ use std::path::PathBuf;
 
 use futures_util::future::BoxFuture;
 
+use droppedneedle_kernel::db::DbError;
 use droppedneedle_library::identify::sources::{ReleaseHit, SourceError};
 use droppedneedle_library::matching::Release;
 use droppedneedle_providers::RequestPriority;
@@ -133,7 +134,14 @@ pub enum ImportFailure {
     /// The library folder the files go to is not there (the folder). The
     /// download waits until it is back.
     FolderMissing(String),
+    /// The library-wide switch is off. The download waits until it is on.
+    LibraryOff,
 }
+
+/// The detail a deferred import carries while the library is switched off.
+/// It rides with `library_folder_missing`, the stored code for "the files
+/// wait for the library".
+pub const LIBRARY_OFF_DETAIL: &str = "the library is switched off";
 
 impl ImportFailure {
     pub fn detail(&self) -> &str {
@@ -142,6 +150,7 @@ impl ImportFailure {
             | ImportFailure::Occupied(detail)
             | ImportFailure::NamingScript(detail)
             | ImportFailure::FolderMissing(detail) => detail,
+            ImportFailure::LibraryOff => LIBRARY_OFF_DETAIL,
         }
     }
 }
@@ -177,8 +186,11 @@ pub trait LandingLibrary: Send + Sync {
     /// any: a manual identity, else the edition pin, else the best fit
     /// ([`crate::edition::chosen_edition`], the same answer
     /// acquisition fetched by). The landing honours it over the edition
-    /// the request carried.
-    fn chosen_edition<'a>(&'a self, release_group_mbid: &'a str) -> BoxFuture<'a, Option<String>>;
+    /// the request carried, and waits while it does not read.
+    fn chosen_edition<'a>(
+        &'a self,
+        release_group_mbid: &'a str,
+    ) -> BoxFuture<'a, Result<Option<String>, DbError>>;
 
     /// Tracks the library already holds for a release group; with
     /// `album`, only in that library album (followed to the album it was
@@ -258,6 +270,12 @@ pub trait LandingLibrary: Send + Sync {
     /// resolves the folders.
     fn import_folder(&self) -> Option<PathBuf> {
         None
+    }
+
+    /// Whether the library-wide switch is off, so nothing lands. Blocking:
+    /// it reads the folders.
+    fn library_off(&self) -> bool {
+        false
     }
 
     /// Publish verified files into the library.

@@ -209,15 +209,14 @@ impl LandingLibrary for LibraryLanding {
         self.releases.at(priority).canonical_recording(mbid)
     }
 
-    fn chosen_edition<'a>(&'a self, release_group_mbid: &'a str) -> BoxFuture<'a, Option<String>> {
+    fn chosen_edition<'a>(
+        &'a self,
+        release_group_mbid: &'a str,
+    ) -> BoxFuture<'a, Result<Option<String>, DbError>> {
         Box::pin(async move {
-            match crate::edition::chosen_edition(&self.library.db, release_group_mbid).await {
-                Ok(chosen) => chosen.map(|chosen| chosen.release_mbid),
-                Err(error) => {
-                    tracing::warn!(%error, "chosen edition unreadable; the request's edition is used");
-                    None
-                }
-            }
+            let chosen =
+                crate::edition::chosen_edition(&self.library.db, release_group_mbid).await?;
+            Ok(chosen.map(|chosen| chosen.release_mbid))
         })
     }
 
@@ -420,6 +419,10 @@ impl LandingLibrary for LibraryLanding {
             .collect()
     }
 
+    fn library_off(&self) -> bool {
+        self.library.core.switched_off()
+    }
+
     fn import_folder(&self) -> Option<PathBuf> {
         let registry = self.library.core.live_registry();
         let usable: Vec<_> = registry
@@ -488,6 +491,7 @@ impl LandingLibrary for LibraryLanding {
                 Err(ImportError::FolderMissing(folder)) => {
                     Err(ImportFailure::FolderMissing(folder))
                 }
+                Err(ImportError::LibraryOff) => Err(ImportFailure::LibraryOff),
             }
         })
     }

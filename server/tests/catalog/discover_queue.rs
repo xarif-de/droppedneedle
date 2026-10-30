@@ -27,7 +27,6 @@ use droppedneedle_catalog::reads::discover::services::ReadsDeps;
 use droppedneedle_catalog::reads::discover::wiring::{DiscoverInputs, deps_over, live_network};
 use droppedneedle_kernel::db::{Db, Lane};
 use droppedneedle_kernel::runtime_config::secret_sections::AdvancedSettings;
-use droppedneedle_media::playback::listening::MemoryListenBrainzLinkStore;
 use droppedneedle_providers::{ProviderError, Providers, RequestPriority};
 use serde_json::{Value, json};
 use tower::ServiceExt as _;
@@ -44,7 +43,8 @@ fn group(n: u8) -> String {
 
 /// Scripted listening answers, the network behind the listening data.
 /// Each read answers its field (empty by default). Release-group facts
-/// fail while `musicbrainz_down` is set.
+/// fail while `musicbrainz_down` is set, fresh releases while
+/// `fresh_down` is.
 #[derive(Default)]
 pub(crate) struct Script {
     pub user: UserMusic,
@@ -70,6 +70,7 @@ pub(crate) struct Script {
     pub tag_albums: Vec<TagAlbum>,
     pub release_group: Option<ReleaseGroupFacts>,
     pub musicbrainz_down: AtomicBool,
+    pub fresh_down: AtomicBool,
     /// When set, ListenBrainz top-artist reads wait here until released.
     pub hold: Option<Arc<Hold>>,
 }
@@ -190,6 +191,13 @@ impl ListeningNetwork for Script {
         ok(self.genres.clone())
     }
     fn fresh_releases<'a>(&'a self, _u: &'a str, _p: RequestPriority) -> Answer<'a, Vec<AlbumRow>> {
+        if self.fresh_down.load(Ordering::SeqCst) {
+            return Box::pin(async {
+                Err(ListeningError::MediaServer(
+                    "fresh releases down".to_owned(),
+                ))
+            });
+        }
         ok(self.fresh.clone())
     }
     fn loved<'a>(
@@ -496,20 +504,15 @@ fn queue_script() -> Script {
     }
 }
 
-/// What production discover is built from, over `rig`'s platform,
-/// `providers` and the users' ListenBrainz `links`.
-pub(crate) fn discover_inputs(
-    rig: &AuthRig,
-    dir: &Path,
-    providers: Providers,
-    links: MemoryListenBrainzLinkStore,
-) -> DiscoverInputs {
+/// What production discover is built from, over `rig`'s platform and
+/// `providers`, with the listening store on the rig's database.
+pub(crate) fn discover_inputs(rig: &AuthRig, dir: &Path, providers: Providers) -> DiscoverInputs {
     let platform = &rig.platform;
     DiscoverInputs {
         db: platform.db.clone(),
         http: platform.http.shared().clone(),
         providers: Arc::new(providers),
-        listenbrainz_links: Arc::new(links),
+        listening: crate::common::listening_store(platform),
         youtube_quota_path: dir.join("youtube_quota.json"),
         users: rig.deps.clone(),
         discover_warmer: false,
@@ -529,8 +532,7 @@ pub(crate) fn discover_deps(
     providers: Providers,
     script: impl FnOnce(&mut Arc<dyn ListeningNetwork>),
 ) -> ReadsDeps {
-    let links = MemoryListenBrainzLinkStore::new(rig.platform.crypto.clone());
-    let inputs = discover_inputs(rig, dir, providers, links);
+    let inputs = discover_inputs(rig, dir, providers);
     let mut network = live_network(&inputs, &rig.config);
     script(&mut network);
     deps_over(inputs, &rig.config, network)
@@ -584,7 +586,7 @@ async fn seed_user(db: &Db) {
     db.write(Lane::Foreground, "test.seed", |tx| {
         tx.execute(
             "INSERT INTO auth_users (id, display_name, role, created_at) \
-                 VALUES ('user-1', 'Ada', 'user', '2026-01-01T00:00:00Z')",
+                 VALUES ('user-1', 'Ada', 'user', 0)",
             [],
         )?;
         Ok::<_, droppedneedle_kernel::db::DbError>(())

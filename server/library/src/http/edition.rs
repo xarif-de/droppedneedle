@@ -902,7 +902,7 @@ pub struct RemoveExtrasView {
         (status = 401, description = "Not authenticated"),
         (status = 403, description = "Curator role required"),
         (status = 404, description = "Unknown album or track"),
-        (status = 409, description = "The edition changed since the plan was read (STALE_REVISION), the library is busy, or a file is outside the library folders"),
+        (status = 409, description = "The edition changed since the plan was read (STALE_REVISION), the library is busy or off, or a file is outside the library folders"),
         (status = 422, description = "A file could not be recycled; nothing changed"),
         (status = 503, description = "MusicBrainz is not answering"),
     )
@@ -1299,7 +1299,7 @@ pub async fn get_edition_tags(
     request_body = EditionTagsApplyBody,
     responses(
         (status = 200, description = "Writing", body = EditionTagsJobView),
-        (status = 400, description = "Wrong token or no request key"),
+        (status = 400, description = "Wrong token, another curator's tag write, or no request key"),
         (status = 401, description = "Not authenticated"),
         (status = 403, description = "Curator role required"),
         (status = 404, description = "Unknown tag write, or another curator's"),

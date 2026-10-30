@@ -5,17 +5,17 @@
 	// the app only after the user allows it here.
 	import '../../auth.css';
 	import { page } from '$app/state';
-	import { api, ApiError } from '$lib/api/client';
-	import type { components } from '$lib/api/v3/openapi';
-	import { AUTH_ENDPOINTS, type AppConnectQuery } from '$lib/queries/auth/endpoints';
+	import { ApiError } from '$lib/api/errors';
+	import {
+		authorizeAppConnect,
+		getAppConnectRequestQuery,
+		type ConnectRequest
+	} from '$lib/queries/auth/AppConnectQueries.svelte';
+	import type { AppConnectQuery } from '$lib/queries/auth/endpoints';
 	import { authStore } from '$lib/stores/authStore.svelte';
 	import { appAddress, framed, handBack } from '$lib/utils/appHandBack';
-	import { onMount } from 'svelte';
 	import { KeyRound, TriangleAlert } from 'lucide-svelte';
 	import Button from '$lib/ui/Button.svelte';
-
-	type RequestView = components['schemas']['AppConnectRequestView'];
-	type ConnectRequest = components['schemas']['ConnectRequest'];
 
 	// What the app asked for, as it put it in the address; the server checks
 	// every field.
@@ -41,54 +41,60 @@
 		authStore.user?.username_display ?? authStore.user?.username ?? authStore.user?.display_name
 	);
 
-	let view = $state<RequestView | null>(null);
-	let error = $state<string | null>(null);
-	let backToApp = $state<string | null>(null);
+	// Inside another page nothing is asked: a frame could click Allow.
+	const inFrame = framed();
+	const requestQuery = getAppConnectRequestQuery(() => (inFrame ? null : asQuery(request)));
+	const authorize = authorizeAppConnect();
+	let refused = $state<unknown>(undefined);
 	let busy = $state(false);
 	let handedBack = $state<string | null>(null);
 
-	function fail(cause: unknown) {
-		if (cause instanceof ApiError && cause.status === 404) {
-			error = 'Signing in apps from the browser is not turned on for this server.';
-			return;
-		}
-		if (cause instanceof ApiError && cause.status < 500) {
-			error = cause.message;
-			const details = cause.details as { redirect?: unknown } | null;
-			backToApp = appAddress(details?.redirect);
-			return;
-		}
-		error =
-			cause instanceof ApiError
-				? 'The server could not answer. Try again from the app.'
-				: 'Could not reach the server.';
+	interface Problem {
+		error: string;
+		backToApp: string | null;
 	}
 
-	onMount(async () => {
-		if (framed()) {
-			error = 'This page cannot be used inside another page.';
-			return;
+	function describe(cause: unknown): Problem {
+		if (cause instanceof ApiError && cause.status === 404) {
+			return {
+				error: 'Signing in apps from the browser is not turned on for this server.',
+				backToApp: null
+			};
 		}
-		try {
-			view = await api.v3.GET(AUTH_ENDPOINTS.appConnectRequest(asQuery(request)));
-		} catch (cause) {
-			fail(cause);
+		if (cause instanceof ApiError && cause.status < 500) {
+			const details = cause.details as { redirect?: unknown } | null;
+			return { error: cause.message, backToApp: appAddress(details?.redirect) };
 		}
+		return {
+			error:
+				cause instanceof ApiError
+					? 'The server could not answer. Try again from the app.'
+					: 'Could not reach the server.',
+			backToApp: null
+		};
+	}
+
+	const problem = $derived.by((): Problem | null => {
+		if (inFrame) return { error: 'This page cannot be used inside another page.', backToApp: null };
+		const cause = refused ?? requestQuery.error ?? undefined;
+		return cause === undefined ? null : describe(cause);
 	});
+	const error = $derived(problem?.error ?? null);
+	const backToApp = $derived(problem?.backToApp ?? null);
+	const view = $derived(problem ? null : (requestQuery.data ?? null));
 
 	// Both buttons leave for the app within the click, which is what lets
 	// the browser hand an app address over.
 	async function allow() {
 		busy = true;
 		try {
-			const answer = await api.v3.POST(AUTH_ENDPOINTS.appConnectAuthorize, request);
+			const answer = await authorize.mutateAsync(request);
 			const target = appAddress(answer.redirect);
 			if (!target) throw new Error('not an app address');
 			handedBack = target;
 			handBack(target);
 		} catch (cause) {
-			view = null;
-			fail(cause);
+			refused = cause;
 		} finally {
 			busy = false;
 		}

@@ -1,11 +1,10 @@
 <script lang="ts">
-	import { REMOTE_ENDPOINTS } from '$lib/queries/remotes/endpoints';
+	import { fetchRemoteAlbumInfo, fetchRemoteMix } from '$lib/queries/remotes/RemoteQueries.svelte';
 	import { remoteApi } from '$lib/queries/remotes/remoteApi';
 	import { fetchLocalAlbumMatch } from '$lib/queries/albumMatch';
 	import { Shuffle, Play, ListPlus, ListStart, ListMusic, Info, Download } from 'lucide-svelte';
 	import { goto } from '$app/navigation';
 	import { LocalDownloadsApi } from '$lib/queries/local/LocalDownloadsApi';
-	import { gatewayStreamUrl } from '$lib/player/playbackGateway';
 	import { downloadAlbumArchive, downloadTrackFile } from '$lib/utils/downloadActions';
 	import { playerStore } from '$lib/stores/player.svelte';
 	import { launchLocalPlayback } from '$lib/player/launchLocalPlayback';
@@ -32,7 +31,6 @@
 	import type { QueueItem } from '$lib/player/types';
 	import { getCoverUrl } from '$lib/utils/errorHandling';
 	import { withBasePath } from '$lib/utils/basePath';
-	import { api } from '$lib/api/client';
 	import NowPlayingIndicator from '$lib/components/NowPlayingIndicator.svelte';
 	import { Radio } from 'lucide-svelte';
 	import type { LocalTrackInfo, LocalAlbumSummary } from '$lib/types';
@@ -146,7 +144,7 @@
 		if (seed?.source !== 'jellyfin') return;
 		mixLoading = true;
 		try {
-			const mix = await api.v3.GET(REMOTE_ENDPOINTS.mix('jellyfin', seed.id, { limit: 50 }));
+			const mix = await fetchRemoteMix('jellyfin', seed.id, { limit: 50 });
 			if (mix.items.length > 0) {
 				const items: QueueItem[] = mix.items.map((t) => ({
 					trackSourceId: t.id,
@@ -158,7 +156,6 @@
 					albumName: t.album_name,
 					coverUrl: t.image_url ?? null,
 					sourceType: 'jellyfin' as const,
-					streamUrl: gatewayStreamUrl('jellyfin', t.id),
 					format: REMOTE_FORMAT,
 					recordingIds: recordingFor('jellyfin', t.recording_mbid)
 				}));
@@ -177,7 +174,7 @@
 		infoLoading = true;
 		infoOpen = true;
 		try {
-			const info = await api.v3.GET(REMOTE_ENDPOINTS.infoAlbum('navidrome', target.id));
+			const info = await fetchRemoteAlbumInfo('navidrome', target.id);
 			infoNotes = info.biography;
 			infoLastfmUrl = info.lastfm_url;
 			infoMbid = info.musicbrainz_id;

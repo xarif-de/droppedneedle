@@ -1,14 +1,9 @@
-import { createMutation, useQueryClient } from '@tanstack/svelte-query';
+import { useQueryClient } from '@tanstack/svelte-query';
 import { api } from '$lib/api/client';
 import { authStore } from '$lib/stores/authStore.svelte';
 import { libraryStore } from '$lib/stores/library';
-import { ArtistQueryKeyFactory } from '../artist/ArtistQueryKeyFactory';
-import { DiscoverQueryKeyFactory } from '../discover/DiscoverQueryKeyFactory';
-import { HomeQueryKeyFactory } from '../HomeQueryKeyFactory';
-import { WantedQueryKeyFactory } from '../wanted/WantedQueryKeyFactory';
-import { invalidateQueriesWithPersister, setQueryDataWithPersister } from '../QueryClient';
-import { LOCAL_KEYS } from '../local/LocalV3Keys';
-import { AlbumMatchKeyFactory } from '../albumMatch';
+import { playerStore } from '$lib/stores/player.svelte';
+import { setQueryDataWithPersister } from '../QueryClient';
 import { LibraryQueryKeyFactory } from './LibraryQueryKeyFactory';
 import { LibraryV3Api } from './LibraryV3Api';
 import type {
@@ -17,11 +12,24 @@ import type {
 	LibraryAlbumStatus,
 	LibraryScanSchedule
 } from '$lib/types';
+import {
+	albumLocalCopyChanged,
+	albumRemovalsChanged,
+	albumStatusChanged,
+	anyWantedChanged,
+	applyEffects,
+	catalogChanged,
+	createAppMutation,
+	editionPlansChanged,
+	libraryCountsChanged,
+	localChanged,
+	scanScheduleChanged
+} from '$lib/queries/effects';
 
 export function removeLibraryAlbum() {
-	return createMutation(() => ({
+	return createAppMutation(() => ({
 		mutationFn: ({ mbid, stopWanted }: { mbid: string; stopWanted: boolean }) =>
-			api.global.v3.DELETE(LibraryV3Api.removeAlbum(mbid, stopWanted)) as Promise<
+			api.v3.DELETE(LibraryV3Api.removeAlbum(mbid, stopWanted)) as Promise<
 				AlbumRemoveResponse | TargetCatalogRemovalResponse
 			>,
 		onSuccess: async (result, { mbid: requestedMbid }) => {
@@ -33,9 +41,10 @@ export function removeLibraryAlbum() {
 			for (const mbid of removedMbids) {
 				libraryStore.removeMbid(mbid);
 			}
+			playerStore.dropTracks(removedTrackIds(result));
 			try {
 				await setQueryDataWithPersister<LibraryAlbumStatus>(
-					LibraryQueryKeyFactory.album(requestedMbid),
+					LibraryQueryKeyFactory.album(authStore.user?.id, requestedMbid),
 					(previous) =>
 						previous
 							? {
@@ -52,21 +61,15 @@ export function removeLibraryAlbum() {
 			} catch (error) {
 				console.error('Album removal cache update failed', error);
 			}
-			const refreshes = await Promise.allSettled([
-				invalidateQueriesWithPersister({ queryKey: LibraryQueryKeyFactory.all }),
-				invalidateQueriesWithPersister({ queryKey: ArtistQueryKeyFactory.prefix }),
-				invalidateQueriesWithPersister({ queryKey: HomeQueryKeyFactory.prefix }),
-				invalidateQueriesWithPersister({ queryKey: DiscoverQueryKeyFactory.prefix }),
-				invalidateQueriesWithPersister({ queryKey: WantedQueryKeyFactory.prefix }),
-				invalidateQueriesWithPersister({ queryKey: LOCAL_KEYS.root })
-			]);
-			for (const refresh of refreshes) {
-				if (refresh.status === 'rejected') {
-					console.error('Album removal cache refresh failed', refresh.reason);
-				}
-			}
-		}
+		},
+		effects: () => [catalogChanged(authStore.user?.id), anyWantedChanged()]
 	}));
+}
+
+/** The tracks a removal took out of the library, from its answer. */
+function removedTrackIds(result: object): string[] {
+	if (!('removed_track_ids' in result) || !Array.isArray(result.removed_track_ids)) return [];
+	return result.removed_track_ids.filter((id): id is string => typeof id === 'string');
 }
 
 // Re-invalidate the album status a few times after a rescan. The rescan endpoint
@@ -75,26 +78,26 @@ export function removeLibraryAlbum() {
 const RESCAN_REFRESH_DELAYS_MS = [2500, 6000];
 
 export function rescanAlbum() {
-	return createMutation(() => ({
-		mutationFn: (mbid: string) => api.global.v3.POST(LibraryV3Api.rescanAlbum(mbid)),
+	return createAppMutation(() => ({
+		mutationFn: (mbid: string) => api.v3.POST(LibraryV3Api.rescanAlbum(mbid)),
 		onSuccess: (_data, mbid) => {
-			const invalidate = () =>
-				invalidateQueriesWithPersister({ queryKey: LibraryQueryKeyFactory.album(mbid) });
-			void invalidate();
-			for (const delay of RESCAN_REFRESH_DELAYS_MS) setTimeout(() => void invalidate(), delay);
-		}
+			const status = albumStatusChanged(authStore.user?.id, mbid);
+			for (const delay of RESCAN_REFRESH_DELAYS_MS) {
+				setTimeout(() => void applyEffects(status), delay);
+			}
+		},
+		effects: (_data, mbid) => [albumStatusChanged(authStore.user?.id, mbid)]
 	}));
 }
 
 export function saveLibraryScanSchedule() {
-	return createMutation(() => ({
+	return createAppMutation(() => ({
 		mutationFn: (schedule: LibraryScanSchedule) =>
-			api.global.v3.PUT(LibraryV3Api.schedule(), {
+			api.v3.PUT(LibraryV3Api.schedule(), {
 				scan_frequency: schedule.scan_frequency,
 				daily_scan_time: schedule.daily_scan_time
 			}),
-		onSuccess: () =>
-			invalidateQueriesWithPersister({ queryKey: LibraryQueryKeyFactory.scanSchedule() })
+		effects: () => [scanScheduleChanged()]
 	}));
 }
 
@@ -104,20 +107,24 @@ export function saveLibraryScanSchedule() {
 // AND the local-library lists, in the cache of the page that removed it.
 export function removeLibraryTrack() {
 	const client = useQueryClient();
-	return createMutation(() => ({
-		mutationFn: ({ fileId }: { fileId: string; albumMbid: string }) =>
-			api.global.v3.DELETE(LibraryV3Api.removeTrack(fileId)),
-		onSuccess: async (_data, { albumMbid }) => {
-			const userId = authStore.user?.id;
-			for (const queryKey of [
-				LibraryQueryKeyFactory.album(albumMbid),
-				AlbumMatchKeyFactory.local(userId, albumMbid),
-				LibraryQueryKeyFactory.catalog.stats(userId),
-				LOCAL_KEYS.root,
-				LibraryQueryKeyFactory.catalog.albumRemovalsPrefix(userId)
-			]) {
-				await invalidateQueriesWithPersister({ queryKey }, undefined, { client });
+	return createAppMutation(
+		() => ({
+			// `albumId`, the library album's own id, also refreshes its edition plans.
+			mutationFn: ({ fileId }: { fileId: string; albumMbid: string; albumId?: string }) =>
+				api.v3.DELETE(LibraryV3Api.removeTrack(fileId)),
+			onSuccess: (result) => playerStore.dropTracks(removedTrackIds(result)),
+			effects: (_data, { albumMbid, albumId }) => {
+				const userId = authStore.user?.id;
+				return [
+					albumStatusChanged(userId, albumMbid),
+					albumLocalCopyChanged(userId, albumMbid),
+					libraryCountsChanged(userId),
+					albumRemovalsChanged(userId),
+					localChanged(),
+					...(albumId ? [editionPlansChanged(userId, albumId)] : [])
+				];
 			}
-		}
-	}));
+		}),
+		client
+	);
 }

@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { apiError, fakeApi, type FakeApi, type RouteData } from '$lib/test/api';
 import { renderWithQuery } from '$lib/test/render';
 
-const h = vi.hoisted(() => ({ goto: vi.fn() }));
+const h = vi.hoisted(() => ({ goto: vi.fn(), dropTracks: vi.fn() }));
 
 vi.mock('$app/state', () => ({ page: { url: new URL('http://localhost/album/x') } }));
 vi.mock('$app/navigation', () => ({ goto: (...args: unknown[]) => h.goto(...args) }));
@@ -15,14 +15,16 @@ vi.mock('$lib/stores/player.svelte', () => ({
 		addToQueue: vi.fn(),
 		playNext: vi.fn(),
 		playMultipleNext: vi.fn(),
-		addMultipleToQueue: vi.fn()
+		addMultipleToQueue: vi.fn(),
+		dropTracks: (...args: unknown[]) => h.dropTracks(...args)
 	}
 }));
 
 import AlbumPage from './ProviderAlbumPage.svelte';
 import AlbumRoute from './+page.svelte';
 import { authStore } from '$lib/stores/authStore.svelte';
-import { integrationStore } from '$lib/stores/integration';
+import { HomeQueryKeyFactory } from '$lib/queries/HomeQueryKeyFactory';
+import { setQueryDataWithPersister } from '$lib/queries/QueryClient';
 import { libraryStore } from '$lib/stores/library';
 import { toAuthUser } from '$lib/queries/auth/types';
 
@@ -230,15 +232,25 @@ async function renderPage(id = albumId) {
 
 const trackRow = (title: string) => page.getByRole('listitem').filter({ hasText: title }).first();
 
-beforeEach(() => {
+beforeEach(async () => {
 	localStorage.clear();
 	h.goto.mockReset();
 	status = notHeld;
 	plan = null;
 	history = { items: [] };
 	editionFetch = null;
-	integrationStore.reset();
-	integrationStore.setStatus({ navidrome: true, localfiles: true, library: true });
+	await setQueryDataWithPersister(HomeQueryKeyFactory.integrationStatus('user-1'), {
+		download_client: false,
+		jellyfin: false,
+		lastfm: false,
+		library: true,
+		listenbrainz: false,
+		localfiles: true,
+		navidrome: true,
+		plex: false,
+		youtube: false,
+		youtube_api: false
+	});
 	signIn('admin');
 	api = routes();
 });
@@ -276,6 +288,7 @@ describe('album detail page track removal', () => {
 
 		await expect.element(page.getByRole('dialog')).not.toBeInTheDocument();
 		expect(api.calls(removeRoute).map((call) => call.params.id)).toEqual(['file-0']);
+		expect(h.dropTracks).toHaveBeenCalledWith(['file-0']);
 		await vi.waitFor(() => expect(api.calls(matchRoute).length).toBe(before + 1));
 		expect(api.calls(matchRoute).every((call) => call.params.mbid === albumId)).toBe(true);
 	});

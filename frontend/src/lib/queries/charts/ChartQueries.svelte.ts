@@ -1,10 +1,10 @@
 import { createInfiniteQuery, createQuery } from '@tanstack/svelte-query';
 import { api } from '$lib/api/client';
-import { CACHE_TTL } from '$lib/constants';
 import { authStore } from '$lib/stores/authStore.svelte';
 import type { AlbumRef, ArtistRef, ListenSource, StatsRange } from '../discover/types';
 import { ChartQueryKeyFactory } from './ChartQueryKeyFactory';
 import { HOME_ENDPOINTS, type ChartKind, type ChartPageParams } from './endpoints';
+import { PERSIST } from '$lib/queries/persistedCache';
 
 type Getter<T> = () => T;
 export type ChartItem = AlbumRef | ArtistRef;
@@ -40,13 +40,13 @@ async function fetchChartPage(
 	signal?: AbortSignal
 ): Promise<ChartPage> {
 	if (chart === 'trending-artists') {
-		return api.global.v3.GET(HOME_ENDPOINTS.trendingArtists(params), { signal });
+		return api.v3.GET(HOME_ENDPOINTS.trendingArtists(params), { signal });
 	}
 	const url =
 		chart === 'popular-albums'
 			? HOME_ENDPOINTS.popularAlbums(params)
 			: HOME_ENDPOINTS.yourTopAlbums(params);
-	return api.global.v3.GET(url, { signal });
+	return api.v3.GET(url, { signal });
 }
 
 // The overview shows every range at once: one short page per range.
@@ -55,7 +55,7 @@ export const getChartOverviewQuery = (
 	getSource: Getter<ListenSource | null>
 ) =>
 	createQuery(() => ({
-		staleTime: CACHE_TTL.TIME_RANGE_OVERVIEW,
+		meta: PERSIST,
 		queryKey: ChartQueryKeyFactory.overview(authStore.user?.id, getChart(), getSource()),
 		queryFn: async ({ signal }): Promise<ChartOverview> => {
 			const chart = getChart();
@@ -80,7 +80,7 @@ export const getChartRangeQuery = (
 	getRange: Getter<StatsRange | null>
 ) =>
 	createInfiniteQuery(() => ({
-		staleTime: CACHE_TTL.TIME_RANGE_OVERVIEW,
+		meta: PERSIST,
 		queryKey: ChartQueryKeyFactory.range(
 			authStore.user?.id,
 			getChart(),

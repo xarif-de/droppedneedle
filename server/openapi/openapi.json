@@ -1859,6 +1859,16 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "Last.fm is down (PROVIDER_UNAVAILABLE, with retry_after when known)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -2227,6 +2237,16 @@
           },
           "401": {
             "description": "Not authenticated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "ListenBrainz is down (PROVIDER_UNAVAILABLE, with retry_after when known)",
             "content": {
               "application/json": {
                 "schema": {
@@ -2719,6 +2739,16 @@
           },
           "401": {
             "description": "Not authenticated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Last.fm is down (PROVIDER_UNAVAILABLE, with retry_after when known)",
             "content": {
               "application/json": {
                 "schema": {
@@ -4708,6 +4738,16 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "A source is down (PROVIDER_UNAVAILABLE names an outside one, with retry_after when known)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -4789,6 +4829,16 @@
           },
           "409": {
             "description": "Not configured (NOT_CONFIGURED) or not built in this version yet (NOT_AVAILABLE)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "A source is down (PROVIDER_UNAVAILABLE names an outside one, with retry_after when known)",
             "content": {
               "application/json": {
                 "schema": {
@@ -5134,8 +5184,8 @@
               }
             }
           },
-          "502": {
-            "description": "A music provider failed",
+          "503": {
+            "description": "A source is down (PROVIDER_UNAVAILABLE names an outside one, with retry_after when known)",
             "content": {
               "application/json": {
                 "schema": {
@@ -5213,6 +5263,16 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "A source is down (PROVIDER_UNAVAILABLE names an outside one, with retry_after when known)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -5265,6 +5325,16 @@
           },
           "401": {
             "description": "Not authenticated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "A source is down (PROVIDER_UNAVAILABLE names an outside one, with retry_after when known)",
             "content": {
               "application/json": {
                 "schema": {
@@ -5391,6 +5461,16 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "A source is down (PROVIDER_UNAVAILABLE names an outside one, with retry_after when known)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -5499,8 +5579,8 @@
               }
             }
           },
-          "502": {
-            "description": "MusicBrainz or YouTube failed",
+          "503": {
+            "description": "A source is down (PROVIDER_UNAVAILABLE names an outside one, with retry_after when known)",
             "content": {
               "application/json": {
                 "schema": {
@@ -5808,6 +5888,16 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "A source is down (PROVIDER_UNAVAILABLE names an outside one, with retry_after when known)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -5896,6 +5986,16 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "A source is down (PROVIDER_UNAVAILABLE names an outside one, with retry_after when known)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -5965,8 +6065,8 @@
               }
             }
           },
-          "502": {
-            "description": "A music provider failed",
+          "503": {
+            "description": "A source is down (PROVIDER_UNAVAILABLE names an outside one, with retry_after when known)",
             "content": {
               "application/json": {
                 "schema": {
@@ -6043,8 +6143,8 @@
               }
             }
           },
-          "502": {
-            "description": "A music provider failed",
+          "503": {
+            "description": "A source is down (PROVIDER_UNAVAILABLE names an outside one, with retry_after when known)",
             "content": {
               "application/json": {
                 "schema": {
@@ -6083,6 +6183,16 @@
           },
           "401": {
             "description": "Not authenticated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "A source is down (PROVIDER_UNAVAILABLE names an outside one, with retry_after when known)",
             "content": {
               "application/json": {
                 "schema": {
@@ -6161,6 +6271,16 @@
           },
           "409": {
             "description": "Not configured (NOT_CONFIGURED) or not built in this version yet (NOT_AVAILABLE)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "A source is down (PROVIDER_UNAVAILABLE names an outside one, with retry_after when known)",
             "content": {
               "application/json": {
                 "schema": {
@@ -7354,6 +7474,7 @@
           "collections"
         ],
         "summary": "Favorite or unfavorite one item.",
+        "description": "Acts on the caller's own favourites, the ones Subsonic apps star and\nJellyfin apps mark. The old id of a merged item acts on the item it went\ninto, and the answer names that id.",
         "operationId": "set_favorite_handler",
         "parameters": [
           {
@@ -7368,7 +7489,7 @@
           {
             "name": "item_id",
             "in": "path",
-            "description": "Favorited item id",
+            "description": "Local id of the item",
             "required": true,
             "schema": {
               "type": "string"
@@ -7408,6 +7529,16 @@
           },
           "401": {
             "description": "Not authenticated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No live item holds the id",
             "content": {
               "application/json": {
                 "schema": {
@@ -8470,6 +8601,16 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "A source is down (PROVIDER_UNAVAILABLE names an outside one, with retry_after when known)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -8511,6 +8652,16 @@
           },
           "409": {
             "description": "Not configured (NOT_CONFIGURED) or not built in this version yet (NOT_AVAILABLE)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "A source is down (PROVIDER_UNAVAILABLE names an outside one, with retry_after when known)",
             "content": {
               "application/json": {
                 "schema": {
@@ -8616,6 +8767,16 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "A source is down (PROVIDER_UNAVAILABLE names an outside one, with retry_after when known)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -8714,6 +8875,16 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "A source is down (PROVIDER_UNAVAILABLE names an outside one, with retry_after when known)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -8805,6 +8976,16 @@
           },
           "409": {
             "description": "Not configured (NOT_CONFIGURED) or not built in this version yet (NOT_AVAILABLE)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "A source is down (PROVIDER_UNAVAILABLE names an outside one, with retry_after when known)",
             "content": {
               "application/json": {
                 "schema": {
@@ -9057,6 +9238,15 @@
             "required": false,
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "name": "favorites",
+            "in": "query",
+            "description": "Only the caller's favourites. Without `sort`, the newest favourite\ncomes first, and `order=asc` puts the oldest first.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
             }
           }
         ],
@@ -9907,7 +10097,7 @@
             }
           },
           "409": {
-            "description": "The edition changed since the plan was read (STALE_REVISION), the library is busy, or a file is outside the library folders",
+            "description": "The edition changed since the plan was read (STALE_REVISION), the library is busy or off, or a file is outside the library folders",
             "content": {
               "application/json": {
                 "schema": {
@@ -10585,7 +10775,7 @@
             }
           },
           "400": {
-            "description": "Wrong token or no request key",
+            "description": "Wrong token, another curator's tag write, or no request key",
             "content": {
               "application/json": {
                 "schema": {
@@ -10846,7 +11036,7 @@
         "tags": [
           "library management"
         ],
-        "summary": "What the app did by itself to the album's tracks and to the albums it\nis made of.",
+        "summary": "What the app did by itself to the album, its tracks and the albums it\nis made of, and the undos of those changes.",
         "operationId": "get_album_history",
         "parameters": [
           {
@@ -11352,7 +11542,7 @@
             }
           },
           "409": {
-            "description": "Another file now sits at an old path, a file or track changed, none of the files are left in the recycle bin, or the library is busy; nothing was put back",
+            "description": "Another file now sits at an old path, a file or track changed, none of the files are left in the recycle bin, the library is busy, or the library is off; nothing was put back",
             "content": {
               "application/json": {
                 "schema": {
@@ -11451,7 +11641,7 @@
             }
           },
           "409": {
-            "description": "The library could not start a scan",
+            "description": "The library could not start a scan, or the library is off",
             "content": {
               "application/json": {
                 "schema": {
@@ -12100,7 +12290,7 @@
             }
           },
           "409": {
-            "description": "Library busy or a file is outside the library folders",
+            "description": "Library busy or off, or a file is outside the library folders",
             "content": {
               "application/json": {
                 "schema": {
@@ -12615,6 +12805,15 @@
             "required": false,
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "name": "favorites",
+            "in": "query",
+            "description": "Only the caller's favourites. Without `sort`, the newest favourite\ncomes first, and `order=asc` puts the oldest first.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
             }
           }
         ],
@@ -15900,7 +16099,7 @@
             }
           },
           "409": {
-            "description": "Undo blocked for a file",
+            "description": "Undo blocked for a file, or the library is off",
             "content": {
               "application/json": {
                 "schema": {
@@ -16152,7 +16351,7 @@
             }
           },
           "409": {
-            "description": "Settings or library folders changed",
+            "description": "Settings or library folders changed, or the library is off",
             "content": {
               "application/json": {
                 "schema": {
@@ -16240,7 +16439,7 @@
             }
           },
           "409": {
-            "description": "The preview or settings changed",
+            "description": "The preview or settings changed, or the library is off",
             "content": {
               "application/json": {
                 "schema": {
@@ -17270,7 +17469,7 @@
             }
           },
           "409": {
-            "description": "Not a finished apply, or nothing to undo",
+            "description": "Not a finished apply, nothing to undo, or the library is off",
             "content": {
               "application/json": {
                 "schema": {
@@ -17348,7 +17547,7 @@
             }
           },
           "409": {
-            "description": "Settings or library policy changed since the page loaded",
+            "description": "Settings or library policy changed since the page loaded, or the library is off",
             "content": {
               "application/json": {
                 "schema": {
@@ -17516,7 +17715,7 @@
             }
           },
           "409": {
-            "description": "Preview expired, stale, or nothing to write",
+            "description": "Preview expired, stale, or nothing to write, or the library is off",
             "content": {
               "application/json": {
                 "schema": {
@@ -17878,7 +18077,7 @@
         "tags": [
           "library management"
         ],
-        "summary": "A new confirmation token for your own ready preview (the old one\nstops working).",
+        "summary": "A new confirmation token for your own ready preview.",
         "operationId": "reissue_management_preview",
         "parameters": [
           {
@@ -18148,7 +18347,7 @@
             }
           },
           "409": {
-            "description": "Settings or library folders changed",
+            "description": "Settings or library folders changed, or the library is off",
             "content": {
               "application/json": {
                 "schema": {
@@ -18911,7 +19110,7 @@
         "tags": [
           "library management"
         ],
-        "summary": "Empty the recycle bin of what it held at `before`, under the rules\nits expiry keeps: a copy that changed in the bin, one a put-back is\nusing, and one in a bin that is or holds a library or download folder\nstay. Runs in the background.",
+        "summary": "Empty the recycle bin of what it held at `before`, under the rules\nits expiry keeps: a copy that changed in the bin, one a put-back is\nusing, and one in a bin that is or holds a library or download folder\nstay. Runs in the background. Refused while the library is off.",
         "operationId": "empty_recycle_bin",
         "requestBody": {
           "content": {
@@ -18956,6 +19155,16 @@
           },
           "403": {
             "description": "Admin role required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The library is off",
             "content": {
               "application/json": {
                 "schema": {
@@ -19403,7 +19612,7 @@
           {
             "name": "state",
             "in": "query",
-            "description": "`pending` (default), `approved`, `rejected`, `dismissed`,\n`excluded` or `all`.",
+            "description": "`pending` (default), `approved`, `rejected`, `dismissed`,\n`excluded`, `resolved` (approved or dismissed) or `all`.",
             "required": false,
             "schema": {
               "type": "string"
@@ -19524,10 +19733,10 @@
           {
             "name": "sort",
             "in": "query",
-            "description": "`newest` (default) or `oldest` change first, or `tracks` for the\nalbums with the most files first.",
+            "description": "Sort order; newest change first by default.",
             "required": false,
             "schema": {
-              "type": "string"
+              "$ref": "#/components/schemas/ReviewSort"
             }
           },
           {
@@ -19597,7 +19806,7 @@
         "tags": [
           "library management"
         ],
-        "summary": "Apply a previewed bulk change. Refused when the token is not the\ncaller's or is too old, or the selection changed since the preview.",
+        "summary": "Apply a previewed bulk change as one background job that can be\npaused, resumed and stopped. Refused when the token is not the caller's\nor is too old, or the selection changed since the preview.",
         "operationId": "apply_bulk_reviews",
         "requestBody": {
           "content": {
@@ -19611,7 +19820,7 @@
         },
         "responses": {
           "200": {
-            "description": "What changed and what did not",
+            "description": "The job, and the reviews the preview left alone",
             "content": {
               "application/json": {
                 "schema": {
@@ -19675,7 +19884,7 @@
         "tags": [
           "library management"
         ],
-        "summary": "Preview a bulk change: how many reviews it changes, which it skips and\nwhy, and the token that applies exactly this change. The token is good\nfor 15 minutes, and only for the person who previewed.",
+        "summary": "Preview a bulk change: how many reviews it changes, which it skips and\nwhy, the releases every selected review shares, and the token that\napplies exactly this change. The token is good for 15 minutes, and only\nfor the person who previewed.",
         "operationId": "preview_bulk_reviews",
         "requestBody": {
           "content": {
@@ -19738,12 +19947,159 @@
         ]
       }
     },
+    "/api/v3/library/reviews/jobs": {
+      "get": {
+        "tags": [
+          "library management"
+        ],
+        "summary": "Review jobs still running, queued or paused, and those that ended in\nthe last five minutes, newest first.",
+        "operationId": "list_review_jobs",
+        "responses": {
+          "200": {
+            "description": "Review jobs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReviewJobsResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Not authenticated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Curator role required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "session": [
+              "curator"
+            ]
+          }
+        ]
+      }
+    },
+    "/api/v3/library/reviews/jobs/{job_id}/control": {
+      "post": {
+        "tags": [
+          "library management"
+        ],
+        "summary": "Pause, resume or stop a review job. A running job halts between\nreviews.",
+        "operationId": "control_review_job",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "description": "Review job id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReviewJobControlBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The review job",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OperationView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad body",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Not authenticated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Curator role required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown review job",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A stopped job can't be resumed (REVIEW_JOB_STOPPED)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "session": [
+              "curator"
+            ]
+          }
+        ]
+      }
+    },
     "/api/v3/library/reviews/retry-pending": {
       "post": {
         "tags": [
           "library management"
         ],
-        "summary": "Start identification again for every pending review a filter selects\n(all of them by default), or with `preview` count what would start.\nReviews whose album cannot start stay open and are counted by reason.",
+        "summary": "Start identification again for every pending review a filter selects\n(all of them by default), as one background job that can be paused,\nresumed and stopped. With `preview`, nothing starts: the answer counts\nwhat would start and why the rest would not.",
         "operationId": "retry_pending_reviews",
         "requestBody": {
           "content": {
@@ -19757,11 +20113,21 @@
         },
         "responses": {
           "200": {
-            "description": "What started and what did not",
+            "description": "The job, or what would start",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ReviewRetryAllResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Unknown filter value, folder or sub-folder",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
                 }
               }
             }
@@ -20469,7 +20835,7 @@
             }
           },
           "409": {
-            "description": "Review already settled or changed since it was read (STALE_REVISION), album excluded, or needs the Local metadata confirmation",
+            "description": "Review already settled or changed since it was read (STALE_REVISION), album excluded (ALBUM_EXCLUDED), needs the Local metadata confirmation (LOCAL_METADATA_NEEDS_CONFIRMATION), keeps its own tags in a managed folder (LOCAL_METADATA_MANAGED), has an edition someone chose (EDITION_IS_CHOSEN), or the idempotency key started another album's job (CONTROL_KEY_REUSED)",
             "content": {
               "application/json": {
                 "schema": {
@@ -21494,6 +21860,15 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "favorites",
+            "in": "query",
+            "description": "Only the caller's favourites. Without `sort`, the newest favourite\ncomes first, and `order=asc` puts the oldest first.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
           }
         ],
         "responses": {
@@ -21839,7 +22214,7 @@
             }
           },
           "409": {
-            "description": "Library busy or the file is outside the library folders",
+            "description": "Library busy or off, or the file is outside the library folders",
             "content": {
               "application/json": {
                 "schema": {
@@ -22468,7 +22843,7 @@
     "/api/v3/me/connections/listenbrainz": {
       "get": {
         "tags": [
-          "plugins"
+          "listening"
         ],
         "summary": "Read the caller's ListenBrainz link status. Unlinked reads as missing.",
         "operationId": "listenbrainz_status",
@@ -22478,7 +22853,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/PluginConnectionStatus"
+                  "$ref": "#/components/schemas/ListeningLinkStatus"
                 }
               }
             }
@@ -22514,7 +22889,7 @@
       },
       "put": {
         "tags": [
-          "plugins"
+          "listening"
         ],
         "summary": "Link the caller's ListenBrainz account. The credential verifies first;\nonly a verified pair stores.",
         "operationId": "connect_listenbrainz_route",
@@ -22534,7 +22909,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/PluginConnectionStatus"
+                  "$ref": "#/components/schemas/ListeningLinkStatus"
                 }
               }
             }
@@ -22568,6 +22943,16 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "The server is busy; try again",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -22580,7 +22965,7 @@
       },
       "delete": {
         "tags": [
-          "plugins"
+          "listening"
         ],
         "summary": "Remove the caller's ListenBrainz link.",
         "operationId": "disconnect_listenbrainz_route",
@@ -22607,6 +22992,16 @@
           },
           "404": {
             "description": "No link",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The server is busy; try again",
             "content": {
               "application/json": {
                 "schema": {
@@ -22773,7 +23168,7 @@
     "/api/v3/me/scrobble-preferences": {
       "get": {
         "tags": [
-          "plugins"
+          "listening"
         ],
         "summary": "Read the caller's scrobble preferences.",
         "operationId": "get_scrobble_preferences",
@@ -22809,7 +23204,7 @@
       },
       "put": {
         "tags": [
-          "plugins"
+          "listening"
         ],
         "summary": "Update the caller's scrobble preferences. Absent fields keep their\nstored values.",
         "operationId": "update_scrobble_preferences",
@@ -22846,6 +23241,16 @@
           },
           "401": {
             "description": "Not authenticated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The server is busy; try again",
             "content": {
               "application/json": {
                 "schema": {
@@ -28419,7 +28824,7 @@
           {
             "name": "status",
             "in": "query",
-            "description": "Status filter.",
+            "description": "Status filter: a request status, or `reimportable` (admins only)\nfor the failed requests whose downloaded files can be imported again.",
             "required": false,
             "schema": {
               "type": "string"
@@ -31043,7 +31448,7 @@
             }
           },
           "400": {
-            "description": "Missing confirmation or proof",
+            "description": "Missing confirmation or proof, or a dry run token that is not valid",
             "content": {
               "application/json": {
                 "schema": {
@@ -31189,7 +31594,7 @@
             }
           },
           "409": {
-            "description": "Settings or library folders changed",
+            "description": "Settings or library folders changed, or the library is off",
             "content": {
               "application/json": {
                 "schema": {
@@ -32843,6 +33248,16 @@
           },
           "502": {
             "description": "Probe failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "MusicBrainz is down (PROVIDER_UNAVAILABLE, with retry_after when known)",
             "content": {
               "application/json": {
                 "schema": {
@@ -34520,6 +34935,16 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "YouTube is down or its daily quota is spent (PROVIDER_UNAVAILABLE, with retry_after)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -34611,6 +35036,16 @@
           },
           "502": {
             "description": "YouTube failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "YouTube is down or its daily quota is spent (PROVIDER_UNAVAILABLE, with retry_after)",
             "content": {
               "application/json": {
                 "schema": {
@@ -36072,7 +36507,7 @@
       },
       "AlbumHistoryByView": {
         "type": "string",
-        "description": "Who asked for a join.",
+        "description": "Who asked for a join or an undo.",
         "enum": [
           "you",
           "person"
@@ -36100,7 +36535,7 @@
               },
               {
                 "$ref": "#/components/schemas/AlbumHistoryByView",
-                "description": "Who asked, for `retag_joined` only; null when the app did it."
+                "description": "Who asked, for `retag_joined` and the undo entries; null when the\napp did it."
               }
             ]
           },
@@ -36112,7 +36547,7 @@
               "string",
               "null"
             ],
-            "description": "The other album's title, null when its row is gone."
+            "description": "The other album's title, for a join, a fold or its undo; null when\nits row is gone."
           },
           "track_count": {
             "type": "integer",
@@ -36146,7 +36581,13 @@
           "leftover_joined",
           "tracks_other_music",
           "tracks_new_copy",
-          "artist_from_tracks"
+          "artist_from_tracks",
+          "edition_changed",
+          "edition_chosen",
+          "edition_change_undone",
+          "fold_undone",
+          "unfolded_from",
+          "hand_back_given_up"
         ]
       },
       "AlbumHistoryView": {
@@ -38386,7 +38827,6 @@
         "description": "Artist credit standardization.",
         "enum": [
           "credited",
-          "variations",
           "canonical"
         ]
       },
@@ -38461,31 +38901,6 @@
           }
         }
       },
-      "ArtworkDownloadSize": {
-        "type": "string",
-        "description": "Artwork download size.",
-        "enum": [
-          "full",
-          "1200",
-          "500",
-          "250"
-        ]
-      },
-      "ArtworkImageType": {
-        "type": "string",
-        "description": "Artwork image type.",
-        "enum": [
-          "front",
-          "back",
-          "booklet",
-          "medium",
-          "tray",
-          "obi",
-          "spine",
-          "track",
-          "other"
-        ]
-      },
       "ArtworkKind": {
         "type": "string",
         "description": "How a genre's mosaic art is drawn.",
@@ -38498,20 +38913,6 @@
         "type": "object",
         "description": "Artwork management block.",
         "properties": {
-          "approved_only": {
-            "type": "boolean",
-            "description": "Approved art only.",
-            "default": true
-          },
-          "download_size": {
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/ArtworkDownloadSize",
-                "description": "Download size."
-              }
-            ],
-            "default": "full"
-          },
           "embedded_enabled": {
             "type": "boolean",
             "description": "Embed art in files.",
@@ -38525,11 +38926,6 @@
               }
             ],
             "default": "jpeg"
-          },
-          "embedded_front_only": {
-            "type": "boolean",
-            "description": "Embedded front only.",
-            "default": true
           },
           "embedded_maximum_size": {
             "type": "integer",
@@ -38551,34 +38947,11 @@
             ],
             "default": "original"
           },
-          "external_front_only": {
-            "type": "boolean",
-            "description": "External front only.",
-            "default": true
-          },
           "external_maximum_size": {
             "type": "integer",
             "format": "int64",
             "description": "External size cap (0 uncapped).",
             "default": 0
-          },
-          "external_naming_script_id": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "External naming script id.",
-            "default": null
-          },
-          "image_types": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/ArtworkImageType"
-            },
-            "description": "Image types to fetch.",
-            "default": [
-              "front"
-            ]
           },
           "local_file_patterns": {
             "type": "array",
@@ -38597,48 +38970,10 @@
               "front.png"
             ]
           },
-          "minimum_height": {
-            "type": "integer",
-            "format": "int64",
-            "description": "Minimum height (0 any).",
-            "default": 0
-          },
-          "minimum_width": {
-            "type": "integer",
-            "format": "int64",
-            "description": "Minimum width (0 any).",
-            "default": 0
-          },
           "never_replace_with_smaller": {
             "type": "boolean",
             "description": "Never replace art with smaller art.",
             "default": true
-          },
-          "overwrite_external_files": {
-            "type": "boolean",
-            "description": "Overwrite external files.",
-            "default": false
-          },
-          "preserve_existing_types": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/ArtworkImageType"
-            },
-            "description": "Existing types never replaced.",
-            "default": []
-          },
-          "providers": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/ArtworkProvider"
-            },
-            "description": "Provider order.",
-            "default": [
-              "cover_art_archive_release",
-              "cover_art_archive_release_group",
-              "local_files",
-              "embedded"
-            ]
           }
         }
       },
@@ -38650,17 +38985,6 @@
           "jpeg",
           "png",
           "webp"
-        ]
-      },
-      "ArtworkProvider": {
-        "type": "string",
-        "description": "Artwork provider.",
-        "enum": [
-          "cover_art_archive_release",
-          "cover_art_archive_release_group",
-          "local_files",
-          "embedded",
-          "audiodb"
         ]
       },
       "AttachExistingBody": {
@@ -39502,7 +39826,9 @@
           "sources",
           "provider_data_on",
           "cover_images",
-          "cover_bytes"
+          "cover_bytes",
+          "database_bytes",
+          "wal_bytes"
         ],
         "properties": {
           "cover_bytes": {
@@ -39515,6 +39841,12 @@
             "type": "integer",
             "format": "int64",
             "description": "Cover and artist images on disk.",
+            "minimum": 0
+          },
+          "database_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Size of the database file in bytes, 0 when it cannot be read.",
             "minimum": 0
           },
           "entries": {
@@ -39533,6 +39865,12 @@
               "$ref": "#/components/schemas/ProviderSourceStats"
             },
             "description": "Rows and bytes per provider."
+          },
+          "wal_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Size of its write-ahead log in bytes, 0 when there is none.",
+            "minimum": 0
           }
         }
       },
@@ -44800,7 +45138,6 @@
             "default": {
               "enabled": false,
               "preserve_existing": false,
-              "provider": "lrclib",
               "required": false,
               "write_plain": true,
               "write_synced": true
@@ -45132,6 +45469,48 @@
           }
         }
       },
+      "ExternalRefresh": {
+        "type": "object",
+        "description": "One media server's rescan after a run, as the run's page shows it.",
+        "required": [
+          "target",
+          "state",
+          "attempts"
+        ],
+        "properties": {
+          "attempts": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Tries so far.",
+            "minimum": 0
+          },
+          "code": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RefreshCode",
+                "description": "Why the last try did not go through."
+              }
+            ]
+          },
+          "finished_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When it ended, unix ms."
+          },
+          "state": {
+            "$ref": "#/components/schemas/RefreshState"
+          },
+          "target": {
+            "$ref": "#/components/schemas/RefreshTarget"
+          }
+        }
+      },
       "ExternalRefreshSettings": {
         "type": "object",
         "description": "External-server refresh after publishing.",
@@ -45155,18 +45534,6 @@
             "type": "boolean",
             "description": "Refresh Plex.",
             "default": false
-          },
-          "retry_attempts": {
-            "type": "integer",
-            "format": "int64",
-            "description": "Retry attempts.",
-            "default": 3
-          },
-          "retry_delay_seconds": {
-            "type": "integer",
-            "format": "int64",
-            "description": "Retry delay in seconds.",
-            "default": 30
           }
         }
       },
@@ -45303,7 +45670,7 @@
           },
           "item_id": {
             "type": "string",
-            "description": "Favorited item id."
+            "description": "The id the favourite is stored under: the item's current id, which\ndiffers from the one sent after a merge."
           },
           "kind": {
             "type": "string",
@@ -45400,42 +45767,6 @@
           "merge",
           "preserve"
         ]
-      },
-      "FileBehaviorSettings": {
-        "type": "object",
-        "description": "File-behavior gates.",
-        "properties": {
-          "preserve_permissions": {
-            "type": "boolean",
-            "description": "Preserve permission bits.",
-            "default": true
-          },
-          "preserve_timestamps": {
-            "type": "boolean",
-            "description": "Preserve mtimes.",
-            "default": true
-          },
-          "reject_symlinks": {
-            "type": "boolean",
-            "description": "Refuse symlinked media.",
-            "default": true
-          },
-          "strict_capability_gate": {
-            "type": "boolean",
-            "description": "Refuse writes the format cannot hold.",
-            "default": true
-          },
-          "validate_technical_audio": {
-            "type": "boolean",
-            "description": "Re-probe audio after writing.",
-            "default": true
-          },
-          "validate_written_metadata": {
-            "type": "boolean",
-            "description": "Re-read tags after writing.",
-            "default": true
-          }
-        }
       },
       "FilesystemWatcher": {
         "type": "object",
@@ -45765,72 +46096,6 @@
           }
         }
       },
-      "FormatCompatibilitySettings": {
-        "type": "object",
-        "description": "Format-compatibility handling.",
-        "properties": {
-          "constrained_genres_primary_only": {
-            "type": "boolean",
-            "description": "Primary genre only for constrained formats.",
-            "default": false
-          },
-          "id3_text_encoding": {
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/Id3TextEncoding",
-                "description": "ID3 text encoding."
-              }
-            ],
-            "default": "utf8"
-          },
-          "id3_version": {
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/Id3Version",
-                "description": "ID3 version for MP3 writes."
-              }
-            ],
-            "default": "2.4"
-          },
-          "id3v23_join_delimiter": {
-            "type": "string",
-            "description": "ID3v2.3 multi-value join delimiter.",
-            "default": "; "
-          },
-          "mp3_apev2_policy": {
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/Mp3ApePolicy",
-                "description": "APEv2 policy for MP3."
-              }
-            ],
-            "default": "preserve"
-          },
-          "raw_aac_tag_policy": {
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/RawAacTagPolicy",
-                "description": "Raw-AAC tag policy."
-              }
-            ],
-            "default": "save_apev2"
-          },
-          "remove_id3_from_flac": {
-            "type": "boolean",
-            "description": "Strip ID3 chunks from FLAC.",
-            "default": false
-          },
-          "wav_tag_policy": {
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/WavTagPolicy",
-                "description": "WAV tag policy."
-              }
-            ],
-            "default": "id3"
-          }
-        }
-      },
       "FrontendCacheTTLs": {
         "type": "object",
         "description": "The advanced settings the web app reads at start. The browser's cache\nlifetimes and the queue's polling interval are fixed in the web app.",
@@ -46074,12 +46339,6 @@
             "format": "int64",
             "description": "ListenBrainz vote floor.",
             "default": 1
-          },
-          "maximum_ancestry_depth": {
-            "type": "integer",
-            "format": "int64",
-            "description": "Max genre-ancestry depth.",
-            "default": 4
           },
           "maximum_count": {
             "type": "integer",
@@ -47005,22 +47264,6 @@
             ]
           }
         }
-      },
-      "Id3TextEncoding": {
-        "type": "string",
-        "description": "ID3 text encoding.",
-        "enum": [
-          "utf8",
-          "utf16"
-        ]
-      },
-      "Id3Version": {
-        "type": "string",
-        "description": "ID3 version for MP3 writes.",
-        "enum": [
-          "2.4",
-          "2.3"
-        ]
       },
       "IdentificationControlBody": {
         "type": "object",
@@ -48281,20 +48524,12 @@
               }
             ],
             "default": {
-              "approved_only": true,
-              "download_size": "full",
               "embedded_enabled": true,
               "embedded_format": "jpeg",
-              "embedded_front_only": true,
               "embedded_maximum_size": 1200,
               "external_enabled": true,
               "external_format": "original",
-              "external_front_only": true,
               "external_maximum_size": 0,
-              "external_naming_script_id": null,
-              "image_types": [
-                "front"
-              ],
               "local_file_patterns": [
                 "cover.jpg",
                 "cover.jpeg",
@@ -48305,17 +48540,7 @@
                 "front.jpg",
                 "front.png"
               ],
-              "minimum_height": 0,
-              "minimum_width": 0,
-              "never_replace_with_smaller": true,
-              "overwrite_external_files": false,
-              "preserve_existing_types": [],
-              "providers": [
-                "cover_art_archive_release",
-                "cover_art_archive_release_group",
-                "local_files",
-                "embedded"
-              ]
+              "never_replace_with_smaller": true
             }
           },
           "description": {
@@ -48334,7 +48559,6 @@
               "lyrics": {
                 "enabled": false,
                 "preserve_existing": false,
-                "provider": "lrclib",
                 "required": false,
                 "write_plain": true,
                 "write_synced": true
@@ -48345,22 +48569,6 @@
                 "mode": "preserve",
                 "required": false
               }
-            }
-          },
-          "file_behavior": {
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/FileBehaviorSettings",
-                "description": "File-behavior gates."
-              }
-            ],
-            "default": {
-              "preserve_permissions": true,
-              "preserve_timestamps": true,
-              "reject_symlinks": true,
-              "strict_capability_gate": true,
-              "validate_technical_audio": true,
-              "validate_written_metadata": true
             }
           },
           "genres": {
@@ -48380,7 +48588,6 @@
               "lastfm_whitelist_only": true,
               "listenbrainz_curated_only": true,
               "listenbrainz_minimum_count": 1,
-              "maximum_ancestry_depth": 4,
               "maximum_count": 5,
               "mode": "replace",
               "musicbrainz_minimum_count": 1,
@@ -48423,16 +48630,6 @@
               },
               "enabled": true,
               "fields": [],
-              "format_compatibility": {
-                "constrained_genres_primary_only": false,
-                "id3_text_encoding": "utf8",
-                "id3_version": "2.4",
-                "id3v23_join_delimiter": "; ",
-                "mp3_apev2_policy": "preserve",
-                "raw_aac_tag_policy": "save_apev2",
-                "remove_id3_from_flac": false,
-                "wav_tag_policy": "id3"
-              },
               "preserve_embedded_art_during_scrub": true,
               "preserve_fields": [],
               "relationships": {
@@ -48464,7 +48661,6 @@
               }
             ],
             "default": {
-              "refresh_droppedneedle": true,
               "refresh_external_servers": false
             }
           },
@@ -48491,7 +48687,6 @@
               "move_sidecars": true,
               "multi_disc_naming_script_id": null,
               "naming_script_id": "69202666-cb88-52b0-bac2-0afc62b1e909",
-              "remove_empty_directories": true,
               "rename_enabled": true,
               "sidecar_patterns": [
                 "cover.jpg",
@@ -48521,8 +48716,7 @@
                 "*.m3u",
                 "*.m3u8",
                 "*.pls"
-              ],
-              "source_cleanup": "remove_after_confirmed_move"
+              ]
             }
           },
           "preset_origin": {
@@ -48977,14 +49171,6 @@
         "type": "object",
         "description": "Per-root profile overrides (`None` inherits the profile).",
         "properties": {
-          "automatic_edition_acceptance_enabled": {
-            "type": [
-              "boolean",
-              "null"
-            ],
-            "description": "Automatic edition acceptance.",
-            "default": null
-          },
           "embedded_artwork_enabled": {
             "type": [
               "boolean",
@@ -49058,32 +49244,12 @@
             "description": "Naming script id.",
             "default": null
           },
-          "preserve_timestamps": {
-            "type": [
-              "boolean",
-              "null"
-            ],
-            "description": "Timestamp preservation.",
-            "default": null
-          },
           "rename_enabled": {
             "type": [
               "boolean",
               "null"
             ],
             "description": "Rename switch.",
-            "default": null
-          },
-          "source_cleanup": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/SourceCleanupMode",
-                "description": "Source cleanup."
-              }
-            ],
             "default": null
           }
         }
@@ -49126,9 +49292,7 @@
               "enabled": false,
               "jellyfin_enabled": false,
               "navidrome_enabled": false,
-              "plex_enabled": false,
-              "retry_attempts": 3,
-              "retry_delay_seconds": 30
+              "plex_enabled": false
             }
           },
           "naming_scripts": {
@@ -49158,11 +49322,6 @@
             },
             "description": "Named profiles.",
             "default": []
-          },
-          "recycle_bin_path": {
-            "type": "string",
-            "description": "Recycle-bin path (\"\" disables).",
-            "default": ""
           },
           "root_assignments": {
             "type": "array",
@@ -50256,6 +50415,27 @@
           "lastfm"
         ]
       },
+      "ListeningLinkStatus": {
+        "type": "object",
+        "description": "One linked listening account. Never carries the secret, only the name.\nNamed apart from the remotes `ConnectionStatus` in the one OpenAPI\ndocument.",
+        "required": [
+          "service"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "description": "Whether the link is active."
+          },
+          "service": {
+            "type": "string",
+            "description": "Service name (`listenbrainz` here)."
+          },
+          "username": {
+            "type": "string",
+            "description": "Linked username."
+          }
+        }
+      },
       "LocalPasswordSet": {
         "type": "object",
         "description": "Set the first local password on an account without one.",
@@ -50409,11 +50589,6 @@
             "type": "boolean",
             "description": "Keep existing lyrics.",
             "default": false
-          },
-          "provider": {
-            "type": "string",
-            "description": "Lyrics provider.",
-            "default": "lrclib"
           },
           "required": {
             "type": "boolean",
@@ -50683,7 +50858,8 @@
         "required": [
           "bundle_id",
           "file_count",
-          "sample_paths"
+          "sample_paths",
+          "source_folders"
         ],
         "properties": {
           "bundle_id": {
@@ -50698,6 +50874,13 @@
             "items": {
               "type": "string"
             }
+          },
+          "source_folders": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The folders the write took its files from, relative to their\nlibrary folder. For a download that is the hidden import folder\nholding the downloaded files."
           }
         }
       },
@@ -51008,8 +51191,9 @@
           "external_refreshes": {
             "type": "array",
             "items": {
-              "type": "object"
-            }
+              "$ref": "#/components/schemas/ExternalRefresh"
+            },
+            "description": "Media servers asked to rescan after the apply, and how it went."
           },
           "failed_count": {
             "type": "integer",
@@ -52497,24 +52681,6 @@
             "description": "Managed fields.",
             "default": []
           },
-          "format_compatibility": {
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/FormatCompatibilitySettings",
-                "description": "Format compatibility."
-              }
-            ],
-            "default": {
-              "constrained_genres_primary_only": false,
-              "id3_text_encoding": "utf8",
-              "id3_version": "2.4",
-              "id3v23_join_delimiter": "; ",
-              "mp3_apev2_policy": "preserve",
-              "raw_aac_tag_policy": "save_apev2",
-              "remove_id3_from_flac": false,
-              "wav_tag_policy": "id3"
-            }
-          },
           "preserve_embedded_art_during_scrub": {
             "type": "boolean",
             "description": "Keep embedded art during a scrub.",
@@ -52583,14 +52749,6 @@
             "description": "The artist's name, empty when MusicBrainz had nothing."
           }
         }
-      },
-      "Mp3ApePolicy": {
-        "type": "string",
-        "description": "APEv2 policy for MP3 writes.",
-        "enum": [
-          "preserve",
-          "remove"
-        ]
       },
       "MultiDiscNamingMode": {
         "type": "string",
@@ -53782,11 +53940,6 @@
             "description": "Naming script id.",
             "default": "69202666-cb88-52b0-bac2-0afc62b1e909"
           },
-          "remove_empty_directories": {
-            "type": "boolean",
-            "description": "Remove newly empty directories.",
-            "default": true
-          },
           "rename_enabled": {
             "type": "boolean",
             "description": "Rename files.",
@@ -53827,15 +53980,6 @@
               "*.m3u8",
               "*.pls"
             ]
-          },
-          "source_cleanup": {
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/SourceCleanupMode",
-                "description": "Source cleanup after a confirmed move."
-              }
-            ],
-            "default": "remove_after_confirmed_move"
           }
         }
       },
@@ -56489,27 +56633,6 @@
           "library_writer"
         ]
       },
-      "PluginConnectionStatus": {
-        "type": "object",
-        "description": "One linked external account. Never carries the secret, only the name.\nThe schema rename keeps this distinct from the remotes\n`ConnectionStatus` in the one OpenAPI document; the wire shape is\nunchanged.",
-        "required": [
-          "service"
-        ],
-        "properties": {
-          "enabled": {
-            "type": "boolean",
-            "description": "Whether the link is active."
-          },
-          "service": {
-            "type": "string",
-            "description": "Service name (`listenbrainz` here)."
-          },
-          "username": {
-            "type": "string",
-            "description": "Linked username."
-          }
-        }
-      },
       "PluginDetails": {
         "type": "object",
         "description": "`GET /albums/{album_id}/plugin-details`: what metadata plugins add\nabout an album. Each field is the first plugin's answer (plugins asked\nin name order); links and tags gather every plugin's, without repeats.\nThe page shows these below its own sources and only fills gaps.",
@@ -57339,11 +57462,6 @@
         "type": "object",
         "description": "Post-publish notifications.",
         "properties": {
-          "refresh_droppedneedle": {
-            "type": "boolean",
-            "description": "Refresh DroppedNeedle views.",
-            "default": true
-          },
           "refresh_external_servers": {
             "type": "boolean",
             "description": "Refresh external servers.",
@@ -58607,15 +58725,6 @@
           }
         }
       },
-      "RawAacTagPolicy": {
-        "type": "string",
-        "description": "Raw-AAC tag policy.",
-        "enum": [
-          "save_apev2",
-          "do_not_write",
-          "remove_apev2"
-        ]
-      },
       "Reason": {
         "type": "string",
         "description": "One reason, stored and sent by its snake_case spelling.",
@@ -58911,6 +59020,18 @@
           }
         }
       },
+      "RefreshCode": {
+        "type": "string",
+        "description": "Why a rescan did not go through. The handler stores these as the\njob's code; the run's page shows them.",
+        "enum": [
+          "EXTERNAL_REFRESH_NOT_CONFIGURED",
+          "EXTERNAL_REFRESH_AUTH_FAILED",
+          "EXTERNAL_REFRESH_NOT_FOUND",
+          "EXTERNAL_REFRESH_UNREACHABLE",
+          "EXTERNAL_REFRESH_FAILED",
+          "EXTERNAL_REFRESH_INTERRUPTED"
+        ]
+      },
       "RefreshResponse": {
         "type": "object",
         "description": "Acknowledgement of a triggered background refresh.",
@@ -58928,6 +59049,26 @@
             "description": "Always `ok` when the trigger lands."
           }
         }
+      },
+      "RefreshState": {
+        "type": "string",
+        "description": "Where a rescan stands.",
+        "enum": [
+          "queued",
+          "running",
+          "done",
+          "failed",
+          "no_record"
+        ]
+      },
+      "RefreshTarget": {
+        "type": "string",
+        "description": "A media server Library Management can ask to rescan.",
+        "enum": [
+          "jellyfin",
+          "plex",
+          "navidrome"
+        ]
       },
       "ReidentificationCandidateView": {
         "type": "object",
@@ -61121,7 +61262,8 @@
           "matched",
           "eligible",
           "skipped",
-          "preview_token"
+          "preview_token",
+          "shared_candidates"
         ],
         "properties": {
           "eligible": {
@@ -61140,6 +61282,13 @@
             "type": "string",
             "description": "Pass back to apply exactly this change."
           },
+          "shared_candidates": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SharedCandidateView"
+            },
+            "description": "Releases every selected pending, unpinned review lists, best\nweakest score first; accept one for them all with its\n`candidate_key`. Empty when they share none."
+          },
           "skipped": {
             "type": "array",
             "items": {
@@ -61151,16 +61300,27 @@
       },
       "ReviewBulkResponse": {
         "type": "object",
-        "description": "What a bulk review change did.",
+        "description": "What a bulk review change started.",
         "required": [
-          "applied",
+          "queued",
           "skipped"
         ],
         "properties": {
-          "applied": {
+          "job": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/OperationView",
+                "description": "The job; none when the preview left nothing to change."
+              }
+            ]
+          },
+          "queued": {
             "type": "integer",
             "format": "int32",
-            "description": "Reviews changed.",
+            "description": "Reviews the job will change, each checked again when it is reached.",
             "minimum": 0
           },
           "skipped": {
@@ -61168,7 +61328,87 @@
             "items": {
               "$ref": "#/components/schemas/SkippedReviews"
             },
-            "description": "Reviews left alone, grouped by why."
+            "description": "Reviews the preview left alone, grouped by why."
+          }
+        }
+      },
+      "ReviewJobAction": {
+        "type": "string",
+        "description": "What a review job does to each of its reviews.",
+        "enum": [
+          "keep_tagged",
+          "exclude",
+          "accept",
+          "retry"
+        ]
+      },
+      "ReviewJobControl": {
+        "type": "string",
+        "description": "What to do with a review job.",
+        "enum": [
+          "pause",
+          "resume",
+          "stop"
+        ]
+      },
+      "ReviewJobControlBody": {
+        "type": "object",
+        "description": "Pause, resume or stop a review job.",
+        "required": [
+          "control"
+        ],
+        "properties": {
+          "control": {
+            "$ref": "#/components/schemas/ReviewJobControl"
+          }
+        }
+      },
+      "ReviewJobView": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/OperationView"
+          },
+          {
+            "type": "object",
+            "required": [
+              "skipped"
+            ],
+            "properties": {
+              "action": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/ReviewJobAction",
+                    "description": "What it does to each review; none when its work is gone."
+                  }
+                ]
+              },
+              "skipped": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/SkippedReviews"
+                },
+                "description": "Reviews it left alone so far, grouped by why."
+              }
+            }
+          }
+        ],
+        "description": "A review job: a bulk change or retry running in the background."
+      },
+      "ReviewJobsResponse": {
+        "type": "object",
+        "description": "The review jobs to show.",
+        "required": [
+          "jobs"
+        ],
+        "properties": {
+          "jobs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ReviewJobView"
+            }
           }
         }
       },
@@ -61212,24 +61452,35 @@
             "type": "boolean",
             "description": "Count what would start and why the rest would not; start nothing."
           },
-          "root_ids": {
+          "scope_ids": {
             "type": "array",
             "items": {
               "type": "string"
             },
-            "description": "Albums in these library folders (overrides the filter's folder)."
+            "description": "Albums in these library folders and sub-folder rules, picked the\nway a scan picks them (overrides the filter's folder)."
           }
         }
       },
       "ReviewRetryAllResponse": {
         "type": "object",
-        "description": "What a \"retry all\" started.",
+        "description": "What a \"retry all\" started, or with `preview` would start.",
         "required": [
           "preview",
           "started",
           "skipped"
         ],
         "properties": {
+          "job": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/OperationView",
+                "description": "The job that retries them; none for a preview or when nothing was\npending."
+              }
+            ]
+          },
           "preview": {
             "type": "boolean",
             "description": "True when nothing started: the counts are what a real run would do."
@@ -61239,12 +61490,12 @@
             "items": {
               "$ref": "#/components/schemas/SkippedReviews"
             },
-            "description": "Reviews that stayed open, grouped by why."
+            "description": "Preview only: reviews that would stay open, grouped by why."
           },
           "started": {
             "type": "integer",
             "format": "int32",
-            "description": "Albums whose identification started again (or would).",
+            "description": "Albums whose identification would start, or that the job will try.",
             "minimum": 0
           }
         }
@@ -61274,6 +61525,19 @@
           }
         }
       },
+      "ReviewSort": {
+        "type": "string",
+        "description": "How the review list is sorted.",
+        "enum": [
+          "newest",
+          "oldest",
+          "tracks",
+          "title",
+          "artist",
+          "root",
+          "reason"
+        ]
+      },
       "ReviewState": {
         "type": "string",
         "enum": [
@@ -61283,6 +61547,44 @@
           "dismissed",
           "excluded"
         ]
+      },
+      "ReviewStateCounts": {
+        "type": "object",
+        "description": "Reviews matching a filter apart from its state, by state.",
+        "required": [
+          "pending",
+          "approved",
+          "rejected",
+          "dismissed",
+          "excluded"
+        ],
+        "properties": {
+          "approved": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "dismissed": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "excluded": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "pending": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "rejected": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
       },
       "ReviewView": {
         "type": "object",
@@ -61458,18 +61760,22 @@
             "description": "Album title or artist contains this, ignoring case."
           },
           "sort": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "`newest` (default) or `oldest` change first, or `tracks` for the\nalbums with the most files first."
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ReviewSort",
+                "description": "Sort order; newest change first by default."
+              }
+            ]
           },
           "state": {
             "type": [
               "string",
               "null"
             ],
-            "description": "`pending` (default), `approved`, `rejected`, `dismissed`,\n`excluded` or `all`."
+            "description": "`pending` (default), `approved`, `rejected`, `dismissed`,\n`excluded`, `resolved` (approved or dismissed) or `all`."
           },
           "updated_from": {
             "type": [
@@ -61504,7 +61810,8 @@
           {
             "type": "object",
             "required": [
-              "reason_counts"
+              "reason_counts",
+              "state_counts"
             ],
             "properties": {
               "reason_counts": {
@@ -61513,6 +61820,10 @@
                   "$ref": "#/components/schemas/ReasonCount"
                 },
                 "description": "Reviews matching the filter apart from its reason, by reason."
+              },
+              "state_counts": {
+                "$ref": "#/components/schemas/ReviewStateCounts",
+                "description": "Reviews matching the filter apart from its state, by state."
               }
             }
           }
@@ -63904,6 +64215,43 @@
           }
         }
       },
+      "SharedCandidateView": {
+        "type": "object",
+        "description": "A release every selected review lists.",
+        "required": [
+          "candidate_key",
+          "release_group_mbid",
+          "album_title",
+          "album_artist_name",
+          "lowest_score"
+        ],
+        "properties": {
+          "album_artist_name": {
+            "type": "string"
+          },
+          "album_title": {
+            "type": "string"
+          },
+          "candidate_key": {
+            "type": "string",
+            "description": "Accept the selection with this key."
+          },
+          "lowest_score": {
+            "type": "number",
+            "format": "double",
+            "description": "Its weakest match score across the selected reviews."
+          },
+          "release_group_mbid": {
+            "type": "string"
+          },
+          "release_mbid": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
       "ShelfSource": {
         "type": "string",
         "description": "Where a shelf's rows came from.",
@@ -64079,14 +64427,6 @@
             "description": "slskd version, when the probe reached it."
           }
         }
-      },
-      "SourceCleanupMode": {
-        "type": "string",
-        "description": "Source-tree cleanup after a confirmed move.",
-        "enum": [
-          "keep",
-          "remove_after_confirmed_move"
-        ]
       },
       "SourceGate": {
         "type": "object",
@@ -65486,6 +65826,20 @@
           },
           "local_track_id": {
             "type": "string"
+          },
+          "recording_mbid": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The MusicBrainz recording the file matched, when it matched one."
+          },
+          "release_track_mbid": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The release's track it matched, when it matched one."
           },
           "title": {
             "type": "string",
@@ -67087,15 +67441,6 @@
           "fulfilled"
         ]
       },
-      "WavTagPolicy": {
-        "type": "string",
-        "description": "WAV tag policy.",
-        "enum": [
-          "id3",
-          "riff_info",
-          "preserve_existing"
-        ]
-      },
       "WeeklyExploration": {
         "type": "object",
         "description": "The weekly exploration playlist shelf.",
@@ -67861,7 +68206,7 @@
         "properties": {
           "date": {
             "type": "string",
-            "description": "UTC date the numbers belong to, YYYY-MM-DD."
+            "description": "Quota day the numbers belong to (it starts at 08:00 UTC), YYYY-MM-DD."
           },
           "limit": {
             "type": "integer",

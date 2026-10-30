@@ -7,22 +7,8 @@ import type {
 } from '$lib/player/types';
 import { createPlaybackSource } from '$lib/player/createSource';
 import { api } from '$lib/api/client';
-import { GATEWAY_ENDPOINTS } from '$lib/player/playbackGateway';
-import {
-	reportProgress as reportJellyfinProgress,
-	reportStop as reportJellyfinStop,
-	startSession as startJellyfinSession
-} from '$lib/player/jellyfinPlaybackApi';
-import {
-	reportNavidromeScrobble,
-	reportNavidromeNowPlaying,
-	reportNavidromeStopped
-} from '$lib/player/navidromePlaybackApi';
-import {
-	reportPlexScrobble,
-	reportPlexNowPlaying,
-	reportPlexStopped
-} from '$lib/player/plexPlaybackApi';
+import { createPlaybackSession, sessionKeyFor } from '$lib/player/playbackSession';
+import { prefetchPathFor, streamUrlFor } from '$lib/player/streamUrl';
 import { playbackToast } from '$lib/stores/playbackToast.svelte';
 import { radioSession } from '$lib/stores/radioSession.svelte';
 import {
@@ -34,7 +20,6 @@ import {
 	showQueueMutationToast,
 	type StoredSession
 } from './playerUtils';
-import { createProgressReporter, createBeforeUnloadHandler } from './playerJellyfinReporting';
 import {
 	computeNextIndex,
 	computePreviousIndex,
@@ -44,12 +29,9 @@ import {
 	queueHasAlbums,
 	performCleanup
 } from './playerQueueOps';
-import {
-	resolveSourceUrl,
-	buildPrefetchUrl,
-	buildNowPlayingMetadata
-} from './playerSourceResolver';
+import { buildNowPlayingMetadata } from './playerSourceResolver';
 import { resumeAudioEngine } from '$lib/player/audioElement';
+import { registerUserSessionReset } from '$lib/utils/userSessionCleanup';
 import {
 	persistSession as doPersistSession,
 	restoreSessionData,
@@ -77,8 +59,33 @@ const PREVIEW_FADE_S = 2;
 const ERROR_SKIP_DELAY_MS = 2000;
 const MAX_HISTORY_LENGTH = 3;
 const SESSION_PERSIST_INTERVAL_MS = 5000;
-const JELLYFIN_REPORT_INTERVAL_MS = 10_000;
-const MAX_JELLYFIN_REPORT_FAILURES = 3;
+const SESSION_REPORT_INTERVAL_MS = 10_000;
+const MAX_SESSION_REPORT_FAILURES = 3;
+
+/**
+ * How the current item is recovering. A failed item is retried once, then moved to another
+ * source once, then counted failed and skipped after a pause; three failures in a row stop
+ * playback. A local item the library no longer has leaves the queue instead. Playing clears
+ * it, so recovery never chains.
+ */
+type RecoveryPhase =
+	'idle' | 'loading' | 'resuming' | 'playing' | 'probing' | 'retrying' | 'fallingBack' | 'failed';
+type LoadKind = 'fresh' | 'retry' | 'fallback';
+
+interface Recovery {
+	phase: RecoveryPhase;
+	/** Bumped by every load: a callback from an older load is ignored. */
+	generation: number;
+	/** The tracks that failed in a row; its length is the error count. */
+	failed: string[];
+	skipTimer: ReturnType<typeof setTimeout> | null;
+}
+
+const LOAD_PHASE: Record<LoadKind, RecoveryPhase> = {
+	fresh: 'loading',
+	retry: 'retrying',
+	fallback: 'fallingBack'
+};
 
 function createPlayerStore() {
 	let currentSource = $state<PlaybackSource | null>(null);
@@ -89,23 +96,28 @@ function createPlayerStore() {
 	let progress = $state(0);
 	let duration = $state(0);
 	let isPlayerVisible = $state(false);
-	let loadGeneration = 0;
 	let queue = $state<QueueItem[]>([]);
 	let currentIndex = $state(0);
 	let shuffleEnabled = $state(false);
 	let shuffleOrder = $state<number[]>([]);
-	let consecutiveErrors = 0;
-	let failedTrackNames: string[] = [];
-	// Per-item error recovery: retry the same item once, then fail over to an
-	// alternate source once, before counting the item failed and skipping on.
-	// loadQueueItem clears both when starting a fresh (non-recovery) item and
-	// the 'playing' handler clears them on success, so recovery never chains.
-	let retriedIndex: number | null = null;
-	let fallbackIndex: number | null = null;
-	let recoveryPending = false;
-	let errorSkipTimeout: ReturnType<typeof setTimeout> | null = null;
+	const recovery: Recovery = { phase: 'idle', generation: 0, failed: [], skipTimer: null };
 	let lastPersistTime = 0;
-	let beforeUnloadRegistered = false;
+
+	function cancelSkip(): void {
+		if (recovery.skipTimer) clearTimeout(recovery.skipTimer);
+		recovery.skipTimer = null;
+	}
+
+	/** Starts a load in the given phase and returns its generation. */
+	function beginLoad(phase: RecoveryPhase): number {
+		cancelSkip();
+		recovery.phase = phase;
+		return ++recovery.generation;
+	}
+
+	function isCurrent(gen: number): boolean {
+		return gen === recovery.generation;
+	}
 
 	const isPlaying = $derived(playbackState === 'playing');
 	const isBuffering = $derived(playbackState === 'buffering' || playbackState === 'loading');
@@ -142,16 +154,11 @@ function createPlayerStore() {
 			: currentIndex + 1
 	);
 
-	const progressReporter = createProgressReporter(
-		reportJellyfinProgress,
-		JELLYFIN_REPORT_INTERVAL_MS,
-		MAX_JELLYFIN_REPORT_FAILURES
-	);
-	const handleBeforeUnload = createBeforeUnloadHandler(
-		() => ({ jellyfinItem: getJellyfinItem(), currentItem: queue[currentIndex] ?? null, progress }),
-		GATEWAY_ENDPOINTS.playbackStop(),
-		GATEWAY_ENDPOINTS.scrobbleSubmit()
-	);
+	const session = createPlaybackSession({
+		intervalMs: SESSION_REPORT_INTERVAL_MS,
+		maxFailures: MAX_SESSION_REPORT_FAILURES,
+		position: () => ({ seconds: progress, isPaused: playbackState !== 'playing' })
+	});
 
 	function getNextIndex(): number | null {
 		return computeNextIndex(currentIndex, queue.length, shuffleEnabled, shuffleOrder);
@@ -159,38 +166,64 @@ function createPlayerStore() {
 	function getPreviousIndex(): number | null {
 		return computePreviousIndex(currentIndex, queue.length, shuffleEnabled, shuffleOrder);
 	}
-	function getJellyfinItem(): QueueItem | null {
-		const item = queue[currentIndex];
-		return item?.sourceType === 'jellyfin' ? item : null;
-	}
-	function getCurrentItem(): QueueItem | null {
-		return queue[currentIndex] ?? null;
-	}
 	function persist(): void {
 		doPersistSession(nowPlaying, queue, currentIndex, progress, shuffleEnabled, shuffleOrder);
 	}
 
-	function registerBeforeUnload(): void {
-		if (beforeUnloadRegistered || typeof window === 'undefined') return;
-		window.addEventListener('beforeunload', handleBeforeUnload);
-		beforeUnloadRegistered = true;
+	/** Load the saved session's current item, paused where it was. */
+	function resumeSaved(): void {
+		const stored = restoreSessionData();
+		if (!stored) return;
+		const resume = buildResumeState(stored);
+		if (!resume) return;
+
+		queue = resume.queue;
+		shuffleEnabled = resume.shuffleEnabled;
+		shuffleOrder = resume.shuffleOrder;
+		isPlayerVisible = true;
+		recovery.failed = [];
+		void session.end(progress);
+		currentSource?.destroy();
+		currentIndex = resume.currentIndex;
+		playbackState = 'loading';
+		isSeekable = true;
+		progress = 0;
+		duration = 0;
+		const gen = beginLoad('resuming');
+
+		void (async () => {
+			try {
+				const { source, loadUrl } = resolveSourceForItem(resume.currentItem);
+				if (!isCurrent(gen)) return;
+				currentSource = source;
+				nowPlaying = resume.nowPlaying;
+				subscribeToSource(source, gen);
+				source.setVolume(volume);
+				void session.begin(sessionKeyFor(resume.currentItem));
+				await source.load({
+					trackSourceId: resume.currentItem.trackSourceId,
+					url: loadUrl,
+					format: resume.currentItem.format
+				});
+				if (!isCurrent(gen)) return;
+				playbackState = 'paused';
+				duration = source.getDuration();
+				if (resume.progress > 0) {
+					source.seekTo(resume.progress);
+					progress = resume.progress;
+				}
+			} catch {
+				if (!isCurrent(gen)) return;
+				playbackState = 'error';
+				storeSessionData(null);
+			}
+		})();
 	}
-	function unregisterBeforeUnload(): void {
-		if (!beforeUnloadRegistered || typeof window === 'undefined') return;
-		window.removeEventListener('beforeunload', handleBeforeUnload);
-		beforeUnloadRegistered = false;
-	}
-	async function stopPreviousSession(item: QueueItem | null, posSeconds: number): Promise<void> {
-		progressReporter.stop();
-		unregisterBeforeUnload();
-		if (!item) return;
-		if (item.sourceType === 'jellyfin' && item.playSessionId) {
-			await reportJellyfinStop(item.trackSourceId, item.playSessionId, posSeconds);
-		} else if (item.sourceType === 'navidrome') {
-			void reportNavidromeStopped(item.trackSourceId);
-		} else if (item.sourceType === 'plex' && item.plexRatingKey) {
-			void reportPlexStopped(item.plexRatingKey);
-		}
+
+	function stopPlayback(): void {
+		void session.end(progress);
+		recovery.generation++;
+		applyResetState();
 	}
 
 	function applyResetState(): void {
@@ -207,13 +240,10 @@ function createPlayerStore() {
 		currentIndex = 0;
 		shuffleOrder = [];
 		shuffleEnabled = false;
-		consecutiveErrors = 0;
-		failedTrackNames = [];
-		retriedIndex = null;
-		fallbackIndex = null;
-		recoveryPending = false;
-		progressReporter.stop();
-		unregisterBeforeUnload();
+		cancelSkip();
+		recovery.phase = 'idle';
+		recovery.failed = [];
+		session.clear();
 		storeSessionData(null);
 	}
 
@@ -221,70 +251,21 @@ function createPlayerStore() {
 		source: PlaybackSource;
 		loadUrl: string | undefined;
 	} {
-		const url = resolveSourceUrl(item);
+		isSeekable = true;
+		const url = streamUrlFor(item);
 		if (item.sourceType === 'youtube') {
-			isSeekable = true;
 			return { source: createPlaybackSource('youtube'), loadUrl: url };
 		}
-		if (item.sourceType === 'local') {
-			isSeekable = true;
-			return { source: createPlaybackSource('local', { url: url!, seekable: true }), loadUrl: url };
-		}
-		if (item.sourceType === 'navidrome') {
-			isSeekable = true;
-			void reportNavidromeNowPlaying(item.trackSourceId);
-			return {
-				source: createPlaybackSource('navidrome', { url: url!, seekable: true }),
-				loadUrl: url
-			};
-		}
-		if (item.sourceType === 'plex') {
-			isSeekable = true;
-			if (item.plexRatingKey) void reportPlexNowPlaying(item.plexRatingKey);
-			return {
-				source: createPlaybackSource('plex', { url: url!, seekable: true }),
-				loadUrl: url
-			};
-		}
-		isSeekable = true;
 		return {
-			source: createPlaybackSource('jellyfin', { url: url!, seekable: true }),
+			source: createPlaybackSource(item.sourceType, { url: url!, seekable: true }),
 			loadUrl: url
 		};
 	}
 
-	async function startJellyfinPlayback(index: number): Promise<void> {
-		const item = queue[index];
-		if (!item || item.sourceType !== 'jellyfin') return;
-		try {
-			const playSessionId = await startJellyfinSession(item.trackSourceId, item.playSessionId);
-			const uq = [...queue];
-			uq[index] = { ...uq[index], playSessionId };
-			queue = uq;
-			registerBeforeUnload();
-		} catch {
-			const uq = [...queue];
-			uq[index] = { ...uq[index], playSessionId: '' };
-			queue = uq;
-		}
-	}
-
-	async function loadQueueItem(index: number): Promise<void> {
+	async function loadQueueItem(index: number, kind: LoadKind = 'fresh'): Promise<void> {
 		const item = queue[index];
 		if (!item) return;
-		// Recovery reloads of the same item preserve the retry/fallback marks so
-		// a failed retry or fallback cannot trigger itself again. Any other load
-		// starts fresh.
-		if (recoveryPending) {
-			recoveryPending = false;
-		} else {
-			retriedIndex = null;
-			fallbackIndex = null;
-		}
-		if (errorSkipTimeout) {
-			clearTimeout(errorSkipTimeout);
-			errorSkipTimeout = null;
-		}
+		const gen = beginLoad(LOAD_PHASE[kind]);
 		const prevProgress = progress,
 			prevItem = currentSource ? (queue[currentIndex] ?? null) : null;
 		currentIndex = index;
@@ -292,24 +273,22 @@ function createPlayerStore() {
 		progress = 0;
 		duration = 0;
 		if (prevItem) {
-			await stopPreviousSession(prevItem, prevProgress);
+			await session.end(prevProgress);
 		} else {
-			progressReporter.stop();
-			unregisterBeforeUnload();
+			session.clear();
 		}
+		if (!isCurrent(gen)) return;
 		currentSource?.destroy();
-		const gen = ++loadGeneration;
 		let source: PlaybackSource, resolvedUrl: string | undefined;
 		try {
 			const r = await resolveSourceForItem(item);
 			source = r.source;
 			resolvedUrl = r.loadUrl;
 		} catch (e) {
-			if (gen === loadGeneration)
-				handleTrackError(
-					gen,
-					e instanceof Error ? { code: 'LOAD_ERROR', message: e.message } : undefined
-				);
+			handleTrackError(
+				gen,
+				e instanceof Error ? { code: 'LOAD_ERROR', message: e.message } : undefined
+			);
 			return;
 		}
 		currentSource = source;
@@ -324,22 +303,19 @@ function createPlayerStore() {
 				url: resolvedUrl,
 				format: activeItem.format
 			});
-			// Session must exist before play(): a fast 'playing' event would otherwise
-			// start the progress reporter without a playSessionId and it bails permanently.
-			if (activeItem.sourceType === 'jellyfin') await startJellyfinPlayback(index);
-			if (gen === loadGeneration && activeItem.sourceType !== 'youtube') {
+			void session.begin(sessionKeyFor(activeItem));
+			if (isCurrent(gen) && activeItem.sourceType !== 'youtube') {
 				source.play();
 			}
 			await loadPromise;
-			if (gen === loadGeneration && activeItem.sourceType === 'youtube') {
+			if (isCurrent(gen) && activeItem.sourceType === 'youtube') {
 				source.play();
 			}
 		} catch (e) {
-			if (gen === loadGeneration)
-				handleTrackError(
-					gen,
-					e instanceof Error ? { code: 'LOAD_ERROR', message: e.message } : undefined
-				);
+			handleTrackError(
+				gen,
+				e instanceof Error ? { code: 'LOAD_ERROR', message: e.message } : undefined
+			);
 		}
 	}
 
@@ -350,57 +326,103 @@ function createPlayerStore() {
 		return alternates[0] ?? null;
 	}
 
+	/**
+	 * Whether the library still has a local item: its stream answers anything but not found.
+	 * A failed or unreadable check counts as still there, so the item is retried as before.
+	 */
+	async function stillInLibrary(item: QueueItem): Promise<boolean> {
+		const path = prefetchPathFor(item);
+		if (!path) return true;
+		try {
+			return (await api.head(path)).status !== 404;
+		} catch {
+			return true;
+		}
+	}
+
+	/**
+	 * A local item the library no longer has (removed, or its file gone) leaves the queue with
+	 * one notice. Playback moves on to the next item; a resumed session shows it paused.
+	 */
+	function dropGone(index: number, trackName: string, resuming: boolean): void {
+		playbackToast.show(`"${trackName}" is no longer in the library`, 'info');
+		const hasNext = getNextIndex() !== null;
+		if (queue.length <= 1 || (!resuming && !hasNext)) {
+			stopPlayback();
+			return;
+		}
+		const r = removeAtIndex(queue, index, currentIndex, shuffleEnabled, shuffleOrder);
+		queue = r.newQueue;
+		currentIndex = r.newIndex;
+		shuffleOrder = r.newShuffleOrder;
+		if (resuming) {
+			const next = queue[currentIndex];
+			nowPlaying = next ? buildNowPlayingMetadata(next) : null;
+			progress = 0;
+			persist();
+			resumeSaved();
+		} else {
+			void loadQueueItem(r.newIndex);
+		}
+	}
+
 	function handleTrackError(gen: number, error?: { code: string; message: string }): void {
-		if (gen !== loadGeneration) return;
+		if (!isCurrent(gen)) return;
 		const index = currentIndex;
 		const item = queue[index];
 		const trackName = nowPlaying?.trackName ?? item?.trackName ?? 'Unknown track';
 		const failedSource = item?.sourceType ?? nowPlaying?.sourceType ?? 'unknown';
 		const detail = error?.message || error?.code || '';
 		const detailSuffix = detail ? ` (${detail})` : '';
-		// Same track may have failed transiently: reload it once with a fresh
-		// resolve+load. The retry keeps its mark in loadQueueItem, so a failed
-		// retry falls through to fallback/skip instead of looping.
-		if (item && retriedIndex !== index) {
-			retriedIndex = index;
-			recoveryPending = true;
+		const { phase } = recovery;
+		// One failed load reports more than once; the check below answers it once.
+		if (phase === 'probing') return;
+		// A first failure may be transient: reload the same item once.
+		const retry = () => {
 			playbackToast.show(
 				`"${trackName}" failed on ${failedSource}${detailSuffix}, retrying...`,
 				'warning'
 			);
-			void loadQueueItem(index);
+			void loadQueueItem(index, 'retry');
+		};
+		if (item && (phase === 'loading' || phase === 'playing' || phase === 'resuming')) {
+			if (item.sourceType !== 'local') {
+				retry();
+				return;
+			}
+			// A local item may have left the library: ask before retrying it.
+			recovery.phase = 'probing';
+			void stillInLibrary(item).then((kept) => {
+				if (!isCurrent(gen)) return;
+				if (kept) {
+					retry();
+				} else {
+					dropGone(index, trackName, phase === 'resuming');
+				}
+			});
 			return;
 		}
-		// Same track playable from another source (e.g. Plex fails but the local
-		// copy works): switch with the existing source machinery before skipping.
-		if (item && fallbackIndex !== index) {
+		// The same track may play from another source (Plex fails, the local copy works).
+		if (item && phase === 'retrying') {
 			const next = nextFallbackSource(item);
-			if (next) {
-				const switched = changeItemSource(queue, index, next);
-				if (!switched.error) {
-					fallbackIndex = index;
-					queue = switched.newQueue;
-					recoveryPending = true;
-					playbackToast.show(
-						`"${trackName}" failed on ${failedSource}, trying ${next}...`,
-						'warning'
-					);
-					void loadQueueItem(index);
-					return;
-				}
+			const switched = next ? changeItemSource(queue, index, next) : null;
+			if (switched && !switched.error) {
+				queue = switched.newQueue;
+				playbackToast.show(
+					`"${trackName}" failed on ${failedSource}, trying ${next}...`,
+					'warning'
+				);
+				void loadQueueItem(index, 'fallback');
+				return;
 			}
 		}
-		consecutiveErrors++;
+		cancelSkip();
+		recovery.phase = 'failed';
+		recovery.failed.push(trackName);
 		playbackState = 'error';
-		failedTrackNames.push(trackName);
-		if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
-			const named = failedTrackNames
-				.slice(0, MAX_CONSECUTIVE_ERRORS)
-				.map((n) => `"${n}"`)
-				.join(', ');
-			const extra = failedTrackNames.length - MAX_CONSECUTIVE_ERRORS;
-			const suffix = extra > 0 ? ` +${extra} more` : '';
-			playbackToast.show(`Several tracks failed: ${named}${suffix} - playback stopped.`, 'error');
+		if (recovery.failed.length >= MAX_CONSECUTIVE_ERRORS) {
+			const named = recovery.failed.map((n) => `"${n}"`).join(', ');
+			playbackToast.show(`Several tracks failed: ${named} - playback stopped.`, 'error');
 			applyResetState();
 			return;
 		}
@@ -410,9 +432,9 @@ function createPlayerStore() {
 				`"${trackName}" failed on ${failedSource}${detailSuffix}, skipping...`,
 				'warning'
 			);
-			errorSkipTimeout = setTimeout(() => {
-				errorSkipTimeout = null;
-				if (gen === loadGeneration) void loadQueueItem(nextIdx);
+			recovery.skipTimer = setTimeout(() => {
+				recovery.skipTimer = null;
+				if (isCurrent(gen)) void loadQueueItem(nextIdx);
 			}, ERROR_SKIP_DELAY_MS);
 		} else {
 			playbackToast.show(`"${trackName}" failed on ${failedSource}${detailSuffix}`, 'error');
@@ -424,39 +446,23 @@ function createPlayerStore() {
 		if (nextIdx === null) return;
 		const nextItem = queue[nextIdx];
 		if (!nextItem) return;
-		const url = buildPrefetchUrl(nextItem);
-		if (url) void api.global.head(url).catch(() => {});
+		const url = prefetchPathFor(nextItem);
+		if (url) void api.head(url).catch(() => {});
 	}
 
 	function subscribeToSource(source: PlaybackSource, gen: number): void {
 		source.onStateChange((state) => {
-			if (gen !== loadGeneration) return;
+			if (!isCurrent(gen)) return;
 			playbackState = state;
 			if (state === 'playing') {
-				consecutiveErrors = 0;
-				failedTrackNames = [];
-				retriedIndex = null;
-				fallbackIndex = null;
-				if (getJellyfinItem())
-					progressReporter.start(() => ({
-						jellyfinItem: getJellyfinItem(),
-						progress,
-						isPaused: playbackState !== 'playing'
-					}));
+				recovery.phase = 'playing';
+				recovery.failed = [];
+				session.playing();
 				prefetchNext();
 			}
-			if (state === 'paused') {
-				const jf = getJellyfinItem();
-				if (jf?.playSessionId)
-					void reportJellyfinProgress(jf.trackSourceId, jf.playSessionId, progress, true);
-			}
+			if (state === 'paused') session.paused(progress);
 			if (state === 'ended') {
-				const endedItem = getCurrentItem();
-				void stopPreviousSession(endedItem, progress);
-				if (endedItem?.sourceType === 'plex' && endedItem.plexRatingKey)
-					void reportPlexScrobble(endedItem.plexRatingKey);
-				else if (endedItem?.sourceType === 'navidrome')
-					void reportNavidromeScrobble(endedItem.trackSourceId);
+				void session.end(progress);
 				const nextIdx = getNextIndex();
 				if (nextIdx !== null) {
 					void loadQueueItem(nextIdx).then(() => {
@@ -478,7 +484,7 @@ function createPlayerStore() {
 			}
 		});
 		source.onProgress((t, d) => {
-			if (gen !== loadGeneration) return;
+			if (!isCurrent(gen)) return;
 			progress = t;
 			duration = d;
 			// preview tier: DJ-style fade over the last 2s so 30s clips blend
@@ -497,7 +503,7 @@ function createPlayerStore() {
 			}
 		});
 		source.onError((error) => {
-			if (gen !== loadGeneration) return;
+			if (!isCurrent(gen)) return;
 			handleTrackError(gen, error);
 		});
 	}
@@ -576,9 +582,10 @@ function createPlayerStore() {
 		playAlbum(source: PlaybackSource, metadata: NowPlaying): void {
 			radioSession.end();
 			void resumeAudioEngine();
-			void stopPreviousSession(getCurrentItem(), progress);
+			void session.end(progress);
 			currentSource?.destroy();
-			const gen = ++loadGeneration;
+			const gen = beginLoad('loading');
+			recovery.failed = [];
 			currentSource = source;
 			nowPlaying = metadata;
 			playbackState = 'loading';
@@ -587,7 +594,6 @@ function createPlayerStore() {
 			queue = [];
 			currentIndex = 0;
 			shuffleOrder = [];
-			consecutiveErrors = 0;
 			subscribeToSource(source, gen);
 			source.setVolume(volume);
 			persist();
@@ -604,7 +610,7 @@ function createPlayerStore() {
 			shuffleEnabled = s.shuffleEnabled;
 			shuffleOrder = s.shuffleOrder;
 			isPlayerVisible = s.isPlayerVisible;
-			consecutiveErrors = 0;
+			recovery.failed = [];
 			void loadQueueItem(s.startIndex);
 		},
 
@@ -769,6 +775,40 @@ function createPlayerStore() {
 			}
 		},
 
+		/**
+		 * Take local tracks the library no longer has (a removal made here) out of the queue.
+		 * When the current one goes, the next takes its place, playing if it was.
+		 */
+		dropTracks(trackIds: readonly string[]): void {
+			const gone = new Set(trackIds);
+			const wasPlaying = playbackState === 'playing';
+			let currentGone = false;
+			for (let index = queue.length - 1; index >= 0; index--) {
+				const item = queue[index];
+				if (item?.sourceType !== 'local' || !gone.has(item.trackSourceId)) continue;
+				if (queue.length <= 1) {
+					stopPlayback();
+					return;
+				}
+				const r = removeAtIndex(queue, index, currentIndex, shuffleEnabled, shuffleOrder);
+				queue = r.newQueue;
+				currentIndex = r.newIndex;
+				shuffleOrder = r.newShuffleOrder;
+				currentGone ||= r.wasPlaying;
+			}
+			if (!currentGone) {
+				persist();
+			} else if (wasPlaying) {
+				void loadQueueItem(currentIndex);
+			} else {
+				const next = queue[currentIndex];
+				nowPlaying = next ? buildNowPlayingMetadata(next) : null;
+				progress = 0;
+				persist();
+				resumeSaved();
+			}
+		},
+
 		reorderQueue(fromIndex: number, toIndex: number): void {
 			const r = performReorder(queue, fromIndex, toIndex, currentIndex);
 			queue = r.newQueue;
@@ -851,26 +891,14 @@ function createPlayerStore() {
 
 		pause(): void {
 			currentSource?.pause();
-			const jf = getJellyfinItem();
-			if (jf?.playSessionId)
-				void reportJellyfinProgress(jf.trackSourceId, jf.playSessionId, progress, true);
-			const item = getCurrentItem();
-			if (item?.sourceType === 'plex' && item.plexRatingKey)
-				void reportPlexStopped(item.plexRatingKey);
-			if (item?.sourceType === 'navidrome') void reportNavidromeStopped(item.trackSourceId);
+			session.paused(progress);
 			persist();
 		},
 
 		togglePlay(): void {
 			if (isPlaying) {
 				currentSource?.pause();
-				const jf = getJellyfinItem();
-				if (jf?.playSessionId)
-					void reportJellyfinProgress(jf.trackSourceId, jf.playSessionId, progress, true);
-				const item = getCurrentItem();
-				if (item?.sourceType === 'plex' && item.plexRatingKey)
-					void reportPlexStopped(item.plexRatingKey);
-				if (item?.sourceType === 'navidrome') void reportNavidromeStopped(item.trackSourceId);
+				session.paused(progress);
 				persist();
 			} else {
 				void resumeAudioEngine();
@@ -891,13 +919,7 @@ function createPlayerStore() {
 		},
 
 		stop(): void {
-			void stopPreviousSession(getCurrentItem(), progress);
-			if (errorSkipTimeout) {
-				clearTimeout(errorSkipTimeout);
-				errorSkipTimeout = null;
-			}
-			loadGeneration++;
-			applyResetState();
+			stopPlayback();
 		},
 
 		restoreSession(): StoredSession | null {
@@ -905,56 +927,12 @@ function createPlayerStore() {
 		},
 
 		resumeSession(): void {
-			const session = restoreSessionData();
-			if (!session) return;
-			const resume = buildResumeState(session);
-			if (!resume) return;
-
-			queue = resume.queue;
-			shuffleEnabled = resume.shuffleEnabled;
-			shuffleOrder = resume.shuffleOrder;
-			isPlayerVisible = true;
-			consecutiveErrors = 0;
-			void stopPreviousSession(getCurrentItem(), progress);
-			currentSource?.destroy();
-			currentIndex = resume.currentIndex;
-			playbackState = 'loading';
-			isSeekable = true;
-			progress = 0;
-			duration = 0;
-			const gen = ++loadGeneration;
-
-			void (async () => {
-				try {
-					const { source, loadUrl } = resolveSourceForItem(resume.currentItem);
-					if (gen !== loadGeneration) return;
-					currentSource = source;
-					nowPlaying = resume.nowPlaying;
-					subscribeToSource(source, gen);
-					source.setVolume(volume);
-					if (resume.currentItem.sourceType === 'jellyfin') {
-						await startJellyfinPlayback(resume.currentIndex);
-					}
-					await source.load({
-						trackSourceId: resume.currentItem.trackSourceId,
-						url: loadUrl,
-						format: resume.currentItem.format
-					});
-					if (gen !== loadGeneration) return;
-					playbackState = 'paused';
-					duration = source.getDuration();
-					if (resume.progress > 0) {
-						source.seekTo(resume.progress);
-						progress = resume.progress;
-					}
-				} catch {
-					if (gen !== loadGeneration) return;
-					playbackState = 'error';
-					storeSessionData(null);
-				}
-			})();
+			resumeSaved();
 		}
 	};
 }
 
 export const playerStore = createPlayerStore();
+
+// The next person on this browser never resumes the last one's listening.
+registerUserSessionReset(() => playerStore.stop());

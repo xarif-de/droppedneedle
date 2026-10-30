@@ -65,12 +65,12 @@ durable_jobs
 durable_loops
 
 [auth]
+auth_app_passwords
 auth_oidc_states
 auth_password_recovery_codes
 auth_providers
 auth_tokens
 auth_users
-connect_app_passwords
 
 [plugins]
 plugin_library_writes
@@ -176,6 +176,7 @@ library_custom_edition_tracks
 library_edition_choice_undo
 library_edition_remap_queue
 library_event_stream_revisions
+library_folder_digests
 library_identification_attempts
 library_identify_artist_id_checks
 library_identify_jobs
@@ -186,7 +187,6 @@ library_management_baseline_purges
 library_management_baselines
 library_management_blobs
 library_management_exclusions
-library_management_external_refresh_deliveries
 library_management_job_snapshots
 library_management_metadata_snapshots
 library_management_overrides

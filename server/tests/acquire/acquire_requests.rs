@@ -34,7 +34,8 @@ use axum::{
 };
 use droppedneedle_acquire::db::AcquireDb;
 use droppedneedle_acquire::dispatch::DownloadDispatch;
-use droppedneedle_acquire::downloads::state::TaskStatus;
+use droppedneedle_acquire::downloads::state::{AttemptState, TaskStatus};
+use droppedneedle_acquire::downloads::worker::{DownloadWorker, WorkerConfig};
 use droppedneedle_acquire::downloads::{PlannedAlbum, ReplaceVersion};
 use droppedneedle_acquire::follows::ImportArtist;
 use droppedneedle_acquire::requests::{
@@ -65,9 +66,29 @@ const MBID_B: &str = "22222222-2222-4222-8222-222222222222";
 const MBID_C: &str = "33333333-3333-4333-8333-333333333333";
 const ARTIST: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 
+/// The requests routes alone (no ports, no quota) over the download
+/// dispatch of a production acquire bundle on a scratch database. Returns
+/// the state, the database (to seed users and rows) and the dispatch (to
+/// read and settle its tasks).
+pub(crate) async fn requests_state() -> (RequestsState, AcquireDb, Arc<DownloadDispatch>) {
+    let db = AcquireDb::scratch().expect("scratch db");
+    let dir = db.path().parent().expect("scratch dir").to_path_buf();
+    let platform = crate::common::TestPlatform::on(db.db(), &dir).build().await;
+    let (library, _) = crate::common::library::library_at(&platform);
+    let acquire = crate::common::bundles::acquire_at(
+        &platform,
+        crate::common::auth::AuthRig::on(&platform).deps,
+        &library,
+        &crate::common::bundles::collections_at(&platform).stores,
+    );
+    let quota = Arc::new(QuotaLedger::unlimited(acquire.db.clone()));
+    let state = RequestsState::new(&acquire.db, quota, acquire.dispatch.clone());
+    (state, db, acquire.dispatch)
+}
+
 /// State over a scratch database with every test user present.
 async fn setup() -> (RequestsState, AcquireDb, Downloads) {
-    let (state, db, dispatch) = RequestsState::for_tests().expect("requests state builds");
+    let (state, db, dispatch) = requests_state().await;
     for (id, name, role) in [
         ("u-ada", "Ada", "user"),
         ("u-bob", "Bob", "user"),
@@ -517,7 +538,8 @@ async fn batch_dedupes_and_dispatches_new_rows() {
     assert_eq!(dispatch.take_calls().await.len(), 2);
 }
 
-// Strangers may not cancel, listeners detach, owners stop the task.
+// Strangers get the unknown-id answer, listeners detach, owners stop the
+// task.
 #[tokio::test]
 async fn cancel_matrix() {
     let (state, _db, dispatch) = setup().await;
@@ -525,7 +547,7 @@ async fn cancel_matrix() {
     ask(&state, BOB, MBID_A).await;
     let uri = format!("/api/v3/requests/active/{MBID_A}");
     let (status, _) = call(&state, Method::DELETE, &uri, Some(ADA), None).await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(status, StatusCode::NOT_FOUND);
     let (_, detached) = call(&state, Method::DELETE, &uri, Some(BOB), None).await;
     assert_eq!(detached["success"], true);
     assert!(
@@ -567,6 +589,58 @@ async fn cancel_matrix() {
         .find(|item| item["musicbrainz_id"] == MBID_B)
         .expect("the stopped row");
     assert_eq!(stopped["status"], "cancelled", "{history}");
+}
+
+// A requester's cancel that meets a download which has just failed stops it
+// for good: the automatic retry neither starts the album again nor moves the
+// request back. Retrying the stopped download by hand brings the request
+// back with it.
+#[tokio::test]
+async fn a_cancel_outlasts_the_automatic_retry() {
+    let (state, db, dispatch) = setup().await;
+    ask(&state, TRUSTED, MBID_A).await;
+    let first = dispatch.task(1).await;
+    // The download fails as the cancel arrives, before the request follows.
+    let failed = first.clone();
+    db.write("test.fail_behind", move |tx| {
+        tx.execute(
+            "UPDATE download_tasks SET status = 'failed', completed_at = 1000 WHERE id = ?1",
+            rusqlite::params![failed],
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let uri = format!("/api/v3/requests/active/{MBID_A}");
+    let (_, cancelled) = call(&state, Method::DELETE, &uri, Some(TRUSTED), None).await;
+    assert_eq!(cancelled["success"], true, "{cancelled}");
+
+    let journal = dispatch.dispatch.journal().clone();
+    let worker = Arc::new(DownloadWorker::fixed(
+        journal.clone(),
+        Vec::new(),
+        WorkerConfig::default(),
+        EventHub::new(),
+        Default::default(),
+    ));
+    worker.run_once(1).await;
+    let row = state.store.get(RequestKind::Album, MBID_A).await.unwrap();
+    assert_eq!(row.unwrap().status.as_str(), "cancelled");
+    assert_eq!(
+        dispatch.ids().await,
+        std::slice::from_ref(&first),
+        "nothing starts again"
+    );
+
+    let source = journal.read_task(&first).await.unwrap().unwrap();
+    let successor = worker
+        .retry_now(&source)
+        .await
+        .expect("a hand retry starts");
+    let row = state.store.get(RequestKind::Album, MBID_A).await.unwrap();
+    let row = row.unwrap();
+    assert_eq!(row.status.as_str(), "downloading");
+    assert_eq!(row.task_id.as_deref(), Some(successor.as_str()));
 }
 
 // The request-count quota counts durable rows, so a restart does not reset
@@ -748,8 +822,8 @@ async fn wanted_view_and_actions() {
     .await;
     assert_eq!(resumed["state"], "watching");
     state
-        .wanted
-        .mark_fulfilled(MBID_A, "in_library", 1_700_000_100)
+        .store
+        .settle_in_library(MBID_A, "in_library", 1_700_000_100)
         .await
         .unwrap();
     assert_eq!(
@@ -949,7 +1023,8 @@ async fn personal_mix_grant_build_and_refresh() {
                 ..PrefsPatch::default()
             },
         )
-        .await;
+        .await
+        .unwrap();
     hooks.on_toggle("u-ada", Role::User, true).await;
     assert_eq!(hooks.state("u-ada", Role::User, true).await, "pending");
     let approve = "/api/v3/requests/personal-mix-approvals/u-ada/approve";
@@ -991,7 +1066,7 @@ async fn personal_mix_grant_build_and_refresh() {
         auto_request_personal_mix: Some(true),
         ..PrefsPatch::default()
     };
-    prefs.update_prefs("u-tris", &toggle).await;
+    prefs.update_prefs("u-tris", &toggle).await.unwrap();
     hooks.on_toggle("u-tris", Role::Trusted, true).await;
     assert_eq!(hooks.state("u-tris", Role::Trusted, true).await, "approved");
     let trusted = builder.build_for_user("u-tris", false).await.unwrap();
@@ -1105,6 +1180,48 @@ async fn history_pages_and_clears() {
     assert_eq!(owners["total"], 2);
 }
 
+// `status=reimportable` lists only the failed requests whose download kept
+// its files, and only for an admin.
+#[tokio::test]
+async fn history_filters_reimportable_for_admins() {
+    let (state, _db, dispatch) = setup().await;
+    for mbid in [MBID_A, MBID_B] {
+        ask(&state, TRUSTED, mbid).await;
+    }
+    let kept = dispatch.task(1).await;
+    let bare = dispatch.task(2).await;
+    let attempt_task = kept.clone();
+    dispatch
+        .dispatch
+        .journal()
+        .run("test.attempt", move |store| {
+            store.insert_attempt(
+                "kept-a0",
+                &attempt_task,
+                "soulseek",
+                0,
+                "",
+                r#"{"source":"soulseek","username":"peer","filenames":["a.flac"],"job_name":""}"#,
+                AttemptState::Preserved,
+                1_700_000_000.0,
+            )
+        })
+        .await
+        .expect("attempt recorded");
+    dispatch.fail(&kept).await;
+    dispatch.fail(&bare).await;
+
+    let uri = "/api/v3/requests/history?status=reimportable";
+    let (status, body) = call(&state, Method::GET, uri, Some(ADMIN), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["total"], 1, "{body}");
+    assert_eq!(body["items"][0]["musicbrainz_id"], MBID_A);
+    assert_eq!(body["items"][0]["can_reimport"], true);
+
+    let (status, body) = call(&state, Method::GET, uri, Some(TRUSTED), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+}
+
 // Missing principal is 401, a user on an admin queue is 403, a bad body is
 // a 400 envelope.
 #[tokio::test]
@@ -1190,6 +1307,198 @@ async fn recovery_finishes_cancels_and_dispatches() {
         .unwrap()
         .unwrap();
     assert!(row.task_id.is_some(), "the new task is linked");
+}
+
+/// An album or track ask whose download cannot be queued because the
+/// database is busy is never failed: the row waits, and the next pass of
+/// waiting requests starts it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_busy_database_leaves_an_ask_waiting_until_the_next_pass() {
+    use droppedneedle_acquire::downloads::journal::Journal;
+    use droppedneedle_kernel::db::{DbConfig, DbError, Lane, LaneLimits, open_runtime};
+
+    let (state, db, dispatch) = setup().await;
+    // A download journal whose writer is held, so a dispatch hears busy.
+    let dir = crate::common::ScratchDir::new("requests-busy-dispatch");
+    let path = dir.join("journal.db");
+    crate::common::migrated_db(&path);
+    let runtime = open_runtime(&DbConfig::new(&path).with_lane_limits(LaneLimits {
+        foreground_wait: std::time::Duration::from_millis(200),
+        watch_tick: std::time::Duration::from_millis(10),
+        ..LaneLimits::default()
+    }))
+    .await
+    .expect("runtime opens");
+    let held = AcquireDb::new(
+        runtime.db().clone(),
+        Arc::new(droppedneedle_kernel::clock::SystemClock),
+    );
+    let settings = droppedneedle_acquire::settings::scratch_settings(&dir.join("settings"))
+        .expect("settings open");
+    let busy = Arc::new(DownloadDispatch::new(
+        Arc::new(Journal::new(held, crate::common::bundles::quiet_ticks())),
+        Arc::new(droppedneedle_kernel::ids::UuidGenerator),
+        settings.live(),
+    ));
+    let busy_state = RequestsState::new(&db, state.quota.clone(), busy);
+    let (entered, inside) = std::sync::mpsc::channel();
+    let (let_go, release) = std::sync::mpsc::channel::<()>();
+    let writer = {
+        let db = runtime.db().clone();
+        std::thread::spawn(move || {
+            let _ = db.write_blocking(Lane::Foreground, "test.hold", |_| {
+                let _ = entered.send(());
+                let _ = release.recv();
+                Ok::<_, DbError>(())
+            });
+        })
+    };
+    inside
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the writer is held");
+
+    let (status, body) = ask(&busy_state, TRUSTED, MBID_A).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body["status"], "queued");
+    let (status, body) = call(
+        &busy_state,
+        Method::POST,
+        "/api/v3/requests/tracks",
+        Some(TRUSTED),
+        Some(json!({
+            "recording_mbid": MBID_B,
+            "artist_name": "Artist",
+            "track_title": "Song",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body["status"], "queued");
+    drop(let_go);
+    writer.join().expect("writer joins");
+    for (kind, key) in [(RequestKind::Album, MBID_A), (RequestKind::Track, MBID_B)] {
+        let row = state.store.get(kind, key).await.unwrap().unwrap();
+        assert!(row.waits_for_quota(), "{kind:?} waits: {:?}", row.status);
+    }
+
+    let started = RequestsService::new(&state)
+        .start_waiting(2_000_000_000)
+        .await
+        .unwrap();
+    assert!(started.is_empty(), "no follow notice for a person's ask");
+    assert_eq!(dispatch.take_calls().await.len(), 2);
+    for (kind, key) in [(RequestKind::Album, MBID_A), (RequestKind::Track, MBID_B)] {
+        let row = state.store.get(kind, key).await.unwrap().unwrap();
+        assert_eq!(row.status.as_str(), "downloading", "{kind:?} started");
+        assert!(row.task_id.is_some(), "{kind:?} is linked");
+    }
+    runtime.shutdown().await;
+}
+
+/// An album ask that names the edition its page showed is still fetched
+/// in the library's chosen edition. While that edition does not read (a
+/// busy database), the ask answers busy and stores nothing, so the named
+/// edition never stands in for the chosen one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_busy_edition_read_never_lets_the_asked_edition_stand_in() {
+    use droppedneedle_kernel::db::{DbConfig, DbError, LaneLimits, open_runtime};
+
+    const ASKED: &str = "22222222-2222-4222-8222-222222222222";
+    const CHOSEN: &str = "33333333-3333-4333-8333-333333333333";
+    let (mut state, _db, dispatch) = setup().await;
+    // The library's database, with one reader, holding the chosen edition.
+    let dir = crate::common::ScratchDir::new("requests-busy-edition");
+    let path = dir.join("library.db");
+    crate::common::migrated_db(&path);
+    let mut config = DbConfig::new(&path)
+        .with_read_wait(std::time::Duration::from_millis(200))
+        .with_lane_limits(LaneLimits {
+            watch_tick: std::time::Duration::from_millis(10),
+            ..LaneLimits::default()
+        });
+    config.readers = 1;
+    let runtime = open_runtime(&config).await.expect("runtime opens");
+    let library = AcquireDb::new(
+        runtime.db().clone(),
+        Arc::new(droppedneedle_kernel::clock::SystemClock),
+    );
+    library
+        .write("test.seed_edition", |tx| {
+            tx.execute_batch(&format!(
+                "INSERT INTO local_artists (id, display_name, folded_name, kind, created_at,
+                   updated_at) VALUES ('ar1', 'A', 'a', 'person', 0, 0);
+                 INSERT INTO local_albums (id, root_id, grouping_key, title, title_folded,
+                   album_artist_id, grouping_source, created_at, updated_at)
+                   VALUES ('al1', 'r1', 'g', 'T', 't', 'ar1', 'automatic', 0, 0);
+                 INSERT INTO local_album_external_identities (local_album_id, provider,
+                   release_group_mbid, release_mbid, decision_source, selected_at, row_revision)
+                   VALUES ('al1', 'musicbrainz', '{MBID_A}', '{CHOSEN}', 'manual', 5, 1);"
+            ))?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    state.library = library;
+    let body = json!({
+        "musicbrainz_id": MBID_A,
+        "artist": "Artist",
+        "album": "Album",
+        "release_mbid": ASKED,
+    });
+
+    let (entered, inside) = std::sync::mpsc::channel();
+    let (let_go, release) = std::sync::mpsc::channel::<()>();
+    let reader = {
+        let db = runtime.db().clone();
+        std::thread::spawn(move || {
+            db.read_blocking("test.hold", move |_| {
+                let _ = entered.send(());
+                let _ = release.recv();
+                Ok::<_, DbError>(())
+            })
+        })
+    };
+    inside
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the reader is held");
+    let (status, answer) = call(
+        &state,
+        Method::POST,
+        "/api/v3/requests/albums",
+        Some(TRUSTED),
+        Some(body.clone()),
+    )
+    .await;
+    drop(let_go);
+    reader
+        .join()
+        .expect("reader joins")
+        .expect("held read ends");
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{answer}");
+    assert!(
+        state
+            .store
+            .get(RequestKind::Album, MBID_A)
+            .await
+            .unwrap()
+            .is_none(),
+        "nothing is stored"
+    );
+    assert!(dispatch.take_calls().await.is_empty(), "nothing is queued");
+
+    let (status, answer) = call(
+        &state,
+        Method::POST,
+        "/api/v3/requests/albums",
+        Some(TRUSTED),
+        Some(body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{answer}");
+    let calls = dispatch.take_calls().await;
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].release_mbid.as_deref(), Some(CHOSEN));
+    runtime.shutdown().await;
 }
 
 /// The library's plan for one album, scripted: track 1 kept, track 2

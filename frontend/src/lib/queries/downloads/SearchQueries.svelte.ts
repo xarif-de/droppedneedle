@@ -1,14 +1,20 @@
-import { createMutation, createQuery, queryOptions } from '@tanstack/svelte-query';
+import { createQuery, queryOptions } from '@tanstack/svelte-query';
 
-import { ApiError, api } from '$lib/api/client';
+import { api } from '$lib/api/client';
+import { ApiError } from '$lib/api/errors';
 import type { components } from '$lib/api/v3/openapi';
-import { invalidateQueriesWithPersister } from '$lib/queries/QueryClient';
-import { WantedQueryKeyFactory } from '$lib/queries/wanted/WantedQueryKeyFactory';
 import { authStore } from '$lib/stores/authStore.svelte';
 import { toastStore } from '$lib/stores/toast';
 
 import { DownloadQueryKeyFactory } from './DownloadQueryKeyFactory';
 import { DOWNLOAD_SEARCH_ENDPOINTS } from './endpoints';
+import { STALE_LIVE } from '$lib/queries/staleTime';
+import {
+	createAppMutation,
+	downloadsChanged,
+	searchJobChanged,
+	wantedChanged
+} from '$lib/queries/effects';
 
 export type SearchAlbumRequest = components['schemas']['SearchAlbumRequest'];
 export type SearchAlbumResponse = components['schemas']['SearchAlbumResponse'];
@@ -22,23 +28,18 @@ type DismissSearchResponse = components['schemas']['DismissSearchResponse'];
 type ActionResponse = components['schemas']['DownloadActionResponse'];
 
 // Safety net for a missed `search_job_updated` event while the search runs.
-const SEARCHING_POLL_MS = 5_000;
+const SEARCHING_POLL_MS = 60_000;
 
 function errorMessage(err: unknown, fallback: string): string {
 	return err instanceof Error && err.message ? err.message : fallback;
 }
 
-const invalidateJob = (jobId: string) =>
-	invalidateQueriesWithPersister({
-		queryKey: DownloadQueryKeyFactory.searchJob(authStore.user?.id, jobId)
-	});
-
 export const getSearchJobQueryOptions = (jobId: string) =>
 	queryOptions({
-		staleTime: 0,
+		staleTime: STALE_LIVE,
 		enabled: jobId !== '',
 		queryKey: DownloadQueryKeyFactory.searchJob(authStore.user?.id, jobId),
-		queryFn: ({ signal }) => api.global.v3.GET(DOWNLOAD_SEARCH_ENDPOINTS.job(jobId), { signal }),
+		queryFn: ({ signal }) => api.v3.GET(DOWNLOAD_SEARCH_ENDPOINTS.job(jobId), { signal }),
 		refetchInterval: (query: { state: { data?: SearchJob } }) =>
 			query.state.data?.status === 'searching' ? SEARCHING_POLL_MS : false
 	});
@@ -46,15 +47,11 @@ export const getSearchJobQueryOptions = (jobId: string) =>
 export const getSearchJobQuery = (jobId: () => string) =>
 	createQuery(() => getSearchJobQueryOptions(jobId()));
 
-/** Refetch a job when the event stream says it moved. */
-export function refreshSearchJob(jobId: string) {
-	void invalidateJob(jobId);
-}
-
 export function startAlbumSearch() {
-	return createMutation(() => ({
+	return createAppMutation(() => ({
+		effects: () => [],
 		mutationFn: (input: SearchAlbumRequest) =>
-			api.global.v3.POST(DOWNLOAD_SEARCH_ENDPOINTS.start(), input),
+			api.v3.POST(DOWNLOAD_SEARCH_ENDPOINTS.start(), input),
 		onSuccess: (data: SearchAlbumResponse) => {
 			if (data.status === 'already_in_library') {
 				toastStore.show({ message: 'This album is already in your library.', type: 'info' });
@@ -76,16 +73,16 @@ export function policyBreak(err: unknown): CandidateRefusal | null {
 }
 
 export function pickSearchCandidate() {
-	return createMutation(() => ({
+	return createAppMutation(() => ({
 		mutationFn: ({ jobId, ...body }: PickInput) =>
-			api.global.v3.POST(DOWNLOAD_SEARCH_ENDPOINTS.pick(jobId), body),
-		onSuccess: (_data: PickResponse, input: PickInput) => {
+			api.v3.POST(DOWNLOAD_SEARCH_ENDPOINTS.pick(jobId), body),
+		onSuccess: () => {
 			toastStore.show({ message: 'Download started from your pick.', type: 'success' });
-			void invalidateJob(input.jobId);
-			void invalidateQueriesWithPersister({
-				queryKey: DownloadQueryKeyFactory.tasks(authStore.user?.id)
-			});
 		},
+		effects: (_data: PickResponse, input: PickInput) => [
+			searchJobChanged(authStore.user?.id, input.jobId),
+			downloadsChanged(authStore.user?.id)
+		],
 		onError: (err: unknown) => {
 			// The page asks first; it opens that question when the server asks.
 			if (policyBreak(err)) return;
@@ -100,18 +97,18 @@ export function pickSearchCandidate() {
 // "None of these - keep watching": closes the search, remembers every
 // candidate as turned down, and puts the album on the wanted watchlist.
 export function dismissSearch() {
-	return createMutation(() => ({
-		mutationFn: (jobId: string) => api.global.v3.POST(DOWNLOAD_SEARCH_ENDPOINTS.dismiss(jobId)),
-		onSuccess: (_data: DismissSearchResponse, jobId: string) => {
+	return createAppMutation(() => ({
+		mutationFn: (jobId: string) => api.v3.POST(DOWNLOAD_SEARCH_ENDPOINTS.dismiss(jobId)),
+		onSuccess: () => {
 			toastStore.show({
 				message: 'On the watchlist - DroppedNeedle will keep checking for it.',
 				type: 'success'
 			});
-			void invalidateJob(jobId);
-			void invalidateQueriesWithPersister({
-				queryKey: WantedQueryKeyFactory.list(authStore.user?.id)
-			});
 		},
+		effects: (_data: DismissSearchResponse, jobId: string) => [
+			searchJobChanged(authStore.user?.id, jobId),
+			wantedChanged(authStore.user?.id)
+		],
 		onError: (err: unknown) =>
 			toastStore.show({
 				message: errorMessage(err, "Couldn't move that to the watchlist."),
@@ -121,9 +118,11 @@ export function dismissSearch() {
 }
 
 export function cancelSearch() {
-	return createMutation(() => ({
-		mutationFn: (jobId: string) => api.global.v3.POST(DOWNLOAD_SEARCH_ENDPOINTS.cancel(jobId)),
-		onSuccess: (_data: ActionResponse, jobId: string) => invalidateJob(jobId),
+	return createAppMutation(() => ({
+		mutationFn: (jobId: string) => api.v3.POST(DOWNLOAD_SEARCH_ENDPOINTS.cancel(jobId)),
+		effects: (_data: ActionResponse, jobId: string) => [
+			searchJobChanged(authStore.user?.id, jobId)
+		],
 		onError: (err: unknown) =>
 			toastStore.show({ message: errorMessage(err, "Couldn't close the search."), type: 'error' })
 	}));

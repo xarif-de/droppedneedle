@@ -19,6 +19,7 @@ use utoipa::{IntoParams, ToSchema};
 use super::blocking;
 use super::operations::{OperationView, ReasonView, job_view};
 use crate::jobs::{ControlRequest, ManagementPhase};
+use crate::management::after_apply::ExternalRefresh;
 use crate::management::models::{
     Eligibility, HistoryFilter, HistoryItem, ItemFilter, JobDetail, ManagementError, PlannedItem,
     PreviewHandle, ResultItem, ResultState, Selection, Summary,
@@ -53,8 +54,14 @@ impl From<ManagementError> for ApiError {
             ManagementError::Invalid(message) => ApiError::invalid_input(message),
             ManagementError::Conflict(message) => ApiError::conflict(message),
             ManagementError::Forbidden(message) => ApiError::forbidden(message),
+            ManagementError::Refused(reason) => {
+                super::error::refused(axum::http::StatusCode::BAD_REQUEST, reason)
+            }
             ManagementError::Store(cause) => ApiError::internal(cause),
             ManagementError::Busy(cause) => ApiError::unavailable(Unavailable::ServerBusy, cause),
+            error @ ManagementError::BinsUnknown => {
+                ApiError::unavailable(Unavailable::ServerBusy, error.to_string())
+            }
         }
     }
 }
@@ -168,8 +175,8 @@ pub struct ManagementJobView {
     pub undo_expired_count: i64,
     pub undo_expires_at: Option<f64>,
     pub baseline_available_count: i64,
-    #[schema(value_type = Vec<Object>)]
-    pub external_refreshes: Vec<serde_json::Value>,
+    /// Media servers asked to rescan after the apply, and how it went.
+    pub external_refreshes: Vec<ExternalRefresh>,
 }
 
 impl From<JobDetail> for ManagementJobView {
@@ -221,7 +228,7 @@ impl From<JobDetail> for ManagementJobView {
             undo_expired_count: detail.undo_expired_count,
             undo_expires_at: detail.undo_expires_at,
             baseline_available_count: detail.baseline_available_count,
-            external_refreshes: detail.external_refreshes,
+            external_refreshes: Vec::new(),
         }
     }
 }
@@ -490,7 +497,7 @@ pub struct ManagementUndoPreviewBody {
         (status = 400, description = "Bad selection, profile or destination"),
         (status = 401, description = "Not authenticated"),
         (status = 403, description = "Admin role required"),
-        (status = 409, description = "Settings or library policy changed since the page loaded"),
+        (status = 409, description = "Settings or library policy changed since the page loaded, or the library is off"),
     )
 )]
 pub async fn create_management_preview(
@@ -529,8 +536,12 @@ pub async fn get_management_preview(
     _caller: Admin,
     Path(job_id): Path<String>,
 ) -> Result<Json<ManagementJobView>, ApiError> {
-    let detail = blocking(move || management.detail(&job_id)).await?;
-    Ok(Json(detail.into()))
+    let reader = management.clone();
+    let detail = blocking(move || reader.detail(&job_id)).await?;
+    let refreshes = management.external_refreshes(&detail.refresh_jobs).await?;
+    let mut view = ManagementJobView::from(detail);
+    view.external_refreshes = refreshes;
+    Ok(Json(view))
 }
 
 fn item_filter(query: &ManagementItemsQuery) -> ItemFilter {
@@ -669,12 +680,12 @@ pub async fn discard_management_preview(
         (status = 401, description = "Not authenticated"),
         (status = 403, description = "Admin role required"),
         (status = 404, description = "Unknown job"),
-        (status = 409, description = "Preview expired, stale, or nothing to write"),
+        (status = 409, description = "Preview expired, stale, or nothing to write, or the library is off"),
     )
 )]
 pub async fn apply_management_preview(
     State(management): State<Management>,
-    _caller: Admin,
+    caller: Admin,
     Path(job_id): Path<String>,
     ValidJson(body): ValidJson<ManagementApplyBody>,
 ) -> Result<Json<OperationView>, ApiError> {
@@ -684,12 +695,11 @@ pub async fn apply_management_preview(
         idempotency_key: body.idempotency_key,
         confirmation: body.confirmation,
     };
-    let job = blocking(move || management.apply(&job_id, request)).await?;
+    let job = blocking(move || management.apply(&job_id, request, caller.user_id())).await?;
     Ok(Json(job_view(&job)))
 }
 
-/// A new confirmation token for your own ready preview (the old one
-/// stops working).
+/// A new confirmation token for your own ready preview.
 #[utoipa::path(
     post,
     tag = "library management",
@@ -822,7 +832,7 @@ pub async fn list_management_operation_results(
         (status = 401, description = "Not authenticated"),
         (status = 403, description = "Admin role required"),
         (status = 404, description = "Unknown job"),
-        (status = 409, description = "Not a finished apply, or nothing to undo"),
+        (status = 409, description = "Not a finished apply, nothing to undo, or the library is off"),
     )
 )]
 pub async fn create_management_undo_preview(

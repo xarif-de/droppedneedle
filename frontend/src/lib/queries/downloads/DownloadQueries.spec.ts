@@ -1,10 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { DownloadQueryKeyFactory } from './DownloadQueryKeyFactory';
+import { downloadPolicyChanged, type Effect } from '$lib/queries/effects';
 
 vi.mock('@tanstack/svelte-query', () => ({
 	createQuery: vi.fn((factory: () => unknown) => factory()),
-	createMutation: vi.fn((factory: () => unknown) => factory()),
 	queryOptions: vi.fn((opts: unknown) => opts)
 }));
 
@@ -12,13 +11,16 @@ const mockGet = vi.fn();
 const mockPost = vi.fn();
 vi.mock('$lib/api/client', () => ({
 	api: {
-		global: {
-			v3: {
-				GET: (...args: unknown[]) => mockGet(...args),
-				POST: (...args: unknown[]) => mockPost(...args)
-			}
+		v3: {
+			GET: (...args: unknown[]) => mockGet(...args),
+			POST: (...args: unknown[]) => mockPost(...args)
 		}
 	}
+}));
+
+vi.mock('$lib/queries/effects', async (importOriginal) => ({
+	...(await importOriginal<typeof import('$lib/queries/effects')>()),
+	createAppMutation: vi.fn((factory: () => unknown) => factory())
 }));
 
 const { mockInvalidate } = vi.hoisted(() => ({ mockInvalidate: vi.fn() }));
@@ -72,27 +74,17 @@ describe('download queue queries', () => {
 		mockAddRequested.mockClear();
 	});
 
-	it('invalidates policy and policy summary with the persister after saving', async () => {
-		mockInvalidate.mockClear();
-		const mutation = saveDownloadPolicy() as unknown as {
-			onSuccess: () => Promise<void>;
-		};
+	it('declares the policy and its summary changed after saving', () => {
+		const mutation = saveDownloadPolicy() as unknown as { effects: () => Effect[] };
 
-		await mutation.onSuccess();
-
-		expect(mockInvalidate).toHaveBeenNthCalledWith(1, {
-			queryKey: DownloadQueryKeyFactory.policy()
-		});
-		expect(mockInvalidate).toHaveBeenNthCalledWith(2, {
-			queryKey: DownloadQueryKeyFactory.policySummary()
-		});
+		expect(mutation.effects()).toEqual([downloadPolicyChanged()]);
 	});
 
-	it('uses one visibility-aware compact summary owner with active and idle cadences', async () => {
+	it('keeps a 60 s safety poll on the compact summary', async () => {
 		const opts = getDownloadActivitySummaryQueryOptions() as unknown as {
 			queryFn: (a: { signal?: AbortSignal }) => unknown;
 			queryKey: readonly unknown[];
-			refetchInterval: (query: { state: { data?: { active_count: number } } }) => number;
+			refetchInterval: number;
 			refetchIntervalInBackground: boolean;
 			refetchOnReconnect: string;
 			refetchOnWindowFocus: string | undefined;
@@ -102,8 +94,7 @@ describe('download queue queries', () => {
 		await opts.queryFn({ signal: undefined });
 
 		expect(mockGet.mock.calls.at(-1)?.[0]).toBe('/api/v3/downloads/activity-summary');
-		expect(opts.refetchInterval({ state: { data: { active_count: 1 } } })).toBe(60_000);
-		expect(opts.refetchInterval({ state: { data: { active_count: 0 } } })).toBe(120_000);
+		expect(opts.refetchInterval).toBe(60_000);
 		expect(opts.refetchIntervalInBackground).toBe(false);
 		expect(opts.refetchOnReconnect).toBe('always');
 		// no focus-'always' - invalidations + the interval own freshness
@@ -120,10 +111,10 @@ describe('download queue queries', () => {
 		};
 
 		expect(opts.refetchInterval).toBeUndefined();
-		// neither always-flag remains; 30 s stale window instead
+		// neither always-flag remains; the default stale window instead
 		expect(opts.refetchOnWindowFocus).toBeUndefined();
 		expect(opts.refetchOnReconnect).toBeUndefined();
-		expect(opts.staleTime).toBe(30_000);
+		expect(opts.staleTime).toBeUndefined();
 	});
 
 	it('drops single-album badge writes when the account changes before the response', async () => {

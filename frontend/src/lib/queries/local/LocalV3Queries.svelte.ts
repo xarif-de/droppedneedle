@@ -3,11 +3,14 @@ import type { Getter } from 'runed';
 
 import { api } from '$lib/api/client';
 import type { components } from '$lib/api/v3/openapi';
-import { CACHE_TTL } from '$lib/constants';
 import { LibraryV3Api } from '../library/LibraryV3Api';
 import { SearchV3Api } from '../search/SearchV3Api';
 import type { SearchV3Limits } from '../search/SearchQueryKeyFactory';
 import { LOCAL_KEYS, type LocalV3AlbumsParams } from './LocalV3Keys';
+import { readNow } from '../readNow';
+import { STALE_LIVE } from '$lib/queries/staleTime';
+import { authStore } from '$lib/stores/authStore.svelte';
+import { PERSIST } from '$lib/queries/persistedCache';
 
 export type SuggestionTrackV3 = components['schemas']['SuggestionTrack'];
 export type LocalTrackV3 = components['schemas']['TrackView'];
@@ -50,10 +53,10 @@ export const getLocalRecentV3Query = (getLimit: Getter<number> = () => 20) =>
 	createQuery(() => {
 		const limit = getLimit();
 		return queryOptions({
-			staleTime: CACHE_TTL.LIBRARY_NATIVE,
+			meta: PERSIST,
 			queryKey: LOCAL_KEYS.recent(limit),
 			queryFn: async ({ signal }) => {
-				const page = await api.global.v3.GET(LibraryV3Api.recentlyAdded(limit), { signal });
+				const page = await api.v3.GET(LibraryV3Api.recentlyAdded(limit), { signal });
 				return page.items.map(toCard);
 			}
 		});
@@ -67,10 +70,10 @@ export const getLocalAlbumsV3Query = (
 		const params = getParams();
 		return queryOptions({
 			enabled: getEnabled(),
-			staleTime: CACHE_TTL.LIBRARY_NATIVE,
+			meta: PERSIST,
 			queryKey: LOCAL_KEYS.albums(params),
 			queryFn: async ({ signal }) => {
-				const page = await api.global.v3.GET(LibraryV3Api.albums(params), { signal });
+				const page = await api.v3.GET(LibraryV3Api.albums(params), { signal });
 				return { ...page, items: page.items.map(toCard) };
 			}
 		});
@@ -85,11 +88,11 @@ export const getLocalSuggestionsV3Query = (
 		const limit = getLimit();
 		return queryOptions({
 			// crate should feel alive, never serve stale
-			staleTime: 0,
+			staleTime: STALE_LIVE,
 			gcTime: 0,
 			queryKey: LOCAL_KEYS.suggestions(limit, decade),
 			queryFn: ({ signal }) =>
-				api.global.v3.GET(LibraryV3Api.suggestions(limit, decade), {
+				api.v3.GET(LibraryV3Api.suggestions(limit, decade), {
 					signal
 				})
 		});
@@ -106,11 +109,10 @@ export const getLibrarySearchV3Query = (getTerm: Getter<string>) =>
 		const term = getTerm().trim();
 		return queryOptions({
 			enabled: term.length >= 2,
-			staleTime: CACHE_TTL.LIBRARY_NATIVE,
 			placeholderData: keepPreviousData,
 			queryKey: LOCAL_KEYS.search(term),
 			queryFn: ({ signal }) =>
-				api.global.v3.GET(
+				api.v3.GET(
 					SearchV3Api.unified(term, LIBRARY_SEARCH_LIMITS, ['albums', 'tracks'], 'library'),
 					{ signal }
 				)
@@ -120,9 +122,9 @@ export const getLibrarySearchV3Query = (getTerm: Getter<string>) =>
 export const getLocalDecadesV3Query = () =>
 	createQuery(() =>
 		queryOptions({
-			staleTime: CACHE_TTL.LIBRARY_NATIVE,
+			meta: PERSIST,
 			queryKey: LOCAL_KEYS.decades(),
-			queryFn: ({ signal }) => api.global.v3.GET(LibraryV3Api.decades(), { signal })
+			queryFn: ({ signal }) => api.v3.GET(LibraryV3Api.decades(), { signal })
 		})
 	);
 
@@ -131,8 +133,20 @@ export const getLocalStatsV3Query = (getEnabled: Getter<boolean> = () => true) =
 	createQuery(() =>
 		queryOptions({
 			enabled: getEnabled(),
-			staleTime: CACHE_TTL.LIBRARY_NATIVE,
-			queryKey: LOCAL_KEYS.stats(),
-			queryFn: ({ signal }) => api.global.v3.GET(LibraryV3Api.stats(), { signal })
+			meta: PERSIST,
+			queryKey: LOCAL_KEYS.stats(authStore.user?.id),
+			queryFn: ({ signal }) => api.v3.GET(LibraryV3Api.stats(), { signal })
 		})
+	);
+
+/** Every library track of one MusicBrainz album, to play or queue it whole. */
+export const fetchLocalAlbumTracksV3 = (mbid: string) =>
+	readNow(LOCAL_KEYS.albumMatch(mbid, { limit: 1000 }), (signal) =>
+		api.v3.GET(LibraryV3Api.albumMatch(mbid, { limit: 1000 }), { signal })
+	);
+
+/** A fresh batch of suggestions for play all and shuffle. */
+export const fetchLocalSuggestionBatchV3 = () =>
+	readNow(LOCAL_KEYS.suggestions(40, null), (signal) =>
+		api.v3.GET(LibraryV3Api.suggestions(40, null), { signal })
 	);

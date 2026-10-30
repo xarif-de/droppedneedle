@@ -263,9 +263,10 @@ pub struct JoinedTrack {
 }
 
 impl Adoption {
-    /// What a resumed commit knows: the policy the bundle journaled for
-    /// the file (`journaled`, automatic when it holds none), and the
-    /// provenance the import recorded next to its staged copies.
+    /// What a resumed commit knows: the policy, join and track the bundle
+    /// journaled for the file (`journaled`, automatic when it holds none),
+    /// and the provenance the import recorded next to its staged copies,
+    /// whose join and track stand in only where the journal has none.
     pub fn recovered(
         journaled: Option<&Adoption>,
         download_task_id: Option<String>,
@@ -284,8 +285,8 @@ impl Adoption {
             download_task_id,
             source_path,
             ingest_source,
-            join,
-            track,
+            join: journaled.and_then(|adopt| adopt.join.clone()).or(join),
+            track: journaled.and_then(|adopt| adopt.track.clone()).or(track),
         }
     }
 
@@ -353,7 +354,9 @@ pub struct PutBack {
 /// One removed file going home.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PutBackItem {
-    pub track_id: String,
+    /// `None` for a sidecar that went with the tracks: it comes home the
+    /// same way, and no track is listed for it.
+    pub track_id: Option<String>,
     /// Where the file was: the removal row's place.
     pub root_id: String,
     pub relative_path: String,
@@ -405,6 +408,10 @@ pub struct Removal {
     /// The account the catalog actions name, when a person asked.
     pub actor: Option<String>,
     pub items: Vec<RemoveItem>,
+    /// Files that go with the tracks: each track's own lyrics, and the
+    /// art, cue sheets and logs of a folder no music is left in.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sidecars: Vec<RemoveSidecar>,
     /// The undo record, written in the commit when a file moves.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub undo: Option<UndoRecord>,
@@ -468,6 +475,21 @@ pub struct RemoveItem {
     pub seal: RemoveSeal,
     /// `None` when there was no file to move (it was already gone).
     pub file: Option<RemoveFile>,
+}
+
+/// A sidecar a removal takes to the recycle bin with its tracks.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RemoveSidecar {
+    pub root_id: String,
+    pub relative_path: String,
+    /// The folder (relative to the library folder) the sidecar goes with,
+    /// when it goes because no music is left there: the commit refuses the
+    /// removal when a track is listed under that folder again. `None` for
+    /// a track's own sidecar, which goes with its track whatever else is
+    /// there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emptied_folder: Option<String>,
+    pub file: RemoveFile,
 }
 
 /// A file a removal moves to the recycle bin.
@@ -818,13 +840,20 @@ impl CollisionGate {
         let freed: HashSet<std::path::PathBuf> = bundle
             .removal
             .iter()
-            .flat_map(|removal| &removal.items)
-            .filter(|item| item.file.is_some())
-            .filter_map(|item| {
-                sandbox
-                    .resolve_removal(&item.seal.root_id, &item.seal.relative_path)
-                    .ok()
+            .flat_map(|removal| {
+                removal
+                    .items
+                    .iter()
+                    .filter(|item| item.file.is_some())
+                    .map(|item| (&item.seal.root_id, &item.seal.relative_path))
+                    .chain(
+                        removal
+                            .sidecars
+                            .iter()
+                            .map(|sidecar| (&sidecar.root_id, &sidecar.relative_path)),
+                    )
             })
+            .filter_map(|(root, rel)| sandbox.resolve_removal(root, rel).ok())
             .collect();
         for item in bundle.items.iter() {
             Self::check_output(

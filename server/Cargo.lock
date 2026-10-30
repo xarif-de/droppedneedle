@@ -723,6 +723,8 @@ dependencies = [
  "droppedneedle-providers",
  "futures-util",
  "image",
+ "libc",
+ "lofty",
  "md5",
  "reqwest",
  "rusqlite",
@@ -814,7 +816,6 @@ dependencies = [
  "libc",
  "lofty",
  "regex",
- "reqwest",
  "rubato",
  "rusqlite",
  "rusty-chromaprint",
@@ -892,6 +893,7 @@ dependencies = [
 name = "droppedneedle-providers"
 version = "3.0.0"
 dependencies = [
+ "base64 0.22.1",
  "caseless",
  "droppedneedle-kernel",
  "futures-util",

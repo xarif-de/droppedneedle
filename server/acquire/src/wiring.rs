@@ -5,9 +5,8 @@
 //! health probes, and the download worker. Every durable piece sits on the
 //! shared SQLite runtime ([`AcquireDb`]). Clients, quotas and the download
 //! policy read their sections through live handles, so saving settings
-//! takes effect without a restart. `for_tests` binds the same shape over a
-//! scratch database and scratch settings. Routes are declared in posture
-//! groups through `routes()`; only the Spotify OAuth callback is public (it
+//! takes effect without a restart. Routes are declared in posture groups
+//! through `routes()`; only the Spotify OAuth callback is public (it
 //! is state-token identified).
 
 use std::path::{Path, PathBuf};
@@ -75,29 +74,10 @@ use droppedneedle_kernel::runtime_config::{ConfigStore, Live, Section};
 use droppedneedle_library::mutations::Mutations;
 use droppedneedle_library::operations::port::EditionPlans;
 use droppedneedle_library::publish::bin::DownloadTrees;
-use droppedneedle_media::playback::listening::{ListenBrainzLinkStore, ListeningStore};
+use droppedneedle_media::playback::listening::ListeningStore;
 use droppedneedle_plugins::host::PluginHost;
 use droppedneedle_providers::Providers;
 use tokio::sync::watch;
-
-#[cfg(any(test, feature = "test-support"))]
-mod test_bundle;
-
-/// Spotify Web API root.
-pub const SPOTIFY_API_BASE: &str = "https://api.spotify.com/v1";
-/// Spotify accounts origin (token exchange).
-pub const SPOTIFY_ACCOUNTS_BASE: &str = "https://accounts.spotify.com";
-
-/// Where the Spotify import reaches Spotify.
-#[derive(Debug, Clone)]
-pub struct SpotifyEndpoints {
-    /// Spotify Web API root.
-    pub api: String,
-    /// Spotify accounts origin (token exchange).
-    pub accounts: String,
-    /// A cover origin allowed beside the Spotify CDN; tests only.
-    pub cover_cdn: Option<String>,
-}
 
 /// Every loop [`AcquireSetup::spawn_loops`] starts, by job name.
 pub const ACQUIRE_LOOPS: &[&str] = &[
@@ -344,13 +324,15 @@ pub struct AcquirePorts {
     /// The library's album removal, for an admin removing a discovery
     /// batch with its albums.
     pub albums: Mutations,
+    /// The app's listening store: the Weekly Mix reads ListenBrainz links
+    /// and the auto-request preference through it.
+    pub listening: ListeningStore,
 }
 
 /// What the Weekly Mix builder is made from.
 struct MixInputs {
     providers: Arc<Providers>,
-    links: Arc<dyn ListenBrainzLinkStore>,
-    prefs: ListeningStore,
+    listening: ListeningStore,
     playlists: droppedneedle_catalog::reads::collections::store::playlists::PlaylistStore,
 }
 
@@ -407,8 +389,7 @@ fn core(
         crate::requests::mix_sources::live_builder(
             &intake,
             &mix.providers,
-            mix.links,
-            mix.prefs,
+            mix.listening,
             mix.playlists,
             events.clone(),
         )
@@ -479,13 +460,13 @@ impl AcquireSetup {
     /// stores already opened on it. Credentials and tuning are read from
     /// its settings on use (decrypted in memory only); notices and import
     /// completions go to its event hub. `ports` are the other areas it
-    /// reaches. Spotify imports are queued on `queue`.
+    /// reaches; Spotify through the shared providers. Spotify imports are
+    /// queued on `queue`.
     pub fn build(
         platform: &Platform,
         users: UsersDeps,
         stores: AcquireStores,
         ports: AcquirePorts,
-        spotify: &SpotifyEndpoints,
         queue: JobQueue,
     ) -> Result<Self, String> {
         let db = stores.db.clone();
@@ -494,8 +475,7 @@ impl AcquireSetup {
             platform.ids.clone(),
             platform.settings.clone(),
         );
-        let http = &platform.http;
-        let (http, no_redirect) = (http.shared().clone(), http.no_redirect().clone());
+        let http = platform.http.shared().clone();
         let staging_root = config.imports_dir();
         let quota = Arc::new(QuotaLedger::new(config_store.live(), db.clone()));
         let clients = Arc::new(LiveClients::new(
@@ -524,6 +504,7 @@ impl AcquireSetup {
         let collections = ports.collections;
         let health = ports.providers.health.clone();
         let resolver = Arc::new(AlbumResolver::new(&ports.providers, config_store.live()));
+        let spotify_client = SpotifyClient::new(&ports.providers);
         let core = core(
             &stores,
             ids.clone(),
@@ -538,18 +519,10 @@ impl AcquireSetup {
                     staging_root: staging_root.clone(),
                 }),
                 release_poll: ports.release_poll,
-                mix: Some({
-                    let listening = ListeningStore::new(
-                        platform.db.clone(),
-                        platform.crypto.clone(),
-                        platform.clock.clone(),
-                    );
-                    MixInputs {
-                        providers: ports.providers,
-                        links: Arc::new(listening.clone()),
-                        prefs: listening,
-                        playlists: collections.playlists.clone(),
-                    }
+                mix: Some(MixInputs {
+                    providers: ports.providers,
+                    listening: ports.listening,
+                    playlists: collections.playlists.clone(),
                 }),
                 targets: clients.targets().clone(),
                 albums: Some(ports.albums),
@@ -572,13 +545,6 @@ impl AcquireSetup {
             collections.playlists.clone(),
             db.clone(),
         ));
-        let spotify_client = SpotifyClient::new(
-            http.clone(),
-            no_redirect,
-            &spotify.api,
-            &spotify.accounts,
-            spotify.cover_cdn.as_deref(),
-        );
         let spotify_service = Arc::new(SpotifyImportService::new(
             spotify_client.clone(),
             spotify_settings.clone(),

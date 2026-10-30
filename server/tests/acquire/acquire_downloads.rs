@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 
 use droppedneedle_acquire::db::AcquireDb;
+use droppedneedle_acquire::dispatch::DispatchOrigin;
 use droppedneedle_acquire::downloads::journal::Journal;
 use droppedneedle_acquire::downloads::worker::{
     DownloadWorker, FixedSource, WorkerConfig, run_startup_recovery,
@@ -49,7 +50,7 @@ fn scratch_store(dir: &std::path::Path) -> Connection {
     let conn = Connection::open(dir.join("brief.db")).unwrap();
     conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
     conn.execute(
-        "INSERT INTO auth_users (id, display_name, role, created_at) VALUES ('u1', 'brief', 'user', 'now')",
+        "INSERT INTO auth_users (id, display_name, role, created_at) VALUES ('u1', 'brief', 'user', 0)",
         [],
     )
     .unwrap();
@@ -398,10 +399,10 @@ fn auto_retry_sweep_honors_backoff_newest_wins_and_held_gate() {
     // Retry spawns keep the original terminal and carry the generation.
     let spawn = plan_retry("orig-r1", TaskStatus::Failed, "retry", 1).unwrap();
     assert_eq!(spawn.task_id, "orig-r1-r2");
-    assert_eq!(spawn.origin, "retry");
+    assert_eq!(spawn.origin, DispatchOrigin::Retry);
     assert_eq!(spawn.retry_count, 2);
     let upgrade_spawn = plan_retry("up", TaskStatus::Failed, "upgrade", 0).unwrap();
-    assert_eq!(upgrade_spawn.origin, "upgrade");
+    assert_eq!(upgrade_spawn.origin, DispatchOrigin::Upgrade);
     assert!(plan_retry("live", TaskStatus::Downloading, "user", 0).is_none());
 }
 
@@ -1228,6 +1229,7 @@ impl HeldRig {
                 .expect("config"),
         );
         let platform = crate::common::TestPlatform::on(db.db(), &dir)
+            .clock(clock.clone())
             .settings(config)
             .build()
             .await;
@@ -1246,13 +1248,7 @@ impl HeldRig {
             &library,
             crate::common::library::every_priority(Arc::new(Releases(releases))),
         );
-        let acquire = droppedneedle_acquire::AcquireSetup::for_tests(
-            db.clone(),
-            Arc::new(droppedneedle_kernel::ids::UuidGenerator),
-            droppedneedle_kernel::events::EventHub::new(),
-            Some(Arc::new(landing)),
-        )
-        .expect("acquire bundle");
+        let acquire = crate::common::bundles::acquire_on(&platform, &library, Arc::new(landing));
         let held_dir = acquire.held.folders().held.clone();
         Self {
             clock,
@@ -1657,13 +1653,16 @@ async fn a_busy_database_or_no_library_spends_no_retry() {
         Arc::new(droppedneedle_kernel::clock::SystemClock),
     );
     db.add_user("u-ada", "Ada", "user").await.expect("user");
-    let acquire = droppedneedle_acquire::AcquireSetup::for_tests(
-        db.clone(),
-        Arc::new(droppedneedle_kernel::ids::UuidGenerator),
-        droppedneedle_kernel::events::EventHub::new(),
-        None,
-    )
-    .expect("acquire bundle");
+    let platform = crate::common::TestPlatform::on(runtime.db(), &dir)
+        .build()
+        .await;
+    let (library, _) = crate::common::library::library_at(&platform);
+    let acquire = crate::common::bundles::acquire_at(
+        &platform,
+        crate::common::auth::AuthRig::on(&platform).deps,
+        &library,
+        &crate::common::bundles::collections_at(&platform).stores,
+    );
     let track = held_release().tracks[0].clone();
     let entry = seed_held(
         &db,
@@ -1697,12 +1696,26 @@ async fn a_busy_database_or_no_library_spends_no_retry() {
         "a busy database spends no try"
     );
 
-    acquire.held.tend().await;
+    // The app always hands its worker a landing; the held list over a
+    // worker without one has no library to place into.
+    let no_library = droppedneedle_acquire::held::HeldService::new(
+        acquire.journal.clone(),
+        Arc::new(DownloadWorker::fixed(
+            acquire.journal.clone(),
+            Vec::new(),
+            WorkerConfig::default(),
+            droppedneedle_kernel::events::EventHub::new(),
+            Default::default(),
+        )),
+        acquire.drops.clone(),
+        acquire.held.folders().clone(),
+    );
+    no_library.tend().await;
     assert_eq!(
         retry_of(&db, entry).await,
         ("held".to_owned(), 0, None),
         "no library set up spends no try"
     );
-    drop(acquire);
+    drop((no_library, acquire, library, platform));
     runtime.shutdown().await;
 }

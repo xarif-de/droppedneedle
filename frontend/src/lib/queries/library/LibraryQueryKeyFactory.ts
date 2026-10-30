@@ -1,38 +1,48 @@
-import { userIdSegment } from '../userKeySegment';
+import type { components } from '$lib/api/v3/openapi';
+import { ADMIN, key, userScope } from '../keys';
 
 export type LibraryV3UserId = string | null | undefined;
 
 // A long list's params, without its cursor: a list's pages share one key.
 export interface LibraryV3AlbumsParams {
 	limit: number;
-	sort: 'name' | 'date_added' | 'year' | 'artist' | 'random' | 'rediscover';
-	order: 'asc' | 'desc';
+	sort?: 'name' | 'date_added' | 'year' | 'artist' | 'random' | 'rediscover';
+	order?: 'asc' | 'desc';
 	q?: string;
 	artistId?: string;
 	decade?: number;
 	format?: string;
+	/** Only the caller's favourites; without a sort, the newest first. */
+	favorites?: boolean;
 }
 
 export interface LibraryV3ArtistsParams {
 	limit: number;
-	sort: 'name' | 'album_count' | 'appearance_count' | 'date_added';
-	order: 'asc' | 'desc';
+	sort?: 'name' | 'album_count' | 'appearance_count' | 'date_added';
+	order?: 'asc' | 'desc';
 	q?: string;
 	scope?: 'all' | 'album_artists' | 'contributors';
+	/** Only the caller's favourites; without a sort, the newest first. */
+	favorites?: boolean;
 }
 
 export interface LibraryV3TracksParams {
 	limit: number;
-	sort: 'title' | 'date_added' | 'artist' | 'album' | 'random';
-	order: 'asc' | 'desc';
+	sort?: 'title' | 'date_added' | 'artist' | 'album' | 'random';
+	order?: 'asc' | 'desc';
 	q?: string;
 	albumId?: string;
 	artistId?: string;
 	genre?: string;
+	/** Only the caller's favourites; without a sort, the newest first. */
+	favorites?: boolean;
 }
 
+/** A stored review state, `resolved` (approved or dismissed) or `all`. */
 export type LibraryReviewState =
-	'pending' | 'approved' | 'rejected' | 'dismissed' | 'excluded' | 'all';
+	'pending' | 'approved' | 'rejected' | 'dismissed' | 'excluded' | 'resolved' | 'all';
+
+export type LibraryReviewSort = components['schemas']['ReviewSort'];
 
 export interface LibraryReviewParams {
 	limit: number;
@@ -47,7 +57,7 @@ export interface LibraryReviewParams {
 	createdFrom?: number;
 	createdTo?: number;
 	withCandidates?: boolean;
-	sort?: 'newest' | 'oldest' | 'tracks';
+	sort?: LibraryReviewSort;
 }
 
 export interface LibraryV3PageParams {
@@ -61,14 +71,16 @@ export interface LibraryV3CursorParams {
 	after?: string | null;
 }
 
+const operations = () => key(ADMIN, 'library', 'operations');
+const reviews = () => key(ADMIN, 'library', 'reviews');
+const policy = () => key(ADMIN, 'library', 'policy');
+
 export const LibraryQueryKeyFactory = {
-	all: ['library'] as const,
+	feature: 'library',
 	// Catalog keys. Album and artist views carry per-caller favorite flags, so
-	// every catalog key carries the userId segment (a missing one would leak
-	// one user's flags to the next through the persisted cache).
+	// every catalog key is the caller's.
 	catalog: {
-		root: (userId: LibraryV3UserId) =>
-			[...LibraryQueryKeyFactory.all, 'catalog', userIdSegment(userId)] as const,
+		root: (userId: LibraryV3UserId) => key(userScope(userId), 'library', 'catalog'),
 		albums: (userId: LibraryV3UserId, params: LibraryV3AlbumsParams) =>
 			[...LibraryQueryKeyFactory.catalog.root(userId), 'albums', params] as const,
 		// The album list's pages, read on by cursor: apart from one page's key.
@@ -101,6 +113,8 @@ export const LibraryQueryKeyFactory = {
 			[...LibraryQueryKeyFactory.catalog.root(userId), 'recently-added'] as const,
 		recentlyAdded: (userId: LibraryV3UserId, limit: number) =>
 			[...LibraryQueryKeyFactory.catalog.root(userId), 'recently-added', limit] as const,
+		resolvedTracks: (userId: LibraryV3UserId, items: readonly unknown[]) =>
+			[...LibraryQueryKeyFactory.catalog.root(userId), 'resolved-tracks', items] as const,
 		search: (userId: LibraryV3UserId, q: string) =>
 			[...LibraryQueryKeyFactory.catalog.root(userId), 'search', q] as const,
 		albumSearch: (userId: LibraryV3UserId, q: string) =>
@@ -142,40 +156,31 @@ export const LibraryQueryKeyFactory = {
 			[...LibraryQueryKeyFactory.catalog.recycleBinPrefix(userId), 'summary'] as const,
 		recycleBinStatus: (userId: LibraryV3UserId) =>
 			[...LibraryQueryKeyFactory.catalog.recycleBinPrefix(userId), 'status'] as const,
+		unconfirmedPrefix: (userId: LibraryV3UserId) =>
+			[...LibraryQueryKeyFactory.catalog.root(userId), 'unconfirmed'] as const,
 		unconfirmed: (userId: LibraryV3UserId, state: string) =>
-			[...LibraryQueryKeyFactory.catalog.root(userId), 'unconfirmed', state] as const
+			[...LibraryQueryKeyFactory.catalog.unconfirmedPrefix(userId), state] as const
 	},
-	activityPrefix: () => [...LibraryQueryKeyFactory.all, 'activity'] as const,
-	activity: (userId: LibraryV3UserId) =>
-		[...LibraryQueryKeyFactory.activityPrefix(), userIdSegment(userId)] as const,
+	activity: (userId: LibraryV3UserId) => key(userScope(userId), 'library', 'activity'),
 	membership: (userId: LibraryV3UserId, albumIds: string[]) =>
-		[
-			...LibraryQueryKeyFactory.all,
-			'membership',
-			userIdSegment(userId),
-			[...albumIds].sort()
-		] as const,
-	operationsPrefix: () => [...LibraryQueryKeyFactory.all, 'operations'] as const,
-	currentRuns: () => [...LibraryQueryKeyFactory.operationsPrefix(), 'current-runs'] as const,
+		key(userScope(userId), 'library', 'membership', [...albumIds].sort()),
+	currentRuns: () => [...operations(), 'current-runs'] as const,
 	runHistory: (cursor: string | undefined) =>
-		[...LibraryQueryKeyFactory.operationsPrefix(), 'run-history', cursor ?? 'first'] as const,
-	run: (runId: string) => [...LibraryQueryKeyFactory.operationsPrefix(), 'run', runId] as const,
-	runFailures: (runId: string) =>
-		[...LibraryQueryKeyFactory.operationsPrefix(), 'run-failures', runId] as const,
-	runEstimate: (scopeIds: string[]) =>
-		[...LibraryQueryKeyFactory.operationsPrefix(), 'estimate', [...scopeIds].sort()] as const,
-	reviewsPrefix: () => [...LibraryQueryKeyFactory.all, 'reviews'] as const,
-	reviews: (params: object) => [...LibraryQueryKeyFactory.reviewsPrefix(), params] as const,
-	reviewCount: (params: object) =>
-		[...LibraryQueryKeyFactory.reviewsPrefix(), 'count', params] as const,
-	review: (reviewId: string) =>
-		[...LibraryQueryKeyFactory.reviewsPrefix(), 'detail', reviewId] as const,
-	policyPrefix: () => [...LibraryQueryKeyFactory.all, 'policy'] as const,
-	targetSettings: () => [...LibraryQueryKeyFactory.policyPrefix(), 'settings'] as const,
-	policyTree: () => [...LibraryQueryKeyFactory.policyPrefix(), 'tree'] as const,
-	pathMapping: () => [...LibraryQueryKeyFactory.policyPrefix(), 'path-mapping'] as const,
-	restorableRoots: () => [...LibraryQueryKeyFactory.policyPrefix(), 'restorable-roots'] as const,
-	repairsPrefix: () => [...LibraryQueryKeyFactory.operationsPrefix(), 'repairs'] as const,
+		[...operations(), 'run-history', cursor ?? 'first'] as const,
+	run: (runId: string) => [...operations(), 'run', runId] as const,
+	runFailures: (runId: string) => [...operations(), 'run-failures', runId] as const,
+	runEstimate: (scopeIds: string[]) => [...operations(), 'estimate', [...scopeIds].sort()] as const,
+	reviewsPrefix: reviews,
+	reviews: (params: object) => [...reviews(), params] as const,
+	reviewCount: (params: object) => [...reviews(), 'count', params] as const,
+	review: (reviewId: string) => [...reviews(), 'detail', reviewId] as const,
+	reviewJobs: () => [...reviews(), 'jobs'] as const,
+	policyPrefix: policy,
+	targetSettings: () => [...policy(), 'settings'] as const,
+	policyTree: () => [...policy(), 'tree'] as const,
+	pathMapping: () => [...policy(), 'path-mapping'] as const,
+	restorableRoots: () => [...policy(), 'restorable-roots'] as const,
+	repairsPrefix: () => [...operations(), 'repairs'] as const,
 	repairs: (cursor: string | undefined) =>
 		[...LibraryQueryKeyFactory.repairsPrefix(), 'history', cursor ?? 'first'] as const,
 	repairEstimate: (rootIds: string[]) =>
@@ -189,12 +194,10 @@ export const LibraryQueryKeyFactory = {
 			findingCategory,
 			cursor ?? 'first'
 		] as const,
+	// The caller's identity reports sit beside the admin operations, so
+	// `everyScope('library', 'operations')` refreshes both.
 	identityPreparationsPrefix: (userId: LibraryV3UserId) =>
-		[
-			...LibraryQueryKeyFactory.operationsPrefix(),
-			'identity-preparations',
-			userIdSegment(userId)
-		] as const,
+		key(userScope(userId), 'library', 'operations', 'identity-preparations'),
 	identityPreparations: (userId: LibraryV3UserId, cursor: string | undefined) =>
 		[
 			...LibraryQueryKeyFactory.identityPreparationsPrefix(userId),
@@ -220,23 +223,16 @@ export const LibraryQueryKeyFactory = {
 			findingCategory,
 			cursor ?? 'first'
 		] as const,
-	albumPrefix: () => [...LibraryQueryKeyFactory.all, 'album'] as const,
-	album: (mbid: string) => [...LibraryQueryKeyFactory.all, 'album', mbid] as const,
+	// One release group's library status, with the caller's flags.
+	albumPrefix: (userId: LibraryV3UserId) => key(userScope(userId), 'library', 'album'),
+	album: (userId: LibraryV3UserId, mbid: string) =>
+		[...LibraryQueryKeyFactory.albumPrefix(userId), mbid] as const,
 	reidentificationReleases: (
 		userId: LibraryV3UserId,
 		albumId: string,
 		title: string,
 		artist: string
-	) =>
-		[
-			...LibraryQueryKeyFactory.all,
-			'reidentification-releases',
-			userIdSegment(userId),
-			albumId,
-			title,
-			artist
-		] as const,
-	scanSchedule: () => [...LibraryQueryKeyFactory.all, 'scan-schedule'] as const,
-	// Admin-only and the same for every admin, so no user segment.
-	retagPairs: () => [...LibraryQueryKeyFactory.all, 'retag-pairs'] as const
+	) => key(userScope(userId), 'library', 'reidentification-releases', albumId, title, artist),
+	scanSchedule: () => key(ADMIN, 'library', 'scan-schedule'),
+	retagPairs: () => key(ADMIN, 'library', 'retag-pairs')
 };

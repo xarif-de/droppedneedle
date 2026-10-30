@@ -1,5 +1,6 @@
-import { api, ApiError } from '$lib/api/client';
-import { CACHE_TTL } from '$lib/constants';
+import { api } from '$lib/api/client';
+import { ApiError } from '$lib/api/errors';
+import { STALE_SLOW } from '$lib/queries/staleTime';
 import type { LyricLine } from '$lib/types';
 import type { NowPlaying } from '$lib/player/types';
 import { createQuery } from '@tanstack/svelte-query';
@@ -19,7 +20,7 @@ export async function fetchLyrics(np: NowPlaying, signal: AbortSignal): Promise<
 	if (!id) return null;
 	try {
 		if (np.sourceType === 'local') {
-			const data = await api.global.v3.GET(LibraryV3Api.lyrics(id), { signal });
+			const data = await api.v3.GET(LibraryV3Api.lyrics(id), { signal });
 			return {
 				text: data.text,
 				is_synced: data.is_synced,
@@ -58,8 +59,7 @@ export const getLyricsQuery = (
 	createQuery(() => {
 		const np = getNowPlaying();
 		return {
-			staleTime: CACHE_TTL.LYRICS,
-			gcTime: CACHE_TTL.LYRICS,
+			staleTime: STALE_SLOW,
 			queryKey: LyricsQueryKeyFactory.lyrics(
 				getUserId(),
 				np?.sourceType === 'navidrome' ? getNavidromeScope() : undefined,

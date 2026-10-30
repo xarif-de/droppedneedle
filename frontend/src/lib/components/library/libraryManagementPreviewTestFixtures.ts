@@ -37,15 +37,11 @@ export const libraryQueriesMock = {
 	getLibrarySearchQuery: () => ({ data: { artists: [], albums: [], tracks: [] } })
 };
 
-export const eventsMock = {
-	createLibraryManagementEvents: () => ({ start: vi.fn(), stop: vi.fn() })
-};
-
 export const queriesMock = {
 	getLibraryManagementPreviewQuery: () => h.preview,
 	getLibraryManagementPlanItemsQuery: () => h.items,
 	getLibraryManagementSettingsQuery: () => ({
-		data: { settings_revision: 'settings-1', recycle_bin_path: '' },
+		data: { settings_revision: 'settings-1' },
 		isLoading: false,
 		isError: false
 	})

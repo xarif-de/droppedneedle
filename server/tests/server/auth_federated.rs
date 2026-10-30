@@ -715,7 +715,7 @@ async fn plex_pins_are_bound_to_their_starter_and_gate_membership() {
     let mock = serve(plex_router).await;
     let e2e = E2e::open("plex").await.with_upstreams(Upstreams {
         plex_tv: mock.clone(),
-        ..droppedneedle::bootstrap::Outbound::live().sign_in()
+        ..crate::common::closed_outbound().sign_in()
     });
     let mut settings = PlexConnection {
         plex_url: mock,
@@ -1025,8 +1025,11 @@ async fn lastfm_links_with_the_instance_key_and_binds_tokens_to_the_user() {
     let store = PlaybackStore::new(
         e2e.db().clone(),
         Arc::new(droppedneedle_kernel::ids::UuidGenerator),
-        users.crypto.clone(),
-        Arc::new(droppedneedle_kernel::clock::SystemClock),
+        droppedneedle_media::playback::listening::ListeningStore::new(
+            e2e.db().clone(),
+            users.crypto.clone(),
+            Arc::new(droppedneedle_kernel::clock::SystemClock),
+        ),
         droppedneedle_kernel::jobs::queue::JobQueue::new(
             e2e.db().clone(),
             Arc::new(droppedneedle_kernel::clock::SystemClock),

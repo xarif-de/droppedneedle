@@ -1,5 +1,5 @@
 import { api } from '$lib/api/client';
-import { createMutation } from '@tanstack/svelte-query';
+import { createAppMutation } from '$lib/queries/effects';
 import { AUTH_ENDPOINTS } from './endpoints';
 import type {
 	JellyfinLoginVars,
@@ -14,41 +14,47 @@ import type {
 /** Recovery redemption is public; code generation uses the authenticated admin client. */
 
 export const createLocalLoginMutation = () =>
-	createMutation(() => ({
-		mutationFn: (vars: LocalLoginVars) => api.global.v3.POST(AUTH_ENDPOINTS.login, vars)
+	createAppMutation(() => ({
+		effects: () => [],
+		mutationFn: (vars: LocalLoginVars) => api.v3.POST(AUTH_ENDPOINTS.login, vars)
 	}));
 
 export const createPasswordRecoveryResetMutation = () =>
-	createMutation(() => ({
+	createAppMutation(() => ({
+		effects: () => [],
 		mutationFn: (vars: PasswordRecoveryResetVars) =>
-			api.global.v3.POST(AUTH_ENDPOINTS.passwordRecoveryReset, vars)
+			api.v3.POST(AUTH_ENDPOINTS.passwordRecoveryReset, vars)
 	}));
 
 export const createPasswordRecoveryCodeMutation = () =>
-	createMutation(() => ({
+	createAppMutation(() => ({
+		effects: () => [],
 		mutationFn: (userId: string): Promise<PasswordRecoveryCodeResponse> =>
 			api.v3.POST(AUTH_ENDPOINTS.adminPasswordRecovery(userId))
 	}));
 
 export const createJellyfinLoginMutation = () =>
-	createMutation(() => ({
-		mutationFn: (vars: JellyfinLoginVars) => api.global.v3.POST(AUTH_ENDPOINTS.jellyfinLogin, vars)
+	createAppMutation(() => ({
+		effects: () => [],
+		mutationFn: (vars: JellyfinLoginVars) => api.v3.POST(AUTH_ENDPOINTS.jellyfinLogin, vars)
 	}));
 
 export const createSetupMutation = () =>
-	createMutation(() => ({
-		mutationFn: (vars: SetupVars) => api.global.v3.POST(AUTH_ENDPOINTS.setup, vars)
+	createAppMutation(() => ({
+		effects: () => [],
+		mutationFn: (vars: SetupVars) => api.v3.POST(AUTH_ENDPOINTS.setup, vars)
 	}));
 
 export const createOidcExchangeMutation = () =>
-	createMutation(() => ({
-		mutationFn: (vars: OidcExchangeVars) => api.global.v3.POST(AUTH_ENDPOINTS.oidcExchange, vars)
+	createAppMutation(() => ({
+		effects: () => [],
+		mutationFn: (vars: OidcExchangeVars) => api.v3.POST(AUTH_ENDPOINTS.oidcExchange, vars)
 	}));
 
 export const createOidcAuthorizeMutation = () =>
-	createMutation(() => ({
-		mutationFn: (): Promise<OidcAuthorizeResponse> =>
-			api.global.v3.POST(AUTH_ENDPOINTS.oidcAuthorize)
+	createAppMutation(() => ({
+		effects: () => [],
+		mutationFn: (): Promise<OidcAuthorizeResponse> => api.v3.POST(AUTH_ENDPOINTS.oidcAuthorize)
 	}));
 
 // Plex sign-in rides the single v3 Plex flow ($lib/queries/plex): the login

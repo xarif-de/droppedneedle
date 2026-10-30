@@ -8,7 +8,9 @@ use std::time::Instant;
 
 use droppedneedle_kernel::db::statement::{Declared, Schema, StatementFile};
 use droppedneedle_kernel::db::{DbConfig, open_runtime};
-use droppedneedle_kernel::schema::{MIGRATOR, apply_migrations, assert_migrated, latest_version};
+use droppedneedle_kernel::schema::{
+    MIGRATOR, apply_migrations, assert_migrated, latest_version, run_migrations,
+};
 use regex::Regex;
 use sqlx::SqlitePool;
 use sqlx::sqlite::SqlitePoolOptions;
@@ -285,7 +287,7 @@ async fn foreign_keys_bite_under_enforcement() {
     .await;
     assert!(orphan.is_err(), "orphan row must fail with FKs on");
 
-    sqlx::query("INSERT INTO auth_users (id, display_name, created_at) VALUES ('u1', 'T', 'now')")
+    sqlx::query("INSERT INTO auth_users (id, display_name, created_at) VALUES ('u1', 'T', 0)")
         .execute(&pool)
         .await
         .unwrap();
@@ -326,11 +328,17 @@ async fn every_earlier_version_upgrades_and_keeps_data() {
             locking: true,
             no_tx: false,
         };
-        through.run(&pool).await.unwrap();
-        sqlx::query(
+        run_migrations(&pool, &through).await.unwrap();
+        // From 0101 on, times are integer milliseconds.
+        let created_at = if version >= 101 {
+            "1704067200000"
+        } else {
+            "'2024-01-01T00:00:00+00:00'"
+        };
+        sqlx::query(&format!(
             "INSERT INTO auth_users (id, display_name, role, created_at) \
-             VALUES ('u1', 'Kept', 'user', '2024-01-01T00:00:00+00:00')",
-        )
+             VALUES ('u1', 'Kept', 'user', {created_at})"
+        ))
         .execute(&pool)
         .await
         .unwrap();
@@ -4811,7 +4819,7 @@ async fn recycle_bin_empties_table_is_added() {
     assert_migrated(&pool).await.unwrap();
     sqlx::raw_sql(
         "INSERT INTO auth_users (id, display_name, role, created_at) \
-         VALUES ('admin', 'Admin', 'admin', '2026-01-01T00:00:00Z')",
+         VALUES ('admin', 'Admin', 'admin', 0)",
     )
     .execute(&pool)
     .await
@@ -7791,4 +7799,1260 @@ async fn reviews_gain_a_revision_on_upgrade() {
         sqlx::query(change).execute(&pool).await.unwrap();
         assert_eq!(revision().await.1, expected, "{change}");
     }
+}
+
+/// Migration 0102 drops the management run's own rescan queue, pending
+/// rows with it, and gives each run a column per media server for the
+/// jobs-table row its rescan was queued as. A run carries, with no rescan
+/// noted.
+#[tokio::test]
+async fn media_rescans_leave_their_queue_for_the_jobs_table() {
+    let pool = scratch_pool().await;
+    migrator_through(100).run(&pool).await.unwrap();
+    sqlx::raw_sql(
+        "INSERT INTO library_operation_jobs (id, kind, state, created_at, updated_at) \
+         VALUES ('run', 'library_management', 'succeeded', 1, 1); \
+         INSERT INTO library_management_job_snapshots (job_id, mode, origin, phase, \
+         selection_json, profile_revision, settings_revision, naming_revision, \
+         policy_revision, catalog_revision, profile_snapshot_json, created_at, updated_at) \
+         VALUES ('run', 'apply', 'manual', 'complete', '{}', 'p', 's', 'n', 'l', 0, '{}', 1, 1); \
+         INSERT INTO library_management_external_refresh_deliveries (id, operation_job_id, \
+         target, state, max_attempts, retry_delay_seconds, created_at, updated_at) \
+         VALUES ('d1', 'run', 'jellyfin', 'pending', 4, 30, 1, 1);",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    apply_migrations(&pool).await.unwrap();
+
+    assert!(
+        !table_names(&pool)
+            .await
+            .contains(&"library_management_external_refresh_deliveries".to_owned())
+    );
+    let noted: (Option<i64>, Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT jellyfin_refresh_job_id, plex_refresh_job_id, navidrome_refresh_job_id \
+         FROM library_management_job_snapshots WHERE job_id = 'run'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(noted, (None, None, None));
+}
+
+/// Migration 0103 adds the folder watcher's digests, empty, so the first
+/// poll after the upgrade takes each root as it finds it. A folder is one
+/// row per root, and a row needs a folder.
+#[tokio::test]
+async fn the_folder_watcher_gets_a_digest_table() {
+    let pool = scratch_pool().await;
+    run_migrations(&pool, &migrator_through(102)).await.unwrap();
+    apply_migrations(&pool).await.unwrap();
+
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM library_folder_digests")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0);
+    sqlx::raw_sql(
+        "INSERT INTO library_folder_digests (root_id, relative_path, digest, audio_files) \
+         VALUES ('r', '.', -7, 0), ('r', 'A', 3, 2), ('s', 'A', 3, 2)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    for refused in [
+        "INSERT INTO library_folder_digests VALUES ('r', 'A', 4, 1)",
+        "INSERT INTO library_folder_digests VALUES ('r', '', 4, 1)",
+        "INSERT INTO library_folder_digests VALUES ('r', 'B', 'x', 1)",
+    ] {
+        assert!(
+            sqlx::raw_sql(refused).execute(&pool).await.is_err(),
+            "{refused}"
+        );
+    }
+}
+
+/// The runner's `-- no-transaction` path and the table-rebuild recipe in the
+/// kernel's `schema::boot` module doc, proven on a parent that cascade,
+/// restrict and set-null children point at.
+mod rebuild {
+    use std::borrow::Cow;
+    use std::path::{Path, PathBuf};
+
+    use droppedneedle_kernel::schema::{MIGRATOR, SchemaError, run_migrations};
+    use regex::Regex;
+    use sqlx::SqlitePool;
+    use sqlx::migrate::{MigrateError, Migration, MigrationType, Migrator};
+    use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+
+    use crate::common::ScratchDir;
+
+    const BASE: &str = r#"
+CREATE TABLE p (id TEXT PRIMARY KEY, name TEXT NOT NULL) STRICT;
+CREATE INDEX p_name ON p (name);
+CREATE TABLE p_log (id TEXT NOT NULL, name TEXT NOT NULL) STRICT;
+CREATE TRIGGER p_renamed AFTER UPDATE OF name ON p
+BEGIN INSERT INTO p_log (id, name) VALUES (NEW.id, NEW.name); END;
+CREATE TABLE c_cascade (id INTEGER PRIMARY KEY,
+    p_id TEXT NOT NULL REFERENCES p (id) ON DELETE CASCADE) STRICT;
+CREATE INDEX c_cascade_p ON c_cascade (p_id);
+CREATE TABLE c_restrict (id INTEGER PRIMARY KEY,
+    p_id TEXT NOT NULL REFERENCES p (id) ON DELETE RESTRICT) STRICT;
+CREATE INDEX c_restrict_p ON c_restrict (p_id);
+CREATE TABLE c_set_null (id INTEGER PRIMARY KEY,
+    p_id TEXT REFERENCES p (id) ON DELETE SET NULL) STRICT;
+CREATE INDEX c_set_null_p ON c_set_null (p_id);
+CREATE TABLE c_keyed (p_id TEXT NOT NULL REFERENCES p (id) ON DELETE CASCADE,
+    tag TEXT NOT NULL, PRIMARY KEY (p_id, tag)) STRICT, WITHOUT ROWID;
+CREATE TABLE other (id INTEGER PRIMARY KEY) STRICT;
+CREATE TABLE other_child (id INTEGER PRIMARY KEY, other_id INTEGER REFERENCES other (id)) STRICT;
+CREATE INDEX other_child_other ON other_child (other_id);
+PRAGMA user_version = 1;
+"#;
+
+    const RECIPE: &str = r#"-- no-transaction
+PRAGMA foreign_keys=OFF;
+BEGIN IMMEDIATE;
+CREATE TEMP TABLE rebuild_guard (ok INTEGER NOT NULL CHECK (ok = 1)) STRICT;
+INSERT INTO rebuild_guard SELECT (SELECT foreign_keys FROM pragma_foreign_keys) = 0;
+INSERT INTO rebuild_guard SELECT (SELECT user_version FROM pragma_user_version) < 2;
+CREATE TEMP TABLE rebuild_orphans AS
+    SELECT "table" AS child, rowid AS row, parent, fkid FROM pragma_foreign_key_check;
+CREATE TABLE p_new (id TEXT PRIMARY KEY, name TEXT NOT NULL,
+    added_at INTEGER NOT NULL DEFAULT 0) STRICT;
+INSERT INTO p_new (rowid, id, name, added_at) SELECT rowid, id, name, 0 FROM p;
+DROP TABLE p;
+ALTER TABLE p_new RENAME TO p;
+CREATE INDEX p_name ON p (name);
+CREATE TRIGGER p_renamed AFTER UPDATE OF name ON p
+BEGIN INSERT INTO p_log (id, name) VALUES (NEW.id, NEW.name); END;
+INSERT INTO rebuild_guard SELECT NOT EXISTS (
+    SELECT 1 FROM (
+        SELECT "table" AS child, rowid AS row, parent, fkid, COUNT(*) AS n
+        FROM pragma_foreign_key_check GROUP BY 1, 2, 3, 4) AS now
+    WHERE now.n > (SELECT COUNT(*) FROM rebuild_orphans AS before
+        WHERE before.child = now.child AND before.row IS now.row
+            AND before.parent = now.parent AND before.fkid = now.fkid));
+DROP TABLE rebuild_guard;
+DROP TABLE rebuild_orphans;
+PRAGMA user_version = 2;
+COMMIT;
+PRAGMA foreign_keys=ON;
+"#;
+
+    const FK_OFF_GUARD: &str =
+        "INSERT INTO rebuild_guard SELECT (SELECT foreign_keys FROM pragma_foreign_keys) = 0;\n";
+
+    fn migration(version: i64, sql: &str, no_tx: bool) -> Migration {
+        Migration::new(
+            version,
+            Cow::Owned(format!("step {version}")),
+            MigrationType::Simple,
+            Cow::Owned(sql.to_owned()),
+            no_tx,
+        )
+    }
+
+    fn set(migrations: Vec<Migration>) -> Migrator {
+        Migrator {
+            migrations: Cow::Owned(migrations),
+            ..Migrator::DEFAULT
+        }
+    }
+
+    fn base() -> Migrator {
+        set(vec![migration(1, BASE, false)])
+    }
+
+    fn rebuilt_by(recipe: &str, no_tx: bool) -> Migrator {
+        set(vec![migration(1, BASE, false), migration(2, recipe, no_tx)])
+    }
+
+    /// A file database with one connection and foreign keys on, as boot
+    /// opens it.
+    async fn file_pool(dir: &ScratchDir) -> (SqlitePool, PathBuf) {
+        let path = dir.join("rebuild.db");
+        let options = SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true)
+            .foreign_keys(true)
+            .journal_mode(SqliteJournalMode::Wal);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        (pool, path)
+    }
+
+    /// Parents inserted out of key order, so rowid order is not key order.
+    async fn seed(pool: &SqlitePool, restrict: bool) {
+        let mut sql = String::from(
+            "INSERT INTO p (id, name) VALUES ('c', 'Cee'), ('a', 'Ay'), ('b', 'Bee');
+             INSERT INTO c_cascade (id, p_id) VALUES (1, 'a'), (2, 'b'), (3, 'c');
+             INSERT INTO c_set_null (id, p_id) VALUES (1, 'a'), (2, 'c');",
+        );
+        if restrict {
+            sql.push_str("INSERT INTO c_restrict (id, p_id) VALUES (1, 'b'), (2, 'c');");
+        }
+        sqlx::raw_sql(&sql).execute(pool).await.unwrap();
+    }
+
+    /// One orphan in a table the rebuild never touches.
+    async fn seed_unrelated_orphan(pool: &SqlitePool) {
+        sqlx::raw_sql(
+            "PRAGMA foreign_keys = OFF;
+             INSERT INTO other_child (id, other_id) VALUES (1, 99);
+             PRAGMA foreign_keys = ON;",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    type Child = (i64, Option<String>);
+
+    async fn rows(pool: &SqlitePool, sql: &str) -> Vec<Child> {
+        sqlx::query_as(sql).fetch_all(pool).await.unwrap()
+    }
+
+    async fn children(pool: &SqlitePool) -> Vec<Vec<Child>> {
+        let mut all = Vec::new();
+        for table in ["c_cascade", "c_restrict", "c_set_null"] {
+            all.push(rows(pool, &format!("SELECT id, p_id FROM {table} ORDER BY id")).await);
+        }
+        all
+    }
+
+    /// Every schema row except the rebuilt table's own `CREATE TABLE`.
+    async fn schema_but_p(pool: &SqlitePool) -> Vec<(String, String, String, String)> {
+        sqlx::query_as(
+            "SELECT type, name, tbl_name, COALESCE(sql, '') FROM sqlite_schema \
+             WHERE NOT (type = 'table' AND name = 'p') ORDER BY type, name",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn scalar(pool: &SqlitePool, sql: &str) -> i64 {
+        sqlx::query_scalar(sql).fetch_one(pool).await.unwrap()
+    }
+
+    async fn recorded(pool: &SqlitePool) -> Vec<(i64, i64)> {
+        sqlx::query_as("SELECT version, execution_time FROM _sqlx_migrations ORDER BY version")
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    /// Every row of every table and the stamp, read over a connection of
+    /// its own.
+    fn snapshot(path: &Path) -> Vec<String> {
+        let connection = rusqlite::Connection::open(path).unwrap();
+        let stamp: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        let mut out = vec![format!("user_version {stamp}")];
+        let schema: Vec<(String, String, Option<String>)> = connection
+            .prepare("SELECT type, name, sql FROM sqlite_schema ORDER BY type, name")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        for (kind, name, sql) in schema {
+            out.push(format!("{kind} {name} {sql:?}"));
+            if kind != "table" {
+                continue;
+            }
+            let mut statement = connection
+                .prepare(&format!("SELECT * FROM \"{name}\""))
+                .unwrap();
+            let width = statement.column_count();
+            let mut table: Vec<String> = statement
+                .query_map([], |row| {
+                    (0..width)
+                        .map(|at| row.get::<_, rusqlite::types::Value>(at))
+                        .collect::<Result<Vec<_>, _>>()
+                        .map(|values| format!("{name} {values:?}"))
+                })
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            table.sort();
+            out.extend(table);
+        }
+        out
+    }
+
+    fn execute_failure(error: SchemaError) -> String {
+        match error {
+            SchemaError::Migrate(MigrateError::ExecuteMigration(error, 2)) => error.to_string(),
+            other => panic!("expected migration 2 to fail, got {other:?}"),
+        }
+    }
+
+    /// The recipe rebuilds the parent through the production runner: every
+    /// child row stays and points at its parent, the rest of the schema is
+    /// unchanged, rowid order holds, foreign keys are back on for the same
+    /// connection, and the keys still act.
+    #[tokio::test]
+    async fn the_recipe_rebuilds_a_parent_and_keeps_every_child() {
+        let dir = ScratchDir::new("rebuild-keep");
+        let (pool, _) = file_pool(&dir).await;
+        run_migrations(&pool, &base()).await.unwrap();
+        seed(&pool, true).await;
+        let children_before = children(&pool).await;
+        let schema_before = schema_but_p(&pool).await;
+        let order_before = rows(&pool, "SELECT rowid, id FROM p ORDER BY rowid").await;
+
+        run_migrations(&pool, &rebuilt_by(RECIPE, true))
+            .await
+            .unwrap();
+
+        assert_eq!(children(&pool).await, children_before, "no child row moved");
+        assert_eq!(
+            scalar(&pool, "SELECT COUNT(*) FROM pragma_foreign_key_check").await,
+            0,
+            "every child points at its parent"
+        );
+        assert_eq!(
+            schema_but_p(&pool).await,
+            schema_before,
+            "indexes, triggers and the children's schema are unchanged"
+        );
+        assert_eq!(
+            rows(&pool, "SELECT rowid, id FROM p ORDER BY rowid").await,
+            order_before
+        );
+        assert_eq!(scalar(&pool, "PRAGMA foreign_keys").await, 1);
+        assert_eq!(scalar(&pool, "PRAGMA user_version").await, 2);
+        assert_eq!(
+            super::column_names(&pool, "p").await,
+            ["id", "name", "added_at"],
+            "the rebuild took effect"
+        );
+        let recorded = recorded(&pool).await;
+        assert_eq!(recorded.len(), 2);
+        assert!(recorded[1].1 >= 0, "a file that ran records its time");
+
+        sqlx::query("DELETE FROM p WHERE id = 'a'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            scalar(&pool, "SELECT COUNT(*) FROM c_cascade WHERE p_id = 'a'").await,
+            0,
+            "the cascade fires"
+        );
+        assert_eq!(
+            rows(&pool, "SELECT id, p_id FROM c_set_null WHERE id = 1").await,
+            [(1, None)],
+            "set null fires"
+        );
+        assert!(
+            sqlx::query("DELETE FROM p WHERE id = 'b'")
+                .execute(&pool)
+                .await
+                .is_err(),
+            "restrict still refuses"
+        );
+        sqlx::query("UPDATE p SET name = 'Cy' WHERE id = 'c'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            scalar(&pool, "SELECT COUNT(*) FROM p_log").await,
+            1,
+            "the trigger fires"
+        );
+    }
+
+    /// An old orphan in another table does not block the rebuild; a rebuild
+    /// that makes a new orphan is refused and leaves the database exactly
+    /// as it was, its stamp and migration records included.
+    #[tokio::test]
+    async fn an_old_orphan_upgrades_and_a_new_one_is_refused() {
+        let dir = ScratchDir::new("rebuild-orphan");
+        let (pool, _) = file_pool(&dir).await;
+        run_migrations(&pool, &base()).await.unwrap();
+        seed(&pool, true).await;
+        seed_unrelated_orphan(&pool).await;
+        run_migrations(&pool, &rebuilt_by(RECIPE, true))
+            .await
+            .unwrap();
+        assert_eq!(scalar(&pool, "PRAGMA user_version").await, 2);
+
+        let dir = ScratchDir::new("rebuild-new-orphan");
+        let (pool, path) = file_pool(&dir).await;
+        run_migrations(&pool, &base()).await.unwrap();
+        seed(&pool, true).await;
+        seed_unrelated_orphan(&pool).await;
+        let before = snapshot(&path);
+        let orphaning = RECIPE.replace("0 FROM p;", "0 FROM p WHERE id <> 'a';");
+        assert_ne!(orphaning, RECIPE);
+
+        let error = run_migrations(&pool, &rebuilt_by(&orphaning, true))
+            .await
+            .unwrap_err();
+        assert!(
+            execute_failure(error).contains("CHECK constraint failed"),
+            "the guard after the copy refuses"
+        );
+        assert_eq!(snapshot(&path), before, "the database is as it was");
+        assert_eq!(
+            scalar(&pool, "PRAGMA foreign_keys").await,
+            1,
+            "the pool's next connection has foreign keys on"
+        );
+    }
+
+    /// A WITHOUT ROWID child reports every orphan with a NULL rowid, so one
+    /// old orphan there must not let a new one through.
+    #[tokio::test]
+    async fn a_new_orphan_behind_an_old_one_without_rowid_is_refused() {
+        let dir = ScratchDir::new("rebuild-keyed-orphan");
+        let (pool, path) = file_pool(&dir).await;
+        run_migrations(&pool, &base()).await.unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO p (id, name) VALUES ('c', 'Cee'), ('a', 'Ay'), ('b', 'Bee');
+             INSERT INTO c_keyed (p_id, tag) VALUES ('a', 'x'), ('b', 'x');
+             PRAGMA foreign_keys = OFF;
+             INSERT INTO c_keyed (p_id, tag) VALUES ('gone', 'x');
+             PRAGMA foreign_keys = ON;",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let before = snapshot(&path);
+        let orphaning = RECIPE.replace("0 FROM p;", "0 FROM p WHERE id <> 'a';");
+
+        let error = run_migrations(&pool, &rebuilt_by(&orphaning, true))
+            .await
+            .unwrap_err();
+        assert!(execute_failure(error).contains("CHECK constraint failed"));
+        assert_eq!(snapshot(&path), before, "the database is as it was");
+    }
+
+    /// The naive versions of the recipe fail, so each step it adds is
+    /// needed.
+    #[tokio::test]
+    async fn the_naive_rebuilds_fail() {
+        // Without the first line and its own BEGIN and COMMIT, the file runs
+        // inside sqlx's transaction, where foreign_keys=OFF does nothing and
+        // DROP TABLE empties the children. The guard that foreign keys are
+        // off is what catches that, so it goes too.
+        let wrapped = RECIPE
+            .replace("-- no-transaction\n", "")
+            .replace("BEGIN IMMEDIATE;\n", "")
+            .replace("COMMIT;\n", "")
+            .replace(FK_OFF_GUARD, "");
+        let dir = ScratchDir::new("rebuild-naive-wrapped");
+        let (pool, _) = file_pool(&dir).await;
+        run_migrations(&pool, &base()).await.unwrap();
+        seed(&pool, false).await;
+        run_migrations(&pool, &rebuilt_by(&wrapped, false))
+            .await
+            .unwrap();
+        assert_eq!(
+            scalar(&pool, "SELECT COUNT(*) FROM c_cascade").await,
+            0,
+            "the children cascade"
+        );
+        assert_eq!(
+            scalar(&pool, "SELECT COUNT(*) FROM c_set_null WHERE p_id IS NULL").await,
+            2,
+            "the set-null children lose their parent"
+        );
+
+        // With that guard kept, the same wrapped file is refused instead.
+        let guarded = wrapped.replace(
+            "CREATE TEMP TABLE rebuild_orphans",
+            &format!("{FK_OFF_GUARD}CREATE TEMP TABLE rebuild_orphans"),
+        );
+        let dir = ScratchDir::new("rebuild-naive-guarded");
+        let (pool, _) = file_pool(&dir).await;
+        run_migrations(&pool, &base()).await.unwrap();
+        seed(&pool, true).await;
+        let error = run_migrations(&pool, &rebuilt_by(&guarded, false))
+            .await
+            .unwrap_err();
+        assert!(execute_failure(error).contains("CHECK constraint failed"));
+        assert_eq!(scalar(&pool, "SELECT COUNT(*) FROM c_cascade").await, 3);
+
+        // Renaming the old table first: SQLite rewrites every child's
+        // REFERENCES to the old name, so its drop leaves them pointing at
+        // nothing, and the guard after the copy refuses.
+        let renamed_first = RECIPE.replace(
+            "DROP TABLE p;\nALTER TABLE p_new RENAME TO p;\n",
+            "ALTER TABLE p RENAME TO p_old;\nALTER TABLE p_new RENAME TO p;\nDROP TABLE p_old;\n",
+        );
+        assert_ne!(renamed_first, RECIPE);
+        let dir = ScratchDir::new("rebuild-naive-renamed");
+        let (pool, path) = file_pool(&dir).await;
+        run_migrations(&pool, &base()).await.unwrap();
+        seed(&pool, true).await;
+        let before = snapshot(&path);
+        let error = run_migrations(&pool, &rebuilt_by(&renamed_first, true))
+            .await
+            .unwrap_err();
+        assert!(execute_failure(error).contains("CHECK constraint failed"));
+        assert_eq!(snapshot(&path), before);
+        // Without that guard it commits, and the children name the old table.
+        let after_copy =
+            Regex::new(r"(?s)INSERT INTO rebuild_guard SELECT NOT EXISTS \(.*?\);\n").unwrap();
+        let unguarded = after_copy.replace(&renamed_first, "").into_owned();
+        assert_ne!(unguarded, renamed_first);
+        run_migrations(&pool, &rebuilt_by(&unguarded, true))
+            .await
+            .unwrap();
+        let child: String =
+            sqlx::query_scalar("SELECT sql FROM sqlite_schema WHERE name = 'c_cascade'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(child.contains("p_old"), "{child}");
+
+        // The recipe under sqlx's own runner fails on its nested BEGIN.
+        let dir = ScratchDir::new("rebuild-naive-sqlx");
+        let (pool, path) = file_pool(&dir).await;
+        run_migrations(&pool, &base()).await.unwrap();
+        seed(&pool, true).await;
+        let before = snapshot(&path);
+        let error = rebuilt_by(RECIPE, true).run(&pool).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot start a transaction within a transaction"),
+            "{error}"
+        );
+        assert_eq!(snapshot(&path), before);
+    }
+
+    /// A crash between the file's COMMIT and its record: the next run
+    /// records it without running it again (the file's own guard would
+    /// refuse a second run). A stamp past an unrecorded file refuses with
+    /// nothing recorded.
+    #[tokio::test]
+    async fn a_committed_file_is_recorded_once_and_a_stamp_past_it_refuses() {
+        let dir = ScratchDir::new("rebuild-crash");
+        let (pool, _) = file_pool(&dir).await;
+        run_migrations(&pool, &base()).await.unwrap();
+        seed(&pool, true).await;
+        sqlx::raw_sql(RECIPE).execute(&pool).await.unwrap();
+        let first = recorded(&pool).await;
+        assert_eq!(first.len(), 1, "committed, not recorded");
+
+        let mut again = pool.acquire().await.unwrap();
+        let rerun = sqlx::raw_sql(RECIPE).execute(&mut *again).await;
+        again.close().await.unwrap();
+        assert!(
+            rerun
+                .unwrap_err()
+                .to_string()
+                .contains("CHECK constraint failed"),
+            "the file refuses to run twice"
+        );
+
+        run_migrations(&pool, &rebuilt_by(RECIPE, true))
+            .await
+            .unwrap();
+        assert_eq!(recorded(&pool).await, [first[0], (2, -1)]);
+        assert_eq!(scalar(&pool, "SELECT COUNT(*) FROM c_cascade").await, 3);
+        assert_eq!(scalar(&pool, "PRAGMA foreign_keys").await, 1);
+
+        let dir = ScratchDir::new("rebuild-ahead");
+        let (pool, _) = file_pool(&dir).await;
+        run_migrations(&pool, &base()).await.unwrap();
+        sqlx::query("PRAGMA user_version = 3")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let error = run_migrations(&pool, &rebuilt_by(RECIPE, true))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                SchemaError::StampAhead {
+                    version: 2,
+                    stamp: 3
+                }
+            ),
+            "{error:?}"
+        );
+        assert_eq!(recorded(&pool).await.len(), 1, "nothing recorded");
+    }
+
+    /// What is wrong with a no-transaction file's shape, by the recipe.
+    fn shape_problems(migration: &Migration) -> Vec<String> {
+        let lines: Vec<&str> = migration
+            .sql
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect();
+        let mut problems = Vec::new();
+        let opening = [
+            "-- no-transaction",
+            "PRAGMA foreign_keys=OFF;",
+            "BEGIN IMMEDIATE;",
+        ];
+        if lines.get(..3) != Some(&opening[..]) {
+            problems.push("does not open with the recipe's three lines".to_owned());
+        }
+        let commits: Vec<usize> = (0..lines.len())
+            .filter(|at| lines[*at] == "COMMIT;")
+            .collect();
+        let stamp = format!("PRAGMA user_version = {};", migration.version);
+        match commits[..] {
+            [at] if at > 0 && lines[at - 1] == stamp => {}
+            [_] => problems.push(format!("COMMIT is not preceded by `{stamp}`")),
+            _ => problems.push(format!("has {} COMMIT lines, not one", commits.len())),
+        }
+        if lines.last() != Some(&"PRAGMA foreign_keys=ON;") {
+            problems.push("does not end with `PRAGMA foreign_keys=ON;`".to_owned());
+        }
+        problems
+    }
+
+    /// Every shipped no-transaction migration has the recipe's shape, and
+    /// every migration that sets foreign keys is one.
+    #[test]
+    fn no_transaction_migrations_follow_the_recipe() {
+        assert_eq!(
+            shape_problems(&migration(2, RECIPE, true)),
+            Vec::<String>::new()
+        );
+        assert_eq!(shape_problems(&migration(3, RECIPE, true)).len(), 1);
+
+        let sets_foreign_keys = Regex::new(r"(?i)PRAGMA\s+foreign_keys\s*=").unwrap();
+        let mut wrong = Vec::new();
+        for migration in MIGRATOR.iter() {
+            if migration.no_tx {
+                for problem in shape_problems(migration) {
+                    wrong.push(format!("{}: {problem}", migration.version));
+                }
+            } else if sets_foreign_keys.is_match(&migration.sql) {
+                wrong.push(format!(
+                    "{}: sets foreign_keys without `-- no-transaction`",
+                    migration.version
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    type Record = (i64, String, bool, Vec<u8>);
+
+    async fn records(pool: &SqlitePool) -> Vec<Record> {
+        sqlx::query_as(
+            "SELECT version, description, success, checksum FROM _sqlx_migrations ORDER BY version",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    type FullRecord = (i64, String, String, bool, Vec<u8>, i64);
+
+    async fn full_records(pool: &SqlitePool) -> Vec<FullRecord> {
+        sqlx::query_as(
+            "SELECT version, description, installed_on, success, checksum, execution_time \
+             FROM _sqlx_migrations ORDER BY version",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    /// A no-transaction file is recorded with the row sqlx's own `apply`
+    /// writes, the shipped migrations sqlx can run record the same rows
+    /// under either runner, and a second run changes no column. sqlx fails
+    /// on a shipped no-transaction file's own `BEGIN`, so those are left out
+    /// of the comparison.
+    #[tokio::test]
+    async fn records_match_what_sqlx_writes() {
+        let plain = set(vec![migration(
+            1,
+            "-- no-transaction\nCREATE TABLE t (x INTEGER) STRICT;\nPRAGMA user_version = 1;\n",
+            true,
+        )]);
+        let by_sqlx = super::scratch_pool().await;
+        plain.run(&by_sqlx).await.unwrap();
+        let ours = super::scratch_pool().await;
+        run_migrations(&ours, &plain).await.unwrap();
+        assert_eq!(records(&ours).await.len(), 1);
+        assert_eq!(records(&ours).await, records(&by_sqlx).await);
+
+        let wrapped = set(MIGRATOR
+            .iter()
+            .filter(|migration| !migration.no_tx)
+            .cloned()
+            .collect());
+        let by_sqlx = super::scratch_pool().await;
+        wrapped.run(&by_sqlx).await.unwrap();
+        let ours = super::scratch_pool().await;
+        run_migrations(&ours, &wrapped).await.unwrap();
+        assert_eq!(records(&ours).await, records(&by_sqlx).await);
+        let ours = super::scratch_pool().await;
+        run_migrations(&ours, &MIGRATOR).await.unwrap();
+
+        let first = full_records(&ours).await;
+        run_migrations(&ours, &MIGRATOR).await.unwrap();
+        assert_eq!(
+            full_records(&ours).await,
+            first,
+            "a second run changes nothing"
+        );
+    }
+}
+
+/// The auth enums are exactly what the auth tables' CHECKs list, in order.
+#[tokio::test]
+async fn auth_checks_list_exactly_the_code_values() {
+    use droppedneedle_auth::Role;
+    use droppedneedle_auth::federated::password_import::HashScheme;
+    use droppedneedle_auth::session::store::SessionKind;
+
+    let pool = migrated_pool().await;
+    let mut schemas = BTreeMap::new();
+    for table in ["auth_users", "auth_tokens", "auth_providers"] {
+        let sql: String = sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE name = ?")
+            .bind(table)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        schemas.insert(table, sql);
+    }
+    let listed = |table: &str, column: &str| -> Vec<String> {
+        let sql = &schemas[table];
+        let marker = format!("CHECK({column} IN (");
+        let values = &sql[sql.find(&marker).expect("the column has a CHECK") + marker.len()..];
+        values[..values.find(')').expect("the list ends")]
+            .split(',')
+            .map(|value| value.trim().trim_matches('\'').to_owned())
+            .collect()
+    };
+    assert_eq!(
+        listed("auth_users", "role"),
+        Role::ALL.map(|role| role.as_str().to_owned())
+    );
+    assert_eq!(
+        listed("auth_tokens", "session_kind"),
+        SessionKind::ALL.map(|kind| kind.as_str().to_owned())
+    );
+    assert_eq!(
+        listed("auth_providers", "hash_scheme"),
+        HashScheme::ALL.map(|scheme| scheme.as_tag().to_owned())
+    );
+    for kind in SessionKind::ALL {
+        assert_eq!(SessionKind::parse(kind.as_str()), Some(kind));
+    }
+    assert_eq!(SessionKind::parse("superuser"), None);
+}
+
+/// Migration 0101 rebuilds the six auth tables as STRICT tables with
+/// millisecond times, the credential and the companion label in columns of
+/// their own, and app passwords under `auth_app_passwords`. Every row reads
+/// as it did: dead ones stay dead, live ones still work through the stores,
+/// and no row of any table that points at an account is lost or orphaned.
+#[tokio::test]
+async fn auth_rows_carry_onto_strict_tables_on_upgrade() {
+    use std::sync::Arc;
+
+    use droppedneedle_auth::prod::{
+        AppPasswords, AuthDb, OidcStates, RecoveryCodes, Sessions, Users,
+    };
+    use droppedneedle_auth::session::store::SessionKind;
+    use droppedneedle_auth::users::models::LocalCredential;
+    use droppedneedle_auth::users::services::COMPANION_LABEL_PREFIX;
+    use droppedneedle_kernel::clock::ManualClock;
+    use droppedneedle_kernel::db::Db;
+    use droppedneedle_kernel::ids::UuidGenerator;
+
+    /// 2026-10-29T00:00:00Z, the stores' clock.
+    const NOW: i64 = 1_793_232_000;
+    const REBUILT: [&str; 7] = [
+        "auth_users",
+        "auth_providers",
+        "auth_tokens",
+        "auth_password_recovery_codes",
+        "auth_oidc_states",
+        "connect_app_passwords",
+        "auth_app_passwords",
+    ];
+    type SchemaRow = (String, String, String, Option<String>);
+    async fn schema_rows(pool: &SqlitePool) -> Vec<SchemaRow> {
+        sqlx::query_as("SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY type, name")
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+    async fn counts(pool: &SqlitePool) -> BTreeMap<String, i64> {
+        let tables: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' \
+             AND name <> '_sqlx_migrations'",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        let mut out = BTreeMap::new();
+        for table in tables {
+            let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM \"{table}\""))
+                .fetch_one(pool)
+                .await
+                .unwrap();
+            let table = if table == "connect_app_passwords" {
+                "auth_app_passwords".to_owned()
+            } else {
+                table
+            };
+            out.insert(table, count);
+        }
+        out
+    }
+    async fn children(pool: &SqlitePool) -> Vec<(String, Option<String>)> {
+        sqlx::query_as(
+            "SELECT 'mark ' || local_track_id, user_id FROM library_user_play_marks \
+             UNION ALL SELECT 'bookmark ' || file_id, user_id FROM compat_bookmarks \
+             UNION ALL SELECT 'empty ' || id, actor_user_id FROM library_recycle_bin_empties \
+             UNION ALL SELECT 'exclusion ' || local_album_id, excluded_by_user_id \
+                 FROM library_management_exclusions \
+             UNION ALL SELECT 'manifest ' || id, sealed_by_user_id \
+                 FROM library_custom_edition_manifests \
+             UNION ALL SELECT 'dismissal ' || left_artist_id, dismissed_by_user_id \
+                 FROM library_artist_reconciliation_dismissals \
+             UNION ALL SELECT 'plays ' || local_album_id || ' ' || plays, user_id \
+                 FROM library_user_album_plays \
+             ORDER BY 1, 2",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    let dir = crate::common::ScratchDir::new("auth-0101");
+    let path = dir.join("app.db");
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&path)
+                .create_if_missing(true)
+                .foreign_keys(true),
+        )
+        .await
+        .unwrap();
+    run_migrations(&pool, &migrator_through(100)).await.unwrap();
+    let prefix = COMPANION_LABEL_PREFIX;
+    sqlx::raw_sql(&format!(
+        "INSERT INTO auth_users (id, display_name, role, created_at, last_login_at, username) \
+         VALUES ('ada', 'Ada', 'admin', '2024-01-01T00:00:00.123456+00:00', \
+             '2026-01-01T00:00:00Z', 'ada'), \
+         ('bob', 'Bob', 'superuser', 'now', '2026-01-01', 'bob'), \
+         ('cy', 'Cy', 'trusted', 'garbage', NULL, 'cy'), \
+         ('dee', 'Dee', 'user', '2026-02-30T00:00:00+00:00', '2026-03-01 10:00:00+0130', \
+             'dee'); \
+         INSERT INTO auth_providers (id, user_id, provider, provider_uid, provider_data, \
+             created_at) VALUES \
+         ('p-ada', 'ada', 'local', 'ada', '{{\"password_hash\": \"$2b$12$ada\"}}', \
+             '2024-01-01T00:00:00+00:00'), \
+         ('p-dee', 'dee', 'local', 'dee', \
+             '{{\"password_hash\": \"$argon2id$dee\", \"scheme\": \"argon2id\"}}', ''), \
+         ('p-cy', 'cy', 'local', 'cy', '{{not json', 'now'), \
+         ('p-cy-sso', 'cy', 'oidc', 'sub-cy', 'v3:sealed tokens', \
+             '2024-01-01T00:00:00+00:00'), \
+         ('p-bob', 'bob', 'local', 'bob', '{{\"password_hash\": \"h\", \"scheme\": \"md5\"}}', \
+             '2024-01-01T00:00:00+00:00'); \
+         INSERT INTO auth_tokens (id, user_id, token_hash, issued_at, expires_at, last_seen_at, \
+             revoked, user_agent, session_kind) VALUES \
+         ('t-live', 'ada', 'hash-live', '2026-10-01T00:00:00+00:00', \
+             '2099-01-01T00:00:00+00:00', '2026-10-28T23:59:00+00:00', 0, 'Firefox', \
+             'standard'), \
+         ('t-phone', 'ada', 'hash-phone', '2026-10-01T00:00:00+00:00', \
+             '2099-01-01T00:00:00+00:00', '2026-10-01T00:00:00+00:00', 0, \
+             '{prefix}Kitchen', 'companion'), \
+         ('t-spoof', 'bob', 'hash-spoof', '2026-10-01T00:00:00+00:00', \
+             '2099-01-01T00:00:00+00:00', 'x', 0, '{prefix}Spoof', 'standard'), \
+         ('t-kind', 'ada', 'hash-kind', '2026-10-01T00:00:00+00:00', \
+             '2099-01-01T00:00:00+00:00', '2026-10-01T00:00:00+00:00', 0, NULL, 'superuser'), \
+         ('t-two', 'ada', 'hash-two', '2026-10-01T00:00:00+00:00', \
+             '2099-01-01T00:00:00+00:00', '2026-10-01T00:00:00+00:00', 2, NULL, 'standard'), \
+         ('t-now', 'dee', 'hash-now', 'now', 'now', 'now', 0, NULL, 'standard'), \
+         ('t-day', 'dee', 'hash-day', '2026-10-01', '2099-01-01', '2026-10-01', 0, NULL, \
+             'standard'); \
+         INSERT INTO auth_password_recovery_codes (user_id, code_hash, created_at, expires_at) \
+         VALUES ('cy', 'code-live', '2026-10-28T23:55:00+00:00', '2099-01-01T00:00:00+00:00'), \
+         ('ada', 'code-old', '2020-01-01T00:00:00+00:00', '2020-01-01T00:15:00+00:00'), \
+         ('dee', 'code-now', 'now', 'now'); \
+         INSERT INTO auth_oidc_states (state, created_at, expires_at, code_verifier) VALUES \
+         ('s-live', '2026-10-28T23:59:00+00:00', '2099-01-01T00:00:00+00:00', 'verifier'), \
+         ('s-day', '2026-10-28', '2099-01-01', 'other'); \
+         INSERT INTO connect_app_passwords (id, user_id, name, secret_sha256, secret_encrypted, \
+             created_at, last_used_at, last_client, revoked) VALUES \
+         ('ap-live', 'ada', 'phone', 'sha-live', 'v3:secret', \
+             '2026-09-28T12:34:56.789+00:00', NULL, NULL, 0), \
+         ('ap-two', 'ada', 'old', 'sha-two', 'v3:other', 'now', 'garbage', 'Feishin', 2); \
+         INSERT INTO local_artists (id, display_name, folded_name, kind, created_at, updated_at) \
+         VALUES ('a1', 'A', 'a', 'group', 1, 1), ('a2', 'B', 'b', 'group', 1, 1); \
+         INSERT INTO local_albums (id, root_id, grouping_key, title, title_folded, \
+             album_artist_id, grouping_source, created_at, updated_at) \
+         VALUES ('al1', 'r1', 'g1', 'T', 't', 'a1', 'automatic', 1, 1); \
+         INSERT INTO local_tracks (id, local_album_id, root_id, file_path, relative_path, \
+             path_hash, file_size_bytes, file_mtime_ns, stat_revision, title, title_folded, \
+             album_title, album_title_folded, file_format, ingest_source, imported_at, \
+             membership_source) \
+         VALUES ('t1', 'al1', 'r1', '/m/1.flac', '1.flac', 'h1', 1, 0, 's', 'T', 't', 'T', 't', \
+             'flac', 'scan', 0, 'automatic'); \
+         INSERT INTO library_user_play_marks (user_id, local_track_id, marked_played_at) \
+         VALUES ('ada', 't1', 1), ('bob', 't1', 2); \
+         INSERT INTO compat_bookmarks (user_id, file_id, position_ms, created_at, changed_at) \
+         VALUES ('dee', 'f1', 5, 1, 1); \
+         INSERT INTO library_recycle_bin_empties (id, actor_user_id, before_at, deleted, \
+             freed_bytes, older_folders, kept, waited, kept_json) \
+         VALUES ('e1', 'bob', 1, 0, 0, 0, 0, 0, '[]'); \
+         INSERT INTO library_management_exclusions (local_album_id, reason, \
+             excluded_by_user_id, excluded_at) VALUES ('al1', 'hand', 'ada', 1); \
+         INSERT INTO library_custom_edition_manifests (id, local_album_id, version, \
+             release_group_mbid, album_title, album_artist_name, source_album_revision, \
+             input_revision, content_hash, sealed_by_user_id, sealed_at) \
+         VALUES ('m1', 'al1', 1, 'rg', 'T', 'A', 1, 'i', 'c', 'ada', 1); \
+         INSERT INTO library_artist_reconciliation_dismissals (left_artist_id, \
+             right_artist_id, left_artist_revision, right_artist_revision, \
+             dismissed_by_user_id, created_at, updated_at) \
+         VALUES ('a1', 'a2', 1, 1, 'ada', 1, 1);"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    // An app password whose account is already gone: an old orphan, which
+    // the rebuild keeps as it is and must not mistake for a new one.
+    sqlx::raw_sql(
+        "PRAGMA foreign_keys = OFF; \
+         INSERT INTO connect_app_passwords (id, user_id, name, secret_sha256, \
+             secret_encrypted, created_at, revoked) \
+         VALUES ('ap-ghost', 'ghost', 'gone', 'sha-ghost', 'v3:gone', 'now', 0); \
+         PRAGMA foreign_keys = ON;",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    async fn orphans(pool: &SqlitePool) -> Vec<(String, String)> {
+        sqlx::query_as(
+            "SELECT CASE \"table\" WHEN 'connect_app_passwords' THEN 'auth_app_passwords' \
+             ELSE \"table\" END, parent FROM pragma_foreign_key_check ORDER BY 1, 2",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+    let orphans_before = orphans(&pool).await;
+    assert_eq!(
+        orphans_before,
+        [("auth_app_passwords".to_owned(), "auth_users".to_owned())]
+    );
+    let schema_before = schema_rows(&pool).await;
+    let counts_before = counts(&pool).await;
+    let children_before = children(&pool).await;
+    assert_eq!(children_before.len(), 9, "every child is seeded");
+
+    // Through 0101 only: later migrations change other tables.
+    let through = sqlx::migrate::Migrator {
+        migrations: std::borrow::Cow::Owned(
+            MIGRATOR
+                .migrations
+                .iter()
+                .filter(|migration| migration.version <= 101)
+                .cloned()
+                .collect(),
+        ),
+        ignore_missing: false,
+        locking: true,
+        no_tx: false,
+    };
+    run_migrations(&pool, &through).await.unwrap();
+
+    // Outside the rebuilt tables, only the index renames differ.
+    let rebuilt = |row: &SchemaRow| row.0 == "table" && REBUILT.contains(&row.1.as_str());
+    let schema_after = schema_rows(&pool).await;
+    let gone: Vec<&str> = schema_before
+        .iter()
+        .filter(|row| !rebuilt(row) && !schema_after.contains(row))
+        .map(|row| row.1.as_str())
+        .collect();
+    let added: Vec<&str> = schema_after
+        .iter()
+        .filter(|row| !rebuilt(row) && !schema_before.contains(row))
+        .map(|row| row.1.as_str())
+        .collect();
+    assert_eq!(
+        gone,
+        [
+            "idx_auth_tokens_hash",
+            "idx_cap_user",
+            "sqlite_autoindex_connect_app_passwords_1",
+            "sqlite_autoindex_connect_app_passwords_2",
+        ]
+    );
+    assert_eq!(
+        added,
+        [
+            "idx_auth_app_passwords_user",
+            "sqlite_autoindex_auth_app_passwords_1",
+            "sqlite_autoindex_auth_app_passwords_2",
+        ]
+    );
+    assert_eq!(
+        counts(&pool).await,
+        counts_before,
+        "every table keeps its rows"
+    );
+    assert_eq!(
+        children(&pool).await,
+        children_before,
+        "every child keeps its user"
+    );
+    assert_eq!(
+        orphans(&pool).await,
+        orphans_before,
+        "the old orphan stays and no new one appears"
+    );
+
+    let users: Vec<(String, String, i64, Option<i64>)> =
+        sqlx::query_as("SELECT id, role, created_at, last_login_at FROM auth_users ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        users,
+        [
+            (
+                "ada".into(),
+                "admin".into(),
+                1_704_067_200_123,
+                Some(1_767_225_600_000)
+            ),
+            ("bob".into(), "user".into(), 0, None),
+            ("cy".into(), "trusted".into(), 0, None),
+            ("dee".into(), "user".into(), 0, Some(1_772_353_800_000)),
+        ],
+        "v2's fractional and offset times keep their instant; others read as before"
+    );
+    type Provider = (String, Option<String>, Option<String>, Option<String>, i64);
+    let providers: Vec<Provider> = sqlx::query_as(
+        "SELECT id, provider_data, hash_scheme, password_hash, created_at FROM auth_providers \
+         ORDER BY id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let in_2024 = 1_704_067_200_000;
+    assert_eq!(
+        providers,
+        [
+            (
+                "p-ada".into(),
+                None,
+                Some("bcrypt".into()),
+                Some("$2b$12$ada".into()),
+                in_2024
+            ),
+            ("p-bob".into(), None, None, None, in_2024),
+            ("p-cy".into(), None, None, None, 0),
+            (
+                "p-cy-sso".into(),
+                Some("v3:sealed tokens".into()),
+                None,
+                None,
+                in_2024
+            ),
+            (
+                "p-dee".into(),
+                None,
+                Some("argon2id".into()),
+                Some("$argon2id$dee".into()),
+                0
+            ),
+        ]
+    );
+    type Token = (
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        i64,
+        i64,
+        i64,
+    );
+    let tokens: Vec<Token> = sqlx::query_as(
+        "SELECT id, session_kind, label, user_agent, revoked, expires_at, last_seen_at \
+         FROM auth_tokens ORDER BY id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let (far, seen) = (4_070_908_800_000, 1_790_812_800_000);
+    let spoof = format!("{prefix}Spoof");
+    assert_eq!(
+        tokens,
+        [
+            ("t-day".into(), "standard".into(), None, None, 0, 0, 0),
+            ("t-kind".into(), "standard".into(), None, None, 1, far, seen),
+            (
+                "t-live".into(),
+                "standard".into(),
+                None,
+                Some("Firefox".into()),
+                0,
+                far,
+                1_793_231_940_000
+            ),
+            ("t-now".into(), "standard".into(), None, None, 0, 0, 0),
+            (
+                "t-phone".into(),
+                "companion".into(),
+                Some("Kitchen".into()),
+                None,
+                0,
+                far,
+                seen
+            ),
+            (
+                "t-spoof".into(),
+                "standard".into(),
+                None,
+                Some(spoof),
+                0,
+                far,
+                0
+            ),
+            ("t-two".into(), "standard".into(), None, None, 1, far, seen),
+        ]
+    );
+    let passwords: Vec<(String, i64, Option<i64>, i64)> = sqlx::query_as(
+        "SELECT id, created_at, last_used_at, revoked FROM auth_app_passwords ORDER BY id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        passwords,
+        [
+            ("ap-ghost".into(), 0, None, 0),
+            ("ap-live".into(), 1_790_598_896_789, None, 0),
+            ("ap-two".into(), 0, None, 1),
+        ]
+    );
+    pool.close().await;
+
+    // The stores read the carried rows as before.
+    let db = Db::open_for_tests(&path).unwrap();
+    let auth = AuthDb::new(&db, Arc::new(ManualClock::at(NOW * 1000)));
+    let sessions = Sessions::new(&auth, Arc::new(UuidGenerator));
+    let live = sessions.lookup_valid("hash-live", NOW).await.unwrap();
+    let live = live.expect("a session made before still signs in");
+    assert_eq!(live.record.user_agent.as_deref(), Some("Firefox"));
+    let phone = sessions.lookup_valid("hash-phone", NOW).await.unwrap();
+    let phone = phone.expect("a companion made before still signs in");
+    assert_eq!(phone.record.kind, SessionKind::Companion);
+    assert_eq!(phone.record.label.as_deref(), Some("Kitchen"));
+    for dead in ["hash-kind", "hash-two", "hash-now", "hash-day"] {
+        assert!(
+            sessions.lookup_valid(dead, NOW).await.unwrap().is_none(),
+            "{dead} stays dead"
+        );
+    }
+    let spoofed = sessions.lookup_valid("hash-spoof", NOW).await.unwrap();
+    assert_eq!(spoofed.expect("a standard session").record.label, None);
+    let listed: Vec<(String, String)> = sessions
+        .list_for_user("ada")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|session| (session.id, session.label))
+        .collect();
+    assert_eq!(
+        listed,
+        [
+            ("t-live".to_owned(), "Firefox".to_owned()),
+            ("t-phone".to_owned(), "Kitchen".to_owned()),
+        ]
+    );
+    sessions
+        .replace_companion("ada", "hash-phone-2", "Kitchen", NOW, NOW + 60)
+        .await
+        .unwrap();
+    assert!(
+        sessions
+            .lookup_valid("hash-phone", NOW)
+            .await
+            .unwrap()
+            .is_none(),
+        "a remint under the label revokes the carried companion"
+    );
+
+    let users = Users::new(&auth);
+    let ada = users.login_credential("ada").await.unwrap().unwrap();
+    assert_eq!(
+        (ada.password.scheme.as_str(), ada.password.hash.as_str()),
+        ("bcrypt", "$2b$12$ada"),
+        "an untagged v2 hash reads as bcrypt"
+    );
+    let dee = users.login_credential("dee").await.unwrap().unwrap();
+    assert_eq!(dee.password.scheme, "argon2id");
+    for nobody in ["bob", "cy"] {
+        assert!(users.login_credential(nobody).await.unwrap().is_none());
+        assert!(users.local_credential(nobody).await.unwrap().is_none());
+    }
+    assert_eq!(
+        users.get_by_id("bob").await.unwrap().unwrap().role,
+        droppedneedle_auth::Role::User
+    );
+
+    let codes = RecoveryCodes::new(&auth);
+    for dead in ["code-old", "code-now"] {
+        assert!(codes.find_live_by_hash(dead, NOW).await.unwrap().is_none());
+    }
+    assert!(
+        codes
+            .find_live_by_hash("code-live", NOW)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    // Cy's local row holds no password: the code gives it its first one, in
+    // place, so the host's recovery code still lets the account in.
+    let first = LocalCredential {
+        id: "p-cy-new".to_owned(),
+        user_id: "cy".to_owned(),
+        scheme: "argon2id".to_owned(),
+        hash: "$argon2id$cy".to_owned(),
+    };
+    assert!(
+        users
+            .complete_recovery_first_password(first, "code-live", NOW)
+            .await
+            .unwrap()
+    );
+    let cy = users.local_credential("cy").await.unwrap().unwrap();
+    assert_eq!((cy.id.as_str(), cy.hash.as_str()), ("p-cy", "$argon2id$cy"));
+
+    let states = OidcStates::new(&auth);
+    assert_eq!(
+        states.consume_state("s-live").await.unwrap().as_deref(),
+        Some("verifier")
+    );
+    assert_eq!(states.consume_state("s-day").await.unwrap(), None);
+
+    let app = AppPasswords::new(&auth);
+    let phone = app.get_active_by_sha256("sha-live").await.unwrap();
+    assert_eq!(
+        phone.expect("an app password made before verifies").name,
+        "phone"
+    );
+    assert!(app.get_active_by_sha256("sha-two").await.unwrap().is_none());
 }

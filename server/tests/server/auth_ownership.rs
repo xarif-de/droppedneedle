@@ -348,12 +348,21 @@ const PATH_ID_ROWS: &[(Owned, &str, &str, u16, u16)] = &[
         403,
         ADMITTED,
     ),
-    // Requests (A's has failed): a requester or an admin.
+    // Requests (A's has failed): a requester or an admin. Retry and
+    // cancel answer another user as for an unknown id whatever the status,
+    // so they are tried on a failed and on a waiting request.
     (
         Owned::Request,
         "POST",
         "/api/v3/requests/retry/{musicbrainz_id}",
-        403,
+        404,
+        ADMITTED,
+    ),
+    (
+        Owned::Request,
+        "DELETE",
+        "/api/v3/requests/active/{musicbrainz_id}",
+        404,
         ADMITTED,
     ),
     (
@@ -372,9 +381,16 @@ const PATH_ID_ROWS: &[(Owned, &str, &str, u16, u16)] = &[
     ),
     (
         Owned::LiveRequest,
+        "POST",
+        "/api/v3/requests/retry/{musicbrainz_id}",
+        404,
+        ADMITTED,
+    ),
+    (
+        Owned::LiveRequest,
         "DELETE",
         "/api/v3/requests/active/{musicbrainz_id}",
-        403,
+        404,
         ADMITTED,
     ),
     (
@@ -758,6 +774,11 @@ const EXACT_EXEMPTIONS: &[(&str, &str, &str)] = &[
         "POST",
         "/api/v3/library/reviews/{id}/keep-tagged",
         SHARED_REVIEW,
+    ),
+    (
+        "POST",
+        "/api/v3/library/reviews/jobs/{job_id}/control",
+        "review jobs are a shared curator queue: any curator may pause, resume or stop one",
     ),
     (
         "DELETE",
@@ -1272,7 +1293,7 @@ async fn seed(app: &TestApp, kind: Owned, owner: &Who, n: u32) -> Ids {
         Owned::TagWrite => {
             let album = format!("tag-write-album-{n}");
             let job = format!("tag-write-job-{n}");
-            seed_tag_write(app, owner, &album, &job);
+            seed_tag_write(app, owner, &album, &job).await;
             ids.insert("album_id", album);
             ids.insert("job_id", job);
         }
@@ -1293,55 +1314,55 @@ async fn seed(app: &TestApp, kind: Owned, owner: &Who, n: u32) -> Ids {
 
 /// A planned tag write of `album`'s edition that `owner` asked for, waiting
 /// to be applied, so the management worker leaves it as it is.
-fn seed_tag_write(app: &TestApp, owner: &Who, album: &str, job: &str) {
+async fn seed_tag_write(app: &TestApp, owner: &Who, album: &str, job: &str) {
     use droppedneedle_library::management::models::{
         EditionPin, JobIntent, Origin, Revisions, Summary,
     };
     use droppedneedle_library::management::store::{NewJob, insert_job};
-    let mut db = app.db();
-    let tx = db.transaction().expect("transaction opens");
-    insert_job(
-        &tx,
-        &NewJob {
-            id: job,
-            requested_by: Some(&owner.id),
-            idempotency_key: None,
-            mode: "preview",
-            selection_json: r#"{"kind":"tracks","ids":[]}"#,
-            profile_snapshot_json: "{}",
-            revisions: &Revisions {
-                profile: String::new(),
-                settings: String::new(),
-                naming: String::new(),
-                policy: String::new(),
-                overrides: String::new(),
+    let (owner, album, job) = (owner.id.clone(), album.to_owned(), job.to_owned());
+    app.seed_tx(move |tx| {
+        insert_job(
+            tx,
+            &NewJob {
+                id: &job,
+                requested_by: Some(&owner),
+                idempotency_key: None,
+                mode: "preview",
+                selection_json: r#"{"kind":"tracks","ids":[]}"#,
+                profile_snapshot_json: "{}",
+                revisions: &Revisions {
+                    profile: String::new(),
+                    settings: String::new(),
+                    naming: String::new(),
+                    policy: String::new(),
+                    overrides: String::new(),
+                },
+                catalog_revision: 0,
+                now: 1.0,
+                expires_at: 1e12,
+                target_root_id: None,
+                linked_job_id: None,
+                summary: &Summary::default(),
+                origin: Origin::Manual,
+                intent: &JobIntent {
+                    edition: Some(EditionPin {
+                        local_album_id: album.clone(),
+                        release_mbid: "00000000-0000-0000-0000-0000000000bb".to_owned(),
+                        identity_revision: 1,
+                    }),
+                    ..JobIntent::default()
+                },
+                proposed_settings_revision: None,
             },
-            catalog_revision: 0,
-            token_hash: "",
-            now: 1.0,
-            expires_at: 1e12,
-            target_root_id: None,
-            linked_job_id: None,
-            summary: &Summary::default(),
-            origin: Origin::Manual,
-            intent: &JobIntent {
-                edition: Some(EditionPin {
-                    local_album_id: album.to_owned(),
-                    release_mbid: "00000000-0000-0000-0000-0000000000bb".to_owned(),
-                    identity_revision: 1,
-                }),
-                ..JobIntent::default()
-            },
-            proposed_settings_revision: None,
-        },
-    )
-    .expect("tag write seeds");
-    tx.execute_batch(&format!(
-        "UPDATE library_operation_jobs SET state = 'ready' WHERE id = '{job}'; \
+        )
+        .expect("tag write seeds");
+        tx.execute_batch(&format!(
+            "UPDATE library_operation_jobs SET state = 'ready' WHERE id = '{job}'; \
          UPDATE library_management_job_snapshots SET phase = 'ready' WHERE job_id = '{job}';"
-    ))
-    .expect("tag write is planned");
-    tx.commit().expect("tag write lands");
+        ))
+        .expect("tag write is planned");
+    })
+    .await;
 }
 
 /// Upload one audio file to the drop import as `owner` and wait for the
@@ -1563,9 +1584,17 @@ async fn caller_keyed_state_stays_with_its_caller() {
         assert!(status.is_success(), "{what}: {status} {body}");
     };
 
-    // Favourites.
-    let album = "00000000-0000-0000-0005-000000000001";
+    // Favourites and ratings, on a library album.
+    app.seed(
+            "INSERT INTO local_artists (id, display_name, folded_name, kind, created_at, updated_at) \
+             VALUES ('own-artist', 'Someone', 'someone', 'person', 0, 0); \
+             INSERT INTO local_albums (id, root_id, grouping_key, title, title_folded, \
+             album_artist_id, grouping_source, created_at, updated_at) VALUES \
+             ('own-album', 'root-1', 'g-own', 'Something', 'something', 'own-artist', 'manual', 0, 0);",
+        ).await;
+    let album = "own-album";
     let favorite = format!("/api/v3/favorites/album/{album}");
+    let hearted = "/api/v3/library/albums?favorites=true";
     let (status, body) = call(
         &app,
         &ada,
@@ -1581,6 +1610,9 @@ async fn caller_keyed_state_stays_with_its_caller() {
         !body.to_string().contains(album),
         "B sees A's favourite: {body}"
     );
+    let (status, body) = call(&app, &bob, "GET", hearted, None).await;
+    ok(status, &body, "B lists favourite albums");
+    assert_eq!(body["items"], json!([]), "B sees A's favourite album");
     let (status, body) = call(
         &app,
         &bob,
@@ -1590,22 +1622,13 @@ async fn caller_keyed_state_stays_with_its_caller() {
     )
     .await;
     ok(status, &body, "B unfavourites");
-    let (_, body) = call(&app, &ada, "GET", "/api/v3/favorites", None).await;
-    assert!(
-        body.to_string().contains(album),
+    let (_, body) = call(&app, &ada, "GET", hearted, None).await;
+    assert_eq!(
+        body["items"][0]["id"],
+        json!(album),
         "B's write took A's favourite: {body}"
     );
 
-    // Ratings, on a library album.
-    app.db()
-        .execute_batch(
-            "INSERT INTO local_artists (id, display_name, folded_name, kind, created_at, updated_at) \
-             VALUES ('own-artist', 'Someone', 'someone', 'person', 0, 0); \
-             INSERT INTO local_albums (id, root_id, grouping_key, title, title_folded, \
-             album_artist_id, grouping_source, created_at, updated_at) VALUES \
-             ('own-album', 'root-1', 'g-own', 'Something', 'something', 'own-artist', 'manual', 0, 0);",
-        )
-        .expect("library album seeds");
     let rating = "/api/v3/ratings/album/own-album";
     let lookup = Some(json!({"album_ids": ["own-album"]}));
     let (status, body) = call(&app, &ada, "PUT", rating, Some(json!({"rating": 4}))).await;

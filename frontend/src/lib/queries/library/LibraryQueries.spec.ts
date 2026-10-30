@@ -1,5 +1,4 @@
 import { describe, expect, it, vi, beforeEach, type Mock } from 'vitest';
-import { LibraryQueryKeyFactory } from './LibraryQueryKeyFactory';
 
 vi.mock('@tanstack/svelte-query', () => ({
 	createQuery: vi.fn((factory: () => Record<string, unknown>) => factory()),
@@ -8,7 +7,7 @@ vi.mock('@tanstack/svelte-query', () => ({
 }));
 
 vi.mock('$lib/api/client', () => ({
-	api: { global: { v3: { GET: vi.fn(), POST: vi.fn() } } }
+	api: { v3: { GET: vi.fn(), POST: vi.fn() } }
 }));
 
 vi.mock('../QueryClient', () => ({
@@ -18,7 +17,7 @@ vi.mock('../QueryClient', () => ({
 import { api } from '$lib/api/client';
 import { getLibraryMembershipQueryOptions } from './LibraryQueries.svelte';
 
-const mockPost = vi.mocked(api.global.v3.POST) as unknown as Mock<
+const mockPost = vi.mocked(api.v3.POST) as unknown as Mock<
 	(...args: unknown[]) => Promise<unknown>
 >;
 
@@ -33,19 +32,10 @@ async function callQueryFn(opts: unknown) {
 }
 
 describe('LibraryQueryKeyFactory', () => {
-	it('keys start with the library prefix', () => {
-		expect(LibraryQueryKeyFactory.all[0]).toBe('library');
-		expect(LibraryQueryKeyFactory.album('x')[0]).toBe('library');
-	});
-
-	it('produces distinct keys for different params', () => {
-		expect(LibraryQueryKeyFactory.album('a')).not.toEqual(LibraryQueryKeyFactory.album('b'));
-	});
-
 	it('keys membership by user and normalized candidate IDs', () => {
 		const first = getLibraryMembershipQueryOptions('user-a', ['B', 'a', 'b']);
 		const second = getLibraryMembershipQueryOptions('user-b', ['a', 'b']);
-		expect(first.queryKey).toEqual(['library', 'membership', 'user-a', ['a', 'b']]);
+		expect(first.queryKey).toEqual(['user:user-a', 'library', 'membership', ['a', 'b']]);
 		expect(first.queryKey).not.toEqual(second.queryKey);
 	});
 });
