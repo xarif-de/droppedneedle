@@ -1426,11 +1426,12 @@ fn write_item(
     };
     tx.prepare_cached(
         "INSERT INTO local_track_edition_tags (local_track_id, media, barcode, catalog_number, \
-         release_country, total_discs, release_date) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+         release_country, total_discs, release_date, total_tracks) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
          ON CONFLICT (local_track_id) DO UPDATE SET media = excluded.media, \
          barcode = excluded.barcode, catalog_number = excluded.catalog_number, \
          release_country = excluded.release_country, total_discs = excluded.total_discs, \
-         release_date = excluded.release_date",
+         release_date = excluded.release_date, total_tracks = excluded.total_tracks",
     )?
     .execute(params![
         track_id,
@@ -1440,6 +1441,7 @@ fn write_item(
         blank(&edition.release_country),
         edition.total_discs,
         edition.release_date,
+        edition.total_tracks,
     ])?;
     let rows_before = credit_rows(tx, CreditSide::Track, &track_id)?;
     tx.prepare_cached("DELETE FROM local_track_artists WHERE local_track_id = ?1")?
@@ -3059,6 +3061,7 @@ fn fill_edition_tags(
                 release_country,
                 edition.total_discs,
                 edition.release_date,
+                edition.total_tracks,
             ])?;
         filled += stored;
         // Only what edition matching reads counts: it takes no release
