@@ -55,11 +55,11 @@ droppedneedle_kernel::sql! {
              AND j.state = 'cleaned' \
              AND (r.recycled_at > ?2 OR (r.recycled_at = ?2 AND r.journal_id > ?3)) \
              ORDER BY r.recycled_at, r.journal_id LIMIT ?4";
-    /// The tracks a put-back not yet settled holds.
+    /// The tracks a put-back not yet settled holds, and NULL when it puts
+    /// back a file with no track (a sidecar).
     pub(super) EXPIRY_HELD_TRACKS = "SELECT DISTINCT track_id FROM library_publish_journal \
              WHERE state IN ('prepared', 'staged', 'published', 'committed', \
-             'cleanup_pending', 'needs_attention') AND kind = 'put_back' \
-             AND track_id IS NOT NULL";
+             'cleanup_pending', 'needs_attention') AND kind = 'put_back'";
     /// Record that row `?1`'s copy left the bin at `?2` (unix
     /// milliseconds): expired, found gone, or put back.
     pub(super) EXPIRY_MARK = "UPDATE library_publish_replacements SET expired_at = ?2 \
@@ -248,6 +248,16 @@ droppedneedle_kernel::sql! {
     /// A track's (`?1`) root, relative path and availability.
     pub(super) TRACK_PLACE = "SELECT root_id, relative_path, availability FROM local_tracks \
              WHERE id = ?1";
+    /// Whether a track is listed in library folder `?1` below folder `?2`:
+    /// a path from `?2/` up to `?20`, `0` being the character after `/`.
+    pub(super) TRACK_LISTED_BELOW = "SELECT EXISTS (SELECT 1 FROM local_tracks \
+             WHERE root_id = ?1 AND relative_path >= ?2 || '/' AND relative_path < ?2 || '0' \
+             AND availability = 'indexed')";
+    /// How many tracks are listed in library folder `?1` below folder `?2`,
+    /// read as [`TRACK_LISTED_BELOW`] reads them.
+    pub(super) TRACKS_LISTED_BELOW = "SELECT COUNT(*) FROM local_tracks \
+             WHERE root_id = ?1 AND relative_path >= ?2 || '/' AND relative_path < ?2 || '0' \
+             AND availability = 'indexed'";
     /// The track at root `?1`, path `?2`, with its availability.
     pub(super) TRACK_AT = "SELECT id, availability FROM local_tracks \
              WHERE root_id = ?1 AND relative_path = ?2";
