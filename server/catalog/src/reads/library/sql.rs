@@ -787,6 +787,9 @@ droppedneedle_kernel::sql! {
     family PLAYER_EXISTING = player_existing;
     /// The accepted and tag ids of some albums.
     family PLAYER_ALBUM_IDS = player_album_ids;
+    /// The track and disc totals the tags of some albums' tracks carry,
+    /// per disc.
+    family PLAYER_ALBUM_DISC_TOTALS = player_album_disc_totals;
     /// The accepted MusicBrainz ids of some artists.
     family PLAYER_ARTIST_IDS = player_artist_ids;
     /// The tag ids of some artists.
@@ -2093,6 +2096,20 @@ pub(crate) fn player_album_ids(ids: ListLen) -> String {
          AND t.local_album_id = a.id AND t.availability = 'indexed' \
          WHERE a.id IN ({})",
         musicbrainz!("ae"),
+        marks(ids)
+    )
+}
+
+/// For `ids` albums, one row per disc their indexed tracks are on: the
+/// largest track total and disc total the tracks' tags carry, NULL when
+/// none carries one.
+pub(crate) fn player_album_disc_totals(ids: ListLen) -> String {
+    format!(
+        "SELECT t.local_album_id, t.disc_number, MAX(h.total_tracks), MAX(h.total_discs) \
+         FROM local_tracks t \
+         LEFT JOIN local_track_edition_tags h ON h.local_track_id = t.id \
+         WHERE t.local_album_id IN ({}) AND t.availability = 'indexed' \
+         GROUP BY t.local_album_id, t.disc_number",
         marks(ids)
     )
 }

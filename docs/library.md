@@ -22,6 +22,8 @@ How DroppedNeedle scans your music, works out which album and edition each folde
 
 The Albums, Artists and Tracks lists show the first page and add the next with Load more, however large the library. Tracks sort by date added, title, artist (then album and track number) or album. Shuffle on the Tracks page plays every track once in a random order.
 
+Subsonic apps are told how many songs an album should have (`releaseSongCount`, beside `songCount`, the songs you have), so an app can show an incomplete album as one. It is the track count of the MusicBrainz edition the album is matched to, all discs together, once the server holds that edition's tracklist (an album page visit or the library precache fetches it; listing albums never asks MusicBrainz). Otherwise it is the track totals in the files' tags, added up over the discs, and only when every disc has one. When neither tells, it is left out. Files scanned by an older version have their track totals read on the next "Rescan files".
+
 ## Scanning
 
 Scans live on the Scanning tab of Library Management. A running scan can be paused, resumed or stopped there; stopping keeps everything it already read. New music shows up in the library as the scan finds it, not only when the scan ends. Rescan files rereads every file in the folders you pick, even ones that look unchanged, which helps after you fix files with another tool. Each finished run in Recent runs lists the files it could not read or skipped, each with a short reason and what to do about it (for example, a damaged file says to re-download or replace it). If someone changed the library folders since you opened the page, the scan is refused: reload and try again.
