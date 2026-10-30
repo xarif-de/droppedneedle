@@ -19,7 +19,9 @@ use super::{
 };
 use droppedneedle_kernel::events::{NowPlayingEntry, NowPlayingSnapshot};
 
-/// Presence time-to-live in seconds (v2 `ENTRY_TTL_SECONDS`).
+/// Presence time-to-live in seconds (v2 `ENTRY_TTL_SECONDS`): how long an
+/// entry outlives its last report unless the report holds it longer
+/// ([`PresenceRegistry::update_until`]).
 pub const PRESENCE_TTL_SECS: i64 = 45;
 
 /// One live presence entry (v2 `_Entry`, times in unix seconds).
@@ -38,6 +40,8 @@ struct PresenceEntry {
     progress_ms: Option<i64>,
     duration_ms: Option<i64>,
     updated_at: i64,
+    /// The sweep drops the entry once this unix second has passed.
+    expires_at: i64,
     track_file_id: Option<String>,
 }
 
@@ -163,6 +167,19 @@ impl PresenceRegistry {
         now: i64,
         load_visibility: impl FnOnce(&str) -> Result<String, ProviderFailure>,
     ) {
+        self.update_until(update, now, now + PRESENCE_TTL_SECS, load_visibility);
+    }
+
+    /// [`Self::update`], kept until `expires_at` (unix seconds) instead of
+    /// [`PRESENCE_TTL_SECS`] past `now`: a reporter that sends no
+    /// heartbeat holds its entry for the rest of the track.
+    pub fn update_until(
+        &self,
+        update: PresenceUpdate,
+        now: i64,
+        expires_at: i64,
+        load_visibility: impl FnOnce(&str) -> Result<String, ProviderFailure>,
+    ) {
         if let Some(user_id) = update.user_id.as_deref()
             && !self.knows_visibility(user_id)
             && let Ok(visibility) = load_visibility(user_id)
@@ -187,6 +204,7 @@ impl PresenceRegistry {
                     progress_ms: update.progress_ms,
                     duration_ms: update.duration_ms,
                     updated_at: now,
+                    expires_at,
                     track_file_id: update.track_file_id,
                 },
             );
@@ -232,6 +250,7 @@ impl PresenceRegistry {
                         progress_ms: session.progress_ms,
                         duration_ms: session.duration_ms,
                         updated_at: now,
+                        expires_at: now + PRESENCE_TTL_SECS,
                         track_file_id: None,
                     },
                 );
@@ -240,16 +259,16 @@ impl PresenceRegistry {
         }
     }
 
-    /// Drop sessions that stopped heartbeating; publish only when any were
-    /// removed (v2 `sweep`).
+    /// Drop sessions past their expiry (no report within
+    /// [`PRESENCE_TTL_SECS`], or past the time a report held them for);
+    /// publish only when any were removed (v2 `sweep`).
     pub fn sweep(&self, now: i64) -> usize {
         self.entries
             .lock()
             .map(|mut entries| {
-                let cutoff = now - PRESENCE_TTL_SECS;
                 let stale: Vec<String> = entries
                     .values()
-                    .filter(|entry| entry.updated_at < cutoff)
+                    .filter(|entry| entry.expires_at < now)
                     .map(|entry| entry.key.clone())
                     .collect();
                 for key in &stale {
@@ -389,18 +408,26 @@ pub fn device_label(device: &str) -> String {
 
 /// Record a native heartbeat (v2 `POST /now-playing`).
 pub fn heartbeat(deps: &PlaybackDeps, user_id: &str, request: &NowPlayingHeartbeat) {
-    write_heartbeat(deps, user_id, request, None);
+    write_heartbeat(deps, user_id, request, None, PRESENCE_TTL_SECS);
 }
 
-/// Record a compat now-playing report for a catalog track. The track id is
-/// kept so `getNowPlaying` can list the entry.
+/// Record a compat now-playing report for a catalog track, kept for
+/// `hold_secs` (at least [`PRESENCE_TTL_SECS`]). The track id is kept so
+/// `getNowPlaying` can list the entry.
 pub fn compat_heartbeat(
     deps: &PlaybackDeps,
     user_id: &str,
     request: &NowPlayingHeartbeat,
     track_file_id: &str,
+    hold_secs: i64,
 ) {
-    write_heartbeat(deps, user_id, request, Some(track_file_id.to_owned()));
+    write_heartbeat(
+        deps,
+        user_id,
+        request,
+        Some(track_file_id.to_owned()),
+        hold_secs.max(PRESENCE_TTL_SECS),
+    );
 }
 
 fn write_heartbeat(
@@ -408,10 +435,11 @@ fn write_heartbeat(
     user_id: &str,
     request: &NowPlayingHeartbeat,
     track_file_id: Option<String>,
+    hold_secs: i64,
 ) {
     let now = deps.clock.now_unix();
     let user_name = deps.store.display_name(user_id);
-    deps.presence.update(
+    deps.presence.update_until(
         PresenceUpdate {
             key: presence_key(user_id, &request.device),
             user_id: Some(user_id.to_owned()),
@@ -428,6 +456,7 @@ fn write_heartbeat(
             track_file_id,
         },
         now,
+        now + hold_secs,
         |owner| deps.store.visibility(owner),
     );
 }
