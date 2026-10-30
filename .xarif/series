@@ -14,3 +14,4 @@ removed-albums-leave-the-lists base=905507ac704378aa9f1bbd4ef230135088068840 pr=
 removed-tracks-leave-the-player base=905507ac704378aa9f1bbd4ef230135088068840 pr=removed-tracks-leave-the-player pr-after=2026-11-06
 track-removal-says-recycle-bin base=905507ac704378aa9f1bbd4ef230135088068840 pr=track-removal-says-recycle-bin pr-after=2026-11-06
 search-suggestions-test-keeps-its-clock base=905507ac704378aa9f1bbd4ef230135088068840 pr=search-suggestions-test-keeps-its-clock pr-after=2026-11-06
+release-song-count base=905507ac704378aa9f1bbd4ef230135088068840 pr=release-song-count pr-after=2026-11-13
