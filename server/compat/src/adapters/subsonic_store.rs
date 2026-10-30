@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::library::{CompatError, CompatLibrary, ImageBytes, cover_version, whole};
-use super::playback::CompatPlayback;
+use super::playback::{CompatPlayback, Reporter};
 use super::queues::CompatQueues;
 use crate::settings::LiveSettings;
 use crate::subsonic::advanced;
@@ -1051,7 +1051,7 @@ impl SubsonicStore {
         _user_name: &str,
     ) -> Result<(), CompatError> {
         self.playback
-            .now_playing(file_id, user_id, client, None, false);
+            .now_playing(Reporter::Subsonic, file_id, user_id, client, None, false);
         Ok(())
     }
 
