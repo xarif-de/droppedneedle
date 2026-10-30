@@ -65,9 +65,11 @@ const MAX_SESSION_REPORT_FAILURES = 3;
 /**
  * How the current item is recovering. A failed item is retried once, then moved to another
  * source once, then counted failed and skipped after a pause; three failures in a row stop
- * playback. Playing clears it, so recovery never chains.
+ * playback. A local item the library no longer has leaves the queue instead. Playing clears
+ * it, so recovery never chains.
  */
-type RecoveryPhase = 'idle' | 'loading' | 'playing' | 'retrying' | 'fallingBack' | 'failed';
+type RecoveryPhase =
+	'idle' | 'loading' | 'resuming' | 'playing' | 'probing' | 'retrying' | 'fallingBack' | 'failed';
 type LoadKind = 'fresh' | 'retry' | 'fallback';
 
 interface Recovery {
@@ -166,6 +168,62 @@ function createPlayerStore() {
 	}
 	function persist(): void {
 		doPersistSession(nowPlaying, queue, currentIndex, progress, shuffleEnabled, shuffleOrder);
+	}
+
+	/** Load the saved session's current item, paused where it was. */
+	function resumeSaved(): void {
+		const stored = restoreSessionData();
+		if (!stored) return;
+		const resume = buildResumeState(stored);
+		if (!resume) return;
+
+		queue = resume.queue;
+		shuffleEnabled = resume.shuffleEnabled;
+		shuffleOrder = resume.shuffleOrder;
+		isPlayerVisible = true;
+		recovery.failed = [];
+		void session.end(progress);
+		currentSource?.destroy();
+		currentIndex = resume.currentIndex;
+		playbackState = 'loading';
+		isSeekable = true;
+		progress = 0;
+		duration = 0;
+		const gen = beginLoad('resuming');
+
+		void (async () => {
+			try {
+				const { source, loadUrl } = resolveSourceForItem(resume.currentItem);
+				if (!isCurrent(gen)) return;
+				currentSource = source;
+				nowPlaying = resume.nowPlaying;
+				subscribeToSource(source, gen);
+				source.setVolume(volume);
+				void session.begin(sessionKeyFor(resume.currentItem));
+				await source.load({
+					trackSourceId: resume.currentItem.trackSourceId,
+					url: loadUrl,
+					format: resume.currentItem.format
+				});
+				if (!isCurrent(gen)) return;
+				playbackState = 'paused';
+				duration = source.getDuration();
+				if (resume.progress > 0) {
+					source.seekTo(resume.progress);
+					progress = resume.progress;
+				}
+			} catch {
+				if (!isCurrent(gen)) return;
+				playbackState = 'error';
+				storeSessionData(null);
+			}
+		})();
+	}
+
+	function stopPlayback(): void {
+		void session.end(progress);
+		recovery.generation++;
+		applyResetState();
 	}
 
 	function applyResetState(): void {
@@ -268,6 +326,46 @@ function createPlayerStore() {
 		return alternates[0] ?? null;
 	}
 
+	/**
+	 * Whether the library still has a local item: its stream answers anything but not found.
+	 * A failed or unreadable check counts as still there, so the item is retried as before.
+	 */
+	async function stillInLibrary(item: QueueItem): Promise<boolean> {
+		const path = prefetchPathFor(item);
+		if (!path) return true;
+		try {
+			return (await api.head(path)).status !== 404;
+		} catch {
+			return true;
+		}
+	}
+
+	/**
+	 * A local item the library no longer has (removed, or its file gone) leaves the queue with
+	 * one notice. Playback moves on to the next item; a resumed session shows it paused.
+	 */
+	function dropGone(index: number, trackName: string, resuming: boolean): void {
+		playbackToast.show(`"${trackName}" is no longer in the library`, 'info');
+		const hasNext = getNextIndex() !== null;
+		if (queue.length <= 1 || (!resuming && !hasNext)) {
+			stopPlayback();
+			return;
+		}
+		const r = removeAtIndex(queue, index, currentIndex, shuffleEnabled, shuffleOrder);
+		queue = r.newQueue;
+		currentIndex = r.newIndex;
+		shuffleOrder = r.newShuffleOrder;
+		if (resuming) {
+			const next = queue[currentIndex];
+			nowPlaying = next ? buildNowPlayingMetadata(next) : null;
+			progress = 0;
+			persist();
+			resumeSaved();
+		} else {
+			void loadQueueItem(r.newIndex);
+		}
+	}
+
 	function handleTrackError(gen: number, error?: { code: string; message: string }): void {
 		if (!isCurrent(gen)) return;
 		const index = currentIndex;
@@ -277,13 +375,31 @@ function createPlayerStore() {
 		const detail = error?.message || error?.code || '';
 		const detailSuffix = detail ? ` (${detail})` : '';
 		const { phase } = recovery;
+		// One failed load reports more than once; the check below answers it once.
+		if (phase === 'probing') return;
 		// A first failure may be transient: reload the same item once.
-		if (item && (phase === 'loading' || phase === 'playing')) {
+		const retry = () => {
 			playbackToast.show(
 				`"${trackName}" failed on ${failedSource}${detailSuffix}, retrying...`,
 				'warning'
 			);
 			void loadQueueItem(index, 'retry');
+		};
+		if (item && (phase === 'loading' || phase === 'playing' || phase === 'resuming')) {
+			if (item.sourceType !== 'local') {
+				retry();
+				return;
+			}
+			// A local item may have left the library: ask before retrying it.
+			recovery.phase = 'probing';
+			void stillInLibrary(item).then((kept) => {
+				if (!isCurrent(gen)) return;
+				if (kept) {
+					retry();
+				} else {
+					dropGone(index, trackName, phase === 'resuming');
+				}
+			});
 			return;
 		}
 		// The same track may play from another source (Plex fails, the local copy works).
@@ -659,6 +775,40 @@ function createPlayerStore() {
 			}
 		},
 
+		/**
+		 * Take local tracks the library no longer has (a removal made here) out of the queue.
+		 * When the current one goes, the next takes its place, playing if it was.
+		 */
+		dropTracks(trackIds: readonly string[]): void {
+			const gone = new Set(trackIds);
+			const wasPlaying = playbackState === 'playing';
+			let currentGone = false;
+			for (let index = queue.length - 1; index >= 0; index--) {
+				const item = queue[index];
+				if (item?.sourceType !== 'local' || !gone.has(item.trackSourceId)) continue;
+				if (queue.length <= 1) {
+					stopPlayback();
+					return;
+				}
+				const r = removeAtIndex(queue, index, currentIndex, shuffleEnabled, shuffleOrder);
+				queue = r.newQueue;
+				currentIndex = r.newIndex;
+				shuffleOrder = r.newShuffleOrder;
+				currentGone ||= r.wasPlaying;
+			}
+			if (!currentGone) {
+				persist();
+			} else if (wasPlaying) {
+				void loadQueueItem(currentIndex);
+			} else {
+				const next = queue[currentIndex];
+				nowPlaying = next ? buildNowPlayingMetadata(next) : null;
+				progress = 0;
+				persist();
+				resumeSaved();
+			}
+		},
+
 		reorderQueue(fromIndex: number, toIndex: number): void {
 			const r = performReorder(queue, fromIndex, toIndex, currentIndex);
 			queue = r.newQueue;
@@ -769,9 +919,7 @@ function createPlayerStore() {
 		},
 
 		stop(): void {
-			void session.end(progress);
-			recovery.generation++;
-			applyResetState();
+			stopPlayback();
 		},
 
 		restoreSession(): StoredSession | null {
@@ -779,52 +927,7 @@ function createPlayerStore() {
 		},
 
 		resumeSession(): void {
-			const stored = restoreSessionData();
-			if (!stored) return;
-			const resume = buildResumeState(stored);
-			if (!resume) return;
-
-			queue = resume.queue;
-			shuffleEnabled = resume.shuffleEnabled;
-			shuffleOrder = resume.shuffleOrder;
-			isPlayerVisible = true;
-			recovery.failed = [];
-			void session.end(progress);
-			currentSource?.destroy();
-			currentIndex = resume.currentIndex;
-			playbackState = 'loading';
-			isSeekable = true;
-			progress = 0;
-			duration = 0;
-			const gen = beginLoad('loading');
-
-			void (async () => {
-				try {
-					const { source, loadUrl } = resolveSourceForItem(resume.currentItem);
-					if (!isCurrent(gen)) return;
-					currentSource = source;
-					nowPlaying = resume.nowPlaying;
-					subscribeToSource(source, gen);
-					source.setVolume(volume);
-					void session.begin(sessionKeyFor(resume.currentItem));
-					await source.load({
-						trackSourceId: resume.currentItem.trackSourceId,
-						url: loadUrl,
-						format: resume.currentItem.format
-					});
-					if (!isCurrent(gen)) return;
-					playbackState = 'paused';
-					duration = source.getDuration();
-					if (resume.progress > 0) {
-						source.seekTo(resume.progress);
-						progress = resume.progress;
-					}
-				} catch {
-					if (!isCurrent(gen)) return;
-					playbackState = 'error';
-					storeSessionData(null);
-				}
-			})();
+			resumeSaved();
 		}
 	};
 }
