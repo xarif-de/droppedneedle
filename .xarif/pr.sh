@@ -10,13 +10,17 @@
 #                        by pr-after=YYYY-MM-DD, or due)
 #   pr.sh get <topic>    check out the topic as the local branch patch/<topic>
 #   pr.sh save <topic>   store the local branch patch/<topic> as the topic (refuses to drop commits
-#                        stored since your get; a rebase needs FORCE=1)
+#                        stored since your get; a rebase needs FORCE=1). Refuses a topic that starts
+#                        from an upstream commit newer than the fork's lock target: a topic is built
+#                        on the target, so the next fork-sync composes it at once; NEWER=1 stores it
+#                        anyway (an upstream move in progress: fork-sync TARGET= dispatched)
 #   pr.sh pull <topic>   take maintainer fixups from the PR head into the topic (fast-forward only)
 #   pr.sh push <topic>   publish the topic as the PR head (refuses to drop commits the PR head has;
 #                        before the day of its pr-after=, EARLY=1 overrides the hold)
 # .xarif/pr.env (KEY=value lines): FORGEJO (fork clone URL), USER_FORK (the GitHub fork the PRs come
 # from: "allow edits from maintainers" needs a user-owned fork), UPSTREAM (owner/repo),
-# UPSTREAM_BASE (the upstream PR base, default main). BRANCH (default xarif) may come from the env.
+# UPSTREAM_BASE (the upstream PR base and the line topics start from, default main), UPSTREAM_URL
+# (default https://github.com/$UPSTREAM). BRANCH (default xarif) may come from the env.
 set -euo pipefail
 self=$(git rev-parse --path-format=absolute --git-common-dir)/xarif-pr.sh
 [ "$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")" = "$self" ] || { cp "$0" "$self"; chmod +x "$self"; }
@@ -25,6 +29,7 @@ envfile=$(git show "origin/$BRANCH:.xarif/pr.env" 2>/dev/null || cat .xarif/pr.e
 val() { sed -n "s/^$1=//p" <<<"$envfile" | tail -1; }
 FORGEJO=${FORGEJO:-$(val FORGEJO)}; USER_FORK=${USER_FORK:-$(val USER_FORK)}
 UPSTREAM=${UPSTREAM:-$(val UPSTREAM)}; UPSTREAM_BASE=${UPSTREAM_BASE:-$(val UPSTREAM_BASE)}; UPSTREAM_BASE=${UPSTREAM_BASE:-main}
+UPSTREAM_URL=${UPSTREAM_URL:-$(val UPSTREAM_URL)}; UPSTREAM_URL=${UPSTREAM_URL:-https://github.com/$UPSTREAM}
 [ -n "$FORGEJO" ] || { echo "no FORGEJO: .xarif/pr.env missing on origin/$BRANCH (run 'git fetch origin' once)" >&2; exit 2; }
 cmd=${1:?list|get|save|pull|push}
 series() { # the series as it is NOW (not a stale local remote-tracking ref)
@@ -67,6 +72,21 @@ case "$cmd" in
     seen=$(git rev-parse -q --verify "$ours" || true) # what your last get/save saw
     if [ -n "$seen" ] && ! git merge-base --is-ancestor "$seen" "patch/$topic" && [ -z "${FORCE:-}" ]; then
       echo "patch/$topic does not contain the stored topic (a rebase?): FORCE=1 $self save $topic" >&2; exit 1
+    fi
+    # The topic's upstream base must be in the fork's lock target, or the next fork-sync stops on it.
+    target=$(series >/dev/null 2>&1; git show "origin/$BRANCH:.xarif/lock" 2>/dev/null | awk '$1=="target"{print $3; exit}' || true)
+    if [ -n "$target" ] && [ -z "${NEWER:-}" ]; then
+      if git fetch -q "$UPSTREAM_URL" "$UPSTREAM_BASE" 2>/dev/null && git cat-file -e "$target^{commit}" 2>/dev/null; then
+        base=$(git merge-base "patch/$topic" FETCH_HEAD || true)
+        if [ -n "$base" ] && ! git merge-base --is-ancestor "$base" "$target"; then
+          echo "patch/$topic starts from upstream ${base:0:12}, newer than the fork's lock target ${target:0:12}: the next" >&2
+          echo "fork-sync would stop on it. Rebase it onto the target (git rebase --onto $target $base patch/$topic)," >&2
+          echo "or move the fork first (fork-sync TARGET=<upstream commit>); NEWER=1 $self save $topic stores it anyway" >&2
+          exit 1
+        fi
+      else
+        echo "could not read upstream $UPSTREAM_BASE or the lock target; the topic's base is not checked" >&2
+      fi
     fi
     git push --force-with-lease="refs/xarif/patch/$topic:$seen" "$FORGEJO" "patch/$topic:refs/xarif/patch/$topic"
     fetch_topic
