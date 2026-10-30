@@ -2,6 +2,7 @@ import { useQueryClient } from '@tanstack/svelte-query';
 import { api } from '$lib/api/client';
 import { authStore } from '$lib/stores/authStore.svelte';
 import { libraryStore } from '$lib/stores/library';
+import { playerStore } from '$lib/stores/player.svelte';
 import { setQueryDataWithPersister } from '../QueryClient';
 import { LibraryQueryKeyFactory } from './LibraryQueryKeyFactory';
 import { LibraryV3Api } from './LibraryV3Api';
@@ -40,6 +41,7 @@ export function removeLibraryAlbum() {
 			for (const mbid of removedMbids) {
 				libraryStore.removeMbid(mbid);
 			}
+			playerStore.dropTracks(removedTrackIds(result));
 			try {
 				await setQueryDataWithPersister<LibraryAlbumStatus>(
 					LibraryQueryKeyFactory.album(authStore.user?.id, requestedMbid),
@@ -62,6 +64,12 @@ export function removeLibraryAlbum() {
 		},
 		effects: () => [catalogChanged(authStore.user?.id), anyWantedChanged()]
 	}));
+}
+
+/** The tracks a removal took out of the library, from its answer. */
+function removedTrackIds(result: object): string[] {
+	if (!('removed_track_ids' in result) || !Array.isArray(result.removed_track_ids)) return [];
+	return result.removed_track_ids.filter((id): id is string => typeof id === 'string');
 }
 
 // Re-invalidate the album status a few times after a rescan. The rescan endpoint
@@ -104,6 +112,7 @@ export function removeLibraryTrack() {
 			// `albumId`, the library album's own id, also refreshes its edition plans.
 			mutationFn: ({ fileId }: { fileId: string; albumMbid: string; albumId?: string }) =>
 				api.v3.DELETE(LibraryV3Api.removeTrack(fileId)),
+			onSuccess: (result) => playerStore.dropTracks(removedTrackIds(result)),
 			effects: (_data, { albumMbid, albumId }) => {
 				const userId = authStore.user?.id;
 				return [
