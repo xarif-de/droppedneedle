@@ -1,0 +1,9 @@
+# Gates every PR into xarif (base/dagger-modules docs/fork.md): sync PRs are recomputed
+# and run the upstream suite; other PRs may only change the infra paths.
+name: fork-check
+on:
+  pull_request:
+jobs:
+  check:
+    uses: base/dagger-modules/.forgejo/workflows/dagger-fork-check.yml@main
+    secrets: inherit
