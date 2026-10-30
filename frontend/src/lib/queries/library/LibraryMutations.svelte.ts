@@ -4,6 +4,7 @@ import { api } from '$lib/api/client';
 import { isStaleRevision } from '$lib/api/errors';
 import { authStore } from '$lib/stores/authStore.svelte';
 import { libraryStore } from '$lib/stores/library';
+import { playerStore } from '$lib/stores/player.svelte';
 import { setQueryDataWithPersister } from '../QueryClient';
 import { LibraryQueryKeyFactory } from './LibraryQueryKeyFactory';
 import type { LibraryAlbumStatus, LibraryScanSchedule } from '$lib/types';
@@ -56,6 +57,7 @@ export function createRemoveLibraryAlbumMutation() {
 			for (const mbid of removedMbids) {
 				libraryStore.removeMbid(mbid);
 			}
+			playerStore.dropTracks(removedTrackIds(result));
 			try {
 				await setQueryDataWithPersister<LibraryAlbumStatus>(
 					LibraryQueryKeyFactory.album(authStore.user?.id, requestedMbid),
@@ -75,6 +77,12 @@ export function createRemoveLibraryAlbumMutation() {
 		},
 		effects: () => [catalogChanged(authStore.user?.id), anyWantedChanged()]
 	}));
+}
+
+/** The tracks a removal took out of the library, from its answer. */
+function removedTrackIds(result: object): string[] {
+	if (!('removed_track_ids' in result) || !Array.isArray(result.removed_track_ids)) return [];
+	return result.removed_track_ids.filter((id): id is string => typeof id === 'string');
 }
 
 // Re-invalidate the album status a few times after a rescan. The rescan endpoint
@@ -142,6 +150,7 @@ export function createRemoveLibraryTrackMutation() {
 						query: { expected_revision: expectedRevision }
 					})
 				),
+			onSuccess: (result) => playerStore.dropTracks(removedTrackIds(result)),
 			// A refusal for a moved revision means the page is old: read it again.
 			onError: (error, { albumMbid, albumId }) => {
 				if (!isStaleRevision(error)) return;

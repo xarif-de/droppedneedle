@@ -4,7 +4,7 @@ import { toastStore } from '$lib/stores/toast';
 import { apiError, fakeApi, type FakeApi, type RouteData } from '$lib/test/api';
 import { renderWithQuery } from '$lib/test/render';
 
-const h = vi.hoisted(() => ({ goto: vi.fn() }));
+const h = vi.hoisted(() => ({ goto: vi.fn(), dropTracks: vi.fn() }));
 
 vi.mock('$app/state', () => ({ page: { url: new URL('http://localhost/album/x') } }));
 vi.mock('$app/navigation', () => ({ goto: (...args: unknown[]) => h.goto(...args) }));
@@ -16,7 +16,8 @@ vi.mock('$lib/stores/player.svelte', () => ({
 		addToQueue: vi.fn(),
 		playNext: vi.fn(),
 		playMultipleNext: vi.fn(),
-		addMultipleToQueue: vi.fn()
+		addMultipleToQueue: vi.fn(),
+		dropTracks: (...args: unknown[]) => h.dropTracks(...args)
 	}
 }));
 
@@ -310,6 +311,7 @@ describe('album detail page track removal', () => {
 		await expect.element(page.getByRole('dialog')).not.toBeInTheDocument();
 		expect(api.calls(removeRoute).map((call) => call.params.id)).toEqual(['file-0']);
 		expect(api.calls(removeRoute)[0].query.get('expected_revision')).toBe('4');
+		expect(h.dropTracks).toHaveBeenCalledWith(['file-0']);
 		await vi.waitFor(() => expect(api.calls(matchRoute).length).toBe(before + 1));
 		expect(api.calls(matchRoute).every((call) => call.params.mbid === albumId)).toBe(true);
 	});
