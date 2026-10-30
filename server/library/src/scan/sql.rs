@@ -77,8 +77,8 @@ droppedneedle_kernel::sql! {
     /// Store the edition hints of track `?1` read at stat revision `?2`, unless
     /// the row moved on since or already holds them.
     pub(super) FILL_EDITION_TAGS = "INSERT INTO local_track_edition_tags (local_track_id, media, \
-             barcode, catalog_number, release_country, total_discs, release_date) \
-             SELECT id, ?3, ?4, ?5, ?6, ?7, ?8 FROM local_tracks \
+             barcode, catalog_number, release_country, total_discs, release_date, total_tracks) \
+             SELECT id, ?3, ?4, ?5, ?6, ?7, ?8, ?9 FROM local_tracks \
              WHERE id = ?1 AND stat_revision = ?2 \
              ON CONFLICT (local_track_id) DO NOTHING";
     /// The album of track `?1` when its MusicBrainz match is not settled:
