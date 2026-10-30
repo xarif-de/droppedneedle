@@ -45,6 +45,9 @@ fork:
         - pnpm run lint
         - pnpm run format:check
         - pnpm run check
-        - pnpm exec vitest run --project server
+        # --retry.count=1: a test that fails and then passes is reported as flaky, not red. A flaky
+        # upstream test failed two fork-checks in a row on 2026-10-30 (SearchSuggestions
+        # debounce, ~50 min per rerun); a real regression still fails twice
+        - pnpm exec vitest run --project server --retry.count=1
         - pnpm exec playwright install --with-deps chromium
-        - pnpm exec vitest run --project client
+        - pnpm exec vitest run --project client --retry.count=1
