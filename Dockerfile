@@ -5,6 +5,8 @@
 FROM node:22-bookworm-slim AS frontend
 
 WORKDIR /app/frontend
+# xarif CI passes the artifact cache's npm registry; unset, npm and pnpm use npmjs.
+ARG NPM_CONFIG_REGISTRY
 
 ENV PNPM_HOME="/pnpm"
 ENV PATH="$PNPM_HOME:$PATH"
@@ -41,6 +43,12 @@ COPY sdk/ ./sdk/
 ARG COMMIT_TAG=dev
 ARG BUILD_DATE=unknown
 ENV COMMIT_TAG=${COMMIT_TAG} BUILD_DATE=${BUILD_DATE}
+# xarif CI passes the artifact cache's crates registry; cargo reads source
+# replacement only from a config file. Unset, cargo uses crates.io.
+ARG XARIF_CARGO_REGISTRY
+RUN if [ -n "${XARIF_CARGO_REGISTRY:-}" ]; then mkdir -p "${CARGO_HOME:-$HOME/.cargo}" && \
+      printf '[source.crates-io]\nreplace-with = "xarif"\n[source.xarif]\nregistry = "%s"\n' \
+        "$XARIF_CARGO_REGISTRY" >> "${CARGO_HOME:-$HOME/.cargo}/config.toml"; fi
 
 RUN cargo build --release --locked --manifest-path server/Cargo.toml --bins -p droppedneedle -p droppedneedle-tool
 
