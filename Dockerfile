@@ -7,6 +7,8 @@
 FROM node:22.23.4-bookworm-slim AS frontend
 
 WORKDIR /app/frontend
+# xarif CI passes the artifact cache's npm registry; unset, npm and pnpm use npmjs.
+ARG NPM_CONFIG_REGISTRY
 
 ENV PNPM_HOME="/pnpm"
 ENV PATH="$PNPM_HOME:$PATH"
@@ -34,6 +36,13 @@ FROM rust:1.89.0-bookworm AS chef
 RUN apt-get update \
     && apt-get install -y --no-install-recommends cmake \
     && rm -rf /var/lib/apt/lists/*
+
+# xarif CI passes the artifact cache's crates registry; cargo reads source
+# replacement only from a config file. Unset, cargo uses crates.io.
+ARG XARIF_CARGO_REGISTRY
+RUN if [ -n "${XARIF_CARGO_REGISTRY:-}" ]; then mkdir -p "${CARGO_HOME:-$HOME/.cargo}" && \
+      printf '[source.crates-io]\nreplace-with = "xarif"\n[source.xarif]\nregistry = "%s"\n' \
+        "$XARIF_CARGO_REGISTRY" >> "${CARGO_HOME:-$HOME/.cargo}/config.toml"; fi
 
 RUN cargo install cargo-chef --version 0.1.78 --locked
 
