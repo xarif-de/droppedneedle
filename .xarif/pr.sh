@@ -70,6 +70,15 @@ case "$cmd" in
   save)
     git rev-parse -q --verify "refs/heads/patch/$topic" >/dev/null || { echo "no local branch patch/$topic" >&2; exit 1; }
     seen=$(git rev-parse -q --verify "$ours" || true) # what your last get/save saw
+    if [ -z "$seen" ] && stored=$(git ls-remote "$FORGEJO" "refs/xarif/patch/$topic" | cut -f1) && [ -n "$stored" ]; then
+      # never fetched here (no get/save in this checkout): the push lease would fail with git's bare "stale info"
+      if [ -z "${FORCE:-}" ]; then
+        echo "topic $topic is stored (${stored:0:12}), but this checkout never fetched it (no get/save here):" >&2
+        echo "$self get $topic first (replaces patch/$topic), or FORCE=1 $self save $topic to replace the stored one" >&2
+        exit 1
+      fi
+      seen=$stored # FORCE: replace exactly what is stored now
+    fi
     if [ -n "$seen" ] && ! git merge-base --is-ancestor "$seen" "patch/$topic" && [ -z "${FORCE:-}" ]; then
       echo "patch/$topic does not contain the stored topic (a rebase?): FORCE=1 $self save $topic" >&2; exit 1
     fi
