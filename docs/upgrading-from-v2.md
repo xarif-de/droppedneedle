@@ -102,8 +102,9 @@ many. Nothing else in the v2 database is changed.
 ## What moves across
 
 - User accounts and roles. Passwords keep working, no resets.
-- App passwords for Subsonic and Jellyfin clients, linked login providers
-  and recovery codes.
+- App passwords for Subsonic and Jellyfin clients, and linked login
+  providers. A password recovery code from v2 does not move across: it only
+  lasts 15 minutes anyway, so make a new one if you need it.
 - Settings, including saved API keys and secrets.
 - Each user's linked Last.fm, ListenBrainz, Spotify, Navidrome, Jellyfin
   and Plex accounts. Scrobbling, Wrapped and Spotify playlist import keep
@@ -112,7 +113,11 @@ many. Nothing else in the v2 database is changed.
   each artist had already released (so v3 does not miss a release that
   came out around the upgrade).
 - Playlists with their covers, favorites (with the names they had in v2)
-  and play history.
+  and play history. A playlist with no owner in v2 stays ownerless: public
+  ones stay readable by everyone, and an admin may delete any of them. In
+  v3, deleting a user deletes their playlists, favorites and follows. A v3
+  database upgraded in place turns a playlist whose owner no longer exists
+  into an ownerless one, and drops favorites left by a deleted user.
 - Finished requests and finished downloads, wanted watches, and the list of
   bad download sources.
 - Per-user quota overrides. Past requests still count toward each user's
@@ -128,14 +133,21 @@ many. Nothing else in the v2 database is changed.
   An artist that can't take that id (Various Artists, one with no songs,
   or one whose name another artist already holds) keeps its v2 id, and
   the summary names any kept apart by name.
+  v2's own Unknown Artist becomes v3's: its songs, plays and favorites move
+  there, and its v2 id still opens it. The summary says so. One with a real
+  artist's id, a link to another service, or songs under another name stays
+  apart, and the summary says why.
   Playlists, favorites, history, queues and bookmarks find their songs and
   artists again. Subsonic apps like Symfonium or Feishin keep everything:
   song and album ids do not change, and an artist they know by its v2 id
-  still opens. In Jellyfin apps like Finamp, stars,
-  play counts and playlists are kept and downloaded music stays matched,
-  but album and artist ids change once, so that nobody without an account
-  can work one out. An album or artist marked to keep offline has to be
-  marked again once; the music already on the device stays.
+  still opens. In Jellyfin apps like Finamp, stars, play counts, playlists
+  and downloads stay matched: every id v2 stored still opens its song,
+  playlist, album or artist. Album and artist ids change once, so that nobody
+  without an account can work one out, and the v2 id keeps working for anyone
+  signed in. An album or artist marked to keep offline has to be marked again
+  once; the music already on the device stays. A stored id that names nothing
+  in v2's library any more, or that v3 already gives another item, is left out,
+  and the import summary counts it.
 - Matches you made by hand (and v2's own matches), retired ids that still
   point at the album or artist that replaced them, "keep as tagged" and
   "exclude" decisions, edition pins and custom editions, albums you kept
@@ -199,6 +211,7 @@ report lists it too (`left_behind`). In short:
 - Album art you picked by hand in v2. v3 reads album art from your files
   again.
 - Held downloads you already imported or threw away.
+- Playlists of users deleted in v2.
 - Requests still waiting for approval or downloading, and unfinished
   downloads. Ask again in v3.
 - Download attempts still cleaning up their download folder.
@@ -206,6 +219,9 @@ report lists it too (`left_behind`). In short:
 - MusicBrainz contributions that were already linked, cancelled or out of
   date. A linked album keeps its match.
 - Caches, which v3 fills again on its own.
+- Keys of v2's `config.json` that v3 no longer uses or reads from the
+  environment instead, such as `port` and `contact_email`. Each is listed by
+  name with what to do, and its value stays out of the list.
 - Plugins. Their settings come across, switched off, and the report lists
   each one as needing porting. Port it, install it again from Settings >
   Plugins, then switch it on.
@@ -278,9 +294,9 @@ machine and its data folders can run it.
   or 1 is refused. Port yours first ("Porting a v2 plugin" in
   [PLUGINS.md](../PLUGINS.md)), or ask its author to, then install it
   again from Settings > Plugins.
-- **v2 profile share codes.** A Library Management profile share code made
-  in v2 does not import into v3. Share the profile again from v3 to get a
-  code v3 reads.
+- **v2 profile share codes and files.** A Library Management profile share
+  code (`DNLP1:`) or `.dnprofile` file made in v2 does not import into v3.
+  Share the profile again from v3 to get a code or file v3 reads.
 - **Wanted watches going dormant.** v2 stopped checking a watch once it was
   older than "Go dormant after (days)", 365 by default, until someone
   resumed it. v3 keeps checking a watch until the album arrives or someone
@@ -321,6 +337,9 @@ machine and its data folders can run it.
   library image pacing now use fixed values equal to v2's defaults. An
   import of a v2 export carrying them goes ahead, and its report lists
   each one as `dropped_setting`.
+  - The server-wide primary music source. Each person's own choice stays
+    in their profile; a discovery section with no source named asks
+    ListenBrainz first.
   - Settings > Advanced: every server and browser cache lifetime
     (including TheAudioDB's), the memory and disk cache limits, the HTTP
     timeouts and pool size, the library image batch sizes, delays and
@@ -345,6 +364,8 @@ machine and its data folders can run it.
 
   The outbound HTTP timeouts are environment variables, `HTTP_TIMEOUT` and
   `HTTP_CONNECT_TIMEOUT`, as before.
+- **5 and 10 minute scan schedules.** v3 has neither. A schedule of either
+  becomes 30 minutes.
 - **Max connections.** v2 had a "max connections" setting for outbound HTTP,
   also read from `HTTP_MAX_CONNECTIONS`. v3 has neither. The nearest is the
   `HTTP_MAX_KEEPALIVE` environment variable, the number of idle connections
@@ -401,6 +422,11 @@ machine and its data folders can run it.
   every tag keeps its own frame; the preview says so for each file. There
   is no switch to keep ID3v2.3, and a few old players read only ID3v2.3.
   Undo and "Restore originals" put the values back; the tag stays ID3v2.4.
+- **Other people's public playlists in music apps.** In v2 Subsonic and
+  Jellyfin apps listed them next to your own. In v3 apps list your own
+  playlists only, for every user, until you turn on the switch under
+  Profile > Connect Apps. An app that saved a public playlist's id can still
+  open it, and the web UI lists what it did before.
 
 ### Moved
 
@@ -440,6 +466,13 @@ If your reverse proxy has a special rule for v2's live update stream at
 stream per download (`/api/v1/downloads/<id>/stream`); v3 sends download
 progress over that same single stream, so a rule for those can go.
 
+If you set your own contact address in v2, set it again in your compose
+file. v3 reads it only from the environment. The upgrade's "Worth a look" list
+says what to set, as `Set CONTACT_EMAIL=you@example.com in your environment`.
+Without it v3 sends its default address to MusicBrainz. With the import by
+hand, the same line is in `validate`'s `note:` lines and in the report's
+`notes`.
+
 Then check:
 
 - You can log in with your v2 password.
@@ -447,6 +480,9 @@ Then check:
   the first moments after each start, while the server records its
   Jellyfin ids, Jellyfin apps are told the server is busy and try again.
 - Settings > Download Client and Settings > Indexers / Prowlarr look right.
+- If you use Jellyfin, Settings > Jellyfin shows your address. An address v2
+  kept only in its older top-level setting moves there, and "Worth a look"
+  says so.
 - Your library folders are listed under Settings > Library. They come across
   with your settings, so check them rather than adding them again: a folder
   added a second time gets a new id, and your carried library is filed under
@@ -568,9 +604,9 @@ A clean file ends with `valid: N warning(s)`. Two warnings are normal:
 `DANGLING_REVIEWER` (an approval whose reviewer no longer exists; the
 reviewer field is cleared on import).
 
-Above that it prints what stays behind in v2, one line per table with a
-row count and the reason. Read it: this is the moment to decide whether
-anything there matters to you before you move.
+Above that it prints what stays behind in v2: one line per table with a row
+count and the reason, then one per setting by name. Read it: this is the
+moment to decide whether anything there matters to you before you move.
 
 If it reports `DANGLING_USER_REF`, v2 has follows or approvals that point at
 deleted users. Remove them from `V2_ROOT` (not the backup) and export again:

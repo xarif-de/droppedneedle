@@ -2,8 +2,13 @@
 //!
 //! v2 keyed queue items and bookmarks by its library track id; v3 keeps
 //! the same id in `file_id`. The v2 id is written as is and recorded as a
-//! pending link until the library carry confirms it.
+//! pending link until the library carry confirms it. v3 keeps these times
+//! in integer milliseconds where v2 had REAL seconds.
+//!
+//! The Jellyfin ids v2 stored travel too, keyed by catalog id, so an artist's
+//! rows follow its new id. The import decides which of them land.
 
+use super::requests::{millis, whole, whole_or};
 use super::{Column, LinkKind, LinkMode, Parent, Source, TableSection, Target, col};
 
 /// One saved queue head per user.
@@ -17,9 +22,9 @@ pub const PLAY_QUEUES: TableSection = TableSection {
     target: Target::Table("compat_play_queues"),
     columns: &[
         col("user_id"),
-        col("current_index"),
-        col("position_ms"),
-        col("updated_at"),
+        Column::new("current_index").from_sql(whole!("current_index")),
+        Column::new("position_ms").from_sql(whole_or!("position_ms", 0)),
+        Column::new("updated_at").from_sql(concat!("COALESCE(", millis!("updated_at"), ", 0)")),
         col("changed_by_client"),
     ],
     key: &["user_id"],
@@ -69,14 +74,36 @@ pub const BOOKMARKS: TableSection = TableSection {
         Column::new("file_id")
             .from_v2("local_track_id")
             .link(LinkKind::Track, LinkMode::AsWritten),
-        col("position_ms"),
+        Column::new("position_ms").from_sql(whole_or!("position_ms", 0)),
         col("comment"),
-        col("created_at"),
-        col("changed_at"),
+        Column::new("created_at").from_sql(concat!("COALESCE(", millis!("created_at"), ", 0)")),
+        Column::new("changed_at").from_sql(concat!("COALESCE(", millis!("changed_at"), ", 0)")),
     ],
     key: &["user_id", "file_id"],
     unique: &[],
     parents: &[],
     user_column: Some("user_id"),
     left_behind: "bookmarks of deleted users; nothing to do, those accounts were deleted in v2",
+};
+
+/// The Jellyfin ids v2 stored. Every row travels: what lands in v3 is the
+/// import's call (`import/carry/jellyfin_ids.rs`).
+pub const JELLYFIN_IDS: TableSection = TableSection {
+    name: "jellyfin_id",
+    source: Source::Table {
+        table: "library_compat_id_map",
+        filter: "",
+        requires: &[],
+    },
+    target: Target::BundleOnly,
+    columns: &[
+        col("jf_id"),
+        col("kind"),
+        Column::new("internal_id").link(LinkKind::ByColumn("kind"), LinkMode::AsWritten),
+    ],
+    key: &["jf_id"],
+    unique: &[],
+    parents: &[],
+    user_column: None,
+    left_behind: "",
 };

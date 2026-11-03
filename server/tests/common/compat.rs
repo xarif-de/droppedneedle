@@ -130,6 +130,14 @@ impl CompatApp {
             .expect("fixture copies");
         }
         app.add_library_folder("music", &music).await;
+        // A fast scan writes several rows in one millisecond. The traces pin
+        // "newest first", so each row gets a time of its own, in scan order.
+        app.seed(
+            "UPDATE local_albums SET created_at = created_at + rowid; \
+             UPDATE local_artists SET created_at = created_at + rowid; \
+             UPDATE local_tracks SET imported_at = imported_at + search_key;",
+        )
+        .await;
         Self::signed_in(app, music, layout).await
     }
 
@@ -210,7 +218,7 @@ impl CompatApp {
     /// A pass stores only what is missing, so running one beside the loop
     /// is safe.
     pub async fn jellyfin_ids_caught_up(&self) {
-        use droppedneedle_compat::adapters::jellyfin_ids::IdsError;
+        use droppedneedle_compat::jellyfin::ids::IdsError;
         let ids = self.app.state().compat.jellyfin_ids().clone();
         let deadline = std::time::Instant::now() + super::PATIENCE;
         loop {

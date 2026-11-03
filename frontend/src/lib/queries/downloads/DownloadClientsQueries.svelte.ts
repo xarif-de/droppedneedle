@@ -1,10 +1,10 @@
+import { v3 } from '$lib/api/v3/endpoint';
 import { createQuery, queryOptions } from '@tanstack/svelte-query';
 
 import { api } from '$lib/api/client';
 import type { components } from '$lib/api/v3/openapi';
 
 import { DownloadQueryKeyFactory } from './DownloadQueryKeyFactory';
-import { DOWNLOAD_SETTINGS_ENDPOINTS } from './endpoints';
 import {
 	createAppMutation,
 	downloadPolicyChanged,
@@ -22,15 +22,16 @@ export type WantedWatcherSettings = components['schemas']['WantedWatcher'];
 const sourcePriorityOptions = () =>
 	queryOptions({
 		queryKey: DownloadQueryKeyFactory.sourcePriority(),
-		queryFn: ({ signal }) => api.v3.GET(DOWNLOAD_SETTINGS_ENDPOINTS.sourcePriority(), { signal })
+		queryFn: ({ signal }) =>
+			api.v3.GET(v3('/api/v3/settings/download-clients/source-priority'), { signal })
 	});
 
 export const getSourcePriorityQuery = () => createQuery(() => sourcePriorityOptions());
 
-export function saveSourcePriority() {
+export function createSaveSourcePriorityMutation() {
 	return createAppMutation(() => ({
 		mutationFn: (order: string[]) =>
-			api.v3.PUT(DOWNLOAD_SETTINGS_ENDPOINTS.sourcePriority(), { order }),
+			api.v3.PUT(v3('/api/v3/settings/download-clients/source-priority'), { order }),
 		effects: () => [sourcePriorityChanged()]
 	}));
 }
@@ -39,7 +40,7 @@ const sabnzbdOptions = () =>
 	queryOptions({
 		queryKey: DownloadQueryKeyFactory.sabnzbd(),
 		queryFn: ({ signal }) =>
-			api.v3.GET(DOWNLOAD_SETTINGS_ENDPOINTS.sabnzbdConfig(), {
+			api.v3.GET(v3('/api/v3/settings/download-clients/sabnzbd'), {
 				signal
 			})
 	});
@@ -49,7 +50,7 @@ export const getSabnzbdConfigQuery = () => createQuery(() => sabnzbdOptions());
 const sabnzbdStatusOptions = () =>
 	queryOptions({
 		queryKey: DownloadQueryKeyFactory.sabnzbdStatus(),
-		queryFn: ({ signal }) => api.v3.GET(DOWNLOAD_SETTINGS_ENDPOINTS.sabnzbdStatus(), { signal })
+		queryFn: ({ signal }) => api.v3.GET(v3('/api/v3/acquire/sabnzbd/status'), { signal })
 	});
 
 export const getSabnzbdStatusQuery = () => createQuery(() => sabnzbdStatusOptions());
@@ -57,7 +58,7 @@ export const getSabnzbdStatusQuery = () => createQuery(() => sabnzbdStatusOption
 const policyOptions = () =>
 	queryOptions({
 		queryKey: DownloadQueryKeyFactory.policy(),
-		queryFn: ({ signal }) => api.v3.GET(DOWNLOAD_SETTINGS_ENDPOINTS.policy(), { signal })
+		queryFn: ({ signal }) => api.v3.GET(v3('/api/v3/settings/download-clients/policy'), { signal })
 	});
 
 // enabled-getter so non-admin pages can render without firing the admin-only
@@ -65,26 +66,26 @@ const policyOptions = () =>
 export const getDownloadPolicyQuery = (getEnabled: () => boolean = () => true) =>
 	createQuery(() => ({ ...policyOptions(), enabled: getEnabled() }));
 
-export function saveSabnzbdConfig() {
+export function createSaveSabnzbdConfigMutation() {
 	return createAppMutation(() => ({
 		mutationFn: (config: SabnzbdConnectionSettings) =>
-			api.v3.PUT(DOWNLOAD_SETTINGS_ENDPOINTS.sabnzbdConfig(), config),
+			api.v3.PUT(v3('/api/v3/settings/download-clients/sabnzbd'), config),
 		effects: () => [usenetSettingsChanged(), downloadReadinessChanged()]
 	}));
 }
 
-export function testSabnzbd() {
+export function createTestSabnzbdMutation() {
 	return createAppMutation(() => ({
 		effects: () => [],
 		mutationFn: (config: SabnzbdConnectionSettings) =>
-			api.v3.POST(DOWNLOAD_SETTINGS_ENDPOINTS.sabnzbdTest(), config)
+			api.v3.POST(v3('/api/v3/settings/download-clients/sabnzbd/test'), config)
 	}));
 }
 
-export function saveDownloadPolicy() {
+export function createSaveDownloadPolicyMutation() {
 	return createAppMutation(() => ({
 		mutationFn: (policy: DownloadPolicySettings) =>
-			api.v3.PUT(DOWNLOAD_SETTINGS_ENDPOINTS.policy(), policy),
+			api.v3.PUT(v3('/api/v3/settings/download-clients/policy'), policy),
 		effects: () => [downloadPolicyChanged()]
 	}));
 }
@@ -92,15 +93,15 @@ export function saveDownloadPolicy() {
 const wantedSettingsOptions = () =>
 	queryOptions({
 		queryKey: DownloadQueryKeyFactory.wantedSettings(),
-		queryFn: ({ signal }) => api.v3.GET(DOWNLOAD_SETTINGS_ENDPOINTS.wanted(), { signal })
+		queryFn: ({ signal }) => api.v3.GET(v3('/api/v3/settings/download-clients/wanted'), { signal })
 	});
 
 export const getWantedSettingsQuery = () => createQuery(() => wantedSettingsOptions());
 
-export function saveWantedSettings() {
+export function createSaveWantedSettingsMutation() {
 	return createAppMutation(() => ({
 		mutationFn: (settings: WantedWatcherSettings) =>
-			api.v3.PUT(DOWNLOAD_SETTINGS_ENDPOINTS.wanted(), settings),
+			api.v3.PUT(v3('/api/v3/settings/download-clients/wanted'), settings),
 		effects: () => [wantedSettingsChanged()]
 	}));
 }

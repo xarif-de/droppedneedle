@@ -1,6 +1,6 @@
 //! The Library Management service behind `/settings/library-management/*`.
 //!
-//! Ports v2's `LibraryManagementProfileService`: settings reads and CAS
+//! Settings reads and CAS
 //! saves, impact previews, profile create/copy/update/delete, preset
 //! diffs, activation health, and profile sharing. Every write goes
 //! through [`LibraryManagementService::save_settings`], which normalizes,
@@ -8,7 +8,7 @@
 //! change without a current confirmed dry run.
 //!
 //! Settings are read from the store on every call, never cached. The
-//! first read seeds the presets (v2 seeds exactly once, from the naming
+//! first read seeds the presets (exactly once, from the naming
 //! template configured before Library Management existed) and later
 //! reads persist preset-catalog migrations.
 //!
@@ -162,7 +162,47 @@ impl LibraryManagementService {
             settings_revision: settings_revision(&settings),
             settings,
             managed_fields: managed_field_catalog(),
+            recycle_bin_warning: None,
+            settings_unreadable: false,
         }
+    }
+
+    /// True when the stored row does not decode. Removals, upgrades and
+    /// automatic work wait on it, so the page serves [`Self::seeded`]
+    /// instead of refusing and a save replaces the row.
+    fn unreadable(&self) -> Result<bool, SettingsError> {
+        match self.store.get::<LibraryManagement>() {
+            Ok(_) => Ok(false),
+            Err(droppedneedle_kernel::runtime_config::ConfigError::SectionDecode {
+                reason,
+                ..
+            }) => {
+                tracing::warn!(%reason, "the stored Library Management settings cannot be read");
+                Ok(true)
+            }
+            Err(other) => Err(self.config(other)),
+        }
+    }
+
+    /// What a first read would seed, stored nowhere: the base of the repair
+    /// view and of the save that replaces an unreadable row. A retention
+    /// the row still holds in range stays, so that save cannot shorten it
+    /// and delete bin copies early.
+    fn seeded(&self) -> Result<LibraryManagement, SettingsError> {
+        let defaults = LibraryManagement::default();
+        let recycle_retention_days = self
+            .store
+            .stored_field("library_management", "recycle_retention_days")
+            .and_then(|days| days.as_i64())
+            .filter(|days| (1..=3650).contains(days))
+            .unwrap_or(defaults.recycle_retention_days);
+        migrated(
+            &LibraryManagement {
+                recycle_retention_days,
+                ..defaults
+            },
+            &self.library()?.naming_script,
+        )
     }
 
     /// Normalize a candidate against the current settings: recompute
@@ -183,12 +223,13 @@ impl LibraryManagementService {
 
     /// The settings plus their revision.
     pub fn get_settings(&self) -> Result<LibraryManagementSettingsResponse, SettingsError> {
+        if self.unreadable()? {
+            return Ok(LibraryManagementSettingsResponse {
+                settings_unreadable: true,
+                ..Self::response(self.seeded()?)
+            });
+        }
         self.load().map(Self::response)
-    }
-
-    /// One profile by id.
-    pub fn get_profile(&self, profile_id: &str) -> Result<LibraryManagementProfile, SettingsError> {
-        find_profile(&self.load()?, profile_id).cloned()
     }
 
     /// Classify a candidate without saving. `stale` reports whether the
@@ -212,7 +253,29 @@ impl LibraryManagementService {
         proposed: LibraryManagement,
         expected_settings_revision: &str,
     ) -> Result<LibraryManagementSettingsResponse, SettingsError> {
+        if self.unreadable()? {
+            return self.replace_unreadable(proposed, expected_settings_revision);
+        }
         self.save_locked(proposed, expected_settings_revision)
+    }
+
+    /// Replace a row that does not decode with `proposed`, checked against
+    /// the seeded view the page showed. The compare-and-swap decodes the
+    /// stored row, so this write goes straight to the store.
+    fn replace_unreadable(
+        &self,
+        proposed: LibraryManagement,
+        expected_settings_revision: &str,
+    ) -> Result<LibraryManagementSettingsResponse, SettingsError> {
+        let seeded = self.seeded()?;
+        let revision = self.require_current(&seeded, expected_settings_revision)?;
+        let candidate = self.normalized_candidate(&seeded, proposed)?;
+        self.check_candidate(&seeded, &revision, &candidate)?;
+        self.store
+            .save_blocking(candidate.clone())
+            .map_err(|error| self.config(error))?;
+        tracing::info!("the unreadable Library Management settings were replaced by a save");
+        Ok(Self::response(candidate))
     }
 
     fn save_locked(
@@ -291,10 +354,22 @@ impl LibraryManagementService {
         current_revision: &str,
         candidate: LibraryManagement,
     ) -> Result<LibraryManagementSettingsResponse, SettingsError> {
-        let expected_settings_revision = current_revision;
-        let current_revision = current_revision.to_owned();
-        let policy_revision = validate_root_assignments(&candidate, &self.library()?)?;
-        let impact = classify(current, &candidate, Some(expected_settings_revision));
+        self.check_candidate(current, current_revision, &candidate)?;
+        let library = self.library()?;
+        self.commit(current_revision, candidate.clone(), &library.naming_script)?;
+        Ok(Self::response(candidate))
+    }
+
+    /// Refuse a candidate whose folders do not validate, or that gives an
+    /// automatic folder new write scope without a current confirmed dry run.
+    fn check_candidate(
+        &self,
+        current: &LibraryManagement,
+        current_revision: &str,
+        candidate: &LibraryManagement,
+    ) -> Result<(), SettingsError> {
+        let policy_revision = validate_root_assignments(candidate, &self.library()?)?;
+        let impact = classify(current, candidate, Some(current_revision));
         if impact.preview_required {
             for root_id in &impact.affected_root_ids {
                 let Some(assignment) = candidate
@@ -307,9 +382,8 @@ impl LibraryManagementService {
                 if !active_automatic(Some(assignment)) {
                     continue;
                 }
-                let confirmed = activation_is_current(&candidate, assignment, &policy_revision)
-                    && assignment.activation_settings_revision.as_deref()
-                        == Some(current_revision.as_str());
+                let confirmed = activation_is_current(candidate, assignment, &policy_revision)
+                    && assignment.activation_settings_revision.as_deref() == Some(current_revision);
                 if !confirmed {
                     return Err(invalid(
                         "A current Library Management dry run must be confirmed before this \
@@ -318,27 +392,7 @@ impl LibraryManagementService {
                 }
             }
         }
-        let library = self.library()?;
-        self.commit(&current_revision, candidate.clone(), &library.naming_script)?;
-        Ok(Self::response(candidate))
-    }
-
-    /// Create a profile as a copy of the default profile.
-    pub fn create_profile(
-        &self,
-        name: &str,
-        description: &str,
-        expected_settings_revision: &str,
-    ) -> Result<LibraryManagementProfileMutationResponse, SettingsError> {
-        let settings = self.load()?;
-        let source = find_profile(&settings, &settings.default_profile_id)?.clone();
-        self.copy_locked(
-            settings,
-            source,
-            name,
-            description,
-            expected_settings_revision,
-        )
+        Ok(())
     }
 
     /// Copy one profile under a new name.
@@ -379,27 +433,6 @@ impl LibraryManagementService {
         settings.profiles.push(copied);
         let saved = self.save_locked(settings, expected_settings_revision)?;
         mutation_response(saved, &copied_id)
-    }
-
-    /// Replace one profile. The body id must match the path id.
-    pub fn update_profile(
-        &self,
-        profile_id: &str,
-        profile: LibraryManagementProfile,
-        expected_settings_revision: &str,
-    ) -> Result<LibraryManagementProfileMutationResponse, SettingsError> {
-        if profile.id != profile_id {
-            return Err(invalid("The profile ID does not match the request path."));
-        }
-        let mut settings = self.load()?;
-        let slot = settings
-            .profiles
-            .iter_mut()
-            .find(|current| current.id == profile.id)
-            .ok_or_else(|| invalid(MISSING_PROFILE))?;
-        *slot = profile;
-        let saved = self.save_locked(settings, expected_settings_revision)?;
-        mutation_response(saved, profile_id)
     }
 
     /// Delete one custom profile that is neither the default nor assigned
@@ -565,7 +598,13 @@ fn migrated(
     naming_template: &str,
 ) -> Result<LibraryManagement, SettingsError> {
     let mut settings = if stored.profiles.is_empty() {
-        initial_settings(naming_template)
+        // Seeding keeps a recycle bin and retention moved in before the
+        // first read.
+        LibraryManagement {
+            recycle_bin_path: stored.recycle_bin_path.clone(),
+            recycle_retention_days: stored.recycle_retention_days,
+            ..initial_settings(naming_template)
+        }
     } else {
         let mut migrated = stored.clone();
         let carried = carry_removed_options(&mut migrated);

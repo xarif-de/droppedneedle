@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { applyEffects, catalogChanged } from '$lib/queries/effects';
 	import '$lib/components/library/library-management.css';
-	import { replaceState } from '$app/navigation';
+	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import { SvelteURL } from 'svelte/reactivity';
 	import {
@@ -29,13 +29,13 @@
 	import { authStore } from '$lib/stores/authStore.svelte';
 	import { withBasePath } from '$lib/utils/basePath';
 	import {
-		controlLibraryManagementOperationMutation,
-		discardLibraryManagementPreviewMutation,
-		handBackAllLibraryAlbumsMutation,
-		handBackLibraryAlbumMutation,
+		createControlLibraryManagementOperationMutation,
+		createDiscardLibraryManagementPreviewMutation,
+		createHandBackAllLibraryAlbumsMutation,
+		createHandBackLibraryAlbumMutation,
 		handBackRefusalMessage,
-		reissueLibraryManagementPreviewMutation,
-		resolveLibraryManagementImportBundleMutation
+		createReissueLibraryManagementPreviewMutation,
+		createResolveLibraryManagementImportBundleMutation
 	} from '$lib/queries/library-management/LibraryManagementMutations.svelte';
 	import AsyncButton from '$lib/ui/AsyncButton.svelte';
 	import Button from '$lib/ui/Button.svelte';
@@ -77,11 +77,11 @@
 			recoveryQuery.isLoading
 		].some(Boolean)
 	);
-	const pauseOperation = controlLibraryManagementOperationMutation('pause');
-	const resumeOperation = controlLibraryManagementOperationMutation('resume');
-	const reissuePreview = reissueLibraryManagementPreviewMutation();
-	const discardPreview = discardLibraryManagementPreviewMutation();
-	const resolveImportBundle = resolveLibraryManagementImportBundleMutation();
+	const pauseOperation = createControlLibraryManagementOperationMutation('pause');
+	const resumeOperation = createControlLibraryManagementOperationMutation('resume');
+	const reissuePreview = createReissueLibraryManagementPreviewMutation();
+	const discardPreview = createDiscardLibraryManagementPreviewMutation();
+	const resolveImportBundle = createResolveLibraryManagementImportBundleMutation();
 	let resolvingBundleId = $state<string | null>(null);
 	type RunnerMode = 'manage' | 'baseline_restore';
 
@@ -149,8 +149,8 @@
 		() => (handingBack > 0 ? TAKEOVERS_POLL_MS : false)
 	);
 	const skippedAlbums = $derived(skippedQuery.data?.items ?? []);
-	const handBackAlbum = handBackLibraryAlbumMutation();
-	const handBackAll = handBackAllLibraryAlbumsMutation();
+	const handBackAlbum = createHandBackLibraryAlbumMutation();
+	const handBackAll = createHandBackAllLibraryAlbumsMutation();
 	// Albums whose files could not be read for a hand-back, with the reason.
 	let handBackRefusals = $state<Record<string, string>>({});
 
@@ -174,11 +174,14 @@
 	}
 
 	function updateRunnerUrl(mode: RunnerMode | null): void {
+		// `goto`, because `replaceState` leaves `page.url` behind and a closed
+		// runner would reopen on the way back to this tab. The tab is named so a
+		// reload stays here after a saved link that named none.
 		const url = new SvelteURL(page.url);
+		url.searchParams.set('tab', 'organize');
 		if (mode) url.searchParams.set('runner', mode);
 		else url.searchParams.delete('runner');
-		url.hash = 'management-controls';
-		replaceState(url, page.state);
+		void goto(url, { replaceState: true, noScroll: true, keepFocus: true, state: page.state });
 	}
 
 	function openRunner(mode: RunnerMode, opener: HTMLElement): void {
@@ -416,7 +419,7 @@
 							href={operationHref(
 								active.operation.id,
 								active.operation.state,
-								active.operation.terminal_code,
+								active.operation.terminal_code ?? null,
 								active.mode
 							)}>Open details</Button
 						>
@@ -438,7 +441,7 @@
 								href={operationHref(
 									item.operation.id,
 									item.operation.state,
-									item.operation.terminal_code,
+									item.operation.terminal_code ?? null,
 									item.mode
 								)}
 								class="management-history-row min-w-0 flex-1"
@@ -480,7 +483,7 @@
 								href={operationHref(
 									item.operation.id,
 									item.operation.state,
-									item.operation.terminal_code,
+									item.operation.terminal_code ?? null,
 									item.mode
 								)}
 								class="management-history-row"
@@ -549,7 +552,7 @@
 														href={operationHref(
 															member.operation.id,
 															member.operation.state,
-															member.operation.terminal_code,
+															member.operation.terminal_code ?? null,
 															member.mode
 														)}>Open details</a
 													>
@@ -583,7 +586,7 @@
 									href={operationHref(
 										single.operation.id,
 										single.operation.state,
-										single.operation.terminal_code,
+										single.operation.terminal_code ?? null,
 										single.mode
 									)}
 									class="management-history-row"
@@ -706,8 +709,8 @@
 						cut short. Look in the same folder for the file with the normal name. If it is there and plays,
 						the hidden file is spare: delete it. If it is missing, copy the hidden file to the normal
 						name and check the copy plays before you delete the hidden one. If the normal file is there
-						but broken, keep both until one of them plays. This list is from the last server start and
-						is checked again at the next one.</span
+						but broken, keep both until one of them plays. Each folder is checked every few hours, and
+						a file you delete leaves this list within minutes.</span
 					>
 					<ul class="flex w-full flex-col gap-1">
 						{#each leftoverFiles as file (`${file.root_id}/${file.rel_path}`)}<li
@@ -773,7 +776,9 @@
 													>{album.artist_name ? ` · ${album.artist_name}` : ''} · {day(
 														album.noticed_at
 													)}</span
-												>{#if handBackRefusals[album.album_id]}<span
+												>{#if album.hand_back_given_up}<span class="block text-warning"
+														>Hand-back stopped: its files could not be read.</span
+													>{/if}{#if handBackRefusals[album.album_id]}<span
 														class="block text-warning"
 														role="status">{handBackRefusals[album.album_id]}</span
 													>{/if}</span
@@ -796,26 +801,26 @@
 				<QueryBoundary
 					query={retagPairsQuery}
 					what="albums that might be one album"
-					isEmpty={(data) => data.total === 0}
+					isEmpty={(data) => data.items.length === 0}
 				>
 					{#snippet loading()}{/snippet}
 					{#snippet empty()}{/snippet}
 					{#snippet children(retagPairs)}
 						<details class="rounded-lg border border-base-content/10 p-3">
 							<summary class="cursor-pointer text-sm font-semibold"
-								>{retagPairs.total}
-								{retagPairs.total === 1
+								>{retagPairs.total ?? retagPairs.items.length}
+								{(retagPairs.total ?? retagPairs.items.length) === 1
 									? 'pair of albums might be one album'
 									: 'pairs of albums might each be one album'} retagged</summary
 							>
 							<div class="mt-3 flex flex-col gap-3">
-								{#each retagPairs.pairs as pair (`${pair.old_album.id}/${pair.new_album.id}`)}
+								{#each retagPairs.items as pair (`${pair.old_album.id}/${pair.new_album.id}`)}
 									<RetagPairCard {pair} />
 								{/each}
 							</div>
-							{#if retagPairs.total > retagPairs.pairs.length}
+							{#if retagPairs.next_cursor}
 								<p class="mt-3 text-sm text-base-content/60">
-									Showing the newest {retagPairs.pairs.length}.
+									Showing the newest {retagPairs.items.length}.
 								</p>
 							{/if}
 						</details>
@@ -829,7 +834,9 @@
 					>
 					<ul class="mt-2 flex flex-col gap-2 text-sm">
 						{#each skippedAlbums as album (album.album_id)}<li>
-								<a class="link font-medium" href={`/album/${encodeURIComponent(album.album_id)}`}
+								<a
+									class="link font-medium"
+									href={withBasePath(`/album/${encodeURIComponent(album.album_id)}`)}
 									>{album.album_title}</a
 								>{#if album.artist_name}<span class="text-base-content/60">
 										· {album.artist_name}</span

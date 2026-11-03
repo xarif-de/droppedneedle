@@ -7,13 +7,14 @@ use rusqlite::{Connection, Transaction, params};
 
 use super::edition::drop_edition;
 use super::membership::retire;
+use crate::catalog_actions::CatalogAction;
+use crate::catalog_actions::record_action;
 use crate::catalog_revision::bump_catalog;
 use crate::identify::sqlite::{
     chosen_matches_differ, match_chosen, merge_moves_match, offer_album, release_chosen,
     settle_merged_match,
 };
-use crate::management::{automatic, takeover};
-use crate::operations::decisions::{CatalogAction, record_action};
+use crate::management::automatic;
 use crate::scan::sqlite_store::retag_pairs::RetagPairReason;
 use droppedneedle_kernel::db::savepoint;
 
@@ -105,7 +106,7 @@ pub(crate) fn merge_retagged(
         return refused(RetagPairReason::ChosenMatchesDiffer);
     }
     let custom: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM library_custom_edition_active WHERE local_album_id = ?1)",
+        crate::corrections::sql::ALBUM_HAS_CUSTOM_EDITION.text(),
         params![old],
         |row| row.get(0),
     )?;
@@ -121,22 +122,19 @@ pub(crate) fn merge_retagged(
         settle_merged_match(tx, old, new, now)?;
         drop_edition(tx, old)?;
         tx.execute(
-            "DELETE FROM library_management_automatic_queue WHERE local_album_id = ?1",
+            crate::corrections::sql::DROP_AUTOMATIC_QUEUE_ROW.text(),
             params![old],
         )?;
         tx.execute(
-            "UPDATE local_tracks SET local_album_id = ?2 WHERE local_album_id = ?1",
+            crate::corrections::sql::MOVE_ALBUM_TRACKS.text(),
             params![old, new],
         )?;
         if new_chosen {
-            tx.execute(
-                "DELETE FROM library_management_exclusions WHERE local_album_id = ?1",
-                params![old],
-            )?;
+            tx.execute(crate::corrections::sql::DROP_EXCLUSION.text(), params![old])?;
         }
         retire(tx, old, new, now)?;
         tx.execute(
-            "UPDATE playlist_tracks SET album_id = ?2 WHERE album_id = ?1",
+            crate::corrections::sql::MOVE_ALBUM_PLAYLIST_ROWS.text(),
             params![old, new],
         )?;
         let stamped = chosen_release && !new_chosen && !album_has_record(tx, new)?;
@@ -167,8 +165,7 @@ pub(crate) fn merge_retagged(
             return Ok(MergeOutcome::Merged { offered: false });
         }
         let automatic: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM local_tracks WHERE local_album_id = ?1 \
-             AND availability = 'indexed' AND applied_policy = 'automatic')",
+            crate::corrections::sql::ALBUM_IS_AUTOMATIC.text(),
             params![new],
             |row| row.get(0),
         )?;
@@ -189,15 +186,8 @@ pub(crate) fn merge_retagged(
 /// its expiry. An album field override is not.
 fn live_work(conn: &Connection, album_id: &str, now: f64) -> rusqlite::Result<bool> {
     conn.query_row(
-        &format!(
-            "SELECT EXISTS(SELECT 1 FROM library_contribution_drafts WHERE local_album_id = ?1 \
-             AND state IN ('draft','ready','seeded','verifying','needs_review')) \
-             OR EXISTS(SELECT 1 FROM library_management_plan_items item \
-             JOIN library_operation_jobs job ON job.id = item.job_id \
-             WHERE item.local_album_id = ?1 AND {})",
-            crate::management::store::live_job_sql("?2")
-        ),
-        params![album_id, now],
+        crate::corrections::sql::LIVE_WORK_ON_ALBUM.text(),
+        params![album_id, crate::clock::ms(now)],
         |row| row.get(0),
     )
 }
@@ -205,11 +195,6 @@ fn live_work(conn: &Connection, album_id: &str, now: f64) -> rusqlite::Result<bo
 /// Whether the app has a record of the bytes of any file on the album,
 /// whatever its availability: one it wrote, or one v2 wrote.
 pub(crate) fn album_has_record(conn: &Connection, album_id: &str) -> rusqlite::Result<bool> {
-    conn.prepare_cached(&format!(
-        "SELECT EXISTS(SELECT 1 FROM local_tracks t \
-         JOIN library_track_management_state s ON s.local_track_id = t.id \
-         WHERE t.local_album_id = ?1 AND {})",
-        takeover::record_sql()
-    ))?
-    .query_row(params![album_id], |row| row.get(0))
+    conn.prepare_cached(crate::corrections::sql::ALBUM_HAS_RECORD.text())?
+        .query_row(params![album_id], |row| row.get(0))
 }

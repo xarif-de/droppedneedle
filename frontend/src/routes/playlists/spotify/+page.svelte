@@ -9,8 +9,9 @@
 	import {
 		getSpotifyPlaylistsQuery,
 		createImportSpotifyPlaylistMutation
-	} from '$lib/queries/spotify/SpotifyQueries.svelte';
+	} from '$lib/queries/spotify.svelte';
 	import { withBasePath } from '$lib/utils/basePath';
+	import { providerUnavailableMessage } from '$lib/utils/serviceError';
 
 	const playlistsQuery = getSpotifyPlaylistsQuery();
 	const importMutation = createImportSpotifyPlaylistMutation();
@@ -29,8 +30,11 @@
 				type: 'success'
 			});
 			await goto(withBasePath(`/playlists/${result.playlist_id}`));
-		} catch {
-			toastStore.show({ message: `Failed to import "${playlist.name}"`, type: 'error' });
+		} catch (error) {
+			toastStore.show({
+				message: providerUnavailableMessage(error) ?? `Failed to import "${playlist.name}"`,
+				type: 'error'
+			});
 		} finally {
 			importing = null;
 		}
@@ -125,7 +129,7 @@
 			<span>
 				{err instanceof Error && err.message.includes('400')
 					? 'Spotify is not connected. Go to your profile to link your account.'
-					: 'Failed to load Spotify playlists.'}
+					: (providerUnavailableMessage(err) ?? 'Failed to load Spotify playlists.')}
 			</span>
 			<div class="flex gap-2">
 				{#if err instanceof Error && err.message.includes('400')}

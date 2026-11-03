@@ -4,7 +4,7 @@
 		getVersionQuery,
 		getUpdateCheckQuery,
 		getReleaseHistoryQuery
-	} from '$lib/queries/VersionQuery.svelte';
+	} from '$lib/queries/version.svelte';
 	import SafeHtml from '$lib/components/SafeHtml.svelte';
 	import { outsideLink } from '$lib/components/outsideLink';
 	import { ExternalLink, RefreshCw, Info, Tag, Calendar, CircleArrowUp } from 'lucide-svelte';
@@ -21,8 +21,10 @@
 	const releases = $derived(releaseHistoryQuery.data);
 	const isCheckingUpdate = $derived(updateCheckQuery.isFetching);
 
-	function formatDate(dateStr: string): string {
-		return new Date(dateStr).toLocaleDateString('en-US', {
+	function formatDate(dateStr: string): string | null {
+		const date = new Date(dateStr);
+		if (Number.isNaN(date.getTime())) return null;
+		return date.toLocaleDateString('en-US', {
 			year: 'numeric',
 			month: 'long',
 			day: 'numeric'
@@ -74,7 +76,7 @@
 								<span class="badge badge-accent font-mono">
 									{version.version}
 								</span>
-								{#if version.build_date}
+								{#if version.build_date && formatDate(version.build_date)}
 									<span class="flex items-center gap-1 text-xs text-base-content/60">
 										<Calendar class="w-3 h-3" />
 										Built {formatDate(version.build_date)}

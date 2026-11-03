@@ -8,8 +8,8 @@ use droppedneedle_kernel::runtime_config::secret_sections::TypedLibrary;
 
 use super::models::ManagementError;
 use super::service::Management;
-use crate::manage::{PlacementCheck, PublishCell, RootPlacement};
 use crate::publish::PlacementMode;
+use crate::publish::session::{PlacementCheck, PublishCell, RootPlacement};
 
 impl Management {
     /// Every saved root files can be written under, with its placement
@@ -18,7 +18,7 @@ impl Management {
     /// the saved roots cannot be read: no list is better than one that
     /// shows every folder as safe. Reads the settings, so blocking.
     pub fn placement_modes(&self) -> Result<Vec<(String, PlacementMode)>, ManagementError> {
-        placement_modes(&self.setup.settings.library, &self.setup.placement)
+        placement_modes(&self.parts.settings.library, &self.parts.placement)
     }
 
     /// Probe one root now. The probe makes and removes its own folder at
@@ -28,7 +28,7 @@ impl Management {
     /// Waits for a write in flight. Blocking.
     pub fn check_placement(&self, root_id: &str) -> Result<PlacementCheck, ManagementError> {
         let checked = self
-            .setup
+            .parts
             .publishing
             .check_placement(root_id)
             .map_err(|error| {
@@ -40,9 +40,9 @@ impl Management {
         if let Some(check) = checked {
             return Ok(check);
         }
-        let left_out = crate::settings::registry(&self.setup.settings.library)
+        let left_out = crate::settings::registry(&self.parts.settings.library)
             .map(|registry| {
-                crate::manage::left_out_now(&registry)
+                crate::publish::session::left_out_now(&registry)
                     .iter()
                     .any(|id| id == root_id)
             })

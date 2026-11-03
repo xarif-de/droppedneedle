@@ -10,12 +10,13 @@ use std::path::Path;
 use rusqlite::{OptionalExtension as _, params};
 
 use super::models::{
-    JobIntent, JobMode, ManagementError, Origin, PreviewHandle, Selection, SelectionKind,
-    TagEditField, TagEditIntent, TagEditMode,
+    JobIntent, JobMode, ManagementError, Origin, OverrideMode, PreviewHandle, Selection,
+    SelectionKind, TagCardinality, TagEditField, TagEditIntent, TagEditMode, TagScope,
 };
 use super::profile;
 use super::reasons;
 use super::service::{JobSpec, Management};
+use super::sql::{EditSubject, SavedOverride};
 use crate::tags::fields::FieldKind;
 use crate::tags::{TagEdit, TagField, save};
 
@@ -68,22 +69,22 @@ const LIST_FIELDS: &[TagField] = &[
     TagField::Director,
 ];
 
-/// `album` or `track`.
-pub fn scope(field: TagField) -> &'static str {
+/// Where the field applies.
+pub fn scope(field: TagField) -> TagScope {
     if ALBUM_FIELDS.contains(&field) {
-        "album"
+        TagScope::Album
     } else {
-        "track"
+        TagScope::Track
     }
 }
 
-/// `string`, `integer`, `boolean`, or `ordered_strings` (v2's names).
-pub fn cardinality(field: TagField) -> &'static str {
+/// The shape of the field's value.
+pub fn cardinality(field: TagField) -> TagCardinality {
     match field.kind() {
-        FieldKind::Count => "integer",
-        FieldKind::Flag => "boolean",
-        _ if LIST_FIELDS.contains(&field) => "ordered_strings",
-        _ => "string",
+        FieldKind::Count => TagCardinality::Integer,
+        FieldKind::Flag => TagCardinality::Boolean,
+        _ if LIST_FIELDS.contains(&field) => TagCardinality::OrderedStrings,
+        _ => TagCardinality::String,
     }
 }
 
@@ -144,11 +145,11 @@ fn values_of(field: TagField, value: &serde_json::Value) -> Result<Vec<String>, 
 #[derive(Debug, Clone)]
 pub struct EditorField {
     pub field_name: String,
-    pub scope: &'static str,
-    pub cardinality: &'static str,
+    pub scope: TagScope,
+    pub cardinality: TagCardinality,
     pub current_value: serde_json::Value,
     pub override_id: Option<String>,
-    pub override_mode: Option<String>,
+    pub override_mode: Option<OverrideMode>,
     pub override_row_revision: Option<i64>,
 }
 
@@ -191,28 +192,25 @@ struct Subject {
 }
 
 /// A saved override: (subject kind, field) -> (id, mode, row revision).
-type SavedOverrides = BTreeMap<(String, String), (String, String, i64)>;
+type SavedOverrides = BTreeMap<(String, String), (String, OverrideMode, i64)>;
 
 impl Management {
     fn subject(&self, track_id: &str) -> Result<Subject, ManagementError> {
-        self.setup.db.read_blocking("management.subject", |conn| {
+        self.parts.db.read_blocking("management.subject", |conn| {
             conn.query_row(
-                "SELECT t.id, t.local_album_id, t.root_id, t.relative_path, t.row_revision, \
-                 a.row_revision FROM local_tracks t JOIN local_albums a ON a.id = t.local_album_id \
-                 WHERE t.id = ?1 AND t.availability = 'indexed'",
+                crate::management::sql::TRACK_TO_EDIT.text(),
                 params![track_id],
-                |row| {
-                    Ok(Subject {
-                        track_id: row.get(0)?,
-                        album_id: row.get(1)?,
-                        root_id: row.get(2)?,
-                        relative_path: row.get(3)?,
-                        track_revision: row.get(4)?,
-                        album_revision: row.get(5)?,
-                    })
-                },
+                EditSubject::read,
             )
             .optional()?
+            .map(|row| Subject {
+                track_id: row.track_id,
+                album_id: row.album_id,
+                root_id: row.root_id,
+                relative_path: row.relative_path,
+                track_revision: row.track_revision,
+                album_revision: row.album_revision,
+            })
             .ok_or(ManagementError::NotFound(
                 "This track is not in the library.",
             ))
@@ -220,27 +218,24 @@ impl Management {
     }
 
     fn saved_overrides(&self, subject: &Subject) -> Result<SavedOverrides, ManagementError> {
-        self.setup
+        self.parts
             .db
             .read_blocking("management.saved_overrides", |conn| {
-                let mut statement = conn.prepare(
-                    "SELECT subject_kind, field_name, id, mode, row_revision \
-                 FROM library_management_overrides \
-                 WHERE (subject_kind = 'album' AND local_album_id = ?1) \
-                 OR (subject_kind = 'track' AND local_track_id = ?2)",
+                let mut statement = conn.prepare(crate::management::sql::SAVED_OVERRIDES.text())?;
+                let rows = statement.query_map(
+                    params![subject.album_id, subject.track_id],
+                    SavedOverride::read,
                 )?;
-                let rows =
-                    statement.query_map(params![subject.album_id, subject.track_id], |row| {
-                        Ok((
-                            (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
+                Ok(rows
+                    .map(|row| {
+                        row.map(|row| {
                             (
-                                row.get::<_, String>(2)?,
-                                row.get::<_, String>(3)?,
-                                row.get::<_, i64>(4)?,
-                            ),
-                        ))
-                    })?;
-                Ok(rows.collect::<rusqlite::Result<_>>()?)
+                                (row.subject_kind, row.field_name),
+                                (row.id, row.mode, row.row_revision),
+                            )
+                        })
+                    })
+                    .collect::<rusqlite::Result<_>>()?)
             })
     }
 
@@ -248,7 +243,7 @@ impl Management {
     /// Blocking.
     pub fn tag_editor(&self, track_id: &str) -> Result<EditorContext, ManagementError> {
         let subject = self.subject(track_id)?;
-        let sandbox = self.setup.publishing.publish_sandbox().map_err(|_| {
+        let sandbox = self.parts.publishing.publish_sandbox().map_err(|_| {
             ManagementError::Conflict(
                 "The track's library folder is not available right now.".to_owned(),
             )
@@ -276,7 +271,7 @@ impl Management {
             &profile::root_assignment(&stored, &subject.root_id),
         )?;
         let saved = self.saved_overrides(&subject)?;
-        let store = &self.setup.identify_store;
+        let store = &self.parts.identify_store;
         let identity_reason = match store.album_identity(&subject.album_id)? {
             None => Some(reasons::identity_not_accepted().code),
             Some(album) if album.release_mbid.is_none() || album.release_group_mbid.is_none() => {
@@ -295,7 +290,7 @@ impl Management {
             .into_iter()
             .map(|field| {
                 let scope = scope(field);
-                let saved = saved.get(&(scope.to_owned(), field.name().to_owned()));
+                let saved = saved.get(&(scope.as_str().to_owned(), field.name().to_owned()));
                 EditorField {
                     field_name: field.name().to_owned(),
                     scope,
@@ -305,7 +300,7 @@ impl Management {
                         doc.managed.field(field).map_or(&[], Vec::as_slice),
                     ),
                     override_id: saved.map(|(id, _, _)| id.clone()),
-                    override_mode: saved.map(|(_, mode, _)| mode.clone()),
+                    override_mode: saved.map(|(_, mode, _)| *mode),
                     override_row_revision: saved.map(|(_, _, revision)| *revision),
                 }
             })
@@ -318,7 +313,7 @@ impl Management {
             profile_name: pinned.profile.name.clone(),
             settings_revision: crate::management::settings::settings_revision(&stored),
             policy_revision: self
-                .setup
+                .parts
                 .core
                 .policy_revision()
                 .map_err(|error| ManagementError::Store(error.to_string()))?,
@@ -357,7 +352,7 @@ impl Management {
             }
             names.push(name.clone());
             let scope = scope(field);
-            let existing = saved.get(&(scope.to_owned(), name.clone()));
+            let existing = saved.get(&(scope.as_str().to_owned(), name.clone()));
             let values = if request.mode == TagEditMode::ResetCanonical {
                 if existing.is_none() {
                     return Err(ManagementError::Invalid(format!(
@@ -370,23 +365,24 @@ impl Management {
             };
             fields.push(TagEditField {
                 field_name: name.clone(),
-                subject_kind: scope.to_owned(),
+                subject_kind: scope.as_str().to_owned(),
                 values,
                 override_id: existing.map(|(id, _, _)| id.clone()),
                 expected_override_row_revision: existing.map(|(_, _, revision)| *revision),
                 previous: match existing {
                     Some((id, mode, _)) => {
-                        self.setup
+                        self.parts
                             .db
                             .read_blocking("management.create_tag_edit", |conn| {
-                                Ok::<_, ManagementError>(conn
-                            .query_row(
-                                "SELECT value_json FROM library_management_overrides WHERE id = ?1",
-                                params![id],
-                                |row| row.get::<_, String>(0),
-                            )
-                            .optional()?
-                            .map(|value| (value, mode.clone())))
+                                Ok::<_, ManagementError>(
+                                    conn.query_row(
+                                        crate::management::sql::CREATE_TAG_EDIT.text(),
+                                        params![id],
+                                        |row| row.get::<_, String>(0),
+                                    )
+                                    .optional()?
+                                    .map(|value| (value, mode.as_str().to_owned())),
+                                )
                             })?
                     }
                     None => None,
@@ -410,7 +406,7 @@ impl Management {
             origin: Origin::Manual,
             actor: Some(actor),
             idempotency_key: request.idempotency_key.as_deref(),
-            revisions: profile::revisions(&stored, &pinned, registry.policy_revision()),
+            revisions: profile::revisions(&stored, &pinned, registry.fingerprint()),
             selection_json: serde_json::to_string(&selection)?,
             pinned: &pinned,
             target_root_id: None,

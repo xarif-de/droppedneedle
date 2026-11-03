@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
 use serde::{Deserialize, Serialize};
 
-use crate::operations::models::ReidentificationCandidate;
+use crate::reidentify::models::ReidentificationCandidate;
 
 /// One SQL conversion for a closed set stored as text: the value is its
 /// `as_str`, and text outside the set fails decoding.
@@ -163,7 +163,7 @@ named! {
     }
 }
 
-/// Matcher version a repair records when the caller names none (v2's).
+/// Matcher version a repair records when the caller names none.
 pub const REPAIR_TARGET_VERSION: &str = "quiet-reconfirm-v1";
 /// Version of the readiness rules; a report made under older rules must be
 /// refreshed before it is applied.
@@ -405,7 +405,7 @@ pub struct NewRepair {
     pub album_ids: Vec<String>,
     /// Hygiene after this scan run only.
     pub scan_run_id: Option<String>,
-    /// Only identities this matcher version wrote (v2's filter).
+    /// Only identities this matcher version wrote.
     pub source_matcher_version: Option<String>,
     pub target_matcher_version: String,
 }

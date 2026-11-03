@@ -15,10 +15,11 @@ use super::undo::{
     ExclusionRow, exclusion_row, restore_album_row, restore_exclusion, restore_track_row,
 };
 use super::{DecisionSource, PROVIDER, Rows, delete_album_row};
+use crate::catalog_actions::CatalogAction;
+use crate::catalog_actions::record_action;
 use crate::catalog_revision::bump_catalog;
 use crate::identify::models::{PriorAlbumIdentity, PriorTrackIdentity};
 use crate::identify::queue::offer_album;
-use crate::operations::decisions::{CatalogAction, record_action};
 
 /// The reason code of a fold's audit row.
 pub const FOLD_REASON: &str = "AUTOMATIC_PROVIDER_CONTRADICTION_CATALOG_REPAIR";
@@ -75,7 +76,7 @@ pub(crate) fn fold_legacy(
     let mut track_identities = Vec::new();
     for track_id in moved_track_ids {
         if let Some(row) = track_row(tx, track_id)?
-            && row.decision_source.as_deref() == Some(DecisionSource::LegacyImport.as_str())
+            && row.decision_source == Some(DecisionSource::LegacyImport)
         {
             track_identities.push(row);
         }
@@ -151,7 +152,11 @@ pub fn undo_fold(
     };
     let source = folded.source_album_id.as_str();
     tx.prepare_cached(sql::UNRETIRE_ALBUM.text())?
-        .execute(params![source, folded.grouping_locked, now])?;
+        .execute(params![
+            source,
+            folded.grouping_locked,
+            crate::clock::ms(now)
+        ])?;
     for track_id in &folded.moved_track_ids {
         tx.prepare_cached(sql::MOVE_TRACK_TO.text())?
             .execute(params![source, track_id])?;
@@ -177,7 +182,7 @@ pub fn undo_fold(
     tx.prepare_cached(sql::DROP_MERGED_ALIAS.text())?
         .execute(params![source, target])?;
     tx.prepare_cached(sql::TOUCH_ALBUM.text())?
-        .execute(params![target, now])?;
+        .execute(params![target, crate::clock::ms(now)])?;
     let now_ms = (now * 1000.0) as i64;
     offer_album(tx, source, now_ms)?;
     offer_album(tx, &target, now_ms)?;

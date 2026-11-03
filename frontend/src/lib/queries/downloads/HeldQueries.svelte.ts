@@ -1,3 +1,5 @@
+import { heldListQuery } from '$lib/queries/downloads/heldFilters';
+import { v3 } from '$lib/api/v3/endpoint';
 import { createQuery } from '@tanstack/svelte-query';
 import type { Getter } from 'runed';
 
@@ -7,7 +9,7 @@ import { toastStore } from '$lib/stores/toast';
 import type { HeldActionResult, HeldRecheckAllResult } from '$lib/types';
 
 import { DownloadQueryKeyFactory } from './DownloadQueryKeyFactory';
-import { HELD_ENDPOINTS, type HeldListFilters } from './endpoints';
+import type { HeldListFilters } from './heldFilters';
 import {
 	albumStatusChanged,
 	applyEffects,
@@ -30,7 +32,13 @@ export const getHeldEntriesQuery = (
 	createQuery(() => ({
 		enabled: getEnabled(),
 		queryKey: DownloadQueryKeyFactory.held(authStore.user?.id, getFilters()),
-		queryFn: ({ signal }) => api.v3.GET(HELD_ENDPOINTS.list(getFilters()), { signal })
+		queryFn: ({ signal }) =>
+			api.v3.GET(
+				v3('/api/v3/held', {
+					query: heldListQuery(getFilters())
+				}),
+				{ signal }
+			)
 	}));
 
 function errorMessage(err: unknown, fallback: string): string {
@@ -104,41 +112,53 @@ function heldMutation<I extends HeldFilesInput>(
 const fileBody = (input: HeldFilesInput) => ({ file_ids: input.fileIds ?? null });
 
 /** Import, Retry, "Use this version" and "Use this file" all place files this way. */
-export const importHeldMutation = () =>
+export const createImportHeldMutation = () =>
 	heldMutation(
-		(input: HeldFilesInput) => api.v3.POST(HELD_ENDPOINTS.import(input.entryId), fileBody(input)),
+		(input: HeldFilesInput) =>
+			api.v3.POST(
+				v3('/api/v3/held/{entry_id}/import', { path: { entry_id: input.entryId } }),
+				fileBody(input)
+			),
 		'Could not import the held files'
 	);
 
 /** Curators only: import the files as the album picked. */
-export const matchHeldMutation = () =>
+export const createMatchHeldMutation = () =>
 	heldMutation(
 		(input: HeldMatchInput) =>
-			api.v3.POST(HELD_ENDPOINTS.match(input.entryId), {
+			api.v3.POST(v3('/api/v3/held/{entry_id}/match', { path: { entry_id: input.entryId } }), {
 				release_group_mbid: input.matchMbid,
 				file_ids: input.fileIds ?? null
 			}),
 		'Match failed'
 	);
 
-export const recheckHeldMutation = () =>
+export const createRecheckHeldMutation = () =>
 	heldMutation(
-		(input: HeldFilesInput) => api.v3.POST(HELD_ENDPOINTS.recheck(input.entryId), fileBody(input)),
+		(input: HeldFilesInput) =>
+			api.v3.POST(
+				v3('/api/v3/held/{entry_id}/recheck', { path: { entry_id: input.entryId } }),
+				fileBody(input)
+			),
 		'Could not re-check the held files'
 	);
 
-export const discardHeldMutation = () =>
+export const createDiscardHeldMutation = () =>
 	heldMutation(
-		(input: HeldFilesInput) => api.v3.POST(HELD_ENDPOINTS.discard(input.entryId), fileBody(input)),
+		(input: HeldFilesInput) =>
+			api.v3.POST(
+				v3('/api/v3/held/{entry_id}/discard', { path: { entry_id: input.entryId } }),
+				fileBody(input)
+			),
 		'Could not discard the held files'
 	);
 
 // Re-check AcoustID holds across entries. The server takes at most 25 checks a
 // call, so entry ids pass through untouched.
-export const recheckAllHeldMutation = () =>
+export const createRecheckAllHeldMutation = () =>
 	createAppMutation(() => ({
 		mutationFn: (entryIds: number[] | null) =>
-			api.v3.POST(HELD_ENDPOINTS.recheckAll(), { entry_ids: entryIds }),
+			api.v3.POST(v3('/api/v3/held/recheck'), { entry_ids: entryIds }),
 		onSuccess: (data: HeldRecheckAllResult) => {
 			const imported = data.results.filter((r) => r.status === 'imported').length;
 			const stillHeld = data.results.filter((r) => r.status === 'still_held').length;

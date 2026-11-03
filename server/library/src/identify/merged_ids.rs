@@ -16,10 +16,12 @@ use std::collections::BTreeSet;
 
 use rusqlite::{Connection, OptionalExtension as _, Transaction, params};
 
-use super::artist_links::{mark_stale, placeholder, settle, touch_artist};
+use super::artist_links::{
+    LINK_GAVE_WAY, drop_app_link, mark_stale, placeholder, settle, touch_artist,
+};
 use super::sources::ArtistAnswer;
-use crate::identity::sql::{PERSONS, REVISABLE};
-use crate::operations::decisions::{ArtistAction, record_artist_action};
+use crate::catalog_actions::ArtistAction;
+use crate::catalog_actions::record_artist_action;
 
 /// A kept id is asked about again after this long, while it still
 /// disagrees with another id on a record.
@@ -51,12 +53,9 @@ impl CheckState {
 
 /// The id `mbid` was merged into, when one is recorded.
 pub(crate) fn merged_into(conn: &Connection, mbid: &str) -> rusqlite::Result<Option<String>> {
-    conn.prepare_cached(
-        "SELECT canonical_mbid FROM library_identify_artist_id_checks \
-         WHERE artist_mbid = ?1 AND state = ?2",
-    )?
-    .query_row(params![mbid, CheckState::Merged.as_str()], |row| row.get(0))
-    .optional()
+    conn.prepare_cached(crate::identify::sql::MERGED_INTO.text())?
+        .query_row(params![mbid, CheckState::Merged.as_str()], |row| row.get(0))
+        .optional()
 }
 
 /// `mbid` lowercased, or the id it was merged into.
@@ -77,42 +76,30 @@ pub(crate) fn nominate(
         if placeholder(id) || id.len() != 36 || uuid::Uuid::parse_str(id).is_err() {
             continue;
         }
-        conn.prepare_cached(
-            "INSERT INTO library_identify_artist_id_checks (artist_mbid, state, nominated_at) \
-             VALUES (?1, ?4, ?2) ON CONFLICT (artist_mbid) DO UPDATE SET \
-             state = excluded.state, nominated_at = excluded.nominated_at, checked_at = NULL \
-             WHERE library_identify_artist_id_checks.state = ?5 \
-             AND library_identify_artist_id_checks.checked_at < ?3",
-        )?
-        .execute(params![
-            id,
-            now_ms,
-            now_ms - RECHECK_AFTER_MS,
-            CheckState::Pending.as_str(),
-            CheckState::Kept.as_str()
-        ])?;
+        conn.prepare_cached(crate::identify::sql::NOMINATE.text())?
+            .execute(params![
+                id,
+                now_ms,
+                now_ms - RECHECK_AFTER_MS,
+                CheckState::Pending.as_str(),
+                CheckState::Kept.as_str()
+            ])?;
     }
     Ok(())
 }
 
 /// Up to `limit` ids waiting for an answer, newest first.
 pub fn pending(conn: &Connection, limit: usize) -> rusqlite::Result<Vec<String>> {
-    conn.prepare_cached(
-        "SELECT artist_mbid FROM library_identify_artist_id_checks \
-         WHERE state = ?2 ORDER BY nominated_at DESC LIMIT ?1",
-    )?
-    .query_map(params![limit as i64, CheckState::Pending.as_str()], |row| {
-        row.get(0)
-    })?
-    .collect()
+    conn.prepare_cached(crate::identify::sql::PENDING.text())?
+        .query_map(params![limit as i64, CheckState::Pending.as_str()], |row| {
+            row.get(0)
+        })?
+        .collect()
 }
 
 fn keep(tx: &Transaction<'_>, mbid: &str, now_ms: i64) -> rusqlite::Result<()> {
-    tx.prepare_cached(
-        "UPDATE library_identify_artist_id_checks SET state = ?3, canonical_mbid = NULL, \
-         checked_at = ?2 WHERE artist_mbid = ?1",
-    )?
-    .execute(params![mbid, now_ms, CheckState::Kept.as_str()])?;
+    tx.prepare_cached(crate::identify::sql::KEEP.text())?
+        .execute(params![mbid, now_ms, CheckState::Kept.as_str()])?;
     Ok(())
 }
 
@@ -127,10 +114,7 @@ pub(crate) fn answer(
 ) -> rusqlite::Result<Vec<String>> {
     let retired = mbid.trim().to_ascii_lowercase();
     let pending: bool = tx
-        .prepare_cached(
-            "SELECT EXISTS (SELECT 1 FROM library_identify_artist_id_checks \
-             WHERE artist_mbid = ?1 AND state = ?2)",
-        )?
+        .prepare_cached(crate::identify::sql::ARTIST_ID_CHECK_IN_STATE.text())?
         .query_row(params![retired, CheckState::Pending.as_str()], |row| {
             row.get(0)
         })?;
@@ -168,21 +152,13 @@ fn not_followed(
         return Ok(Some("the answers point at each other"));
     }
     let known: bool = tx
-        .prepare_cached(
-            "SELECT EXISTS (SELECT 1 FROM library_identify_artist_id_checks \
-             WHERE artist_mbid = ?1) OR EXISTS (SELECT 1 FROM library_identify_artist_id_checks \
-             WHERE canonical_mbid = ?1)",
-        )?
+        .prepare_cached(crate::identify::sql::NOT_FOLLOWED.text())?
         .query_row(params![current], |row| row.get(0))?;
     if !known {
         return Ok(Some("no artist record held the id beside another"));
     }
     let linked: Vec<String> = tx
-        .prepare_cached(&format!(
-            "SELECT local_artist_id FROM local_artist_external_identities \
-             WHERE provider = 'musicbrainz' AND decision_source IN {PERSONS} \
-             AND lower(provider_artist_id) = ?1"
-        ))?
+        .prepare_cached(crate::identify::sql::ARTISTS_PERSON_LINKED_TO_MBID.text())?
         .query_map(params![retired], |row| row.get(0))?
         .collect::<rusqlite::Result<_>>()?;
     let stays = match linked.as_slice() {
@@ -196,12 +172,8 @@ fn not_followed(
 /// Whether a row other than `artist` holds `mbid` by a person's or v2's
 /// link.
 fn person_link_elsewhere(conn: &Connection, artist: &str, mbid: &str) -> rusqlite::Result<bool> {
-    conn.prepare_cached(&format!(
-        "SELECT EXISTS (SELECT 1 FROM local_artist_external_identities \
-         WHERE provider = 'musicbrainz' AND decision_source IN {PERSONS} \
-         AND lower(provider_artist_id) = ?1 AND local_artist_id <> ?2)"
-    ))?
-    .query_row(params![mbid, artist], |row| row.get(0))
+    conn.prepare_cached(crate::identify::sql::PERSON_LINK_ELSEWHERE.text())?
+        .query_row(params![mbid, artist], |row| row.get(0))
 }
 
 /// Record row `artist` and the row a person's or v2's link holds `mbid`
@@ -209,12 +181,7 @@ fn person_link_elsewhere(conn: &Connection, artist: &str, mbid: &str) -> rusqlit
 /// two rows are linked to one id.
 fn suggest_merge(tx: &Transaction<'_>, artist: &str, mbid: &str, now: f64) -> rusqlite::Result<()> {
     let other: Option<String> = tx
-        .prepare_cached(&format!(
-            "SELECT local_artist_id FROM local_artist_external_identities \
-             WHERE provider = 'musicbrainz' AND decision_source IN {PERSONS} \
-             AND lower(provider_artist_id) = ?1 AND local_artist_id <> ?2 \
-             ORDER BY local_artist_id LIMIT 1"
-        ))?
+        .prepare_cached(crate::identify::sql::PERSON_LINKED_ARTIST.text())?
         .query_row(params![mbid, artist], |row| row.get(0))
         .optional()?;
     let Some(other) = other else {
@@ -225,17 +192,13 @@ fn suggest_merge(tx: &Transaction<'_>, artist: &str, mbid: &str, now: f64) -> ru
     } else {
         (other.as_str(), artist)
     };
-    tx.prepare_cached(
-        "INSERT OR IGNORE INTO local_artist_merge_candidates (id, left_artist_id, \
-         right_artist_id, reason_code, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, 'SHARED_PROVIDER_IDENTITY', ?4, ?4)",
-    )?
-    .execute(params![
-        format!("provider:{left}:{right}"),
-        left,
-        right,
-        now
-    ])?;
+    tx.prepare_cached(crate::identify::sql::SUGGEST_MERGE.text())?
+        .execute(params![
+            format!("provider:{left}:{right}"),
+            left,
+            right,
+            crate::clock::ms(now)
+        ])?;
     Ok(())
 }
 
@@ -269,55 +232,38 @@ fn follow(
         keep(tx, retired, now_ms)?;
         return Ok(Vec::new());
     }
-    tx.prepare_cached(
-        "UPDATE library_identify_artist_id_checks SET state = ?4, canonical_mbid = ?2, \
-         checked_at = ?3 WHERE artist_mbid = ?1",
-    )?
-    .execute(params![
-        retired,
-        current,
-        now_ms,
-        CheckState::Merged.as_str()
-    ])?;
-    tx.prepare_cached(
-        "UPDATE library_identify_artist_id_checks SET canonical_mbid = ?2 \
-         WHERE canonical_mbid = ?1",
-    )?
-    .execute(params![retired, current])?;
+    tx.prepare_cached(crate::identify::sql::SETTLE_ARTIST_ID_CHECK.text())?
+        .execute(params![
+            retired,
+            current,
+            now_ms,
+            CheckState::Merged.as_str()
+        ])?;
+    tx.prepare_cached(crate::identify::sql::REPOINT_ARTIST_ID_CHECKS.text())?
+        .execute(params![retired, current])?;
     let albums: Vec<String> = tx
-        .prepare_cached(
-            "SELECT DISTINCT local_album_id FROM library_artist_credit_proofs \
-             WHERE artist_mbid = ?1",
-        )?
+        .prepare_cached(crate::identify::sql::ALBUMS_WITH_PROOF_OF_MBID.text())?
         .query_map(params![retired], |row| row.get(0))?
         .collect::<rusqlite::Result<_>>()?;
     let mut credits = 0;
-    for table in ["local_track_artists", "local_album_artists"] {
+    for statement in [
+        crate::identify::sql::REPOINT_TRACK_CREDIT_MBID,
+        crate::identify::sql::REPOINT_ALBUM_CREDIT_MBID,
+    ] {
         credits += tx
-            .prepare_cached(&format!(
-                "UPDATE {table} SET artist_mbid = ?2 WHERE artist_mbid = ?1"
-            ))?
+            .prepare_cached(statement.text())?
             .execute(params![retired, current])?;
     }
     let proofs = tx
-        .prepare_cached(
-            "UPDATE library_artist_credit_proofs SET artist_mbid = ?2 WHERE artist_mbid = ?1",
-        )?
+        .prepare_cached(crate::identify::sql::REPOINT_PROOFS_TO_MBID.text())?
         .execute(params![retired, current])?;
-    tx.prepare_cached("UPDATE local_artists SET converged_mbid = ?2 WHERE converged_mbid = ?1")?
+    tx.prepare_cached(crate::identify::sql::REPOINT_CONVERGED_MBID.text())?
         .execute(params![retired, current])?;
     for album in &albums {
         mark_stale(tx, album)?;
     }
     let rows: Vec<String> = tx
-        .prepare_cached(
-            "SELECT local_artist_id FROM local_track_artists WHERE artist_mbid = ?2 \
-             UNION SELECT local_artist_id FROM local_album_artists WHERE artist_mbid = ?2 \
-             UNION SELECT source_local_artist_id FROM library_artist_credit_proofs \
-              WHERE artist_mbid = ?2 AND source_local_artist_id IS NOT NULL \
-             UNION SELECT local_artist_id FROM local_artist_external_identities \
-              WHERE provider = 'musicbrainz' AND lower(provider_artist_id) = ?1",
-        )?
+        .prepare_cached(crate::identify::sql::ARTISTS_CREDITED_WITH_MBID.text())?
         .query_map(params![retired, current], |row| row.get(0))?
         .collect::<rusqlite::Result<_>>()?;
     let mut ids = BTreeSet::from([current.clone()]);
@@ -346,11 +292,7 @@ pub(crate) fn follow_person_links(
     let mut moved = false;
     for artist in rows {
         let link: Option<String> = tx
-            .prepare_cached(&format!(
-                "SELECT lower(provider_artist_id) FROM local_artist_external_identities \
-                 WHERE local_artist_id = ?1 AND provider = 'musicbrainz' \
-                 AND decision_source IN {PERSONS}"
-            ))?
+            .prepare_cached(crate::identify::sql::ARTIST_PERSON_LINKS.text())?
             .query_row(params![artist], |row| row.get(0))
             .optional()?;
         let Some(retired) = link else { continue };
@@ -368,26 +310,14 @@ pub(crate) fn follow_person_links(
             continue;
         }
         let giving_way: Vec<String> = tx
-            .prepare_cached(&format!(
-                "SELECT local_artist_id FROM local_artist_external_identities \
-                 WHERE provider = 'musicbrainz' AND decision_source IN {REVISABLE} \
-                 AND lower(provider_artist_id) = ?1 AND local_artist_id <> ?2"
-            ))?
+            .prepare_cached(crate::identify::sql::ARTISTS_REVISABLY_LINKED_TO_MBID.text())?
             .query_map(params![current, artist], |row| row.get(0))?
             .collect::<rusqlite::Result<_>>()?;
         for other in &giving_way {
-            tx.prepare_cached(
-                "DELETE FROM local_artist_external_identities \
-                 WHERE local_artist_id = ?1 AND provider = 'musicbrainz'",
-            )?
-            .execute(params![other])?;
-            touch_artist(tx, other, now)?;
+            drop_app_link(tx, other, LINK_GAVE_WAY, now)?;
         }
-        tx.prepare_cached(
-            "UPDATE local_artist_external_identities SET provider_artist_id = ?2, \
-             row_revision = row_revision + 1 WHERE local_artist_id = ?1 AND provider = 'musicbrainz'",
-        )?
-        .execute(params![artist, current])?;
+        tx.prepare_cached(crate::identify::sql::FOLLOW_PERSON_LINKS.text())?
+            .execute(params![artist, current])?;
         touch_artist(tx, artist, now)?;
         record_artist_action(
             tx,

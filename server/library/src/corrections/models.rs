@@ -5,7 +5,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::operations::reasons::Reason;
+use crate::identity::DecisionSource;
+use crate::reasons::Reason;
 
 /// Which album membership change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,7 +140,7 @@ pub struct DroppedEdition {
     pub album_id: String,
     pub release_group_mbid: String,
     pub release_mbid: Option<String>,
-    pub decision_source: String,
+    pub decision_source: DecisionSource,
 }
 
 /// What a membership change does.
@@ -255,8 +256,9 @@ pub struct PairSide {
     /// Indexed tracks.
     pub track_count: i64,
     pub edition: Option<PairEdition>,
-    /// The edition's revision, 0 for none. Send it back with a join.
-    pub identity_revision: i64,
+    /// The edition as shown: its revision with what it names, `0` for
+    /// none. Send it back with a join, unread.
+    pub identity_token: String,
 }
 
 /// An album's edition on a retag pair.
@@ -308,15 +310,6 @@ pub struct RetagPair {
     pub recorded_at: i64,
 }
 
-/// The open retag pairs, newest first (at most 100), and how many there
-/// are.
-#[derive(Debug, Clone, Default, Serialize, utoipa::ToSchema)]
-#[schema(as = RetagPairListResponse)]
-pub struct RetagPairList {
-    pub pairs: Vec<RetagPair>,
-    pub total: i64,
-}
-
 /// A person joining a retag pair.
 #[derive(Debug, Clone)]
 pub struct PairJoinRequest {
@@ -324,8 +317,8 @@ pub struct PairJoinRequest {
     pub new_album_id: String,
     /// Which album's chosen edition stays, when the two differ.
     pub keep_edition_of: Option<String>,
-    /// The edition revisions the card showed, by album id (0 for none).
-    pub expected_identity_revisions: BTreeMap<String, i64>,
+    /// The edition tokens the card showed, by album id.
+    pub expected_identity_tokens: BTreeMap<String, String>,
     pub actor: String,
 }
 

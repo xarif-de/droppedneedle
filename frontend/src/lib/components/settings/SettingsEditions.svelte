@@ -107,6 +107,7 @@
 			{#snippet children(draft)}
 				<div class="grid gap-4 lg:grid-cols-3">
 					{#each lists as list (list.key)}
+						{@const refusal = section.fieldError(list.key, list.title)}
 						<Card as="section" variant="bordered" padding="md">
 							<h3 class="font-semibold">{list.title}</h3>
 							<p class="grow-0 text-xs text-base-content/55">{list.hint}</p>
@@ -169,16 +170,25 @@
 									label="Add"
 								/>
 							</form>
+							{#if refusal}
+								<p class="mt-2 text-sm text-error" role="alert">{refusal}</p>
+							{/if}
 						</Card>
 					{/each}
 				</div>
 
 				<div class="grid gap-4 md:grid-cols-2">
-					<SelectField label="Release date" options={dateOptions} bind:value={draft.date} />
+					<SelectField
+						label="Release date"
+						options={dateOptions}
+						bind:value={draft.date}
+						error={section.fieldError('date', 'Release date')}
+					/>
 					<SelectField
 						label="Standard or deluxe"
 						options={versionOptions}
 						bind:value={draft.version}
+						error={section.fieldError('version', 'Standard or deluxe')}
 					/>
 				</div>
 
@@ -197,6 +207,11 @@
 							</label>
 						{/each}
 					</div>
+					{#if section.fieldError('avoid_types', 'Avoid unless nothing else fits')}
+						<p class="mt-2 text-sm text-error" role="alert">
+							{section.fieldError('avoid_types', 'Avoid unless nothing else fits')}
+						</p>
+					{/if}
 				</fieldset>
 
 				<Card variant="bordered" padding="md">

@@ -12,6 +12,11 @@ export interface LibraryV3AlbumsParams {
 	artistId?: string;
 	decade?: number;
 	format?: string;
+	/** Primary formats to keep, or with `formatMode: 'without'` to hide. */
+	formats?: string[];
+	formatMode?: 'with' | 'without';
+	/** Only albums with at least this many tracks in the library. */
+	minTracks?: number;
 	/** Only the caller's favourites; without a sort, the newest first. */
 	favorites?: boolean;
 }
@@ -22,6 +27,8 @@ export interface LibraryV3ArtistsParams {
 	order?: 'asc' | 'desc';
 	q?: string;
 	scope?: 'all' | 'album_artists' | 'contributors';
+	/** Only artists with at least this many tracks in the library. */
+	minTracks?: number;
 	/** Only the caller's favourites; without a sort, the newest first. */
 	favorites?: boolean;
 }
@@ -86,6 +93,8 @@ export const LibraryQueryKeyFactory = {
 		// The album list's pages, read on by cursor: apart from one page's key.
 		albumPages: (userId: LibraryV3UserId, params: LibraryV3AlbumsParams) =>
 			[...LibraryQueryKeyFactory.catalog.root(userId), 'album-pages', params] as const,
+		albumFormats: (userId: LibraryV3UserId) =>
+			[...LibraryQueryKeyFactory.catalog.root(userId), 'album-formats'] as const,
 		artists: (userId: LibraryV3UserId, params: LibraryV3ArtistsParams) =>
 			[...LibraryQueryKeyFactory.catalog.root(userId), 'artists', params] as const,
 		tracks: (userId: LibraryV3UserId, params: LibraryV3TracksParams) =>
@@ -178,7 +187,6 @@ export const LibraryQueryKeyFactory = {
 	policyPrefix: policy,
 	targetSettings: () => [...policy(), 'settings'] as const,
 	policyTree: () => [...policy(), 'tree'] as const,
-	pathMapping: () => [...policy(), 'path-mapping'] as const,
 	restorableRoots: () => [...policy(), 'restorable-roots'] as const,
 	repairsPrefix: () => [...operations(), 'repairs'] as const,
 	repairs: (cursor: string | undefined) =>
@@ -234,5 +242,7 @@ export const LibraryQueryKeyFactory = {
 		artist: string
 	) => key(userScope(userId), 'library', 'reidentification-releases', albumId, title, artist),
 	scanSchedule: () => key(ADMIN, 'library', 'scan-schedule'),
-	retagPairs: () => key(ADMIN, 'library', 'retag-pairs')
+	retagPairs: () => key(ADMIN, 'library', 'retag-pairs'),
+	albumRetagPairs: (albumId: string) =>
+		[...LibraryQueryKeyFactory.retagPairs(), 'album', albumId] as const
 };

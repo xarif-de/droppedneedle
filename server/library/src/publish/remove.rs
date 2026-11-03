@@ -68,7 +68,7 @@ pub enum Refusal {
     /// A track's library folder is not one the publisher holds.
     OutsideRoot,
     /// No recycle bin is known while this setting cannot be read.
-    BinsUnknown(&'static str),
+    BinsUnknown(super::bin::BinsUnknown),
     /// This library folder has no usable recycle bin.
     NoBin(String),
     /// The publish refused or failed. `kept`: its unwind kept a file under
@@ -535,17 +535,19 @@ pub(crate) fn file_of<'a>(removal: &'a Removal, journal: &FileJournal) -> Option
 }
 
 /// Whether the file a `remove` row moves is a hard link to the file of an
-/// earlier row of the same removal: one inode under two names. Setting
-/// the earlier one aside moves the inode's change time.
+/// row of the same removal that is set aside first: one inode under two
+/// names. Rows run in journal id order, which past 1000 items is not the
+/// plan's (`-1000` sorts before `-101`). Setting the earlier one aside moves
+/// the inode's change time.
 pub(super) fn linked_to_earlier(removal: &Removal, journal: &FileJournal) -> bool {
     let files = files(&journal.bundle_id, removal);
     let Some(index) = files.iter().position(|(id, _)| *id == journal.id) else {
         return false;
     };
-    let file = files[index].1;
-    files[..index]
-        .iter()
-        .any(|(_, earlier)| earlier.stat.dev == file.stat.dev && earlier.stat.ino == file.stat.ino)
+    let (mine, file) = (&files[index].0, files[index].1);
+    files.iter().any(|(other, earlier)| {
+        other < mine && earlier.stat.dev == file.stat.dev && earlier.stat.ino == file.stat.ino
+    })
 }
 
 /// Whether the set-aside file at `path` holds `sha256`: by identity when
@@ -784,7 +786,9 @@ pub(crate) fn mark_removed(
 ) -> rusqlite::Result<bool> {
     let revision: Option<i64> = conn
         .prepare_cached(sql::TRACK_MARK_MISSING.text())?
-        .query_row(rusqlite::params![track_id, now], |row| row.get(0))
+        .query_row(rusqlite::params![track_id, crate::clock::ms(now)], |row| {
+            row.get(0)
+        })
         .optional()?;
     let Some(revision) = revision else {
         return Ok(false);
@@ -822,7 +826,7 @@ pub(super) struct Action<'a> {
 }
 
 pub(super) fn record_action(conn: &Connection, action: &Action<'_>) -> rusqlite::Result<()> {
-    conn.prepare_cached(sql::CATALOG_ACTION_INSERT.text())?
+    conn.prepare_cached(crate::catalog_actions::sql::RECORD_REMOVAL_ACTION.text())?
         .execute(rusqlite::params![
             action.id,
             action.actor,
@@ -832,7 +836,7 @@ pub(super) fn record_action(conn: &Connection, action: &Action<'_>) -> rusqlite:
             action.before,
             action.after,
             action.reason_code,
-            action.at,
+            crate::clock::ms(action.at),
         ])?;
     Ok(())
 }

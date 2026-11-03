@@ -15,28 +15,25 @@
 
 use std::sync::Arc;
 
-use droppedneedle_kernel::clock::Clock;
-
 use super::effects::Effects;
 use super::models::{
-    DownloadPolicyView, FrontendCacheTTLs, IndexerSavedResponse, IndexerTestResponse,
-    JellyfinUserInfo, JellyfinVerifyResponse, LibraryScanScheduleResponse,
-    LibrarySettingsSaveRequest, PlexLibrarySectionInfo, PlexVerifyResponse, PolicySummaryResponse,
-    ProwlarrTestResponse, SabnzbdTestResponse, SourcePriorityOrder, TestConnectionResponse,
-    UsenetSearchBackend, VerifyConnectionResponse,
+    DownloadPolicyView, IndexerSavedResponse, IndexerTestResponse, JellyfinUserInfo,
+    JellyfinVerifyResponse, LibraryScanScheduleResponse, LibrarySettingsSaveRequest,
+    PlexLibrarySectionInfo, PlexVerifyResponse, ProwlarrTestResponse, QualityRecipeStatus,
+    SabnzbdTestResponse, SourcePriorityOrder, TestConnectionResponse, UsenetSearchBackend,
+    VerifyConnectionResponse,
 };
 use super::quality;
 use super::verify::{VerifyProbes, check_hibp_file, require_service_url};
 use droppedneedle_kernel::ids::IdGenerator;
 use droppedneedle_kernel::runtime_config::secret_sections::{
-    AdvancedSettings, DownloadClients, EventsSettings, IdentificationPolicy, JellyfinConnection,
-    LibraryRoot, ListenBrainzConnection, NavidromeConnection, NewznabIndexer, OidcConnection,
-    PlexConnection, ProwlarrConnection, SabnzbdConnection, SlskdConnection, TypedLibrary,
-    YouTubeConnection,
+    DownloadClients, EventsSettings, JellyfinConnection, ListenBrainzConnection,
+    NavidromeConnection, NewznabIndexer, OidcConnection, PlexConnection, ProwlarrConnection,
+    SabnzbdConnection, SlskdConnection, TypedLibrary, YouTubeConnection,
 };
 use droppedneedle_kernel::runtime_config::sections::{
     DownloadPolicy, LibraryScanSchedule, PlainSection, SecuritySettings, SourcePriority,
-    UsenetBackendSetting, derive_default_order, validate_quality_recipe,
+    UsenetBackendSetting, validate_quality_recipe,
 };
 use droppedneedle_kernel::runtime_config::settings_error::SettingsError;
 use droppedneedle_kernel::runtime_config::{
@@ -58,18 +55,15 @@ pub struct SettingsService {
     pub timezone: Option<String>,
     /// Connection probes behind the verify methods.
     probes: Arc<dyn VerifyProbes>,
-    /// Wall time, which picks the zone label (summer or winter time).
-    clock: Arc<dyn Clock>,
 }
 
 impl SettingsService {
-    /// Build over the shared store, effects, ids, probes and clock.
+    /// Build over the shared store, effects, ids and probes.
     pub fn new(
         store: Arc<ConfigStore>,
         effects: Effects,
         ids: Arc<dyn IdGenerator>,
         probes: Arc<dyn VerifyProbes>,
-        clock: Arc<dyn Clock>,
     ) -> Self {
         Self {
             store,
@@ -77,7 +71,6 @@ impl SettingsService {
             ids,
             timezone: None,
             probes,
-            clock,
         }
     }
 
@@ -170,7 +163,7 @@ impl SettingsService {
     pub fn get_schedule(&self) -> Result<LibraryScanScheduleResponse, SettingsError> {
         Ok(LibraryScanScheduleResponse {
             schedule: self.get()?,
-            server_timezone: server_timezone(self.timezone.as_deref(), self.clock.now_unix()),
+            server_timezone: server_timezone(self.timezone.as_deref()),
             last_scan_at: None,
         })
     }
@@ -182,7 +175,7 @@ impl SettingsService {
     ) -> Result<LibraryScanScheduleResponse, SettingsError> {
         Ok(LibraryScanScheduleResponse {
             schedule: self.save(schedule).await?,
-            server_timezone: server_timezone(self.timezone.as_deref(), self.clock.now_unix()),
+            server_timezone: server_timezone(self.timezone.as_deref()),
             last_scan_at: None,
         })
     }
@@ -251,14 +244,6 @@ impl SettingsService {
         Ok(saved.map(|clients| clients.sabnzbd))
     }
 
-    /// The advanced settings the web app reads at start.
-    pub fn get_cache_ttls(&self) -> Result<FrontendCacheTTLs, SettingsError> {
-        let stored: Masked<AdvancedSettings> = self.get_masked()?;
-        Ok(FrontendCacheTTLs {
-            discover_queue_auto_generate: stored.discover_queue_auto_generate,
-        })
-    }
-
     // --- library settings -----------------------------------------------------------
 
     /// The library settings: normalized roots plus the policy revision,
@@ -299,72 +284,6 @@ impl SettingsService {
             let normalized = library_policy::normalize(&request.settings)?;
             library_policy::guard_last_root(&normalized, catalog_has_tracks)?;
             Ok(normalized)
-        })
-        .await
-    }
-
-    /// Add one library root path. The path must be a directory on this
-    /// machine; adding a path that is already a root is a silent no-op.
-    pub async fn add_library_path(
-        &self,
-        path: &str,
-    ) -> Result<LibrarySettingsResponse, SettingsError> {
-        let candidate = path.trim().to_owned();
-        if candidate.is_empty() {
-            return Err(SettingsError::InvalidInput {
-                message: "Library path is required.".to_owned(),
-            });
-        }
-        let is_dir = tokio::fs::metadata(&candidate)
-            .await
-            .is_ok_and(|meta| meta.is_dir());
-        if !is_dir {
-            return Err(SettingsError::InvalidInput {
-                message: format!("Path does not exist or is not a directory: {candidate}"),
-            });
-        }
-        let id = self.ids.new_id();
-        self.update_library(move |mut library| {
-            if !library
-                .library_roots
-                .iter()
-                .any(|root| root.path == candidate)
-            {
-                let label = std::path::Path::new(&candidate)
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .filter(|name| !name.is_empty())
-                    .unwrap_or(&candidate)
-                    .to_owned();
-                library.library_roots.push(LibraryRoot {
-                    id,
-                    path: candidate,
-                    label,
-                    policy: IdentificationPolicy::Automatic,
-                    rules: Vec::new(),
-                });
-            }
-            library_policy::normalize(&library)
-        })
-        .await
-    }
-
-    /// Remove every library root at one path. Unknown paths are a silent
-    /// no-op; removing the last root while the catalog holds tracks is a
-    /// 400.
-    pub async fn remove_library_path(
-        &self,
-        path: &str,
-        catalog_has_tracks: bool,
-    ) -> Result<LibrarySettingsResponse, SettingsError> {
-        let path = path.to_owned();
-        self.update_library(move |mut library| {
-            let before = library.library_roots.len();
-            library.library_roots.retain(|root| root.path != path);
-            if library.library_roots.len() < before {
-                library_policy::guard_last_root(&library, catalog_has_tracks)?;
-            }
-            library_policy::normalize(&library)
         })
         .await
     }
@@ -427,9 +346,8 @@ impl SettingsService {
             Ok(policy) => Ok(policy_view(policy)),
             Err(ConfigError::SectionDecode { reason, .. }) => Ok(DownloadPolicyView {
                 policy: DownloadPolicy::default(),
-                quality_recipe_status: "invalid".to_owned(),
+                quality_recipe_status: QualityRecipeStatus::Invalid,
                 quality_recipe_error: Some(reason),
-                recycle_bin_warning: None,
             }),
             Err(other) => Err(self.config(other)),
         }
@@ -474,30 +392,6 @@ impl SettingsService {
             );
         }
         Ok(policy)
-    }
-
-    /// Safe acquisition-policy summary for any signed-in user: the
-    /// composed contract sentence and the recipe verdict, no admin
-    /// internals.
-    pub fn policy_summary(&self) -> Result<PolicySummaryResponse, SettingsError> {
-        let stored: DownloadPolicy = self.get()?;
-        let inputs = summary_inputs(&stored);
-        let summary = quality::compose_summary(&inputs);
-        let recipe_error = validate_quality_recipe(&stored.quality_recipe)
-            .err()
-            .map(|error| error.to_string());
-        let (status, error) = quality::recipe_status(
-            &stored.quality_recipe,
-            stored.flac_mp3_only,
-            recipe_error.is_none(),
-            recipe_error.as_deref(),
-        );
-        Ok(PolicySummaryResponse {
-            summary,
-            legacy_rollback_compatible: stored.quality_recipe.is_empty(),
-            quality_recipe_status: status,
-            quality_recipe_error: error,
-        })
     }
 
     // --- indexers ---------------------------------------------------------------------
@@ -642,6 +536,19 @@ impl SettingsService {
     ) -> Result<VerifyConnectionResponse, SettingsError> {
         let resolved = self.unmask(incoming)?;
         let verdict = self.probes.youtube(resolved.api_key.expose()).await;
+        Ok(verdict_response(verdict.valid, verdict.message))
+    }
+
+    /// Test the submitted Last.fm key pair.
+    pub async fn verify_lastfm(
+        &self,
+        incoming: Masked<droppedneedle_kernel::runtime_config::secret_sections::LastFmSettings>,
+    ) -> Result<VerifyConnectionResponse, SettingsError> {
+        let resolved = self.unmask(incoming)?;
+        let verdict = self
+            .probes
+            .lastfm(resolved.api_key.expose(), resolved.shared_secret.expose())
+            .await;
         Ok(verdict_response(verdict.valid, verdict.message))
     }
 
@@ -806,49 +713,17 @@ fn policy_view(policy: DownloadPolicy) -> DownloadPolicyView {
         policy,
         quality_recipe_status: status,
         quality_recipe_error: error,
-        recycle_bin_warning: None,
     }
 }
 
-fn summary_inputs(policy: &DownloadPolicy) -> quality::SummaryInputs {
-    quality::SummaryInputs {
-        quality_preference_order: derive_default_order(&policy.quality_min, &policy.quality_max),
-        quality_recipe: policy.quality_recipe.clone(),
-        flac_mp3_only: policy.flac_mp3_only,
-    }
-}
-
-/// Server-local timezone label for the daily-scan picker. Prefers the
-/// configured IANA name (`TZ`), else the local abbreviation, else
-/// "server time".
-pub fn server_timezone(configured: Option<&str>, now_unix: i64) -> String {
+/// Server-local timezone label for the daily-scan picker: the configured
+/// `TZ`, else the system zone's name, else "UTC".
+pub fn server_timezone(configured: Option<&str>) -> String {
     if let Some(tz) = configured {
         return tz.to_owned();
     }
-    local_timezone_label(now_unix).unwrap_or_else(|| "server time".to_owned())
-}
-
-fn local_timezone_label(now_unix: i64) -> Option<String> {
-    // libc localtime names the zone the same C library call v2's tzname
-    // bottoms out in; only the abbreviation is used, never the offset.
-    let now = libc::time_t::try_from(now_unix).ok()?;
-    let mut broken = std::mem::MaybeUninit::<libc::tm>::zeroed();
-    // SAFETY: localtime_r writes only into the caller-owned `broken`
-    // struct; a null return means the input was out of range.
-    let filled = unsafe { libc::localtime_r(&now, broken.as_mut_ptr()) };
-    if filled.is_null() {
-        return None;
-    }
-    let zone = unsafe { (*filled).tm_zone };
-    if zone.is_null() {
-        return None;
-    }
-    // SAFETY: tm_zone points at static storage that localtime_r owns; it
-    // is a NUL-terminated C string for the process lifetime.
-    let name = unsafe { std::ffi::CStr::from_ptr(zone) }.to_str().ok()?;
-    if name.is_empty() {
-        None
-    } else {
-        Some(name.to_owned())
-    }
+    droppedneedle_library::settings::schedule_zone(None)
+        .iana_name()
+        .unwrap_or("UTC")
+        .to_owned()
 }

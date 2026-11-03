@@ -23,8 +23,8 @@ What DroppedNeedle does to keep a plugin in its lane:
   enables it in Settings > Plugins.
 - **Installs are pinned.** DroppedNeedle installs an exact commit and records
   it. The install screen shows that commit, the plugin's version, and what it
-  asks to do, before anything is written. If the repository changes between
-  the preview and the install, the install stops and asks you to look again.
+  asks to do, before anything is written. The install takes exactly the commit
+  you previewed, even if the branch or release has moved on since.
   An update stays the kind of install you chose, and stops if the
   repository at that address was deleted and created again.
 - **Each plugin is its own process.** If it crashes, only that plugin stops;
@@ -65,10 +65,10 @@ In **Settings > Plugins**, paste the repository URL and press **Preview**.
 DroppedNeedle keeps its GitHub requests under GitHub's limit for servers
 without an account: 10 at once, then about 50 an hour, shared by installs,
 updates and DroppedNeedle's own update check. A preview uses 4 requests
-from a plain repository URL and 3 from the other kinds. An install uses
-4 from a plain URL and 2 from the others, and an update 3 or 4. So
-after the first preview and install, about six plain-URL installs fit in
-an hour. When a preview, install or update would not fit, it stops before
+from a plain repository URL and 3 from the other kinds. An install from
+the preview uses 2, and an update 2 or 3, plus 1 when there is a new
+commit to download. So after the first preview and install, about eight
+installs fit in an hour. When a preview, install or update would not fit, it stops before
 sending anything and says how long to wait, for example "GitHub requests
 are paced. Try again in 3 minutes." That wait covers the whole operation,
 and it is usually DroppedNeedle's own pacing, not a limit from GitHub.
@@ -361,11 +361,13 @@ capability and use `await ctx.write_library_file(rel_path, data)`. It adds
 one new file under your first library folder and answers the full path. The path is relative,
 in lowercase letters, digits, `_`, `-`, `.` and `/`, without hidden or `..`
 parts. A file that already exists is never replaced, nor is a file whose
-name differs only in letter case: the call fails instead. A first library
+name differs only in letter case or Unicode form (`Straße` for
+`strasse`): the call fails instead. A first library
 folder set to Excluded, one that isn't there (a share not mounted), one
 reached through a link into another library folder, or one on a disk that
 can only add a file by checking first and then renaming, takes no plugin
-files: the call fails. While the library is switched off, the call fails
+files: the call fails. Neither does a path under a path rule set to
+Excluded. While the library is switched off, the call fails
 with `the library is switched off; try again once it is on`. Each plugin may
 write 100 MiB and 1000 files a day; past either the call fails until older
 writes are a day old. The allowance is kept in the database, so a restart
@@ -377,8 +379,10 @@ The write has 8 seconds: it waits for the library to be free (no move or
 other change running) and then fails, and a file not in place by
 then, or that the server stopped waiting for, is never put there. In rare
 cases a `host request timed out` answer means the file did land; a retry
-then answers that it already exists. After each write the library folder
-is scanned again, so the file, audio included, shows up like any other.
+then answers that it already exists. Why the last write was refused shows
+on the plugin's card in Settings > Plugins, beside its health, until a
+write lands, the plugin is switched off or removed, or the server restarts. After each write the library folder is scanned again, so the
+file, audio included, shows up like any other.
 
 Each write is a recorded library change, made the way the server makes its
 own: the file is written beside its destination under a hidden name and

@@ -28,12 +28,9 @@ use super::corrections::service::Corrections;
 use super::identify::service::{IdentifyDeps, IdentifyService};
 use super::identify::sqlite::SqliteIdentifyStore;
 use super::import::Imports;
-use super::manage::{PublishCell, Publishing};
 use super::management::enrich::EnrichmentPort;
 use super::management::service::Management;
 use super::management::settings::service::LibraryManagementService;
-use super::mutations::Mutations;
-use super::operations::service::Operations;
 use super::reconcile::service::Reconcile;
 use super::repairs::service::{RepairWorker, Repairs};
 use super::scan::coordinator::{
@@ -46,6 +43,9 @@ use super::scan::watcher::{DirtyScopes, WatcherState, WorkWakeups};
 use super::scans::Scans;
 use super::service::{Identification, ServiceError};
 use super::settings::LibrarySettings;
+use crate::jobs::service::Operations;
+use crate::publish::session::{PublishCell, Publishing};
+use crate::removal::Mutations;
 use droppedneedle_kernel::ids::IdGenerator;
 use droppedneedle_kernel::runtime_config::secret_sections::TypedLibrary;
 use droppedneedle_kernel::runtime_config::{Live, Plain};
@@ -127,13 +127,15 @@ pub struct LibraryCore {
     pub(crate) dirty: DirtyScopes,
     pub(crate) wakeups: WorkWakeups,
     pub(crate) publish: Arc<std::sync::Mutex<PublishCell>>,
-    pub(crate) placement: super::manage::RootPlacement,
-    pub(crate) held_bundles: super::manage::HeldBundles,
+    pub(crate) placement: crate::publish::session::RootPlacement,
+    pub(crate) held_bundles: crate::publish::session::HeldBundles,
     pub(crate) bins: super::publish::bin::BinSource,
     /// Wall time: the kernel clock.
     pub(crate) clock: Arc<dyn droppedneedle_kernel::clock::Clock>,
     /// The undo copies, in the folder beside the database.
     pub(crate) blobs: super::publish::BlobStore,
+    /// The settings revision whose skipped roots were last logged.
+    pub(crate) root_problems_at: Arc<std::sync::atomic::AtomicI64>,
 }
 
 impl LibraryCore {
@@ -149,16 +151,21 @@ impl LibraryCore {
             LibrarySettings::new(&platform.settings, platform.config.timezone.as_deref());
         // The roots load before anything can scan or stream: a restart
         // comes back with exactly the roots the settings hold.
-        let registry: Arc<SharedResolver> = Arc::new(SharedResolver::new(
-            super::settings::registry(&settings.library)
-                .map_err(|error| format!("library roots: {error}"))?,
-        ));
+        let revision = *settings.library.subscribe().borrow();
+        let section = settings
+            .library
+            .get()
+            .map_err(|error| format!("library roots: {error}"))?;
+        let (roots, problems) = super::settings::build_registry(&section);
+        let root_problems_at = Arc::new(std::sync::atomic::AtomicI64::new(-1));
+        super::settings::log_root_problems(&root_problems_at, revision, &problems);
+        let registry: Arc<SharedResolver> = Arc::new(SharedResolver::new(roots));
         let root_dirs: RootDirs = {
             let registry = registry.clone();
             Arc::new(move || registry.resolver().registry().root_paths())
         };
         let bins = super::publish::bin::BinSource::new(
-            settings.download_policy.clone(),
+            settings.management.clone(),
             settings.library.clone(),
             download_trees,
         );
@@ -181,10 +188,11 @@ impl LibraryCore {
             wakeups: WorkWakeups::new(),
             placement: publish.placement(),
             publish: Arc::new(std::sync::Mutex::new(publish)),
-            held_bundles: super::manage::HeldBundles::new(platform.db.clone()),
+            held_bundles: crate::publish::session::HeldBundles::new(platform.db.clone()),
             bins,
             clock: platform.clock.clone(),
             blobs,
+            root_problems_at,
         })
     }
 
@@ -194,14 +202,15 @@ impl LibraryCore {
     /// current registry.
     pub fn refresh_registry(&self) -> RootRegistry {
         let current = self.registry.resolver().registry().clone();
-        let fresh = match super::settings::registry(&self.library) {
-            Ok(fresh) => fresh,
-            Err(error) => {
-                tracing::warn!(%error, "cannot read the library roots; keeping the current set");
-                return current;
-            }
+        let revision = *self.library.subscribe().borrow();
+        // An unreadable section keeps the current set; `Live::read` logs it
+        // once per revision.
+        let Some(section) = self.library.read() else {
+            return current;
         };
-        if fresh.policy_revision() == current.policy_revision() {
+        let (fresh, problems) = super::settings::build_registry(&section);
+        super::settings::log_root_problems(&self.root_problems_at, revision, &problems);
+        if fresh.fingerprint() == current.fingerprint() {
             return current;
         }
         self.registry.update(fresh.clone());
@@ -218,6 +227,15 @@ impl LibraryCore {
         fresh
     }
 
+    /// Have the scan loop look at album art and lyrics again soon, so art
+    /// a publish just wrote shows without waiting for the folder watcher
+    /// to notice it and a scan to run. Unchanged albums cost the sweep one
+    /// stat per folder.
+    pub fn sweep_soon(&self) {
+        self.wakeups.notify(super::jobs::SWEEP_WAKEUP);
+        self.wakeups.notify("scan");
+    }
+
     /// Live root registry: re-read from the settings, never cached.
     pub fn live_registry(&self) -> RootRegistry {
         self.refresh_registry()
@@ -227,21 +245,34 @@ impl LibraryCore {
     /// `expected_policy_revision`: the saved settings' revision of the
     /// roots and rules, as `GET /settings/library` shows it. The
     /// registry's own fingerprint is a different hash, kept internally.
+    /// Touches no file.
     pub fn policy_revision(&self) -> Result<String, ServiceError> {
         let settings = self.library_settings()?;
-        Ok(crate::policy::resolve_stored(&settings).policy_revision)
+        Ok(crate::policy::stored_revision(&settings))
     }
 
     /// The live registry, or `None` when the saved roots and rules no
     /// longer carry `expected` as their policy revision (see
     /// [`Self::policy_revision`]) or the registry does not match them.
     pub fn registry_at(&self, expected: &str) -> Result<Option<RootRegistry>, ServiceError> {
-        let live = self.live_registry();
         let settings = self.library_settings()?;
-        let current = crate::policy::resolve_stored(&settings).policy_revision == expected
-            && super::settings::registry_from(&settings).policy_revision()
-                == live.policy_revision();
-        Ok(current.then_some(live))
+        Ok(self.registry_matching(&settings, Some(expected)))
+    }
+
+    /// The live registry when it matches `settings` (and, when given,
+    /// `expected` is their policy revision), else `None`. Saved settings
+    /// that fail validation still carry the revision the page shows.
+    pub(crate) fn registry_matching(
+        &self,
+        settings: &TypedLibrary,
+        expected: Option<&str>,
+    ) -> Option<RootRegistry> {
+        if expected.is_some_and(|expected| crate::policy::stored_revision(settings) != expected) {
+            return None;
+        }
+        let live = self.live_registry();
+        (super::settings::registry_from(settings).fingerprint() == live.fingerprint())
+            .then_some(live)
     }
 
     fn library_settings(&self) -> Result<Arc<Plain<TypedLibrary>>, ServiceError> {
@@ -292,12 +323,12 @@ pub struct LibrarySetup {
     pub publish: Arc<std::sync::Mutex<PublishCell>>,
     /// Placement modes of the open publish session, readable without the
     /// cell.
-    pub placement: super::manage::RootPlacement,
+    pub placement: crate::publish::session::RootPlacement,
     /// Unsettled publish bundles, read from the journal; their tracks
     /// take no new managed writes until a pass settles them.
-    pub held_bundles: super::manage::HeldBundles,
+    pub held_bundles: crate::publish::session::HeldBundles,
     /// Hidden files no journal row names, from the pass after startup.
-    pub leftover_files: super::manage::LeftoverFiles,
+    pub leftover_files: crate::publish::session::LeftoverFiles,
     /// Shared root-directory lookup.
     pub root_dirs: RootDirs,
     /// The jobs table: a removed album's clean-up is queued here in the
@@ -313,7 +344,7 @@ pub struct LibrarySetup {
     /// each other.
     pub management_settings: Arc<LibraryManagementService>,
     /// Genres, lyrics and covers Library Management plans with (the
-    /// artwork cache lives with the reads). `None` in a test bundle with
+    /// artwork cache lives with the catalog). `None` in a test bundle with
     /// no outside sources.
     pub enrichment: Option<Arc<dyn EnrichmentPort>>,
     /// The write side the fields above share, which the plugin host holds
@@ -571,7 +602,10 @@ impl LibrarySetup {
             publish: core.publish.clone(),
             placement: core.placement.clone(),
             held_bundles: core.held_bundles.clone(),
-            leftover_files: super::manage::LeftoverFiles::new(db.clone(), platform.clock.clone()),
+            leftover_files: crate::publish::session::LeftoverFiles::new(
+                db.clone(),
+                platform.clock.clone(),
+            ),
             root_dirs,
             jobs,
             bins: core.bins.clone(),
@@ -614,7 +648,6 @@ impl LibraryServices {
         Self {
             repairs: Repairs::new(
                 setup.db.clone(),
-                operations.clone(),
                 setup.ids.clone(),
                 setup.wakeups.clone(),
                 setup.clock.clone(),

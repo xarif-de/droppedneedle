@@ -316,7 +316,7 @@ impl Drop for InFlight<'_> {
 #[derive(Debug)]
 pub struct RateLimiter {
     state: Mutex<BucketState>,
-    calls: CallTally,
+    calls: Arc<CallTally>,
     /// The shared budget this row also draws from (rates `SHARED_BUDGETS`).
     door: Option<Arc<RateLimiter>>,
 }
@@ -340,6 +340,14 @@ impl RateLimiter {
         Self::shaped(RatePolicy::new(per_second, row.burst), row.max_in_flight)
     }
 
+    /// Count this limiter's calls on `row` too, for buckets of one rate row
+    /// that pace apart but report as the row.
+    #[must_use]
+    pub fn counting_on(mut self, row: &Self) -> Self {
+        self.calls = Arc::clone(&row.calls);
+        self
+    }
+
     fn shaped(policy: RatePolicy, max_in_flight: Option<u32>) -> Self {
         Self {
             state: Mutex::new(BucketState {
@@ -354,7 +362,7 @@ impl RateLimiter {
                 waiters: BinaryHeap::new(),
                 sequence: 0,
             }),
-            calls: CallTally::new(),
+            calls: Arc::new(CallTally::new()),
             door: None,
         }
     }

@@ -1,3 +1,9 @@
+import { cursorQuery } from '$lib/queries/library/listQueries';
+import { pageQuery } from '$lib/queries/library/listQueries';
+import { tracksQuery } from '$lib/queries/library/listQueries';
+import { artistsQuery } from '$lib/queries/library/listQueries';
+import { albumsQuery } from '$lib/queries/library/listQueries';
+import { v3 } from '$lib/api/v3/endpoint';
 import {
 	createInfiniteQuery,
 	createQuery,
@@ -14,46 +20,26 @@ import {
 	type LibraryV3TracksParams,
 	type LibraryV3UserId
 } from './LibraryQueryKeyFactory';
-import { LibraryV3Api } from './LibraryV3Api';
-import { SearchV3Api } from '../search/SearchV3Api';
 import { toMusicBrainzAlbums } from '../search/SearchV3Adapters';
-import {
-	toAlbumDetail,
-	toAlbumSummary,
-	toArtistSummary,
-	toLibraryStats,
-	toNativeAlbums
-} from './libraryAdapters';
-import {
-	fetchLibraryTracks,
-	toAlbumStatus,
-	toNativeTrack,
-	type LibraryTrackPage
-} from './libraryTracks';
+import { fetchLibraryTracks, type LibraryTrackPage } from './libraryTracks';
+import type { components } from '$lib/api/v3/openapi';
 import type {
 	Album,
+	AlbumDetailView,
+	AlbumView,
 	ArtistSort,
+	ArtistView,
 	LibraryAlbumStatus,
-	LibraryAlbumDetail,
-	LibraryAlbumSummary,
-	LibraryArtistSummary,
-	LibraryArtistAppearancesResponse,
 	LibraryArtistScope,
-	LibraryScanSchedule,
 	LibraryMembershipResponse,
-	NativeAlbumsResponse,
-	NativeArtistsResponse,
-	NativeTrackListItem,
-	ScanFrequency
+	TrackView
 } from '$lib/types';
 import { authStore } from '$lib/stores/authStore.svelte';
 import { setQueryDataWithPersister } from '../QueryClient';
 import { PERSIST } from '$lib/queries/persistedCache';
 
-// Catalog reads for the local library. Each read calls the v3 catalog and
-// adapts the view into the page model the library components render
-// (libraryAdapters.ts); keys come from the v3 key set, which carries the
-// user id because the views include per-caller favorite flags.
+// Catalog reads for the local library. Keys come from the v3 key set, which
+// carries the user id because the views include per-caller favorite flags.
 
 const userId = () => authStore.user?.id;
 
@@ -73,7 +59,7 @@ export const getLibraryMembershipQueryOptions = (
 			let requestedIds: string[] = [];
 			for (let offset = 0; offset < albumIds.length; offset += 500) {
 				const membership: LibraryMembershipResponse = await api.v3.POST(
-					LibraryV3Api.membership(),
+					v3('/api/v3/library/membership'),
 					{ album_ids: albumIds.slice(offset, offset + 500) },
 					{ signal }
 				);
@@ -91,23 +77,34 @@ export const getLibraryMembershipQueryOptions = (
 export const getLibraryMembershipQuery = (getAlbumIds: Getter<string[]>) =>
 	createQuery(() => getLibraryMembershipQueryOptions(authStore.user?.id, getAlbumIds()));
 
-export const getLibraryAlbumsQueryOptions = (
-	forUser: LibraryV3UserId,
-	params: LibraryV3AlbumsParams
-) =>
+const getLibraryAlbumsQueryOptions = (forUser: LibraryV3UserId, params: LibraryV3AlbumsParams) =>
 	queryOptions({
 		placeholderData: keepPreviousData,
 		meta: PERSIST,
 		queryKey: LibraryQueryKeyFactory.catalog.albums(forUser, params),
-		queryFn: async ({ signal }) =>
-			toNativeAlbums(await api.v3.GET(LibraryV3Api.albums(params), { signal }))
+		queryFn: ({ signal }) =>
+			api.v3.GET(
+				v3('/api/v3/library/albums', {
+					query: albumsQuery(params, null)
+				}),
+				{ signal }
+			)
 	});
 
 export const getLibraryAlbumsQuery = (getParams: Getter<LibraryV3AlbumsParams>) =>
 	createQuery(() => getLibraryAlbumsQueryOptions(userId(), getParams()));
 
-/** One page of albums and the cursor of the page after it. */
-export type LibraryAlbumsPage = NativeAlbumsResponse & { next: string | null };
+type AlbumPage = components['schemas']['AlbumPage'];
+type ArtistPage = components['schemas']['ArtistPage'];
+
+/** How many albums each primary format has, for the album list's format filter. */
+export const getLibraryAlbumFormatsQuery = () =>
+	createQuery(() => ({
+		meta: PERSIST,
+		queryKey: LibraryQueryKeyFactory.catalog.albumFormats(userId()),
+		queryFn: async ({ signal }) =>
+			(await api.v3.GET(v3('/api/v3/library/albums/formats'), { signal })).items
+	}));
 
 // The album list a page at a time: each page reads on from the last one's
 // cursor, so a deep page costs what the first does.
@@ -119,11 +116,14 @@ export const getLibraryAlbumsInfiniteQuery = (getParams: Getter<LibraryV3AlbumsP
 			meta: PERSIST,
 			queryKey: LibraryQueryKeyFactory.catalog.albumPages(userId(), params),
 			initialPageParam: null as string | null,
-			queryFn: async ({ pageParam, signal }): Promise<LibraryAlbumsPage> => {
-				const page = await api.v3.GET(LibraryV3Api.albums(params, pageParam), { signal });
-				return { ...toNativeAlbums(page), next: page.next ?? null };
-			},
-			getNextPageParam: (lastPage: LibraryAlbumsPage) => lastPage.next ?? undefined
+			queryFn: ({ pageParam, signal }) =>
+				api.v3.GET(
+					v3('/api/v3/library/albums', {
+						query: albumsQuery(params, pageParam)
+					}),
+					{ signal }
+				),
+			getNextPageParam: (lastPage: AlbumPage) => lastPage.next ?? undefined
 		};
 	});
 
@@ -133,6 +133,8 @@ export interface LibraryArtistsParams {
 	sortOrder: 'asc' | 'desc';
 	q: string;
 	scope: LibraryArtistScope;
+	/** Only artists with at least this many tracks in the library. */
+	minTracks?: number;
 	favorites?: boolean;
 }
 
@@ -144,26 +146,22 @@ function artistParams(params: LibraryArtistsParams): LibraryV3ArtistsParams {
 		...(params.sortBy === 'hearted' ? {} : { sort: params.sortBy, order: params.sortOrder }),
 		q: params.q || undefined,
 		scope: params.scope === 'contributors' ? 'contributors' : 'album_artists',
+		...(params.minTracks && params.minTracks > 1 ? { minTracks: params.minTracks } : {}),
 		...(params.favorites ? { favorites: true } : {})
 	};
 }
 
-/** One page of artists and the cursor of the page after it. */
-type LibraryArtistsPage = NativeArtistsResponse & { next: string | null };
-
-async function fetchArtists(
+function fetchArtists(
 	params: LibraryV3ArtistsParams,
 	after: string | null,
 	signal?: AbortSignal
-): Promise<LibraryArtistsPage> {
-	const page = await api.v3.GET(LibraryV3Api.artists(params, after), { signal });
-	return {
-		items: page.items.map(toArtistSummary),
-		total: page.total,
-		album_artist_total: page.album_artist_total,
-		contributor_total: page.contributor_total,
-		next: page.next ?? null
-	};
+): Promise<ArtistPage> {
+	return api.v3.GET(
+		v3('/api/v3/library/artists', {
+			query: artistsQuery(params, after)
+		}),
+		{ signal }
+	);
 }
 
 export const getLibraryArtistsInfiniteQuery = (getParams: Getter<LibraryArtistsParams>) =>
@@ -174,7 +172,7 @@ export const getLibraryArtistsInfiniteQuery = (getParams: Getter<LibraryArtistsP
 			queryKey: LibraryQueryKeyFactory.catalog.artists(userId(), params),
 			initialPageParam: null as string | null,
 			queryFn: ({ pageParam, signal }) => fetchArtists(params, pageParam, signal),
-			getNextPageParam: (lastPage: LibraryArtistsPage) => lastPage.next ?? undefined
+			getNextPageParam: (lastPage: ArtistPage) => lastPage.next ?? undefined
 		};
 	});
 
@@ -203,12 +201,11 @@ export const getLibraryArtistThumbsQuery = () =>
 			fetchArtists({ limit: ARTIST_THUMBS_LIMIT, sort: 'album_count', order: 'desc' }, null, signal)
 	}));
 
-export const getLibraryStatsQueryOptions = (forUser: LibraryV3UserId) =>
+const getLibraryStatsQueryOptions = (forUser: LibraryV3UserId) =>
 	queryOptions({
 		meta: PERSIST,
 		queryKey: LibraryQueryKeyFactory.catalog.stats(forUser),
-		queryFn: async ({ signal }) =>
-			toLibraryStats(await api.v3.GET(LibraryV3Api.stats(), { signal }))
+		queryFn: async ({ signal }) => await api.v3.GET(v3('/api/v3/library/stats'), { signal })
 	});
 
 export const getLibraryStatsQuery = () => createQuery(() => getLibraryStatsQueryOptions(userId()));
@@ -219,16 +216,18 @@ export const getLibraryRecentlyAddedQuery = () =>
 	createQuery(() => ({
 		meta: PERSIST,
 		queryKey: LibraryQueryKeyFactory.catalog.recentlyAdded(userId(), RECENTLY_ADDED_LIMIT),
-		queryFn: async ({ signal }) =>
-			toNativeAlbums(await api.v3.GET(LibraryV3Api.recentlyAdded(RECENTLY_ADDED_LIMIT), { signal }))
+		queryFn: ({ signal }) =>
+			api.v3.GET(v3('/api/v3/library/recently-added', { query: { limit: RECENTLY_ADDED_LIMIT } }), {
+				signal
+			})
 	}));
 
 export const getLibraryAlbumDetailQueryOptions = (forUser: LibraryV3UserId, albumId: string) =>
 	queryOptions({
 		meta: PERSIST,
 		queryKey: LibraryQueryKeyFactory.catalog.albumDetail(forUser, albumId),
-		queryFn: async ({ signal }) =>
-			toAlbumDetail(await api.v3.GET(LibraryV3Api.albumDetail(albumId), { signal }))
+		queryFn: ({ signal }) =>
+			api.v3.GET(v3('/api/v3/library/albums/{id}', { path: { id: albumId } }), { signal })
 	});
 
 const HAND_BACK_POLL_MS = 5_000;
@@ -240,7 +239,7 @@ export const getLibraryAlbumDetailQuery = (getAlbumId: Getter<string>) =>
 			...getLibraryAlbumDetailQueryOptions(userId(), albumId),
 			enabled: !!albumId,
 			// Read again until the album's turn to be handed back has come.
-			refetchInterval: (query: { state: { data?: LibraryAlbumDetail } }) =>
+			refetchInterval: (query: { state: { data?: AlbumDetailView } }) =>
 				query.state.data?.management_hold?.handing_back ? HAND_BACK_POLL_MS : false
 		};
 	});
@@ -249,17 +248,19 @@ export const getLibraryAlbumDetailQuery = (getAlbumId: Getter<string>) =>
 // local album's page moves to its release group's address, its detail is
 // stored (and persisted) under its own local id, where the matched page that
 // follows reads it.
-export const cacheCanonicalLibraryAlbumDetail = (album: LibraryAlbumDetail) =>
-	setQueryDataWithPersister<LibraryAlbumDetail>(
+export const cacheCanonicalLibraryAlbumDetail = (album: AlbumDetailView) =>
+	setQueryDataWithPersister<AlbumDetailView>(
 		LibraryQueryKeyFactory.catalog.albumDetail(userId(), album.id),
 		album
 	);
 
-export const getLibraryAlbumCopiesQueryOptions = (forUser: LibraryV3UserId, albumId: string) =>
+const getLibraryAlbumCopiesQueryOptions = (forUser: LibraryV3UserId, albumId: string) =>
 	queryOptions({
 		queryKey: LibraryQueryKeyFactory.catalog.albumCopies(forUser, albumId),
-		queryFn: async ({ signal }) =>
-			toNativeAlbums(await api.v3.GET(LibraryV3Api.albumCopies(albumId), { signal }))
+		queryFn: ({ signal }) =>
+			api.v3.GET(v3('/api/v3/library/albums/{id}/copies', { path: { id: albumId } }), {
+				signal
+			})
 	});
 
 export const getLibraryAlbumCopiesQuery = (
@@ -283,12 +284,16 @@ export const getLibraryAlbumTracksQuery = (getAlbumId: Getter<string>) =>
 			enabled: !!albumId,
 			meta: PERSIST,
 			queryKey: LibraryQueryKeyFactory.catalog.albumTracks(userId(), albumId, ALBUM_TRACKS_PAGE),
-			queryFn: async ({ signal }) => {
-				const page = await api.v3.GET(LibraryV3Api.albumTracks(albumId, ALBUM_TRACKS_PAGE), {
-					signal
-				});
-				return { ...page, items: page.items.map(toNativeTrack) };
-			}
+			queryFn: ({ signal }) =>
+				api.v3.GET(
+					v3('/api/v3/library/albums/{id}/tracks', {
+						path: { id: albumId },
+						query: pageQuery(ALBUM_TRACKS_PAGE)
+					}),
+					{
+						signal
+					}
+				)
 		};
 	});
 
@@ -296,8 +301,8 @@ export const getLibraryArtistDetailQueryOptions = (forUser: LibraryV3UserId, art
 	queryOptions({
 		meta: PERSIST,
 		queryKey: LibraryQueryKeyFactory.catalog.artistDetail(forUser, artistId),
-		queryFn: async ({ signal }) =>
-			toArtistSummary(await api.v3.GET(LibraryV3Api.artistDetail(artistId), { signal }))
+		queryFn: ({ signal }) =>
+			api.v3.GET(v3('/api/v3/library/artists/{id}', { path: { id: artistId } }), { signal })
 	});
 
 export const getLibraryArtistDetailQuery = (getArtistId: Getter<string>) =>
@@ -306,8 +311,8 @@ export const getLibraryArtistDetailQuery = (getArtistId: Getter<string>) =>
 		return { ...getLibraryArtistDetailQueryOptions(userId(), artistId), enabled: !!artistId };
 	});
 
-export const cacheCanonicalLibraryArtistDetail = (artist: LibraryArtistSummary) =>
-	setQueryDataWithPersister<LibraryArtistSummary>(
+export const cacheCanonicalLibraryArtistDetail = (artist: ArtistView) =>
+	setQueryDataWithPersister<ArtistView>(
 		LibraryQueryKeyFactory.catalog.artistDetail(userId(), artist.id),
 		artist
 	);
@@ -321,16 +326,28 @@ export const getLibraryArtistAlbumsQuery = (getArtistId: Getter<string>) =>
 			enabled: !!artistId,
 			meta: PERSIST,
 			queryKey: LibraryQueryKeyFactory.catalog.artistAlbums(userId(), artistId, ARTIST_ALBUMS_PAGE),
-			queryFn: async ({ signal }) =>
-				toNativeAlbums(
-					await api.v3.GET(LibraryV3Api.artistAlbums(artistId, ARTIST_ALBUMS_PAGE), {
+			queryFn: ({ signal }) =>
+				api.v3.GET(
+					v3('/api/v3/library/artists/{id}/albums', {
+						path: { id: artistId },
+						query: cursorQuery(ARTIST_ALBUMS_PAGE)
+					}),
+					{
 						signal
-					})
+					}
 				)
 		};
 	});
 
 const ARTIST_APPEARANCES_PAGE_SIZE = 20;
+
+interface ArtistAppearancesPage {
+	items: { album: AlbumView; tracks: TrackView[] }[];
+	total: number;
+	total_tracks: number;
+	/** The cursor of the page after this one; null on the last page. */
+	next: string | null;
+}
 
 // v3 lists the albums an artist appears on; the tracks they appear on come
 // from the track list filtered by album and artist, one read per album. The
@@ -340,25 +357,35 @@ async function fetchAppearances(
 	id: string,
 	after: string | null,
 	signal: AbortSignal
-): Promise<LibraryArtistAppearancesResponse> {
-	const artistId = (await api.v3.GET(LibraryV3Api.artistDetail(id), { signal })).id;
+): Promise<ArtistAppearancesPage> {
+	const artistId = (
+		await api.v3.GET(v3('/api/v3/library/artists/{id}', { path: { id: id } }), { signal })
+	).id;
 	const page = await api.v3.GET(
-		LibraryV3Api.artistAppearances(artistId, { limit: ARTIST_APPEARANCES_PAGE_SIZE, after }),
+		v3('/api/v3/library/artists/{id}/appearances', {
+			path: { id: artistId },
+			query: cursorQuery({ limit: ARTIST_APPEARANCES_PAGE_SIZE, after })
+		}),
 		{ signal }
 	);
 	const items = await Promise.all(
 		page.items.map(async (album) => {
 			const tracks = await api.v3.GET(
-				LibraryV3Api.tracks({
-					limit: 200,
-					sort: 'title',
-					order: 'asc',
-					albumId: album.id,
-					artistId
+				v3('/api/v3/library/tracks', {
+					query: tracksQuery(
+						{
+							limit: 200,
+							sort: 'title',
+							order: 'asc',
+							albumId: album.id,
+							artistId
+						},
+						null
+					)
 				}),
 				{ signal }
 			);
-			return { album: toAlbumSummary(album), tracks: tracks.items.map(toNativeTrack) };
+			return { album, tracks: tracks.items };
 		})
 	);
 	return {
@@ -380,7 +407,7 @@ export const getLibraryArtistAppearancesQuery = (getArtistId: Getter<string>) =>
 			}),
 			initialPageParam: null as string | null,
 			queryFn: ({ pageParam, signal }) => fetchAppearances(artistId, pageParam, signal),
-			getNextPageParam: (lastPage: LibraryArtistAppearancesResponse) => lastPage.next ?? undefined
+			getNextPageParam: (lastPage: ArtistAppearancesPage) => lastPage.next ?? undefined
 		};
 	});
 
@@ -389,15 +416,7 @@ export const getLibraryScanScheduleQuery = (enabled: () => boolean = () => true)
 	createQuery(() => ({
 		enabled: enabled(),
 		queryKey: LibraryQueryKeyFactory.scanSchedule(),
-		queryFn: async ({ signal }): Promise<LibraryScanSchedule> => {
-			const data = await api.v3.GET(LibraryV3Api.schedule(), { signal });
-			return {
-				scan_frequency: (data.scan_frequency ?? 'manual') as ScanFrequency,
-				daily_scan_time: data.daily_scan_time ?? '',
-				server_timezone: data.server_timezone,
-				last_scan_at: data.last_scan_at ?? null
-			};
-		}
+		queryFn: ({ signal }) => api.v3.GET(v3('/api/v3/settings/library/schedule'), { signal })
 	}));
 
 // What the library holds for one album, by MusicBrainz id or local id, with
@@ -405,17 +424,19 @@ export const getLibraryScanScheduleQuery = (enabled: () => boolean = () => true)
 export const getLibraryAlbumStatusQueryOptions = (mbid: string) =>
 	queryOptions({
 		queryKey: LibraryQueryKeyFactory.album(authStore.user?.id, mbid),
-		queryFn: async ({ signal }): Promise<LibraryAlbumStatus> =>
-			toAlbumStatus(await api.v3.GET(LibraryV3Api.albumStatus(mbid), { signal }))
+		queryFn: ({ signal }): Promise<LibraryAlbumStatus> =>
+			api.v3.GET(v3('/api/v3/library/albums/{id}/status', { path: { id: mbid } }), {
+				signal
+			})
 	});
 
 export const getLibraryAlbumStatusQuery = (getMbid: Getter<string>) =>
 	createQuery(() => getLibraryAlbumStatusQueryOptions(getMbid()));
 
 interface LibrarySearchResults {
-	albums: LibraryAlbumSummary[];
-	artists: LibraryArtistSummary[];
-	tracks: NativeTrackListItem[];
+	albums: AlbumView[];
+	artists: ArtistView[];
+	tracks: TrackView[];
 }
 
 const LIBRARY_SEARCH_LIMIT = 6;
@@ -431,20 +452,35 @@ export const getLibrarySearchQuery = (getTerm: Getter<string>) =>
 			queryFn: async ({ signal }): Promise<LibrarySearchResults> => {
 				const page = { limit: LIBRARY_SEARCH_LIMIT, q: term } as const;
 				const [albums, artists, tracks] = await Promise.all([
-					api.v3.GET(LibraryV3Api.albums({ ...page, sort: 'date_added', order: 'desc' }), {
-						signal
-					}),
-					api.v3.GET(LibraryV3Api.artists({ ...page, sort: 'name', order: 'asc' }), {
-						signal
-					}),
-					api.v3.GET(LibraryV3Api.tracks({ ...page, sort: 'date_added', order: 'desc' }), {
-						signal
-					})
+					api.v3.GET(
+						v3('/api/v3/library/albums', {
+							query: albumsQuery({ ...page, sort: 'date_added', order: 'desc' }, null)
+						}),
+						{
+							signal
+						}
+					),
+					api.v3.GET(
+						v3('/api/v3/library/artists', {
+							query: artistsQuery({ ...page, sort: 'name', order: 'asc' }, null)
+						}),
+						{
+							signal
+						}
+					),
+					api.v3.GET(
+						v3('/api/v3/library/tracks', {
+							query: tracksQuery({ ...page, sort: 'date_added', order: 'desc' }, null)
+						}),
+						{
+							signal
+						}
+					)
 				]);
 				return {
-					albums: albums.items.map(toAlbumSummary),
-					artists: artists.items.map(toArtistSummary),
-					tracks: tracks.items.map(toNativeTrack)
+					albums: albums.items,
+					artists: artists.items,
+					tracks: tracks.items
 				};
 			}
 		};
@@ -459,9 +495,15 @@ export const getAlbumSearchQuery = (getTerm: Getter<string>) =>
 			enabled: term.length >= 2,
 			queryKey: LibraryQueryKeyFactory.catalog.albumSearch(userId(), term),
 			queryFn: async ({ signal }): Promise<Album[]> => {
-				const data = await api.v3.GET(SearchV3Api.bucket('albums', term, 20, 0), {
-					signal
-				});
+				const data = await api.v3.GET(
+					v3('/api/v3/search/{bucket}', {
+						path: { bucket: 'albums' },
+						query: { q: term.trim(), limit: 20, offset: 0 }
+					}),
+					{
+						signal
+					}
+				);
 				return toMusicBrainzAlbums(data.results);
 			}
 		};
@@ -479,6 +521,6 @@ export const getResolvedTracksQuery = (getItems: Getter<ResolveTracksItem[]>) =>
 			enabled: items.length > 0,
 			queryKey: LibraryQueryKeyFactory.catalog.resolvedTracks(authStore.user?.id, items),
 			queryFn: ({ signal }: { signal: AbortSignal }) =>
-				api.v3.POST(LibraryV3Api.resolveTracks(), { items }, { signal })
+				api.v3.POST(v3('/api/v3/library/resolve-tracks'), { items }, { signal })
 		};
 	});

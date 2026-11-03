@@ -25,13 +25,14 @@ use crate::clock::LibraryClock as _;
 use crate::identify::models::{IdentifyKind, LocalAlbumFacts, RecallResult};
 use crate::identify::service::IdentifyService;
 use crate::identify::sqlite::{SqliteIdentifyStore, album_input_revision};
+use crate::jobs::OperationJob;
+use crate::jobs::OperationKind;
+use crate::jobs::models::OperationDetail;
+use crate::jobs::models::OperationError;
+use crate::jobs::service::job_detail;
 use crate::jobs::{self, OperationState, WorkState};
-use crate::operations::models::{
-    Control, OperationDetail, OperationError, OperationJob, OperationKind,
-    ReidentificationCandidate,
-};
-use crate::operations::reidentify::evaluation;
-use crate::operations::service::{Operations, job_detail};
+use crate::reidentify::candidates::evaluation;
+use crate::reidentify::models::ReidentificationCandidate;
 use crate::scan::watcher::WorkWakeups;
 use crate::wiring::ScanCoordinator;
 use droppedneedle_kernel::db::{Db, DbError, Lane};
@@ -72,7 +73,6 @@ enum Checked {
 #[derive(Clone)]
 pub struct Repairs {
     db: Db,
-    ops: Operations,
     ids: Arc<dyn IdGenerator>,
     wakeups: WorkWakeups,
     clock: Arc<dyn droppedneedle_kernel::clock::Clock>,
@@ -81,35 +81,16 @@ pub struct Repairs {
 impl Repairs {
     pub fn new(
         db: Db,
-        ops: Operations,
         ids: Arc<dyn IdGenerator>,
         wakeups: WorkWakeups,
         clock: Arc<dyn droppedneedle_kernel::clock::Clock>,
     ) -> Self {
         Self {
             db,
-            ops,
             ids,
             wakeups,
             clock,
         }
-    }
-
-    /// Any operation job for the generic operation view, with its report
-    /// summary when it is a repair. One read: read apart, a commit between
-    /// them shows a ready job with no summary. Blocking.
-    pub fn operation(
-        &self,
-        job_id: &str,
-    ) -> Result<(OperationDetail, Option<Summary>), OperationError> {
-        self.db.read_blocking("repairs.operation", |conn| {
-            let detail = job_detail(conn, job_id)?;
-            if OperationKind::parse(&detail.job.kind) != Some(OperationKind::Repair) {
-                return Ok((detail, None));
-            }
-            let snap = store::snapshot(conn, job_id)?.transpose()?;
-            Ok::<_, OperationError>((detail, snap.and_then(|snap| snap.summary)))
-        })
     }
 
     /// A scan run's redacted diagnostic report: its file name and bytes.
@@ -175,20 +156,6 @@ impl Repairs {
             .read_blocking("repairs.estimate_preparation", |conn| {
                 Ok(store::estimate_preparation(conn, &roots)?)
             })
-    }
-
-    /// One repair job with its summary; not found when it is not a job of
-    /// `purpose`.
-    pub fn get(&self, job_id: &str, purpose: Purpose) -> Result<RepairDetail, OperationError> {
-        // The job and its summary come from one read: read apart, a commit
-        // between them shows a ready job with no summary.
-        self.db.read_blocking("repairs.get", |conn| {
-            let (_, snap) = store::repair_job(conn, job_id, purpose)?;
-            Ok(RepairDetail {
-                detail: job_detail(conn, job_id)?,
-                summary: snap.summary,
-            })
-        })
     }
 
     /// A page of a purpose's jobs, newest first, and the `(created_at, id)`
@@ -284,22 +251,6 @@ impl Repairs {
                 store::discard(tx, job_id, expected_row_revision, self.clock.now_secs())
             })
     }
-
-    /// Pause, resume, or stop a repair job.
-    pub fn control(
-        &self,
-        job_id: &str,
-        purpose: Purpose,
-        control: Control,
-        expected_row_revision: i64,
-        idempotency_key: Option<&str>,
-    ) -> Result<OperationJob, OperationError> {
-        self.db.read_blocking("repairs.control", |conn| {
-            store::repair_job(conn, job_id, purpose).map(|_| ())
-        })?;
-        self.ops
-            .control(job_id, control, expected_row_revision, idempotency_key)
-    }
 }
 
 /// The repairs worker the loop runs: it claims and works repair jobs and
@@ -386,8 +337,8 @@ impl RepairWorker {
                 .is_some_and(CancellationToken::is_cancelled)
     }
 
-    /// Queue a cleanup of albums identification finished with (v2's
-    /// per-album hygiene after identification), one job per page of
+    /// Queue a cleanup of albums identification finished with (per-album
+    /// hygiene after identification), one job per page of
     /// finished identifications after the stored watermark. Each job is
     /// queued in the write that moves the watermark past its page, so a
     /// restart neither repeats nor skips one, and a busy database leaves
@@ -618,7 +569,7 @@ impl RepairWorker {
     }
 
     /// After each finished scan, queue a cleanup of the albums that scan
-    /// changed and of empty album shells (v2's per-album hygiene). Checked
+    /// changed and of empty album shells (per-album hygiene). Checked
     /// once per run; nothing is queued when no album qualifies.
     fn queue_hygiene_after_scan(&self) -> Result<(), OperationError> {
         let Some(run) = self.db.read_blocking(

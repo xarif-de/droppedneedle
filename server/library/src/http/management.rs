@@ -2,7 +2,7 @@
 //! through its files, apply or discard it, get a new token for it, read
 //! the history and results of applied jobs, and preview an undo.
 //!
-//! Every route is admin-only, as in v2. Store and file work runs on a
+//! Every route is admin-only. Store and file work runs on a
 //! blocking thread.
 
 use axum::{
@@ -18,6 +18,7 @@ use utoipa::{IntoParams, ToSchema};
 
 use super::blocking;
 use super::operations::{OperationView, ReasonView, job_view};
+use crate::jobs::OperationState;
 use crate::jobs::{ControlRequest, ManagementPhase};
 use crate::management::after_apply::ExternalRefresh;
 use crate::management::models::{
@@ -26,7 +27,6 @@ use crate::management::models::{
 };
 use crate::management::reasons::ItemReason;
 use crate::management::service::{ApplyRequest, HISTORY_MAX, Management, PAGE_MAX, PreviewRequest};
-use crate::operations::models::OperationState;
 use crate::wiring::LibraryServices;
 use droppedneedle_auth::Admin;
 use droppedneedle_kernel::runtime_config::sections::LibraryManagementRootOverrides;
@@ -59,7 +59,7 @@ impl From<ManagementError> for ApiError {
             }
             ManagementError::Store(cause) => ApiError::internal(cause),
             ManagementError::Busy(cause) => ApiError::unavailable(Unavailable::ServerBusy, cause),
-            error @ ManagementError::BinsUnknown => {
+            error @ ManagementError::BinsUnknown(_) => {
                 ApiError::unavailable(Unavailable::ServerBusy, error.to_string())
             }
         }
@@ -137,7 +137,6 @@ pub struct ManagementJobView {
     pub profile_name: String,
     pub profile_revision: String,
     pub settings_revision: String,
-    pub policy_revision: String,
     pub catalog_revision: i64,
     pub proposed_settings_revision: Option<String>,
     pub target_root_id: Option<String>,
@@ -192,7 +191,6 @@ impl From<JobDetail> for ManagementJobView {
             profile_name: detail.profile_name,
             profile_revision: detail.profile_revision,
             settings_revision: detail.settings_revision,
-            policy_revision: detail.policy_revision,
             catalog_revision: detail.catalog_revision,
             proposed_settings_revision: detail.proposed_settings_revision,
             target_root_id: detail.target_root_id,
@@ -213,7 +211,7 @@ impl From<JobDetail> for ManagementJobView {
             terminal_reason: job
                 .terminal_code
                 .as_deref()
-                .map(|code| crate::operations::reasons::terminal(code).into()),
+                .map(|code| crate::reasons::terminal(code).into()),
             terminal_code: job.terminal_code.clone(),
             worker_heartbeat_at: detail.heartbeat_at,
             worker_lease_expires_at: detail.lease_expires_at,

@@ -5,6 +5,8 @@
 	import AlbumGridSkeleton from '$lib/components/AlbumGridSkeleton.svelte';
 	import ArtistWhereToBuy from '$lib/components/ArtistWhereToBuy.svelte';
 	import ReleaseList from '$lib/components/ReleaseList.svelte';
+	import { heldTracksByGroup } from '$lib/utils/trackCount';
+	import { getLibraryArtistAlbumsQuery } from '$lib/queries/library/LibraryQueries.svelte';
 	import Button from '$lib/ui/Button.svelte';
 	import ArtistHero from '$lib/components/ArtistHero.svelte';
 	import ArtistDescription from '$lib/components/ArtistDescription.svelte';
@@ -12,12 +14,13 @@
 	import TopSongsList from '$lib/components/TopSongsList.svelte';
 	import TopAlbumsList from '$lib/components/TopAlbumsList.svelte';
 	import LastFmEnrichment from '$lib/components/LastFmEnrichment.svelte';
-	import LibraryAlbumsCarousel from '$lib/components/LibraryAlbumsCarousel.svelte';
+	import ArtistLibraryAlbums from '$lib/components/library/ArtistLibraryAlbums.svelte';
 	import ArtistAppearancesSection from '$lib/components/library/ArtistAppearancesSection.svelte';
+	import ArtistMusicBrainzLink from '$lib/components/library/ArtistMusicBrainzLink.svelte';
 	import LocalArtistPage from './LocalArtistPage.svelte';
-	import type { LibraryArtistSummary } from '$lib/types';
+	import type { ArtistView } from '$lib/types';
 	import PageSectionToc from '$lib/components/PageSectionToc.svelte';
-	import { requestAlbum } from '$lib/queries/downloads/DownloadMutations.svelte';
+	import { createRequestAlbumMutation } from '$lib/queries/downloads/DownloadMutations.svelte';
 	import { withBasePath } from '$lib/utils/basePath';
 	import { libraryStore } from '$lib/stores/library';
 	import { type MusicSource, isMusicSource } from '$lib/stores/musicSource';
@@ -41,26 +44,32 @@
 		discographyDownloadStore,
 		type DiscographyRelease
 	} from '$lib/stores/discographyDownload.svelte';
-	import { Download } from 'lucide-svelte';
+	import { CircleAlert, Download } from 'lucide-svelte';
+	import { listeningSourceNotice } from '$lib/components/artist/listeningSourceNotice';
 	import ArtistReleasePagination from '$lib/components/ArtistReleasePagination.svelte';
 	import { mergeArtistReleasePages } from '$lib/queries/artist/artistReleasePages';
 	import { mergeArtistImages } from '$lib/queries/catalog/catalogAdapters';
-	import { getRatingsQuery, ratingOf, setRating } from '$lib/queries/ratings/RatingQueries.svelte';
-	import { setFavorite } from '$lib/queries/library/FavoriteMutations.svelte';
+	import { getRatingsQuery, ratingOf, createSetRatingMutation } from '$lib/queries/ratings.svelte';
+	import { createSetFavoriteMutation } from '$lib/queries/library/FavoriteMutations.svelte';
 
 	interface Props {
 		data: { artistId: string; primarySource: MusicSource };
-		localArtist?: LibraryArtistSummary;
+		localArtist?: ArtistView;
 	}
 
 	let { data, localArtist }: Props = $props();
+
+	// The discography rows of albums the library holds say how many of
+	// their tracks it has.
+	const libraryAlbumsQuery = getLibraryArtistAlbumsQuery(() => localArtist?.id ?? '');
+	const libraryTracks = $derived(heldTracksByGroup(libraryAlbumsQuery.data?.items ?? []));
 
 	// Only an artist the library holds is rated, under its local id.
 	const ratingsQuery = getRatingsQuery(() =>
 		localArtist ? { artistIds: [localArtist.id] } : null
 	);
-	const rate = setRating();
-	const heart = setFavorite();
+	const rate = createSetRatingMutation();
+	const heart = createSetFavoriteMutation();
 
 	// svelte-ignore state_referenced_locally
 	let activeSource = new PersistedState<MusicSource>(
@@ -193,6 +202,7 @@
 		enabled: discoveryEnabled
 	}));
 	const topAlbums = $derived(discoveryEnabled ? topAlbumsQuery.data : undefined);
+	const sourceNotice = $derived(listeningSourceNotice([topSongs, topAlbums, similarArtists]));
 	const loadingTopAlbums = $derived(!discoveryEnabled || topAlbumsQuery.isLoading);
 
 	const lastFmEnrichmentQuery = getArtistLastFmEnrichmentQuery(() => ({
@@ -240,7 +250,7 @@
 		void refreshArtist(data.artistId);
 	}
 
-	const providerReleaseRequest = requestAlbum();
+	const providerReleaseRequest = createRequestAlbumMutation();
 
 	async function handleRequest(releaseId: string, releaseTitle?: string) {
 		requestedReleaseIds.add(releaseId);
@@ -294,7 +304,7 @@
 			title: r.title,
 			type: r.type ?? 'Album',
 			year: r.year,
-			in_library: libraryStore.isInLibrary(r.id) || (!$libraryStore.initialized && r.in_library),
+			in_library: libraryStore.isInLibrary(r.id) || r.in_library,
 			requested: r.requested || libraryStore.isRequested(r.id)
 		}));
 		discographyDownloadStore.show(artist.name, data.artistId, items);
@@ -307,7 +317,7 @@
 			title: r.title,
 			type,
 			year: r.year,
-			in_library: libraryStore.isInLibrary(r.id) || (!$libraryStore.initialized && r.in_library),
+			in_library: libraryStore.isInLibrary(r.id) || r.in_library,
 			requested: r.requested || libraryStore.isRequested(r.id)
 		}));
 		discographyDownloadStore.show(artist.name, data.artistId, items);
@@ -319,6 +329,9 @@
 		}
 		return [
 			{ id: 'section-overview', label: 'Overview' },
+			...(localArtist && localArtist.album_count > 0
+				? [{ id: 'section-library-albums', label: 'In your library' }]
+				: []),
 			...(artist.appears_in_library
 				? [{ id: 'section-library-appearances', label: 'Local appearances' }]
 				: []),
@@ -426,8 +439,19 @@
 						</div>
 					{/if}
 
+					{#if localArtist}
+						<ArtistMusicBrainzLink
+							artistId={localArtist.id}
+							className="justify-center sm:justify-start"
+						/>
+					{/if}
+
 					<ArtistWhereToBuy artistMbid={data.artistId} artistName={artist.name} />
 				</section>
+
+				{#if localArtist && localArtist.album_count > 0}
+					<ArtistLibraryAlbums libraryArtistId={localArtist.id} artistMbid={data.artistId} />
+				{/if}
 
 				{#if artist.appears_in_library}
 					<ArtistAppearancesSection artistId={data.artistId} />
@@ -466,12 +490,6 @@
 					</div>
 				{/if}
 
-				<LibraryAlbumsCarousel
-					releases={[...releases.albums, ...releases.eps, ...releases.singles]}
-					artistName={artist.name}
-					loading={loadingBasic}
-				/>
-
 				{#if linkedSources.length === 2}
 					<div class="flex items-center justify-end mt-8 mb-4">
 						<SimpleSourceSwitcher
@@ -480,6 +498,17 @@
 								activeSource.current = newSource;
 							}}
 						/>
+					</div>
+				{/if}
+
+				{#if sourceNotice}
+					<div
+						role="status"
+						class="alert alert-warning alert-soft mb-4 flex items-center gap-2 text-sm"
+						class:mt-8={linkedSources.length !== 2}
+					>
+						<CircleAlert class="h-4 w-4 shrink-0" />
+						<span>{sourceNotice}</span>
 					</div>
 				{/if}
 
@@ -523,6 +552,7 @@
 						<ReleaseList
 							title="Albums"
 							releases={releases.albums}
+							{libraryTracks}
 							collapsed={albumsCollapsed}
 							requestingIds={requestedReleaseIds}
 							showLoadingIndicator={loadingMoreReleases}
@@ -540,6 +570,7 @@
 						<ReleaseList
 							title="EPs"
 							releases={releases.eps}
+							{libraryTracks}
 							collapsed={epsCollapsed}
 							requestingIds={requestedReleaseIds}
 							showLoadingIndicator={loadingMoreReleases}
@@ -557,6 +588,7 @@
 						<ReleaseList
 							title="Singles"
 							releases={releases.singles}
+							{libraryTracks}
 							collapsed={singlesCollapsed}
 							requestingIds={requestedReleaseIds}
 							showLoadingIndicator={loadingMoreReleases}

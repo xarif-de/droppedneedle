@@ -111,7 +111,7 @@ pub struct Sandbox {
     /// `Err` with the cause while the bins are unknown (a setting they
     /// come from cannot be read): nothing then moves into a bin, and no
     /// other bin stands in.
-    bins: Result<Vec<Root>, &'static str>,
+    bins: Result<Vec<Root>, super::bin::BinsUnknown>,
     /// Keyed by (is a bin, id), so a bin id never shadows a root id.
     modes: Arc<Mutex<BTreeMap<(bool, String), PlacementMode>>>,
 }
@@ -148,7 +148,7 @@ impl Sandbox {
     /// The same sandbox while its bins are unknown because `cause`: no
     /// entry is checked or written until a session that knows them opens.
     #[must_use]
-    pub fn with_bins_unknown(mut self, cause: &'static str) -> Self {
+    pub fn with_bins_unknown(mut self, cause: super::bin::BinsUnknown) -> Self {
         self.bins = Err(cause);
         self
     }
@@ -215,7 +215,13 @@ impl Sandbox {
                 return PlacementMode::Unknown;
             }
         }
-        let mode = place::probe(&bin.dir);
+        let mode = match probe_held_dir(&bin.dir) {
+            Ok(mode) => mode,
+            Err(error) => {
+                tracing::warn!(bin = bin.id, %error, "recycle bin folder refused");
+                return PlacementMode::Unknown;
+            }
+        };
         if mode == PlacementMode::Check {
             tracing::info!(
                 bin = bin.id,
@@ -399,7 +405,7 @@ impl Sandbox {
     }
 
     /// Why the session's bins are unknown, while they are.
-    pub fn bins_unknown(&self) -> Option<&'static str> {
+    pub fn bins_unknown(&self) -> Option<super::bin::BinsUnknown> {
         self.bins.as_ref().err().copied()
     }
 
@@ -565,7 +571,8 @@ impl ResolvedRoot {
         }
     }
 
-    fn folder(&self) -> &Path {
+    /// The real folder, or the configured path while it does not resolve.
+    pub fn folder(&self) -> &Path {
         self.real.as_deref().unwrap_or(&self.configured)
     }
 }
@@ -654,8 +661,9 @@ pub(crate) fn below_root<'p>(root: &Path, path: &'p Path) -> Option<&'p Path> {
 /// existing component of `path` below it is a symlink. `root` and what
 /// lies above it are the admin's and are not checked for links. Missing
 /// trailing components are allowed so new destinations can be validated
-/// before they exist. Readers outside the publisher use it too, so a file
-/// is never read through a link below a library folder.
+/// before they exist. A reader opens through
+/// `droppedneedle_kernel::beneath` instead, which refuses a link at the
+/// open itself.
 pub fn ensure_no_symlink_below(root: &Path, path: &Path) -> Result<(), PublishError> {
     ensure_library_dir(root)?;
     no_symlink_below(root, path)
@@ -1025,8 +1033,13 @@ pub fn recycle_backup(
     };
     let backup_meta = match std::fs::symlink_metadata(backup) {
         Ok(meta) => meta,
+        // An earlier attempt moved it in: the file set aside, by identity
+        // (an edit before the move keeps it so), or the bytes read.
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(hash_of(recycle_to).as_deref() == Some(sha256));
+            let moved_in = known.is_some_and(|known| {
+                FileStat::read(recycle_to).is_ok_and(|now| known.same_moved(&now))
+            });
+            return Ok(moved_in || hash_of(recycle_to).as_deref() == Some(sha256));
         }
         Err(error) => return Err(PublishError::Io(error.to_string().into())),
     };
@@ -1178,6 +1191,26 @@ pub(crate) fn incoming_temp(recycle_to: &Path) -> Option<PathBuf> {
     )))
 }
 
+/// Probe placement in `dir` through a handle on the folder itself, opened
+/// without following a link: a folder that turned into a link after its
+/// check is refused, not probed through.
+#[cfg(target_os = "linux")]
+fn probe_held_dir(dir: &Path) -> std::io::Result<PlacementMode> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_DIRECTORY)
+        .open(dir)?;
+    let through = PathBuf::from(format!("/proc/self/fd/{}", held.as_raw_fd()));
+    Ok(place::probe(&through))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn probe_held_dir(dir: &Path) -> std::io::Result<PlacementMode> {
+    Ok(place::probe(dir))
+}
+
 /// Make `dir` and any folder above it that is missing. Answers the
 /// folders made, top first.
 fn make_dirs(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
@@ -1212,7 +1245,7 @@ fn sync_made(made: &[PathBuf]) -> Result<(), PublishError> {
 /// Unicode/case-fold collision key: NFC normalization plus full
 /// casefold, so names that differ only by case or by canonically
 /// equivalent sequences can never publish side by side.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CollisionKey(String);
 
 /// Build the collision key for one root-relative destination.

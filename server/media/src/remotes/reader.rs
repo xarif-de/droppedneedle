@@ -10,13 +10,16 @@
 
 use std::sync::Arc;
 
+use crate::stream::engine::{AudioSource, MediaBody, StreamFault, StreamMedia};
 use crate::stream::gateway::RemoteReader;
 use crate::stream::ranged;
-use crate::stream::routes::{AudioSource, MediaBody, StreamFault, StreamMedia};
 
-use super::adapter::{AdapterError, RemoteHandle, status_error, transport};
+use super::source::{AdapterError, RemoteHandle};
+
 use super::connections::{ConnectionResolver, Reads, ResolveError};
 use super::models::SourceName;
+use super::transport::{status_error, transport};
+use droppedneedle_providers::RequestPriority;
 
 /// Gateway remote reads over the caller's connection (own link first,
 /// then the admin's shared account, like every other remote read).
@@ -54,7 +57,7 @@ impl RemotesRemoteReader {
         };
         let resolved = self
             .resolver
-            .resolve(user_id, name)
+            .resolve(user_id, name, RequestPriority::UserInitiated)
             .await
             .map_err(|error| match error {
                 // Without a usable connection the item is unresolvable,

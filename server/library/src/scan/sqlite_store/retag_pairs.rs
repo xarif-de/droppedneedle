@@ -119,12 +119,10 @@ pub(super) fn recorded(
     new_album_id: &str,
 ) -> rusqlite::Result<Option<(RetagPairReason, RetagPairState)>> {
     let stored: Option<(String, String)> = conn
-        .prepare_cached(
-            "SELECT reason, state FROM library_retag_pairs \
-             WHERE old_album_id = ?1 AND new_album_id = ?2",
-        )?
+        .prepare_cached(crate::scan::sql::RECORDED.text())?
         .query_row(params![old_album_id, new_album_id], |row| {
-            Ok((row.get(0)?, row.get(1)?))
+            let row = crate::scan::sql::RetagPairRow::read(row)?;
+            Ok((row.reason, row.state))
         })
         .optional()?;
     let unknown = |column: usize, value: &str| {
@@ -157,15 +155,7 @@ pub(super) fn record(
     now_ms: i64,
 ) -> rusqlite::Result<bool> {
     let written = conn
-        .prepare_cached(
-            "INSERT INTO library_retag_pairs (old_album_id, new_album_id, reason, state, \
-             recorded_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5) \
-             ON CONFLICT (old_album_id, new_album_id) DO UPDATE SET \
-             reason = excluded.reason, updated_at = excluded.updated_at \
-             WHERE library_retag_pairs.reason IN (?6, ?7, ?8) \
-             AND library_retag_pairs.state = ?4 \
-             AND excluded.reason <> library_retag_pairs.reason",
-        )?
+        .prepare_cached(crate::scan::sql::RECORD.text())?
         .execute(params![
             old_album_id,
             new_album_id,
@@ -177,4 +167,26 @@ pub(super) fn record(
             RetagPairReason::WorkOnNewRow.as_str(),
         ])?;
     Ok(written > 0)
+}
+
+/// End the dismissed pairs whose new album is `album_id` or was merged
+/// into it since, when this run
+/// moved tracks from it back to the pair's old album and it holds no
+/// indexed track any more. The person's answer was about a rename that is
+/// undone, so it must not stop a later rename of the old album from being
+/// joined. Returns each ended pair's old and new album.
+pub(super) fn end_dismissed_returned(
+    conn: &Connection,
+    run_id: &str,
+    album_id: &str,
+) -> rusqlite::Result<Vec<(String, String)>> {
+    conn.prepare_cached(crate::scan::sql::END_DISMISSED_RETURNED.text())?
+        .query_map(
+            params![run_id, album_id, RetagPairState::Dismissed.as_str()],
+            |row| {
+                let row = crate::scan::sql::RetagAlbums::read(row)?;
+                Ok((row.old_album_id, row.new_album_id))
+            },
+        )?
+        .collect()
 }

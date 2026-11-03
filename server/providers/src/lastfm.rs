@@ -39,6 +39,16 @@ pub const DEFAULT_BASE_URL: &str = "https://ws.audioscrobbler.com/2.0/";
 /// purpose; it is decoded from the documented envelope and covered by a
 /// scripted fake instead.
 pub const ERROR_RATE_LIMITED: i64 = 29;
+/// Invalid API key. Seen live: a 403 with this code, recorded 2026-10-26
+/// (tests/fixtures/lastfm/invalid_key.json).
+pub const ERROR_INVALID_KEY: i64 = 10;
+/// Invalid method signature: the shared secret does not match the key.
+/// Taken from the listing at https://www.last.fm/api/errorcodes (read
+/// 2026-11-02), not provoked live; the envelope is assumed to match error
+/// 10's.
+pub const ERROR_INVALID_SIGNATURE: i64 = 13;
+/// Suspended API key. From the same listing, not provoked live.
+pub const ERROR_SUSPENDED_KEY: i64 = 26;
 /// The rest after error 29.
 pub const RATE_LIMIT_WAIT: Duration = Duration::from_secs(1);
 /// The provider name errors carry, and the Last.fm rate row.
@@ -66,7 +76,10 @@ pub static SPEC: Spec = Spec {
 /// - 6, unknown entity: absence ([`ProviderError::NotFound`]);
 /// - 29, rate limit: [`ProviderError::RateLimited`] for one second;
 /// - 11 and 16, offline or temporary: [`ProviderError::Unavailable`];
-/// - 4, 10, 13, 15 and 26 (key, signature, expired token, suspended key):
+/// - 10, 13 and 26 (invalid key, invalid signature, suspended key):
+///   [`ProviderError::Rejected`] with the code, so a key check can say
+///   which credential is wrong;
+/// - 4 and 15 (authentication failed, expired token):
 ///   [`ProviderError::Unauthorized`];
 /// - 9, 14 and 17 (session, unapproved token, login required):
 ///   [`ProviderError::Forbidden`];
@@ -91,7 +104,10 @@ pub fn classify(answer: &Answer<'_>) -> Result<(), ProviderError> {
             provider,
             retry_after: None,
         },
-        Some(4 | 10 | 13 | 15 | 26) => ProviderError::Unauthorized { provider },
+        Some(code @ (ERROR_INVALID_KEY | ERROR_INVALID_SIGNATURE | ERROR_SUSPENDED_KEY)) => {
+            ProviderError::Rejected { provider, code }
+        }
+        Some(4 | 15) => ProviderError::Unauthorized { provider },
         Some(9 | 14 | 17) => ProviderError::Forbidden { provider },
         Some(_) => ProviderError::BadRequest { provider, status },
         None => ProviderError::Server { provider, status },
@@ -157,8 +173,8 @@ pub struct AuthToken {
 }
 
 /// A session reply from `auth.getSession`. Name and key are both required:
-/// an answer missing either is a failure.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// an answer missing either is a failure. Its debug form never shows the key.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Session {
     /// Linked Last.fm username.
     pub name: String,
@@ -166,6 +182,16 @@ pub struct Session {
     pub key: String,
     /// Subscriber flag.
     pub subscriber: i64,
+}
+
+impl std::fmt::Debug for Session {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Session")
+            .field("name", &self.name)
+            .field("key", &"<redacted>")
+            .field("subscriber", &self.subscriber)
+            .finish()
+    }
 }
 
 /// A plain tag.
@@ -193,10 +219,10 @@ pub struct ArtistInfo {
     pub name: String,
     /// MusicBrainz artist id.
     pub mbid: Option<String>,
-    /// Listener count.
-    pub listeners: i64,
-    /// Play count.
-    pub playcount: i64,
+    /// Listener count; `None` when Last.fm sent none.
+    pub listeners: Option<i64>,
+    /// Play count; `None` when Last.fm sent none.
+    pub playcount: Option<i64>,
     /// Last.fm URL.
     pub url: String,
     /// Biography summary.
@@ -218,10 +244,10 @@ pub struct AlbumInfo {
     pub artist_name: String,
     /// MusicBrainz release id.
     pub mbid: Option<String>,
-    /// Listener count.
-    pub listeners: i64,
-    /// Play count.
-    pub playcount: i64,
+    /// Listener count; `None` when Last.fm sent none.
+    pub listeners: Option<i64>,
+    /// Play count; `None` when Last.fm sent none.
+    pub playcount: Option<i64>,
     /// Last.fm URL.
     pub url: String,
     /// Artwork URL (extralarge preferred, else the last image).
@@ -271,8 +297,8 @@ pub struct TopItem {
     pub artist_name: String,
     /// MusicBrainz id (recording, release or artist), when Last.fm knows one.
     pub mbid: Option<String>,
-    /// Play count.
-    pub playcount: i64,
+    /// Play count, when Last.fm sent one.
+    pub playcount: Option<i64>,
     /// Artwork URL (extralarge preferred), empty when none was sent.
     pub image_url: String,
 }
@@ -1059,7 +1085,13 @@ pub fn api_sig(params: &[(String, String)], shared_secret: &str) -> String {
 
 /// A count, 0 when Last.fm sent none or sent text that is not a number.
 fn count(value: Option<&models::Lenient>) -> i64 {
-    value.and_then(models::Lenient::value).unwrap_or(0)
+    sent_count(value).unwrap_or(0)
+}
+
+/// A count Last.fm sent, or `None` when it sent none or sent text that is
+/// not a number.
+fn sent_count(value: Option<&models::Lenient>) -> Option<i64> {
+    value.and_then(models::Lenient::value)
 }
 
 /// Pick the artwork URL: `extralarge` wins, otherwise the last image wins.
@@ -1106,8 +1138,8 @@ fn artist_info(artist: models::WireArtistInfo) -> Option<ArtistInfo> {
     let bio = artist.bio.as_ref().and_then(models::Section::get);
     Some(ArtistInfo {
         mbid: mbid_or_none(artist.mbid.as_deref()),
-        listeners: count(stats.and_then(|stats| stats.listeners.as_ref())),
-        playcount: count(stats.and_then(|stats| stats.playcount.as_ref())),
+        listeners: sent_count(stats.and_then(|stats| stats.listeners.as_ref())),
+        playcount: sent_count(stats.and_then(|stats| stats.playcount.as_ref())),
         url: web_address::or_empty(artist.url),
         bio_summary: bio.and_then(|bio| bio.summary.clone()).unwrap_or_default(),
         bio_content: bio.and_then(|bio| bio.content.clone()).unwrap_or_default(),
@@ -1149,8 +1181,8 @@ fn album_info(album: models::WireAlbumInfo) -> Option<AlbumInfo> {
             .unwrap_or("")
             .to_owned(),
         mbid: mbid_or_none(album.mbid.as_deref()),
-        listeners: count(album.listeners.as_ref()),
-        playcount: count(album.playcount.as_ref()),
+        listeners: sent_count(album.listeners.as_ref()),
+        playcount: sent_count(album.playcount.as_ref()),
         image_url: pick_image(album.image.as_ref()),
         summary: album
             .wiki
@@ -1180,7 +1212,7 @@ fn top_item(item: &models::WireTopItem) -> Option<TopItem> {
             .unwrap_or("")
             .to_owned(),
         mbid: mbid_or_none(item.mbid.as_deref()),
-        playcount: count(item.playcount.as_ref()),
+        playcount: sent_count(item.playcount.as_ref()),
         image_url: pick_image(item.image.as_ref()),
     })
 }

@@ -9,8 +9,8 @@
 	import { ApiError } from '$lib/api/errors';
 	import { getAlbumEditionsQuery } from '$lib/queries/albums/EditionQueries.svelte';
 	import {
-		dismissRetagPair,
-		joinRetagPair,
+		createDismissRetagPairMutation,
+		createJoinRetagPairMutation,
 		type RetagPair
 	} from '$lib/queries/library/LibraryRetagPairQueries.svelte';
 	import { authStore } from '$lib/stores/authStore.svelte';
@@ -26,8 +26,8 @@
 
 	let { pair, currentAlbumId }: Props = $props();
 
-	const join = joinRetagPair();
-	const dismiss = dismissRetagPair();
+	const join = createJoinRetagPairMutation();
+	const dismiss = createDismissRetagPairMutation();
 
 	let keep = $state<string | null>(null);
 	let refusal = $state<string | null>(null);
@@ -98,9 +98,9 @@
 				oldAlbumId: oldAlbum.id,
 				newAlbumId: newAlbum.id,
 				keepEditionOf: pair.editions_differ ? keep : null,
-				expectedIdentityRevisions: {
-					[oldAlbum.id]: oldAlbum.identity_revision,
-					[newAlbum.id]: newAlbum.identity_revision
+				expectedIdentityTokens: {
+					[oldAlbum.id]: oldAlbum.identity_token,
+					[newAlbum.id]: newAlbum.identity_token
 				}
 			});
 			if (currentAlbumId && joined.album_id !== currentAlbumId) {

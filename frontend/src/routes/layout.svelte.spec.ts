@@ -51,14 +51,6 @@ vi.mock('$app/stores', () => ({
 		})
 	}
 }));
-vi.mock('$lib/stores/errorModal', () => ({
-	errorModal: {
-		subscribe: vi.fn((cb: (v: unknown) => void) => {
-			cb({ show: false });
-			return () => {};
-		})
-	}
-}));
 vi.mock('$lib/stores/library', () => ({
 	libraryStore: {
 		subscribe: vi.fn((cb: (v: unknown) => void) => {
@@ -76,7 +68,7 @@ vi.mock('$lib/stores/library', () => ({
 	}
 }));
 // The shell's session-wide reads answer from fixed state, with no network.
-vi.mock('$lib/queries/HomeIntegrationStatusQuery.svelte', () => ({
+vi.mock('$lib/queries/home.svelte', () => ({
 	getIntegrationStatusQuery: vi.fn(() => ({ data: integrationState })),
 	useIntegrationStatus: () => ({ current: integrationState })
 }));
@@ -130,9 +122,6 @@ vi.mock('$lib/stores/player.svelte', () => ({
 	}
 }));
 vi.mock('$lib/player/launchYouTubePlayback', () => ({ launchYouTubePlayback: vi.fn() }));
-vi.mock('$lib/stores/playbackToast.svelte', () => ({
-	playbackToast: { visible: false, message: '', type: 'info', show: vi.fn(), dismiss: vi.fn() }
-}));
 vi.mock('$lib/stores/scrobble.svelte', () => ({
 	scrobbleManager: { init: vi.fn().mockResolvedValue(undefined) }
 }));
@@ -142,7 +131,7 @@ vi.mock('$lib/utils/lazyImage', () => ({
 	resetLazyImage: vi.fn()
 }));
 vi.mock('$lib/queries/downloads/DownloadMutations.svelte', () => ({
-	requestBatch: () => ({ mutateAsync: batchRequestMock })
+	createRequestBatchMutation: () => ({ mutateAsync: batchRequestMock })
 }));
 vi.mock('$lib/utils/navigationProgress', () => ({
 	createNavigationProgressController: vi.fn(() => ({

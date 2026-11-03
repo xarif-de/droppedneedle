@@ -4,8 +4,8 @@
 	import {
 		getSabnzbdConfigQuery,
 		getSabnzbdStatusQuery,
-		saveSabnzbdConfig,
-		testSabnzbd
+		createSaveSabnzbdConfigMutation,
+		createTestSabnzbdMutation
 	} from '$lib/queries/downloads/DownloadClientsQueries.svelte';
 	import { getIndexersQuery } from '$lib/queries/downloads/IndexerQueries.svelte';
 	import { toastStore } from '$lib/stores/toast';
@@ -28,31 +28,35 @@
 
 	const statusQuery = getSabnzbdStatusQuery();
 	const indexersQuery = getIndexersQuery();
-	const test = testSabnzbd();
+	const test = createTestSabnzbdMutation();
 
 	// SABnzbd only downloads what an indexer finds - a Usenet source with no indexer is inert.
 	const hasIndexer = $derived((indexersQuery.data?.length ?? 0) > 0);
 
 	let testResult = $state<SabnzbdTestResult | null>(null);
 
-	const section = createSettingsSection(getSabnzbdConfigQuery(), saveSabnzbdConfig(), {
-		normalize: (draft) => ({
-			...draft,
-			category: draft.category || '*',
-			downloads_mount: draft.downloads_mount || '/sabnzbd-downloads'
-		}),
-		test: async (draft) => {
-			testResult = null;
-			if (!draft.url.trim()) return { passed: false, message: 'Add the URL first.' };
-			testResult = await test.mutateAsync(draft);
-			return {
-				passed: testResult.valid,
-				message: testResult.valid
-					? `Connected${testResult.version ? ` · v${testResult.version}` : ''}`
-					: testResult.message
-			};
+	const section = createSettingsSection(
+		getSabnzbdConfigQuery(),
+		createSaveSabnzbdConfigMutation(),
+		{
+			normalize: (draft) => ({
+				...draft,
+				category: draft.category || '*',
+				downloads_mount: draft.downloads_mount || '/sabnzbd-downloads'
+			}),
+			test: async (draft) => {
+				testResult = null;
+				if (!draft.url.trim()) return { passed: false, message: 'Add the URL first.' };
+				testResult = await test.mutateAsync(draft);
+				return {
+					passed: testResult.valid,
+					message: testResult.valid
+						? `Connected${testResult.version ? ` · v${testResult.version}` : ''}`
+						: testResult.message
+				};
+			}
 		}
-	});
+	);
 
 	function statusText(enabled: boolean, url: string): string {
 		const live = testResult ?? statusQuery.data;
@@ -121,12 +125,14 @@
 					mono
 					bind:value={draft.url}
 					placeholder="http://sabnzbd:8080"
+					error={section.fieldError('url', 'SABnzbd URL')}
 				/>
 				<SecretField
 					label="API key (full)"
 					mask={SECRET_MASK}
 					bind:value={draft.api_key}
 					placeholder="SABnzbd full API key"
+					error={section.fieldError('api_key', 'API key (full)')}
 				/>
 			</section>
 
@@ -140,6 +146,7 @@
 				bind:value={draft.category}
 				options={categoryOptions(draft.category)}
 				help="Run Test to load categories. A dedicated droppedneedle category gives predictable folders, but * works."
+				error={section.fieldError('category', 'Category')}
 			/>
 
 			<section class="space-y-2">

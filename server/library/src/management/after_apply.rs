@@ -17,6 +17,23 @@ use super::store::{self, ManagedMark, Snapshot};
 use super::takeover;
 use crate::clock::LibraryClock as _;
 use crate::jobs;
+use crate::publish::PublishError;
+use crate::service::ServiceError;
+
+/// Why the route that undoes a single bundle did not undo it.
+#[derive(Debug)]
+pub enum UndoBundleError {
+    /// A Library Management run wrote the bundle; it is undone from History.
+    RunBundle,
+    /// The undo itself was refused or failed.
+    Service(ServiceError),
+}
+
+impl From<ServiceError> for UndoBundleError {
+    fn from(error: ServiceError) -> Self {
+        Self::Service(error)
+    }
+}
 
 impl Management {
     /// Bookkeeping for one album the job just wrote. The files are
@@ -52,17 +69,17 @@ impl Management {
     ) -> Result<Option<serde_json::Value>, ManagementError> {
         let job_id = snapshot.job.id.as_str();
         let items = self
-            .setup
+            .parts
             .db
             .read_blocking("management.record_bundle_items", |conn| {
                 Ok::<_, ManagementError>(store::bundle_items(conn, job_id, ordinal)?)
             })?;
         let intent = snapshot.intent();
         let mode = snapshot.job_mode();
-        let now = self.setup.clock.now_secs();
+        let now = self.parts.clock.now_secs();
         let mut extra = None;
         if let Some(edit) = &intent.tag_edit {
-            self.setup
+            self.parts
                 .db
                 .write_blocking(Lane::Background, "management.save_tag_edit", |tx| {
                     Ok::<_, ManagementError>(store::save_tag_edit(
@@ -88,13 +105,13 @@ impl Management {
         }
         if mode == Some(JobMode::Undo)
             && let Some(source) = snapshot.linked_job_id.as_deref()
-            && let Some(source) = self.setup.db.read_blocking("management.snapshot", |conn| {
+            && let Some(source) = self.parts.db.read_blocking("management.snapshot", |conn| {
                 Ok::<_, ManagementError>(store::snapshot(conn, source)?)
             })?
         {
             if let Some(edit) = source.intent().tag_edit {
                 // Undoing a tag edit also puts its kept values back.
-                self.setup.db.write_blocking(
+                self.parts.db.write_blocking(
                     Lane::Background,
                     "management.revert_tag_edit",
                     |tx| Ok::<_, ManagementError>(store::revert_tag_edit(tx, &edit, job_id, now)?),
@@ -106,7 +123,7 @@ impl Management {
         let written = items.iter().filter(|item| item.eligibility.writes());
         match mode {
             Some(JobMode::BaselineRestore) => {
-                self.setup
+                self.parts
                     .db
                     .write_blocking(Lane::Background, "management.mark_restored", |tx| {
                         for item in written {
@@ -118,11 +135,12 @@ impl Management {
                     })
             }
             // A profile run: remember what it applied. Tag edits and
-            // duplicate resolutions apply no whole profile, and an undo
-            // puts the old state back.
+            // duplicate resolutions apply no whole profile. An undo leaves
+            // the row as its commit wrote it, `managed`, never the
+            // `succeeded` that says the profile is applied.
             Some(JobMode::Apply | JobMode::AutomaticApply) if intent.tag_edit.is_none() => {
                 let (profile_id, _) = snapshot.profile_label();
-                let sandbox = self.setup.publishing.publish_sandbox().ok();
+                let sandbox = self.parts.publishing.publish_sandbox().ok();
                 struct Mark {
                     track_id: String,
                     album_id: String,
@@ -151,7 +169,7 @@ impl Management {
                         })
                     })
                     .collect();
-                self.setup
+                self.parts
                     .db
                     .write_blocking(Lane::Background, "management.mark_managed", |tx| {
                         use crate::identify::sqlite::{read_album_identity, read_track_identity};
@@ -204,7 +222,7 @@ impl Management {
             Some(JobMode::Apply | JobMode::AutomaticApply)
         ) && source.intent().tag_edit.is_none();
         if profile_run && self.managed_automatically(album_id)? {
-            self.setup
+            self.parts
                 .db
                 .write_blocking(Lane::Background, "management.run_undone", |tx| {
                     Ok::<_, ManagementError>(takeover::mark(
@@ -221,59 +239,55 @@ impl Management {
     }
 
     /// Undo one published bundle (see
-    /// [`Publishing::undo_bundle`](crate::manage::Publishing::undo_bundle)).
-    /// An undone run of the profile is not run again by itself; the undo
-    /// stands either way. Blocking.
+    /// [`Publishing::undo_bundle`](crate::publish::session::Publishing::undo_bundle)):
+    /// a plugin's added file or a change published outside a job. A bundle
+    /// a Library Management run wrote is refused: the run is undone from
+    /// History, whose undo job also gives back what the run replaced. A
+    /// caller who may not undo the bundle is told it does not exist, as
+    /// for any other bundle. Blocking.
     pub fn undo_bundle(
         &self,
         bundle_id: &str,
         only_by: Option<&str>,
-    ) -> Result<crate::manage::AppliedBundle, crate::service::ServiceError> {
+    ) -> Result<crate::publish::session::AppliedBundle, UndoBundleError> {
         if self.library_off() {
-            return Err(crate::service::ServiceError::Conflict {
+            return Err(ServiceError::Conflict {
                 message: super::service::LIBRARY_OFF.to_owned(),
-            });
+            }
+            .into());
         }
-        let applied = self.setup.publishing.undo_bundle(bundle_id, only_by)?;
-        if let Err(error) = self.bundle_undone(bundle_id) {
-            tracing::warn!(%error, bundle_id, "undone bundle not recorded for automatic management");
+        let (run, applied_by) = self
+            .parts
+            .db
+            .read_blocking("management.undo_bundle_source", |conn| {
+                let run = jobs::work_of_bundle(conn, bundle_id)?;
+                let applied_by = crate::publish::operations::applied_by(conn, bundle_id)?;
+                Ok::<_, PublishError>((run, applied_by))
+            })
+            .map_err(crate::publish::session::publish_error)?;
+        if run.is_some() {
+            if only_by.is_some_and(|caller| applied_by.flatten().as_deref() != Some(caller)) {
+                return Err(ServiceError::NotFound.into());
+            }
+            return Err(UndoBundleError::RunBundle);
         }
-        Ok(applied)
+        Ok(self.parts.publishing.undo_bundle(bundle_id, only_by)?)
     }
 
-    /// The same for one bundle undone on its own, outside a job (the
-    /// route that undoes a single bundle). Blocking.
-    fn bundle_undone(&self, bundle_id: &str) -> Result<(), ManagementError> {
-        let found: Option<(String, i64)> = self
-            .setup
+    /// After an undo job undid `source_job_id`'s run on the album at
+    /// `ordinal`, put back the records a run of the whole profile replaced
+    /// ([`takeover::restore_records`]), so a hand edit the undo brings
+    /// back is the user's again. Blocking.
+    pub(super) fn restore_replaced(
+        &self,
+        source_job_id: &str,
+        ordinal: i64,
+    ) -> Result<(), ManagementError> {
+        self.parts
             .db
-            .read_blocking("management.undone_bundle", |conn| {
-                Ok::<_, ManagementError>(jobs::work_of_bundle(conn, bundle_id)?)
-            })?;
-        let Some((source_id, ordinal)) = found else {
-            return Ok(());
-        };
-        let Some(source) = self
-            .setup
-            .db
-            .read_blocking("management.bundle_undone_snapshot", |conn| {
-                Ok::<_, ManagementError>(store::snapshot(conn, &source_id)?)
-            })?
-        else {
-            return Ok(());
-        };
-        let items = self
-            .setup
-            .db
-            .read_blocking("management.bundle_undone_bundle_items", |conn| {
-                Ok::<_, ManagementError>(store::bundle_items(conn, &source_id, ordinal)?)
-            })?;
-        match items.first() {
-            Some(item) => {
-                self.run_undone(&source, &item.album_id, None, self.setup.clock.now_secs())
-            }
-            None => Ok(()),
-        }
+            .write_blocking(Lane::Background, "management.restore_records", |tx| {
+                Ok::<_, ManagementError>(takeover::restore_records(tx, source_job_id, ordinal)?)
+            })
     }
 
     /// The media servers a finished run asks to rescan: every server whose
@@ -302,10 +316,10 @@ impl Management {
         job_id: &str,
         targets: &[RefreshTarget],
     ) -> Result<(), ManagementError> {
-        let due = self.setup.clock.now_ms().saturating_add(REFRESH_DELAY_MS);
+        let due = self.parts.clock.now_ms().saturating_add(REFRESH_DELAY_MS);
         for &target in targets {
             let queued = self
-                .setup
+                .parts
                 .jobs
                 .enqueue_at(
                     tx,
@@ -335,7 +349,7 @@ impl Management {
     ) -> Result<Vec<ExternalRefresh>, ManagementError> {
         let mut refreshes = Vec::with_capacity(jobs.len());
         for &(target, id) in jobs {
-            let status = self.setup.jobs.get(id).await?;
+            let status = self.parts.jobs.get(id).await?;
             refreshes.push(ExternalRefresh::read(target, status));
         }
         Ok(refreshes)

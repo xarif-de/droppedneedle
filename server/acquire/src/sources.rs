@@ -51,6 +51,7 @@ use super::usenet::indexer::{Indexer, IndexerQuery};
 use super::usenet::newznab::{IndexerResult, usenet_identity};
 use super::usenet::policy::UsenetPolicy;
 use super::usenet::sabnzbd::{SabnzbdError, SabnzbdQueue};
+use droppedneedle_providers::RequestPriority;
 
 /// A refused request or an answer of the wrong shape is the client
 /// rejecting this request; a refused key, a missing item, a rate limit or
@@ -78,6 +79,7 @@ fn sab_error(error: SabnzbdError) -> SourceError {
         }
         SabnzbdError::Api(_)
         | SabnzbdError::NzbRefused { .. }
+        | SabnzbdError::NzbPaced { .. }
         | SabnzbdError::AmbiguousIdentity => SourceError::Unavailable(error.to_string()),
     }
 }
@@ -509,9 +511,10 @@ impl SabnzbdSource {
     }
 
     /// The releases an automatic pick may take: [`Self::listed`] minus
-    /// those outside the download settings.
+    /// those outside the download settings. Nobody waits on a pick, so the
+    /// indexers are asked at background priority.
     async fn candidates(&self, query: &IndexerQuery<'_>) -> Vec<IndexerResult> {
-        self.listed(query)
+        self.listed(query, RequestPriority::BackgroundSync)
             .await
             .into_iter()
             .filter(|hit| self.refusals(hit).is_empty())
@@ -524,9 +527,15 @@ impl SabnzbdSource {
     /// provider's retention. Album results are ordered against the
     /// target's tracklist. Blocklisted releases are left to the caller,
     /// which needs the count found before them.
-    async fn listed(&self, query: &IndexerQuery<'_>) -> Vec<IndexerResult> {
+    async fn listed(
+        &self,
+        query: &IndexerQuery<'_>,
+        priority: RequestPriority,
+    ) -> Vec<IndexerResult> {
         let found = futures_util::future::join_all(
-            self.indexers.iter().map(|indexer| indexer.search(query)),
+            self.indexers
+                .iter()
+                .map(|indexer| indexer.search(query, priority)),
         )
         .await;
         // The first copy of a release wins.
@@ -631,7 +640,7 @@ impl SabnzbdSource {
         }
         let blocked = blocklist(&self.journal, &SourceTag::Usenet).await?;
         let (mut listing, refused): (Vec<Candidate>, Vec<Candidate>) = self
-            .unblocked_albums(target, &blocked)
+            .unblocked_albums(target, &blocked, RequestPriority::UserInitiated)
             .await
             .iter()
             .map(|hit| Candidate::from_release(hit, target, self.refusals(hit)))
@@ -647,8 +656,9 @@ impl SabnzbdSource {
         &self,
         target: &SearchTarget,
         blocked: &Blocklist,
+        priority: RequestPriority,
     ) -> Vec<IndexerResult> {
-        self.listed(&IndexerQuery::Album(target))
+        self.listed(&IndexerQuery::Album(target), priority)
             .await
             .into_iter()
             .filter(|hit| {
@@ -728,7 +738,7 @@ impl SabnzbdSource {
             // outside the download settings: they judged it): the NZB link
             // is never stored.
             Some(Pin::Release { identity }) => self
-                .unblocked_albums(&target, &blocked)
+                .unblocked_albums(&target, &blocked, RequestPriority::BackgroundSync)
                 .await
                 .into_iter()
                 .find(|hit| usenet_identity(&hit.usenet.title, hit.usenet.size_bytes) == identity)
@@ -751,6 +761,10 @@ impl SabnzbdSource {
             }
         };
         let category = self.category.as_deref().filter(|cat| *cat != "*");
+        let grab = self
+            .indexers
+            .iter()
+            .find_map(|indexer| indexer.grab_client(&pick.usenet.indexer_id));
         // Worker-built job name: the counter keeps failover
         // attempts distinct on the client and matches the orphan shape.
         let handle = if task.download_type == "track" {
@@ -759,6 +773,7 @@ impl SabnzbdSource {
                     task_id,
                     &job_name,
                     Some(pick.usenet.nzb_url.as_str()),
+                    grab.as_ref(),
                     category,
                     None,
                     None,
@@ -770,6 +785,7 @@ impl SabnzbdSource {
                     task_id,
                     &job_name,
                     Some(pick.usenet.nzb_url.as_str()),
+                    grab.as_ref(),
                     category,
                     None,
                     None,

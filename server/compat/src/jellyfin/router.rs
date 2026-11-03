@@ -19,15 +19,15 @@ use axum::routing::{MethodFilter, MethodRouter, on};
 use droppedneedle_auth::compat_auth::jellyfin::{
     JellyfinDenied, JellyfinRequest, extract_client, extract_token, resolve_token, server_id,
 };
-use droppedneedle_auth::compat_auth::prod::ProdCompatPasswords;
+use droppedneedle_auth::compat_auth::prod::CompatPasswords;
 use droppedneedle_kernel::error::{ApiError, Unavailable};
 use droppedneedle_kernel::ids::RequestId;
 use droppedneedle_kernel::mount::CompatRoutes;
 use uuid::Uuid;
 
-use crate::adapters::jellyfin_library::{CatalogIds, JellyfinLibrary};
-use crate::adapters::playback::CompatPlayback;
 use crate::body::AudioBody;
+use crate::jellyfin::library::{CatalogIds, JellyfinLibrary};
+use crate::playback::CompatPlayback;
 use crate::settings::LiveSettings;
 use crate::setup::CompatAudio;
 use crate::shared::address::{ListenerConfig, base_address};
@@ -40,8 +40,8 @@ use super::builders::Builder;
 use super::images::*;
 use super::playlists::*;
 use super::playstate::*;
-use super::seams::{ByteOutcome, Principal, WriteRefusal};
 use super::system::*;
+use super::views::{ByteOutcome, Principal, WriteRefusal};
 
 // ===== State + registration =====
 
@@ -49,7 +49,7 @@ use super::system::*;
 #[derive(Clone)]
 pub struct JellyfinState {
     /// App-password store.
-    pub passwords: ProdCompatPasswords,
+    pub passwords: CompatPasswords,
     /// Library reads.
     pub library: JellyfinLibrary,
     /// Audio over the stream gateway.
@@ -69,7 +69,7 @@ pub struct JellyfinState {
 impl JellyfinState {
     /// Assemble state; `server_id()` is restart-stable.
     pub fn new(
-        passwords: ProdCompatPasswords,
+        passwords: CompatPasswords,
         library: JellyfinLibrary,
         engine: CompatAudio,
         sessions: CompatPlayback,
@@ -309,8 +309,8 @@ async fn method_not_allowed(State(state): State<JellyfinState>) -> Response {
 
 // ===== Response helpers =====
 
-/// Empty-body error: v2 `JellyfinError(status, message)` carries no body by
-/// default, and every mapped exception renders status-only.
+/// Empty-body error. Quirk (v2): errors carry no body by default, and every
+/// mapped exception renders status-only.
 pub(super) fn error(status: StatusCode) -> Response {
     Response::builder()
         .status(status)
@@ -367,8 +367,8 @@ pub(super) fn no_content() -> Response {
     error(StatusCode::NO_CONTENT)
 }
 
-/// Map a refused library write to its status (v2 maps not-found to 404
-/// and permission errors to 403). A busy write wrote nothing, so it is
+/// Map a refused library write to its status. Quirk (v2): not-found maps to 404
+/// and permission errors to 403. A busy write wrote nothing, so it is
 /// 503 with `Retry-After`; the request boundary logs a server fault once,
 /// with its cause.
 pub(super) fn refused(refusal: WriteRefusal) -> Response {
@@ -389,8 +389,8 @@ pub(super) fn refused(refusal: WriteRefusal) -> Response {
 /// headers, 404/429 status-only). Outcomes without a `Content-Length` carry a
 /// non-empty body only for transcodes (estimate off on Jellyfin), and those
 /// must stream unsized: axum stamps a `Content-Length` on sized bodies, so a
-/// sized transcode response would violate the v2 wire contract. Empty bodies
-/// stay sized (`Content-Length: 0`, the v2 416 shape).
+/// sized transcode response would break the wire contract. Empty bodies
+/// stay sized (`Content-Length: 0`, the shape of a 416 answer).
 pub(super) fn outcome_response(outcome: &ByteOutcome) -> Response {
     let status = StatusCode::from_u16(outcome.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     if outcome.status == StatusCode::NOT_FOUND.as_u16() {
@@ -446,8 +446,8 @@ pub(super) fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> 
     headers.get(name).and_then(|v| v.to_str().ok())
 }
 
-/// Exact-spelling raw-query lookup for the two auth keys (v2 `auth.py`
-/// reads Starlette's case-sensitive params: only `ApiKey` and `api_key`).
+/// Exact-spelling raw-query lookup for the two auth keys. Quirk (v2): the
+/// params are case-sensitive, so only `ApiKey` and `api_key` match.
 fn query_exact<'a>(raw: Option<&'a str>, key: &str) -> Option<&'a str> {
     for pair in raw.unwrap_or("").split('&') {
         let (name, value) = match pair.find('=') {
@@ -509,7 +509,7 @@ impl QueryTokens {
 /// A revoked app password gets the same 401, marked so it does not count.
 /// A credential-store failure keeps its own status, never a 401.
 pub(super) async fn sign_in(
-    State(passwords): State<ProdCompatPasswords>,
+    State(passwords): State<CompatPasswords>,
     mut request: Request<Body>,
     next: Next,
 ) -> Response {

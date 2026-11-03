@@ -1,6 +1,8 @@
 //! Durable scan state: the types [`super::SqliteScanStore`] takes and
 //! returns, and its error.
 
+use std::collections::HashSet;
+
 use droppedneedle_kernel::db::DbError;
 
 use super::models::{Counter, EffectivePolicy, ScanInventoryItem};
@@ -72,6 +74,10 @@ pub struct IndexWindow {
     /// Unchanged files whose edition hints were never stored (files
     /// carried over from v2): only those rows are written for them.
     pub edition_fills: Vec<EditionFill>,
+    /// Unchanged files whose row does not say whether their length was
+    /// measured (rows from before the scan recorded it): only that flag
+    /// is written for them.
+    pub length_fills: Vec<LengthFill>,
     pub now: f64,
 }
 
@@ -91,6 +97,27 @@ pub struct EditionFill {
     pub effective_policy: EffectivePolicy,
 }
 
+/// Unchanged catalog tracks whose rows lack something only their files
+/// can tell: the edition hints, or whether their length was measured.
+#[derive(Debug, Clone, Default)]
+pub struct UnreadRows {
+    pub edition_tags: HashSet<String>,
+    pub length: HashSet<String>,
+}
+
+/// Whether an unchanged file's length was measured, for a catalog row
+/// that does not say.
+#[derive(Debug, Clone)]
+pub struct LengthFill {
+    pub root_id: String,
+    pub relative_path: String,
+    pub track_id: String,
+    /// The file's stat revision when it was read: a row that has moved on
+    /// since is left to the scan that reads it in full.
+    pub stat_revision: String,
+    pub measured: bool,
+}
+
 /// One counter delta and the inventory row (root, path) it counts.
 pub type RowCounter = ((String, String), Counter, i64);
 
@@ -106,8 +133,7 @@ pub struct WindowOutcome {
     pub failed: Vec<(String, String, String)>,
 }
 
-/// Store errors. Spelling mirrors the v2 exception mapping: stale reads
-/// fail loudly, missing runs are not-found. The database's own answers
+/// Store errors. Stale reads fail loudly, missing runs are not-found. The database's own answers
 /// that a caller branches on keep their own variants.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScanStoreError {

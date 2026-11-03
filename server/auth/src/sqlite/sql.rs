@@ -52,13 +52,13 @@ droppedneedle_kernel::sql! {
     /// Whether a custom edition manifest names the account.
     pub(super) HELD_BY_EDITION_MANIFESTS = "SELECT 1 FROM library_custom_edition_manifests \
         WHERE sealed_by_user_id = ?1 LIMIT 1";
-    /// Whether a library management exclusion names the account.
-    pub(super) HELD_BY_MANAGEMENT_EXCLUSIONS = "SELECT 1 FROM library_management_exclusions \
-        WHERE excluded_by_user_id = ?1 LIMIT 1";
 
     /// Insert one sign-in binding, with its sealed token document or none.
     pub(super) INSERT_PROVIDER = "INSERT INTO auth_providers (id, user_id, provider, provider_uid, \
         provider_data, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)";
+    /// Insert one sign-in row with its password, its uid given as it is.
+    pub(super) INSERT_PASSWORD_BINDING = "INSERT INTO auth_providers (id, user_id, provider, \
+        provider_uid, password_hash, hash_scheme, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)";
     /// Insert one local credential.
     pub(super) INSERT_LOCAL_CREDENTIAL = "INSERT INTO auth_providers (id, user_id, provider, \
         provider_uid, password_hash, hash_scheme, created_at) \
@@ -176,6 +176,33 @@ droppedneedle_kernel::sql! {
     /// Drop one account's Last.fm link.
     pub(super) DELETE_LASTFM_LINK = "DELETE FROM user_connections \
         WHERE user_id = ?1 AND service = 'lastfm'";
+
+    /// Store or replace user `?1`'s link to service `?2`, its document `?3`.
+    /// A link already there stays as enabled as it was.
+    pub(super) SAVE_LINK = "INSERT INTO user_connections (user_id, service, connection_data, \
+        enabled, created_at, updated_at) VALUES (?1, ?2, ?3, 1, ?4, ?4) \
+        ON CONFLICT (user_id, service) DO UPDATE SET connection_data = excluded.connection_data, \
+        updated_at = excluded.updated_at";
+    /// Store or replace user `?1`'s link to service `?2`, its document `?3`,
+    /// enabling it.
+    pub(super) SAVE_LINK_ENABLED = "INSERT INTO user_connections (user_id, service, \
+        connection_data, enabled, created_at, updated_at) VALUES (?1, ?2, ?3, 1, ?4, ?4) \
+        ON CONFLICT (user_id, service) DO UPDATE SET connection_data = excluded.connection_data, \
+        enabled = 1, updated_at = excluded.updated_at";
+    /// Replace the document of user `?1`'s link to service `?2`, if it exists.
+    pub(super) REPLACE_LINK_DOCUMENT = "UPDATE user_connections SET connection_data = ?3, \
+        updated_at = ?4 WHERE user_id = ?1 AND service = ?2";
+    /// Remove user `?1`'s link to service `?2`.
+    pub(super) DELETE_LINK = "DELETE FROM user_connections \
+        WHERE user_id = ?1 AND service = ?2";
+    /// Remove every link holding a value sealed under the data key. A
+    /// document sealed whole is walked as an empty array, because
+    /// `json_tree` fails the whole statement on text that is not JSON.
+    pub(super) FORGET_SEALED_LINKS = "DELETE FROM user_connections \
+        WHERE connection_data LIKE 'v3:%' OR EXISTS ( \
+        SELECT 1 FROM json_tree(CASE WHEN json_valid(user_connections.connection_data) \
+        THEN user_connections.connection_data ELSE '[]' END) AS tree \
+        WHERE tree.type = 'text' AND tree.value LIKE 'v3:%')";
 }
 
 /// [`USERS_BY_IDS`] for `len` ids.

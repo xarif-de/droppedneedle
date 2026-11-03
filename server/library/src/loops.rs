@@ -12,8 +12,6 @@ use droppedneedle_kernel::jobs::{
 use tokio::runtime::Handle;
 
 use super::clock::LibraryClock as _;
-use super::manage::LeftoverFiles;
-use super::manage::Publishing;
 use super::publish::PublishError;
 use super::publish::expiry::{self, ExpiryPass, ExpiryReport};
 use super::publish::paths::{Root, Sandbox};
@@ -28,7 +26,8 @@ use super::scan::supervisor::{
 use super::scan::watcher::{Asked, WatcherAction, WatcherSettings, WatcherState, ask_for_changes};
 use super::scans::Scans;
 use super::service::Identification;
-use super::wiring::{LibraryCore, LibraryServices};
+use super::wiring::LibraryServices;
+use crate::publish::session::Publishing;
 
 /// The library's always-on loops on the supervisor.
 pub const SCAN_JOB: &str = "library-scan";
@@ -38,7 +37,7 @@ pub const WATCHER_JOB: &str = "library-watcher";
 pub const IDENTIFY_JOB: &str = "library-identify";
 /// Publish maintenance.
 pub const PUBLISH_JOB: &str = "library-publish";
-/// The one look for leftover hidden files after startup recovery.
+/// The check for leftover hidden files no journal row names.
 pub const LEFTOVERS_JOB: &str = "library-leftovers";
 /// The move of undo copies out of the database, once at start.
 pub const UNDO_MOVE_JOB: &str = "library-undo-move";
@@ -55,11 +54,12 @@ pub const LOOPS: &[&str] = &[
     WATCHER_JOB,
     IDENTIFY_JOB,
     super::contrib::worker::UPKEEP_JOB,
-    super::operations::JOB_NAME,
+    crate::jobs::worker::JOB_NAME,
     super::management::JOB_NAME,
     super::repairs::JOB_NAME,
     PUBLISH_JOB,
     RECYCLE_EXPIRY_JOB,
+    LEFTOVERS_JOB,
 ];
 
 /// Scan idle ceiling: how often the scan loop looks for scheduled work
@@ -120,6 +120,13 @@ const RECYCLE_EXPIRY_JITTER: Duration = Duration::from_secs(300);
 const RECYCLE_EXPIRY_PAGE: usize = 200;
 /// Row code of an expiry pass that failed.
 const RECYCLE_EXPIRY_FAILED: &str = "RECYCLE_EXPIRY_FAILED";
+
+/// How often the leftover check looks for roots due a look and for listed
+/// files that were cleared, and the spread added to each.
+const LEFTOVERS_EVERY: Duration = Duration::from_secs(600);
+const LEFTOVERS_JITTER: Duration = Duration::from_secs(60);
+/// Row code of a leftover check that failed.
+const LEFTOVERS_FAILED: &str = "LEFTOVER_CHECK_FAILED";
 
 impl Scans {
     /// Supervisor inputs, rebuilt per call so settings-swap rebuilds
@@ -504,7 +511,8 @@ impl Publishing {
         // renames. Held bundles wait while the library is switched off.
         let session = cell.session(&registry);
         let reopen = cell.needs_refresh(&session);
-        let retry = !reopen && !super::manage::switched_off(&registry) && cell.has_held()?;
+        let retry =
+            !reopen && !crate::publish::session::switched_off(&registry) && cell.has_held()?;
         cell.refresh_to(session, &self.core.root_dirs)?;
         if retry {
             cell.retry_held()?;
@@ -538,23 +546,24 @@ impl Publishing {
         Ok(purged)
     }
 
-    /// One recycle-bin expiry pass, on the retention the download settings
-    /// give now. Skipped while those or the library settings cannot be
-    /// read, and while the library is switched off. The deletes wait for the publish lock, so no put-back or
+    /// One recycle-bin expiry pass, on the retention Library Management
+    /// gives now. Skipped while those or the library settings cannot be
+    /// read, while the library is switched off, or while an empty of the
+    /// bin runs. The deletes wait for the publish lock, so no put-back or
     /// removal is reading a copy while it goes. `go_on` is asked between
     /// rows. Blocking.
     pub fn recycle_expiry_tick(
         &self,
         go_on: &dyn Fn() -> bool,
     ) -> Result<ExpiryReport, PublishError> {
-        let Some(policy) = self.settings.download_policy.read() else {
+        let Some(_one) = self.expiry.try_one_pass() else {
             return Ok(ExpiryReport::default());
         };
-        if self.core.switched_off() {
+        let Some(management) = self.settings.management.read() else {
             return Ok(ExpiryReport::default());
-        }
+        };
         let pass = ExpiryPass {
-            retention_days: policy.recycle_retention_days,
+            retention_days: management.recycle_retention_days,
             now_ms: self.core.clock.now_ms(),
             page: RECYCLE_EXPIRY_PAGE,
             due_before_ms: None,
@@ -566,12 +575,14 @@ impl Publishing {
     /// the copies that reached the bin before `before_ms` (unix ms, never
     /// later than now) and the old entries stamped before it. Every rule
     /// of the expiry holds; `finished` is false when it stopped early or
-    /// the bins could not be told. Blocking.
+    /// the bins could not be told. Waits for an hourly pass that is
+    /// running to end first. Blocking.
     pub fn empty_recycle_bin(
         &self,
         before_ms: i64,
         go_on: &dyn Fn() -> bool,
     ) -> Result<ExpiryReport, PublishError> {
+        let _one = self.expiry.one_pass();
         let now_ms = self.core.clock.now_ms();
         let pass = ExpiryPass {
             retention_days: 0,
@@ -591,7 +602,14 @@ impl Publishing {
             &self.db,
             pass,
             &self.expiry,
-            &|| self.expiry_sandbox(),
+            // Asked again under each hold of the publish lock: a library
+            // switched off meanwhile stops the pass there.
+            &|| {
+                if self.core.switched_off() {
+                    return None;
+                }
+                self.expiry_sandbox()
+            },
             || {
                 self.core
                     .publish
@@ -642,7 +660,21 @@ impl Publishing {
             })
             .collect();
         roots.extend(bins);
-        Sandbox::new(roots).ok()
+        match Sandbox::new(roots) {
+            Ok(sandbox) => {
+                self.expiry.note("sandbox", None);
+                Some(sandbox)
+            }
+            Err(error) => {
+                self.expiry.note(
+                    "sandbox",
+                    Some(format!(
+                        "recycle bin expiry waits: its folders do not fit together: {error}"
+                    )),
+                );
+                None
+            }
+        }
     }
 }
 
@@ -650,9 +682,8 @@ impl Publishing {
 // Background loops on the supervisor, over the tick methods above.
 // ---------------------------------------------------------------------------
 
-/// Start the library's loops on `supervisor`: the always-on [`LOOPS`] and
-/// the one [`LEFTOVERS_JOB`] look. Called from inside the runtime, after
-/// startup recovery.
+/// Start the library's loops on `supervisor`, the always-on [`LOOPS`].
+/// Called from inside the runtime, after startup recovery.
 pub(crate) fn start_loops(
     services: &LibraryServices,
     supervisor: &Supervisor,
@@ -688,13 +719,34 @@ pub(crate) fn start_loops(
         identify_tick(services.identification.clone(), handle),
     )?;
     super::contrib::worker::start_upkeep(supervisor, setup.contrib_worker.clone())?;
-    super::operations::start(setup, services.operations.clone(), supervisor)?;
+    crate::jobs::worker::start(setup, services.operations.clone(), supervisor)?;
     super::management::start(services.management.clone(), supervisor)?;
     super::repairs::start(services.repair_worker(), supervisor)?;
     let (core, leftovers) = (setup.core.clone(), setup.leftover_files.clone());
-    supervisor.one_shot(LEFTOVERS_JOB, move |ctx| {
-        leftover_pass(core, leftovers, ctx)
-    })?;
+    supervisor.periodic_blocking(
+        LEFTOVERS_JOB,
+        Schedule::new(LEFTOVERS_EVERY)
+            .with_jitter(LEFTOVERS_JITTER)
+            .with_backoff(Duration::from_secs(60), LEFTOVERS_EVERY),
+        move |ctx| {
+            let stop = ctx.token();
+            let checked = caught("leftover check", || {
+                leftovers.check(&core.live_registry(), &|| {
+                    ctx.heartbeat();
+                    stop.is_cancelled()
+                })
+            })?;
+            match checked {
+                Ok(Some(count)) if count > 0 => tracing::warn!(
+                    count,
+                    "hidden files no publish journal row names were found; nothing was removed"
+                ),
+                Ok(_) => {}
+                Err(error) => return Err(TickError::new(LEFTOVERS_FAILED, error)),
+            }
+            Ok(Next::Continue)
+        },
+    )?;
     let (db, blobs) = (setup.db.clone(), setup.core.blobs.clone());
     supervisor.one_shot(UNDO_MOVE_JOB, move |ctx| undo_move(db, blobs, ctx))?;
     let publish = services.publishing.clone();
@@ -749,13 +801,14 @@ fn drive<F: std::future::Future>(
 
 /// The scan loop's turn: startup recovery once, then every run that is
 /// due until none is left, then the album art and lyrics sweeps when a run
-/// changed something. A cancelled stop ends the run in flight; the next
+/// changed something or a publish asked for them. A cancelled stop ends the run in flight; the next
 /// start resumes it.
 fn scan_tick(scans: Scans, handle: Handle) -> impl FnMut(&TickCtx) -> TickResult + Send + 'static {
     let mut recovered = false;
     // Album art and the lyrics marks are refreshed once the scans go idle,
-    // and once at boot.
+    // once at boot, and when a publish asks for it.
     let mut sweeps_due = true;
+    let mut sweep_asked = scans.core.wakeups.revision(super::jobs::SWEEP_WAKEUP);
     move |ctx| {
         let stop = ctx.token();
         if !recovered {
@@ -780,6 +833,11 @@ fn scan_tick(scans: Scans, handle: Handle) -> impl FnMut(&TickCtx) -> TickResult
             }
             sweeps_due = true;
             ctx.heartbeat();
+        }
+        let asked = scans.core.wakeups.revision(super::jobs::SWEEP_WAKEUP);
+        if asked != sweep_asked {
+            sweep_asked = asked;
+            sweeps_due = true;
         }
         if sweeps_due && !stop.is_cancelled() {
             // A sweep of its own: a panic there waits for the next scan and
@@ -911,28 +969,4 @@ async fn undo_move(db: Db, blobs: BlobStore, ctx: TickCtx) -> Result<(), TickErr
         }
         return Ok(());
     }
-}
-
-/// Look once for hidden files no journal row names. The walk runs off the
-/// async runtime and gives up between two folders once the stop comes.
-async fn leftover_pass(
-    core: LibraryCore,
-    leftovers: LeftoverFiles,
-    ctx: TickCtx,
-) -> Result<(), TickError> {
-    let stop = ctx.token().clone();
-    let walk = tokio::task::spawn_blocking(move || {
-        let registry = core.live_registry();
-        leftovers.refresh(&registry, &|| stop.is_cancelled())
-    });
-    match walk.await {
-        Ok(Ok(Some(report))) if report.count > 0 => tracing::warn!(
-            count = report.count,
-            "hidden files no publish journal row names were found; nothing was removed"
-        ),
-        Ok(Ok(_)) => {}
-        Ok(Err(error)) => tracing::warn!(%error, "leftover pass failed"),
-        Err(error) => tracing::warn!(%error, "leftover pass panicked"),
-    }
-    Ok(())
 }

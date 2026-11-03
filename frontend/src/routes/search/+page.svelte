@@ -19,12 +19,7 @@
 		type EnrichmentResponseV3
 	} from '$lib/queries/search/SearchV3Queries.svelte';
 	import { SearchEnrichCollector } from '$lib/queries/search/SearchV3Enrichment.svelte';
-	import {
-		toSearchRemoteStatus,
-		toSearchSongs,
-		toV1Album,
-		toV1Artist
-	} from '$lib/queries/search/SearchV3Adapters';
+	import { toSearchSongs, toV1Album, toV1Artist } from '$lib/queries/search/SearchV3Adapters';
 	import { ArrowRight, RefreshCw } from 'lucide-svelte';
 	import SearchTopResult from '$lib/components/SearchTopResult.svelte';
 	import Button from '$lib/ui/Button.svelte';
@@ -76,10 +71,10 @@
 		return albums.find((album) => album.musicbrainz_id === id) ?? null;
 	});
 	let artistStatus: SearchRemoteStatus = $derived(
-		searchQuery.isError ? 'error' : toSearchRemoteStatus(searchQuery.data?.artist_status ?? 'ok')
+		searchQuery.isError ? 'error' : (searchQuery.data?.artist_status ?? 'ok')
 	);
 	let albumStatus: SearchRemoteStatus = $derived(
-		searchQuery.isError ? 'error' : toSearchRemoteStatus(searchQuery.data?.album_status ?? 'ok')
+		searchQuery.isError ? 'error' : (searchQuery.data?.album_status ?? 'ok')
 	);
 	let artistNotice = $derived(getSearchStatusNotice(artistStatus, 'artists'));
 	let albumNotice = $derived(getSearchStatusNotice(albumStatus, 'albums'));
@@ -174,7 +169,7 @@
 				<div class="flex items-center justify-between mb-4">
 					<h2 class="text-xl font-bold">Songs</h2>
 					<a
-						href={`/search/tracks?q=${encodeURIComponent(normalizedQuery)}`}
+						href={withBasePath(`/search/tracks?q=${encodeURIComponent(normalizedQuery)}`)}
 						class="text-sm text-primary hover:underline"
 					>
 						View more <ArrowRight class="h-4 w-4 inline align-middle" />
@@ -239,7 +234,7 @@
 				<h2 class="text-xl font-bold">Albums</h2>
 				{#if displayedAlbums.length > 0}
 					<a
-						href={`/search/albums?q=${encodeURIComponent(normalizedQuery)}`}
+						href={withBasePath(`/search/albums?q=${encodeURIComponent(normalizedQuery)}`)}
 						class="text-sm text-primary hover:underline"
 					>
 						View more <ArrowRight class="h-4 w-4 inline align-middle" />
@@ -268,9 +263,10 @@
 						class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-4"
 					>
 						<ViewMoreAlbumCard />
-						{#each displayedAlbums as album (album.musicbrainz_id)}
+						{#each displayedAlbums as album, index (album.musicbrainz_id)}
 							<AlbumCard
 								{album}
+								lazy={index >= 12}
 								{enrichmentSource}
 								onenrichmentrequest={() => enrichCollector.requestAlbum(album)}
 							/>

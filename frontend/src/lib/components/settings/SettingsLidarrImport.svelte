@@ -1,11 +1,11 @@
 <script lang="ts">
 	import { CloudDownload } from 'lucide-svelte';
 
-	import { getLidarrImportConfigQuery } from '$lib/queries/lidarr-import/LidarrImportQueries.svelte';
+	import { getLidarrImportConfigQuery } from '$lib/queries/lidarr-import.svelte';
 	import {
-		saveLidarrConfigMutation,
-		testLidarrMutation
-	} from '$lib/queries/lidarr-import/LidarrImportMutations.svelte';
+		createSaveLidarrConfigMutation,
+		createTestLidarrMutation
+	} from '$lib/queries/lidarr-import.svelte';
 	import Card from '$lib/ui/Card.svelte';
 	import QueryBoundary from '$lib/ui/QueryBoundary.svelte';
 	import SaveBar from '$lib/ui/SaveBar.svelte';
@@ -15,14 +15,18 @@
 	import { createSettingsSection } from '$lib/ui/settingsSection.svelte';
 	import LidarrImportSyncCard from './LidarrImportSyncCard.svelte';
 
-	const test = testLidarrMutation();
+	const test = createTestLidarrMutation();
 
-	const section = createSettingsSection(getLidarrImportConfigQuery(), saveLidarrConfigMutation(), {
-		test: async (draft) => {
-			const result = await test.mutateAsync(draft);
-			return { passed: result.valid, message: result.message };
+	const section = createSettingsSection(
+		getLidarrImportConfigQuery(),
+		createSaveLidarrConfigMutation(),
+		{
+			test: async (draft) => {
+				const result = await test.mutateAsync(draft);
+				return { passed: result.valid, message: result.message };
+			}
 		}
-	});
+	);
 
 	// Locked until a connection is saved. The masked config returns an empty
 	// api_key when nothing is stored, so a non-empty pair means configured.
@@ -63,6 +67,7 @@
 							placeholder="http://localhost:8686"
 							help="Your Lidarr address. A plain http:// LAN URL is fine."
 							bind:value={draft.url}
+							error={section.fieldError('url', 'URL')}
 						/>
 
 						<SecretField
@@ -70,6 +75,7 @@
 							mask={SECRET_MASK}
 							placeholder="Lidarr → Settings → General → Security → API Key"
 							bind:value={draft.api_key}
+							error={section.fieldError('api_key', 'API key')}
 						/>
 
 						<SaveBar {...section.bar} disabled={!draft.url.trim()} />

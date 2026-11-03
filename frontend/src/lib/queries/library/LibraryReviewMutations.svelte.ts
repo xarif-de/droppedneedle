@@ -1,8 +1,9 @@
+import { v3 } from '$lib/api/v3/endpoint';
 import { api } from '$lib/api/client';
 import type { components } from '$lib/api/v3/openapi';
 import { toastStore } from '$lib/stores/toast';
 import { authStore } from '$lib/stores/authStore.svelte';
-import { LibraryV3Api, reviewFilterQuery } from './LibraryV3Api';
+import { reviewFilterQuery } from './listQueries';
 import type { LibraryReviewParams } from './LibraryQueryKeyFactory';
 import {
 	anyLibraryActivityChanged,
@@ -53,20 +54,35 @@ function post({ reviewId, revision, action }: ReviewActionInput) {
 	const body = { expected_revision: revision };
 	switch (action) {
 		case 'keep_tagged':
-			return api.v3.POST(LibraryV3Api.keepTaggedReview(reviewId), body);
+			return api.v3.POST(
+				v3('/api/v3/library/reviews/{id}/keep-tagged', { path: { id: reviewId } }),
+				body
+			);
 		case 'dismiss':
-			return api.v3.POST(LibraryV3Api.dismissReview(reviewId), body);
+			return api.v3.POST(
+				v3('/api/v3/library/reviews/{id}/dismiss', { path: { id: reviewId } }),
+				body
+			);
 		case 'detach':
-			return api.v3.POST(LibraryV3Api.detachReview(reviewId), body);
+			return api.v3.POST(
+				v3('/api/v3/library/reviews/{id}/detach', { path: { id: reviewId } }),
+				body
+			);
 		case 'exclude':
-			return api.v3.POST(LibraryV3Api.excludeReview(reviewId), body);
+			return api.v3.POST(
+				v3('/api/v3/library/reviews/{id}/exclude', { path: { id: reviewId } }),
+				body
+			);
 		case 'restore':
-			return api.v3.POST(LibraryV3Api.restoreReview(reviewId), body);
+			return api.v3.POST(
+				v3('/api/v3/library/reviews/{id}/restore', { path: { id: reviewId } }),
+				body
+			);
 	}
 }
 
 /** Settle one review. `keep_tagged` and `dismiss` leave the catalog as it is. */
-export function actOnLibraryReview() {
+export function createActOnLibraryReviewMutation() {
 	return createAppMutation(() => ({
 		mutationFn: async (input: ReviewActionInput) => {
 			await post(input);
@@ -80,13 +96,16 @@ export function actOnLibraryReview() {
 	}));
 }
 
-export function acceptLibraryReviewCandidate() {
+export function createAcceptLibraryReviewCandidateMutation() {
 	return createAppMutation(() => ({
 		mutationFn: async (input: { reviewId: string; revision: number; candidateKey: string }) => {
-			await api.v3.POST(LibraryV3Api.approveReview(input.reviewId), {
-				candidate_key: input.candidateKey,
-				expected_revision: input.revision
-			});
+			await api.v3.POST(
+				v3('/api/v3/library/reviews/{id}/approve', { path: { id: input.reviewId } }),
+				{
+					candidate_key: input.candidateKey,
+					expected_revision: input.revision
+				}
+			);
 		},
 		effects: () => reviewState({ catalog: true }),
 		onSuccess: () => {
@@ -96,10 +115,10 @@ export function acceptLibraryReviewCandidate() {
 	}));
 }
 
-export function retryLibraryReview() {
+export function createRetryLibraryReviewMutation() {
 	return createAppMutation(() => ({
 		mutationFn: (input: { reviewId: string; revision: number; confirmLocalMetadata?: boolean }) =>
-			api.v3.POST(LibraryV3Api.retryReview(input.reviewId), {
+			api.v3.POST(v3('/api/v3/library/reviews/{id}/retry', { path: { id: input.reviewId } }), {
 				expected_revision: input.revision,
 				confirm_local_metadata: input.confirmLocalMetadata ?? false
 			}),
@@ -115,7 +134,7 @@ export function retryLibraryReview() {
  * Start identification again for every album with a pending review, as one
  * background job. `scopeIds` picks library folders and sub-folder rules.
  */
-export function retryPendingLibraryReviews() {
+export function createRetryPendingLibraryReviewsMutation() {
 	return createAppMutation(() => ({
 		mutationFn: (input: {
 			confirmLocalMetadata: boolean;
@@ -123,7 +142,7 @@ export function retryPendingLibraryReviews() {
 			scopeIds?: string[];
 			preview?: boolean;
 		}) =>
-			api.v3.POST(LibraryV3Api.retryPendingReviews(), {
+			api.v3.POST(v3('/api/v3/library/reviews/retry-pending'), {
 				confirm_local_metadata: input.confirmLocalMetadata,
 				filter: { state: 'pending', ...reviewFilterQuery(input.filter ?? {}) },
 				scope_ids: input.scopeIds ?? [],
@@ -136,10 +155,13 @@ export function retryPendingLibraryReviews() {
 export type ReviewJobControl = components['schemas']['ReviewJobControl'];
 
 /** Pause, resume or stop a review job. */
-export function controlLibraryReviewJob() {
+export function createControlLibraryReviewJobMutation() {
 	return createAppMutation(() => ({
 		mutationFn: (input: { jobId: string; control: ReviewJobControl }) =>
-			api.v3.POST(LibraryV3Api.reviewJobControl(input.jobId), { control: input.control }),
+			api.v3.POST(
+				v3('/api/v3/library/reviews/jobs/{job_id}/control', { path: { job_id: input.jobId } }),
+				{ control: input.control }
+			),
 		effects: () => reviewState()
 	}));
 }
@@ -171,18 +193,21 @@ function bulkBody(selection: BulkReviewSelection, previewToken?: string) {
 	};
 }
 
-export function previewBulkLibraryReviews() {
+export function createPreviewBulkLibraryReviewsMutation() {
 	return createAppMutation(() => ({
 		effects: () => [],
 		mutationFn: (selection: BulkReviewSelection) =>
-			api.v3.POST(LibraryV3Api.bulkReviewPreview(), bulkBody(selection))
+			api.v3.POST(v3('/api/v3/library/reviews/bulk-preview'), bulkBody(selection))
 	}));
 }
 
-export function applyBulkLibraryReviews() {
+export function createApplyBulkLibraryReviewsMutation() {
 	return createAppMutation(() => ({
 		mutationFn: (input: { selection: BulkReviewSelection; previewToken: string }) =>
-			api.v3.POST(LibraryV3Api.bulkReviewApply(), bulkBody(input.selection, input.previewToken)),
+			api.v3.POST(
+				v3('/api/v3/library/reviews/bulk-apply'),
+				bulkBody(input.selection, input.previewToken)
+			),
 		effects: (_result, input) => reviewState({ catalog: input.selection.action !== 'keep_tagged' })
 	}));
 }

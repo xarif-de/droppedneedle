@@ -2,9 +2,9 @@
 	import { ArrowDownToLine, CircleCheck, Lock, RefreshCw } from 'lucide-svelte';
 
 	import ArtistImage from '$lib/components/ArtistImage.svelte';
-	import { getLidarrImportCandidatesQuery } from '$lib/queries/lidarr-import/LidarrImportQueries.svelte';
-	import { importFromLidarrMutation } from '$lib/queries/lidarr-import/LidarrImportMutations.svelte';
-	import type { LidarrImportResult } from '$lib/queries/lidarr-import/types';
+	import { getLidarrImportCandidatesQuery } from '$lib/queries/lidarr-import.svelte';
+	import { createImportFromLidarrMutation } from '$lib/queries/lidarr-import.svelte';
+	import type { LidarrImportResult } from '$lib/queries/lidarr-import.svelte';
 	import Button from '$lib/ui/Button.svelte';
 	import Card from '$lib/ui/Card.svelte';
 
@@ -26,7 +26,7 @@
 	const followedCount = $derived(candidates.filter((c) => c.already_following).length);
 	const newCount = $derived(selectable.length);
 	const allSelected = $derived(selectable.length > 0 && selected.length === selectable.length);
-	const importMutation = importFromLidarrMutation();
+	const importMutation = createImportFromLidarrMutation();
 
 	// Seed key: the candidate list identity. Reset the pre-check when the list
 	// identity changes (fresh fetch, connection change), but never re-seed once

@@ -15,14 +15,16 @@ use super::profile;
 use super::reasons::{self, ItemReason};
 use super::selection;
 use super::service::{JobSpec, Management, UNDO_COPY_MISSING, stale};
+use super::sql::{BaselinePurge, BlobSize};
 use super::store::Snapshot;
 use crate::clock::LibraryClock as _;
-use crate::manage::BaselineSkip;
+use crate::jobs::OperationState;
 use crate::publish::record::changed_since_written;
+use crate::publish::session::BaselineSkip;
 use crate::publish::snapshots::sha256_hex;
 use crate::publish::undo::BaselineBlock;
 
-/// The phrase a purge must be confirmed with (as in v2).
+/// The phrase a purge must be confirmed with.
 pub const PURGE_CONFIRMATION: &str = "CONFIRM";
 
 /// A request for a baseline restore preview.
@@ -126,7 +128,7 @@ impl Management {
             origin: Origin::Manual,
             actor: Some(actor),
             idempotency_key: Some(&request.idempotency_key),
-            revisions: profile::revisions(&stored, &pinned, registry.policy_revision()),
+            revisions: profile::revisions(&stored, &pinned, registry.fingerprint()),
             selection_json: serde_json::to_string(&selection)?,
             pinned: &pinned,
             target_root_id: None,
@@ -146,7 +148,7 @@ impl Management {
     ) -> Result<Option<Summary>, ManagementError> {
         let selection: Selection = serde_json::from_str(&snapshot.selection_json)?;
         let mut albums = self
-            .setup
+            .parts
             .db
             .read_blocking("management.restore_albums", |conn| {
                 selection::albums(conn, &selection)
@@ -164,7 +166,7 @@ impl Management {
         let mut ordinal = 0;
         for (bundle_ordinal, scope) in albums.iter().enumerate() {
             let tracks = self
-                .setup
+                .parts
                 .db
                 .read_blocking("management.restore_tracks", |conn| {
                     selection::tracks(conn, scope)
@@ -176,7 +178,7 @@ impl Management {
             let album_id = scope.album_id.clone();
             let override_of = |track_id: &str| self.override_revision(&album_id, track_id);
             let files = self
-                .setup
+                .parts
                 .publishing
                 .baseline_files(&track_ids, &override_of)
                 .map_err(|error| ManagementError::Store(format!("{error:?}")))?;
@@ -259,7 +261,7 @@ impl Management {
                 // file changed outside since the app wrote it: restore the
                 // album by itself for that.
                 let changed =
-                    self.setup
+                    self.parts
                         .db
                         .read_blocking("management.restore_changed", |conn| {
                             let mut changed = Vec::new();
@@ -288,8 +290,8 @@ impl Management {
                 // As a many-album preview does: where the folder is managed
                 // automatically, the album is left unmanaged too.
                 if !changed.is_empty() && self.managed_automatically(&scope.album_id)? {
-                    let now = self.setup.clock.now_secs();
-                    self.setup.db.write_blocking(
+                    let now = self.parts.clock.now_secs();
+                    self.parts.db.write_blocking(
                         Lane::Background,
                         "management.restore_mark_changed",
                         |tx| {
@@ -337,12 +339,12 @@ impl Management {
     /// What purging every saved original would remove. Blocking.
     pub fn purge_impact(&self) -> Result<PurgeImpact, ManagementError> {
         let (mut impact, kept) = self
-            .setup
+            .parts
             .db
             .read_blocking("management.purge_impact", |conn| {
                 Ok::<_, ManagementError>((purge_impact(conn)?, baseline_blob_sizes(conn)?))
             })?;
-        let dir = self.setup.core.blobs.dir();
+        let dir = self.parts.core.blobs.dir();
         impact.referenced_blob_bytes = kept
             .into_iter()
             .map(|(sha256, in_database)| {
@@ -374,34 +376,27 @@ impl Management {
         // Under the publish lock: no write is between saving an original
         // and referring to it while the purge runs.
         let publishing = self
-            .setup
+            .parts
             .publish
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let outcome = self.setup.db.write_blocking(Lane::Foreground, "management.purge", |tx| {
+        let outcome = self.parts.db.write_blocking(Lane::Foreground, "management.purge", |tx| {
             let earlier = tx
                 .query_row(
-                    "SELECT impact_token, purged_baseline_count, detached_reference_count \
-                     FROM library_management_baseline_purges WHERE idempotency_key = ?1",
+                    crate::management::sql::PURGE_OF_IDEMPOTENCY_KEY.text(),
                     params![request.idempotency_key],
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, i64>(1)?,
-                            row.get::<_, i64>(2)?,
-                        ))
-                    },
+                    BaselinePurge::read,
                 )
                 .optional()?;
-            if let Some((token, purged, detached)) = earlier {
-                if token != request.impact_token {
+            if let Some(earlier) = earlier {
+                if earlier.impact_token != request.impact_token {
                     return Err(stale(
                         "This request key was already used for another purge.",
                     ));
                 }
                 return Ok(PurgeOutcome {
-                    purged_baseline_count: purged,
-                    detached_reference_count: detached,
+                    purged_baseline_count: earlier.purged_baseline_count,
+                    detached_reference_count: earlier.detached_reference_count,
                     cleaned_blob_count: 0,
                     existing: true,
                 });
@@ -419,29 +414,26 @@ impl Management {
                 ));
             }
             let detached = tx.execute(
-                "DELETE FROM library_publish_blob_refs WHERE owner_kind IN ('baseline', 'v2_baseline')",
+                crate::management::sql::DROP_BASELINE_BLOB_REFS.text(),
                 [],
             )? as i64;
-            tx.execute("DELETE FROM library_publish_baselines", [])?;
+            tx.execute(crate::management::sql::DROP_PUBLISH_BASELINES.text(), [])?;
             // Originals v2 recorded: without this, files v2 managed
             // would wait for an original that will never come.
             tx.execute(
-                "UPDATE library_track_management_state SET baseline_id = NULL, \
-                 row_revision = row_revision + 1 WHERE baseline_id IS NOT NULL",
+                crate::management::sql::DETACH_BASELINES.text(),
                 [],
             )?;
-            tx.execute("DELETE FROM library_management_baselines", [])?;
+            tx.execute(crate::management::sql::DROP_MANAGEMENT_BASELINES.text(), [])?;
             tx.execute(
-                "INSERT INTO library_management_baseline_purges (idempotency_key, impact_token, \
-                 actor_user_id, purged_baseline_count, detached_reference_count, created_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                crate::management::sql::RECORD_BASELINE_PURGE.text(),
                 params![
                     request.idempotency_key,
                     request.impact_token,
                     actor,
                     impact.baseline_count,
                     detached,
-                    self.setup.clock.now_secs()
+                    self.parts.clock.now_ms()
                 ],
             )?;
             Ok(PurgeOutcome {
@@ -454,9 +446,9 @@ impl Management {
         // The sweep needs no publish lock: the undo folder's own lock keeps
         // it off a copy that is being kept.
         drop(publishing);
-        let blobs = &self.setup.core.blobs;
-        let cleaned = crate::publish::snapshots::sweep_unreferenced_blobs(&self.setup.db)
-            .and_then(|rows| Ok(rows + blobs.sweep(&self.setup.db)?))
+        let blobs = &self.parts.core.blobs;
+        let cleaned = crate::publish::snapshots::sweep_unreferenced_blobs(&self.parts.db)
+            .and_then(|rows| Ok(rows + blobs.sweep(&self.parts.db)?))
             .map_err(|error| ManagementError::Store(error.to_string()))?;
         tracing::info!(
             purged = outcome.purged_baseline_count,
@@ -475,38 +467,31 @@ impl Management {
 fn baseline_blob_sizes(
     conn: &rusqlite::Connection,
 ) -> rusqlite::Result<Vec<(String, Option<i64>)>> {
-    let mut stmt = conn.prepare(
-        "SELECT r.sha256, (SELECT LENGTH(b.bytes) FROM library_publish_blobs b \
-         WHERE b.sha256 = r.sha256) FROM (SELECT DISTINCT sha256 FROM library_publish_blob_refs \
-         WHERE owner_kind IN ('baseline', 'v2_baseline')) r",
-    )?;
-    let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
-    rows.collect()
+    let mut stmt = conn.prepare(crate::management::sql::BASELINE_BLOB_SIZES.text())?;
+    let rows = stmt.query_map([], BlobSize::read)?;
+    rows.map(|row| row.map(|row| (row.sha256, row.size)))
+        .collect()
 }
 
 /// Count what a purge would remove, and the token that proves it. The
 /// size of the copies is filled in by the caller, outside any write.
 fn purge_impact(conn: &rusqlite::Connection) -> rusqlite::Result<PurgeImpact> {
     let count = |sql: &str| conn.query_row(sql, [], |row| row.get::<_, i64>(0));
-    let v3 = count("SELECT COUNT(*) FROM library_publish_baselines")?;
-    let v2 = count(
-        "SELECT COUNT(*) FROM library_management_baselines b WHERE NOT EXISTS \
-         (SELECT 1 FROM library_publish_baselines p WHERE p.track_id = b.local_track_id)",
-    )?;
-    let newest = count("SELECT COALESCE(MAX(created_day), 0) FROM library_publish_baselines")?;
-    let blobs = count(
-        "SELECT COUNT(DISTINCT sha256) FROM library_publish_blob_refs \
-         WHERE owner_kind IN ('baseline', 'v2_baseline')",
-    )?;
-    let journals = count(
-        "SELECT COUNT(*) FROM library_publish_journal \
-         WHERE state NOT IN ('cleaned', 'compensated', 'needs_attention')",
-    )?;
-    let restores = count(
-        "SELECT COUNT(*) FROM library_management_job_snapshots s \
-         JOIN library_operation_jobs j ON j.id = s.job_id \
-         WHERE s.mode = 'baseline_restore' AND j.state IN ('queued', 'running', 'paused', 'ready') \
-         AND (j.state <> 'ready' OR COALESCE(s.preview_expires_at, 0) > CAST(strftime('%s', 'now') AS REAL))",
+    let v3 = count(crate::management::sql::PUBLISH_BASELINE_COUNT.text())?;
+    let v2 = count(crate::management::sql::OLD_BASELINE_COUNT.text())?;
+    let newest = count(crate::management::sql::NEWEST_BASELINE_AT.text())?;
+    let blobs = count(crate::management::sql::BASELINE_BLOB_COUNT.text())?;
+    let journals = count(crate::management::sql::OPEN_JOURNAL_COUNT.text())?;
+    let restores = conn.query_row(
+        crate::management::sql::ACTIVE_BASELINE_RESTORE_COUNT.text(),
+        params![
+            JobMode::BaselineRestore.as_str(),
+            OperationState::Queued,
+            OperationState::Running,
+            OperationState::Paused,
+            OperationState::Ready,
+        ],
+        |row| row.get::<_, i64>(0),
     )?;
     let baseline_count = v3 + v2;
     let material = format!("{baseline_count}:{newest}:{blobs}:{journals}:{restores}");

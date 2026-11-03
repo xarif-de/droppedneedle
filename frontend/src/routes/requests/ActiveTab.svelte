@@ -1,19 +1,9 @@
-<script lang="ts" module>
-	export interface ActiveSummary {
-		count: number;
-		downloading: number;
-		searching: number;
-		fetching: boolean;
-	}
-</script>
-
 <script lang="ts">
 	import { SvelteSet } from 'svelte/reactivity';
 	import { fade, fly } from '$lib/ui/motion';
 	import { CircleCheck, TriangleAlert } from 'lucide-svelte';
 	import RequestCard from '$lib/components/RequestCard.svelte';
 	import type { RequestKind } from '$lib/queries/requests/types';
-	import { getRequestDownloadsQuery } from '$lib/queries/downloads/DownloadQueries.svelte';
 	import { getActiveRequestsQuery } from '$lib/queries/requests/RequestQueries.svelte';
 	import {
 		createBatchCancelRequestsMutation,
@@ -22,35 +12,18 @@
 	import { authStore } from '$lib/stores/authStore.svelte';
 	import Button from '$lib/ui/Button.svelte';
 	import RequestsEmpty from './RequestsEmpty.svelte';
-	import { itemKind, itemRequestKey, liveRequestStatus, requestKey } from './requestItems';
+	import { itemKind, itemRequestKey, requestKey } from './requestItems';
 
 	interface Props {
 		active: boolean;
-		onsummary?: (summary: ActiveSummary) => void;
 	}
 
-	let { active, onsummary }: Props = $props();
+	let { active }: Props = $props();
 
 	const activeListQuery = getActiveRequestsQuery(() => active);
 	const activeItems = $derived(activeListQuery.data?.items ?? []);
 	const activeLoading = $derived(activeListQuery.isPending);
 	const activeError = $derived(activeListQuery.isError ? "Couldn't load active requests" : null);
-
-	const tasksQuery = getRequestDownloadsQuery(() => active && activeItems.some((i) => i.task_id));
-	const tasksById = $derived(new Map((tasksQuery.data?.items ?? []).map((t) => [t.id, t])));
-	const liveStatusOf = (item: (typeof activeItems)[number]) => liveRequestStatus(item, tasksById);
-
-	$effect(() => {
-		onsummary?.({
-			count: activeListQuery.data?.count ?? activeItems.length,
-			downloading: activeItems.filter((i) => liveStatusOf(i) === 'downloading').length,
-			searching: activeItems.filter((i) => {
-				const status = liveStatusOf(i);
-				return status === 'pending' || status === 'queued';
-			}).length,
-			fetching: activeListQuery.isFetching
-		});
-	});
 
 	// Batch-cancel selection.
 	let selectedKeys = $state<Set<string>>(new Set());
@@ -162,7 +135,6 @@
 						<RequestCard
 							{item}
 							mode="active"
-							liveStatus={liveStatusOf(item)}
 							selectable
 							selected={selectedKeys.has(itemRequestKey(item))}
 							onselect={handleSelect}

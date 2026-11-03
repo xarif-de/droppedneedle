@@ -61,7 +61,7 @@ pub fn root_assignment(
         })
 }
 
-/// A tag-only profile for the tag editor (as in v2): the folder's own
+/// A tag-only profile for the tag editor: the folder's own
 /// profile with only the edited fields managed: no scripts, genres,
 /// lyrics, ReplayGain, scrubbing, renames, moves or artwork.
 pub fn tag_edit_profile(
@@ -730,21 +730,15 @@ pub fn plan_tags(
         });
         updates.insert(TagTarget::Field(field), new);
     }
-    // Scrubbing (v2's rule): every native item outside the managed
+    // Scrubbing: every native item outside the managed
     // fields goes, except the ones the profile preserves and v2's other
     // managed spellings, which always stay. The values are recorded in
     // the before-state, so undo and a baseline restore put them back.
     let mut scrubbed = Vec::new();
     if profile.metadata.enabled && profile.metadata.scrub_unmanaged_tags {
-        let preserved: Vec<String> = profile
-            .metadata
-            .preserve_fields
-            .iter()
-            .flat_map(|name| preserved_native(name))
-            .collect();
+        let preserved = scrub_preserved(profile);
         for (key, values) in &doc.custom {
-            let folded = key.to_ascii_lowercase();
-            if preserved.contains(&folded) || scrub_keeps(&folded) {
+            if !scrub_removes(&preserved, key) {
                 continue;
             }
             let target = TagTarget::Native(key.clone());
@@ -815,11 +809,10 @@ fn names_unavailable() -> ItemReason {
 }
 
 /// Native spellings (folded keys) a scrub never removes: every spelling
-/// in v2's per-format maps (`_ID3_TXXX`, the ID3 frame list, the Vorbis
-/// and MP4 key maps), plus spellings of v2's other managed names
-/// (comment, encoder, copyright, publisher, grouping). Spellings a
-/// writable field owns never reach the scrub; they are listed so the
-/// list can be checked against v2's whole.
+/// in the per-format maps (ID3 TXXX, the ID3 frame list, the Vorbis and MP4
+/// key maps), plus spellings of other managed names (comment, encoder,
+/// copyright, publisher, grouping). Spellings a writable field owns never
+/// reach the scrub; they are listed so this set stays complete.
 const SCRUB_KEEPS: &[&str] = &[
     "id3:comm",
     "id3:grp1",
@@ -999,6 +992,24 @@ const SCRUB_KEEPS: &[&str] = &[
     "vorbis:unsyncedlyrics",
     "vorbis:work",
 ];
+
+/// The native items (folded keys) this profile's preserved names keep
+/// from a scrub.
+pub(super) fn scrub_preserved(profile: &LibraryManagementProfile) -> Vec<String> {
+    profile
+        .metadata
+        .preserve_fields
+        .iter()
+        .flat_map(|name| preserved_native(name))
+        .collect()
+}
+
+/// Whether a scrub removes this native item (`id3:GEOB`), given
+/// [`scrub_preserved`].
+pub(super) fn scrub_removes(preserved: &[String], key: &str) -> bool {
+    let folded = key.to_ascii_lowercase();
+    !preserved.contains(&folded) && !scrub_keeps(&folded)
+}
 
 /// Whether a scrub keeps this native item (a folded key): v2's managed
 /// names in every spelling, every MusicBrainz and AcoustID id, and

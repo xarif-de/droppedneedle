@@ -1,8 +1,8 @@
-//! Tag reads through lofty's generic items, mirroring v2's field mapping.
+//! Tag reads through lofty's generic items.
 //!
 //! Rule zero (see `save/mod.rs`) cuts both ways: native tags are for
 //! writes, and generic items are for reads. The generic `Tag` lofty builds
-//! on read is complete for every field v2 surfaces (multi-values arrive as
+//! on read is complete for every field the app surfaces (multi-values arrive as
 //! separate items, UFID and TXXX spellings included), while the native
 //! round-trip mangles known `TXXX` description case and drops follow-on
 //! values on several text frames. So reads never touch native tags.
@@ -22,9 +22,14 @@
 //! AAC carries an APEv2 tag lofty does not read, so this module parses that
 //! tag itself (reads only; AAC stays read-only for writes).
 
+use std::fs::File;
+use std::io::{BufReader, Seek as _};
 use std::path::Path;
 
-use lofty::file::{AudioFile as _, TaggedFile, TaggedFileExt as _};
+use lofty::config::{ParseOptions, ParsingMode};
+use lofty::error::FileParseError;
+use lofty::file::{AudioFile as _, FileType, TaggedFile, TaggedFileExt as _};
+use lofty::probe::Probe;
 use lofty::tag::{ItemKey, Tag, TagType};
 
 use super::{AudioFormat, TagsError, format_for_path};
@@ -39,7 +44,7 @@ pub struct AudioArtistCredit {
     pub join_phrase: String,
 }
 
-/// Tag metadata read from an audio file. Field-for-field the v2 `AudioTag`.
+/// Tag metadata read from an audio file, with the fields of v2's `AudioTag`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct AudioTag {
     pub title: String,
@@ -120,7 +125,7 @@ impl std::fmt::Debug for EditionTags {
     }
 }
 
-/// Read tags plus technical info, like v2's `AudioTagger.read_tags`.
+/// Read tags plus technical info.
 pub fn read_tags(path: &Path) -> Result<(AudioTag, super::AudioInfo), TagsError> {
     let format = format_for_path(path)?;
     let tag = read_tag_only(path, format)?;
@@ -138,6 +143,11 @@ pub struct HeaderInfo {
     pub channels: Option<u32>,
     /// Meaningful bit depth: lossless containers only, as v2 stored it.
     pub bit_depth: Option<u8>,
+    /// The duration was measured, not estimated. Only an MP3 can be
+    /// estimated: lofty measures one from a Xing, Info or VBRI frame count
+    /// ([`super::mpeg_length`]) and otherwise estimates it from the first
+    /// frame's bitrate.
+    pub duration_measured: bool,
 }
 
 /// Tags plus header properties for one file, the way the scan indexes it.
@@ -157,8 +167,12 @@ pub fn read_scan_metadata(
                 sample_rate: Some(info.sample_rate).filter(|rate| *rate > 0),
                 channels: Some(info.channels).filter(|count| *count > 0),
                 bit_depth: None,
+                duration_measured: true,
             },
-            Err(_) => HeaderInfo::default(),
+            Err(_) => HeaderInfo {
+                duration_measured: true,
+                ..HeaderInfo::default()
+            },
         };
         return Ok((tag, header));
     }
@@ -201,6 +215,11 @@ pub fn read_scan_metadata(
         } else {
             None
         },
+        duration_measured: format != AudioFormat::Mp3
+            || super::mpeg_length::length_measured(path).map_err(|source| TagsError::Io {
+                path: path.display().to_string(),
+                source,
+            })?,
     };
     Ok((tag, header))
 }
@@ -229,6 +248,36 @@ fn read_lenient(path: &Path) -> Result<TaggedFile, lofty::error::FileParseError>
 /// The I/O error under a lofty read failure, if that is what it was.
 fn io_source(error: &lofty::error::FileParseError) -> Option<&std::io::Error> {
     std::error::Error::source(error).and_then(|source| source.downcast_ref::<std::io::Error>())
+}
+
+/// True when a tag read failed because the file could not be read, rather
+/// than because of what it holds. A file that ends early reads as damaged.
+pub(super) fn is_read_failure(error: &FileParseError) -> bool {
+    nested_io_error(error).is_some_and(|source| source.kind() != std::io::ErrorKind::UnexpectedEof)
+}
+
+/// The I/O error anywhere under a parse error: lofty nests it under the
+/// atom, page or tag it was reading. [`io_source`] stops at the first
+/// level on purpose, so the scan's relaxed re-read still runs for a
+/// truncated tag.
+fn nested_io_error(error: &FileParseError) -> Option<&std::io::Error> {
+    let mut source = std::error::Error::source(error);
+    while let Some(error) = source {
+        if let Some(io) = error.downcast_ref::<std::io::Error>() {
+            return Some(io);
+        }
+        source = error.source();
+    }
+    None
+}
+
+/// Read a file that did not parse to its end. lofty drops some I/O errors:
+/// looking for MP4's `moov` it stops at any failed read and reports no such
+/// atom. Only a file that reads to its end is damaged.
+pub(super) fn read_through(file: &File) -> std::io::Result<()> {
+    let mut file = file.try_clone()?;
+    file.rewind()?;
+    std::io::copy(&mut file, &mut std::io::sink()).map(|_| ())
 }
 
 /// Read the tag half only. The probe half lives in [`super::probe`].
@@ -316,19 +365,59 @@ fn select_tag(tagged: &TaggedFile, format: AudioFormat) -> Option<&Tag> {
 
 /// First embedded cover-art blob, or `None` when the file has none.
 pub fn read_cover_art(path: &Path) -> Result<Option<Vec<u8>>, TagsError> {
-    // WMA is unrecognized even here: v2 returned None by falling through,
-    // v3 rejects the extension before any reader runs.
+    // WMA is not read: the extension is rejected before any reader runs.
     format_for_path(path)?;
-    let tagged = read_lenient(path).map_err(|error| TagsError::TagRead {
+    let file = File::open(path).map_err(|source| TagsError::Io {
         path: path.display().to_string(),
-        reason: error.to_string(),
+        source,
     })?;
-    for tag in tagged.tags() {
-        if let Some(picture) = tag.pictures().first() {
-            return Ok(Some(picture.data().to_vec()));
+    read_cover_art_from(&file, path)
+}
+
+/// [`read_cover_art`] over a file the caller has open (say, one opened
+/// without following a link), read as the container `path`'s extension
+/// names, from its start. The shared file position moves.
+pub fn read_cover_art_from(file: &File, path: &Path) -> Result<Option<Vec<u8>>, TagsError> {
+    format_for_path(path)?;
+    let failed = |reason: String| TagsError::TagRead {
+        path: path.display().to_string(),
+        reason,
+    };
+    let file_type = FileType::from_path(path).ok_or_else(|| failed("unknown container".into()))?;
+    let read = |options: Option<ParseOptions>| -> Result<TaggedFile, FileParseError> {
+        let mut file = file.try_clone()?;
+        file.rewind()?;
+        let probe = Probe::with_file_type(BufReader::new(file), file_type);
+        match options {
+            Some(options) => probe.options(options).read(),
+            None => probe.read(),
         }
+    };
+    // The same two passes as `read_lenient`.
+    let tagged = match read(None) {
+        Err(error) if io_source(&error).is_none() && !is_read_failure(&error) => {
+            read(Some(ParseOptions::new().parsing_mode(ParsingMode::Relaxed)))
+        }
+        read => read,
     }
-    Ok(None)
+    .map_err(|error| match nested_io_error(&error) {
+        Some(source) if is_read_failure(&error) => TagsError::Io {
+            path: path.display().to_string(),
+            source: std::io::Error::new(source.kind(), source.to_string()),
+        },
+        _ => match read_through(file) {
+            Err(source) if source.kind() != std::io::ErrorKind::UnexpectedEof => TagsError::Io {
+                path: path.display().to_string(),
+                source,
+            },
+            _ => failed(error.to_string()),
+        },
+    })?;
+    Ok(tagged
+        .tags()
+        .iter()
+        .find_map(|tag| tag.pictures().first())
+        .map(|picture| picture.data().to_vec()))
 }
 
 // ---------------------------------------------------------------------------
@@ -509,7 +598,8 @@ fn year_of(values: &[String]) -> Option<i32> {
 /// as the album's release date, a FLAC `DATE` or an ID3 `TDRC` alone does
 /// not) and its source at tag v0.62.0 (github.com/navidrome/navidrome):
 /// `resources/mappings.yaml` for the `releasedate` aliases, `mapDates` in
-/// `model/metadata/map_mediafile.go` for step 4, and `ToAlbum` in
+/// `model/metadata/map_mediafile.go` for how the release date is picked, and
+/// `ToAlbum` in
 /// `model/mediafile.go`, where an album keeps the value only when every
 /// track has the same one. Item keys per lofty 0.25.4's table in
 /// `tag/item.rs`: `©day` is `RecordingDate`, Vorbis `YEAR` is `Year`.
@@ -668,8 +758,80 @@ fn parse_ape_items(
 
 #[cfg(test)]
 mod tests {
-    use super::{ape_tag_from_items, audio_tag_from_values, id3v23_tag_bytes};
+    use super::{
+        FileType, Probe, ape_tag_from_items, audio_tag_from_values, id3v23_tag_bytes,
+        is_read_failure,
+    };
     use lofty::tag::{ItemKey, TagType};
+
+    /// A file whose reads fail with EIO after `limit` bytes, as on a mount
+    /// whose backend went down while stat and open still answer.
+    struct FailsAfter {
+        inner: std::io::Cursor<&'static [u8]>,
+        limit: u64,
+    }
+
+    impl std::io::Read for FailsAfter {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let left = self.limit.saturating_sub(self.inner.position());
+            if left == 0 {
+                return Err(std::io::Error::from_raw_os_error(libc::EIO));
+            }
+            let room = buf.len().min(usize::try_from(left).unwrap_or(usize::MAX));
+            self.inner.read(&mut buf[..room])
+        }
+    }
+
+    impl std::io::Seek for FailsAfter {
+        fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(to)
+        }
+    }
+
+    /// An I/O failure partway through a file is a failed read in every
+    /// container, however deep lofty nests it, never a damaged file: the
+    /// sweeps clear rows on a damaged file and keep them on a failed read.
+    #[test]
+    fn an_io_error_inside_a_tag_is_a_read_failure() {
+        // Each failure lands inside the tag. Above it lofty and ogg_pager drop
+        // a failed read while walking atoms and page headers, which
+        // `read_through` catches when the file then does not parse.
+        let files: [(FileType, &'static [u8], &[u8], u64); 3] = [
+            (
+                FileType::Mp4,
+                include_bytes!("../../../tests/fixtures/library/management_full.m4a"),
+                b"ilst",
+                8,
+            ),
+            (
+                FileType::Opus,
+                include_bytes!("../../../tests/fixtures/library/management_full.opus"),
+                b"OpusTags",
+                8,
+            ),
+            (
+                FileType::Mpeg,
+                include_bytes!("../../../tests/fixtures/library/management_full.mp3"),
+                b"ID3",
+                64,
+            ),
+        ];
+        for (file_type, bytes, marker, past) in files {
+            let start = bytes
+                .windows(marker.len())
+                .position(|name| name == marker)
+                .expect("the fixture has its tag");
+            let reader = FailsAfter {
+                inner: std::io::Cursor::new(bytes),
+                limit: start as u64 + past,
+            };
+            let error = Probe::with_file_type(reader, file_type)
+                .read()
+                .err()
+                .unwrap_or_else(|| panic!("{file_type:?} read past the failure"));
+            assert!(is_read_failure(&error), "{file_type:?}: {error}");
+        }
+    }
 
     /// The tag `pairs` make for a `tag_type` file.
     fn tag_of(tag_type: TagType, pairs: &'static [(ItemKey, &'static str)]) -> super::AudioTag {

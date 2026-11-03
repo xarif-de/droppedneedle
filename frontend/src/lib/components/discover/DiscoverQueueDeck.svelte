@@ -18,13 +18,14 @@
 	import { discoverQueueDeck } from '$lib/stores/discoverQueueDeck.svelte';
 	import { deckSampler } from '$lib/stores/deckSampler.svelte';
 	import { audioFocus } from '$lib/stores/audioFocus.svelte';
+	import { withBasePath } from '$lib/utils/basePath';
 	import { playerStore } from '$lib/stores/player.svelte';
 	import { libraryStore } from '$lib/stores/library';
-	import { requestAlbum } from '$lib/queries/downloads/DownloadMutations.svelte';
+	import { createRequestAlbumMutation } from '$lib/queries/downloads/DownloadMutations.svelte';
 	import AlbumImage from '$lib/components/AlbumImage.svelte';
 	import HeroBackdrop from '$lib/components/HeroBackdrop.svelte';
 	import YouTubeIcon from '$lib/components/YouTubeIcon.svelte';
-	import { getQueuePreviewV3Mutation } from '$lib/queries/discover/DiscoverV3Mutations.svelte';
+	import { createQueuePreviewV3Mutation } from '$lib/queries/discover/DiscoverV3Mutations.svelte';
 	import Button from '$lib/ui/Button.svelte';
 	import Card from '$lib/ui/Card.svelte';
 	import IconButton from '$lib/ui/IconButton.svelte';
@@ -46,7 +47,7 @@
 	let ytSearchUrl = $state<string | null>(null);
 	let previewController: AbortController | null = null;
 	let previewGeneration = 0;
-	const previewMutation = getQueuePreviewV3Mutation();
+	const previewMutation = createQueuePreviewV3Mutation();
 
 	const current = $derived(deck.current);
 	const cardIdentity = $derived(`${deck.requestKey}:${current?.musicbrainz_id ?? ''}`);
@@ -204,7 +205,7 @@
 		}
 	}
 
-	const deckRequest = requestAlbum();
+	const deckRequest = createRequestAlbumMutation();
 
 	function handleAdvance() {
 		deckSampler.stop();
@@ -376,7 +377,10 @@
 								/>
 							{:else}
 								<div class="deck-cover relative overflow-hidden rounded-2xl shadow-xl">
-									<a href={`/album/${current.musicbrainz_id}`} aria-label="View {current.title}">
+									<a
+										href={withBasePath(`/album/${current.musicbrainz_id}`)}
+										aria-label="View {current.title}"
+									>
 										<AlbumImage
 											mbid={current.musicbrainz_id}
 											alt={current.title}
@@ -469,14 +473,14 @@
 						<!-- info pane -->
 						<div class="flex min-w-0 flex-col">
 							<a
-								href={`/album/${current.musicbrainz_id}`}
+								href={withBasePath(`/album/${current.musicbrainz_id}`)}
 								class="w-fit max-w-full truncate text-2xl font-extrabold leading-tight tracking-tight transition-colors hover:text-primary sm:text-3xl"
 							>
 								{current.title}
 							</a>
 							{#if artistMbid}
 								<a
-									href={`/artist/${artistMbid}`}
+									href={withBasePath(`/artist/${artistMbid}`)}
 									class="w-fit text-sm font-semibold uppercase tracking-wide text-base-content/60 transition-colors hover:text-primary"
 								>
 									{current.artist_name}
@@ -516,7 +520,7 @@
 									<div class="mt-3 flex flex-wrap gap-1.5">
 										{#each [...new Set(enrichment.tags)].slice(0, 6) as tag (tag)}
 											<a
-												href={`/genre?name=${encodeURIComponent(tag)}`}
+												href={withBasePath(`/genre?name=${encodeURIComponent(tag)}`)}
 												class="badge badge-ghost badge-sm border-base-content/10 transition-colors hover:border-primary/40 hover:text-primary"
 											>
 												{tag}

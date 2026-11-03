@@ -9,7 +9,9 @@ publish = false
 
 [dependencies]
 droppedneedle = { path = "..", version = "3.0.0" }
+droppedneedle-acquire.workspace = true
 droppedneedle-auth.workspace = true
+droppedneedle-catalog.workspace = true
 droppedneedle-kernel.workspace = true
 droppedneedle-library.workspace = true
 aes.workspace = true
@@ -24,7 +26,6 @@ rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-sqlx.workspace = true
 thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true
@@ -44,8 +45,6 @@ test-support = [
 [dev-dependencies]
 droppedneedle-tool = { path = ".", features = ["test-support"] }
 droppedneedle-kernel = { workspace = true, features = ["test-support"] }
-droppedneedle-acquire.workspace = true
-droppedneedle-catalog.workspace = true
 droppedneedle-compat.workspace = true
 droppedneedle-media.workspace = true
 droppedneedle-plugins.workspace = true
@@ -53,6 +52,7 @@ droppedneedle-providers.workspace = true
 droppedneedle-testkit = { path = "../testkit", version = "0.1.0" }
 axum.workspace = true
 regex.workspace = true
+sqlx.workspace = true
 tower.workspace = true
 tracing-subscriber.workspace = true
 utoipa.workspace = true

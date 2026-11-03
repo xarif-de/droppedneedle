@@ -21,9 +21,9 @@ use super::models::{
     AdminUserCreate, AdminUserListResponse, AppPasswordCreate, AppPasswordCreatedResponse,
     DeviceSessionMint, DeviceSessionResponse, DisplayNameUpdate, EmailUpdate,
     ImportCandidateListResponse, ImportUsersRequest, ImportUsersResponse, LastFmConfiguredResponse,
-    LastFmCredentialsSet, LastFmSessionExchange, LastFmSessionResponse, LastFmStatusResponse,
-    LastFmTokenResponse, LocalPasswordSet, PasswordChange, PasswordReset, ProfileResponse,
-    RecoveryCodeResponse, RoleUpdate, SessionListResponse, UserResponse, UsernameUpdate,
+    LastFmCredentialsSet, LastFmSessionExchange, LastFmSessionResponse, LastFmTokenResponse,
+    LocalPasswordSet, PasswordChange, PasswordReset, ProfileResponse, RecoveryCodeResponse,
+    RoleUpdate, SessionListResponse, UserResponse, UsernameUpdate,
 };
 use super::roles::{Admin, Role, User};
 use super::services;
@@ -46,8 +46,21 @@ impl From<UsersError> for ApiError {
             UsersError::Unavailable { cause } => {
                 ApiError::fault(StatusCode::SERVICE_UNAVAILABLE, cause)
             }
+            UsersError::Paced {
+                provider,
+                retry_after,
+            } => ApiError::unavailable(
+                Unavailable::Provider {
+                    provider,
+                    retry_after,
+                },
+                format!("{provider} is paced"),
+            ),
             UsersError::Upstream { cause } => ApiError::fault(StatusCode::BAD_GATEWAY, cause),
             UsersError::Busy => ApiError::unavailable(Unavailable::ServerBusy, "users store busy"),
+            UsersError::HashingBusy => {
+                ApiError::unavailable(Unavailable::ServerBusy, "password hashing slots busy")
+            }
             UsersError::Internal { cause } => ApiError::internal(cause),
         }
     }
@@ -133,7 +146,12 @@ pub async fn put_email(
     tag = "users",
     path = "/api/v3/me/password",
     request_body = PasswordChange,
-    responses((status = 200, description = "Updated account", body = UserResponse))
+    responses(
+        (status = 200, description = "Updated account", body = UserResponse),
+        (status = 400, description = "Current password is incorrect, or the new one is refused"),
+        (status = 401, description = "Missing or invalid session"),
+        (status = 409, description = "The account has no local password")
+    )
 )]
 pub async fn post_password(
     State(deps): State<UsersDeps>,
@@ -377,23 +395,6 @@ pub async fn revoke_app_password(
         .map_err(ApiError::from)
 }
 
-/// Per-user Last.fm link status.
-#[utoipa::path(
-    get,
-    tag = "users",
-    path = "/api/v3/me/connections/lastfm",
-    responses((status = 200, description = "Link status", body = LastFmStatusResponse))
-)]
-pub async fn lastfm_status(
-    State(deps): State<UsersDeps>,
-    User(caller): User,
-) -> Result<Json<LastFmStatusResponse>, ApiError> {
-    services::lastfm_status(&deps, caller.user_id())
-        .await
-        .map(Json)
-        .map_err(ApiError::from)
-}
-
 /// Store the caller's own Last.fm API credentials.
 #[utoipa::path(
     put,
@@ -539,25 +540,6 @@ pub async fn admin_create_user(
     .await
     .map(|user| (StatusCode::CREATED, Json(user)))
     .map_err(ApiError::from)
-}
-
-/// Fetch one user.
-#[utoipa::path(
-    get,
-    tag = "users",
-    path = "/api/v3/admin/users/{id}",
-    params(("id" = String, Path, description = "User id")),
-    responses((status = 200, description = "The account", body = UserResponse))
-)]
-pub async fn admin_get_user(
-    State(deps): State<UsersDeps>,
-    admin: Admin,
-    Path(user_id): Path<String>,
-) -> Result<Json<UserResponse>, ApiError> {
-    services::admin_get_user(&deps, &admin, &user_id)
-        .await
-        .map(Json)
-        .map_err(ApiError::from)
 }
 
 /// Change one user's role.

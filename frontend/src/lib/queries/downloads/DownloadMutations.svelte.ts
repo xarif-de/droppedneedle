@@ -1,9 +1,9 @@
+import { v3 } from '$lib/api/v3/endpoint';
 import { api } from '$lib/api/client';
 import type { components } from '$lib/api/v3/openapi';
-import { REQUESTS_ENDPOINTS } from '$lib/queries/requests/endpoints';
 import type { IntakeResponse, TrackIntakeResponse } from '$lib/queries/requests/types';
 import { authStore } from '$lib/stores/authStore.svelte';
-import { readIntegrationStatus } from '$lib/queries/HomeIntegrationStatusQuery.svelte';
+import { readIntegrationStatus } from '$lib/queries/home.svelte';
 import { libraryStore } from '$lib/stores/library';
 import { toastStore } from '$lib/stores/toast';
 // Request-surface copy lives beside the other acquisition label mappings.
@@ -13,7 +13,6 @@ import {
 	requestStatusCopy
 } from '$lib/utils/acquisitionLabels';
 import { albumRequestOutcome } from '$lib/utils/requestOutcome';
-import { DOWNLOAD_TASKS_ENDPOINTS } from './endpoints';
 import {
 	albumStatusChanged,
 	anyDownloadChanged,
@@ -66,13 +65,13 @@ const requestSurface = () => [anyDownloadChanged(), anyRequestChanged()];
 // One click, one toast, one cache path (Acquisition "Request surfaces"). The
 // response status is mapped to the spec's four copy lines by albumRequestOutcome;
 // the summary sentence comes from the response when the backend carries one.
-export function requestAlbum() {
+export function createRequestAlbumMutation() {
 	return createAppMutation(() => ({
 		mutationFn: async (input: AlbumRequestInput): Promise<IntakeResponse> => {
 			const initiatingUserId = authStore.user?.id;
 			let data: IntakeResponse;
 			try {
-				data = await api.v3.POST(REQUESTS_ENDPOINTS.requestAlbum(), {
+				data = await api.v3.POST(v3('/api/v3/requests/albums'), {
 					musicbrainz_id: input.release_group_mbid,
 					artist: input.artist_name ?? null,
 					album: input.album_title ?? null,
@@ -136,7 +135,7 @@ export interface BatchRequestResult {
 
 // Discography/discovery bulk requests. Counts are rendered verbatim by
 // batchRequestCopy - skipped and over-limit albums are never claimed as queued.
-export function requestBatch() {
+export function createRequestBatchMutation() {
 	return createAppMutation(() => ({
 		mutationFn: async (input: {
 			items: BatchAlbumItem[];
@@ -145,7 +144,7 @@ export function requestBatch() {
 		}): Promise<BatchRequestResult> => {
 			const initiatingUserId = authStore.user?.id;
 			try {
-				const response = await api.v3.POST(REQUESTS_ENDPOINTS.requestBatch(), {
+				const response = await api.v3.POST(v3('/api/v3/requests/batches'), {
 					items: input.items,
 					monitor_artist: input.monitorArtist === true,
 					auto_download_artist: input.autoDownloadArtist === true
@@ -183,11 +182,11 @@ export function requestBatch() {
 	}));
 }
 
-export function requestTrack() {
+export function createRequestTrackMutation() {
 	return createAppMutation(() => ({
 		effects: tasks,
 		mutationFn: (input: TrackRequestInput) =>
-			api.v3.POST(REQUESTS_ENDPOINTS.requestTrack(), {
+			api.v3.POST(v3('/api/v3/requests/tracks'), {
 				recording_mbid: input.recording_mbid,
 				artist_name: input.artist_name,
 				track_title: input.track_title,
@@ -200,13 +199,11 @@ export function requestTrack() {
 		onSuccess: (data: TrackIntakeResponse) => {
 			toastStore.show({
 				message:
-					data.status === 'already_in_library'
-						? 'That track is already in your library'
-						: data.status === 'awaiting_approval'
-							? 'Track request submitted for admin approval'
-							: noSourceReady()
-								? WAITING_FOR_SOURCE_COPY
-								: 'Track requested - searching for downloads',
+					data.status === 'awaiting_approval'
+						? 'Track request submitted for admin approval'
+						: noSourceReady()
+							? WAITING_FOR_SOURCE_COPY
+							: 'Track requested - searching for downloads',
 				type: 'success'
 			});
 		},
@@ -215,10 +212,11 @@ export function requestTrack() {
 	}));
 }
 
-export function cancelDownload() {
+export function createCancelDownloadMutation() {
 	return createAppMutation(() => ({
 		effects: tasks,
-		mutationFn: (id: string) => api.v3.POST(DOWNLOAD_TASKS_ENDPOINTS.cancel(id)),
+		mutationFn: (id: string) =>
+			api.v3.POST(v3('/api/v3/downloads/tasks/{task_id}/cancel', { path: { task_id: id } })),
 		onSuccess: () => {
 			toastStore.show({ message: 'Download cancelled', type: 'info' });
 		},
@@ -232,13 +230,16 @@ interface NextSourceInput {
 	candidateIndex: number;
 }
 
-export function tryNextSource() {
+export function createTryNextSourceMutation() {
 	return createAppMutation(() => ({
 		effects: tasks,
 		mutationFn: (input: NextSourceInput) =>
-			api.v3.POST(DOWNLOAD_TASKS_ENDPOINTS.nextSource(input.id), {
-				expected_candidate_index: input.candidateIndex
-			}),
+			api.v3.POST(
+				v3('/api/v3/downloads/tasks/{task_id}/next-source', { path: { task_id: input.id } }),
+				{
+					expected_candidate_index: input.candidateIndex
+				}
+			),
 		onSuccess: () => {
 			toastStore.show({ message: 'Trying the next source', type: 'info' });
 		},
@@ -254,10 +255,11 @@ export function tryNextSource() {
 
 // Stop a scheduled auto-retry. Cancelling the failed/partial task drops it out of the
 // retry sweep (status -> cancelled); a manual Retry is still available afterwards.
-export function stopAutoRetry() {
+export function createStopAutoRetryMutation() {
 	return createAppMutation(() => ({
 		effects: tasks,
-		mutationFn: (id: string) => api.v3.POST(DOWNLOAD_TASKS_ENDPOINTS.cancel(id)),
+		mutationFn: (id: string) =>
+			api.v3.POST(v3('/api/v3/downloads/tasks/{task_id}/cancel', { path: { task_id: id } })),
 		onSuccess: () => {
 			toastStore.show({ message: 'Stopped retrying', type: 'info' });
 		},
@@ -266,10 +268,11 @@ export function stopAutoRetry() {
 	}));
 }
 
-export function retryDownload() {
+export function createRetryDownloadMutation() {
 	return createAppMutation(() => ({
 		effects: tasks,
-		mutationFn: (id: string) => api.v3.POST(DOWNLOAD_TASKS_ENDPOINTS.retry(id)),
+		mutationFn: (id: string) =>
+			api.v3.POST(v3('/api/v3/downloads/tasks/{task_id}/retry', { path: { task_id: id } })),
 		onSuccess: () => {
 			toastStore.show({ message: 'Download retry initiated', type: 'info' });
 		},
@@ -284,10 +287,10 @@ function pluralDownloads(n: number): string {
 	return `${n} download${n === 1 ? '' : 's'}`;
 }
 
-export function clearFinished() {
+export function createClearFinishedMutation() {
 	return createAppMutation(() => ({
 		effects: tasks,
-		mutationFn: () => api.v3.POST(DOWNLOAD_TASKS_ENDPOINTS.clear()),
+		mutationFn: () => api.v3.POST(v3('/api/v3/downloads/clear')),
 		onSuccess: (data: { cleared: number }) => {
 			toastStore.show({
 				message: data.cleared > 0 ? `Cleared ${pluralDownloads(data.cleared)}` : 'Nothing to clear',
@@ -299,10 +302,10 @@ export function clearFinished() {
 	}));
 }
 
-export function stopAllRetries() {
+export function createStopAllRetriesMutation() {
 	return createAppMutation(() => ({
 		effects: tasks,
-		mutationFn: () => api.v3.POST(DOWNLOAD_TASKS_ENDPOINTS.stopAllRetries()),
+		mutationFn: () => api.v3.POST(v3('/api/v3/downloads/stop-all-retries')),
 		onSuccess: (data: { stopped: number }) => {
 			toastStore.show({
 				message:
@@ -317,10 +320,10 @@ export function stopAllRetries() {
 	}));
 }
 
-export function retryAllFailed() {
+export function createRetryAllFailedMutation() {
 	return createAppMutation(() => ({
 		effects: tasks,
-		mutationFn: () => api.v3.POST(DOWNLOAD_TASKS_ENDPOINTS.retryAllFailed()),
+		mutationFn: () => api.v3.POST(v3('/api/v3/downloads/retry-all-failed')),
 		onSuccess: (data: { retried: number }) => {
 			toastStore.show({
 				message:
@@ -341,9 +344,12 @@ interface ReimportInput {
 // Admin reimport: the task goes back in line with its picked candidate
 // kept, so the worker checks the downloads mount again without
 // re-searching.
-export function reimportDownload() {
+export function createReimportDownloadMutation() {
 	return createAppMutation(() => ({
-		mutationFn: (input: ReimportInput) => api.v3.POST(DOWNLOAD_TASKS_ENDPOINTS.reimport(input.id)),
+		mutationFn: (input: ReimportInput) =>
+			api.v3.POST(
+				v3('/api/v3/downloads/tasks/{task_id}/reimport', { path: { task_id: input.id } })
+			),
 		onSuccess: (data) => {
 			if (data.status === 'completed') {
 				toastStore.show({ message: 'Import complete', type: 'success' });

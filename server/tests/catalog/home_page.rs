@@ -8,17 +8,17 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use droppedneedle_catalog::reads::discover::genre::GenrePages;
-use droppedneedle_catalog::reads::discover::genre::artwork::GenreArt;
-use droppedneedle_catalog::reads::discover::home::library::HomeLibrary;
-use droppedneedle_catalog::reads::discover::home::{HomeInputs, LiveHome};
-use droppedneedle_catalog::reads::discover::listening::{
+use droppedneedle_catalog::discover::genre::GenrePages;
+use droppedneedle_catalog::discover::genre::artwork::GenreArt;
+use droppedneedle_catalog::discover::home::library::HomeLibrary;
+use droppedneedle_catalog::discover::home::{HomeInputs, LiveHome};
+use droppedneedle_catalog::discover::listening::{
     ArtistRow, ListenedAlbum, ListeningData, LovedTrack, TagAlbum, UserMusic,
 };
-use droppedneedle_catalog::reads::discover::models::{
+use droppedneedle_catalog::discover::models::{
     ArtworkKind, PromptService, SectionItem, SectionKey,
 };
-use droppedneedle_catalog::reads::discover::page::shelves::shelf_of;
+use droppedneedle_catalog::discover::page::shelves::shelf_of;
 use droppedneedle_kernel::clock::ManualClock;
 use droppedneedle_kernel::db::{DbError, Lane};
 
@@ -33,7 +33,7 @@ fn artist(name: &str, mbid: &str) -> ArtistRow {
     ArtistRow {
         name: name.to_owned(),
         mbid: Some(mbid.to_owned()),
-        listen_count: 10,
+        listen_count: Some(10),
     }
 }
 
@@ -122,18 +122,18 @@ async fn home_and_genre_pages_build_from_library_and_listening() {
         })
         .await
         .expect("seed");
-    let pool = runtime.db().sqlx().clone();
+    let db = runtime.db().clone();
     let listening = ListeningData::new(
         Arc::new(home_script()),
         droppedneedle_providers::Providers::closed().cache,
     );
-    let art = Arc::new(GenreArt::new(HomeLibrary::new(pool.clone())));
+    let art = Arc::new(GenreArt::new(HomeLibrary::new(db.clone())));
     let home_over = || {
         LiveHome::new(HomeInputs {
             listening: listening.clone(),
             db: runtime.db().clone(),
             clock: Arc::new(ManualClock::at(1_790_000_000_000)),
-            integrations: droppedneedle_catalog::reads::discover::content::IntegrationSettings::new(
+            integrations: droppedneedle_catalog::discover::content::IntegrationSettings::new(
                 &crate::common::config_store(&dir),
                 Arc::new(crate::common::bundles::NoDownloadSource),
             ),
@@ -194,7 +194,7 @@ async fn home_and_genre_pages_build_from_library_and_listening() {
     assert!(shelf_of(&restarted.sections, SectionKey::RecentlyPlayed).is_some());
 
     // The genre page: owned and popular rows side by side.
-    let genre = GenrePages::new(pool.clone(), listening, art.clone(), None)
+    let genre = GenrePages::new(db.clone(), listening, art.clone(), None)
         .detail("Shoegaze", 50, 0, 0)
         .await;
     let library = genre.library.expect("library lane");

@@ -27,7 +27,7 @@ use droppedneedle_acquire::slskd::{
 use droppedneedle_acquire::sources::{SabnzbdSource, SlskdSource};
 use droppedneedle_acquire::target::SearchTarget;
 use droppedneedle_acquire::usenet::indexer::{Indexer, IndexerQuery, PluginIndexers};
-use droppedneedle_acquire::usenet::newznab::{NewznabClient, NewznabIndexer, NewznabIndexerEntry};
+use droppedneedle_acquire::usenet::newznab::{NewznabIndexer, NewznabIndexerEntry};
 use droppedneedle_acquire::usenet::policy::UsenetPolicy;
 use droppedneedle_acquire::usenet::prowlarr::{ProwlarrClient, ProwlarrIndexer};
 use droppedneedle_acquire::usenet::sabnzbd::{SabnzbdClient, SabnzbdQueue};
@@ -36,6 +36,8 @@ use droppedneedle_kernel::runtime_config::crypto::Crypto;
 use droppedneedle_plugins::host::PluginHost;
 use droppedneedle_plugins::process::ProcessLauncher;
 use droppedneedle_plugins::runtime::RuntimeState;
+use droppedneedle_providers::newznab::NewznabIndexers;
+use droppedneedle_providers::{ProviderEndpoints, Providers, RequestPriority};
 use droppedneedle_testkit::slskd::{MOCK_API_KEY, MockSlskd};
 use droppedneedle_testkit::usenet::{
     NewznabMock, NewznabScenario, ProwlarrMock, ProwlarrScenario, SabnzbdMock, serve_loopback,
@@ -207,13 +209,7 @@ async fn sabnzbd_conforms() {
     );
     let newznab = NewznabIndexer::new(
         vec![NewznabIndexerEntry {
-            client: NewznabClient::new(
-                reqwest::Client::new(),
-                &format!("{indexer}/api"),
-                "NZKEY",
-                "dummy",
-                "Dummy",
-            ),
+            client: newznab_indexers().client("dummy", "Dummy", &format!("{indexer}/api"), "NZKEY"),
             id: "dummy".to_owned(),
             name: "Dummy".to_owned(),
             categories: vec![3040],
@@ -221,8 +217,6 @@ async fn sabnzbd_conforms() {
             priority: 1,
             limit: 100,
         }],
-        WAIT,
-        WAIT,
         WAIT,
         WAIT,
     );
@@ -250,6 +244,98 @@ async fn sabnzbd_conforms() {
     .await;
 }
 
+/// A native indexer's release is fetched through that indexer's client, so
+/// the source's grab reaches the cap its answers report.
+#[tokio::test]
+async fn a_usenet_pick_grabs_through_its_indexer() {
+    let mock = SabnzbdMock::new();
+    let (sab, _sab_server) = serve_loopback(mock.router()).await.expect("mock serves");
+    let body = format!(
+        r#"<rss version="2.0" xmlns:newznab="http://www.newznab.com/DTD/2010/feeds/attributes/">
+ <channel>
+  <newznab:apilimits apiCurrent="1" apiMax="100" grabCurrent="0" grabMax="1"/>
+  <item>
+   <title>Portishead - Dummy (1994) [FLAC]</title>
+   <guid>dummy-flac</guid>
+   <enclosure url="{sab}/nzb/good" length="314572800" type="application/x-nzb"/>
+   <newznab:attr name="category" value="3040"/>
+   <newznab:attr name="size" value="314572800"/>
+   <newznab:attr name="files" value="12"/>
+  </item>
+ </channel>
+</rss>"#
+    );
+    let (indexer, _indexer_server) = serve_loopback(Router::new().route(
+        "/api",
+        get(move || {
+            let body = body.clone();
+            async move { body }
+        }),
+    ))
+    .await
+    .expect("feed serves");
+    let dir = ScratchDir::new("source-grab");
+    let policy = UsenetPolicy::v2_defaults();
+    let queue = SabnzbdQueue::new(
+        SabnzbdClient::new(
+            reqwest::Client::new(),
+            &sab,
+            "SABKEY",
+            3,
+            Duration::from_millis(1),
+        ),
+        &sab,
+        "SABKEY",
+        dir.join("complete"),
+        policy.clone(),
+    );
+    let client = newznab_indexers().client("dummy", "Dummy", &format!("{indexer}/api"), "NZKEY");
+    let source = SabnzbdSource::new(
+        Arc::new(queue),
+        vec![Arc::new(NewznabIndexer::new(
+            vec![NewznabIndexerEntry {
+                client: client.clone(),
+                id: "dummy".to_owned(),
+                name: "Dummy".to_owned(),
+                categories: vec![3040],
+                enabled: true,
+                priority: 1,
+                limit: 100,
+            }],
+            WAIT,
+            WAIT,
+        ))],
+        policy,
+        journal_with_task("t-grab", "Portishead", "Dummy").await,
+        None,
+    );
+    source.enqueue("t-grab", 0).await.expect("enqueues");
+    assert_eq!(mock.state().add_file_requests.len(), 1);
+    let next = client.search("Portishead", &[], 0, 100, USER).await;
+    assert!(
+        matches!(
+            next,
+            Err(droppedneedle_providers::newznab::NewznabError::Provider(
+                droppedneedle_providers::ProviderError::RateLimited { .. }
+            ))
+        ),
+        "the grab counted against the cap: {next:?}"
+    );
+}
+
+/// The indexers are asked as a person's search would ask them.
+const USER: RequestPriority = RequestPriority::UserInitiated;
+
+/// The providers' Newznab indexers over real HTTP to loopback, unpaced.
+fn newznab_indexers() -> NewznabIndexers {
+    let http = droppedneedle_kernel::http_client::HttpClientFactory::new().expect("http");
+    Providers::unpaced_at(
+        Arc::new(droppedneedle_providers::ReqwestWire::new(&http)),
+        ProviderEndpoints::closed(),
+    )
+    .newznab
+}
+
 fn album(artist: &str, title: &str) -> SearchTarget {
     SearchTarget {
         artist: artist.to_owned(),
@@ -265,7 +351,7 @@ fn album(artist: &str, title: &str) -> SearchTarget {
 /// carrying an NZB link.
 async fn answers(indexer: &dyn Indexer) {
     let target = album("Radiohead", "In Rainbows");
-    let hits = indexer.search(&IndexerQuery::Album(&target)).await;
+    let hits = indexer.search(&IndexerQuery::Album(&target), USER).await;
     assert!(!hits.is_empty(), "the indexer answers");
     for hit in &hits {
         assert_eq!(hit.source, SourceTag::Usenet);
@@ -278,20 +364,19 @@ async fn refused(indexer: &dyn Indexer) {
     let target = album("Radiohead", "In Rainbows");
     assert!(
         indexer
-            .search(&IndexerQuery::Album(&target))
+            .search(&IndexerQuery::Album(&target), USER)
             .await
             .is_empty()
     );
 }
 
 /// A 429 is no releases, and the indexer sits out for the `Retry-After`
-/// it was given (each indexer's own backoff is zero here, so only the
-/// header can keep it out).
+/// it was given.
 async fn limited(indexer: &dyn Indexer, searches: impl Fn() -> usize) {
     let target = album("Radiohead", "In Rainbows");
     assert!(
         indexer
-            .search(&IndexerQuery::Album(&target))
+            .search(&IndexerQuery::Album(&target), USER)
             .await
             .is_empty()
     );
@@ -299,7 +384,7 @@ async fn limited(indexer: &dyn Indexer, searches: impl Fn() -> usize) {
     assert!(asked > 0, "the indexer was asked");
     assert!(
         indexer
-            .search(&IndexerQuery::Album(&target))
+            .search(&IndexerQuery::Album(&target), USER)
             .await
             .is_empty()
     );
@@ -316,13 +401,7 @@ async fn newznab_on(scenario: NewznabScenario) -> Rig<NewznabIndexer, NewznabMoc
         .expect("mock serves");
     let indexer = NewznabIndexer::new(
         vec![NewznabIndexerEntry {
-            client: NewznabClient::new(
-                reqwest::Client::new(),
-                &format!("{base}/api"),
-                "NZKEY",
-                "nz",
-                "NZ",
-            ),
+            client: newznab_indexers().client("nz", "NZ", &format!("{base}/api"), "NZKEY"),
             id: "nz".to_owned(),
             name: "NZ".to_owned(),
             categories: vec![3040],
@@ -331,8 +410,6 @@ async fn newznab_on(scenario: NewznabScenario) -> Rig<NewznabIndexer, NewznabMoc
             limit: 100,
         }],
         WAIT,
-        WAIT,
-        Duration::ZERO,
         WAIT,
     );
     (indexer, mock, server)
@@ -600,20 +677,26 @@ async fn plugin_rig(tag: &str) -> PluginRig {
     }
 }
 
-/// The host gives a plugin 15 seconds to answer its handshake, so the wait
-/// runs a little past that.
+/// Wait for `name` to answer its handshake. On a loaded host a Python
+/// start can outrun the host's 15 seconds; the plugin is then restarted
+/// after its backoff, so the wait is bounded in wall-clock time, not by the
+/// handshake limit.
 async fn running(host: &PluginHost, name: &str) {
-    for _ in 0..800 {
-        let state = host
-            .get(name)
-            .and_then(|plugin| plugin.runtime_status())
-            .map(|status| status.state);
-        if state == Some(RuntimeState::Running) {
+    let deadline = std::time::Instant::now() + crate::common::PATIENCE;
+    loop {
+        let status = host.get(name).and_then(|plugin| plugin.runtime_status());
+        if status
+            .as_ref()
+            .is_some_and(|status| status.state == RuntimeState::Running)
+        {
             return;
         }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{name} never started: {status:?}"
+        );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    panic!("{name} never started");
 }
 
 /// The example client as a download source over `journal`.
@@ -660,7 +743,7 @@ async fn plugins_conform() {
     let indexers = PluginIndexers::new(rig.host.clone());
     answers(&indexers).await;
     let target = album("Radiohead", "In Rainbows");
-    let hits = indexers.search(&IndexerQuery::Album(&target)).await;
+    let hits = indexers.search(&IndexerQuery::Album(&target), USER).await;
     assert_eq!(hits.len(), 1, "a release without an NZB link is dropped");
 }
 

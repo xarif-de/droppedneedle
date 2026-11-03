@@ -1,8 +1,7 @@
 //! Subsonic/OpenSubsonic compat API.
 //!
-//! Pinned protocol `1.16.1`, ported quirk-for-quirk from v2's Subsonic
-//! compat package. Every behavior below cites its source; the golden tests
-//! pin the wire bytes.
+//! Pinned protocol `1.16.1`. The quirks clients depend on are listed with their
+//! sources below; the golden tests pin the wire bytes.
 //!
 //! # Endpoint x fields x auth
 //!
@@ -54,7 +53,7 @@
 //! | getPodcasts/getNewestPodcasts | podcasts/newestPodcasts | yes | always empty: no podcasts here |
 //! | getInternetRadioStations | internetRadioStations | yes | always empty: no radio here |
 //!
-//! # Quirk citations (all ported, none dropped)
+//! # Quirks, with their sources
 //!
 //! - Match-all search (Symfonium #129 / Arpeggi / gonic#229): missing,
 //!   empty, or quote-only `query` matches everything; surrounding
@@ -94,17 +93,17 @@
 //!   apiKeyAuthentication, formPost, transcodeOffset, songLyrics,
 //!   playbackReport, indexBasedQueue, transcoding.
 //!
-//! # What the handlers call (in `compat::adapters`, built in `compat::setup`)
+//! # What the handlers call (built in `compat::setup`)
 //!
 //! - Auth: [`auth::Credentials`] classification here; secret verification
 //!   lives in `auth::compat_auth::subsonic::authenticate`, and
-//!   [`SubsonicVerifier`](crate::adapters::principal::SubsonicVerifier)
+//!   [`SubsonicVerifier`](crate::subsonic::principal::SubsonicVerifier)
 //!   delegates to it. The HTTP adapter (`compat::http`) gates, verifies
 //!   and runs the method from [`ENDPOINTS`].
 //! - Data: [`SubsonicStore`] (library, playlists, favorites, scrobble,
 //!   queues, bookmarks, lyrics, avatars, scan, cover art, advanced
 //!   transcode).
-//! - Audio bytes: [`GatewayAudio`](crate::adapters::audio::GatewayAudio)
+//! - Audio bytes: [`GatewayAudio`](crate::audio::GatewayAudio)
 //!   on the stream gateway (ranges, HEAD, leases per caller).
 //! - Edge (`compat::shared`): enablement kill-switch default, rate limits,
 //!   CORS, case-insensitive paths, access-log redaction. The enablement
@@ -121,6 +120,8 @@ pub mod media;
 pub mod models;
 pub mod params;
 pub mod picture;
+pub mod principal;
+pub mod records;
 pub mod store;
 pub mod stream;
 pub mod value;
@@ -132,10 +133,10 @@ use std::pin::Pin;
 use droppedneedle_kernel::runtime_config::sections::DownloadAccess;
 use serde::Serialize;
 
-use crate::adapters::library::CompatError;
-use crate::adapters::principal::CompatPrincipal;
-use crate::adapters::subsonic_store::SubsonicStore;
+use crate::library::CompatError;
 use crate::setup::CompatAudio;
+use crate::subsonic::principal::CompatPrincipal;
+use crate::subsonic::store::SubsonicStore;
 
 pub use auth::{Credentials, classify};
 pub use error::{GENERIC, PARAM_MISSING, SubsonicError};
@@ -145,14 +146,13 @@ pub use value::{
     sniff_format,
 };
 
-/// Codes that stay enveloped on the binary dispatch path (v2 `_AUTH_CODES`).
+/// Codes that stay enveloped on the binary dispatch path.
 pub const AUTH_CODES: &[u8] = &[10, 40, 41, 42, 43, 44, 50];
 
-/// getAvatar refusal for a non-self username, v2 message verbatim.
+/// getAvatar refusal for a non-self username. Quirk (v2): the message text is kept.
 pub const AVATAR_FORBIDDEN_MESSAGE: &str = "Avatar access is limited to the authenticated user";
 
-/// Normalize an endpoint name: casefold, strip one `.view` suffix
-/// (v2 `_dispatch`).
+/// Normalize an endpoint name: casefold, strip one `.view` suffix.
 pub fn normalize_endpoint(raw: &str) -> String {
     let folded = raw.to_lowercase();
     folded.strip_suffix(".view").unwrap_or(&folded).to_owned()
@@ -165,7 +165,7 @@ pub type HandlerFuture<'c> =
 /// A method's handler.
 pub type Handler = for<'c> fn(&'c Ctx<'c>) -> HandlerFuture<'c>;
 
-/// One Subsonic method (v2 `_HANDLERS`, `_BINARY` and `_PUBLIC`).
+/// One Subsonic method.
 pub struct Endpoint {
     /// Normalized name.
     pub name: &'static str,
@@ -307,7 +307,7 @@ pub fn dispatch_uses_envelope(code: u8, normalized_endpoint: &str) -> bool {
 /// Server settings the Subsonic API reads (filled from preferences).
 #[derive(Debug, Clone)]
 pub struct Settings {
-    /// Kill switch; off -> failed envelope code 0 (v2 enablement).
+    /// Kill switch; off -> failed envelope code 0.
     pub enabled: bool,
     /// Advertised server name (`type` in the envelope).
     pub server_name: String,
@@ -344,7 +344,7 @@ impl Default for Settings {
 
 impl Settings {
     /// Transcode hint for song children: Some iff transcoding is on and
-    /// ffmpeg is present (v2 `_transcode_hint`).
+    /// ffmpeg is present.
     pub fn transcode_hint(&self) -> Option<(String, String)> {
         if self.transcoding_enabled && self.ffmpeg_available {
             let (content_type, suffix) = stream::transcode_hint(&self.transcode_default_format);

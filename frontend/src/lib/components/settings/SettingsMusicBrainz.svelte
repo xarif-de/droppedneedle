@@ -2,11 +2,11 @@
 	import { tick } from 'svelte';
 	import { invalidateMusicBrainzProviderQueries } from '$lib/queries/QueryClient';
 	import {
-		activateBrainzMash,
-		consentBrainzMash,
-		saveMusicBrainzSettings,
-		stageBrainzMash as stageBrainzMashMutation,
-		testMusicBrainzConnection
+		createActivateBrainzMashMutation,
+		createConsentBrainzMashMutation,
+		createSaveMusicBrainzSettingsMutation,
+		createStageBrainzMashMutation as stageBrainzMashMutation,
+		createTestMusicBrainzConnectionMutation
 	} from '$lib/queries/musicbrainz/MusicBrainzMutations.svelte';
 	import { getMusicBrainzSettingsQuery } from '$lib/queries/musicbrainz/MusicBrainzQueries.svelte';
 	import type {
@@ -71,11 +71,11 @@
 	}
 
 	const settingsQuery = getMusicBrainzSettingsQuery();
-	const saveMutation = saveMusicBrainzSettings();
-	const consentMutation = consentBrainzMash();
-	const verifyMutation = testMusicBrainzConnection();
+	const saveMutation = createSaveMusicBrainzSettingsMutation();
+	const consentMutation = createConsentBrainzMashMutation();
+	const verifyMutation = createTestMusicBrainzConnectionMutation();
 	const stageMutation = stageBrainzMashMutation();
-	const activateMutation = activateBrainzMash();
+	const activateMutation = createActivateBrainzMashMutation();
 
 	const CARD_ICONS = {
 		brainzmash: Network,
@@ -702,6 +702,7 @@
 										: 'https://mb.example.org/ws/2'}
 									help="The full URL to the server's MusicBrainz API, including the version path."
 									bind:value={draft.api_url}
+									error={section.fieldError('api_url', 'API endpoint URL')}
 								/>
 								{#if selectedMode === 'mirror'}
 									<p class="mt-1 ml-1 text-xs text-base-content/50">
@@ -737,6 +738,7 @@
 									? `Up to ${selectedBounds.rateMax} req/sec on your own or a chosen server. 0 = ${UNLIMITED_RATE_LABEL}. Be polite with servers you do not own.`
 									: 'DroppedNeedle keeps this source at 1 request/second.'}
 								bind:value={() => draft.rate_limit, (next) => (draft.rate_limit = Number(next))}
+								error={section.fieldError('rate_limit', 'Rate limit')}
 							/>
 						</div>
 					</div>

@@ -1,11 +1,9 @@
 //! ListenBrainz client.
 //!
-//! Ports the read paths of v2's ListenBrainz repository and its wire
-//! models, including the live-verified metadata surface
-//! (`listenbrainz_MANAGEMENT_API_NOTES.md`, verified against production on
-//! 2026-07-21; the recording-metadata POST was verified on 2026-07-17), the
-//! credential check behind Settings and account linking, and listen
-//! submission for scrobble forwarding.
+//! The core reads (listens, recording and release-group metadata,
+//! popularity, LB Radio), the credential check behind Settings and account
+//! linking, and listen submission for scrobble forwarding. The wire shapes
+//! are in [`models`], each noting what it was checked against.
 //!
 //! Every request goes through the one ListenBrainz [`Executor`], which
 //! paces at the `listenbrainz` row of the rate table: reads and scrobble
@@ -18,36 +16,50 @@
 //! A token that fails the check is
 //! refused before sending.
 //!
-//! Failures are typed [`ProviderError`]s. An empty answer (204, or a body
-//! that does not decode, which is noted for the request) reads as an empty
-//! result, so an outage never reads as "zero listens".
+//! Failures are typed [`ProviderError`]s. A 204 (ListenBrainz is still
+//! computing) reads as an empty result; a body that does not decode is a
+//! [`ProviderError::Payload`], so a changed answer never reads as "zero
+//! listens".
 
 use std::collections::HashMap;
 use std::time::Duration;
 
+use serde::de::DeserializeOwned;
+
 use crate::RequestPriority;
+use crate::cache::{CacheKey, Policy, ProviderCacheStore, Source};
 use crate::degradation::{IntegrationStatus, record_current};
 use crate::error::{ProviderError, TransportKind, retry_delay_from_headers};
 use crate::executor::{Answer, Backoff, Executor, Reply, Request, Spec, Url, standard_classify};
 
+use self::models::{
+    ListenCountAnswer, ListenItem, ListensAnswer, RadioArtistAnswer, RecordingMetadataAnswer,
+    ReleaseGroupEntry, ReleaseGroupMetadataAnswer, ReleaseGroupPopularityAnswer, TagItem,
+    TopRecordingRow, TopRecordingsAnswer, TopReleaseGroupRow, TopReleaseGroupsAnswer,
+    ValidateTokenAnswer,
+};
+
+pub mod models;
 pub mod playlists;
 pub mod stats;
 
 /// Default API host.
 pub const DEFAULT_BASE_URL: &str = "https://api.listenbrainz.org";
-/// Local ceiling on release-group ids per metadata GET. The notes stress this
-/// is a local safety bound, not an upstream claim (v2 batches of 25).
+/// Local ceiling on release-group ids per metadata GET: a local safety
+/// bound, not an upstream limit.
 pub const RELEASE_GROUP_BATCH: usize = 25;
-/// Local ceiling on recording ids per metadata POST (v2 batches of 50).
+/// Local ceiling on recording ids per metadata POST.
 pub const RECORDING_BATCH: usize = 50;
-/// Local ceiling on ids per genre-batch call (v2 raises past 500).
+/// Local ceiling on ids per genre-batch call.
 pub const MAX_GENRE_IDS: usize = 500;
 /// Longest token accepted for a header.
 pub const MAX_TOKEN_LEN: usize = 1024;
 /// The provider name errors carry, and the ListenBrainz rate row.
 pub const SOURCE: &str = "listenbrainz";
 /// Largest ListenBrainz answer read.
-const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
+// The popularity lists take no limit: Radiohead's top recordings are 1.5 MB
+// (recorded 2026-11-02). An answer over the cap fails and is asked for again.
+const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 /// The [`ProviderError::Invalid`] reason when the API root is not a usable
 /// URL, so a caller can tell it from a token that cannot be sent.
 pub const UNUSABLE_ADDRESS: &str = "the ListenBrainz address is not usable";
@@ -130,8 +142,9 @@ fn reset_in(reply: &Reply, now_unix: i64) -> Option<Duration> {
 
 /// One user's ListenBrainz identity. The username scopes reads; the token
 /// authenticates them. Both are optional because the metadata reads need no
-/// token (per the management notes), while submissions and validation do.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// token, while submissions and validation do. Its debug form never shows
+/// the token.
+#[derive(Clone, PartialEq, Eq, Default)]
 pub struct ListenBrainzCredentials {
     /// ListenBrainz username.
     pub username: Option<String>,
@@ -139,11 +152,20 @@ pub struct ListenBrainzCredentials {
     pub user_token: Option<String>,
 }
 
-/// One listen. Track and artist names are required;
-/// a payload missing them fails decode instead of yielding placeholder
-/// text. (v2 defaults those to `"Unknown"`; this client treats names as
-/// identity and skips nameless items, so placeholder text can never flow
-/// into the library as metadata.)
+impl std::fmt::Debug for ListenBrainzCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ListenBrainzCredentials")
+            .field("username", &self.username)
+            .field(
+                "user_token",
+                &self.user_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+/// One listen. Track and artist names are identity: a listen without them
+/// is skipped, so placeholder text never flows into the library.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Listen {
     /// Track title.
@@ -162,8 +184,8 @@ pub struct Listen {
     pub artist_mbids: Option<Vec<String>>,
 }
 
-/// A genre tag on a release group (v2 management tag shape). Curated genre
-/// entries carry `genre_mbid`; ordinary folksonomy entries omit it.
+/// A genre tag on a release group. Curated genre entries carry
+/// `genre_mbid`; ordinary folksonomy entries omit it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GenreTag {
     /// Tag text (never blank).
@@ -174,9 +196,7 @@ pub struct GenreTag {
     pub genre_mbid: Option<String>,
 }
 
-/// Release-group metadata. Only the
-/// tag half is projected here; the artist/release summaries ride along in
-/// the tolerant decode so the shape stays faithful to the live response.
+/// Release-group metadata: the tags of the group and of its artists.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ReleaseGroupMetadata {
     /// Artist tags.
@@ -185,10 +205,9 @@ pub struct ReleaseGroupMetadata {
     pub release_group_tags: Vec<GenreTag>,
 }
 
-/// One top release-group row behind an artist popularity sum (trimmed to the
-/// popularity fields). The MBID is identity and required; the count is required
-/// too (a zero count is a real answer, a non-integer count is malformed and
-/// skipped); the display name tolerates absence rather than placeholder text.
+/// One top release-group row behind an artist popularity sum. The MBID is
+/// identity; a row without a whole-number count is skipped (zero is a real
+/// count); the display names are empty when the wire omits them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TopReleaseGroup {
     /// Release-group MBID.
@@ -204,7 +223,7 @@ pub struct TopReleaseGroup {
 /// One of an artist's most played recordings.
 /// The display fields tolerate absence; a row without a usable title is
 /// skipped rather than shown as "Unknown".
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TopRecording {
     /// Recording title.
     pub title: String,
@@ -230,6 +249,15 @@ pub struct SimilarArtist {
     pub artist_name: String,
     /// Summed listen count of the sampled recordings.
     pub listen_count: i64,
+}
+
+/// The cache key of one recording's release group.
+#[must_use]
+pub fn recording_group_key(recording_mbid: &str) -> CacheKey {
+    CacheKey::new(
+        Source::ListenBrainz,
+        &["recording_group", &recording_mbid.trim().to_lowercase()],
+    )
 }
 
 /// ListenBrainz client over the ListenBrainz executor. Built once with the
@@ -260,8 +288,8 @@ impl ListenBrainzClient {
     }
 
     /// Recent listens for a user (`GET /1/user/{user}/listens`, at most 100
-    /// per call). An empty username answers empty without touching the wire
-    /// (v2). Items missing track or artist names are skipped.
+    /// per call). An empty username answers empty without touching the
+    /// wire. Items missing track or artist names are skipped.
     ///
     /// # Errors
     ///
@@ -282,23 +310,20 @@ impl ListenBrainzClient {
             &[("count", &count)],
             creds,
         )?;
-        let Some(payload) = self.read(request, priority).await? else {
+        let Some(answer) = self.read::<ListensAnswer>(request, priority).await? else {
             return Ok(Vec::new());
         };
-        let listens = payload
-            .get("payload")
-            .and_then(|payload| payload.get("listens"))
-            .and_then(serde_json::Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        Ok(listens.iter().filter_map(parse_listen).collect())
+        Ok(answer
+            .payload
+            .listens
+            .into_iter()
+            .filter_map(listen)
+            .collect())
     }
 
     /// Resolve recording MBIDs to release-group MBIDs (`POST
-    /// /1/metadata/recording/` with `inc=release`; live-verified on
-    /// 2026-07-17, returns an object keyed by recording MBID whose release
-    /// object carries `release_group_mbid`). Input dedupes, wire calls batch
-    /// at 50, and MBIDs absent from the answer are simply left out.
+    /// /1/metadata/recording/` with `inc=release`). Input dedupes, wire
+    /// calls batch at 50, and MBIDs absent from the answer are left out.
     ///
     /// # Errors
     ///
@@ -322,44 +347,59 @@ impl ListenBrainzClient {
             let request = self.post(&["1", "metadata", "recording"], &body, creds)?;
             // A read sent as POST: sending it twice is safe.
             let request = request.trailing_slash().idempotent(true);
-            // A non-object payload is noted and skips the batch (v2);
-            // results gathered so far are kept.
-            let Some(payload) = self
-                .read(request, priority)
+            let Some(mut answer) = self
+                .read_unconfirmed::<RecordingMetadataAnswer>(request, priority)
                 .await?
-                .and_then(|payload| payload.as_object().cloned())
             else {
-                note_shape("ListenBrainz returned no recording metadata");
                 continue;
             };
             for mbid in batch {
-                let release_group = payload
-                    .get(*mbid)
-                    .and_then(|metadata| metadata.get("release"))
-                    .and_then(|release| release.get("release_group_mbid"))
-                    .and_then(serde_json::Value::as_str);
-                if let Some(release_group) = release_group {
-                    resolved.insert((*mbid).to_owned(), release_group.to_owned());
+                if let Some(release) = answer.remove(*mbid).and_then(|metadata| metadata.release) {
+                    resolved.insert((*mbid).to_owned(), release.release_group_mbid);
                 }
             }
         }
         Ok(resolved)
     }
 
-    /// Genre tags for release-group MBIDs from the live-verified GET-only
-    /// endpoint (`GET /1/metadata/release_group/` with comma-separated ids
-    /// and `inc=artist tag release`; verified against production on
-    /// 2026-07-21). Calls batch at 25 ids; a valid-but-unknown MBID answers
-    /// HTTP 200 with `{}` and yields an empty tag list for that id (v2).
-    /// POST must never be used here: the live notes record that POST answers
-    /// 405, and the recording endpoint's POST support must not be
-    /// generalized to release groups.
+    /// [`recording_release_groups`](Self::recording_release_groups) through
+    /// `cache`, each recording kept on its own under
+    /// [`recording_group_key`], so only recordings never seen go out.
+    ///
+    /// # Errors
+    ///
+    /// The typed failure of the first batch that failed.
+    pub async fn cached_recording_groups(
+        &self,
+        cache: &ProviderCacheStore,
+        recording_mbids: &[String],
+        creds: &ListenBrainzCredentials,
+        priority: RequestPriority,
+    ) -> Result<HashMap<String, String>, ProviderError> {
+        cache
+            .fetch_each(
+                recording_mbids,
+                recording_group_key,
+                Policy::RECORDING_TO_GROUP,
+                |missing| async move {
+                    self.recording_release_groups(&missing, creds, priority)
+                        .await
+                },
+            )
+            .await
+    }
+
+    /// Genre tags for release-group MBIDs (`GET /1/metadata/release_group/`
+    /// with comma-separated ids and `inc=artist tag release`). Calls batch
+    /// at 25 ids; an MBID ListenBrainz does not know is left out of its
+    /// answer and gets an empty tag list. This endpoint is GET only: unlike
+    /// the recording endpoint it answered a POST with 405 (seen 2026-07-21).
     ///
     /// # Errors
     ///
     /// [`ProviderError::Invalid`] for more than [`MAX_GENRE_IDS`] ids
-    /// (nothing is sent), a payload error when a batch carries no metadata
-    /// object, otherwise the typed failure of the call.
+    /// (nothing is sent), a payload error when a batch answers 204 or does
+    /// not decode, otherwise the typed failure of the call.
     pub async fn release_group_genres(
         &self,
         release_group_mbids: &[String],
@@ -391,10 +431,9 @@ impl ListenBrainzClient {
                 )?
                 .trailing_slash();
             // No payload at all is an upstream failure, not an empty answer.
-            let Some(payload) = self
-                .read(request, priority)
+            let Some(mut answer) = self
+                .read::<ReleaseGroupMetadataAnswer>(request, priority)
                 .await?
-                .and_then(|payload| payload.as_object().cloned())
             else {
                 return Err(ProviderError::Payload {
                     provider: SOURCE,
@@ -403,9 +442,9 @@ impl ListenBrainzClient {
                 });
             };
             for mbid in batch {
-                let metadata = payload
-                    .get(mbid)
-                    .map(parse_release_group_metadata)
+                let metadata = answer
+                    .remove(mbid)
+                    .map(release_group_metadata)
                     .unwrap_or_default();
                 resolved.insert(mbid.clone(), metadata);
             }
@@ -414,9 +453,10 @@ impl ListenBrainzClient {
     }
 
     /// Listen counts for release-group MBIDs (`POST
-    /// /1/popularity/release-group`). A malformed or absent answer yields
-    /// an empty map, because an outage must never read as "zero listens"
-    /// (v2's poisoning guards). A well-formed empty list is legitimate.
+    /// /1/popularity/release-group`). A 204 yields an empty map with a note
+    /// and a malformed answer a payload error, never "zero listens"; a row
+    /// without a whole-number count is left out. A well-formed empty list
+    /// is legitimate.
     ///
     /// # Errors
     ///
@@ -442,35 +482,22 @@ impl ListenBrainzClient {
         let request = self
             .post(&["1", "popularity", "release-group"], &body, creds)?
             .idempotent(true);
-        let mut counts: HashMap<String, i64> = HashMap::new();
-        let Some(items) = self
-            .read(request, priority)
+        let rows = self
+            .read_unconfirmed::<ReleaseGroupPopularityAnswer>(request, priority)
             .await?
-            .and_then(|payload| payload.as_array().cloned())
-        else {
-            return Ok(counts);
-        };
-        for item in &items {
-            let mbid = item
-                .get("release_group_mbid")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
-            // v2 keeps a zero count (`count is not None`) but skips a blank
-            // id; a non-integer count is malformed and skipped.
-            if mbid.is_empty() {
-                continue;
-            }
-            if let Some(count) = item.get("total_listen_count").and_then(count_int) {
-                counts.insert(mbid.to_owned(), count);
-            }
-        }
-        Ok(counts)
+            .unwrap_or_default();
+        // A zero count is kept; a blank id is skipped.
+        Ok(rows
+            .into_iter()
+            .filter(|row| !row.release_group_mbid.trim().is_empty())
+            .filter_map(|row| Some((row.release_group_mbid, row.total_listen_count?)))
+            .collect())
     }
 
     /// Top release groups behind one artist's popularity sum (`GET
-    /// /1/popularity/top-release-groups-for-artist/{mbid}`, v2
-    /// `get_artist_top_release_groups`). Malformed items are skipped and a
-    /// malformed payload reads as empty, mirroring the popularity batch.
+    /// /1/popularity/top-release-groups-for-artist/{mbid}`). Rows whose count
+    /// is null are skipped; a malformed answer is a payload error, and a 204
+    /// reads as empty with a note, so neither is kept as "nothing there".
     ///
     /// # Errors
     ///
@@ -497,18 +524,19 @@ impl ListenBrainzClient {
             creds,
         )?;
         Ok(self
-            .read_array(request, priority)
+            .read_unconfirmed::<TopReleaseGroupsAnswer>(request, priority)
             .await?
-            .iter()
+            .unwrap_or_default()
+            .into_iter()
             .take(count)
-            .filter_map(parse_top_release_group)
+            .filter_map(top_release_group)
             .collect())
     }
 
     /// An artist's most played recordings
     /// (`GET /1/popularity/top-recordings-for-artist/{mbid}`), most played
-    /// first. Malformed rows are skipped; a malformed payload reads as an
-    /// empty answer, never as "zero listens" rows.
+    /// first. Rows whose title or count is null are skipped; a malformed
+    /// answer is a payload error, never "zero listens" rows.
     ///
     /// # Errors
     ///
@@ -530,18 +558,19 @@ impl ListenBrainzClient {
             creds,
         )?;
         Ok(self
-            .read_array(request, priority)
+            .read_unconfirmed::<TopRecordingsAnswer>(request, priority)
             .await?
-            .iter()
-            .filter_map(parse_top_recording)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(top_recording)
             .take(count)
             .collect())
     }
 
     /// Artists similar to one artist, from LB Radio's artist mode
-    /// (`GET /1/lb-radio/artist/{mbid}` with v2's `easy` parameters). The
-    /// reply maps each similar artist's MBID to a sample of its recordings;
-    /// the seed artist is dropped and the rest sort by summed listens.
+    /// (`GET /1/lb-radio/artist/{mbid}` in `easy` mode). The reply maps
+    /// each similar artist's MBID to a sample of its recordings; the seed
+    /// artist is dropped and the rest sort by summed listens.
     ///
     /// # Errors
     ///
@@ -569,35 +598,27 @@ impl ListenBrainzClient {
             ],
             creds,
         )?;
-        let Some(payload) = self.read(request, priority).await? else {
-            return Ok(Vec::new());
-        };
-        let Some(entries) = payload.as_object() else {
+        let Some(entries) = self
+            .read_unconfirmed::<RadioArtistAnswer>(request, priority)
+            .await?
+        else {
             return Ok(Vec::new());
         };
         let mut similar: Vec<SimilarArtist> = entries
-            .iter()
+            .into_iter()
             .filter(|(mbid, _)| {
                 super::musicbrainz::is_valid_mbid(mbid) && !mbid.eq_ignore_ascii_case(artist_mbid)
             })
-            .filter_map(|(mbid, recordings)| {
-                let recordings = recordings.as_array()?;
-                let artist_name = recordings
+            .map(|(mbid, recordings)| SimilarArtist {
+                artist_name: recordings
                     .first()
-                    .and_then(|first| first.get("similar_artist_name"))
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("")
-                    .to_owned();
-                let listen_count = recordings
+                    .and_then(|first| first.similar_artist_name.clone())
+                    .unwrap_or_default(),
+                listen_count: recordings
                     .iter()
-                    .filter_map(|recording| recording.get("total_listen_count"))
-                    .filter_map(count_int)
-                    .sum();
-                Some(SimilarArtist {
-                    artist_mbid: mbid.clone(),
-                    artist_name,
-                    listen_count,
-                })
+                    .filter_map(|recording| recording.total_listen_count)
+                    .sum(),
+                artist_mbid: mbid,
             })
             .collect();
         similar.sort_by(|left, right| right.listen_count.cmp(&left.listen_count));
@@ -631,7 +652,7 @@ impl ListenBrainzClient {
     /// (`GET /1/validate-token`); without one, that the username exists
     /// (`GET /1/user/{user}/listen-count`). 401 and 403 mean an invalid
     /// token, 404 an unknown user, and a rate limit asks the caller to back
-    /// off (v2's repository verify methods).
+    /// off. An answer that does not decode gives no verdict.
     pub async fn verify(
         &self,
         username: &str,
@@ -663,20 +684,17 @@ impl ListenBrainzClient {
             Ok(request) => self.send(request, priority).await,
             Err(error) => Err(error),
         };
-        let body: serde_json::Value = match reply.and_then(|reply| reply.json()) {
-            Ok(body) => body,
+        let answer = match reply.and_then(|reply| decode::<ValidateTokenAnswer>(&reply)) {
+            Ok(answer) => answer,
             Err(ProviderError::Unauthorized { .. } | ProviderError::Forbidden { .. }) => {
                 return invalid_token();
             }
             Err(error) => return VerifyOutcome::failed(&error),
         };
-        if body.get("valid").and_then(serde_json::Value::as_bool) != Some(true) {
+        if !answer.valid {
             return invalid_token();
         }
-        let who = body
-            .get("user_name")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or(username);
+        let who = answer.user_name.as_deref().unwrap_or(username);
         VerifyOutcome {
             valid: true,
             message: format!("Successfully connected as '{who}'"),
@@ -696,18 +714,13 @@ impl ListenBrainzClient {
             Ok(request) => self.send(request, priority).await,
             Err(error) => Err(error),
         };
-        let body: serde_json::Value = match reply.and_then(|reply| reply.json()) {
-            Ok(body) => body,
+        let count = match reply.and_then(|reply| decode::<ListenCountAnswer>(&reply)) {
+            Ok(answer) => answer.payload.count,
             Err(ProviderError::NotFound { .. }) => {
                 return VerifyOutcome::invalid(format!("User '{username}' not found"));
             }
             Err(error) => return VerifyOutcome::failed(&error),
         };
-        let count = body
-            .get("payload")
-            .and_then(|payload| payload.get("count"))
-            .and_then(serde_json::Value::as_i64)
-            .unwrap_or(0);
         VerifyOutcome {
             valid: true,
             message: format!("User found with {} listens", grouped_count(count)),
@@ -735,7 +748,7 @@ impl ListenBrainzClient {
     fn post(
         &self,
         segments: &[&str],
-        body: &serde_json::Value,
+        body: &impl serde::Serialize,
         creds: &ListenBrainzCredentials,
     ) -> Result<Request, ProviderError> {
         let json = serde_json::to_vec(body).map_err(|_| invalid("the request did not encode"))?;
@@ -771,38 +784,32 @@ impl ListenBrainzClient {
         Ok(reply)
     }
 
-    /// Send one read and decode its JSON body. `None` is an empty answer:
-    /// a 204 (ListenBrainz is still computing), or a body that does not
-    /// decode, which is noted for the request.
-    async fn read(
+    /// Send one read and decode its body as `T`. `None` is a 204:
+    /// ListenBrainz is still computing.
+    async fn read<T: DeserializeOwned>(
         &self,
         request: Request,
         priority: RequestPriority,
-    ) -> Result<Option<serde_json::Value>, ProviderError> {
+    ) -> Result<Option<T>, ProviderError> {
         let reply = self.send(request, priority).await?;
         if reply.status() == 204 {
             return Ok(None);
         }
-        match reply.json::<serde_json::Value>() {
-            Ok(payload) => Ok(Some(payload)),
-            Err(error) => {
-                note_shape(&error.to_string());
-                Ok(None)
-            }
-        }
+        decode(&reply).map(Some)
     }
 
-    /// Send one read whose answer is a JSON array. Anything else reads as
-    /// an empty array.
-    async fn read_array(
+    /// [`read`](Self::read) for an answer whose emptiness gets kept. A 204
+    /// carries a note, so nothing is stored.
+    async fn read_unconfirmed<T: DeserializeOwned>(
         &self,
         request: Request,
         priority: RequestPriority,
-    ) -> Result<Vec<serde_json::Value>, ProviderError> {
-        Ok(match self.read(request, priority).await? {
-            Some(serde_json::Value::Array(items)) => items,
-            _ => Vec::new(),
-        })
+    ) -> Result<Option<T>, ProviderError> {
+        let answer = self.read(request, priority).await?;
+        if answer.is_none() {
+            record_current(SOURCE, IntegrationStatus::Degraded, false);
+        }
+        Ok(answer)
     }
 
     fn base(&self) -> Result<&Url, ProviderError> {
@@ -820,6 +827,14 @@ fn with_headers(request: Request, token: Option<&str>) -> Result<Request, Provid
         }
         Some(_) => Err(invalid("the token cannot be sent in a header")),
     }
+}
+
+/// Decode `reply` as `T`. A body that does not decode is a payload error,
+/// noted for the request.
+fn decode<T: DeserializeOwned>(reply: &Reply) -> Result<T, ProviderError> {
+    reply
+        .json::<T>()
+        .inspect_err(|error| note_shape(&error.to_string()))
 }
 
 /// An answer that did not have the expected shape: the service answered,
@@ -851,149 +866,87 @@ fn header_safe_token(token: &str) -> bool {
         .all(|char| ('\u{21}'..='\u{7e}').contains(&char))
 }
 
-/// Read an integer count, tolerating integral floats the way the lenient v2
-/// parsers do. Booleans and strings never pass as counts.
-fn count_int(value: &serde_json::Value) -> Option<i64> {
-    match value {
-        serde_json::Value::Number(number) => number.as_i64().or_else(|| {
-            number
-                .as_f64()
-                .filter(|float| float.is_finite() && float.fract() == 0.0)
-                .map(|float| float as i64)
-        }),
-        _ => None,
-    }
-}
-
-/// Read an optional MBID-ish string: blank reads as absent.
-fn optional_text(value: Option<&serde_json::Value>) -> Option<String> {
-    value
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
+/// Non-blank trimmed text, or `None`.
+fn non_blank(text: Option<String>) -> Option<String> {
+    text.map(|text| text.trim().to_owned())
         .filter(|text| !text.is_empty())
-        .map(str::to_owned)
 }
 
-/// Parse one listen. Recording and release MBIDs prefer
-/// the MBID mapping and fall back to the additional info.
-fn parse_listen(item: &serde_json::Value) -> Option<Listen> {
-    let meta = item.get("track_metadata")?.as_object()?;
-    let track_name = meta.get("track_name")?.as_str()?;
-    let artist_name = meta.get("artist_name")?.as_str()?;
-    if track_name.trim().is_empty() || artist_name.trim().is_empty() {
+/// One listen. Recording and release MBIDs prefer the MBID mapping and fall
+/// back to the additional info.
+fn listen(item: ListenItem) -> Option<Listen> {
+    let meta = item.track_metadata;
+    let track_name = meta.track_name.filter(|name| !name.trim().is_empty())?;
+    let artist_name = meta.artist_name.filter(|name| !name.trim().is_empty())?;
+    let mapping = meta.mbid_mapping.unwrap_or_default();
+    let additional = meta.additional_info.unwrap_or_default();
+    Some(Listen {
+        track_name,
+        artist_name,
+        listened_at: item.listened_at,
+        recording_mbid: non_blank(mapping.recording_mbid).or(additional.recording_mbid),
+        release_name: meta.release_name,
+        release_mbid: non_blank(mapping.release_mbid).or(additional.release_mbid),
+        artist_mbids: mapping.artist_mbids,
+    })
+}
+
+/// One artist top-release-group row: a blank MBID or a missing count skips
+/// it; the display names tolerate absence.
+fn top_release_group(row: TopReleaseGroupRow) -> Option<TopReleaseGroup> {
+    let mbid = row.release_group_mbid.trim();
+    if mbid.is_empty() {
         return None;
     }
-    let additional = meta.get("additional_info");
-    let mapping = meta.get("mbid_mapping");
-    let recording_mbid = mapping
-        .and_then(|mapping| mapping.get("recording_mbid"))
-        .or_else(|| additional.and_then(|info| info.get("recording_mbid")));
-    let release_mbid = mapping
-        .and_then(|mapping| mapping.get("release_mbid"))
-        .or_else(|| additional.and_then(|info| info.get("release_mbid")));
-    let artist_mbids = mapping
-        .and_then(|mapping| mapping.get("artist_mbids"))
-        .and_then(serde_json::Value::as_array)
-        .map(|mbids| {
-            mbids
-                .iter()
-                .filter_map(|mbid| mbid.as_str().map(str::to_owned))
-                .collect::<Vec<_>>()
-        });
-    Some(Listen {
-        track_name: track_name.to_owned(),
-        artist_name: artist_name.to_owned(),
-        listened_at: item.get("listened_at").and_then(count_int).unwrap_or(0),
-        recording_mbid: optional_text(recording_mbid),
-        release_name: optional_text(meta.get("release_name")),
-        release_mbid: optional_text(release_mbid),
-        artist_mbids,
-    })
-}
-
-/// Parse one artist top-release-group row: the MBID is required identity
-/// (blank reads as absent), the count must be an integer (zero kept, like
-/// the popularity batch), and the nested display name tolerates absence.
-fn parse_top_release_group(item: &serde_json::Value) -> Option<TopReleaseGroup> {
-    let mbid = item
-        .get("release_group_mbid")?
-        .as_str()
-        .map(str::trim)
-        .filter(|mbid| !mbid.is_empty())?;
-    let listen_count = item.get("total_listen_count").and_then(count_int)?;
-    let name = item
-        .get("release_group")
-        .and_then(|group| group.get("name"))
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("")
-        .to_owned();
-    let artist_name = item
-        .get("artist")
-        .and_then(|artist| artist.get("name"))
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("")
-        .to_owned();
     Some(TopReleaseGroup {
         release_group_mbid: mbid.to_owned(),
-        name,
-        artist_name,
-        listen_count,
+        name: row
+            .release_group
+            .and_then(|group| group.name)
+            .unwrap_or_default(),
+        artist_name: row
+            .artist
+            .and_then(|artist| artist.name)
+            .unwrap_or_default(),
+        listen_count: row.total_listen_count?,
     })
 }
 
-/// Parse one top-recording row: a non-blank title and an integer count are
-/// required, everything else is optional display data.
-fn parse_top_recording(item: &serde_json::Value) -> Option<TopRecording> {
-    let text = |key: &str| {
-        item.get(key)
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_owned)
-    };
-    let title = text("recording_name")?;
-    let listen_count = item.get("total_listen_count").and_then(count_int)?;
+/// One top-recording row: a non-blank title and a count are needed,
+/// everything else is optional display data.
+fn top_recording(row: TopRecordingRow) -> Option<TopRecording> {
     Some(TopRecording {
-        title,
-        artist_name: text("artist_name").unwrap_or_default(),
-        listen_count,
-        recording_mbid: text("recording_mbid"),
-        release_name: text("release_name"),
-        release_mbid: text("release_mbid"),
+        title: row.recording_name?,
+        artist_name: non_blank(row.artist_name).unwrap_or_default(),
+        listen_count: row.total_listen_count?,
+        recording_mbid: non_blank(row.recording_mbid),
+        release_name: non_blank(row.release_name),
+        release_mbid: non_blank(row.release_mbid),
     })
 }
 
-/// Parse one genre tag: tag text required and non-blank, count lenient,
-/// `genre_mbid` optional (v2 management tag shape; the live notes record
-/// that curated entries carry it and folksonomy entries may omit it).
-fn parse_genre_tag(item: &serde_json::Value) -> Option<GenreTag> {
-    let tag = item.as_object()?;
-    let text = tag.get("tag")?.as_str()?;
-    if text.trim().is_empty() {
+/// One genre tag; a blank tag is skipped.
+fn genre_tag(item: TagItem) -> Option<GenreTag> {
+    if item.tag.trim().is_empty() {
         return None;
     }
     Some(GenreTag {
-        tag: text.to_owned(),
-        count: tag.get("count").and_then(count_int).unwrap_or(0),
-        genre_mbid: optional_text(tag.get("genre_mbid")),
+        tag: item.tag,
+        count: item.count,
+        genre_mbid: non_blank(item.genre_mbid),
     })
 }
 
-/// Parse the release-group metadata object.
-/// `tag` holds `artist` and
-/// `release_group` arrays; `release` is an object with the same summary
-/// shape, not a list (live notes). Unknown members are ignored.
-fn parse_release_group_metadata(entry: &serde_json::Value) -> ReleaseGroupMetadata {
-    let tags = entry.get("tag");
-    let collect = |key: &str| {
-        tags.and_then(|tags| tags.get(key))
-            .and_then(serde_json::Value::as_array)
-            .map(|items| items.iter().filter_map(parse_genre_tag).collect())
-            .unwrap_or_default()
-    };
+/// The tags of one release group and its artists.
+fn release_group_metadata(entry: ReleaseGroupEntry) -> ReleaseGroupMetadata {
+    let tags = entry.tag.unwrap_or_default();
     ReleaseGroupMetadata {
-        artist_tags: collect("artist"),
-        release_group_tags: collect("release_group"),
+        artist_tags: tags.artist.into_iter().filter_map(genre_tag).collect(),
+        release_group_tags: tags
+            .release_group
+            .into_iter()
+            .filter_map(genre_tag)
+            .collect(),
     }
 }
 
@@ -1075,7 +1028,7 @@ impl ListenBrainzVerifier for ListenBrainzClient {
     }
 }
 
-/// Render a count with thousands separators, the way v2's `{count:,}` does.
+/// Render a count with thousands separators.
 fn grouped_count(count: i64) -> String {
     let digits = count.max(0).to_string();
     let mut out = String::new();

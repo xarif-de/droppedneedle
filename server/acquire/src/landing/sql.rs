@@ -8,25 +8,30 @@ droppedneedle_kernel::sql! {
     /// watcher share: an album identified as the group (`?1`, lowered),
     /// or, in an album with no identity yet, a file whose own tags name
     /// the group. An album identified as another group never counts for
-    /// its files' tags. The `t.id IN` list names every track either side
-    /// could match, through the lowered-id indexes, so the tracks are
-    /// reached by key.
+    /// its files' tags. Only MusicBrainz identities count. The `t.id IN`
+    /// list names every track either side could match, through the
+    /// lowered-id indexes, so the tracks are reached by key.
     pub(crate) fragment OWNED_TRACKS_FROM = "FROM local_tracks t \
          JOIN local_albums b ON b.id = t.local_album_id AND b.retired_into_album_id IS NULL \
-         LEFT JOIN local_album_external_identities ai ON ai.local_album_id = b.id \
-         LEFT JOIN local_track_external_identities ti ON ti.local_track_id = t.id \
+         LEFT JOIN local_album_external_identities ai \
+           ON ai.local_album_id = b.id AND ai.provider = 'musicbrainz' \
+         LEFT JOIN local_track_external_identities ti \
+           ON ti.local_track_id = t.id AND ti.provider = 'musicbrainz' \
          WHERE t.availability = 'indexed' \
            AND t.id IN (SELECT gt.id FROM local_album_external_identities ga \
                JOIN local_tracks gt ON gt.local_album_id = ga.local_album_id \
-               WHERE lower(ga.release_group_mbid) = ?1 \
+               WHERE ga.provider = 'musicbrainz' AND lower(ga.release_group_mbid) = ?1 \
              UNION ALL SELECT id FROM local_tracks \
                WHERE embedded_release_group_mbid IS NOT NULL \
                  AND lower(embedded_release_group_mbid) = ?1) \
            AND (lower(ai.release_group_mbid) = ?1 \
              OR (ai.local_album_id IS NULL AND lower(t.embedded_release_group_mbid) = ?1))";
     /// [`OWNED_TRACKS_FROM`] kept to one library album when `?2` names one,
-    /// followed to the album it was merged into.
-    fragment IN_ALBUM = " AND (?2 IS NULL OR b.id = (SELECT COALESCE(retired_into_album_id, id) \
+    /// followed to the album it was merged into. An album since deleted
+    /// keeps nothing: the whole group is read.
+    fragment IN_ALBUM = " AND (?2 IS NULL \
+         OR NOT EXISTS (SELECT 1 FROM local_albums WHERE id = ?2) \
+         OR b.id = (SELECT COALESCE(retired_into_album_id, id) \
          FROM local_albums WHERE id = ?2))";
     /// Indexed tracks of one release group: release track and recording
     /// (sealed identity first, then the file's own tags) and quality facts.

@@ -2,7 +2,7 @@
 //! MusicBrainz releases for the edition finder, and undo an automatic
 //! edition.
 //!
-//! Every route is admin-only, as in v2, except the release search, which
+//! Every route is admin-only, except the release search, which
 //! curators use to choose an edition. Store work runs on
 //! a blocking thread; the release search awaits MusicBrainz.
 
@@ -21,15 +21,21 @@ use utoipa::{IntoParams, ToSchema};
 use super::blocking;
 use super::error::refused;
 use super::models::PenaltyView;
+use crate::edition::service::RELEASE_PAGE_MAX;
 use crate::identify::models::EvidenceClass;
-use crate::operations::models::{
-    AutomaticUndone, Control, ControlRequest, OperationDetail, OperationError, OperationJob,
-    OperationState, ReidentificationCandidate, WorkState,
-};
-use crate::operations::reasons::{self, Reason};
-use crate::operations::service::{Operations, RELEASE_PAGE_MAX};
+use crate::identity::AutomaticUndone;
+use crate::jobs::ControlRequest;
+use crate::jobs::OperationJob;
+use crate::jobs::OperationState;
+use crate::jobs::WorkState;
+use crate::jobs::models::Control;
+use crate::jobs::models::OperationDetail;
+use crate::jobs::models::OperationError;
+use crate::jobs::service::Operations;
+use crate::reasons;
+use crate::reasons::Reason;
+use crate::reidentify::models::ReidentificationCandidate;
 use crate::repairs::models::Summary;
-use crate::repairs::service::Repairs;
 use crate::wiring::LibraryServices;
 use droppedneedle_auth::{Admin, Curator};
 
@@ -39,7 +45,6 @@ const MATCHER_VERSION: &str = "library-matching-v1";
 /// Operation routes.
 pub fn routes() -> Routes<LibraryServices> {
     Routes::new()
-        .admin(routes!(get_operation))
         .admin(routes!(pause_operation))
         .admin(routes!(resume_operation))
         .admin(routes!(stop_operation))
@@ -122,7 +127,9 @@ pub struct OperationTrackEvidenceView {
     /// What ties the file to the release track (`embedded_id`, `acoustid`,
     /// `title_position_length`, or `track_id_elsewhere`: the recording ID,
     /// on a file whose track ID belongs to another edition), or why it does
-    /// not.
+    /// not (`distant_pair`: paired, but not closely). `acoustid_overruled`
+    /// follows when the file's measured length set aside a fingerprint
+    /// that named another track.
     pub evidence_kinds: Vec<String>,
     pub candidate_track_title: Option<String>,
     pub candidate_disc_number: Option<u32>,
@@ -412,31 +419,6 @@ pub(super) fn detail_view(detail: &OperationDetail) -> OperationView {
 // ---------------------------------------------------------------------------
 // Handlers.
 // ---------------------------------------------------------------------------
-
-/// Get one operation job with its results and candidates.
-#[utoipa::path(
-    get,
-    tag = "library management",
-    path = "/api/v3/library/operations/{job_id}",
-    params(("job_id" = String, Path, description = "Operation job id")),
-    responses(
-        (status = 200, description = "Operation job", body = OperationView),
-        (status = 401, description = "Not authenticated"),
-        (status = 403, description = "Admin role required"),
-        (status = 404, description = "Unknown job"),
-    )
-)]
-pub async fn get_operation(
-    State(repairs): State<Repairs>,
-    _caller: Admin,
-    Path(job_id): Path<String>,
-) -> Result<Json<OperationView>, ApiError> {
-    let (detail, summary) = blocking(move || repairs.operation(&job_id)).await?;
-    Ok(Json(OperationView {
-        repair_summary: summary,
-        ..detail_view(&detail)
-    }))
-}
 
 async fn control(
     ops: Operations,

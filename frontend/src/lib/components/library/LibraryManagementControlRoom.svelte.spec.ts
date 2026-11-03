@@ -7,7 +7,6 @@ const h = vi.hoisted(() => ({
 	reissue: vi.fn(),
 	resolveImportBundle: vi.fn(),
 	goto: vi.fn(),
-	replaceState: vi.fn(),
 	apiGet: vi.fn(),
 	apiPost: vi.fn(),
 	toast: vi.fn(),
@@ -63,6 +62,7 @@ const h = vi.hoisted(() => ({
 						artist_name: string | null;
 						cause: string;
 						noticed_at: number;
+						hand_back_given_up: boolean;
 					}>;
 			  }
 			| undefined,
@@ -74,7 +74,9 @@ const h = vi.hoisted(() => ({
 	handBack: vi.fn(),
 	handBackAll: vi.fn(),
 	retagPairs: {
-		data: undefined as { total: number; pairs: Array<Record<string, unknown>> } | undefined,
+		data: undefined as
+			| { total: number; items: Array<Record<string, unknown>>; next_cursor: string | null }
+			| undefined,
 		isPending: false,
 		isError: false,
 		error: null,
@@ -82,7 +84,7 @@ const h = vi.hoisted(() => ({
 	}
 }));
 
-vi.mock('$app/navigation', () => ({ goto: h.goto, replaceState: h.replaceState }));
+vi.mock('$app/navigation', () => ({ goto: h.goto }));
 vi.mock('$app/state', () => ({ page: h.appPage }));
 vi.mock('$lib/api/client', () => ({
 	api: { get: h.apiGet, post: h.apiPost }
@@ -186,13 +188,22 @@ vi.mock('$lib/queries/library-management/LibraryManagementQueries.svelte', () =>
 	TAKEOVERS_POLL_MS: 5_000
 }));
 vi.mock('$lib/queries/library-management/LibraryManagementMutations.svelte', () => ({
-	controlLibraryManagementOperationMutation: () => ({ mutateAsync: vi.fn(), isPending: false }),
-	handBackLibraryAlbumMutation: () => ({ mutateAsync: h.handBack, isPending: false }),
-	handBackAllLibraryAlbumsMutation: () => ({ mutateAsync: h.handBackAll, isPending: false }),
+	createControlLibraryManagementOperationMutation: () => ({
+		mutateAsync: vi.fn(),
+		isPending: false
+	}),
+	createHandBackLibraryAlbumMutation: () => ({ mutateAsync: h.handBack, isPending: false }),
+	createHandBackAllLibraryAlbumsMutation: () => ({ mutateAsync: h.handBackAll, isPending: false }),
 	handBackRefusalMessage: () => null,
-	discardLibraryManagementPreviewMutation: () => ({ mutateAsync: h.discard, isPending: false }),
-	reissueLibraryManagementPreviewMutation: () => ({ mutateAsync: h.reissue, isPending: false }),
-	resolveLibraryManagementImportBundleMutation: () => ({
+	createDiscardLibraryManagementPreviewMutation: () => ({
+		mutateAsync: h.discard,
+		isPending: false
+	}),
+	createReissueLibraryManagementPreviewMutation: () => ({
+		mutateAsync: h.reissue,
+		isPending: false
+	}),
+	createResolveLibraryManagementImportBundleMutation: () => ({
 		mutateAsync: h.resolveImportBundle,
 		isPending: false
 	}),
@@ -201,42 +212,42 @@ vi.mock('$lib/queries/library-management/LibraryManagementMutations.svelte', () 
 		mutateAsync: vi.fn(),
 		isPending: false
 	}),
-	updateLibraryManagementSettingsMutation: () => ({
+	createUpdateLibraryManagementSettingsMutation: () => ({
 		mutateAsync: vi.fn(),
 		mutate: vi.fn(),
 		isPending: false
 	}),
-	previewLibraryManagementSettingsImpactMutation: () => ({
+	createPreviewLibraryManagementSettingsImpactMutation: () => ({
 		mutateAsync: vi.fn(),
 		mutate: vi.fn(),
 		isPending: false
 	}),
-	validateLibraryManagementSettingsMutation: () => ({
+	createValidateLibraryManagementSettingsMutation: () => ({
 		mutateAsync: vi.fn(),
 		mutate: vi.fn(),
 		isPending: false
 	}),
-	copyLibraryManagementProfileMutation: () => ({
+	createCopyLibraryManagementProfileMutation: () => ({
 		mutateAsync: vi.fn(),
 		mutate: vi.fn(),
 		isPending: false
 	}),
-	deleteLibraryManagementProfileMutation: () => ({
+	createDeleteLibraryManagementProfileMutation: () => ({
 		mutateAsync: vi.fn(),
 		mutate: vi.fn(),
 		isPending: false
 	}),
-	exportLibraryManagementProfileMutation: () => ({
+	createExportLibraryManagementProfileMutation: () => ({
 		mutateAsync: vi.fn(),
 		mutate: vi.fn(),
 		isPending: false
 	}),
-	previewLibraryManagementProfileImportMutation: () => ({
+	createPreviewLibraryManagementProfileImportMutation: () => ({
 		mutateAsync: vi.fn(),
 		mutate: vi.fn(),
 		isPending: false
 	}),
-	importLibraryManagementProfileMutation: () => ({
+	createImportLibraryManagementProfileMutation: () => ({
 		mutateAsync: vi.fn(),
 		mutate: vi.fn(),
 		isPending: false
@@ -246,7 +257,7 @@ vi.mock('$lib/queries/library-management/LibraryManagementMutations.svelte', () 
 		mutate: vi.fn(),
 		isPending: false
 	}),
-	confirmLibraryManagementActivationMutation: () => ({
+	createConfirmLibraryManagementActivationMutation: () => ({
 		mutateAsync: vi.fn(),
 		mutate: vi.fn(),
 		isPending: false
@@ -256,7 +267,7 @@ vi.mock('$lib/queries/library-management/LibraryManagementMutations.svelte', () 
 		mutate: vi.fn(),
 		isPending: false
 	}),
-	applyLibraryManagementPreviewMutation: () => ({
+	createApplyLibraryManagementPreviewMutation: () => ({
 		mutateAsync: vi.fn(),
 		mutate: vi.fn(),
 		isPending: false
@@ -271,12 +282,12 @@ vi.mock('$lib/queries/library-management/LibraryManagementMutations.svelte', () 
 		mutate: vi.fn(),
 		isPending: false
 	}),
-	previewLibraryManagementBaselinePurgeMutation: () => ({
+	createPreviewLibraryManagementBaselinePurgeMutation: () => ({
 		mutateAsync: vi.fn(),
 		mutate: vi.fn(),
 		isPending: false
 	}),
-	purgeLibraryManagementBaselinesMutation: () => ({
+	createPurgeLibraryManagementBaselinesMutation: () => ({
 		mutateAsync: vi.fn(),
 		mutate: vi.fn(),
 		isPending: false
@@ -284,8 +295,8 @@ vi.mock('$lib/queries/library-management/LibraryManagementMutations.svelte', () 
 }));
 vi.mock('$lib/queries/library/LibraryRetagPairQueries.svelte', () => ({
 	getRetagPairsQuery: () => h.retagPairs,
-	joinRetagPair: () => ({ mutateAsync: vi.fn(), isPending: false }),
-	dismissRetagPair: () => ({ mutateAsync: vi.fn(), isPending: false })
+	createJoinRetagPairMutation: () => ({ mutateAsync: vi.fn(), isPending: false }),
+	createDismissRetagPairMutation: () => ({ mutateAsync: vi.fn(), isPending: false })
 }));
 vi.mock('$lib/queries/albums/EditionQueries.svelte', async (importOriginal) => ({
 	...(await importOriginal<object>()),
@@ -301,15 +312,26 @@ vi.mock('$lib/queries/library/LibraryIdentityPreparationQueries.svelte', () => (
 	})
 }));
 vi.mock('$lib/queries/library/LibraryIdentityPreparationMutations.svelte', () => ({
-	createLibraryIdentityPreparation: () => ({ mutateAsync: vi.fn(), isPending: false }),
-	applyLibraryIdentityPreparation: () => ({ mutateAsync: vi.fn(), isPending: false }),
-	discardLibraryIdentityPreparation: () => ({ mutateAsync: vi.fn(), isPending: false }),
-	undoLibraryAutomaticEdition: () => ({ mutateAsync: vi.fn(), isPending: false })
+	createLibraryIdentityPreparationMutation: () => ({ mutateAsync: vi.fn(), isPending: false }),
+	createApplyLibraryIdentityPreparationMutation: () => ({ mutateAsync: vi.fn(), isPending: false }),
+	createDiscardLibraryIdentityPreparationMutation: () => ({
+		mutateAsync: vi.fn(),
+		isPending: false
+	}),
+	createUndoLibraryAutomaticEditionMutation: () => ({ mutateAsync: vi.fn(), isPending: false })
 }));
 vi.mock('$lib/queries/library/LibraryOperationMutations.svelte', () => ({
-	controlLibraryOperation: () => ({ mutateAsync: vi.fn(), isPending: false }),
-	controlLibraryRun: () => ({ mutateAsync: vi.fn(), mutate: vi.fn(), isPending: false }),
-	controlIdentification: () => ({ mutateAsync: vi.fn(), mutate: vi.fn(), isPending: false })
+	createControlLibraryOperationMutation: () => ({ mutateAsync: vi.fn(), isPending: false }),
+	createControlLibraryRunMutation: () => ({
+		mutateAsync: vi.fn(),
+		mutate: vi.fn(),
+		isPending: false
+	}),
+	createControlIdentificationMutation: () => ({
+		mutateAsync: vi.fn(),
+		mutate: vi.fn(),
+		isPending: false
+	})
 }));
 vi.mock('$lib/queries/library/LibraryRepairQueries.svelte', () => ({
 	getLibraryRepairsQuery: () => ({ data: { pages: [{ items: [] }] }, isLoading: false }),
@@ -322,8 +344,8 @@ vi.mock('$lib/queries/library/LibraryRepairQueries.svelte', () => ({
 	})
 }));
 vi.mock('$lib/queries/library/LibraryRepairMutations.svelte', () => ({
-	createLibraryRepair: () => ({ mutateAsync: vi.fn(), isPending: false }),
-	applyLibraryRepair: () => ({ mutateAsync: vi.fn(), isPending: false })
+	createLibraryRepairMutation: () => ({ mutateAsync: vi.fn(), isPending: false }),
+	createApplyLibraryRepairMutation: () => ({ mutateAsync: vi.fn(), isPending: false })
 }));
 
 import LibraryManagementControlRoom from './LibraryManagementControlRoom.svelte';
@@ -404,13 +426,14 @@ beforeEach(() => {
 	h.handBackAll.mockResolvedValue({ albums: 2 });
 });
 
-function takenOver(id: string, title: string) {
+function takenOver(id: string, title: string, givenUp = false) {
 	return {
 		album_id: id,
 		album_title: title,
 		artist_name: 'Signal Artist',
 		cause: 'files_changed',
-		noticed_at: Date.UTC(2026, 9, 1, 12)
+		noticed_at: Date.UTC(2026, 9, 1, 12),
+		hand_back_given_up: givenUp
 	};
 }
 
@@ -426,13 +449,20 @@ describe('albums left unmanaged', () => {
 	});
 
 	it('lists the albums with one button each and no bulk button for one', async () => {
-		h.takeovers.data = { total: 1, handing_back: 0, items: [takenOver('album-1', 'Kept Mine')] };
+		h.takeovers.data = {
+			total: 1,
+			handing_back: 0,
+			items: [takenOver('album-1', 'Kept Mine', true)]
+		};
 		await render(LibraryManagementControlRoom);
 
 		await page
 			.getByText('1 album is left unmanaged because its files were changed outside DroppedNeedle')
 			.click();
 		await expect.element(page.getByRole('link', { name: 'Kept Mine' })).toBeVisible();
+		await expect
+			.element(page.getByText('Hand-back stopped: its files could not be read.'))
+			.toBeVisible();
 		await page.getByRole('button', { name: 'Manage it again' }).click();
 
 		expect(h.handBack).toHaveBeenCalledWith({ albumId: 'album-1' });
@@ -479,7 +509,7 @@ function retagPair(id: string) {
 		title,
 		album_artist_name: 'Signal Artist',
 		track_count: 10,
-		identity_revision: 1,
+		identity_token: '0',
 		edition: null
 	});
 	return {
@@ -493,7 +523,7 @@ function retagPair(id: string) {
 
 describe('albums that might be one album retagged', () => {
 	it('says nothing when no pair is waiting', async () => {
-		h.retagPairs.data = { total: 0, pairs: [] };
+		h.retagPairs.data = { total: 0, items: [], next_cursor: null };
 		await render(LibraryManagementControlRoom);
 
 		await expect.element(page.getByText('Ready previews')).toBeVisible();
@@ -501,7 +531,7 @@ describe('albums that might be one album retagged', () => {
 	});
 
 	it('counts the pairs and opens to their cards', async () => {
-		h.retagPairs.data = { total: 2, pairs: [retagPair('a'), retagPair('b')] };
+		h.retagPairs.data = { total: 2, items: [retagPair('a'), retagPair('b')], next_cursor: null };
 		await render(LibraryManagementControlRoom);
 
 		await page.getByText('2 pairs of albums might each be one album retagged').click();
@@ -666,5 +696,18 @@ describe('LibraryManagementControlRoom', () => {
 		await expect
 			.element(page.getByRole('button', { name: 'Mark bundle-1 as handled' }))
 			.not.toBeInTheDocument();
+	});
+});
+
+describe('the runner in the URL', () => {
+	it('closes a runner from a saved link so the URL holds the tab and no runner', async () => {
+		h.goto.mockClear();
+		h.appPage.url = new URL('https://music.example.test/library/management?runner=manage');
+		await render(LibraryManagementControlRoom);
+
+		await page.getByRole('button', { name: 'Close manual management runner' }).click();
+
+		expect(h.goto).toHaveBeenCalledTimes(1);
+		expect(new URL(h.goto.mock.calls[0][0]).search).toBe('?tab=organize');
 	});
 });

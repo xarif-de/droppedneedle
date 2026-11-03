@@ -12,12 +12,12 @@ use droppedneedle_kernel::db::savepoint;
 use rusqlite::{Connection, OptionalExtension as _, Transaction, params};
 
 use super::reads::{read_album_identity, read_track_identity, stored_release};
+use super::release::ReleaseIdentity;
 use super::sql;
 use super::{DecisionSource, PROVIDER, write_match_flag};
 use crate::corrections::continuation::{Scope, continue_tracks};
 use crate::identify::models::{AlbumIdentity, TrackIdentity};
 use crate::identify::queue::offer_album;
-use crate::publish::planner::ReleaseIdentity;
 
 /// One file an import's bundle added to the catalog.
 #[derive(Debug, Clone, Copy)]
@@ -229,7 +229,7 @@ pub(crate) fn save_album(
             group,
             identity.release_mbid,
             identity.decision_source.as_str(),
-            now,
+            crate::clock::ms(now),
             identity.row_revision.max(1) as i64,
         ])?;
     if written == 0 {
@@ -263,7 +263,7 @@ pub(crate) fn save_track(
             recording,
             identity.release_track_mbid,
             identity.decision_source.as_str(),
-            now,
+            crate::clock::ms(now),
             identity.row_revision.max(1) as i64,
         ])?;
     if written == 0 {

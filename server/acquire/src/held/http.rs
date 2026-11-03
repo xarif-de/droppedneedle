@@ -17,7 +17,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 
-use super::service::{Acted, HeldError, HeldService, is_retry, retries_by_itself};
+use super::service::{Acted, HeldError, HeldService, is_retry, rechecks, retries_by_itself};
 use super::store::{Entry, EntryOrigin, EntryState, HeldFile};
 use crate::downloads::queue_rows::Viewer;
 use crate::reason::{Reason, ReasonKind};
@@ -26,9 +26,8 @@ use droppedneedle_auth::{Curator, Principal, User};
 use droppedneedle_kernel::error::ApiError;
 use droppedneedle_kernel::extract::{ValidJson, ValidQuery};
 use droppedneedle_kernel::mount::{Routes, routes};
-use droppedneedle_media::stream::routes::{
-    DirectSpan, content_type_for_extension, file_range, range_header,
-};
+use droppedneedle_media::stream::engine::content_type_for_extension;
+use droppedneedle_media::stream::framing::{DirectSpan, file_range, range_header};
 
 /// What a person can do with one held file, besides listening and
 /// discarding, which every file offers.
@@ -64,10 +63,7 @@ fn actions_for(file: &HeldFile) -> Vec<HeldFileAction> {
         reason if is_retry(reason) => actions.push(HeldFileAction::Retry),
         _ => actions.push(HeldFileAction::Import),
     }
-    if matches!(
-        file.reason,
-        Reason::FingerprintMismatch | Reason::FingerprintUnconfirmed
-    ) {
+    if rechecks(file) {
         actions.push(HeldFileAction::Recheck);
     }
     actions
@@ -249,10 +245,12 @@ impl From<Acted> for HeldActionResponse {
             already_owned: acted.owned,
             discarded: acted.discarded,
             still_held: acted.held.len(),
-            message: acted
-                .held
-                .first()
-                .map(|reason| format!("{} {}", reason.message(), reason.action())),
+            message: acted.message.or_else(|| {
+                acted
+                    .held
+                    .first()
+                    .map(|reason| format!("{} {}", reason.message(), reason.action()))
+            }),
         }
     }
 }
@@ -338,23 +336,6 @@ pub async fn list_handler(
     Ok(Json(HeldListResponse {
         entries: entries.into_iter().map(Into::into).collect(),
     }))
-}
-
-/// One entry with its held files. `GET /api/v3/held/{entry_id}`.
-#[utoipa::path(
-    get,
-    tag = "held",
-    path = "/api/v3/held/{entry_id}",
-    params(("entry_id" = i64, Path, description = "Held entry id")),
-    responses((status = 200, body = HeldEntryResponse))
-)]
-pub async fn get_handler(
-    State(service): State<Arc<HeldService>>,
-    User(principal): User,
-    Path(entry_id): Path<String>,
-) -> Result<Json<HeldEntryResponse>, ApiError> {
-    let entry = service.get(&viewer(&principal), id_of(&entry_id)?).await?;
-    Ok(Json(entry.into()))
 }
 
 /// Import an entry's held files (all, or those named), skipping the check
@@ -558,7 +539,6 @@ pub fn routes() -> Routes<Arc<HeldService>> {
     Routes::new()
         .user(routes!(list_handler))
         .user(routes!(recheck_all_handler))
-        .user(routes!(get_handler))
         .user(routes!(import_handler))
         .curator(routes!(match_handler))
         .user(routes!(recheck_handler))

@@ -1,15 +1,15 @@
 //! Automatic scan scheduling from durable terminal runs.
 //!
-//! Port of v2's library scan scheduler and the terminal-time math in its
-//! schedule service. The scheduler never
+//! Library scan scheduler and the terminal-time math. The scheduler never
 //! scans on wall-clock guesses: every tick anchors on the latest
 //! filesystem terminal run, and only fires when the interval fully elapsed.
 //!
 //! Daily schedules run at the set time in the server's time zone, read
 //! from the system zone database. Interval frequencies are time-zone free
-//! and ported exactly, including the absolute-seconds DST note.
+//! and count absolute seconds, so a clock change does not move them.
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use droppedneedle_kernel::runtime_config::sections::ScanFrequency;
 use jiff::Timestamp;
@@ -17,7 +17,7 @@ use jiff::civil::Date;
 use jiff::tz::TimeZone;
 
 use super::models::{Disposition, EffectivePolicy, ScanKind, ScanRequest, ScanScope, ScanTrigger};
-use super::roots::RootRegistry;
+use super::roots::{RootRegistry, on_disk_rule_paths, scope_covers};
 
 /// Schedule settings for automatic scans.
 #[derive(Debug, Clone)]
@@ -46,8 +46,6 @@ impl ScheduleSettings {
 /// `daily`.
 fn interval_seconds(frequency: ScanFrequency) -> Option<f64> {
     match frequency {
-        ScanFrequency::Min5 => Some(300.0),
-        ScanFrequency::Min10 => Some(600.0),
         ScanFrequency::Min30 => Some(1_800.0),
         ScanFrequency::Hr1 => Some(3_600.0),
         ScanFrequency::Hr6 => Some(21_600.0),
@@ -60,7 +58,7 @@ fn interval_seconds(frequency: ScanFrequency) -> Option<f64> {
 }
 
 /// Seconds until the next automatic scan is due, anchored on the latest
-/// terminal run (v2 `seconds_until_due`). `None` means manual: never due.
+/// terminal run. `None` means manual: never due.
 /// A daily time is read in `zone`. On a day a clock change skips it, the
 /// scan runs as far after the change as the time was past it (02:30 for a
 /// lost 01:30); on a day the time comes twice, it runs the first time.
@@ -80,7 +78,7 @@ pub fn seconds_until_due(
             return Some(0.0);
         };
         // Absolute-seconds arithmetic keeps the rolling gap exact across
-        // DST transitions (v2 schedule-service note).
+        // DST transitions.
         return Some((terminal + interval - now).max(0.0));
     }
     let (hour, minute) = parse_daily_time(daily_time);
@@ -102,7 +100,7 @@ pub fn seconds_until_due(
 }
 
 fn parse_daily_time(daily_time: &str) -> (i8, i8) {
-    // v2 falls back to 03:00 on any parse failure.
+    // Quirk (v2): any parse failure falls back to 03:00.
     daily_time
         .split_once(':')
         .and_then(|(hour, minute)| {
@@ -136,7 +134,7 @@ impl InclusionRule {
     }
 }
 
-/// Whole-registry scopes for an automatic scan (v2 `scheduled_scopes`):
+/// Whole-registry scopes for an automatic scan:
 /// every non-excluded root walks whole; excluded roots contribute only
 /// their included subpaths, skipping rules covered by an already-selected
 /// ancestor.
@@ -153,26 +151,29 @@ pub fn scheduled_scopes(registry: &RootRegistry, rules: &[InclusionRule]) -> Vec
         let Some(root_path) = excluded_paths.get(rule.root_id.as_str()) else {
             continue;
         };
-        if selected.iter().any(|parent| {
-            rule.relative_path == *parent || rule.relative_path.starts_with(&format!("{parent}/"))
-        }) {
+        if selected
+            .iter()
+            .any(|parent| scope_covers(parent, &rule.relative_path))
+        {
             continue;
         }
         selected.push(rule.relative_path.clone());
-        scopes.push(ScanScope {
-            root_id: rule.root_id.clone(),
-            scope_id: Some(rule.rule_id.clone()),
-            relative_path: rule.relative_path.clone(),
-            root_path: Some(root_path.clone()),
-            effective_policy: EffectivePolicy::Automatic,
-            policy_revision: registry.policy_revision().to_owned(),
-            estimated_count: None,
-        });
+        for relative_path in on_disk_rule_paths(Path::new(root_path), &rule.relative_path) {
+            scopes.push(ScanScope {
+                root_id: rule.root_id.clone(),
+                scope_id: Some(rule.rule_id.clone()),
+                relative_path,
+                root_path: Some(root_path.clone()),
+                effective_policy: EffectivePolicy::Automatic,
+                policy_revision: registry.fingerprint().to_owned(),
+                estimated_count: None,
+            });
+        }
     }
     scopes
 }
 
-/// One scheduler tick (v2 `LibraryAutomaticScanScheduler.tick`).
+/// One scheduler tick.
 /// `request` issues the scan request; returns true when work will run.
 /// started/queued/coalesced/expanded all mean work runs; only conflict
 /// means "leave the queued follow-up alone".
@@ -211,7 +212,7 @@ where
         trigger: ScanTrigger::Automatic,
         scopes,
         requested_by_user_id: None,
-        policy_revision: registry.policy_revision().to_owned(),
+        policy_revision: registry.fingerprint().to_owned(),
     }) {
         Ok(disposition) => disposition != Disposition::Conflict,
         Err(_) => false,
@@ -312,6 +313,35 @@ mod tests {
         assert!(scopes.iter().any(|scope| scope.relative_path == "."));
         assert!(scopes.iter().any(|scope| scope.relative_path == "keep"));
         assert!(scopes.iter().any(|scope| scope.relative_path == "other"));
+    }
+
+    /// An included rule walks every folder the disk has that differs only in
+    /// case, keeps its own spelling for rows a rename left there, and a rule
+    /// its folded spelling covers adds nothing.
+    #[test]
+    fn included_rules_walk_the_folder_on_disk() {
+        let dir =
+            droppedneedle_kernel::db::scratch::ScratchDir::new("scheduler-rules").expect("scratch");
+        std::fs::create_dir_all(dir.path().join("live").join("90s")).unwrap();
+        std::fs::create_dir_all(dir.path().join("LIVE")).unwrap();
+        let registry = RootRegistry::new(
+            vec![LibraryRoot::new(
+                "x",
+                dir.path().to_path_buf(),
+                EffectivePolicy::Excluded,
+            )],
+            true,
+            "rev-1",
+        );
+        let rules = vec![
+            InclusionRule::new("x", "rule-1", "Live"),
+            InclusionRule::new("x", "rule-2", "live/90s"),
+        ];
+        let paths: Vec<String> = scheduled_scopes(&registry, &rules)
+            .into_iter()
+            .map(|scope| scope.relative_path)
+            .collect();
+        assert_eq!(paths, ["LIVE", "live", "Live"]);
     }
 
     #[test]

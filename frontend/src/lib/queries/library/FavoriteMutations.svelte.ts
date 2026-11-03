@@ -1,3 +1,4 @@
+import { v3 } from '$lib/api/v3/endpoint';
 import { useQueryClient, type QueryKey } from '@tanstack/svelte-query';
 import { api } from '$lib/api/client';
 import { catalogChanged, createAppMutation, favoritesChanged } from '$lib/queries/effects';
@@ -5,7 +6,6 @@ import { authStore } from '$lib/stores/authStore.svelte';
 import { toastStore } from '$lib/stores/toast';
 import { setQueryDataWithPersister } from '../QueryClient';
 import { LibraryQueryKeyFactory } from './LibraryQueryKeyFactory';
-import { LibraryV3Api } from './LibraryV3Api';
 
 export type FavoriteKind = 'album' | 'track' | 'artist';
 
@@ -17,11 +17,11 @@ interface FavoriteVars {
 
 type Row = Record<string, unknown>;
 
-// A field only each kind's page model has, so an album never takes a
+// A field only each kind's view has, so an album never takes a
 // track's heart when two ids match.
 const KIND_FIELD: Record<FavoriteKind, string> = {
-	album: 'album_identity_state',
-	artist: 'artist_identity_state',
+	album: 'is_compilation',
+	artist: 'led_track_count',
 	track: 'track_number'
 };
 
@@ -57,13 +57,15 @@ function flaggedRoots(): QueryKey[] {
  * if the save fails. Saves run one at a time, so quick clicks end on the
  * last one.
  */
-export function setFavorite() {
+export function createSetFavoriteMutation() {
 	const client = useQueryClient();
 	return createAppMutation(
 		() => ({
 			scope: { id: 'favorites' },
 			mutationFn: ({ kind, itemId, favorited }: FavoriteVars) =>
-				api.v3.PUT(LibraryV3Api.favorite(kind, itemId), { favorited }),
+				api.v3.PUT(v3('/api/v3/favorites/{kind}/{item_id}', { path: { kind, item_id: itemId } }), {
+					favorited
+				}),
 			onMutate: async (vars: FavoriteVars) => {
 				const previous: [QueryKey, unknown][] = [];
 				for (const root of flaggedRoots()) {

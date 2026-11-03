@@ -1,10 +1,10 @@
 <script lang="ts">
 	import { AudioLines, ExternalLink } from 'lucide-svelte';
-	import { getListenBrainzConnectionQuery } from '$lib/queries/listenbrainz/ListenBrainzQuery.svelte';
+	import { getListenBrainzConnectionQuery } from '$lib/queries/listenbrainz.svelte';
 	import {
 		createSaveListenBrainzMutation,
 		createVerifyListenBrainzMutation
-	} from '$lib/queries/listenbrainz/ListenBrainzMutations.svelte';
+	} from '$lib/queries/listenbrainz.svelte';
 	import Card from '$lib/ui/Card.svelte';
 	import CardTitle from '$lib/ui/CardTitle.svelte';
 	import QueryBoundary from '$lib/ui/QueryBoundary.svelte';
@@ -53,6 +53,7 @@
 						label="Username"
 						placeholder="Your ListenBrainz username"
 						bind:value={draft.username}
+						error={section.fieldError('username', 'Username')}
 					/>
 
 					<SecretField
@@ -60,6 +61,7 @@
 						mask={SECRET_MASK}
 						placeholder="User token"
 						bind:value={draft.user_token}
+						error={section.fieldError('user_token', 'User token')}
 					/>
 
 					<a

@@ -82,17 +82,20 @@ vi.mock('$lib/queries/library/LibraryOperationQueries.svelte', () => ({
 	getLibraryRunEstimateQuery: () => ({ data: { estimated_file_count: 100 }, isFetching: false })
 }));
 vi.mock('$lib/queries/library/LibraryOperationMutations.svelte', () => ({
-	requestLibraryRun: () => ({ mutateAsync: h.requestRun, isPending: false }),
+	createRequestLibraryRunMutation: () => ({ mutateAsync: h.requestRun, isPending: false }),
 	createScanDiagnosticsExportMutation: () => ({ mutateAsync: vi.fn(), isPending: false }),
-	controlLibraryRun: (action: string) => ({
+	createControlLibraryRunMutation: (action: string) => ({
 		mutateAsync: action === 'pause' ? h.pauseRun : action === 'resume' ? h.resumeRun : h.stopRun,
 		isPending: false
 	}),
-	controlIdentification: (action: string) => ({
+	createControlIdentificationMutation: (action: string) => ({
 		mutateAsync: action === 'pause' ? h.pauseIdentification : h.resumeRun,
 		isPending: false
 	}),
-	controlLibraryOperation: () => ({ mutateAsync: h.controlOperationMutate, isPending: false })
+	createControlLibraryOperationMutation: () => ({
+		mutateAsync: h.controlOperationMutate,
+		isPending: false
+	})
 }));
 vi.mock('$lib/queries/library/LibraryPolicyQueries.svelte', () => ({
 	getTargetLibrarySettingsQuery: () => h.settings,
@@ -131,11 +134,11 @@ vi.mock('$lib/queries/library/LibraryPolicyQueries.svelte', () => ({
 vi.mock('$lib/queries/library/LibraryReviewQueries.svelte', () => ({
 	getPendingReviewCountQuery: () => h.reviews
 }));
-vi.mock('$lib/queries/artist-reconciliation/ArtistReconciliationQueries.svelte', () => ({
+vi.mock('$lib/queries/artist-reconciliation.svelte', () => ({
 	getArtistReconciliationProgressQuery: () => h.artistReconciliation
 }));
 vi.mock('$lib/queries/library/LibraryReviewMutations.svelte', () => ({
-	retryPendingLibraryReviews: () => ({
+	createRetryPendingLibraryReviewsMutation: () => ({
 		mutateAsync: h.bulkApply,
 		reset: h.bulkApplyReset,
 		data: undefined,
@@ -202,7 +205,19 @@ function run(overrides: Partial<ScanRun> = {}): ScanRun {
 		coalesced_request_count: 0,
 		row_revision: 4,
 		event_revision: 5,
-		counters: {},
+		counters: {
+			changed_count: 0,
+			discovered_count: 0,
+			errored_count: 0,
+			excluded_count: 0,
+			identification_enqueued_count: 0,
+			indexed_count: 0,
+			inspected_count: 0,
+			missing_count: 0,
+			new_count: 0,
+			total_count: 0,
+			unchanged_count: 0
+		},
 		phase_timings: {},
 		...overrides
 	};

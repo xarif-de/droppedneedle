@@ -158,7 +158,7 @@ async fn operator_repair_converges_to_clean_import() {
 async fn imported_counts_match_the_fixture() {
     // Two users in (both emails nulled onto the pre-seeded strangers), two
     // local providers in, the Plex binding kept on its existing owner,
-    // three app passwords, one recovery code, three follows, three
+    // three app passwords, three follows, three
     // approvals with one reviewer nulled.
     let root = scratch_dir("counts");
     let (fixture, text) = repaired_export(&root);
@@ -176,21 +176,12 @@ async fn imported_counts_match_the_fixture() {
             .await
             .expect("alice reads");
     assert_eq!(alice, (1_704_067_200_000, Some(1_767_225_600_000)));
-    let code: (i64, i64) = sqlx::query_as(
-        "SELECT created_at, expires_at FROM auth_password_recovery_codes WHERE user_id = ?",
-    )
-    .bind(&fixture.alice_id)
-    .fetch_one(&pool)
-    .await
-    .expect("alice's code reads");
-    assert_eq!(code, (1_711_929_600_000, 1_806_537_600_000));
     let count = |entity: &str| report.entities.get(entity).expect("entity counted").clone();
     assert_eq!(count("user").imported, 2);
     assert_eq!(count("user").nulled_field, 2);
     assert_eq!(count("provider").imported, 2);
     assert_eq!(count("provider").conflict_kept_existing, 1);
     assert_eq!(count("app_password").imported, 3);
-    assert_eq!(count("recovery_code").imported, 1);
     assert_eq!(count("follow").imported, 3);
     assert_eq!(count("approval").imported, 3);
     assert_eq!(count("approval").nulled_field, 1);
@@ -331,6 +322,48 @@ async fn settings_land_with_schedule_carry_and_no_plaintext() {
     }
 }
 
+/// A top-level Jellyfin address and contact address reach the person: the
+/// first in v3's settings, the second as a line in the import report, which
+/// lists the config keys left behind.
+#[tokio::test]
+async fn top_level_config_keys_reach_the_import() {
+    let root = scratch_dir("config-keys");
+    let _ = repaired_export(&root);
+    let config_path = root.join("v2").join("config").join("config.json");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config_path).expect("config reads"))
+            .expect("config parses");
+    config["jellyfin_url"] = "http://jellyfin.lan:8096".into();
+    config["contact_email"] = "ops@example.org".into();
+    std::fs::write(&config_path, config.to_string()).expect("config writes");
+    let export_path = root.join("edited.json");
+    droppedneedle_tool::export::export_v2_to_file(
+        &export_request(&root.join("v2"), PASSPHRASE),
+        &export_path,
+    )
+    .expect("export writes");
+    let text = std::fs::read_to_string(&export_path).expect("export reads back");
+
+    let (v3_root, pool) = seeded_target(&root).await;
+    let report = run_pipeline(&text, PASSPHRASE, &v3_root, &pool, false).await;
+    assert_eq!(
+        v3_settings(&v3_root)["jellyfin_settings"]["jellyfin_url"],
+        "http://jellyfin.lan:8096"
+    );
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|note| note.starts_with("Set CONTACT_EMAIL=ops@example.org in your environment")),
+        "{:?}",
+        report.notes
+    );
+    assert!(report.left_behind.iter().any(|item| {
+        item.table == "contact_email"
+            && item.kind == droppedneedle_tool::export::LeftBehindKind::Setting
+    }));
+}
+
 #[tokio::test]
 async fn reimport_writes_nothing() {
     let root = scratch_dir("reimport");
@@ -392,8 +425,8 @@ async fn user_data_carries_resumes_and_repeats_as_noop() {
         droppedneedle_tool::r#import::ExitCode::FailedInternal
     );
     assert_eq!(rows("user_connections").await, 4);
-    assert_eq!(rows("playlists").await, 2);
-    assert_eq!(rows("playlist_tracks").await, 2);
+    assert_eq!(rows("catalog_playlists").await, 2);
+    assert_eq!(rows("catalog_playlist_tracks").await, 2);
     assert_eq!(rows("library_play_history").await, 0);
     let playlists = &crashed.entities["playlist"];
     assert_eq!(
@@ -427,16 +460,16 @@ async fn user_data_carries_resumes_and_repeats_as_noop() {
         .collect();
     assert_eq!(skipped, ["connection", "playlist", "playlist_track"]);
     for (table, expected) in [
-        ("playlists", 2),
-        ("playlist_covers", 1),
-        ("library_user_favorites", 2),
+        ("catalog_playlists", 2),
+        ("catalog_playlist_covers", 1),
+        ("catalog_user_favorites", 2),
         ("library_play_history", 2),
         ("request_history", 1),
         ("request_history_requesters", 1),
         ("request_history_dismissals", 1),
         ("download_tasks", 1),
         ("download_attempts", 1),
-        ("library_user_favorite_names", 2),
+        ("catalog_user_favorite_names", 2),
         ("wanted_watches", 2),
         ("wanted_seen_candidates", 1),
         ("user_quotas", 1),
@@ -444,13 +477,13 @@ async fn user_data_carries_resumes_and_repeats_as_noop() {
         ("user_listening_prefs", 1),
         ("personal_mix_approvals", 1),
         ("user_section_prefs", 1),
-        ("user_navidrome_folder_preferences", 1),
-        ("user_new_release_seen", 1),
+        ("media_navidrome_folder_preferences", 1),
+        ("catalog_new_release_seen_marks", 1),
         ("compat_play_queues", 1),
         ("compat_play_queue_items", 2),
         ("compat_bookmarks", 1),
         ("artist_known_releases", 1),
-        ("new_release_feed", 1),
+        ("acquire_new_release_feed", 1),
     ] {
         assert_eq!(rows(table).await, expected, "{table}");
     }
@@ -519,8 +552,17 @@ async fn user_data_carries_resumes_and_repeats_as_noop() {
         history.as_deref(),
         Some(droppedneedle_tool::tooling::fixture::V2_TRACK_ID)
     );
+    let made: i64 = sqlx::query_scalar("SELECT created_at FROM catalog_playlists WHERE id = ?")
+        .bind(PLAYLIST_ID)
+        .fetch_one(&pool)
+        .await
+        .expect("playlist time reads");
+    assert_eq!(
+        made, 1_748_736_000_000,
+        "v2's ISO time lands in milliseconds"
+    );
     let cover: Vec<u8> =
-        sqlx::query_scalar("SELECT image FROM playlist_covers WHERE playlist_id = ?")
+        sqlx::query_scalar("SELECT image FROM catalog_playlist_covers WHERE playlist_id = ?")
             .bind(PLAYLIST_ID)
             .fetch_one(&pool)
             .await
@@ -615,7 +657,7 @@ async fn user_data_carries_resumes_and_repeats_as_noop() {
 
     // A repeat import writes nothing anywhere, and a playlist deleted in v3
     // since does not come back: each section is carried once.
-    sqlx::query("DELETE FROM playlists WHERE id = 'playlist-bob'")
+    sqlx::query("DELETE FROM catalog_playlists WHERE id = 'playlist-bob'")
         .execute(&pool)
         .await
         .expect("playlist deletes");
@@ -775,7 +817,7 @@ async fn run_pipeline_with(
     droppedneedle_tool::r#import::run_import(droppedneedle_tool::r#import::ImportRequest {
         export_bytes: export_text.as_bytes().to_vec(),
         passphrase: passphrase.to_owned(),
-        pool: pool.clone(),
+        db_path: pool.connect_options().get_filename().to_owned(),
         legacy: droppedneedle_kernel::runtime_config::LegacyConfig::at(&config_dir, false),
         crypto,
         v2_config_path: Some(
@@ -971,6 +1013,120 @@ async fn stray_whole_numbers_carry_as_null_or_whole() {
     assert_eq!(landed, (None, Some(7)));
 }
 
+/// The listening preferences Alice lands with after `v2_sql` runs on the v2
+/// database: the Last.fm flag, the Navidrome flag, visibility, personal mix.
+async fn landed_listening_prefs(tag: &str, v2_sql: &str) -> (i64, i64, String, i64) {
+    let root = scratch_dir(tag);
+    build_v2_fixture(&root.join("v2")).expect("fixture builds");
+    let v2_db = root.join("v2").join("cache").join("library.db");
+    delete_orphan_rows(&v2_db).expect("repair runs");
+    let v2 = rusqlite::Connection::open(&v2_db).expect("v2 db opens");
+    v2.execute_batch(v2_sql).expect("v2 table changes");
+    drop(v2);
+    let export_path = root.join("export.json");
+    droppedneedle_tool::export::export_v2_to_file(
+        &export_request(&root.join("v2"), PASSPHRASE),
+        &export_path,
+    )
+    .expect("export writes");
+    let text = std::fs::read_to_string(&export_path).expect("export reads back");
+    let (v3_root, pool) = seeded_target(&root).await;
+    run_pipeline(&text, PASSPHRASE, &v3_root, &pool, false).await;
+    sqlx::query_as(
+        "SELECT scrobble_to_lastfm, navidrome_handles_external_scrobbles, \
+         now_playing_visibility, auto_request_personal_mix FROM user_listening_prefs",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("the preferences carry")
+}
+
+/// A v2 database last started before these three columns were added upgrades
+/// all the same: what it has carries and v3's defaults fill the rest.
+#[tokio::test]
+async fn listening_prefs_carry_from_a_v2_table_without_the_later_columns() {
+    let landed = landed_listening_prefs(
+        "prefs-older-v2",
+        "ALTER TABLE user_listening_prefs DROP COLUMN now_playing_visibility;
+         ALTER TABLE user_listening_prefs DROP COLUMN navidrome_handles_external_scrobbles;
+         ALTER TABLE user_listening_prefs DROP COLUMN auto_request_personal_mix;",
+    )
+    .await;
+    assert_eq!(landed, (1, 1, "full".to_owned(), 0));
+}
+
+/// A v2 visibility that is not text carries as hiding the song, never as
+/// showing it.
+#[tokio::test]
+async fn a_visibility_that_is_not_text_carries_as_hidden() {
+    let landed = landed_listening_prefs(
+        "prefs-blob-visibility",
+        "UPDATE user_listening_prefs SET now_playing_visibility = X'00';",
+    )
+    .await;
+    assert_eq!(landed, (1, 1, "track_hidden".to_owned(), 0));
+}
+
+/// A v2 download with values v3's readers do not know carries with the
+/// safe ones: one stray value must not stop the upgrade.
+#[tokio::test]
+async fn stray_download_labels_carry_as_their_defaults() {
+    let root = scratch_dir("stray-labels");
+    let fixture = build_v2_fixture(&root.join("v2")).expect("fixture builds");
+    let v2_db = root.join("v2").join("cache").join("library.db");
+    delete_orphan_rows(&v2_db).expect("repair runs");
+    let alice = &fixture.alice_id;
+    let v2 = rusqlite::Connection::open(&v2_db).expect("v2 db opens");
+    v2.execute_batch(&format!(
+        "ALTER TABLE download_tasks ADD COLUMN download_type TEXT;
+         ALTER TABLE download_tasks ADD COLUMN download_client TEXT;
+         ALTER TABLE download_tasks ADD COLUMN source TEXT;
+         ALTER TABLE download_tasks ADD COLUMN origin TEXT;
+         INSERT INTO download_tasks (id, user_id, release_group_mbid, artist_name,
+             album_title, status, download_type, download_client, source, origin,
+             created_at, updated_at)
+         VALUES ('download-labels', '{alice}', 'dddddddd-0000-4000-8000-000000000005',
+                 'Artist', 'Album', 'completed', 'mixtape', '', 'carrier-pigeon', 'mystery',
+                 1700000000.0, 1700000000.0),
+                ('download-conversion', '{alice}', 'dddddddd-0000-4000-8000-000000000006',
+                 'Artist', 'Album', 'completed', 'album', 'slskd', 'soulseek',
+                 'edition_conversion', 1700000000.0, 1700000000.0);"
+    ))
+    .expect("v2 row seeds");
+    drop(v2);
+    let export_path = root.join("export.json");
+    droppedneedle_tool::export::export_v2_to_file(
+        &export_request(&root.join("v2"), PASSPHRASE),
+        &export_path,
+    )
+    .expect("export writes");
+    let text = std::fs::read_to_string(&export_path).expect("export reads back");
+    let (v3_root, pool) = seeded_target(&root).await;
+    run_pipeline(&text, PASSPHRASE, &v3_root, &pool, false).await;
+    let landed: (String, String, String, String) = sqlx::query_as(
+        "SELECT download_type, download_client, source, origin FROM download_tasks \
+         WHERE id = 'download-labels'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("the download carries");
+    assert_eq!(
+        landed,
+        (
+            "album".to_owned(),
+            "slskd".to_owned(),
+            "soulseek".to_owned(),
+            "user".to_owned()
+        )
+    );
+    let origin: String =
+        sqlx::query_scalar("SELECT origin FROM download_tasks WHERE id = 'download-conversion'")
+            .fetch_one(&pool)
+            .await
+            .expect("the conversion carries");
+    assert_eq!(origin, "edition");
+}
+
 /// A v2 download with a text track duration and preflight score, a held
 /// file with text durations and an unknown reason, and a finished request
 /// of an unknown kind carry: the text numbers land NULL, and the kind and
@@ -1136,9 +1292,9 @@ async fn assert_follows_intact(
     pool: &sqlx::SqlitePool,
     fixture: &droppedneedle_tool::tooling::fixture::V2Fixture,
 ) {
-    let rows: Vec<(String, String, String, i64, f64, f64)> = sqlx::query_as(
+    let rows: Vec<(String, String, String, i64, i64, i64)> = sqlx::query_as(
         "SELECT user_id, artist_mbid, artist_name, auto_download, followed_at, updated_at
-         FROM user_followed_artists ORDER BY user_id, artist_mbid",
+         FROM acquire_followed_artists ORDER BY user_id, artist_mbid",
     )
     .fetch_all(pool)
     .await

@@ -5,7 +5,7 @@
 		AlbumTracksInfo,
 		DownloadTask,
 		HeldFile,
-		LibraryAlbumSummary
+		AlbumView
 	} from '$lib/types';
 	import AlbumImage from '$lib/components/AlbumImage.svelte';
 	import HeroBackdrop from '$lib/components/HeroBackdrop.svelte';
@@ -22,8 +22,8 @@
 		TrendingUp,
 		TriangleAlert
 	} from 'lucide-svelte';
-	import { rescanAlbum } from '$lib/queries/library/LibraryMutations.svelte';
-	import { requestUpgradeAlbum } from '$lib/queries/downloads/UpgradeQueries.svelte';
+	import { createRescanAlbumMutation } from '$lib/queries/library/LibraryMutations.svelte';
+	import { createRequestUpgradeAlbumMutation } from '$lib/queries/downloads/UpgradeQueries.svelte';
 	import { authStore } from '$lib/stores/authStore.svelte';
 	import { toastStore } from '$lib/stores/toast';
 	import { deckSampler } from '$lib/stores/deckSampler.svelte';
@@ -58,7 +58,7 @@
 		/** The current edition's tracks a file sits on, out of all of them, once its plan is read. */
 		editionCounts?: { kept: number; total: number } | null;
 		releaseGroupMbid?: string;
-		localCopies?: LibraryAlbumSummary[];
+		localCopies?: AlbumView[];
 		/** The edition a request gets, for a curator on an album the library does not hold. */
 		editionPick?: EditionRequestPick | null;
 		downloadAllowed?: boolean;
@@ -122,7 +122,7 @@
 		});
 	}
 
-	const rescan = rescanAlbum();
+	const rescan = createRescanAlbumMutation();
 	// With the edition's plan read, "In Library" counts the edition's tracks a
 	// file sits on: a file that sits on none reads "Unmatched files", never
 	// owned. Before the plan is there, held files are counted.
@@ -149,7 +149,7 @@
 
 	// Album quality upgrade (admin/trusted): fetch a
 	// better copy of everything below the cutoff; replace is strictly-better-only.
-	const upgrade = requestUpgradeAlbum();
+	const upgrade = createRequestUpgradeAlbumMutation();
 	let upgradeQueued = $state(false);
 	async function handleUpgrade() {
 		try {

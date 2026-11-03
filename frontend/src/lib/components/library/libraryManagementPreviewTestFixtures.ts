@@ -48,9 +48,15 @@ export const queriesMock = {
 };
 
 export const mutationsMock = {
-	applyLibraryManagementPreviewMutation: () => ({ mutateAsync: h.apply, isPending: false }),
-	discardLibraryManagementPreviewMutation: () => ({ mutateAsync: h.discard, isPending: false }),
-	reissueLibraryManagementPreviewMutation: () => ({ mutateAsync: h.reissue, isPending: false }),
+	createApplyLibraryManagementPreviewMutation: () => ({ mutateAsync: h.apply, isPending: false }),
+	createDiscardLibraryManagementPreviewMutation: () => ({
+		mutateAsync: h.discard,
+		isPending: false
+	}),
+	createReissueLibraryManagementPreviewMutation: () => ({
+		mutateAsync: h.reissue,
+		isPending: false
+	}),
 	createLibraryManagementDuplicateResolutionMutation: () => ({
 		mutateAsync: h.resolve,
 		isPending: false
@@ -68,7 +74,6 @@ export function detail(overrides: Record<string, unknown> = {}): Record<string, 
 		profile_name: 'Picard-style Organizer',
 		profile_revision: 'profile-revision-1',
 		settings_revision: 'settings-1',
-		policy_revision: 'policy-1',
 		catalog_revision: 4,
 		proposed_settings_revision: null,
 		target_root_id: null,

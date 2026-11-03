@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::{Connection, OpenFlags, params};
 use sha2::{Digest as _, Sha256};
 
-use crate::export::envelope::LeftBehind;
+use crate::export::envelope::{LeftBehind, LeftBehindKind};
 use crate::export::error::ExportError;
 use crate::export::sections::library::ARTIST_ALIASES;
 use crate::export::sections::{ALL, Column, FileSet, LIVE_USER, Source, TableSection, V2Value};
@@ -214,6 +214,9 @@ fn v2_sql(column: &Column, available: &HashSet<String>) -> Option<String> {
         V2Value::Column(name) => available.contains(name).then(|| format!("s.\"{name}\"")),
         V2Value::Expr(expr) => Some(format!("({expr})")),
         V2Value::ExprOf(name, expr) => available.contains(name).then(|| format!("({expr})")),
+        V2Value::Ruled(name, rule) => available
+            .contains(name)
+            .then(|| format!("({})", rule.sql(&format!("s.\"{name}\"")))),
     }
 }
 
@@ -302,6 +305,7 @@ fn copy_table(
             table: table.to_owned(),
             rows: skipped,
             reason: section.left_behind.to_owned(),
+            kind: LeftBehindKind::Table,
         });
     }
     Ok(copied)
@@ -399,6 +403,7 @@ fn attach_held_files(
                      V2_ROOT/cache/held from your backup and export again, or request the \
                      download again in v3"
                 .to_owned(),
+            kind: LeftBehindKind::Files,
         });
     }
     Ok(kept)
@@ -464,6 +469,7 @@ fn copy_management_blobs(
                      Restore V2_ROOT/cache/library-management from your backup and export \
                      again"
                 .to_owned(),
+            kind: LeftBehindKind::Files,
         });
     }
     Ok(copied)
@@ -530,7 +536,12 @@ fn copy_playlist_covers(
         conn.execute(
             "INSERT INTO main.\"playlist_cover\" (playlist_id, content_type, image, updated_at) \
              VALUES (?1, ?2, ?3, ?4)",
-            params![playlist_id, content_type, bytes, modified_secs(&path)],
+            params![
+                playlist_id,
+                content_type,
+                bytes,
+                (modified_secs(&path) * 1000.0).round() as i64
+            ],
         )
         .map_err(bundle_error)?;
         copied += 1;
@@ -543,6 +554,7 @@ fn copy_playlist_covers(
                      V2_ROOT/cache/covers/playlists from your backup and export again, or \
                      pick a new cover in v3"
                 .to_owned(),
+            kind: LeftBehindKind::Files,
         });
     }
     Ok(copied)

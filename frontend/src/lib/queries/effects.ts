@@ -10,36 +10,37 @@ import {
 import { invalidateQueriesWithPersister } from '$lib/queries/QueryClient';
 import { everyScope, key, userScope } from '$lib/queries/keys';
 import { ArtistQueryKeyFactory } from '$lib/queries/artist/ArtistQueryKeyFactory';
+import { ArtistLinkQueryKeyFactory } from '$lib/queries/featureKeys';
 import { DiscoverQueryKeyFactory } from '$lib/queries/discover/DiscoverQueryKeyFactory';
 import { DownloadQueryKeyFactory } from '$lib/queries/downloads/DownloadQueryKeyFactory';
 import { FollowQueryKeyFactory } from '$lib/queries/following/FollowQueryKeyFactory';
-import { GenreQueryKeyFactory } from '$lib/queries/genre/GenreQueryKeyFactory';
-import { HomeQueryKeyFactory } from '$lib/queries/HomeQueryKeyFactory';
-import { DropImportQueryKeyFactory } from '$lib/queries/import/DropImportQueryKeyFactory';
+import { GenreQueryKeyFactory } from '$lib/queries/featureKeys';
+import { HomeQueryKeyFactory } from '$lib/queries/featureKeys';
+import { DropImportQueryKeyFactory } from '$lib/queries/featureKeys';
 import { LibraryQueryKeyFactory } from '$lib/queries/library/LibraryQueryKeyFactory';
 import { LOCAL_KEYS } from '$lib/queries/local/LocalV3Keys';
-import { LyricsQueryKeyFactory } from '$lib/queries/lyrics/LyricsQueryKeyFactory';
-import { RatingQueryKeyFactory } from '$lib/queries/ratings/RatingQueryKeyFactory';
+import { LyricsQueryKeyFactory } from '$lib/queries/featureKeys';
+import { RatingQueryKeyFactory } from '$lib/queries/featureKeys';
 import { RequestQueryKeyFactory } from '$lib/queries/requests/RequestQueryKeyFactory';
 import { SearchQueryKeyFactory } from '$lib/queries/search/SearchQueryKeyFactory';
-import { WantedQueryKeyFactory } from '$lib/queries/wanted/WantedQueryKeyFactory';
-import { AlbumMatchKeyFactory } from '$lib/queries/AlbumMatchQueryKeyFactory';
+import { WantedQueryKeyFactory } from '$lib/queries/featureKeys';
+import { AlbumMatchKeyFactory } from '$lib/queries/featureKeys';
 import { AlbumQueryKeyFactory } from '$lib/queries/catalog/AlbumQueryKeyFactory';
 import { AuthQueryKeyFactory } from '$lib/queries/auth/AuthQueryKeyFactory';
-import { ConnectAppsQueryKeyFactory } from '$lib/queries/connect-apps/ConnectAppsQueryKeyFactory';
+import { ConnectAppsQueryKeyFactory } from '$lib/queries/featureKeys';
 import { ConnectionsQueryKeyFactory } from '$lib/queries/connections/ConnectionsQueryKeyFactory';
 import { LibraryContributionQueryKeyFactory } from '$lib/queries/libraryContributions/LibraryContributionQueryKeyFactory';
 import { LibraryManagementQueryKeyFactory } from '$lib/queries/library-management/LibraryManagementQueryKeyFactory';
-import { LidarrImportQueryKeyFactory } from '$lib/queries/lidarr-import/LidarrImportQueryKeyFactory';
+import { LidarrImportQueryKeyFactory } from '$lib/queries/featureKeys';
 import { PluginQueryKeyFactory } from '$lib/queries/plugins/PluginQueryKeyFactory';
-import { ProfileQueryKeyFactory } from '$lib/queries/profile/ProfileQueryKeyFactory';
+import { ProfileQueryKeyFactory } from '$lib/queries/featureKeys';
 import { RemoteQueryKeyFactory } from '$lib/queries/remotes/RemoteQueryKeyFactory';
-import { ScrobblePreferencesQueryKeyFactory } from '$lib/queries/scrobble-preferences/ScrobblePreferencesQueryKeyFactory';
-import { SessionsQueryKeyFactory } from '$lib/queries/sessions/SessionsQueryKeyFactory';
+import { ScrobblePreferencesQueryKeyFactory } from '$lib/queries/featureKeys';
+import { SessionsQueryKeyFactory } from '$lib/queries/featureKeys';
 import { SettingsQueryKeyFactory } from '$lib/queries/settings/SettingsQueryKeyFactory';
-import { SourcePlaylistQueryKeyFactory } from '$lib/queries/source-playlists/SourcePlaylistQueryKeyFactory';
-import { SpotifyQueryKeyFactory } from '$lib/queries/spotify/SpotifyQueryKeyFactory';
-import { SystemQueryKeyFactory } from '$lib/queries/system/SystemQueryKeyFactory';
+import { SourcePlaylistQueryKeyFactory } from '$lib/queries/featureKeys';
+import { SpotifyQueryKeyFactory } from '$lib/queries/featureKeys';
+import { SystemQueryKeyFactory } from '$lib/queries/featureKeys';
 import { PlaylistQueryKeyFactory } from '$lib/queries/playlists/PlaylistQueryKeyFactory';
 import type { RemoteSource } from '$lib/queries/remotes/types';
 
@@ -134,13 +135,27 @@ export const EFFECTS = {
 	],
 	/** The caller's wanted albums. */
 	wantedChanged: (userId: UserId): Sweep[] => [{ key: WantedQueryKeyFactory.list(userId) }],
-	/** The caller asked for fewer recommendations like one album. */
+	/** The caller hid an album from their recommendations, or brought one back. */
 	recommendationsChanged: (userId: UserId): Sweep[] => [
 		{ key: DiscoverQueryKeyFactory.v3.ignored(userId) },
 		{ key: DiscoverQueryKeyFactory.v3.home(userId) }
 	],
 	/** The admin's artist duplicate groups. */
 	artistDuplicatesChanged: (): Sweep[] => [{ everyScope: ['library', 'artist-reconciliation'] }],
+	/**
+	 * One artist's MusicBrainz link: the link, the library artist under its id
+	 * and each MusicBrainz id it had or has, those artist pages, and the
+	 * admin's duplicate groups.
+	 */
+	artistLinkChanged: (userId: UserId, artistId: string, ...mbids: string[]): Sweep[] => [
+		{ key: ArtistLinkQueryKeyFactory.link(userId, artistId) },
+		{ key: LibraryQueryKeyFactory.catalog.artistDetail(userId, artistId) },
+		...mbids.flatMap((mbid): Sweep[] => [
+			{ key: LibraryQueryKeyFactory.catalog.artistDetail(userId, mbid) },
+			{ key: ArtistQueryKeyFactory.basic(mbid) }
+		]),
+		{ everyScope: ['library', 'artist-reconciliation'] }
+	],
 	/** The admin's list of accounts. */
 	usersChanged: (userId: UserId): Sweep[] => [{ key: AuthQueryKeyFactory.adminUsers(userId) }],
 	/** Accounts a media server offers for import. */
@@ -171,6 +186,10 @@ export const EFFECTS = {
 	],
 	/** The connect-apps settings. */
 	connectAppsSettingsChanged: (): Sweep[] => [{ key: ConnectAppsQueryKeyFactory.settings() }],
+	/** The caller's own Connect Apps choices. */
+	myConnectAppsChanged: (userId: string): Sweep[] => [
+		{ key: ConnectAppsQueryKeyFactory.mine(userId) }
+	],
 	/** The caller's linked accounts. */
 	connectionsChanged: (userId: UserId): Sweep[] => [
 		{ key: ConnectionsQueryKeyFactory.list(userId) }
@@ -216,11 +235,8 @@ export const EFFECTS = {
 	],
 	/** The order download sources are tried in. */
 	sourcePriorityChanged: (): Sweep[] => [{ key: DownloadQueryKeyFactory.sourcePriority() }],
-	/** The download policy and its summary. */
-	downloadPolicyChanged: (): Sweep[] => [
-		{ key: DownloadQueryKeyFactory.policy() },
-		{ key: DownloadQueryKeyFactory.policySummary() }
-	],
+	/** The download policy. */
+	downloadPolicyChanged: (): Sweep[] => [{ key: DownloadQueryKeyFactory.policy() }],
 	/** The wanted watcher's settings. */
 	wantedSettingsChanged: (): Sweep[] => [{ key: DownloadQueryKeyFactory.wantedSettings() }],
 	/** Any download, in the caller's views and the admin's. */
@@ -462,6 +478,7 @@ export const albumHeaderChanged = fact('albumHeaderChanged');
 export const appPasswordsChanged = fact('appPasswordsChanged');
 export const appPasswordRosterChanged = fact('appPasswordRosterChanged');
 export const connectAppsSettingsChanged = fact('connectAppsSettingsChanged');
+export const myConnectAppsChanged = fact('myConnectAppsChanged');
 export const connectionsChanged = fact('connectionsChanged');
 export const sourcePlaylistsChanged = fact('sourcePlaylistsChanged');
 export const spotifyPlaylistsChanged = fact('spotifyPlaylistsChanged');
@@ -533,6 +550,7 @@ export const integrationStatusChanged = fact('integrationStatusChanged');
 export const albumCopiesChanged = fact('albumCopiesChanged');
 export const albumCopiesStale = fact('albumCopiesStale');
 export const artistChanged = fact('artistChanged');
+export const artistLinkChanged = fact('artistLinkChanged');
 export const playlistSourcesDropped = fact('playlistSourcesDropped');
 export const discoverRadioChanged = fact('discoverRadioChanged');
 

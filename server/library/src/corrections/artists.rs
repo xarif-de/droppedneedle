@@ -3,7 +3,7 @@
 //! Every reference to a merged artist (album and track credits, album
 //! artists, favorites, ratings, play history, credit proofs, links and
 //! source links) moves to the survivor; the merged rows stay as retired
-//! records with an alias, so old links keep resolving. As in v2, this is
+//! records with an alias, so old links keep resolving. This is
 //! not undoable. Every merge, chosen or automatic, retires a row only
 //! through [`retire_artist`], with the [`MergeBasis`] it rests on.
 
@@ -13,48 +13,25 @@ use rusqlite::types::Value;
 use rusqlite::{OptionalExtension as _, Transaction, params, params_from_iter};
 use serde::Serialize;
 
-use super::edition::placeholders;
 use super::merge_basis::MergeBasis;
 use super::models::{ArtistMergeOutcome, ArtistMergeRequest, CorrectionError, ProviderChoice};
 use super::reasons;
+use super::sql::{self, ReferenceKind};
 use crate::identify::sqlite::retarget_references;
 use droppedneedle_auth::Admin;
+use droppedneedle_kernel::db::statement::ListLen;
 
 const VARIOUS_ARTISTS_ID: &str = "00000000-0000-4000-8000-000000000001";
 const UNKNOWN_ARTIST_ID: &str = "00000000-0000-4000-8000-000000000002";
 
 /// Reference kinds a merge moves, counted for the preview.
-const REFERENCE_COUNTS: [(&str, &str); 6] = [
-    (
-        "album_credits",
-        "SELECT local_artist_id, COUNT(*) FROM local_album_artists \
-         WHERE local_artist_id IN ({}) GROUP BY 1",
-    ),
-    (
-        "track_credits",
-        "SELECT local_artist_id, COUNT(*) FROM local_track_artists \
-         WHERE local_artist_id IN ({}) GROUP BY 1",
-    ),
-    (
-        "primary_albums",
-        "SELECT album_artist_id, COUNT(*) FROM local_albums \
-         WHERE album_artist_id IN ({}) GROUP BY 1",
-    ),
-    (
-        "favorites",
-        "SELECT item_id, COUNT(*) FROM library_user_favorites \
-         WHERE item_kind = 'artist' AND item_id IN ({}) GROUP BY 1",
-    ),
-    (
-        "ratings",
-        "SELECT item_id, COUNT(*) FROM library_user_ratings \
-         WHERE item_kind = 'artist' AND item_id IN ({}) GROUP BY 1",
-    ),
-    (
-        "history",
-        "SELECT local_artist_id, COUNT(*) FROM library_play_history \
-         WHERE local_artist_id IN ({}) GROUP BY 1",
-    ),
+const REFERENCE_KINDS: [(&str, ReferenceKind); 6] = [
+    ("album_credits", ReferenceKind::AlbumCredits),
+    ("track_credits", ReferenceKind::TrackCredits),
+    ("primary_albums", ReferenceKind::PrimaryAlbums),
+    ("favorites", ReferenceKind::Favorites),
+    ("ratings", ReferenceKind::Ratings),
+    ("history", ReferenceKind::History),
 ];
 
 /// A merge as run: what it did and the material its token covers.
@@ -106,8 +83,7 @@ pub(super) fn merge(
     for id in &all {
         let revision: i64 = tx
             .query_row(
-                "SELECT row_revision FROM local_artists WHERE id = ?1 \
-                 AND retired_into_artist_id IS NULL",
+                crate::corrections::sql::LIVE_ARTIST_REVISION.text(),
                 params![id],
                 |row| row.get(0),
             )
@@ -153,24 +129,22 @@ pub(super) fn merge(
     match request.provider_choice {
         ProviderChoice::Detach => {
             tx.execute(
-                "DELETE FROM local_artist_external_identities WHERE local_artist_id = ?1",
+                crate::corrections::sql::DROP_ARTIST_LINKS.text(),
                 params![survivor],
             )?;
         }
         ProviderChoice::RetainSurvivor => {
             if let Some(row) = carried_row.flatten() {
                 tx.execute(
-                    "INSERT INTO local_artist_external_identities (local_artist_id, provider, \
-                     provider_artist_id, decision_source, selected_at) VALUES (?1, 'musicbrainz', \
-                     ?2, ?3, ?4)",
-                    params![survivor, row.0, row.1, now],
+                    crate::corrections::sql::WRITE_MERGED_ARTIST_LINK.text(),
+                    params![survivor, row.0, row.1, crate::clock::ms(now)],
                 )?;
             }
         }
     }
     tx.execute(
-        "UPDATE local_artists SET updated_at = ?2, row_revision = row_revision + 1 WHERE id = ?1",
-        params![survivor, now],
+        crate::corrections::sql::BUMP_ARTIST_REVISION.text(),
+        params![survivor, crate::clock::ms(now)],
     )?;
     let material = serde_json::to_string(&Material {
         kind: "artist_merge",
@@ -195,14 +169,12 @@ pub(super) fn merge(
 
 /// (artist id, MusicBrainz artist id) for the artists that have a link.
 fn identities(tx: &Transaction<'_>, ids: &[String]) -> rusqlite::Result<Vec<(String, String)>> {
-    let marks = placeholders(ids.len());
-    tx.prepare(&format!(
-        "SELECT local_artist_id, provider_artist_id FROM local_artist_external_identities \
-         WHERE provider = 'musicbrainz' AND local_artist_id IN ({marks}) \
-         ORDER BY local_artist_id"
-    ))?
+    tx.prepare(&crate::corrections::sql::artist_links_of(ListLen::new(
+        ids.len(),
+    )))?
     .query_map(params_from_iter(ids.iter()), |row| {
-        Ok((row.get(0)?, row.get(1)?))
+        let row = sql::ArtistLink::read(row)?;
+        Ok((row.local_artist_id, row.provider_artist_id))
     })?
     .collect()
 }
@@ -213,10 +185,12 @@ fn identity_row(
     artist_id: &str,
 ) -> rusqlite::Result<Option<(String, String)>> {
     tx.query_row(
-        "SELECT provider_artist_id, decision_source FROM local_artist_external_identities \
-         WHERE local_artist_id = ?1 AND provider = 'musicbrainz'",
+        crate::corrections::sql::IDENTITY_ROW.text(),
         params![artist_id],
-        |row| Ok((row.get(0)?, row.get(1)?)),
+        |row| {
+            let row = sql::IdentityRow::read(row)?;
+            Ok((row.provider_artist_id, row.decision_source))
+        },
     )
     .optional()
 }
@@ -225,23 +199,24 @@ fn reference_counts(
     tx: &Transaction<'_>,
     ids: &[String],
 ) -> rusqlite::Result<BTreeMap<String, i64>> {
-    let marks = placeholders(ids.len());
     let mut counts = BTreeMap::new();
-    for (kind, query) in REFERENCE_COUNTS {
+    for (label, kind) in REFERENCE_KINDS {
         let mut total = 0;
-        let mut stmt = tx.prepare(&query.replace("{}", &marks))?;
-        let rows = stmt.query_map(params_from_iter(ids.iter()), |row| row.get::<_, i64>(1))?;
+        let mut stmt = tx.prepare(&sql::references_of(kind, ListLen::new(ids.len())))?;
+        let rows = stmt.query_map(params_from_iter(ids.iter()), |row| {
+            Ok(sql::ReferenceCount::read(row)?.count)
+        })?;
         for count in rows {
             total += count?;
         }
-        counts.insert(kind.to_owned(), total);
+        counts.insert(label.to_owned(), total);
     }
     Ok(counts)
 }
 
 /// The reason of an open merge candidate that records a row waiting to
 /// follow its proven credits to another row (`artist_convergence`).
-pub(super) const CREDITS_MOVED: &str = "CREDITS_MOVED_TO_PROVEN_ROW";
+pub(crate) const CREDITS_MOVED: &str = "CREDITS_MOVED_TO_PROVEN_ROW";
 
 /// The reason of an open merge candidate recording that a scan moved a
 /// credit from its left row to its right one by name alone: no id in the
@@ -257,6 +232,10 @@ pub(crate) const MOVED_WITH_ID: &str = "CREDITS_MOVED_WITH_ID";
 /// spacing (`artist_convergence`).
 pub(crate) const MERGED_BY_NAME: &str = "AUTOMATIC_SAME_NAME_CREDITS_MOVED";
 
+/// The audit reason of a v2 "Unknown Artist" row the upgrade merged into
+/// the built-in one (`artist_convergence`).
+pub(crate) const V2_PLACEHOLDER_FOLDED: &str = "AUTOMATIC_V2_PLACEHOLDER_FOLDED";
+
 /// Point every reference of the basis's retiree at its survivor and
 /// retire it, recording in `converged_mbid` what proved the merge. The
 /// only writer of `local_artists.retired_into_artist_id`.
@@ -270,49 +249,19 @@ pub(super) fn retire_artist(
     // A row waiting to follow its credits to `artist`, or whose credits a
     // scan moved to it, follows them on to the survivor; every other open
     // candidate naming `artist` is resolved below.
-    tx.prepare_cached(
-        "UPDATE OR IGNORE local_artist_merge_candidates SET right_artist_id = ?2, \
-         updated_at = ?3, row_revision = row_revision + 1 \
-         WHERE reason_code IN (?4, ?5, ?6) AND state = 'open' AND right_artist_id = ?1 \
-         AND left_artist_id <> ?2",
-    )?
-    .execute(params![
-        artist,
-        survivor,
-        now,
-        CREDITS_MOVED,
-        MOVED_BY_NAME,
-        MOVED_WITH_ID
-    ])?;
+    repoint_merge_candidates(tx, artist, survivor, now)?;
     let moves = [
-        "UPDATE local_album_artists SET local_artist_id = ?2, row_revision = row_revision + 1 \
-         WHERE local_artist_id = ?1",
-        "UPDATE local_track_artists SET local_artist_id = ?2, row_revision = row_revision + 1 \
-         WHERE local_artist_id = ?1",
-        "UPDATE local_albums SET album_artist_id = ?2, updated_at = ?3, \
-         row_revision = row_revision + 1 WHERE album_artist_id = ?1",
-        "DELETE FROM local_entity_source_links WHERE local_artist_id = ?1 AND EXISTS \
-         (SELECT 1 FROM local_entity_source_links kept WHERE kept.local_artist_id = ?2 \
-          AND kept.provider = local_entity_source_links.provider \
-          AND kept.external_entity_type = local_entity_source_links.external_entity_type \
-          AND kept.external_id = local_entity_source_links.external_id)",
-        "UPDATE local_entity_source_links SET local_artist_id = ?2, updated_at = ?3, \
-         row_revision = row_revision + 1 WHERE local_artist_id = ?1",
-        "DELETE FROM local_artist_external_identities WHERE local_artist_id = ?1",
-        "UPDATE local_artists SET retired_into_artist_id = ?2, converged_mbid = ?4, \
-         updated_at = ?3, row_revision = row_revision + 1 WHERE id = ?1",
-        "UPDATE local_artist_aliases SET local_artist_id = ?2 WHERE local_artist_id = ?1",
-        "INSERT OR IGNORE INTO local_artist_aliases (alias, local_artist_id, kind, created_at) \
-         VALUES (?1, ?2, 'merged_artist', ?3)",
-        "UPDATE library_artist_credit_proofs SET \
-         local_artist_id = CASE WHEN local_artist_id = ?1 THEN ?2 ELSE local_artist_id END, \
-         source_local_artist_id = CASE WHEN source_local_artist_id = ?1 THEN ?2 \
-         ELSE source_local_artist_id END, updated_at = CAST(?3 * 1000 AS INTEGER), \
-         row_revision = row_revision + 1 \
-         WHERE local_artist_id = ?1 OR source_local_artist_id = ?1",
-        "UPDATE local_artist_merge_candidates SET state = 'resolved', updated_at = ?3, \
-         row_revision = row_revision + 1 WHERE state = 'open' \
-         AND (left_artist_id = ?1 OR right_artist_id = ?1)",
+        sql::REPOINT_ALBUM_CREDITS,
+        sql::REPOINT_TRACK_CREDITS,
+        sql::REPOINT_ALBUM_ARTIST,
+        sql::DROP_SHARED_SOURCE_LINKS,
+        sql::REPOINT_SOURCE_LINKS,
+        sql::DROP_ARTIST_LINK,
+        sql::RETIRE_ARTIST_ROW,
+        sql::REPOINT_ARTIST_ALIASES,
+        sql::ALIAS_RETIRED_ARTIST,
+        sql::REPOINT_CREDIT_PROOFS,
+        sql::RESOLVE_MERGE_CANDIDATES,
     ];
     // Favorites (with their names), ratings and plays, the same way
     // identify merges move them.
@@ -320,8 +269,8 @@ pub(super) fn retire_artist(
     let mark = basis
         .converged_mark()
         .map_or(Value::Null, |mark| Value::Text(mark.to_owned()));
-    for sql in moves {
-        let mut stmt = tx.prepare(sql)?;
+    for statement in moves {
+        let mut stmt = tx.prepare(statement.text())?;
         let values = [
             Value::Text(artist.to_owned()),
             Value::Text(survivor.to_owned()),
@@ -332,4 +281,53 @@ pub(super) fn retire_artist(
         stmt.execute(params_from_iter(values.into_iter().take(wanted)))?;
     }
     Ok(())
+}
+
+fn repoint_merge_candidates(
+    tx: &Transaction<'_>,
+    artist: &str,
+    survivor: &str,
+    now: f64,
+) -> rusqlite::Result<usize> {
+    tx.prepare_cached(crate::corrections::sql::REPOINT_MERGE_CANDIDATES.text())?
+        .execute(params![
+            artist,
+            survivor,
+            crate::clock::ms(now),
+            CREDITS_MOVED,
+            MOVED_BY_NAME,
+            MOVED_WITH_ID
+        ])
+}
+
+/// Move on what landed on `artist` after it was retired into `survivor`:
+/// favorites, ratings, plays, aliases, candidates and credits under exactly
+/// `name` with no id. Links, source links and any other credit stay on the
+/// retired row, since they may be another artist's. Answers how many rows
+/// moved.
+pub(super) fn retarget_retired(
+    tx: &Transaction<'_>,
+    artist: &str,
+    survivor: &str,
+    name: &str,
+    now: f64,
+) -> rusqlite::Result<u64> {
+    let mut moved = repoint_merge_candidates(tx, artist, survivor, now)? as u64;
+    moved += retarget_references(tx, "artist", artist, survivor)?;
+    moved += tx.execute(
+        sql::REPOINT_ARTIST_ALIASES.text(),
+        params![artist, survivor],
+    )? as u64;
+    moved += tx.execute(
+        sql::RESOLVE_MERGE_CANDIDATES.text(),
+        params![artist, survivor, now],
+    )? as u64;
+    for credits in [sql::RETARGET_ALBUM_CREDITS, sql::RETARGET_TRACK_CREDITS] {
+        moved += tx.execute(credits.text(), params![artist, survivor, name])? as u64;
+    }
+    moved += tx.execute(
+        sql::RETARGET_ALBUM_ARTIST.text(),
+        params![artist, survivor, now, name],
+    )? as u64;
+    Ok(moved)
 }

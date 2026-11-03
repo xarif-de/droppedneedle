@@ -1,13 +1,15 @@
 import { createQuery, skipToken } from '@tanstack/svelte-query';
 
 import { api } from '$lib/api/client';
+import { v3, type V3QueryOf } from '$lib/api/v3/endpoint';
 import type { components } from '$lib/api/v3/openapi';
 import { createAppMutation } from '$lib/queries/effects';
 import { authStore } from '$lib/stores/authStore.svelte';
 
 import { AuthQueryKeyFactory } from './AuthQueryKeyFactory';
-import { AUTH_ENDPOINTS, type AppConnectQuery } from './endpoints';
 
+/** What an app asks for at /connect, as its query. */
+export type AppConnectQuery = V3QueryOf<'/api/v3/auth/app-connect/request'>;
 export type AppConnectRequestView = components['schemas']['AppConnectRequestView'];
 export type ConnectRequest = components['schemas']['ConnectRequest'];
 
@@ -27,16 +29,16 @@ export const getAppConnectRequestQuery = (query: () => AppConnectQuery | null) =
 			refetchOnWindowFocus: false,
 			queryFn: asked
 				? ({ signal }: { signal: AbortSignal }) =>
-						api.v3.GET(AUTH_ENDPOINTS.appConnectRequest(asked), { signal })
+						api.v3.GET(v3('/api/v3/auth/app-connect/request', { query: asked }), { signal })
 				: skipToken
 		};
 	});
 
 /** Allow the app: the answer is the address that hands the code back to it. */
-export function authorizeAppConnect() {
+export function createAuthorizeAppConnectMutation() {
 	return createAppMutation(() => ({
 		mutationFn: (request: ConnectRequest) =>
-			api.v3.POST(AUTH_ENDPOINTS.appConnectAuthorize, request),
+			api.v3.POST(v3('/api/v3/auth/app-connect/authorize'), request),
 		effects: () => []
 	}));
 }

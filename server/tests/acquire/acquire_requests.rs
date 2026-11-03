@@ -12,8 +12,8 @@ use std::sync::{Arc, Mutex};
 use droppedneedle_acquire::requests::mix::{
     MixGrantHooks, MixSources, PersonalMixBuilder, SkipReason,
 };
-use droppedneedle_catalog::reads::collections::db::CollectionsDb;
-use droppedneedle_catalog::reads::collections::store::playlists::PlaylistStore;
+use droppedneedle_catalog::collections::db::CollectionsDb;
+use droppedneedle_catalog::collections::store::playlists::PlaylistStore;
 use droppedneedle_kernel::events::EventHub;
 use droppedneedle_kernel::runtime_config::sections::DownloadPolicy;
 use droppedneedle_kernel::runtime_config::{ConfigStore, Live};
@@ -40,7 +40,7 @@ use droppedneedle_acquire::downloads::{PlannedAlbum, ReplaceVersion};
 use droppedneedle_acquire::follows::ImportArtist;
 use droppedneedle_acquire::requests::{
     self, RequestsState,
-    ledger::{WantedWatch, WatchState},
+    ledger::{WantedWatch, WatchKind, WatchState},
     models::RequestKind,
     quota::{QuotaLedger, QuotaPolicy},
     service::RequestsService,
@@ -314,7 +314,7 @@ fn watch(key: &str, user: &str) -> WantedWatch {
         artist_mbid: None,
         year: None,
         cover_url: None,
-        kind: "missing".to_owned(),
+        kind: WatchKind::Missing,
         state: WatchState::Watching,
         created_at: 1_700_000_000,
         first_release_date: None,
@@ -439,6 +439,15 @@ async fn duplicate_ask_attaches_a_listener() {
     .await;
     assert_eq!(all["count"], 1);
     assert_eq!(all["items"][0]["task_id"], calls[0].id.as_str());
+
+    // The listener reads the download's own state on the shared row, though
+    // the task is the owner's and not in the listener's own task list.
+    let active = "/api/v3/requests/active";
+    let (_, bobs) = call(&state, Method::GET, active, Some(BOB), None).await;
+    assert_eq!(bobs["items"][0]["task_state"], "searching", "{bobs}");
+    dispatch.settle(&calls[0].id, TaskStatus::Downloading).await;
+    let (_, bobs) = call(&state, Method::GET, active, Some(BOB), None).await;
+    assert_eq!(bobs["items"][0]["task_state"], "downloading", "{bobs}");
 }
 
 const REL_1: &str = "44444444-4444-4444-8444-444444444444";
@@ -848,6 +857,80 @@ async fn wanted_view_and_actions() {
 }
 
 // Auto-download approvals: single approve, then a batch reject.
+// Removing a watch takes its seen candidates with it, and an active one goes
+// in one step. Clearing takes only the finished watches the caller can see.
+#[tokio::test]
+async fn wanted_watches_can_be_removed_and_cleared() {
+    const MBID_D: &str = "44444444-4444-4444-8444-444444444444";
+    const MBID_E: &str = "55555555-5555-4555-8555-555555555555";
+    let (state, _db, _dispatch) = setup().await;
+    state.wanted.enrol(watch(MBID_A, "u-ada")).await.unwrap();
+    state
+        .wanted
+        .add_seen(MBID_A, vec![("slskd".into(), "peer".into())], 1_700_000_000)
+        .await
+        .unwrap();
+    let remove = format!("/api/v3/requests/wanted/{MBID_A}");
+    assert_eq!(
+        call(&state, Method::DELETE, &remove, Some(BOB), None)
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    let (status, removed) = call(&state, Method::DELETE, &remove, Some(ADA), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(removed["removed"], 1);
+    assert!(state.wanted.get(MBID_A).await.unwrap().is_none());
+    assert!(state.wanted.seen(MBID_A).await.unwrap().is_empty());
+    assert_eq!(
+        call(&state, Method::DELETE, &remove, Some(ADA), None)
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+
+    for (key, user) in [
+        (MBID_B, "u-ada"),
+        (MBID_C, "u-ada"),
+        (MBID_D, "u-ada"),
+        (MBID_E, "u-bob"),
+    ] {
+        state.wanted.enrol(watch(key, user)).await.unwrap();
+    }
+    for (key, who) in [(MBID_B, ADA), (MBID_E, BOB)] {
+        let stop = format!("/api/v3/requests/wanted/{key}/stop");
+        call(&state, Method::POST, &stop, Some(who), None).await;
+    }
+    state
+        .store
+        .settle_in_library(MBID_C, "in_library", 1_700_000_100)
+        .await
+        .unwrap();
+    let clear = "/api/v3/requests/wanted/clear-finished";
+    let (_, cleared) = call(&state, Method::POST, clear, Some(ADA), None).await;
+    assert_eq!(cleared["removed"], 2, "stopped and fulfilled, own only");
+    let (_, left) = call(
+        &state,
+        Method::GET,
+        "/api/v3/requests/wanted",
+        Some(ADMIN),
+        None,
+    )
+    .await;
+    assert_eq!(keys(&left), vec![MBID_D.to_owned(), MBID_E.to_owned()]);
+    let (_, cleared) = call(&state, Method::POST, clear, Some(ADMIN), None).await;
+    assert_eq!(cleared["removed"], 1, "an admin's covers everyone's");
+    let (_, left) = call(
+        &state,
+        Method::GET,
+        "/api/v3/requests/wanted",
+        Some(ADMIN),
+        None,
+    )
+    .await;
+    assert_eq!(keys(&left), vec![MBID_D.to_owned()], "active stays");
+}
+
 #[tokio::test]
 async fn auto_download_approvals() {
     let (state, _db, _dispatch) = setup().await;
@@ -909,6 +992,17 @@ async fn auto_download_approvals() {
         status.followed && !status.auto_download,
         "a rejected batch keeps the follow and clears its intent"
     );
+
+    // A grant stays listed for an admin until it is revoked.
+    let list = "/api/v3/requests/auto-download-approvals";
+    let (_, listed) = call(&state, Method::GET, list, Some(ADMIN), None).await;
+    assert_eq!(listed["granted"][0]["artist_mbid"], ARTIST, "{listed}");
+    assert_eq!(listed["count"], 0, "a grant is not a pending ask");
+    let revoke = format!("/api/v3/requests/auto-download-approvals/u-ada/{ARTIST}/revoke");
+    let (_, revoked) = call(&state, Method::POST, &revoke, Some(ADMIN), None).await;
+    assert_eq!(revoked["success"], true);
+    let (_, listed) = call(&state, Method::GET, list, Some(ADMIN), None).await;
+    assert_eq!(listed["granted"], json!([]), "{listed}");
 }
 
 /// ListenBrainz stand-in: one weekly-jams playlist with two tracks on two
@@ -1088,6 +1182,9 @@ async fn personal_mix_grant_build_and_refresh() {
     let demoted = builder.build_for_user("u-tris", true).await.unwrap();
     assert_eq!(demoted.requested_albums, 0, "a demotion drops the grant");
 
+    let list = "/api/v3/requests/personal-mix-approvals";
+    let (_, listed) = call(&state, Method::GET, list, Some(ADMIN), None).await;
+    assert_eq!(listed["granted"][0]["user_id"], "u-ada", "{listed}");
     let revoke = "/api/v3/requests/personal-mix-approvals/u-ada/revoke";
     assert_eq!(
         call(&state, Method::POST, revoke, Some(ADMIN), None)
@@ -1095,6 +1192,8 @@ async fn personal_mix_grant_build_and_refresh() {
             .1["success"],
         true
     );
+    let (_, listed) = call(&state, Method::GET, list, Some(ADMIN), None).await;
+    assert_eq!(listed["granted"], json!([]), "{listed}");
     assert!(
         !prefs.prefs("u-ada").await.auto_request_personal_mix,
         "revoke turns the toggle off"
@@ -1142,7 +1241,7 @@ async fn history_pages_and_clears() {
         call(&state, Method::DELETE, &clear, Some(ADA), None)
             .await
             .0,
-        StatusCode::FORBIDDEN
+        StatusCode::NOT_FOUND
     );
     assert_eq!(
         call(&state, Method::DELETE, &clear, Some(BOB), None)
@@ -1508,21 +1607,23 @@ struct PlannedEdition {
     complete: bool,
 }
 
-impl droppedneedle_library::operations::port::EditionPlans for PlannedEdition {
+impl droppedneedle_library::edition::port::EditionPlans for PlannedEdition {
     fn group_plan<'a>(
         &'a self,
         _album_id: Option<&'a str>,
         _release_group_mbid: &'a str,
-    ) -> droppedneedle_library::operations::port::BoxFuture<
+    ) -> droppedneedle_library::edition::port::BoxFuture<
         'a,
         Result<
-            Option<droppedneedle_library::operations::plan::EditionPlan>,
-            droppedneedle_library::operations::models::OperationError,
+            Option<droppedneedle_library::edition::plan::EditionPlan>,
+            droppedneedle_library::jobs::models::OperationError,
         >,
     > {
-        use droppedneedle_library::operations::plan::{
-            EditionFacts, EditionPlan, FileFate, PlanFile, PlanTrack,
-        };
+        use droppedneedle_library::edition::plan::EditionFacts;
+        use droppedneedle_library::edition::plan::EditionPlan;
+        use droppedneedle_library::edition::plan::FileFate;
+        use droppedneedle_library::edition::plan::PlanFile;
+        use droppedneedle_library::edition::plan::PlanTrack;
         let track = |position: u32, file: Option<&str>| PlanTrack {
             disc: 1,
             position,
@@ -1612,6 +1713,117 @@ async fn edition_setup() -> (RequestsState, AcquireDb, Downloads) {
         },
     ));
     (state, db, dispatch)
+}
+
+// With two copies and no chosen release, a fetch with no album named joins
+// the copy the album page shows, on its release: here the newer copy, the
+// only one with files. A shown copy that names no release gives no edition.
+#[tokio::test]
+async fn a_fetch_follows_the_copy_the_album_page_shows() {
+    let (state, db, dispatch) = setup().await;
+    seed_edition_album(&db).await;
+    let group = MBID_A.to_owned();
+    let seed_group = group.clone();
+    db.write("test.seed_copies", move |tx| {
+        tx.execute_batch(&format!(
+            "UPDATE local_albums SET created_at = 5, title = 'Shown', album_artist_name = 'A' WHERE id = 'al1';
+             INSERT INTO local_albums (id, root_id, grouping_key, title, title_folded,
+               album_artist_id, grouping_source, created_at, updated_at)
+               VALUES ('al0', 'r1', 'g0', 'Empty', 'empty', 'ar1', 'automatic', 0, 0);
+             INSERT INTO local_album_external_identities (local_album_id, provider,
+               release_group_mbid, release_mbid, decision_source, selected_at, row_revision)
+               VALUES ('al0', 'musicbrainz', '{seed_group}', 'rel-empty', 'automatic', 0, 1),
+                      ('al1', 'musicbrainz', '{seed_group}', 'rel-shown', 'automatic', 0, 1);"
+        ))?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let page = droppedneedle_catalog::metadata::library::LocalCatalog::new(db.db().clone())
+        .album(&group)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(page.title, "Shown");
+    let edition = droppedneedle_acquire::edition::chosen_edition(db.db(), &group)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(edition.release_mbid, "rel-shown");
+    let uri = format!("/api/v3/albums/{MBID_A}/edition/acquire");
+    let (status, body) = call(&state, Method::POST, &uri, Some(ADMIN), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let planned = dispatch.take_calls().await[0]
+        .planned_album
+        .clone()
+        .expect("a planned copy");
+    assert_eq!(
+        (planned.album_id.as_str(), planned.release_mbid.as_str()),
+        ("al1", "rel-shown")
+    );
+
+    db.write("test.unmanaged", |tx| {
+        tx.execute_batch(
+            "UPDATE local_album_external_identities SET release_mbid = NULL \
+             WHERE local_album_id = 'al1'",
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        droppedneedle_acquire::edition::chosen_edition(db.db(), &group)
+            .await
+            .unwrap(),
+        None,
+        "another copy's release does not stand in"
+    );
+}
+
+// Two copies with files: the newer one a person picked is the one the album
+// page shows and a fetch joins.
+#[tokio::test]
+async fn a_fetch_and_the_album_page_agree_on_a_picked_copy() {
+    let (state, db, dispatch) = setup().await;
+    seed_edition_album(&db).await;
+    let group = MBID_A.to_owned();
+    let seed_group = group.clone();
+    db.write("test.seed_copies", move |tx| {
+        tx.execute_batch(&format!(
+            "UPDATE local_albums SET created_at = 5, title = 'Picked', album_artist_name = 'A'
+               WHERE id = 'al1';
+             INSERT INTO local_albums (id, root_id, grouping_key, title, title_folded,
+               album_artist_id, grouping_source, album_artist_name, created_at, updated_at)
+               VALUES ('al0', 'r1', 'g0', 'Older', 'older', 'ar1', 'automatic', 'A', 0, 0);
+             INSERT INTO local_tracks (id, local_album_id, root_id, file_path, relative_path,
+               path_hash, file_size_bytes, file_mtime_ns, stat_revision, title, title_folded,
+               album_title, album_title_folded, file_format, bit_rate, ingest_source, imported_at,
+               membership_source)
+               VALUES ('t0', 'al0', 'r1', '/m/0.flac', '0.flac', 'h0', 1, 0, 's', 'T', 't', 'T',
+                 't', 'flac', NULL, 'scan', 0, 'automatic');
+             INSERT INTO local_album_external_identities (local_album_id, provider,
+               release_group_mbid, release_mbid, decision_source, selected_at, row_revision)
+               VALUES ('al0', 'musicbrainz', '{seed_group}', 'rel-older', 'automatic', 0, 1),
+                      ('al1', 'musicbrainz', '{seed_group}', 'rel-picked', 'manual', 0, 1);"
+        ))?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let page = droppedneedle_catalog::metadata::library::LocalCatalog::new(db.db().clone())
+        .album(&group)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(page.title, "Picked");
+    let uri = format!("/api/v3/albums/{MBID_A}/edition/acquire");
+    let (status, body) = call(&state, Method::POST, &uri, Some(ADMIN), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let planned = dispatch.take_calls().await[0]
+        .planned_album
+        .clone()
+        .expect("a planned copy");
+    assert_eq!(planned.album_id, "al1");
 }
 
 // "Get missing tracks" sends one album download on the chosen edition for
@@ -1718,21 +1930,21 @@ async fn edition_acquire_asks_once_for_missing_and_below_cutoff_tracks() {
 /// The library's plan, unavailable (MusicBrainz down).
 struct NoPlan;
 
-impl droppedneedle_library::operations::port::EditionPlans for NoPlan {
+impl droppedneedle_library::edition::port::EditionPlans for NoPlan {
     fn group_plan<'a>(
         &'a self,
         _album_id: Option<&'a str>,
         _release_group_mbid: &'a str,
-    ) -> droppedneedle_library::operations::port::BoxFuture<
+    ) -> droppedneedle_library::edition::port::BoxFuture<
         'a,
         Result<
-            Option<droppedneedle_library::operations::plan::EditionPlan>,
-            droppedneedle_library::operations::models::OperationError,
+            Option<droppedneedle_library::edition::plan::EditionPlan>,
+            droppedneedle_library::jobs::models::OperationError,
         >,
     > {
         Box::pin(async {
             Err(
-                droppedneedle_library::operations::models::OperationError::Unavailable(
+                droppedneedle_library::jobs::models::OperationError::Unavailable(
                     "MusicBrainz is down".into(),
                 ),
             )
@@ -1789,7 +2001,7 @@ async fn edition_acquire_is_held_while_no_source_is_ready() {
     state.edition_plans = Some(Arc::new(PlannedEdition { complete: false }));
     let staging = crate::common::ScratchDir::new("edition-held");
     state.readiness = Some(AcquireReadiness {
-        sources: droppedneedle_acquire::readiness::SourceReadiness::unprobed(
+        sources: droppedneedle_acquire::readiness::SourceReadiness::new(
             droppedneedle_acquire::downloads::worker::SourceList::Fixed(Arc::new(Vec::new())),
         ),
         staging_root: staging.to_path_buf(),
@@ -1813,21 +2025,23 @@ struct LibraryPlan {
     db: AcquireDb,
 }
 
-impl droppedneedle_library::operations::port::EditionPlans for LibraryPlan {
+impl droppedneedle_library::edition::port::EditionPlans for LibraryPlan {
     fn group_plan<'a>(
         &'a self,
         _album_id: Option<&'a str>,
         _release_group_mbid: &'a str,
-    ) -> droppedneedle_library::operations::port::BoxFuture<
+    ) -> droppedneedle_library::edition::port::BoxFuture<
         'a,
         Result<
-            Option<droppedneedle_library::operations::plan::EditionPlan>,
-            droppedneedle_library::operations::models::OperationError,
+            Option<droppedneedle_library::edition::plan::EditionPlan>,
+            droppedneedle_library::jobs::models::OperationError,
         >,
     > {
-        use droppedneedle_library::operations::plan::{
-            EditionFacts, EditionPlan, FileFate, PlanFile, PlanTrack,
-        };
+        use droppedneedle_library::edition::plan::EditionFacts;
+        use droppedneedle_library::edition::plan::EditionPlan;
+        use droppedneedle_library::edition::plan::FileFate;
+        use droppedneedle_library::edition::plan::PlanFile;
+        use droppedneedle_library::edition::plan::PlanTrack;
         Box::pin(async move {
             let files: Vec<String> =
                 sqlx::query_scalar("SELECT id FROM local_tracks WHERE local_album_id = 'al1'")
@@ -2068,7 +2282,8 @@ fn ask_to_follow(album: &str, artist: &str, auto_download: bool) -> Value {
 }
 
 // A request that asks to follow its artist follows it in the request's own
-// write: a plain user's auto-download waits for an admin, a repeat ask on a
+// write: one that names no artist is refused, a plain user's auto-download
+// waits for an admin, a repeat ask on a
 // live row follows too, a batch follows each artist, and a request the
 // quota refuses leaves no follow behind.
 #[tokio::test]
@@ -2080,6 +2295,11 @@ async fn a_request_that_asks_to_follow_follows_the_artist() {
     };
     let state = rebuilt(&db, limited, &dispatch);
     let albums = "/api/v3/requests/albums";
+    let no_artist = json!({
+        "musicbrainz_id": MBID_C, "artist": "Artist", "album": "Album", "monitor_artist": true,
+    });
+    let (status, _) = call(&state, Method::POST, albums, Some(ADA), Some(no_artist)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "a follow needs its artist");
     let body = ask_to_follow(MBID_A, ARTIST, true);
     let (status, _) = call(&state, Method::POST, albums, Some(ADA), Some(body)).await;
     assert_eq!(status, StatusCode::ACCEPTED);
@@ -2127,4 +2347,69 @@ async fn a_request_that_asks_to_follow_follows_the_artist() {
         follow.followed && follow.auto_download,
         "a trusted ask arms itself"
     );
+}
+
+// An admin's or a trusted user's Weekly Mix grant never waits for review: a
+// pending ask of theirs (filed before their role changed, or brought over
+// from v2) is not in the admin's list, and startup removes it.
+#[tokio::test]
+async fn a_curators_pending_mix_ask_is_neither_listed_nor_kept() {
+    let (state, _db, _) = setup().await;
+    state
+        .mixes
+        .file_pending("u-tris", 1_700_000_000)
+        .await
+        .unwrap();
+    state
+        .mixes
+        .file_pending("u-ada", 1_700_000_001)
+        .await
+        .unwrap();
+
+    let uri = "/api/v3/requests/personal-mix-approvals";
+    let (_, listed) = call(&state, Method::GET, uri, Some(ADMIN), None).await;
+    let users: Vec<&str> = listed["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["user_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(users, ["u-ada"]);
+
+    let report = RequestsService::new(&state).recover().await.unwrap();
+    assert_eq!(report.mix_asks_cleared, 1);
+    assert_eq!(state.mixes.state("u-tris").await.unwrap(), None);
+    assert_eq!(
+        state.mixes.state("u-ada").await.unwrap(),
+        Some(droppedneedle_acquire::requests::ledger::ApprovalState::Pending)
+    );
+}
+
+// A dispatch whose link loses the row's generation to another linker of the
+// same task (a waiting pass, a recovery) keeps that task: the ask answers as
+// started, the row follows the task, and nothing is cancelled.
+#[tokio::test]
+async fn a_link_won_by_another_linker_of_the_same_task_stands() {
+    let (state, db, dispatch) = setup().await;
+    db.write("test.steal_link", |tx| {
+        tx.execute_batch(
+            "CREATE TRIGGER steal_link AFTER INSERT ON download_tasks BEGIN \
+             UPDATE request_history SET download_task_id = NEW.id, status = 'downloading', \
+             generation = generation + 1 \
+             WHERE musicbrainz_id_lower = lower(NEW.release_group_mbid); END;",
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let (status, body) = ask(&state, TRUSTED, MBID_A).await;
+    assert!(status.is_success(), "{status} {body}");
+    let task = dispatch.task(1).await;
+    assert!(
+        dispatch.take_cancels().await.is_empty(),
+        "nothing is cancelled"
+    );
+    let row = state.store.get(RequestKind::Album, MBID_A).await.unwrap();
+    assert_eq!(row.unwrap().task_id.as_deref(), Some(task.as_str()));
 }

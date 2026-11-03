@@ -4,26 +4,6 @@
  */
 
 export interface paths {
-    "/api/v3/acquire/health": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Acquisition health smoke: whether a download source is on, plus the
-         *     independent per-source release gates.
-         */
-        get: operations["get_health"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/v3/acquire/lidarr-import/artists": {
         parameters: {
             query?: never;
@@ -166,23 +146,6 @@ export interface paths {
          *     app to be enabled and complete.
          */
         get: operations["get_spotify_auth_url"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v3/acquire/spotify/jobs/{id}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Latest known state of one Spotify playlist import. */
-        get: operations["get_spotify_job"];
         put?: never;
         post?: never;
         delete?: never;
@@ -512,8 +475,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Fetch one user. */
-        get: operations["admin_get_user"];
+        get?: never;
         put?: never;
         post?: never;
         /** Delete one user. */
@@ -587,23 +549,6 @@ export interface paths {
         post?: never;
         /** Revoke every session of one user. */
         delete: operations["admin_revoke_sessions"];
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v3/albums/{album_id}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Header, tracklist and artwork in one call. */
-        get: operations["album"];
-        put?: never;
-        post?: never;
-        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -909,6 +854,26 @@ export interface paths {
         };
         /** Last.fm biography, tags and similar artists. */
         get: operations["artist_lastfm"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v3/artists/{artist_mbid}/owned-releases": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The release groups of the artist's discography that the library holds,
+         *     whatever their type.
+         */
+        get: operations["owned_releases"];
         put?: never;
         post?: never;
         delete?: never;
@@ -1777,6 +1742,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v3/discover/queue/ignored/{release_group_mbid}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Take one release off the caller's ignore ledger, so later decks may
+         *     hold it. Answers the same when the caller had not ignored it.
+         */
+        delete: operations["unignore_queue_item"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v3/discover/queue/preview/{release_group_mbid}": {
         parameters: {
             query?: never;
@@ -1828,57 +1813,6 @@ export interface paths {
         put?: never;
         /** The given cards whose albums the library already holds. */
         post: operations["validate_queue"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v3/discover/queue/youtube-cache-check": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** Bulk YouTube cache membership. Unconfigured YouTube answers empty. */
-        post: operations["youtube_cache_check"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v3/discover/queue/youtube-quota": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** YouTube data-API quota state. 404 when YouTube is unconfigured. */
-        get: operations["youtube_quota"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v3/discover/queue/youtube-search": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Album video lookup with the cached flag. */
-        get: operations["youtube_search"];
-        put?: never;
-        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -2036,7 +1970,7 @@ export interface paths {
         };
         /**
          * One track file, unchanged, as an attachment. A single `Range` is
-         *     answered with 206, as v2's file response did, so download managers can
+         *     answered with 206, so download managers can
          *     resume.
          */
         get: operations["download_track"];
@@ -2309,23 +2243,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v3/downloads/tasks/{task_id}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** One download task. `GET /api/v3/downloads/tasks/{task_id}`. */
-        get: operations["get_task_handler"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/v3/downloads/tasks/{task_id}/cancel": {
         parameters: {
             query?: never;
@@ -2341,26 +2258,6 @@ export interface paths {
          *     too. `POST /api/v3/downloads/tasks/{task_id}/cancel`.
          */
         post: operations["cancel_task_handler"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v3/downloads/tasks/{task_id}/files": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * The files of a task's current source.
-         *     `GET /api/v3/downloads/tasks/{task_id}/files`.
-         */
-        get: operations["task_files_handler"];
-        put?: never;
-        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -2486,23 +2383,6 @@ export interface paths {
          *     go to everyone, the rest only to the user they concern.
          */
         get: operations["events_stream"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v3/favorites": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** List the caller's favorites. */
-        get: operations["list_favorites_handler"];
         put?: never;
         post?: never;
         delete?: never;
@@ -2642,23 +2522,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v3/following/new-releases": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** List new-release sightings for followed artists. */
-        get: operations["list_new_releases_handler"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/v3/following/new-releases/recent": {
         parameters: {
             query?: never;
@@ -2764,23 +2627,6 @@ export interface paths {
          *     `POST /api/v3/held/recheck`.
          */
         post: operations["recheck_all_handler"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v3/held/{entry_id}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** One entry with its held files. `GET /api/v3/held/{entry_id}`. */
-        get: operations["get_handler"];
-        put?: never;
-        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -2929,7 +2775,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** One popular-albums page (same range-param redesign). */
+        /** One popular-albums page, with the range param. */
         get: operations["popular_albums"];
         put?: never;
         post?: never;
@@ -2946,10 +2792,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /**
-         * One trending-artists page. Range rides the `range` query param (one
-         *     route replaces the v2 base plus `/{range_key}` pair).
-         */
+        /** One trending-artists page. Range rides the `range` query param. */
         get: operations["trending_artists"];
         put?: never;
         post?: never;
@@ -2966,7 +2809,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** One your-top-albums page for the caller (same redesign, per-user). */
+        /** One your-top-albums page for the caller. */
         get: operations["your_top_albums"];
         put?: never;
         post?: never;
@@ -2988,23 +2831,6 @@ export interface paths {
          *     `GET /api/v3/import/jobs`.
          */
         get: operations["list_jobs_handler"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v3/import/jobs/{job_id}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** One import job. `GET /api/v3/import/jobs/{job_id}`. */
-        get: operations["get_job_handler"];
         put?: never;
         post?: never;
         delete?: never;
@@ -3063,6 +2889,23 @@ export interface paths {
         };
         /** One page of catalog albums. */
         get: operations["list_albums"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v3/library/albums/formats": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** How many albums each primary format has, for the format filter. */
+        get: operations["album_format_counts"];
         put?: never;
         post?: never;
         delete?: never;
@@ -3941,6 +3784,33 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v3/library/artists/{id}/musicbrainz-link": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** An artist's MusicBrainz link: the id, who set it and when. */
+        get: operations["get_artist_link"];
+        /**
+         * Link an artist to a MusicBrainz artist by hand. The app's own linking
+         *     never changes it. Refused when another artist in the library is that
+         *     MusicBrainz artist: an admin merges them instead.
+         */
+        put: operations["set_artist_link"];
+        post?: never;
+        /**
+         * Clear an artist's hand-set link. The app then links the artist again
+         *     where its albums and files prove one. Refused when that would make it
+         *     the same MusicBrainz artist as another in the library.
+         */
+        delete: operations["clear_artist_link"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v3/library/contributions/musicbrainz/callback": {
         parameters: {
             query?: never;
@@ -3952,7 +3822,7 @@ export interface paths {
          * Where the MusicBrainz release editor sends the curator back. Public:
          *     the one-time token identifies the contribution. Every outcome is a 303
          *     to the web app: the contribution page on success, the library page
-         *     with `musicbrainz=callback-error` otherwise (v2's contract).
+         *     with `musicbrainz=callback-error` otherwise.
          */
         get: operations["musicbrainz_callback"];
         put?: never;
@@ -4208,40 +4078,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v3/library/genres": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Full genre listing. */
-        get: operations["list_genres"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v3/library/genres/{name}/tracks": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** One page of a genre's streamable tracks. */
-        get: operations["list_genre_tracks"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/v3/library/identification/pause": {
         parameters: {
             query?: never;
@@ -4308,22 +4144,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v3/library/identity-repairs/{job_id}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get: operations["get_repair"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/v3/library/identity-repairs/{job_id}/apply": {
         parameters: {
             query?: never;
@@ -4350,54 +4170,6 @@ export interface paths {
         get: operations["repair_findings"];
         put?: never;
         post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v3/library/identity-repairs/{job_id}/pause": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post: operations["pause_repair"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v3/library/identity-repairs/{job_id}/resume": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post: operations["resume_repair"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v3/library/identity-repairs/{job_id}/stop": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post: operations["stop_repair"];
         delete?: never;
         options?: never;
         head?: never;
@@ -4568,22 +4340,6 @@ export interface paths {
             cookie?: never;
         };
         get: operations["estimate_preparation"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v3/library/management/identity-preparations/{job_id}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get: operations["get_preparation"];
         put?: never;
         post?: never;
         delete?: never;
@@ -4930,26 +4686,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v3/library/mbids": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Every MusicBrainz release group the library holds, and every album
-         *     with an open request.
-         */
-        get: operations["album_mbids"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/v3/library/membership": {
         parameters: {
             query?: never;
@@ -4961,23 +4697,6 @@ export interface paths {
         put?: never;
         /** Which MusicBrainz album ids the library holds or has requested. */
         post: operations["membership"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v3/library/operations/{job_id}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Get one operation job with its results and candidates. */
-        get: operations["get_operation"];
-        put?: never;
-        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -5180,7 +4899,10 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Mark a retag pair as two different albums. A scan never joins it then. */
+        /**
+         * Mark a retag pair as two different albums. A scan never joins it then,
+         *     until its tracks are back on the old album.
+         */
         post: operations["dismiss_retag_pair"];
         delete?: never;
         options?: never;
@@ -5485,8 +5207,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** List current plus recent scan runs. */
-        get: operations["list_runs"];
+        get?: never;
         put?: never;
         /** Request a scan by kind over chosen roots and path rules. */
         post: operations["request_scan_run"];
@@ -5740,8 +5461,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** One streamable track. */
-        get: operations["get_track"];
+        get?: never;
         put?: never;
         post?: never;
         /**
@@ -5763,23 +5483,6 @@ export interface paths {
         };
         /** Stored lyrics for one track. */
         get: operations["get_lyrics"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v3/library/tracks/{id}/tags": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** The tags in one track's file on disk (admins only). */
-        get: operations["track_tags"];
         put?: never;
         post?: never;
         delete?: never;
@@ -5878,6 +5581,24 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v3/me/connect-apps": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Read your own Connect Apps choices. */
+        get: operations["get_my_connect_apps"];
+        /** Save your own Connect Apps choices. */
+        put: operations["put_my_connect_apps"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v3/me/connections": {
         parameters: {
             query?: never;
@@ -5902,8 +5623,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Per-user Last.fm link status. */
-        get: operations["lastfm_status"];
+        get?: never;
         /** Store the caller's own Last.fm API credentials. */
         put: operations["lastfm_set_credentials"];
         post?: never;
@@ -5955,8 +5675,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Read the caller's ListenBrainz link status. Unlinked reads as missing. */
-        get: operations["listenbrainz_status"];
+        get?: never;
         /**
          * Link the caller's ListenBrainz account. The credential verifies first;
          *     only a verified pair stores.
@@ -6145,7 +5864,11 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Open a playback session for one catalog track. */
+        /**
+         * Open a playback session for one track.
+         * @description A Jellyfin, Navidrome or Plex track is reported on to that server under
+         *     the caller's own linked account, and the answer does not wait for it.
+         */
         post: operations["start_playback"];
         delete?: never;
         options?: never;
@@ -6162,7 +5885,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Close a session, counting the play past threshold. */
+        /** Close a session, counting a library play past threshold. */
         post: operations["stop_playback"];
         delete?: never;
         options?: never;
@@ -6589,23 +6312,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v3/remotes/{source}/albums/{id}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** One album by id. */
-        get: operations["remotes_get_album"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/v3/remotes/{source}/albums/{id}/tracks": {
         parameters: {
             query?: never;
@@ -6666,23 +6372,6 @@ export interface paths {
         };
         /** Full alphabetic artist index. */
         get: operations["remotes_get_artist_index"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v3/remotes/{source}/artists/{id}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** One artist by id. */
-        get: operations["remotes_get_artist"];
         put?: never;
         post?: never;
         delete?: never;
@@ -6975,40 +6664,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v3/remotes/{source}/most-played/albums": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Most-played albums (Jellyfin). */
-        get: operations["remotes_list_most_played_albums"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v3/remotes/{source}/most-played/artists": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Most-played artists (Jellyfin). */
-        get: operations["remotes_list_most_played_artists"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/v3/remotes/{source}/playlists": {
         parameters: {
             query?: never;
@@ -7068,8 +6723,8 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * Random tracks, optionally filtered by genre. Limits mirror the v2
-         *     Navidrome route (default 20, max 50); Plex answers unsupported.
+         * Random tracks, optionally filtered by genre. The default is 20 and the max 50.
+         *     Plex answers unsupported.
          */
         get: operations["remotes_list_random"];
         put?: never;
@@ -7097,23 +6752,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v3/remotes/{source}/recently-added": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Recently added albums. */
-        get: operations["remotes_list_recently_added"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/v3/remotes/{source}/search": {
         parameters: {
             query?: never;
@@ -7123,23 +6761,6 @@ export interface paths {
         };
         /** Unified search across artists, albums, and tracks. */
         get: operations["remotes_search"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v3/remotes/{source}/sessions": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Active audio sessions. */
-        get: operations["remotes_list_sessions"];
         put?: never;
         post?: never;
         delete?: never;
@@ -7774,6 +7395,46 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v3/requests/wanted/clear-finished": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Remove every stopped or fulfilled watch the caller can see.
+         *     `POST /api/v3/requests/wanted/clear-finished`. An admin's covers everyone's.
+         */
+        post: operations["wanted_clear_finished_handler"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v3/requests/wanted/{musicbrainz_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Remove one wanted watch, stopping it first if it is active.
+         *     `DELETE /api/v3/requests/wanted/{musicbrainz_id}`.
+         */
+        delete: operations["wanted_remove_handler"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v3/requests/wanted/{musicbrainz_id}/resume": {
         parameters: {
             query?: never;
@@ -7893,8 +7554,8 @@ export interface paths {
         put?: never;
         /**
          * The single enrich-batch method: one POST enriches a mixed batch of
-         *     artists and albums. v2's duplicate GET form is gone; GET on this path
-         *     is a 405. Provider failures degrade into typed notes, never a 5xx.
+         *     artists and albums. GET on this path is a 405. Provider failures degrade
+         *     into typed notes, never a 5xx.
          */
         post: operations["enrich_batch"];
         delete?: never;
@@ -7912,7 +7573,7 @@ export interface paths {
         };
         /**
          * Merged typeahead across buckets. Queries under two characters return
-         *     an empty 200, kept from v2 so typing never errors.
+         *     an empty 200, so typing never errors.
          */
         get: operations["suggest"];
         put?: never;
@@ -7975,23 +7636,6 @@ export interface paths {
          *     native app sign-in off.
          */
         put: operations["put_app_connect"];
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v3/settings/cache-ttls": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Read the advanced settings the web app reads at start. */
-        get: operations["get_cache_ttls"];
-        put?: never;
         post?: never;
         delete?: never;
         options?: never;
@@ -8066,26 +7710,6 @@ export interface paths {
          *     ignored.
          */
         put: operations["put_policy"];
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v3/settings/download-clients/policy-summary": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Safe policy summary for the settings page: the contract sentence
-         *     plus the source-mode label only.
-         */
-        get: operations["get_policy_summary"];
-        put?: never;
         post?: never;
         delete?: never;
         options?: never;
@@ -8411,6 +8035,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v3/settings/lastfm/verify": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Test the submitted Last.fm key pair (a masked value tests the stored one). */
+        post: operations["verify_lastfm"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v3/settings/library": {
         parameters: {
             query?: never;
@@ -8614,7 +8255,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v3/settings/library-management/profiles": {
+    "/api/v3/settings/library-management/profiles/{profile_id}": {
         parameters: {
             query?: never;
             header?: never;
@@ -8623,25 +8264,6 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Create a profile as a copy of the default profile. */
-        post: operations["create_library_management_profile"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v3/settings/library-management/profiles/{profile_id}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Read one profile. */
-        get: operations["get_library_management_profile"];
-        /** Replace one profile. The body id must match the path id. */
-        put: operations["update_library_management_profile"];
         post?: never;
         /** Delete one custom profile that is neither the default nor assigned. */
         delete: operations["delete_library_management_profile"];
@@ -8716,47 +8338,6 @@ export interface paths {
          */
         post: operations["validate_library_management"];
         delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v3/settings/library/path-mapping": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Dry run: map every catalog file path to a saved root. */
-        get: operations["get_library_path_mapping"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v3/settings/library/paths": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Add one library root path. The path must be a directory on this
-         *     machine; re-adding is a silent no-op.
-         */
-        post: operations["add_library_path"];
-        /**
-         * Remove every library root at one path. Unknown paths are a silent
-         *     no-op; removing the last root while the catalog holds tracks is a 400.
-         */
-        delete: operations["remove_library_path"];
         options?: never;
         head?: never;
         patch?: never;
@@ -8870,24 +8451,6 @@ export interface paths {
         get: operations["get_schedule"];
         /** Save the scan schedule. */
         put: operations["put_schedule"];
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v3/settings/library/sync": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** The legacy catalog-sync section is gone (one-shot import only now). */
-        get: operations["dropped_library_sync"];
-        /** PUT twin of the dropped catalog-sync route: gone, not moved. */
-        put: operations["dropped_library_sync_put"];
         post?: never;
         delete?: never;
         options?: never;
@@ -9223,24 +8786,6 @@ export interface paths {
         get: operations["get_preferences"];
         /** Save the release-type filters. */
         put: operations["put_preferences"];
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v3/settings/primary-source": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Read the primary music source. */
-        get: operations["get_primary_source"];
-        /** Save the primary music source. */
-        put: operations["put_primary_source"];
         post?: never;
         delete?: never;
         options?: never;
@@ -9659,40 +9204,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v3/youtube/quota": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Today's YouTube search budget. A zero budget while search is off. */
-        get: operations["get_youtube_quota"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v3/youtube/track-link/{album_id}/{disc_number}/{track_number}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post?: never;
-        /** Remove one track link. */
-        delete: operations["delete_track_link"];
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/v3/youtube/track-links/{album_id}": {
         parameters: {
             query?: never;
@@ -9748,26 +9259,6 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
-        /**
-         * @description Acquisition health smoke. `ready`
-         *     says whether a download source is on; the gates unpack per source.
-         */
-        AcquireHealth: {
-            /** @description Independent per-source release gates. */
-            gates: components["schemas"]["SourceGate"][];
-            /**
-             * @description True when a download source is on: slskd, SABnzbd or a plugin
-             *     download client. Requests are taken while it is false, and wait.
-             */
-            ready: boolean;
-            /**
-             * @description The sources that are on and answered the last probe: `soulseek`,
-             *     `usenet` or `plugin:<name>`.
-             */
-            ready_via: string[];
-            /** @description Overall verdict: `ok`, `degraded`, or `error`. */
-            status: string;
-        };
         /** @description Mutation outcome for approve/reject/cancel/retry/clear. */
         ActionResponse: {
             /** @description Human outcome. */
@@ -9854,11 +9345,7 @@ export interface components {
             provider_unavailable: boolean;
             /** Format: double */
             started_at: number | null;
-            /**
-             * @description A scan run state, or `running`, `pausing`, `paused`, `idle` or
-             *     `failed` for identification.
-             */
-            state: string;
+            state: components["schemas"]["ActivityState"];
             /** Format: int64 */
             total: number | null;
             /** Format: double */
@@ -9871,6 +9358,11 @@ export interface components {
          * @enum {string}
          */
         ActivityKind: "scan" | "identification";
+        /**
+         * @description What a card's work is doing: a scan run's state, or identification's.
+         * @enum {string}
+         */
+        ActivityState: "queued" | "discovering" | "indexing" | "reconciling" | "running" | "pausing" | "paused" | "stopping" | "idle" | "completed" | "cancelled" | "superseded_policy_changed" | "failed";
         /** @description Add-tracks body. */
         AddTracksBody: {
             /** @description Insert position. Missing appends; past-the-end clamps. */
@@ -10089,6 +9581,14 @@ export interface components {
         /** @description One catalog album with what its own page shows. */
         AlbumDetailView: components["schemas"]["AlbumView"] & {
             management_hold?: null | components["schemas"]["ManagementHoldView"];
+            /** @description The album's pending identification review, if any. */
+            pending_review_id?: string | null;
+            /**
+             * Format: int64
+             * @description The album row's revision, which a change to its grouping and its
+             *     removal echo.
+             */
+            row_revision: number;
         };
         /** @description One edition (MusicBrainz release) of an album. */
         AlbumEditionItem: {
@@ -10170,6 +9670,21 @@ export interface components {
             /** @description Provider release-group id. */
             musicbrainz_id: string;
         };
+        /** @description How many albums one primary format has. */
+        AlbumFormatCount: {
+            /**
+             * Format: int64
+             * @description Listed albums whose most common track format it is.
+             */
+            album_count: number;
+            /** @description Lowercased format, e.g. `flac`. */
+            format: string;
+        };
+        /** @description Every primary format the album list has, for its format filter. */
+        AlbumFormatCounts: {
+            /** @description Formats by descending album count, name tiebreak. */
+            items: components["schemas"]["AlbumFormatCount"][];
+        };
         /**
          * @description Who asked for a join or an undo.
          * @enum {string}
@@ -10203,37 +9718,13 @@ export interface components {
          * @description What one history entry tells.
          * @enum {string}
          */
-        AlbumHistoryKindView: "tracks_continued" | "tracks_replaced" | "retag_joined" | "retag_half_left_alone" | "leftover_joined" | "tracks_other_music" | "tracks_new_copy" | "artist_from_tracks" | "edition_changed" | "edition_chosen" | "edition_change_undone" | "fold_undone" | "unfolded_from" | "hand_back_given_up";
+        AlbumHistoryKindView: "tracks_continued" | "tracks_replaced" | "retag_joined" | "retag_half_left_alone" | "retag_dismissal_ended" | "leftover_joined" | "tracks_other_music" | "tracks_new_copy" | "artist_from_tracks" | "edition_changed" | "edition_chosen" | "match_withdrawn" | "edition_change_undone" | "fold_undone" | "unfolded_from" | "hand_back_given_up";
         /**
          * @description An album's history, newest first: at most ten entries, none older than
          *     180 days.
          */
         AlbumHistoryView: {
             items: components["schemas"]["AlbumHistoryEntryView"][];
-        };
-        /** @description TheAudioDB album images. Every field is optional. */
-        AlbumImages: {
-            /** @description 3D case. */
-            album_3d_case_url?: string | null;
-            /** @description 3D face. */
-            album_3d_face_url?: string | null;
-            /** @description 3D flat. */
-            album_3d_flat_url?: string | null;
-            /** @description 3D thumbnail. */
-            album_3d_thumb_url?: string | null;
-            /** @description Back cover. */
-            album_back_url?: string | null;
-            /** @description CD art. */
-            album_cdart_url?: string | null;
-            /** @description Spine. */
-            album_spine_url?: string | null;
-            /** @description Front thumbnail. */
-            album_thumb_url?: string | null;
-        };
-        /** @description `GET /albums/{album_id}`: header, tracklist and artwork in one call. */
-        AlbumInfo: components["schemas"]["AlbumBasicInfo"] & components["schemas"]["AlbumTracksInfo"] & {
-            /** @description TheAudioDB artwork, fetched and cached by this call. */
-            images: components["schemas"]["AlbumImages"];
         };
         /**
          * @description Album intake body. Names may be omitted only when they resolve; intake
@@ -10413,6 +9904,13 @@ export interface components {
         };
         /** @description One catalog album. */
         AlbumView: {
+            /**
+             * @description True when the server knows the cover routes the web UI would ask
+             *     answer "no art": no art of its own, and no release group, or one whose
+             *     cover is known missing with no other copy's art standing in. False
+             *     means ask.
+             */
+            art_missing: boolean;
             /** @description Local album-artist id. */
             artist_id: string;
             /** @description Linked MusicBrainz artist id, when the artist is identified. */
@@ -10426,13 +9924,23 @@ export interface components {
              *     or `needs_review`.
              */
             contribution_state?: string | null;
-            /** @description True when an artwork row exists for this album. */
+            /**
+             * @description True when the album has art of its own: a folder image or an
+             *     embedded picture.
+             */
             cover_available: boolean;
             /**
              * Format: double
              * @description Import time, unix seconds.
              */
             date_added?: number | null;
+            /**
+             * Format: int64
+             * @description Tracks the album's edition has: the matched MusicBrainz release's
+             *     tracklist while the catalog holds it, else the totals its files'
+             *     tags give. `None` when neither tells.
+             */
+            expected_track_count?: number | null;
             /** @description True when the caller favorited this album. */
             favorite: boolean;
             /** @description Most common track format, when any track exists. */
@@ -10830,14 +10338,17 @@ export interface components {
             description?: string | null;
             /** @description Portrait from Wikidata/Commons. */
             image?: string | null;
-            /** @description Artist images from TheAudioDB, fetched and cached by this call. */
+            /**
+             * @description Artist images from TheAudioDB, as far as they are cached. A miss
+             *     queues a background fetch, so a later call has them.
+             */
             images: components["schemas"]["ArtistImages"];
         };
         /**
          * @description What kind of duplicate group this is.
          * @enum {string}
          */
-        ArtistGroupState: "waiting_for_identity" | "provider_conflict" | "ambiguous_credit_structure" | "same_name_only" | "credits_moved" | "resolved_automatically";
+        ArtistGroupState: "waiting_for_identity" | "provider_conflict" | "ambiguous_credit_structure" | "same_name_only" | "credits_moved" | "shared_provider_identity" | "resolved_automatically";
         /** @description The credit an artist's picture asks for. */
         ArtistImageCredit: {
             credit: null | components["schemas"]["PhotoCredit"];
@@ -10884,8 +10395,8 @@ export interface components {
             /** @description Up to ten aliases. */
             aliases: string[];
             /**
-             * @description True when the artist only appears on the library's tracks (a guest
-             *     or featured credit) without an album of their own.
+             * @description True when the artist appears on a library album led by someone else
+             *     (a guest or featured credit), whatever they lead themselves.
              */
             appears_in_library: boolean;
             /** @description Whether the caller asked for new releases to download on their own. */
@@ -10933,6 +10444,34 @@ export interface components {
             /** @description Artist type (`Person`, `Group`, ...). */
             type?: string | null;
         };
+        /**
+         * @description Who set an artist's link, as the caller may know it.
+         * @enum {string}
+         */
+        ArtistLinkByView: "you" | "person" | "app" | "v2";
+        /**
+         * @description Who decided an artist's link.
+         * @enum {string}
+         */
+        ArtistLinkSourceView: "app" | "person" | "v2";
+        /** @description An artist's MusicBrainz link. */
+        ArtistLinkView: {
+            artist_id: string;
+            /**
+             * Format: int64
+             * @description The revision a change must name.
+             */
+            artist_revision: number;
+            /** @description The linked MusicBrainz artist id; null when there is none. */
+            musicbrainz_artist_id?: string | null;
+            /**
+             * Format: int64
+             * @description When it was set, unix milliseconds; null when there is no link.
+             */
+            selected_at?: number | null;
+            set_by?: null | components["schemas"]["ArtistLinkByView"];
+            source?: null | components["schemas"]["ArtistLinkSourceView"];
+        };
         /** @description A previewed artist merge to apply. */
         ArtistMergeApplyBody: {
             expected_revisions?: {
@@ -10949,7 +10488,7 @@ export interface components {
          * @description What an automatic artist merge rested on.
          * @enum {string}
          */
-        ArtistMergeBasis: "musicbrainz_proof" | "same_name";
+        ArtistMergeBasis: "musicbrainz_proof" | "same_name" | "v2_placeholder";
         /** @description An artist merge to preview. */
         ArtistMergePreviewBody: {
             /**
@@ -11157,6 +10696,12 @@ export interface components {
              *     else.
              */
             appearance_track_count: number;
+            /**
+             * @description True when the server knows the picture route the web UI would ask
+             *     answers "no art": a linked artist's picture is known missing, or an
+             *     unlinked artist has no album art to draw from. False means ask.
+             */
+            art_missing: boolean;
             /** @description Linked MusicBrainz artist id, when identified. */
             artist_mbid?: string | null;
             /**
@@ -11170,6 +10715,12 @@ export interface components {
             id: string;
             /** @description `local_only` or `linked`. */
             identity_state: string;
+            /**
+             * Format: int64
+             * @description Streamable tracks on albums this artist leads, whoever is credited
+             *     on them.
+             */
+            led_track_count: number;
             /** @description Display name. */
             name: string;
             /**
@@ -11280,8 +10831,10 @@ export interface components {
         };
         /** @description Pending-approval list answer. */
         AutoDownloadApprovalListResponse: {
-            /** @description Item count. */
+            /** @description Item count: pending requests only. */
             count: number;
+            /** @description Approvals already granted, which an admin may revoke. */
+            granted: components["schemas"]["AutoDownloadApprovalItem"][];
             /** @description Pending requests. */
             items: components["schemas"]["AutoDownloadApprovalItem"][];
         };
@@ -11420,8 +10973,7 @@ export interface components {
         };
         /** @description Batch-cancel body. Dedupe is by exact string before lookup. */
         BatchCancelBody: {
-            /** @description Request kind; defaults to album. */
-            kind?: string | null;
+            kind?: null | components["schemas"]["RequestKind"];
             /** @description MBIDs to cancel. */
             musicbrainz_ids: string[];
         };
@@ -11470,14 +11022,16 @@ export interface components {
              * @description Rows skipped (duplicates, in-progress, unresolvable).
              */
             skipped: number;
-            /**
-             * @description Batch decision: `pending`, `awaiting_approval`, `already_requested`,
-             *     or `failed`.
-             */
-            status: string;
+            /** @description Batch decision. */
+            status: components["schemas"]["BatchIntakeStatus"];
             /** @description Whether the batch recorded anything. */
             success: boolean;
         };
+        /**
+         * @description What a batch ask did as a whole.
+         * @enum {string}
+         */
+        BatchIntakeStatus: "pending" | "awaiting_approval" | "already_requested" | "failed";
         /** @description One batch row. */
         BatchItem: {
             /** @description Album title. */
@@ -11507,9 +11061,9 @@ export interface components {
             fanart_url?: string | null;
             /**
              * Format: int64
-             * @description Seed listen count backing the pick.
+             * @description Seed listen count backing the pick; null when the provider sent none.
              */
-            listen_count: number;
+            listen_count?: number | null;
             /** @description Similar-albums shelf. */
             section: components["schemas"]["ChartSection"];
             /** @description Seed artist name. */
@@ -12218,6 +11772,11 @@ export interface components {
             account_mode: string;
             /** @description True when a credential is stored and the source is enabled. */
             connected: boolean;
+            /**
+             * @description The configured server address. Set only when the caller's own account
+             *     is linked to that server, so nobody else learns it.
+             */
+            server_url?: string | null;
             /** @description Owning source. */
             source: components["schemas"]["SourceName"];
         };
@@ -12237,12 +11796,12 @@ export interface components {
             expected_row_revision: number;
         };
         /**
-         * @description Where a draft field value came from, v2 `ContributionFieldSource`.
+         * @description Where a draft field value came from. The strings match v2's.
          * @enum {string}
          */
         ContributionFieldSource: "local" | "discogs" | "entered_here";
         /**
-         * @description Follow-up actions the UI may offer, v2 `ContributionNextAction` verbatim.
+         * @description Follow-up actions the UI may offer. The strings match v2's.
          * @enum {string}
          */
         ContributionNextAction: "edit_draft" | "refresh_discogs" | "run_duplicate_check" | "attach_existing" | "seed_musicbrainz" | "retry_verification" | "rebuild" | "cancel";
@@ -12257,38 +11816,38 @@ export interface components {
             /** Format: int64 */
             album_row_revision: number;
             /** Format: double */
-            created_at?: number;
-            created_by_user_id?: string | null;
-            discogs_source?: null | components["schemas"]["DiscogsSourceView"];
+            created_at: number;
+            created_by_user_id: string | null;
+            discogs_source: null | components["schemas"]["DiscogsSourceView"];
             draft: components["schemas"]["ReleaseDraft"];
             /** Format: double */
-            duplicate_checked_at?: number | null;
-            duplicate_result?: null | components["schemas"]["DuplicateCheckResult"];
+            duplicate_checked_at: number | null;
+            duplicate_result: null | components["schemas"]["DuplicateCheckResult"];
             id: string;
-            input_is_current?: boolean;
+            input_is_current: boolean;
             input_revision: string;
             local_album_id: string;
             local_snapshot: components["schemas"]["LocalReleaseSnapshot"];
-            next_actions?: components["schemas"]["ContributionNextAction"][];
+            next_actions: components["schemas"]["ContributionNextAction"][];
             /** Format: double */
-            provider_snapshot_expires_at?: number | null;
+            provider_snapshot_expires_at: number | null;
             /** Format: double */
-            result_received_at?: number | null;
-            result_release_mbid?: string | null;
-            result_source?: string | null;
-            review_reason?: null | components["schemas"]["ContributionReason"];
+            result_received_at: number | null;
+            result_release_mbid: string | null;
+            result_source: string | null;
+            review_reason: null | components["schemas"]["ContributionReason"];
             /** Format: int64 */
             row_revision: number;
             /** Format: double */
-            seeded_at?: number | null;
+            seeded_at: number | null;
             source_selection: components["schemas"]["ContributionSourceSelection"];
             state: components["schemas"]["ContributionState"];
             /** Format: double */
-            terminal_at?: number | null;
+            terminal_at: number | null;
             /** Format: double */
-            updated_at?: number;
-            updated_by_user_id?: string | null;
-            validation?: components["schemas"]["ContributionValidationIssue"][];
+            updated_at: number;
+            updated_by_user_id: string | null;
+            validation: components["schemas"]["ContributionValidationIssue"][];
         };
         /** @description A revision guard alone (rebuild, cancel, remove Discogs, seed, verify). */
         ContributionRevisionBody: {
@@ -12299,13 +11858,13 @@ export interface components {
             expected_row_revision: number;
         };
         ContributionSourceSelection: {
-            alignments?: components["schemas"]["TrackAlignment"][];
+            alignments: components["schemas"]["TrackAlignment"][];
             /** Format: int32 */
-            schema_version?: number;
-            sources?: components["schemas"]["SourceReference"][];
+            schema_version: number;
+            sources: components["schemas"]["SourceReference"][];
         };
         /**
-         * @description Contribution lifecycle states, v2 `ContributionState` verbatim.
+         * @description Contribution lifecycle states. The strings match v2's.
          * @enum {string}
          */
         ContributionState: "draft" | "ready" | "seeded" | "verifying" | "linked" | "needs_review" | "stale" | "cancelled";
@@ -12513,56 +12072,56 @@ export interface components {
             token: string;
         };
         DiscogsArtistCredit: {
-            artist_id?: string | null;
-            canonical_url?: string | null;
-            credited_name?: string | null;
-            join_phrase?: string;
-            name?: string;
+            artist_id: string | null;
+            canonical_url: string | null;
+            credited_name: string | null;
+            join_phrase: string;
+            name: string;
         };
         DiscogsFormat: {
-            descriptions?: string[];
-            name?: string;
+            descriptions: string[];
+            name: string;
             /** Format: int64 */
-            quantity?: number | null;
-            text?: string | null;
+            quantity: number | null;
+            text: string | null;
         };
         DiscogsIdentifier: {
-            description?: string | null;
-            type?: string;
-            value?: string;
+            description: string | null;
+            type: string;
+            value: string;
         };
         DiscogsLabel: {
-            canonical_url?: string | null;
-            catalogue_number?: string | null;
-            label_id?: string | null;
-            name?: string;
+            canonical_url: string | null;
+            catalogue_number: string | null;
+            label_id: string | null;
+            name: string;
         };
         DiscogsMedium: {
-            format?: string | null;
+            format: string | null;
             /** Format: int64 */
             position: number;
-            title?: string | null;
-            tracks?: components["schemas"]["DiscogsTrack"][];
+            title: string | null;
+            tracks: components["schemas"]["DiscogsTrack"][];
         };
         DiscogsRelease: {
-            artist_name?: string;
-            artists?: components["schemas"]["DiscogsArtistCredit"][];
-            barcode?: string | null;
-            canonical_master_url?: string | null;
-            canonical_release_url?: string;
-            country?: string | null;
-            formats?: components["schemas"]["DiscogsFormat"][];
-            identifiers?: components["schemas"]["DiscogsIdentifier"][];
-            labels?: components["schemas"]["DiscogsLabel"][];
-            master_id?: string | null;
-            media?: components["schemas"]["DiscogsMedium"][];
-            release_id?: string;
-            released_date?: string | null;
+            artist_name: string;
+            artists: components["schemas"]["DiscogsArtistCredit"][];
+            barcode: string | null;
+            canonical_master_url: string | null;
+            canonical_release_url: string;
+            country: string | null;
+            formats: components["schemas"]["DiscogsFormat"][];
+            identifiers: components["schemas"]["DiscogsIdentifier"][];
+            labels: components["schemas"]["DiscogsLabel"][];
+            master_id: string | null;
+            media: components["schemas"]["DiscogsMedium"][];
+            release_id: string;
+            released_date: string | null;
             /** Format: double */
-            source_fetched_at?: number;
-            title?: string;
+            source_fetched_at: number;
+            title: string;
             /** Format: int32 */
-            year?: number | null;
+            year: number | null;
         };
         DiscogsReleaseCandidate: {
             artist_name?: string;
@@ -12602,20 +12161,20 @@ export interface components {
             release_id_or_url: string;
         };
         DiscogsSourceView: {
-            expired?: boolean;
+            expired: boolean;
             /** Format: double */
-            expires_at?: number | null;
-            release?: null | components["schemas"]["DiscogsRelease"];
+            expires_at: number | null;
+            release: null | components["schemas"]["DiscogsRelease"];
         };
         DiscogsTrack: {
-            artists?: components["schemas"]["DiscogsArtistCredit"][];
+            artists: components["schemas"]["DiscogsArtistCredit"][];
             /** Format: double */
-            duration_seconds?: number | null;
-            heading?: boolean;
+            duration_seconds: number | null;
+            heading: boolean;
             /** Format: int64 */
-            number?: number | null;
-            source_position?: string | null;
-            title?: string;
+            number: number | null;
+            source_position: string | null;
+            title: string;
         };
         /** @description Body recording one discover interaction for personalization. */
         DiscoverActivityRequest: {
@@ -12812,6 +12371,13 @@ export interface components {
              * @description Albums removed with the batch.
              */
             removed_albums?: number;
+            /**
+             * Format: int64
+             * @description Albums left in the batch because no recycle bin is known yet.
+             */
+            waiting?: number;
+            /** @description Why those albums wait, when any do. */
+            waiting_reason?: string | null;
         };
         /** @description A batch without its album outcomes. */
         DiscoveryBatchSummary: {
@@ -12847,7 +12413,7 @@ export interface components {
         DiscoveryHubView: {
             /** @description Albums on this shelf. */
             albums: components["schemas"]["RemotesAlbumView"][];
-            /** @description Hub kind; always `"album"` (other hub kinds are dropped, as in v2). */
+            /** @description Hub kind; always `"album"`. Other hub kinds are dropped. */
             hub_type: string;
             /** @description Hub title, e.g. "Recommended for you". */
             title: string;
@@ -12865,13 +12431,6 @@ export interface components {
             state: string;
             success: boolean;
         };
-        /**
-         * @description What started a download. Stored as the task's `origin`; origins decide
-         *     quota exemptions and how a landing treats the files, never routing.
-         *     A request row stores it too, and the Requests page shows it.
-         * @enum {string}
-         */
-        DispatchOrigin: "user" | "approval" | "retry" | "wanted" | "upgrade" | "edition" | "follow";
         /** @description Change display name. */
         DisplayNameUpdate: {
             /** @description New display name, 1-64 chars after trimming. */
@@ -12903,34 +12462,6 @@ export interface components {
              */
             revision: number;
         };
-        /** @description One file of a task's current source. */
-        DownloadFileItem: {
-            /**
-             * Format: double
-             * @description Always empty: sources do not advertise durations.
-             */
-            duration?: number | null;
-            filename: string;
-            /**
-             * Format: int64
-             * @description Advertised size in bytes, when the source gave one.
-             */
-            size?: number | null;
-        };
-        /** @description A task's files and counts. */
-        DownloadFilesResponse: {
-            files: components["schemas"]["DownloadFileItem"][];
-            /** Format: int64 */
-            files_completed: number;
-            /** Format: int64 */
-            files_failed: number;
-            /** Format: int64 */
-            files_total: number;
-            /** Format: int64 */
-            progress_percent: number;
-            status: components["schemas"]["TaskStatus"];
-            task_id: string;
-        };
         /** @description One page of the queue. */
         DownloadListResponse: {
             items: components["schemas"]["DownloadTaskResponse"][];
@@ -12941,7 +12472,7 @@ export interface components {
         };
         /**
          * @description Download policy: quality tiers, recipe v2, timeouts, retry, retention,
-         *     recycle bin, quotas, and the upgrade scan.
+         *     quotas, and the upgrade scan.
          */
         DownloadPolicy: {
             /**
@@ -13083,17 +12614,6 @@ export interface components {
              */
             quality_recipe: components["schemas"]["QualityRecipeEntry"][];
             /**
-             * @description Recycle-bin path ("" disables).
-             * @default
-             */
-            recycle_bin_path: string;
-            /**
-             * Format: int64
-             * @description Recycle retention in days.
-             * @default 30
-             */
-            recycle_retention_days: number;
-            /**
              * @description Terms a candidate must carry.
              * @default []
              */
@@ -13124,13 +12644,8 @@ export interface components {
         DownloadPolicyView: components["schemas"]["DownloadPolicy"] & {
             /** @description Recipe verdict detail, when any. */
             quality_recipe_error?: string | null;
-            /** @description Read-only recipe verdict: `v1`, `v2`, `non_convertible`, `invalid`. */
-            quality_recipe_status: string;
-            /**
-             * @description Why the recycle bin path is not used, when it is not: each library
-             *     folder's `.recycle` takes its place. Read-only.
-             */
-            recycle_bin_warning?: string | null;
+            /** @description Read-only recipe verdict. */
+            quality_recipe_status: components["schemas"]["QualityRecipeStatus"];
         };
         /**
          * @description `download_progress`: the worker polled one of the user's live
@@ -13350,11 +12865,7 @@ export interface components {
             ok: boolean;
             /** @description The mount path inside DroppedNeedle's container. */
             path: string;
-            /**
-             * @description `ok`, `not_set`, `missing`, `not_writable`, `different_mount`,
-             *     `different_filesystem`, or `stat_error`.
-             */
-            reason: string;
+            reason: components["schemas"]["MountReason"];
         };
         /**
          * @description One album-shaped folder of an upload. Staged paths never leave the
@@ -13376,11 +12887,7 @@ export interface components {
             reason_action?: string | null;
             reason_code?: null | components["schemas"]["Reason"];
             release_group_mbid?: string | null;
-            /**
-             * @description `processing`, `imported`, `skipped`, `needs_review`, `failed` or
-             *     `discarded`.
-             */
-            status: string;
+            status: components["schemas"]["DropItemStatus"];
             /** Format: double */
             updated_at: number;
         };
@@ -13392,8 +12899,7 @@ export interface components {
             error?: string | null;
             id: string;
             items: components["schemas"]["DropImportItemResponse"][];
-            /** @description `processing`, `completed` or `failed`. */
-            status: string;
+            status: components["schemas"]["DropJobStatus"];
             upload_name: string;
             user_id: string;
             user_name: string;
@@ -13409,18 +12915,30 @@ export interface components {
             /** @description The job that moved. */
             job_id: string;
         };
+        /**
+         * @description Item lifecycle. The `drop_import_items.status` CHECK lists exactly these
+         *     values.
+         * @enum {string}
+         */
+        DropItemStatus: "processing" | "imported" | "skipped" | "needs_review" | "failed" | "discarded";
+        /**
+         * @description Job lifecycle. The `drop_import_jobs.status` CHECK lists exactly these
+         *     values.
+         * @enum {string}
+         */
+        DropJobStatus: "processing" | "completed" | "failed";
         /** @description The upload form: one or more `files` parts (audio or `.zip`). */
         DropUploadForm: {
             files: string[];
         };
         DuplicateCandidate: {
-            artist_name?: string;
-            differences?: string[];
+            artist_name: string;
+            differences: string[];
             evidence_kind: components["schemas"]["DuplicateEvidenceKind"];
-            exact?: boolean;
-            release_group_mbid?: string | null;
-            release_mbid?: string | null;
-            title?: string;
+            exact: boolean;
+            release_group_mbid: string | null;
+            release_mbid: string | null;
+            title: string;
         };
         /** @description Run the MusicBrainz duplicate check. */
         DuplicateCheckBody: {
@@ -13433,17 +12951,17 @@ export interface components {
             expected_row_revision: number;
         };
         DuplicateCheckResult: {
-            candidates?: components["schemas"]["DuplicateCandidate"][];
+            candidates: components["schemas"]["DuplicateCandidate"][];
             /** Format: double */
-            checked_at?: number;
-            different_edition_confirmed?: boolean;
-            input_revision?: string;
+            checked_at: number;
+            different_edition_confirmed: boolean;
+            input_revision: string;
             /** Format: int32 */
-            schema_version?: number;
+            schema_version: number;
         };
         /**
-         * @description Duplicate evidence kinds, ordered weakest-last (v2 sort key
-         *     exact_discogs_url < release_group < barcode < similar).
+         * @description Duplicate evidence kinds, ordered weakest-last:
+         *     exact_discogs_url < release_group < barcode < similar.
          * @enum {string}
          */
         DuplicateEvidenceKind: "exact_discogs_url" | "release_group" | "barcode" | "similar";
@@ -13459,8 +12977,7 @@ export interface components {
              *     is another version of.
              */
             requested?: number | null;
-            /** @description `started`, `already_in_progress`, or `already_complete`. */
-            status: string;
+            status: components["schemas"]["EditionAcquireStatus"];
             /** @description Linked download task, when dispatched. */
             task_id?: string | null;
             /**
@@ -13483,6 +13000,11 @@ export interface components {
              */
             versions?: number | null;
         };
+        /**
+         * @description What an edition acquire did.
+         * @enum {string}
+         */
+        EditionAcquireStatus: "started" | "already_in_progress" | "already_complete";
         /** @description One candidate the matcher scored, as the edition picker shows it. */
         EditionCandidateView: {
             album_artist_name: string;
@@ -14175,7 +13697,7 @@ export interface components {
          */
         EventsSweepScope: "followed" | "library";
         /**
-         * @description Per-track verdict against one candidate, ported from v2.
+         * @description Per-track verdict against one candidate.
          * @enum {string}
          */
         EvidenceClass: "supported" | "unknown" | "contradictory";
@@ -14240,37 +13762,7 @@ export interface components {
          *     could not read.
          * @enum {string}
          */
-        FailureCode: "ROOT_UNAVAILABLE" | "ROOT_PERMISSION_DENIED" | "WALK_TIMEOUT" | "WALKER_UNAVAILABLE" | "PROBE_UNAVAILABLE" | "WALK_SUPERSEDED" | "WALK_ERROR" | "WALK_EPERM" | "WALK_ENOENT" | "WALK_EIO" | "WALK_EACCES" | "WALK_ENOTDIR" | "WALK_EISDIR" | "WALK_EINVAL" | "WALK_ENFILE" | "WALK_EMFILE" | "WALK_ENOSPC" | "WALK_EROFS" | "WALK_ENAMETOOLONG" | "WALK_ELOOP" | "WALK_EUNKNOWN" | "SYMLINK_ESCAPE_OUT" | "NON_REGULAR_FILE" | "WALK_NAME_ENCODING" | "NFC_TWIN_COLLISION" | "TAG_READ_DEFERRED" | "TAG_READ_FAILED" | "MTIME_SKEW" | "SUPERSEDED_POLICY_CHANGED" | "UNEXPECTED_WORKER_FAILURE" | "MASS_MISSING_GUARD" | "CATALOG_COMMIT_FAILED" | "RUN_END_PENDING";
-        /** @description Per-kind counts. */
-        FavoriteCounts: {
-            /** @description Favorited albums. */
-            album: number;
-            /** @description Favorited artists. */
-            artist: number;
-            /** @description Favorited tracks. */
-            track: number;
-        };
-        /** @description One favorite row. */
-        FavoriteItem: {
-            /**
-             * Format: int64
-             * @description When it was favorited, epoch seconds.
-             */
-            favorited_at: number;
-            /** @description Favorited item id. */
-            item_id: string;
-            /** @description Favorited kind: album, artist, or track. */
-            kind: string;
-            /** @description Display name, when the caller sent one. */
-            name?: string | null;
-        };
-        /** @description Favorite-list answer. */
-        FavoriteListResponse: {
-            /** @description Counts across all kinds, ignoring the filter. */
-            counts: components["schemas"]["FavoriteCounts"];
-            /** @description Favorites, optionally filtered by kind. */
-            items: components["schemas"]["FavoriteItem"][];
-        };
+        FailureCode: "ROOT_UNAVAILABLE" | "ROOT_PERMISSION_DENIED" | "WALK_TIMEOUT" | "WALKER_UNAVAILABLE" | "PROBE_UNAVAILABLE" | "WALK_SUPERSEDED" | "WALK_ERROR" | "WALK_EPERM" | "WALK_ENOENT" | "WALK_EIO" | "WALK_EACCES" | "WALK_ENOTDIR" | "WALK_EISDIR" | "WALK_EINVAL" | "WALK_ENFILE" | "WALK_EMFILE" | "WALK_ENOSPC" | "WALK_EROFS" | "WALK_ENAMETOOLONG" | "WALK_ELOOP" | "WALK_EUNKNOWN" | "SYMLINK_ESCAPE_OUT" | "NON_REGULAR_FILE" | "WALK_NAME_ENCODING" | "NFC_TWIN_COLLISION" | "TAG_READ_DEFERRED" | "TAG_READ_FAILED" | "MTIME_SKEW" | "SUPERSEDED_POLICY_CHANGED" | "UNEXPECTED_WORKER_FAILURE" | "MASS_MISSING_GUARD" | "CATALOG_COMMIT_FAILED" | "SCOPE_THROUGH_LINK" | "SCOPE_RENAMED";
         /** @description Favorite-status answer. */
         FavoriteStatusResponse: {
             /** @description Current state. */
@@ -14436,17 +13928,6 @@ export interface components {
             /** @description Followed artists. */
             artists: components["schemas"]["FollowedArtist"][];
         };
-        /**
-         * @description The advanced settings the web app reads at start. The browser's cache
-         *     lifetimes and the queue's polling interval are fixed in the web app.
-         */
-        FrontendCacheTTLs: {
-            /**
-             * @description Discover-queue auto-generate switch.
-             * @default true
-             */
-            discover_queue_auto_generate: boolean;
-        };
         /** @description One genre alias. */
         GenreAlias: {
             /**
@@ -14513,11 +13994,6 @@ export interface components {
             artist_count: number;
             /** @description Owned artists. */
             artists: components["schemas"]["ArtistRef"][];
-        };
-        /** @description Full genre listing. Catalogs hold dozens of genres, so no paging. */
-        GenreList: {
-            /** @description Genres by descending track count, name tiebreak. */
-            items: components["schemas"]["GenreView"][];
         };
         /** @description Genre management block. */
         GenreManagementSettings: {
@@ -14639,21 +14115,6 @@ export interface components {
          * @enum {string}
          */
         GenreSource: "musicbrainz" | "listenbrainz" | "lastfm" | "existing_local";
-        /** @description One genre with streamable-only counts. */
-        GenreView: {
-            /**
-             * Format: int64
-             * @description Albums holding at least one such track.
-             */
-            album_count: number;
-            /** @description Genre display name, representative casing. */
-            name: string;
-            /**
-             * Format: int64
-             * @description Streamable tracks carrying this tag.
-             */
-            track_count: number;
-        };
         /** @description Store-region settings. */
         GetIt: {
             /**
@@ -15154,7 +14615,7 @@ export interface components {
             /** @description Canonical MBID. */
             musicbrainz_id: string;
             /** @description Row status after this call. */
-            status: string;
+            status: components["schemas"]["RequestStatus"];
             /** @description Whether the ask was recorded. */
             success: boolean;
             /** @description Linked download task, when dispatched. */
@@ -15271,14 +14732,14 @@ export interface components {
         LastFmAlbumEnrichment: {
             /**
              * Format: int64
-             * @description Listener count.
+             * @description Listener count; null when Last.fm sent none.
              */
-            listeners: number;
+            listeners?: number | null;
             /**
              * Format: int64
-             * @description Play count.
+             * @description Play count; null when Last.fm sent none.
              */
-            playcount: number;
+            playcount?: number | null;
             /** @description Wiki summary, HTML stripped. */
             summary?: string | null;
             /** @description Tags. */
@@ -15295,14 +14756,14 @@ export interface components {
             bio?: string | null;
             /**
              * Format: int64
-             * @description Listener count.
+             * @description Listener count; null when Last.fm sent none.
              */
-            listeners: number;
+            listeners?: number | null;
             /**
              * Format: int64
-             * @description Play count.
+             * @description Play count; null when Last.fm sent none.
              */
-            playcount: number;
+            playcount?: number | null;
             /** @description Similar artists. */
             similar_artists: components["schemas"]["LastFmSimilarArtist"][];
             /** @description Short summary, HTML stripped. */
@@ -15376,15 +14837,6 @@ export interface components {
             name: string;
             /** @description Last.fm page. */
             url?: string | null;
-        };
-        /** @description Per-user Last.fm link status. Never carries secrets. */
-        LastFmStatusResponse: {
-            /** @description Whether API credentials are stored. */
-            configured: boolean;
-            /** @description Whether a session is linked. */
-            linked: boolean;
-            /** @description Linked Last.fm username, when linked. */
-            username?: string | null;
         };
         /** @description A Last.fm tag. */
         LastFmTag: {
@@ -15690,15 +15142,6 @@ export interface components {
             /** @description Name for the copy. */
             name: string;
         };
-        /** @description Create-profile request (clones the default profile). */
-        LibraryManagementProfileCreateRequest: {
-            /** @description Description for the new profile. */
-            description?: string;
-            /** @description Compare-and-swap token from the last GET. */
-            expected_settings_revision: string;
-            /** @description Name for the new profile. */
-            name: string;
-        };
         /** @description Delete-profile request. */
         LibraryManagementProfileDeleteRequest: {
             /** @description Compare-and-swap token from the last GET. */
@@ -15724,7 +15167,7 @@ export interface components {
             mime_type: string;
             /** @description Settings revision at export time. */
             settings_revision: string;
-            /** @description Share code (`DNLP1:...`). */
+            /** @description Share code (`DNLP2:...`). */
             share_code: string;
         };
         /** @description Import-preview request (accepts a document or a share code). */
@@ -15794,13 +15237,6 @@ export interface components {
             profile: components["schemas"]["LibraryManagementProfile"];
             /** @description Fresh settings revision. */
             settings_revision: string;
-        };
-        /** @description Update-profile request. */
-        LibraryManagementProfileUpdateRequest: {
-            /** @description Compare-and-swap token from the last GET. */
-            expected_settings_revision: string;
-            /** @description Full replacement profile (id must match the path). */
-            profile: components["schemas"]["LibraryManagementProfile"];
         };
         /** @description One root-to-profile assignment. */
         LibraryManagementRootAssignment: {
@@ -15979,6 +15415,19 @@ export interface components {
              */
             profiles: components["schemas"]["LibraryManagementProfile"][];
             /**
+             * @description The recycle bin folder removed and replaced files go to ("" uses
+             *     each library folder's own `.recycle`).
+             * @default
+             */
+            recycle_bin_path: string;
+            /**
+             * Format: int64
+             * @description Days a copy stays in the recycle bin, from 1 to 3650. A stored value
+             *     outside that does not decode: expiry deletes on it, so it waits.
+             * @default 30
+             */
+            recycle_retention_days: number;
+            /**
              * @description Root assignments.
              * @default []
              */
@@ -16018,19 +15467,20 @@ export interface components {
              *     the genre row last.
              */
             managed_fields: components["schemas"]["ManagedFieldInfo"][];
+            /**
+             * @description Why the recycle bin path is not used, when it is not: each library
+             *     folder's `.recycle` takes its place, or files wait for a folder
+             *     that can't be reached. Set on the settings read and save only.
+             */
+            recycle_bin_warning?: string | null;
             /** @description Settings content revision. */
             settings_revision: string;
-        };
-        /**
-         * @description Every MusicBrainz release group the library holds and every album with
-         *     an open request (v2 `/library/mbids`). Both lists are lowercase and
-         *     sorted.
-         */
-        LibraryMbids: {
-            /** @description Release groups held with at least one streamable track. */
-            mbids: string[];
-            /** @description Album ids with an open acquisition request. */
-            requested_mbids: string[];
+            /**
+             * @description The stored settings cannot be read, so these are the seeded ones
+             *     and a save replaces the row. Removals, upgrades and automatic work
+             *     wait until then.
+             */
+            settings_unreadable?: boolean;
         };
         /**
          * @description Which of these MusicBrainz album ids the library holds or has an open
@@ -16046,54 +15496,6 @@ export interface components {
             owned_ids: string[];
             /** @description Asked ids with an open acquisition request. */
             requested_ids: string[];
-        };
-        /** @description One catalog path and the root it maps to under the saved settings. */
-        LibraryPathMappingItem: {
-            /** @description Absolute file path the catalog holds. */
-            absolute_path: string;
-            error?: null | components["schemas"]["PathMappingError"];
-            /** @description Path relative to that root, when it maps. */
-            relative_path?: string | null;
-            /** @description Root the path maps to, when it maps. */
-            root_id?: string | null;
-            /** @description Track id. */
-            source_id: string;
-            /** @description Source kind. */
-            source_kind: components["schemas"]["PathMappingSource"];
-        };
-        /** @description Dry run: does every catalog path map to exactly one saved root. */
-        LibraryPathMappingReport: {
-            /**
-             * Format: int64
-             * @description Paths under more than one root.
-             */
-            ambiguous_count: number;
-            /** @description Some path does not map. */
-            blocking: boolean;
-            /** @description Every checked path, ordered by track id. */
-            items: components["schemas"]["LibraryPathMappingItem"][];
-            /**
-             * Format: int64
-             * @description Paths that map to one root.
-             */
-            mapped_count: number;
-            /**
-             * Format: int64
-             * @description Paths under no root.
-             */
-            out_of_root_count: number;
-            /** @description Saved revision the report was built from. */
-            policy_revision: string;
-            /**
-             * Format: int64
-             * @description Paths checked.
-             */
-            source_count: number;
-        };
-        /** @description Add-one-library-path body. */
-        LibraryPathRequest: {
-            /** @description Directory to add as a library root. */
-            path: string;
         };
         /** @description One path-policy rule inside a root. */
         LibraryPathRule: {
@@ -16511,8 +15913,8 @@ export interface components {
             username: string;
         };
         /**
-         * @description A listening-data service: the primary source setting, and the one the
-         *     discover shelves, charts, radio and enrichment answers name.
+         * @description A listening-data service: the one the discover shelves, charts, radio and
+         *     enrichment answers name.
          * @enum {string}
          */
         ListenSource: "listenbrainz" | "lastfm";
@@ -16535,26 +15937,26 @@ export interface components {
             new_password: string;
         };
         LocalReleaseSnapshot: {
-            album_artist_name?: string;
+            album_artist_name: string;
             /** Format: int64 */
-            album_row_revision?: number;
-            artist_kind?: string;
+            album_row_revision: number;
+            artist_kind: string;
             /** Format: double */
-            captured_at?: number;
-            input_revision?: string;
-            is_compilation?: boolean;
-            local_album_id?: string;
-            local_artist_id?: string;
-            media?: components["schemas"]["ReleaseMediumSnapshot"][];
-            musicbrainz_artist_id?: string | null;
-            musicbrainz_release_group_id?: string | null;
-            musicbrainz_release_id?: string | null;
-            release_date?: string | null;
+            captured_at: number;
+            input_revision: string;
+            is_compilation: boolean;
+            local_album_id: string;
+            local_artist_id: string;
+            media: components["schemas"]["ReleaseMediumSnapshot"][];
+            musicbrainz_artist_id: string | null;
+            musicbrainz_release_group_id: string | null;
+            musicbrainz_release_id: string | null;
+            release_date: string | null;
             /** Format: int32 */
-            schema_version?: number;
-            title?: string;
+            schema_version: number;
+            title: string;
             /** Format: int32 */
-            year?: number | null;
+            year: number | null;
         };
         /** @description Local login body. */
         LoginBody: {
@@ -16728,6 +16130,11 @@ export interface components {
             /** Format: int64 */
             to_year?: number | null;
         };
+        /**
+         * @description What kind of collision a duplicate resolution settles.
+         * @enum {string}
+         */
+        ManagementCollisionKind: "same_path_same_content" | "same_path_different_content" | "same_release_position_different_content" | "normalized_path_collision" | "sidecar_collision" | "destination_created_after_preview";
         /** @description Discard a preview. */
         ManagementDiscardBody: {
             /** Format: int64 */
@@ -16743,7 +16150,7 @@ export interface components {
             action: components["schemas"]["ManagementDuplicateAction"];
             /** @description For `keep_incoming_alternate`: where the incoming file goes. */
             alternate_relative_path?: string | null;
-            collision_kind: string;
+            collision_kind: components["schemas"]["ManagementCollisionKind"];
             existing_local_track_id?: string | null;
             existing_relative_path: string;
             existing_root_id: string;
@@ -16840,7 +16247,6 @@ export interface components {
             operation_row_revision: number;
             origin: string;
             phase: components["schemas"]["ManagementPhase"];
-            policy_revision: string;
             profile_id: string;
             profile_name: string;
             profile_revision: string;
@@ -16889,6 +16295,11 @@ export interface components {
             /** @description The library folder it is in. */
             root_path: string;
         };
+        /**
+         * @description What a saved override does to its tag.
+         * @enum {string}
+         */
+        ManagementOverrideMode: "replace" | "preserve" | "clear";
         /**
          * @description Where a management job is: planning its files, a preview waiting to be
          *     applied, writing (applying, undoing or restoring originals), or done.
@@ -17037,7 +16448,7 @@ export interface components {
             /**
              * Format: int64
              * @description Hidden temporary files under the library folders that no write
-             *     accounts for, as the check after startup found them. Nothing
+             *     accounts for, as the last check of each folder found them. Nothing
              *     removes them.
              */
             leftover_file_count: number;
@@ -17176,6 +16587,11 @@ export interface components {
             /** Format: int64 */
             warning_count: number;
         };
+        /**
+         * @description The shape of a tag's value in the editor.
+         * @enum {string}
+         */
+        ManagementTagCardinality: "string" | "integer" | "boolean" | "ordered_strings";
         /** @description One edited tag. */
         ManagementTagEditFieldBody: {
             field_name: string;
@@ -17201,18 +16617,15 @@ export interface components {
         };
         /** @description One tag in the editor. */
         ManagementTagEditorFieldView: {
-            /** @description `string`, `integer`, `boolean`, or `ordered_strings`. */
-            cardinality: string;
+            cardinality: components["schemas"]["ManagementTagCardinality"];
             /** @description The file's value now: text, a number, true/false, a list, or null. */
             current_value: unknown;
             field_name: string;
             override_id?: string | null;
-            /** @description `replace`, `preserve`, or `clear`. */
-            override_mode?: string | null;
+            override_mode: null | components["schemas"]["ManagementOverrideMode"];
             /** Format: int64 */
             override_row_revision?: number | null;
-            /** @description `album` (applies to every file of the album) or `track`. */
-            scope: string;
+            scope: components["schemas"]["ManagementTagScope"];
         };
         /** @description One file's tags, saved overrides and match. */
         ManagementTagEditorView: {
@@ -17234,6 +16647,11 @@ export interface components {
             /** Format: int64 */
             track_revision: number;
         };
+        /**
+         * @description Where a tag applies.
+         * @enum {string}
+         */
+        ManagementTagScope: "album" | "track";
         /**
          * @description Why the app stepped back from an album.
          * @enum {string}
@@ -17260,6 +16678,11 @@ export interface components {
             album_title: string;
             artist_name?: string | null;
             cause: components["schemas"]["ManagementTakeoverCause"];
+            /**
+             * @description A hand-back since then was given up because the album's files
+             *     could not be read.
+             */
+            hand_back_given_up: boolean;
             /**
              * Format: int64
              * @description When it stepped back, unix milliseconds.
@@ -17409,6 +16832,11 @@ export interface components {
              */
             tagging_script_ids: string[];
         };
+        /**
+         * @description Whether a personal-mix refresh started.
+         * @enum {string}
+         */
+        MixRefreshStatus: "started" | "already_running";
         /** @description `GET /albums/{album_id}/more-by-artist`. */
         MoreByArtistResponse: {
             /** @description Other release groups by the artist, in MusicBrainz browse order. */
@@ -17416,6 +16844,12 @@ export interface components {
             /** @description The artist's name, empty when MusicBrainz had nothing. */
             artist_name: string;
         };
+        /**
+         * @description Why the mount is or is not usable, and whether moves stay on one
+         *     filesystem.
+         * @enum {string}
+         */
+        MountReason: "ok" | "not_set" | "missing" | "not_writable" | "different_mount" | "different_filesystem" | "stat_error";
         /**
          * @description Multi-disc naming mode for a root override.
          * @enum {string}
@@ -17489,7 +16923,7 @@ export interface components {
             /**
              * Format: double
              * @description Requests per second (0 = Unlimited, off-official only).
-             * @default 10
+             * @default 4
              */
             rate_limit: number;
             /** @default brainzmash */
@@ -17542,6 +16976,11 @@ export interface components {
             id: string;
             /** @description Folder name. */
             name: string;
+        };
+        /** @description The caller's choices for their music apps. */
+        MyConnectApps: {
+            /** @description Apps list other people's public playlists as well as the caller's. */
+            include_public_playlists: boolean;
         };
         /** @description One naming script. */
         NamingScript: {
@@ -17710,7 +17149,7 @@ export interface components {
         };
         /**
          * @description One live session, already privacy-projected (same JSON as the
-         *     `reads::discover` now-playing shape, so clients see no difference).
+         *     `discover` now-playing shape, so clients see no difference).
          */
         NowPlayingEntry: {
             /** @description Album title (none when redacted or unknown). */
@@ -17744,7 +17183,7 @@ export interface components {
             /** @description Display name of the listener. */
             user_name: string;
         };
-        /** @description Native heartbeat (v2 `NowPlayingReport` fields). */
+        /** @description Native heartbeat. */
         NowPlayingHeartbeat: {
             /** @description Album title. */
             album_name?: string | null;
@@ -17889,7 +17328,9 @@ export interface components {
              * @description What ties the file to the release track (`embedded_id`, `acoustid`,
              *     `title_position_length`, or `track_id_elsewhere`: the recording ID,
              *     on a file whose track ID belongs to another edition), or why it does
-             *     not.
+             *     not (`distant_pair`: paired, but not closely). `acoustid_overruled`
+             *     follows when the file's measured length set aside a fingerprint
+             *     that named another track.
              */
             evidence_kinds: string[];
             local_track_id: string;
@@ -18032,6 +17473,40 @@ export interface components {
              *     ]
              */
             sidecar_patterns: string[];
+        };
+        /** @description One release group of an artist's discography that the library holds. */
+        OwnedRelease: {
+            /** @description Release-group MBID. */
+            id: string;
+            /** @description Primary type (`Album`, `EP`, `Single`, `Other`, ...). */
+            primary_type?: string | null;
+            /** @description Secondary types (`Compilation`, `Live`, `Soundtrack`, ...). */
+            secondary_types: string[];
+            /** @description Title. */
+            title?: string | null;
+            /**
+             * Format: int32
+             * @description First release year.
+             */
+            year?: number | null;
+        };
+        /**
+         * @description `GET /artists/{artist_mbid}/owned-releases`: every release group of the
+         *     artist's discography that the library holds, whatever its type. The
+         *     release-type preferences only shape the discography; the library part of
+         *     an artist page shows everything the library holds.
+         */
+        OwnedReleases: {
+            /**
+             * @description False while the rest of a large discography is still being fetched,
+             *     or when MusicBrainz could not be asked: some held albums may be
+             *     missing from `items`.
+             */
+            complete: boolean;
+            /** @description The held release groups, newest first. */
+            items: components["schemas"]["OwnedRelease"][];
+            /** @description Sources that degraded while building the list. */
+            service_status: components["schemas"]["Option"];
         };
         /** @description One section of a page. */
         PageSection: {
@@ -18356,6 +17831,36 @@ export interface components {
             total: number | null;
         };
         /** @description One page of a list. */
+        Page_RetagPairView: {
+            items: {
+                /**
+                 * @description Two different chosen editions remain once a custom edition on the
+                 *     old album is left out: the join must name the one to keep.
+                 */
+                editions_differ: boolean;
+                /**
+                 * @description The row the files sit on now, or the album it was merged into
+                 *     since. A join keeps this one.
+                 */
+                new_album: components["schemas"]["RetagPairAlbumView"];
+                /** @description The row the files left. It holds the favorites, plays and links. */
+                old_album: components["schemas"]["RetagPairAlbumView"];
+                reason: components["schemas"]["RetagPairReasonView"];
+                /**
+                 * Format: int64
+                 * @description When the scan recorded the pair (Unix milliseconds).
+                 */
+                recorded_at: number;
+            }[];
+            /** @description Pass back as `cursor` for the next page; null on the last. */
+            next_cursor: string | null;
+            /**
+             * Format: int64
+             * @description Rows in the whole list, for lists that count them.
+             */
+            total: number | null;
+        };
+        /** @description One page of a list. */
         Page_ReviewView: {
             items: {
                 /** @description Local album id. */
@@ -18597,16 +18102,6 @@ export interface components {
              */
             windows_legacy_path_limit: boolean;
         };
-        /**
-         * @description Why a path did not map to a root.
-         * @enum {string}
-         */
-        PathMappingError: "ambiguous" | "out_of_root";
-        /**
-         * @description Where a mapped path came from.
-         * @enum {string}
-         */
-        PathMappingSource: "library_file";
         /** @description One penalty's share of a candidate's distance. */
         PenaltyView: {
             /** @description Penalty name. */
@@ -18633,9 +18128,11 @@ export interface components {
         PersonalMixApprovalsResponse: {
             /**
              * Format: int32
-             * @description Row count.
+             * @description Pending row count.
              */
             count: number;
+            /** @description Approvals already granted, which an admin may revoke. */
+            granted: components["schemas"]["PersonalMixApprovalItem"][];
             /** @description Pending rows. */
             items: components["schemas"]["PersonalMixApprovalItem"][];
         };
@@ -18689,6 +18186,11 @@ export interface components {
         PlaybackProgressRequest: {
             /** @description Reporting device slug. */
             device?: string;
+            /**
+             * Format: int64
+             * @description Track length in milliseconds, when the player knows it.
+             */
+            duration_ms?: number | null;
             /** @description True while paused. */
             is_paused?: boolean;
             /**
@@ -18696,9 +18198,12 @@ export interface components {
              * @description Position in milliseconds, when the player knows it.
              */
             position_ms?: number | null;
-            /** @description Playback source. */
-            source?: string;
-            /** @description Catalog track id. */
+            /** @description Where the track plays from. */
+            source?: components["schemas"]["PlaybackSource"];
+            /**
+             * @description The library track id for `local` and `youtube`; for a media server,
+             *     that server's item id (the Plex rating key).
+             */
             track_id: string;
         };
         /** @description Answer to a progress heartbeat. */
@@ -18706,13 +18211,32 @@ export interface components {
             /** @description Always true: reporting never fails the player. */
             accepted: boolean;
         };
-        /** @description Open a playback session for one catalog track. */
+        /**
+         * @description Where a session's track plays from.
+         * @enum {string}
+         */
+        PlaybackSource: "local" | "youtube" | "jellyfin" | "navidrome" | "plex";
+        /** @description Open a playback session for one track. */
         PlaybackStartRequest: {
             /** @description Reporting device slug. */
             device?: string;
-            /** @description Playback source (`local`, `youtube`, `jellyfin`, `navidrome`, `plex`). */
-            source?: string;
-            /** @description Catalog track id. */
+            /**
+             * Format: int64
+             * @description Track length in milliseconds, when the player knows it.
+             */
+            duration_ms?: number | null;
+            /**
+             * Format: int64
+             * @description Where playback starts in milliseconds, when not at the beginning (a
+             *     resumed track). Read for media-server plays only.
+             */
+            position_ms?: number | null;
+            /** @description Where the track plays from. */
+            source?: components["schemas"]["PlaybackSource"];
+            /**
+             * @description The library track id for `local` and `youtube`; for a media server,
+             *     that server's item id (the Plex rating key).
+             */
             track_id: string;
         };
         /** @description Answer to a session start. */
@@ -18722,27 +18246,48 @@ export interface components {
             /** @description Session key (`user_id:device:track_id`), for log correlation. */
             session: string;
         };
-        /** @description Close a session. A stop past the scrobble threshold counts the play. */
+        /** @description Close a session. A library play past the scrobble threshold counts. */
         PlaybackStopRequest: {
             /** @description Reporting device slug. */
             device?: string;
-            /** @description Skip the scrobble even past threshold (private session). */
+            /**
+             * Format: int64
+             * @description Track length in milliseconds, when the player knows it.
+             */
+            duration_ms?: number | null;
+            /**
+             * @description Skip the scrobble even past threshold (private session). A media
+             *     server counts a play by its own rule.
+             */
             ignore_scrobble?: boolean;
             /**
              * Format: int64
              * @description Final position in milliseconds, when the player knows it.
              */
             position_ms?: number | null;
-            /** @description Playback source. */
-            source?: string;
-            /** @description Catalog track id. */
+            /** @description Where the track plays from. */
+            source?: components["schemas"]["PlaybackSource"];
+            /**
+             * Format: int64
+             * @description Where this play started in milliseconds, for a resumed track; absent
+             *     means the beginning. Read for media-server plays only.
+             */
+            start_position_ms?: number | null;
+            /**
+             * @description The library track id for `local` and `youtube`; for a media server,
+             *     that server's item id (the Plex rating key).
+             */
             track_id: string;
         };
         /** @description Answer to a stop report. */
         PlaybackStopResponse: {
             /** @description Always true: reporting never fails the player. */
             accepted: boolean;
-            /** @description True when the play counted (history recorded, forwarding attempted). */
+            /**
+             * @description True when the play counted (history recorded, forwarding attempted).
+             *     Always false for a media-server play: the web player's scrobble
+             *     submit records that one.
+             */
             scrobbled: boolean;
         };
         /** @description Playlist list. */
@@ -18752,6 +18297,11 @@ export interface components {
         };
         /** @description Full playlist detail: summary fields plus tracks. */
         PlaylistDetail: {
+            /**
+             * @description True when the caller may delete it: its owner, or an admin when it
+             *     has no owner.
+             */
+            can_delete: boolean;
             /** @description Up to four track covers for the header. */
             cover_urls: string[];
             /**
@@ -18840,6 +18390,11 @@ export interface components {
         };
         /** @description Playlist summary for lists and visibility answers. */
         PlaylistSummary: {
+            /**
+             * @description True when the caller may delete it: its owner, or an admin when it
+             *     has no owner.
+             */
+            can_delete: boolean;
             /** @description Up to four track covers for the list tile. */
             cover_urls: string[];
             /**
@@ -18962,6 +18517,11 @@ export interface components {
             plex_rating_key?: string | null;
             /** @description Zero-based position in the playlist. */
             position: number;
+            /**
+             * @description The MusicBrainz recording `source_type` gave for this entry, when
+             *     known.
+             */
+            recording_mbid?: string | null;
             /** @description Preferred source type, empty when unresolved. */
             source_type: string;
             /** @description Track title. */
@@ -19249,7 +18809,11 @@ export interface components {
              *     installs, whatever the ref points at by now.
              */
             commit?: string | null;
-            /** @description A release tag, tag, branch or commit; overrides any in the URL. */
+            ref_kind?: null | components["schemas"]["PluginRefKind"];
+            /**
+             * @description A release tag, tag, branch or commit; overrides any in the URL.
+             *     With `ref_kind`, the reference a preview showed for this URL.
+             */
             reference?: string | null;
             /**
              * @description Repository URL, e.g. `https://github.com/owner/repo` (latest
@@ -19280,6 +18844,12 @@ export interface components {
             implemented_capabilities?: string[];
             /** @description Last start failure, crash or protocol problem. */
             last_error?: string | null;
+            /**
+             * @description Why the plugin's last library write was refused. Cleared when a
+             *     write lands, the plugin is switched off or removed, or the server
+             *     restarts.
+             */
+            library_refusal?: string | null;
             /**
              * Format: int64
              * @description Restarts since it was enabled.
@@ -19375,20 +18945,6 @@ export interface components {
          */
         PolicyNodeKind: "root" | "rule";
         /**
-         * @description Safe, signed-in-user projection of the acquisition policy: the quality
-         *     summary sentence and the recipe verdict only, no admin internals.
-         */
-        PolicySummaryResponse: {
-            /** @description Whether a down-level image reproduces acquisition behavior. */
-            legacy_rollback_compatible: boolean;
-            /** @description Recipe verdict detail, when any. */
-            quality_recipe_error?: string | null;
-            /** @description Read-only recipe verdict: `v1`, `v2`, `non_convertible`, `invalid`. */
-            quality_recipe_status: string;
-            /** @description Backend-composed contract sentence. */
-            summary: string;
-        };
-        /**
          * @description One precache run starting. The run continues in the background under
          *     the `precache-library` job name; a second start while it is live is 409.
          */
@@ -19442,11 +18998,6 @@ export interface components {
             preview_url: string;
             /** @description Track title. */
             title: string;
-        };
-        /** @description Primary music source selection. */
-        PrimaryMusicSource: {
-            /** @default listenbrainz */
-            source: components["schemas"]["ListenSource"];
         };
         /** @description Post-publish notifications. */
         ProfileNotificationSettings: {
@@ -19658,8 +19209,8 @@ export interface components {
              * @description Custom FLAC bit depth.
              */
             bit_depth?: number | null;
-            /** @description Container: `flac` or `mp3`. */
-            format: string;
+            /** @description Container. */
+            format: components["schemas"]["RecipeFormat"];
             /**
              * Format: int64
              * @description Custom MP3 upper bound (`None` when open-ended), or canonical.
@@ -19670,14 +19221,21 @@ export interface components {
              * @description Custom MP3 lower bound, or canonical standard bound.
              */
             min_bitrate_kbps?: number | null;
-            /** @description Quality id (per-format closed set, or `custom`). */
-            quality: string;
+            /** @description Quality id: one of the format's own, or `custom`. */
+            quality: components["schemas"]["RecipeQuality"];
             /**
              * Format: int64
              * @description Custom FLAC sample rate.
              */
             sample_rate_hz?: number | null;
         };
+        /**
+         * @description How the stored quality settings read: a v1 tier range, a v2 recipe, a
+         *     policy with codecs a recipe cannot express, or a recipe that does not
+         *     validate.
+         * @enum {string}
+         */
+        QualityRecipeStatus: "v1" | "v2" | "non_convertible" | "invalid";
         /** @description One blocklisted release. */
         QuarantineEntry: {
             /** @description The client label: `slskd`, `sabnzbd`, or the source for plugins. */
@@ -20049,7 +19607,7 @@ export interface components {
          * @description One reason, stored and sent by its snake_case spelling.
          * @enum {string}
          */
-        Reason: "weak_match" | "no_artist_evidence" | "mostly_unmatched" | "tag_mismatch" | "fingerprint_mismatch" | "fingerprint_unconfirmed" | "album_version_only" | "no_release" | "no_tracks" | "version_lower_quality" | "no_better_than_yours" | "owned_elsewhere" | "owned_on_album" | "no_album_match" | "album_not_found" | "tags_disagree" | "not_chosen_edition" | "samples" | "too_many_files" | "interrupted" | "import_failed" | "held_by_earlier_version" | "target_occupied" | "upgrade_blocked" | "library_changed" | "library_unavailable" | "naming_script_failed" | "library_folder_missing" | "local_fault" | "files_missing" | "files_unlisted" | "outside_downloads_folder" | "size_mismatch" | "corrupt" | "no_audio" | "sample" | "wrong_edition" | "not_pinned_edition" | "wrong_album" | "quality_rejected" | "not_an_upgrade" | "wrong_track" | "stalled" | "queue_timeout" | "queue_gave_way" | "never_started" | "deadline" | "source_failed" | "no_source" | "download_failed" | "album_lookup_unavailable" | "recording_unknown" | "no_album_for_recording" | "no_album_folder" | "no_album_release" | "album_releases_exhausted" | "track_not_found" | "no_download_source" | "settings_unreadable" | "journal_unreadable" | "musicbrainz_unavailable" | "held_for_review" | "tracks_missing" | "already_owned" | "cancelled" | "moved_on";
+        Reason: "weak_match" | "no_artist_evidence" | "mostly_unmatched" | "tag_mismatch" | "fingerprint_mismatch" | "fingerprint_unconfirmed" | "album_version_only" | "no_release" | "no_tracks" | "version_lower_quality" | "no_better_than_yours" | "owned_elsewhere" | "owned_on_album" | "no_album_match" | "album_not_found" | "tags_disagree" | "not_chosen_edition" | "samples" | "too_many_files" | "interrupted" | "import_failed" | "held_by_earlier_version" | "target_occupied" | "upgrade_blocked" | "library_changed" | "library_unavailable" | "naming_script_failed" | "library_folder_missing" | "library_off" | "local_fault" | "files_missing" | "files_unlisted" | "outside_downloads_folder" | "size_mismatch" | "corrupt" | "no_audio" | "sample" | "wrong_edition" | "not_pinned_edition" | "wrong_album" | "quality_rejected" | "not_an_upgrade" | "wrong_track" | "stalled" | "queue_timeout" | "queue_gave_way" | "never_started" | "deadline" | "source_failed" | "no_source" | "download_failed" | "album_lookup_unavailable" | "recording_unknown" | "no_album_for_recording" | "no_album_folder" | "no_album_release" | "album_releases_exhausted" | "track_not_found" | "no_download_source" | "settings_unreadable" | "journal_unreadable" | "musicbrainz_unavailable" | "acoustid_unavailable" | "held_for_review" | "tracks_missing" | "already_owned" | "cancelled" | "moved_on";
         /** @description How many reviews one reason holds. */
         ReasonCount: {
             /** Format: int64 */
@@ -20072,6 +19630,17 @@ export interface components {
             code: string;
             message: string;
         };
+        /**
+         * @description A recipe entry's container.
+         * @enum {string}
+         */
+        RecipeFormat: "flac" | "mp3";
+        /**
+         * @description A recipe entry's quality: MP3 bitrate bands, FLAC resolutions, or
+         *     `custom` for either.
+         * @enum {string}
+         */
+        RecipeQuality: "below_192" | "192_255" | "256_319" | "320_plus" | "cd" | "24_48" | "24_96" | "24_192" | "hi_res" | "custom";
         /** @description A minted recovery code. The code appears here once, never again. */
         RecoveryCodeResponse: {
             /**
@@ -20128,15 +19697,18 @@ export interface components {
             staying: number;
         };
         /**
-         * @description Another user's private playlist: existence, count, and owner only. Never
-         *     the name, tracks, or covers.
+         * @description A private playlist the caller may not read: existence, count, and owner
+         *     only. Never the name, tracks, or covers. An admin also gets the ones with
+         *     no owner, which they may delete.
          */
         RedactedPlaylist: {
+            /** @description True for an admin when it has no owner. */
+            can_delete: boolean;
             /** @description Playlist id. */
             id: string;
             /** @description Always true. */
             is_redacted: boolean;
-            /** @description Owner display name. */
+            /** @description Owner display name. None when it has no owner. */
             owner_name?: string | null;
             /** @description Track count. */
             track_count: number;
@@ -20225,17 +19797,17 @@ export interface components {
          */
         RelationshipType: "composer" | "lyricist" | "conductor" | "performer" | "arranger" | "remixer" | "producer" | "other";
         ReleaseDraft: {
-            artist_credit?: components["schemas"]["ReleaseTextField"];
-            barcode?: components["schemas"]["ReleaseTextField"];
-            catalogue_number?: components["schemas"]["ReleaseTextField"];
-            country?: components["schemas"]["ReleaseTextField"];
-            label?: components["schemas"]["ReleaseTextField"];
-            media?: components["schemas"]["ReleaseMediumDraft"][];
-            packaging?: components["schemas"]["ReleaseTextField"];
-            release_date?: components["schemas"]["ReleaseTextField"];
+            artist_credit: components["schemas"]["ReleaseTextField"];
+            barcode: components["schemas"]["ReleaseTextField"];
+            catalogue_number: components["schemas"]["ReleaseTextField"];
+            country: components["schemas"]["ReleaseTextField"];
+            label: components["schemas"]["ReleaseTextField"];
+            media: components["schemas"]["ReleaseMediumDraft"][];
+            packaging: components["schemas"]["ReleaseTextField"];
+            release_date: components["schemas"]["ReleaseTextField"];
             /** Format: int32 */
-            schema_version?: number;
-            title?: components["schemas"]["ReleaseTextField"];
+            schema_version: number;
+            title: components["schemas"]["ReleaseTextField"];
         };
         /**
          * @description One page of the edition finder, with MusicBrainz's count of matches as
@@ -20276,42 +19848,42 @@ export interface components {
             year?: number | null;
         };
         ReleaseMediumDraft: {
-            format?: components["schemas"]["ReleaseTextField"];
+            format: components["schemas"]["ReleaseTextField"];
             /** Format: int64 */
             position: number;
-            title?: components["schemas"]["ReleaseTextField"];
-            tracks?: components["schemas"]["ReleaseTrackDraft"][];
+            title: components["schemas"]["ReleaseTextField"];
+            tracks: components["schemas"]["ReleaseTrackDraft"][];
         };
         ReleaseMediumSnapshot: {
             /** Format: int64 */
             position: number;
-            title?: string | null;
-            tracks?: components["schemas"]["ReleaseTrackSnapshot"][];
+            title: string | null;
+            tracks: components["schemas"]["ReleaseTrackSnapshot"][];
         };
         ReleaseTextField: {
-            source?: components["schemas"]["ContributionFieldSource"];
-            value?: string | null;
+            source: components["schemas"]["ContributionFieldSource"];
+            value: string | null;
         };
         ReleaseTrackDraft: {
             artist_name: components["schemas"]["ReleaseTextField"];
             /** Format: int64 */
             disc_number: number;
             /** Format: double */
-            duration_seconds?: number | null;
+            duration_seconds: number | null;
             local_track_id: string;
             title: components["schemas"]["ReleaseTextField"];
             /** Format: int64 */
             track_number: number;
         };
         ReleaseTrackSnapshot: {
-            artist_name?: string | null;
+            artist_name: string | null;
             /** Format: int64 */
             disc_number: number;
-            duration_reliable?: boolean;
+            duration_reliable: boolean;
             /** Format: double */
-            duration_seconds?: number | null;
+            duration_seconds: number | null;
             local_track_id: string;
-            title?: string;
+            title: string;
             /** Format: int64 */
             track_number: number;
         };
@@ -20467,37 +20039,6 @@ export interface components {
             artists: components["schemas"]["RemotesArtistView"][];
             /** @description Matching tracks. */
             tracks: components["schemas"]["RemotesTrackView"][];
-        };
-        /** @description One active remote listening session. */
-        RemotesSessionView: {
-            /** @description Track album. */
-            album_name: string;
-            /** @description Track artist. */
-            artist_name: string;
-            /** @description Player or device label. */
-            device_name: string;
-            /**
-             * Format: int64
-             * @description Track length in milliseconds.
-             */
-            duration_ms: number;
-            /** @description Relative images URL under `/api/v3` for the playing track's art. */
-            image_url?: string | null;
-            /** @description True when paused. */
-            is_paused: boolean;
-            /**
-             * Format: int64
-             * @description Playback position in milliseconds.
-             */
-            progress_ms: number;
-            /** @description Remote session id. */
-            session_id: string;
-            /** @description Owning source. */
-            source: components["schemas"]["SourceName"];
-            /** @description Track title. */
-            track_title: string;
-            /** @description Listening user. */
-            user_name: string;
         };
         /** @description Library totals for one source. */
         RemotesStatsView: {
@@ -20810,10 +20351,10 @@ export interface components {
             /** @description Album or recording MBID. */
             musicbrainz_id: string;
             /**
-             * @description What made the request: a person's ask (`user`) or a followed
-             *     artist's new release (`follow`).
+             * @description What made the request: a person's ask or a followed artist's new
+             *     release.
              */
-            origin: components["schemas"]["DispatchOrigin"];
+            origin: components["schemas"]["RequestOrigin"];
             /**
              * Format: double
              * @description Download progress percent (0-100) from the linked task, when linked.
@@ -20857,7 +20398,7 @@ export interface components {
              */
             size_remaining?: number | null;
             /** @description Row status. */
-            status: string;
+            status: components["schemas"]["RequestStatus"];
             /**
              * @description Task status detail groups behind the card's expander. None until a
              *     producer exists.
@@ -20865,6 +20406,7 @@ export interface components {
             status_messages?: components["schemas"]["RequestStatusMessage"][] | null;
             /** @description Linked download task. */
             task_id?: string | null;
+            task_state?: null | components["schemas"]["RequestTaskState"];
             /** @description Containing release group for exact-track rows (album context). */
             track_release_group_mbid?: string | null;
             /** @description Track title for exact-track rows. */
@@ -20884,11 +20426,22 @@ export interface components {
          */
         RequestKind: "album" | "track";
         /**
+         * @description What made a request row.
+         * @enum {string}
+         */
+        RequestOrigin: "user" | "follow";
+        /**
          * @description How urgent a provider call is. Lower wins ties in the rate limiter.
          *     There is no default: every caller names its priority.
          * @enum {string}
          */
         RequestPriority: "user_initiated" | "image_fetch" | "prefetch_visible" | "background_sync" | "opportunistic";
+        /**
+         * @description A request row's status. The `request_history.status` CHECK lists
+         *     exactly these values.
+         * @enum {string}
+         */
+        RequestStatus: "pending" | "queued" | "downloading" | "awaiting_approval" | "cancelling" | "cancelled" | "failed" | "imported" | "incomplete" | "rejected";
         /**
          * @description One grouped status detail behind the request card's expander. Intake
          *     has no producer for these yet, so views answer None until one exists.
@@ -20900,6 +20453,11 @@ export interface components {
             title?: string | null;
         };
         /**
+         * @description A live download's state as a request card shows it.
+         * @enum {string}
+         */
+        RequestTaskState: "searching" | "awaiting_review" | "queued" | "downloading" | "importing";
+        /**
          * @description Pending control on a run, as the runs table stores it and the API
          *     reports it.
          * @enum {string}
@@ -20910,8 +20468,7 @@ export interface components {
          *     unrelated `RefreshResponse` in the shared document.
          */
         RequestsRefreshResponse: {
-            /** @description `started` or `already_running`. */
-            status: string;
+            status: components["schemas"]["MixRefreshStatus"];
         };
         /** @description Source-resolution answer: each track id maps to its known sources. */
         ResolveSourcesResponse: {
@@ -21022,10 +20579,10 @@ export interface components {
             edition?: null | components["schemas"]["RetagPairEditionView"];
             id: string;
             /**
-             * Format: int64
-             * @description The edition's revision, 0 for none. Send it back with a join.
+             * @description The edition as shown: its revision with what it names, `0` for
+             *     none. Send it back with a join, unread.
              */
-            identity_revision: number;
+            identity_token: string;
             title: string;
             /**
              * Format: int64
@@ -21050,11 +20607,11 @@ export interface components {
         /** @description Join a retag pair. */
         RetagPairJoinBody: {
             /**
-             * @description Each album's `identity_revision` as shown, by album id. Both albums
+             * @description Each album's `identity_token` as shown, by album id. Both albums
              *     must be named.
              */
-            expected_identity_revisions: {
-                [key: string]: number;
+            expected_identity_tokens: {
+                [key: string]: string;
             };
             /**
              * @description The album whose chosen edition stays. Required when
@@ -21066,15 +20623,6 @@ export interface components {
         RetagPairJoinResponse: {
             /** @description The album that stays. The old album's id now opens it. */
             album_id: string;
-        };
-        /**
-         * @description The open retag pairs, newest first (at most 100), and how many there
-         *     are.
-         */
-        RetagPairListResponse: {
-            pairs: components["schemas"]["RetagPairView"][];
-            /** Format: int64 */
-            total: number;
         };
         /**
          * @description Why the scan left a retag pair for a person.
@@ -21502,7 +21050,7 @@ export interface components {
             stream_revision: number;
         };
         /**
-         * @description How `request_run` disposed of a request (v2 `ScanRequestResult`).
+         * @description How `request_run` disposed of a request.
          * @enum {string}
          */
         ScanDisposition: "started" | "queued" | "coalesced" | "expanded" | "conflict";
@@ -21519,7 +21067,7 @@ export interface components {
             estimated_file_count: number | null;
         };
         /**
-         * @description Classify verdict. Spelling matches v2 `comparison_result` exactly.
+         * @description Classify verdict. Its spelling is kept from v2, since the values are stored.
          * @enum {string}
          */
         ScanFileVerdict: "new" | "changed" | "unchanged" | "excluded" | "candidate_missing";
@@ -21538,7 +21086,7 @@ export interface components {
          * @description Automatic-scan cadence values.
          * @enum {string}
          */
-        ScanFrequency: "manual" | "5min" | "10min" | "30min" | "1hr" | "6hr" | "12hr" | "24hr" | "3d" | "7d" | "daily";
+        ScanFrequency: "manual" | "30min" | "1hr" | "6hr" | "12hr" | "24hr" | "3d" | "7d" | "daily";
         /**
          * @description Scan kind. `rescan_files` re-reads every in-policy file even when its
          *     stat revision is unchanged; `policy_reconcile` walks but skips tag reads.
@@ -21674,13 +21222,6 @@ export interface components {
              */
             updated_at: number;
         };
-        /** @description Current plus recent scan runs. */
-        ScanRunsResponse: {
-            /** @description Live runs. */
-            current: components["schemas"]["ScanRunView"][];
-            /** @description Recent terminal runs. */
-            history: components["schemas"]["ScanRunView"][];
-        };
         /** @description One scope inside a run. */
         ScanScopeView: {
             /** @description Effective policy for the scope. */
@@ -21700,7 +21241,7 @@ export interface components {
          * @enum {string}
          */
         ScanTrigger: "manual" | "automatic" | "subsonic" | "startup_resume" | "policy_apply";
-        /** @description One native now-playing forward, by name (v2 `NowPlayingRequest` fields). */
+        /** @description One native now-playing forward, by name. */
         ScrobbleNowPlayingRequest: {
             /** @description Album title. */
             album_name?: string | null;
@@ -21770,13 +21311,13 @@ export interface components {
              */
             scrobble_to_listenbrainz: boolean | null;
         };
-        /** @description Answer to a scrobble or now-playing forward (v2 `ScrobbleResponse`). */
+        /** @description Answer to a scrobble or now-playing forward. */
         ScrobbleResponse: {
             /**
              * @description Whether the play counted. Submit is true when history recorded it,
              *     even with no linked account, and false when the play could not be
-             *     saved; now-playing is true only when at least one service has it
-             *     (the v2 accepted-quirk, kept).
+             *     saved. Quirk (v2): now-playing is true only when at least one service
+             *     has it.
              */
             accepted: boolean;
             /** @description Per-service outcomes, keyed by service name. */
@@ -21784,7 +21325,7 @@ export interface components {
                 [key: string]: components["schemas"]["ServiceResult"];
             };
         };
-        /** @description One native scrobble, by name (v2 `ScrobbleRequest` fields). */
+        /** @description One native scrobble, by name. */
         ScrobbleSubmitRequest: {
             /** @description Album title. */
             album_name?: string | null;
@@ -21977,9 +21518,9 @@ export interface components {
          */
         SearchKind: "artist" | "album" | "track";
         /**
-         * @description Per-bucket MusicBrainz health for one search call. The values mirror
-         *     v2's `SearchRemoteStatus` exactly so the same notice and stale-time
-         *     logic applies. Library hits show whatever the status says.
+         * @description Per-bucket MusicBrainz health for one search call. The values match what
+         *     the web UI's notice and stale-time logic expects. Library hits show
+         *     whatever the status says.
          * @enum {string}
          */
         SearchRemoteStatus: "ok" | "partial" | "timeout" | "error" | "stale";
@@ -22333,12 +21874,15 @@ export interface components {
              */
             last_seen_at: number;
         };
-        /** @description Active sessions for one source. */
-        SessionsView: {
-            /** @description Active audio sessions. */
-            sessions: components["schemas"]["RemotesSessionView"][];
-            /** @description Owning source. */
-            source: components["schemas"]["SourceName"];
+        /** @description Link an artist to a MusicBrainz artist. */
+        SetArtistLinkBody: {
+            /**
+             * Format: int64
+             * @description The `artist_revision` as last read.
+             */
+            expected_revision: number;
+            /** @description The MusicBrainz artist id. */
+            musicbrainz_artist_id: string;
         };
         /** @description Set-favorite body. */
         SetFavoriteBody: {
@@ -22403,12 +21947,19 @@ export interface components {
         };
         /** @description `GET /artists/{artist_mbid}/similar`. */
         SimilarArtistsResponse: {
+            /**
+             * @description The source the caller asked for (or the preferred one). When it
+             *     differs from `source`, the other service stood in.
+             */
+            asked_source: components["schemas"]["ListenSource"];
             /** @description False when the provider is not set up; the list is then empty. */
             configured: boolean;
             /** @description Similar artists, most similar first. */
             similar_artists: components["schemas"]["ArtistRef"][];
             /** @description Provider that answered. */
             source: components["schemas"]["ListenSource"];
+            /** @description Services that failed, or are switched off, while the list was built. */
+            unavailable_sources: components["schemas"]["ListenSource"][];
         };
         /** @description Reviews one reason held back. */
         SkippedReviews: {
@@ -22478,24 +22029,6 @@ export interface components {
             version?: string | null;
         };
         /**
-         * @description Per-source release gate verdict. Each source gates independently: one
-         *     red gate never flips another.
-         */
-        SourceGate: {
-            /** @description Credentials/URL present. */
-            configured: boolean;
-            /** @description Admin master switch for this source. */
-            enabled: boolean;
-            /** @description User-safe summary. */
-            message: string;
-            /** @description True when releases may flow from this source. */
-            open: boolean;
-            /** @description Live probe answered. */
-            reachable: boolean;
-            /** @description `slskd`, `sabnzbd`, `newznab`, or `lidarr_import`. */
-            source: string;
-        };
-        /**
          * @description Which remote source a view or id belongs to.
          * @enum {string}
          */
@@ -22517,7 +22050,7 @@ export interface components {
             entity_type: string;
             external_id: string;
             /** Format: double */
-            fetched_at?: number | null;
+            fetched_at: number | null;
             provider: string;
         };
         /**
@@ -22543,20 +22076,6 @@ export interface components {
         SpotifyImportResponse: {
             /** @description Internal playlist id. */
             playlist_id: string;
-        };
-        /** @description Terminal-or-live state of one `spotify:import` job. */
-        SpotifyJobStatus: {
-            /** @description User-safe failure summary, else null. */
-            message?: string | null;
-            /** @description Internal playlist id the job populates. */
-            playlist_id: string;
-            /** @description `running`, `done`, or `error`. */
-            state: string;
-            /**
-             * Format: int64
-             * @description Tracks written on success.
-             */
-            track_count?: number | null;
         };
         /** @description One owned Spotify playlist. */
         SpotifyPlaylistItem: {
@@ -22831,7 +22350,7 @@ export interface components {
             album_title: string;
             /** @description Track artist display name. */
             artist_name: string;
-            /** @description True when the owning album has artwork. */
+            /** @description True when the owning album has a folder image or an embedded picture. */
             cover_available: boolean;
             /**
              * Format: double
@@ -22864,19 +22383,6 @@ export interface components {
         SystemHealthResponse: {
             /** @description Live degraded entries, sorted by service then capability. */
             degraded: components["schemas"]["ServiceHealthItem"][];
-        };
-        /** @description One artist value as the file carries it (v2 `AudioArtistCredit`). */
-        TagArtistCredit: {
-            /** @description Name as credited, when it differs. */
-            credited_name?: string | null;
-            /** @description Text joining this credit to the next. */
-            join_phrase: string;
-            /** @description MusicBrainz artist id. */
-            musicbrainz_artist_id?: string | null;
-            /** @description Artist name. */
-            name: string;
-            /** @description Sort name. */
-            sort_name?: string | null;
         };
         /** @description One tagging script. */
         TaggingScript: {
@@ -22930,10 +22436,17 @@ export interface components {
         TopAlbumsResponse: {
             /** @description Albums, most played first. */
             albums: components["schemas"]["AlbumRef"][];
+            /**
+             * @description The source the caller asked for (or the preferred one). When it
+             *     differs from `source`, the other service stood in.
+             */
+            asked_source: components["schemas"]["ListenSource"];
             /** @description False when the provider is not set up. */
             configured: boolean;
             /** @description Provider that answered. */
             source: components["schemas"]["ListenSource"];
+            /** @description Services that failed, or are switched off, while the list was built. */
+            unavailable_sources: components["schemas"]["ListenSource"][];
         };
         /** @description One personalized top pick. */
         TopPickItem: {
@@ -22973,9 +22486,9 @@ export interface components {
             disc_number?: number | null;
             /**
              * Format: int64
-             * @description Listen or play count.
+             * @description Listen or play count, when the provider sent one.
              */
-            listen_count: number;
+            listen_count?: number | null;
             /** @description Release the listens point at, when known. */
             original_release_mbid?: string | null;
             /** @description Recording MBID, when known. */
@@ -22994,43 +22507,24 @@ export interface components {
         };
         /** @description `GET /artists/{artist_mbid}/top-songs`. */
         TopSongsResponse: {
+            /**
+             * @description The source the caller asked for (or the preferred one). When it
+             *     differs from `source`, the other service stood in.
+             */
+            asked_source: components["schemas"]["ListenSource"];
             /** @description False when the provider is not set up. */
             configured: boolean;
             /** @description Songs, most played first. */
             songs: components["schemas"]["TopSong"][];
             /** @description Provider that answered. */
             source: components["schemas"]["ListenSource"];
+            /** @description Services that failed, or are switched off, while the list was built. */
+            unavailable_sources: components["schemas"]["ListenSource"][];
         };
         TrackAlignment: {
-            classification?: components["schemas"]["AlignmentClassification"];
+            classification: components["schemas"]["AlignmentClassification"];
             local_track_id: string;
-            provider_position?: string | null;
-        };
-        /** @description One artist/track pair to check against the YouTube cache. */
-        TrackCacheCheckItem: {
-            /** @description Artist name. */
-            artist: string;
-            /** @description Track name. */
-            track: string;
-        };
-        /** @description Body checking track cache membership in bulk. */
-        TrackCacheCheckRequest: {
-            /** @description Pairs to check (capped, deduped case-insensitively). */
-            items?: components["schemas"]["TrackCacheCheckItem"][];
-        };
-        /** @description Bulk cache membership. */
-        TrackCacheCheckResponse: {
-            /** @description Membership rows in request order (deduped). */
-            items?: components["schemas"]["TrackCacheCheckResponseItem"][];
-        };
-        /** @description Cache membership behind one pair. */
-        TrackCacheCheckResponseItem: {
-            /** @description Artist name as sent. */
-            artist: string;
-            /** @description True when a cached video covers the pair. */
-            cached?: boolean;
-            /** @description Track name as sent. */
-            track: string;
+            provider_position: string | null;
         };
         /** @description How one file fits a candidate release. */
         TrackEvidenceView: {
@@ -23082,6 +22576,11 @@ export interface components {
             format?: string | null;
             /** @description Plex rating key, when the track came from Plex. */
             plex_rating_key?: string | null;
+            /**
+             * @description The MusicBrainz recording `source_type` gave for this entry. Anything
+             *     that is not an MBID is left out.
+             */
+            recording_mbid?: string | null;
             /** @description Preferred source type. */
             source_type?: string;
             /** @description Track title. */
@@ -23118,8 +22617,8 @@ export interface components {
         };
         /** @description Exact-track intake response. */
         TrackIntakeResponse: {
-            /** @description `queued`, `awaiting_approval`, or `already_in_library`. */
-            status: string;
+            /** @description `queued` or `awaiting_approval`. */
+            status: components["schemas"]["RequestStatus"];
             /** @description Linked download task, when dispatched. */
             task_id?: string | null;
         };
@@ -23192,52 +22691,6 @@ export interface components {
             title: string;
         };
         /**
-         * @description The tags in one audio file, field for field v2's `AudioTag`. The
-         *     `musicbrainz_*` fields use Picard's tag names.
-         */
-        TrackTags: {
-            acoustid_id?: string | null;
-            album: string;
-            album_artist?: string | null;
-            album_artist_sort?: string | null;
-            album_artists: components["schemas"]["TagArtistCredit"][];
-            album_sort?: string | null;
-            artist: string;
-            artist_sort?: string | null;
-            artists: components["schemas"]["TagArtistCredit"][];
-            compilation: boolean;
-            /** Format: int32 */
-            disc_number: number;
-            disc_subtitle?: string | null;
-            genre?: string | null;
-            genres: string[];
-            musicbrainz_album_artist_id?: string | null;
-            musicbrainz_album_artist_ids: string[];
-            musicbrainz_artist_id?: string | null;
-            musicbrainz_artist_ids: string[];
-            musicbrainz_recording_id?: string | null;
-            musicbrainz_release_group_id?: string | null;
-            musicbrainz_release_id?: string | null;
-            musicbrainz_release_track_id?: string | null;
-            original_release_date?: string | null;
-            /** @description Raw RELEASETYPE / MUSICBRAINZ_ALBUMTYPE value. */
-            release_type?: string | null;
-            /** Format: double */
-            replaygain_album_gain?: number | null;
-            /** Format: double */
-            replaygain_album_peak?: number | null;
-            /** Format: double */
-            replaygain_track_gain?: number | null;
-            /** Format: double */
-            replaygain_track_peak?: number | null;
-            title: string;
-            title_sort?: string | null;
-            /** Format: int32 */
-            track_number: number;
-            /** Format: int32 */
-            year?: number | null;
-        };
-        /**
          * @description One catalog track. Only streamable tracks are listed; missing or
          *     excluded files read as absent (404 on the detail route).
          */
@@ -23252,6 +22705,11 @@ export interface components {
             album_id: string;
             /** @description Album title. */
             album_title: string;
+            /**
+             * @description The owning album's `art_missing`: true when the server knows its
+             *     cover routes answer "no art". False means ask.
+             */
+            art_missing: boolean;
             /** @description Local track-artist id, when credited. */
             artist_id?: string | null;
             /**
@@ -23276,7 +22734,10 @@ export interface components {
              * @description Channel count, when probed.
              */
             channels?: number | null;
-            /** @description True when the owning album has artwork. */
+            /**
+             * @description True when the owning album has art of its own: a folder image or an
+             *     embedded picture.
+             */
             cover_available: boolean;
             /**
              * Format: double
@@ -23310,6 +22771,11 @@ export interface components {
             recording_mbid?: string | null;
             /** @description Linked release group of the owning album, when identified. */
             release_group_mbid?: string | null;
+            /**
+             * Format: int64
+             * @description The track row's revision, which its removal echoes.
+             */
+            row_revision: number;
             /**
              * Format: int64
              * @description Sample rate, when probed.
@@ -23465,9 +22931,9 @@ export interface components {
         };
         /**
          * @description Per-user year-in-review. `loved_tracks_count` and `total_listens_estimated`
-         *     are both approximations (v2 caveat kept): ListenBrainz caps the loved
-         *     endpoint at 100 rows per request, and the total sums only the returned
-         *     top artists rather than every play.
+         *     are both approximations: ListenBrainz caps the loved endpoint at 100 rows
+         *     per request, and the total sums only the returned top artists rather than
+         *     every play.
          */
         UserWrappedResponse: {
             /** @description Display name. */
@@ -23554,11 +23020,11 @@ export interface components {
          * @description Why a live request waits. It starts by itself once the cause clears.
          * @enum {string}
          */
-        WaitingReason: "no_download_source" | "request_quota_full" | "storage_full";
+        WaitingReason: "no_download_source" | "request_quota_full" | "storage_full" | "waiting_to_start";
         /** @description Wanted mutation outcome. */
         WantedActionResponse: {
             /** @description Watch state after this call. */
-            state: string;
+            state: components["schemas"]["WatchState"];
             /** @description Whether the action applied. */
             success: boolean;
         };
@@ -23585,8 +23051,8 @@ export interface components {
              * @description Epoch seconds when created.
              */
             created_at: number;
-            /** @description `missing` (whole album) or `partial` (filling gaps). */
-            kind: string;
+            /** @description The whole album or the gaps of a short one. */
+            kind: components["schemas"]["WatchKind"];
             /** @description Release-group MBID. */
             musicbrainz_id: string;
             /**
@@ -23633,6 +23099,14 @@ export interface components {
              * @description Tracks started (`wanted_auto_dispatched` for a partial album).
              */
             tracks?: number | null;
+        };
+        /** @description How many wanted watches a removal took off the list. */
+        WantedRemovalResponse: {
+            /**
+             * Format: int64
+             * @description Watches removed.
+             */
+            removed: number;
         };
         /** @description Wanted list: watches plus the still-retrying set. */
         WantedResponse: {
@@ -23710,6 +23184,12 @@ export interface components {
              */
             watch_partial_albums: boolean;
         };
+        /**
+         * @description What a wanted watch waits for. The `wanted_watches.kind` CHECK lists
+         *     exactly these values.
+         * @enum {string}
+         */
+        WatchKind: "missing" | "partial";
         /**
          * @description A wanted watch's state. The `wanted_watches.state` CHECK lists exactly
          *     these values.
@@ -23800,7 +23280,7 @@ export interface components {
             skipped_count: number;
             /** Format: double */
             started_at: number | null;
-            state: string;
+            state: components["schemas"]["ActivityState"];
             /** Format: int64 */
             subject_count: number | null;
             /** Format: int64 */
@@ -24013,24 +23493,6 @@ export interface components {
             /** @description A YouTube URL or a bare 11-character video id. */
             youtube_url: string;
         };
-        /** @description YouTube data-API quota state. */
-        YouTubeQuotaResponse: {
-            /**
-             * Format: int64
-             * @description Quota units available per window.
-             */
-            limit: number;
-            /**
-             * Format: int64
-             * @description Unix seconds when the window resets.
-             */
-            resets_at: number;
-            /**
-             * Format: int64
-             * @description Quota units spent in the current window.
-             */
-            used: number;
-        };
         /** @description Today's YouTube search budget. */
         YouTubeQuotaStatus: {
             /** @description Quota day the numbers belong to (it starts at 08:00 UTC), YYYY-MM-DD. */
@@ -24097,6 +23559,11 @@ export interface components {
             disc_number: number;
             /** @description Embed URL for the video. */
             embed_url: string;
+            /**
+             * @description The MusicBrainz recording the link stands for, when known. It names
+             *     the track, not what the video holds.
+             */
+            recording_mbid?: string | null;
             /** @description Track title. */
             track_name: string;
             /**
@@ -24185,26 +23652,6 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
-    get_health: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Acquisition health */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["AcquireHealth"];
-                };
-            };
-        };
-    };
     list_lidarr_artists: {
         parameters: {
             query?: never;
@@ -24411,29 +23858,6 @@ export interface operations {
             };
         };
     };
-    get_spotify_job: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Spotify playlist id the import runs for */
-                id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Job state */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["SpotifyJobStatus"];
-                };
-            };
-        };
-    };
     list_spotify_playlists: {
         parameters: {
             query?: never;
@@ -24450,6 +23874,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["SpotifyPlaylistListResponse"];
+                };
+            };
+            /** @description Spotify is rate limiting this server */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
         };
@@ -24902,29 +24335,6 @@ export interface operations {
             };
         };
     };
-    admin_get_user: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description User id */
-                id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description The account */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["UserResponse"];
-                };
-            };
-        };
-    };
     admin_delete_user: {
         parameters: {
             query?: never;
@@ -25064,65 +24474,6 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
-            };
-        };
-    };
-    album: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Release-group MBID, or a library album id identified as one */
-                album_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Album page */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["AlbumInfo"];
-                };
-            };
-            /** @description Not a MusicBrainz id */
-            400: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Not authenticated */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Unknown album */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description MusicBrainz down and the album is not in the library */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
             };
         };
     };
@@ -26046,6 +25397,47 @@ export interface operations {
             };
         };
     };
+    owned_releases: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Artist MBID */
+                artist_mbid: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Held release groups */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OwnedReleases"];
+                };
+            };
+            /** @description Not a MusicBrainz id */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
     artist_purchase_options: {
         parameters: {
             query?: {
@@ -26150,7 +25542,7 @@ export interface operations {
             query?: {
                 /** @description How many to return, 1 to 50. */
                 count?: number;
-                /** @description Provider to ask; default is the primary music source setting. */
+                /** @description Provider to ask; default is ListenBrainz. */
                 source?: components["schemas"]["ListenSource"];
             };
             header?: never;
@@ -26196,7 +25588,7 @@ export interface operations {
             query?: {
                 /** @description How many to return, 1 to 50. */
                 count?: number;
-                /** @description Provider to ask; default is the primary music source setting. */
+                /** @description Provider to ask; default is ListenBrainz. */
                 source?: components["schemas"]["ListenSource"];
             };
             header?: never;
@@ -26242,7 +25634,7 @@ export interface operations {
             query?: {
                 /** @description How many to return, 1 to 50. */
                 count?: number;
-                /** @description Provider to ask; default is the primary music source setting. */
+                /** @description Provider to ask; default is ListenBrainz. */
                 source?: components["schemas"]["ListenSource"];
             };
             header?: never;
@@ -26710,6 +26102,15 @@ export interface operations {
             };
             /** @description Invalid or expired code */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Server busy */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -28048,6 +27449,54 @@ export interface operations {
             };
         };
     };
+    unignore_queue_item: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description MusicBrainz release-group id */
+                release_group_mbid: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Release is not ignored */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Not a MusicBrainz id */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description The change could not be saved */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
     preview_queue_item: {
         parameters: {
             query?: never;
@@ -28169,156 +27618,6 @@ export interface operations {
             };
             /** @description The library check failed */
             500: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-        };
-    };
-    youtube_cache_check: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["TrackCacheCheckRequest"];
-            };
-        };
-        responses: {
-            /** @description Cache membership */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["TrackCacheCheckResponse"];
-                };
-            };
-            /** @description Bad request body */
-            400: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Not authenticated */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-        };
-    };
-    youtube_quota: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Quota state */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["YouTubeQuotaResponse"];
-                };
-            };
-            /** @description Not authenticated */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description YouTube unconfigured */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-        };
-    };
-    youtube_search: {
-        parameters: {
-            query: {
-                /** @description Artist name */
-                artist: string;
-                /** @description Album name */
-                album: string;
-            };
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Resolved video */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["YouTubeSearchResponse"];
-                };
-            };
-            /** @description Bad query string */
-            400: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Not authenticated */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Not configured (NOT_CONFIGURED) or not built in this version yet (NOT_AVAILABLE) */
-            409: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description YouTube search quota used up for today (RATE_LIMITED) */
-            429: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description A source is down (PROVIDER_UNAVAILABLE names an outside one, with retry_after when known) */
-            503: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -29098,28 +28397,6 @@ export interface operations {
             };
         };
     };
-    get_task_handler: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Download task id */
-                task_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["DownloadTaskResponse"];
-                };
-            };
-        };
-    };
     cancel_task_handler: {
         parameters: {
             query?: never;
@@ -29138,28 +28415,6 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["DownloadActionResponse"];
-                };
-            };
-        };
-    };
-    task_files_handler: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Download task id */
-                task_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["DownloadFilesResponse"];
                 };
             };
         };
@@ -29296,47 +28551,6 @@ export interface operations {
                 };
                 content: {
                     "text/event-stream": components["schemas"]["StreamEvent"];
-                };
-            };
-            /** @description Not authenticated */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-        };
-    };
-    list_favorites_handler: {
-        parameters: {
-            query?: {
-                /** @description Kind filter: album, artist, or track */
-                kind?: string;
-            };
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Caller favorites */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["FavoriteListResponse"];
-                };
-            };
-            /** @description Bad kind filter */
-            400: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
             /** @description Not authenticated */
@@ -29643,49 +28857,6 @@ export interface operations {
             };
         };
     };
-    list_new_releases_handler: {
-        parameters: {
-            query?: {
-                /** @description Page size, 1-100 (default 50). */
-                limit?: number;
-                /** @description Rows to skip (default 0). */
-                offset?: number;
-            };
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description New releases */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["NewReleaseListResponse"];
-                };
-            };
-            /** @description Bad paging */
-            400: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Not authenticated */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-        };
-    };
     list_recent_releases_handler: {
         parameters: {
             query?: {
@@ -29850,9 +29021,7 @@ export interface operations {
                 headers: {
                     [name: string]: unknown;
                 };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
+                content?: never;
             };
         };
     };
@@ -29875,28 +29044,6 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HeldRecheckAllResponse"];
-                };
-            };
-        };
-    };
-    get_handler: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Held entry id */
-                entry_id: number;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HeldEntryResponse"];
                 };
             };
         };
@@ -30355,28 +29502,6 @@ export interface operations {
             };
         };
     };
-    get_job_handler: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Import job id */
-                job_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["DropImportJobResponse"];
-                };
-            };
-        };
-    };
     upload_handler: {
         parameters: {
             query?: never;
@@ -30455,9 +29580,22 @@ export interface operations {
                 decade?: number;
                 /**
                  * @description Restrict to one primary track format, e.g. `flac`. Blank reads as
-                 *     absent; matching is case-insensitive.
+                 *     absent; matching is case-insensitive. `formats` wins when both are
+                 *     given.
                  */
                 format?: string;
+                /**
+                 * @description Primary track formats, comma-separated, e.g. `flac,mp3`; matching is
+                 *     case-insensitive. See `format_mode`.
+                 */
+                formats?: string;
+                /**
+                 * @description `with` (default): only albums in one of `formats`; `without`: only
+                 *     albums in none of them.
+                 */
+                format_mode?: string;
+                /** @description Only albums with at least this many indexed tracks, 1-10000. */
+                min_tracks?: number;
                 /**
                  * @description Only the caller's favourites. Without `sort`, the newest favourite
                  *     comes first, and `order=asc` puts the oldest first.
@@ -30486,6 +29624,35 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    album_format_counts: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Album counts per format */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AlbumFormatCounts"];
                 };
             };
             /** @description Not authenticated */
@@ -32589,7 +31756,17 @@ export interface operations {
     };
     remove_album: {
         parameters: {
-            query?: {
+            query: {
+                /**
+                 * @description The album's `row_revision` as the person saw it. Another revision
+                 *     answers STALE_REVISION and nothing moves.
+                 */
+                expected_revision: number;
+                /**
+                 * @description The album's `track_count` as the person saw it. Another count answers
+                 *     STALE_REVISION and nothing moves.
+                 */
+                expected_track_count: number;
                 /**
                  * @description Move the album's files into the recycle bin too. Off by default:
                  *     the album only leaves the catalog.
@@ -32603,7 +31780,7 @@ export interface operations {
             };
             header?: never;
             path: {
-                /** @description Local album id or release-group MBID */
+                /** @description The album's local id, as its detail shows it */
                 id: string;
             };
             cookie?: never;
@@ -32617,6 +31794,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["RemovalResponse"];
+                };
+            };
+            /** @description Bad query string */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
             /** @description Not authenticated */
@@ -32646,7 +31832,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
-            /** @description Library busy or off, or a file is outside the library folders */
+            /** @description The album or its tracks changed since the values sent, the library is busy or off, or a file is outside the library folders */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -32989,6 +32175,12 @@ export interface operations {
                 q?: string;
                 /** @description `all`, `album_artists`, or `contributors`. Default `all`. */
                 scope?: string;
+                /**
+                 * @description Only artists with at least this many indexed tracks in the library,
+                 *     1-10000: the tracks credited to them and the tracks on the albums
+                 *     they lead, each once. The scope totals count the same artists.
+                 */
+                min_tracks?: number;
                 /**
                  * @description Only the caller's favourites. Without `sort`, the newest favourite
                  *     comes first, and `order=asc` puts the oldest first.
@@ -33581,6 +32773,190 @@ export interface operations {
             };
             /** @description Not authenticated */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    get_artist_link: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Local artist id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The artist's link */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ArtistLinkView"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Unknown artist */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    set_artist_link: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Local artist id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetArtistLinkBody"];
+            };
+        };
+        responses: {
+            /** @description The artist's link */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ArtistLinkView"];
+                };
+            };
+            /** @description Not a MusicBrainz artist id, or a special-purpose one (ARTIST_MBID_INVALID, ARTIST_MBID_SPECIAL) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Curator role required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Unknown artist */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description The artist changed since it was read (STALE_REVISION), cannot be linked (ARTIST_NOT_LINKABLE), or other artists are that MusicBrainz artist (ARTIST_LINK_SHARED, listed in details.artists) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    clear_artist_link: {
+        parameters: {
+            query: {
+                /** @description The `artist_revision` as last read. */
+                expected_revision: number;
+            };
+            header?: never;
+            path: {
+                /** @description Local artist id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The artist's link after the clear */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ArtistLinkView"];
+                };
+            };
+            /** @description No revision given */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Curator role required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Unknown artist */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description The artist changed since it was read (STALE_REVISION), has no hand-set link (ARTIST_LINK_NOT_CHOSEN), or would be the same MusicBrainz artist as others (ARTIST_LINK_SHARED, listed in details.artists) */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -34523,81 +33899,6 @@ export interface operations {
             };
         };
     };
-    list_genres: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Genres */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["GenreList"];
-                };
-            };
-            /** @description Not authenticated */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-        };
-    };
-    list_genre_tracks: {
-        parameters: {
-            query?: {
-                /** @description Page size, 1-1000. Default 200. */
-                limit?: number;
-                /** @description Page start. Default 0. */
-                offset?: number;
-            };
-            header?: never;
-            path: {
-                /** @description Genre name */
-                name: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Genre tracks */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["TrackPage"];
-                };
-            };
-            /** @description Bad query string */
-            400: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Not authenticated */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-        };
-    };
     pause_identification: {
         parameters: {
             query?: never;
@@ -34853,56 +34154,6 @@ export interface operations {
             };
         };
     };
-    get_repair: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Repair job id */
-                job_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Repair job */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["OperationView"];
-                };
-            };
-            /** @description Not authenticated */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Admin role required */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Unknown repair job */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-        };
-    };
     apply_repair: {
         parameters: {
             query?: never;
@@ -35046,195 +34297,6 @@ export interface operations {
             };
         };
     };
-    pause_repair: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Repair job id */
-                job_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["OperationControlBody"];
-            };
-        };
-        responses: {
-            /** @description Repair job */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["OperationView"];
-                };
-            };
-            /** @description Not authenticated */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Admin role required */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Unknown repair job */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Stale revision or reused idempotency key */
-            409: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-        };
-    };
-    resume_repair: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Repair job id */
-                job_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["OperationControlBody"];
-            };
-        };
-        responses: {
-            /** @description Repair job */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["OperationView"];
-                };
-            };
-            /** @description Not authenticated */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Admin role required */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Unknown repair job */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Stale revision or reused idempotency key */
-            409: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-        };
-    };
-    stop_repair: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Repair job id */
-                job_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["OperationControlBody"];
-            };
-        };
-        responses: {
-            /** @description Repair job */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["OperationView"];
-                };
-            };
-            /** @description Not authenticated */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Admin role required */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Unknown repair job */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Stale revision or reused idempotency key */
-            409: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-        };
-    };
     list_plugin_files: {
         parameters: {
             query: {
@@ -35347,7 +34409,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
-            /** @description Undo blocked for a file, or the library is off */
+            /** @description Undo blocked for a file, a Library Management run's change (undone from History), or the library is off */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -35805,56 +34867,6 @@ export interface operations {
             };
             /** @description Admin role required */
             403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-        };
-    };
-    get_preparation: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Preparation job id */
-                job_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Preparation job */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["OperationView"];
-                };
-            };
-            /** @description Not authenticated */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Admin role required */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Unknown preparation job */
-            404: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -37015,35 +36027,6 @@ export interface operations {
             };
         };
     };
-    album_mbids: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Held and requested album ids */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["LibraryMbids"];
-                };
-            };
-            /** @description Not authenticated */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-        };
-    };
     membership: {
         parameters: {
             query?: never;
@@ -37077,56 +36060,6 @@ export interface operations {
             };
             /** @description Not authenticated */
             401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-        };
-    };
-    get_operation: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Operation job id */
-                job_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Operation job */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["OperationView"];
-                };
-            };
-            /** @description Not authenticated */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Admin role required */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Unknown job */
-            404: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -37661,20 +36594,36 @@ export interface operations {
     };
     list_retag_pairs: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Only the pairs naming this album, as their old or new album. */
+                album_id?: string;
+                /** @description Page size, 1 to 100 (default 100); more is read as 100. */
+                limit?: number;
+                /** @description `next_cursor` from the previous page. */
+                cursor?: string;
+            };
             header?: never;
             path?: never;
             cookie?: never;
         };
         requestBody?: never;
         responses: {
-            /** @description Open pairs, newest first */
+            /** @description One page of open pairs, newest first */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["RetagPairListResponse"];
+                    "application/json": components["schemas"]["Page_RetagPairView"];
+                };
+            };
+            /** @description Bad cursor */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
             /** @description Not authenticated */
@@ -38666,35 +37615,6 @@ export interface operations {
             };
         };
     };
-    list_runs: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Scan runs */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ScanRunsResponse"];
-                };
-            };
-            /** @description Not authenticated */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-        };
-    };
     request_scan_run: {
         parameters: {
             query?: never;
@@ -39525,54 +38445,15 @@ export interface operations {
             };
         };
     };
-    get_track: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Local track id */
-                id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Track */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["TrackView"];
-                };
-            };
-            /** @description Not authenticated */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Unknown track id */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-        };
-    };
     remove_track: {
         parameters: {
-            query?: {
+            query: {
                 /**
-                 * @description Move the track's file into the recycle bin too. On by default, as
-                 *     in v2 (where it deleted the file outright).
+                 * @description The track's `row_revision` as the person saw it. Another revision
+                 *     answers STALE_REVISION and nothing moves.
                  */
+                expected_revision: number;
+                /** @description Move the track's file into the recycle bin too. On by default. */
                 delete_file?: boolean;
             };
             header?: never;
@@ -39591,6 +38472,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["RemovalResponse"];
+                };
+            };
+            /** @description Bad query string */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
             /** @description Not authenticated */
@@ -39620,7 +38510,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
-            /** @description Library busy or off, or the file is outside the library folders */
+            /** @description The track changed since the revision sent, the library is busy or off, or the file is outside the library folders */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -39671,65 +38561,6 @@ export interface operations {
                 };
             };
             /** @description Unknown track id */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-        };
-    };
-    track_tags: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Local track id */
-                id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description The file's tags */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["TrackTags"];
-                };
-            };
-            /** @description The file is gone from disk or cannot be read */
-            400: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Not authenticated */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Admin role required, or the file left the library roots */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Unknown track */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -39918,6 +38749,50 @@ export interface operations {
             };
         };
     };
+    get_my_connect_apps: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Own Connect Apps choices */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MyConnectApps"];
+                };
+            };
+        };
+    };
+    put_my_connect_apps: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MyConnectApps"];
+            };
+        };
+        responses: {
+            /** @description Saved choices */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MyConnectApps"];
+                };
+            };
+        };
+    };
     me_list_connections: {
         parameters: {
             query?: never;
@@ -39934,26 +38809,6 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["LinkedAccounts"];
-                };
-            };
-        };
-    };
-    lastfm_status: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Link status */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["LastFmStatusResponse"];
                 };
             };
         };
@@ -40040,44 +38895,6 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["LastFmTokenResponse"];
-                };
-            };
-        };
-    };
-    listenbrainz_status: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Link status */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ListeningLinkStatus"];
-                };
-            };
-            /** @description Not authenticated */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description No link */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
         };
@@ -40284,6 +39101,33 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["UserResponse"];
+                };
+            };
+            /** @description Current password is incorrect, or the new one is refused */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Missing or invalid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description The account has no local password */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
         };
@@ -40842,6 +39686,15 @@ export interface operations {
             };
             /** @description Not authenticated */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description PLAYLIST_PRIVATE: another user's private playlist, with a RedactedPlaylist in error.details */
+            403: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -42387,31 +41240,6 @@ export interface operations {
             };
         };
     };
-    remotes_get_album: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Remote source */
-                source: components["schemas"]["SourceName"];
-                /** @description Remote album id */
-                id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Album detail */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["RemotesAlbumView"];
-                };
-            };
-        };
-    };
     remotes_list_album_tracks: {
         parameters: {
             query?: never;
@@ -42513,31 +41341,6 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ArtistIndex"];
-                };
-            };
-        };
-    };
-    remotes_get_artist: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Remote source */
-                source: components["schemas"]["SourceName"];
-                /** @description Remote artist id */
-                id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Artist detail */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["RemotesArtistView"];
                 };
             };
         };
@@ -43014,58 +41817,6 @@ export interface operations {
             };
         };
     };
-    remotes_list_most_played_albums: {
-        parameters: {
-            query?: {
-                /** @description Max items (1-50, default 10). */
-                limit?: number;
-            };
-            header?: never;
-            path: {
-                /** @description Remote source */
-                source: components["schemas"]["SourceName"];
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Most-played albums */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["RemotesAlbumView"][];
-                };
-            };
-        };
-    };
-    remotes_list_most_played_artists: {
-        parameters: {
-            query?: {
-                /** @description Max items (1-50, default 10). */
-                limit?: number;
-            };
-            header?: never;
-            path: {
-                /** @description Remote source */
-                source: components["schemas"]["SourceName"];
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Most-played artists */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["RemotesArtistView"][];
-                };
-            };
-        };
-    };
     remotes_list_playlists: {
         parameters: {
             query?: never;
@@ -43195,34 +41946,6 @@ export interface operations {
             };
         };
     };
-    remotes_list_recently_added: {
-        parameters: {
-            query?: {
-                /** @description Max items (1-500, default 50). */
-                limit?: number;
-                /** @description Records to skip (default 0). */
-                offset?: number;
-            };
-            header?: never;
-            path: {
-                /** @description Remote source */
-                source: components["schemas"]["SourceName"];
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Recently added */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["RemotesAlbumView"][];
-                };
-            };
-        };
-    };
     remotes_search: {
         parameters: {
             query: {
@@ -43247,29 +41970,6 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["RemotesSearchResults"];
-                };
-            };
-        };
-    };
-    remotes_list_sessions: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Remote source */
-                source: components["schemas"]["SourceName"];
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Sessions */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["SessionsView"];
                 };
             };
         };
@@ -43452,6 +42152,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ActionResponse"];
+                };
+            };
+            /** @description No such request on the caller's list */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
         };
@@ -43861,6 +42570,15 @@ export interface operations {
                     "application/json": components["schemas"]["ClearHistoryResponse"];
                 };
             };
+            /** @description No such request on the caller's list */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
         };
     };
     mix_approvals_handler: {
@@ -44008,6 +42726,15 @@ export interface operations {
                     "application/json": components["schemas"]["ActionResponse"];
                 };
             };
+            /** @description No such request on the caller's list */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
         };
     };
     request_track_handler: {
@@ -44053,16 +42780,7 @@ export interface operations {
                     "application/json": components["schemas"]["ActionResponse"];
                 };
             };
-            /** @description Another user's request */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description No track request for this recording */
+            /** @description No such track request on the caller's list */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -44097,6 +42815,47 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["WantedResponse"];
+                };
+            };
+        };
+    };
+    wanted_clear_finished_handler: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WantedRemovalResponse"];
+                };
+            };
+        };
+    };
+    wanted_remove_handler: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Release-group MBID */
+                musicbrainz_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WantedRemovalResponse"];
                 };
             };
         };
@@ -44349,7 +43108,7 @@ export interface operations {
             query: {
                 /**
                  * @description Search text. Queries shorter than two characters return an empty
-                 *     200, kept from v2 so the typeahead never errors mid-typing.
+                 *     200, so the typeahead never errors mid-typing.
                  */
                 q: string;
                 /** @description Max suggestions (1-10, default 5). */
@@ -44544,26 +43303,6 @@ export interface operations {
             };
         };
     };
-    get_cache_ttls: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Web app settings */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["FrontendCacheTTLs"];
-                };
-            };
-        };
-    };
     get_connect_apps: {
         parameters: {
             query?: never;
@@ -44716,26 +43455,6 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["DownloadPolicyView"];
-                };
-            };
-        };
-    };
-    get_policy_summary: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Policy summary */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["PolicySummaryResponse"];
                 };
             };
         };
@@ -45374,6 +44093,30 @@ export interface operations {
             };
         };
     };
+    verify_lastfm: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["LastFmSettings"];
+            };
+        };
+        responses: {
+            /** @description Verify verdict */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["VerifyConnectionResponse"];
+                };
+            };
+        };
+    };
     get_library: {
         parameters: {
             query?: never;
@@ -45884,80 +44627,6 @@ export interface operations {
             };
         };
     };
-    create_library_management_profile: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["LibraryManagementProfileCreateRequest"];
-            };
-        };
-        responses: {
-            /** @description Created profile */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["LibraryManagementProfileMutationResponse"];
-                };
-            };
-        };
-    };
-    get_library_management_profile: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Profile id */
-                profile_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Profile */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["LibraryManagementProfile"];
-                };
-            };
-        };
-    };
-    update_library_management_profile: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Profile id */
-                profile_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["LibraryManagementProfileUpdateRequest"];
-            };
-        };
-        responses: {
-            /** @description Saved profile */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["LibraryManagementProfileMutationResponse"];
-                };
-            };
-        };
-    };
     delete_library_management_profile: {
         parameters: {
             query?: never;
@@ -46082,91 +44751,6 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["LibraryManagementChangeImpact"];
-                };
-            };
-        };
-    };
-    get_library_path_mapping: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Path mapping report */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["LibraryPathMappingReport"];
-                };
-            };
-            /** @description Catalog reads are unwired */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-        };
-    };
-    add_library_path: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["LibraryPathRequest"];
-            };
-        };
-        responses: {
-            /** @description Library settings */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["LibrarySettingsResponse"];
-                };
-            };
-        };
-    };
-    remove_library_path: {
-        parameters: {
-            query: {
-                /** @description Directory to remove */
-                path: string;
-            };
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Library settings */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["LibrarySettingsResponse"];
-                };
-            };
-            /** @description Removing the last root would orphan the catalog */
-            400: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
         };
@@ -46395,46 +44979,6 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["LibraryScanScheduleResponse"];
-                };
-            };
-        };
-    };
-    dropped_library_sync: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Section dropped in v3 */
-            410: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-        };
-    };
-    dropped_library_sync_put: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Section dropped in v3 */
-            410: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
         };
@@ -47109,50 +45653,6 @@ export interface operations {
             };
         };
     };
-    get_primary_source: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Primary music source */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["PrimaryMusicSource"];
-                };
-            };
-        };
-    };
-    put_primary_source: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["PrimaryMusicSource"];
-            };
-        };
-        responses: {
-            /** @description Saved source */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["PrimaryMusicSource"];
-                };
-            };
-        };
-    };
     get_prowlarr: {
         parameters: {
             query?: never;
@@ -47591,54 +46091,42 @@ export interface operations {
                 headers: {
                     [name: string]: unknown;
                 };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
+                content?: never;
             };
             /** @description Not authenticated */
             401: {
                 headers: {
                     [name: string]: unknown;
                 };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
+                content?: never;
             };
             /** @description Playback refused */
             403: {
                 headers: {
                     [name: string]: unknown;
                 };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
+                content?: never;
             };
             /** @description Unknown audio id */
             404: {
                 headers: {
                     [name: string]: unknown;
                 };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
+                content?: never;
             };
             /** @description Stream capacity exhausted */
             429: {
                 headers: {
                     [name: string]: unknown;
                 };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
+                content?: never;
             };
             /** @description Remote source failed the read */
             502: {
                 headers: {
                     [name: string]: unknown;
                 };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
+                content?: never;
             };
         };
     };
@@ -48260,78 +46748,6 @@ export interface operations {
                 };
             };
             /** @description Bad body or not a YouTube URL */
-            400: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Not authenticated */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-        };
-    };
-    get_youtube_quota: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Today's budget */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["YouTubeQuotaStatus"];
-                };
-            };
-            /** @description Not authenticated */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-        };
-    };
-    delete_track_link: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Album id */
-                album_id: string;
-                /** @description Disc number */
-                disc_number: number;
-                /** @description Track position on its disc */
-                track_number: number;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Removed, or nothing was saved */
-            204: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            /** @description Disc or track is not a number */
             400: {
                 headers: {
                     [name: string]: unknown;

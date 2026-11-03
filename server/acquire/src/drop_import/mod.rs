@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use self::identify::Outcome;
-use self::store::{DropStore, ItemRecord, JobRecord, StoreError, item_status, job_status};
+use self::store::{DropItemStatus, DropJobStatus, DropStore, ItemRecord, JobRecord, StoreError};
 use crate::flows::seams::{FlowEvent, TickSink};
 use crate::held::store::{
     Entry, EntryOrigin, FileState, GroupKey, HeldFile, HeldRows, NewEntry, NewFile,
@@ -61,6 +61,13 @@ const LIST_LIMIT: i64 = 50;
 /// Where uploads stream before a job exists.
 const INCOMING_DIR: &str = "_incoming";
 
+/// How one item's run ended.
+enum Ran {
+    Done,
+    /// The database closed for a shutdown; the job goes no further.
+    Stopped,
+}
+
 /// Who is asking.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Viewer {
@@ -79,11 +86,17 @@ pub enum DropError {
     Conflict(String),
     /// Storage or the library failed; the cause is logged, not shown.
     Unavailable(String),
+    /// The database was busy during the operation; nothing changed and
+    /// the call can run again.
+    Busy(String),
 }
 
 impl From<StoreError> for DropError {
     fn from(error: StoreError) -> Self {
-        Self::Unavailable(error.to_string())
+        match error {
+            StoreError::Busy { operation } => Self::Busy(operation),
+            StoreError::Failed(_) => Self::Unavailable(error.to_string()),
+        }
     }
 }
 
@@ -281,14 +294,6 @@ impl DropImports {
         Ok(self.store.list_jobs(user, LIST_LIMIT).await?)
     }
 
-    /// One job, when the person may see it.
-    pub async fn get_job(&self, viewer: &Viewer, job_id: &str) -> Result<JobRecord, DropError> {
-        match self.store.get_job(job_id).await? {
-            Some(job) if viewer.admin || job.user_id == viewer.user_id => Ok(job),
-            _ => Err(DropError::NotFound),
-        }
-    }
-
     /// The staging folder uploads wait in: the held list's `drop` root.
     pub fn root(&self) -> &Path {
         &self.root
@@ -316,7 +321,7 @@ impl DropImports {
             .get_job(&item.job_id)
             .await?
             .ok_or(DropError::NotFound)?;
-        if item.status != item_status::NEEDS_REVIEW {
+        if item.status != DropItemStatus::NeedsReview {
             return Err(DropError::Conflict(
                 "Only files awaiting review can be matched.".into(),
             ));
@@ -344,18 +349,29 @@ impl DropImports {
         let landing = self.probe(library.as_ref(), paths).await;
         let summary = match identify::assigned(library.as_ref(), &landing, group).await {
             Outcome::Matched(summary) => summary,
+            Outcome::Busy | Outcome::Closed => {
+                let mut back = item.clone();
+                back.status = DropItemStatus::NeedsReview;
+                self.store
+                    .save_item(&back, DropItemStatus::Processing)
+                    .await?;
+                return Err(DropError::Busy("drop match edition read".to_owned()));
+            }
             other => {
                 let reason = match other {
                     Outcome::Unavailable(detail) => {
                         tracing::warn!(item_id, %detail, "drop match: MusicBrainz unavailable");
                         Reason::MusicbrainzUnavailable
                     }
+                    Outcome::AcoustidUnavailable => Reason::AcoustidUnavailable,
                     Outcome::Review { reason, .. } => reason,
-                    Outcome::Matched(_) => Reason::ImportFailed,
+                    Outcome::Matched(_) | Outcome::Busy | Outcome::Closed => Reason::ImportFailed,
                 };
                 let mut back = item.clone();
-                back.status = item_status::NEEDS_REVIEW.to_owned();
-                self.store.save_item(&back, item_status::PROCESSING).await?;
+                back.status = DropItemStatus::NeedsReview;
+                self.store
+                    .save_item(&back, DropItemStatus::Processing)
+                    .await?;
                 return Err(DropError::Invalid(format!(
                     "{} {}",
                     reason.message(),
@@ -364,7 +380,7 @@ impl DropImports {
             }
         };
         let mut working = item.clone();
-        working.status = item_status::PROCESSING.to_owned();
+        working.status = DropItemStatus::Processing;
         let organised = self
             .organise(&job, working, library.as_ref(), &landing, &summary, true)
             .await;
@@ -373,8 +389,13 @@ impl DropImports {
         // goes onto the album this Match replaced.
         if let Some(reason) = organised.deferred {
             let mut back = item.clone();
-            back.status = item_status::NEEDS_REVIEW.to_owned();
-            self.store.save_item(&back, item_status::PROCESSING).await?;
+            back.status = DropItemStatus::NeedsReview;
+            self.store
+                .save_item(&back, DropItemStatus::Processing)
+                .await?;
+            if reason == Reason::JournalUnreadable {
+                return Err(DropError::Busy("drop match import".to_owned()));
+            }
             return Err(DropError::Conflict(format!(
                 "{} {}",
                 reason.message(),
@@ -522,8 +543,19 @@ impl DropImports {
         };
         tracing::info!(job_id, "drop import job started");
         let cause = match self.process_job(&job).await {
-            Ok((status, items)) => {
-                tracing::info!(job_id, status, items, "drop import job finished");
+            Ok(Some((status, items))) => {
+                tracing::info!(
+                    job_id,
+                    status = status.as_str(),
+                    items,
+                    "drop import job finished"
+                );
+                return;
+            }
+            // The server is stopping: the job stays processing, and the
+            // sweep at the next start settles it.
+            Ok(None) => {
+                tracing::info!(job_id, "drop import job stopped for a shutdown");
                 return;
             }
             Err(cause) => cause,
@@ -533,7 +565,7 @@ impl DropImports {
             .store
             .set_job_status(
                 job_id,
-                job_status::FAILED,
+                DropJobStatus::Failed,
                 Some("The import didn't finish. Check the server log.".to_owned()),
             )
             .await
@@ -543,8 +575,9 @@ impl DropImports {
         self.publish(&job.user_id, job_id);
     }
 
-    /// Answers the job's final status and how many items it made.
-    async fn process_job(&self, job: &JobRecord) -> Result<(&'static str, usize), String> {
+    /// Answers the job's final status and how many items it made, or
+    /// `None` when a shutdown stopped it.
+    async fn process_job(&self, job: &JobRecord) -> Result<Option<(DropJobStatus, usize)>, String> {
         let dir = PathBuf::from(&job.staging_dir);
         let (units, notes) = tokio::task::spawn_blocking(move || extract::extract_and_group(&dir))
             .await
@@ -556,11 +589,11 @@ impl DropImports {
                 .cloned()
                 .unwrap_or_else(|| "No audio files were found in the upload.".to_owned());
             self.store
-                .set_job_status(&job.id, job_status::FAILED, Some(error))
+                .set_job_status(&job.id, DropJobStatus::Failed, Some(error))
                 .await
                 .map_err(|error| error.to_string())?;
             self.publish(&job.user_id, &job.id);
-            return Ok((job_status::FAILED, 0));
+            return Ok(Some((DropJobStatus::Failed, 0)));
         }
         let ids = self
             .store
@@ -571,16 +604,26 @@ impl DropImports {
         self.publish(&job.user_id, &job.id);
         let count = items.len();
         for (id, unit) in items {
-            if let Err(cause) = self
+            match self
                 .process_item(job, id, &unit.folder_name, unit.files)
                 .await
             {
-                tracing::error!(item_id = id, %cause, "drop import item failed");
-                if let Ok(Some(item)) = self.store.get_item(id).await {
-                    let failed = settled(item, item_status::FAILED, Reason::ImportFailed, None);
-                    if let Err(error) = self.store.save_item(&failed, item_status::PROCESSING).await
-                    {
-                        tracing::warn!(item_id = id, %error, "drop item failure not recorded");
+                Ok(Ran::Done) => {}
+                // Nothing more is written and nothing is tidied: the files
+                // stay staged for the next start's sweep.
+                Ok(Ran::Stopped) => return Ok(None),
+                Err(cause) => {
+                    tracing::error!(item_id = id, %cause, "drop import item failed");
+                    if let Ok(Some(item)) = self.store.get_item(id).await {
+                        let failed =
+                            settled(item, DropItemStatus::Failed, Reason::ImportFailed, None);
+                        if let Err(error) = self
+                            .store
+                            .save_item(&failed, DropItemStatus::Processing)
+                            .await
+                        {
+                            tracing::warn!(item_id = id, %error, "drop item failure not recorded");
+                        }
                     }
                 }
             }
@@ -590,12 +633,12 @@ impl DropImports {
         // completes and the notes say what was skipped.
         let note = (!notes.is_empty()).then(|| notes.join(" "));
         self.store
-            .set_job_status(&job.id, job_status::COMPLETED, note)
+            .set_job_status(&job.id, DropJobStatus::Completed, note)
             .await
             .map_err(|error| error.to_string())?;
         self.tidy(job).await;
         self.publish(&job.user_id, &job.id);
-        Ok((job_status::COMPLETED, count))
+        Ok(Some((DropJobStatus::Completed, count)))
     }
 
     async fn process_item(
@@ -604,7 +647,7 @@ impl DropImports {
         item_id: i64,
         folder: &str,
         paths: Vec<PathBuf>,
-    ) -> Result<(), String> {
+    ) -> Result<Ran, String> {
         let item = self
             .store
             .get_item(item_id)
@@ -617,16 +660,16 @@ impl DropImports {
         let landing = self.probe(library.as_ref(), paths).await;
         let unreadable = landing.unreadable.len();
         if landing.audio.is_empty() {
-            let mut failed = settled(item, item_status::FAILED, Reason::Corrupt, None);
+            let mut failed = settled(item, DropItemStatus::Failed, Reason::Corrupt, None);
             failed.staging_paths = Vec::new();
             self.save(&failed).await;
-            return Ok(());
+            return Ok(Ran::Done);
         }
         if landing.audio.len() > MAX_FILES_PER_UNIT {
             let specifics = format!("It has {} audio files.", landing.audio.len());
             self.wait_whole(job, item, Reason::TooManyFiles, Some(specifics))
                 .await;
-            return Ok(());
+            return Ok(Ran::Done);
         }
         match identify::identify(library.as_ref(), &landing, folder).await {
             Outcome::Matched(summary) => {
@@ -644,8 +687,22 @@ impl DropImports {
                 self.wait_whole(job, item, Reason::MusicbrainzUnavailable, None)
                     .await;
             }
+            Outcome::AcoustidUnavailable => {
+                tracing::info!(item_id, "drop import: AcoustID unavailable");
+                self.wait_whole(job, item, Reason::AcoustidUnavailable, None)
+                    .await;
+            }
+            // Background identification reads a busy edition until it
+            // answers, so busy should never reach here.
+            Outcome::Busy => {
+                tracing::warn!(
+                    item_id,
+                    "drop import: identification answered busy; item left as it is"
+                );
+            }
+            Outcome::Closed => return Ok(Ran::Stopped),
         }
-        Ok(())
+        Ok(Ran::Done)
     }
 
     /// Every staged file of an item waits in the held list for `reason`.
@@ -662,7 +719,7 @@ impl DropImports {
             .iter()
             .map(|path| Fate::held(PathBuf::from(path), reason, &detail))
             .collect();
-        let mut review = settled(item, item_status::NEEDS_REVIEW, reason, specifics);
+        let mut review = settled(item, DropItemStatus::NeedsReview, reason, specifics);
         review.staging_paths = Vec::new();
         self.record(&job.user_id, &review, &fates, None).await;
     }
@@ -692,7 +749,7 @@ impl DropImports {
                         .map(|path| Fate::held(path.clone(), Reason::Samples, "")),
                 )
                 .collect();
-            let mut review = settled(item, item_status::NEEDS_REVIEW, reason, specifics);
+            let mut review = settled(item, DropItemStatus::NeedsReview, reason, specifics);
             review.staging_paths = Vec::new();
             (review, fates)
         };
@@ -747,38 +804,6 @@ impl DropImports {
             },
             owner: job.user_id.clone(),
         };
-        let placed = match intake::place(library, &batch, pairing, None).await {
-            Ok(placed) => placed,
-            Err(deferred) => {
-                tracing::warn!(item_id = item.id, detail = %deferred.detail, "library could not take a drop import");
-                // Nothing ran: every file waits with the item. A library that
-                // changed under the import twice keeps the publisher's words.
-                let (reason, specifics) = match deferred.reason {
-                    Reason::LibraryChanged => (Reason::LibraryChanged, Some(deferred.detail)),
-                    Reason::NamingScriptFailed => (Reason::NamingScriptFailed, None),
-                    Reason::LibraryFolderMissing => {
-                        (Reason::LibraryFolderMissing, Some(deferred.detail))
-                    }
-                    _ => (Reason::LibraryUnavailable, None),
-                };
-                let (item, fates) = all_wait(item, reason, specifics);
-                return Organised {
-                    item,
-                    fates,
-                    consumed: Vec::new(),
-                    release: release.clone(),
-                    placed: 0,
-                    fulfills: false,
-                    deferred: Some(reason),
-                };
-            }
-        };
-
-        let mut done = Counts {
-            expected: release.tracks.len(),
-            tags_kept: placed.tags_kept,
-            ..Counts::default()
-        };
         let pairing_of = |file: usize, track: Option<usize>| {
             let track = track.or_else(|| found.scored.pair_for(file).map(|pair| pair.track))?;
             let on = release.tracks.get(track)?;
@@ -791,6 +816,51 @@ impl DropImports {
                 track_title: Some(on.title.clone()),
                 expected_duration_seconds: on.length_ms.map(|ms| ms as f64 / 1000.0),
             })
+        };
+        let placed = match intake::place(library, &batch, pairing, None).await {
+            Ok(placed) => placed,
+            Err(deferred) => {
+                tracing::warn!(item_id = item.id, detail = %deferred.detail, "library could not take a drop import");
+                // Nothing ran: every file waits with the item. A library that
+                // changed under the import twice keeps the publisher's words.
+                let (reason, specifics) = match deferred.reason {
+                    Reason::LibraryChanged => (Reason::LibraryChanged, Some(deferred.detail)),
+                    Reason::NamingScriptFailed => (Reason::NamingScriptFailed, None),
+                    Reason::LibraryFolderMissing => {
+                        (Reason::LibraryFolderMissing, Some(deferred.detail))
+                    }
+                    Reason::LibraryOff => (Reason::LibraryOff, None),
+                    Reason::AcoustidUnavailable => (Reason::AcoustidUnavailable, None),
+                    _ => (Reason::LibraryUnavailable, None),
+                };
+                // An automatic upload is held paired, so the held list retries
+                // it by itself, a wait for AcoustID included (checked as an
+                // automatic import is); a person's Match answers busy and
+                // changes nothing.
+                let put_off = match deferred.reason {
+                    Reason::JournalUnreadable => Reason::JournalUnreadable,
+                    _ => reason,
+                };
+                let (item, mut fates) = all_wait(item, reason, specifics);
+                for (file, fate) in fates.iter_mut().take(landing.audio.len()).enumerate() {
+                    fate.pairing = pairing_of(file, None);
+                }
+                return Organised {
+                    item,
+                    fates,
+                    consumed: Vec::new(),
+                    release: release.clone(),
+                    placed: 0,
+                    fulfills: false,
+                    deferred: Some(put_off),
+                };
+            }
+        };
+
+        let mut done = Counts {
+            expected: release.tracks.len(),
+            tags_kept: placed.tags_kept,
+            ..Counts::default()
         };
         let mut imported_tracks: HashSet<usize> = HashSet::new();
         // Imported and already owned uploads are consumed; the rest wait
@@ -912,7 +982,7 @@ impl DropImports {
                 .or(first_held)
                 .unwrap_or(Reason::NoAlbumMatch);
             ItemRecord {
-                status: item_status::NEEDS_REVIEW.to_owned(),
+                status: DropItemStatus::NeedsReview,
                 detail: Some(if placed > 0 || done.owned > 0 {
                     summary_text
                 } else {
@@ -923,14 +993,14 @@ impl DropImports {
             }
         } else if placed > 0 {
             ItemRecord {
-                status: item_status::IMPORTED.to_owned(),
+                status: DropItemStatus::Imported,
                 detail: Some(summary_text),
                 reason_code: None,
                 ..item
             }
         } else {
             ItemRecord {
-                status: item_status::SKIPPED.to_owned(),
+                status: DropItemStatus::Skipped,
                 detail: Some(format!("{} {summary_text}", Reason::AlreadyOwned.message())),
                 reason_code: Some(Reason::AlreadyOwned),
                 ..item
@@ -1035,7 +1105,7 @@ impl DropImports {
             .write_background("drop_import.record", move |tx| {
                 let at = crate::db::unix_secs_f64(clock.as_ref());
                 let now = clock.now_ms();
-                if !store::write_item(tx, &item, item_status::PROCESSING, at)? {
+                if !store::write_item(tx, &item, DropItemStatus::Processing, at)? {
                     return Ok(false);
                 }
                 let rows = HeldRows::new(tx);
@@ -1165,7 +1235,7 @@ impl DropImports {
 
     /// Settle an item that is processing; a lost race is logged.
     async fn save(&self, item: &ItemRecord) {
-        match self.store.save_item(item, item_status::PROCESSING).await {
+        match self.store.save_item(item, DropItemStatus::Processing).await {
             Ok(true) => {}
             Ok(false) => tracing::warn!(item_id = item.id, "drop item changed under the import"),
             Err(error) => tracing::warn!(item_id = item.id, %error, "drop item not saved"),
@@ -1264,7 +1334,7 @@ pub(crate) fn album_pairing(
 /// detail, the reason beside it.
 fn settled(
     item: ItemRecord,
-    status: &str,
+    status: DropItemStatus,
     reason: Reason,
     specifics: Option<String>,
 ) -> ItemRecord {
@@ -1273,7 +1343,7 @@ fn settled(
         None => reason.message().to_owned(),
     };
     ItemRecord {
-        status: status.to_owned(),
+        status,
         detail: Some(detail),
         reason_code: Some(reason),
         ..item
@@ -1339,11 +1409,16 @@ fn describe(done: &Counts, unreadable: usize, complete: bool) -> String {
     }
     if done.blocked > 0 {
         parts.push(format!(
-            "{} kept because your copy couldn't go to the recycle bin",
+            "{} kept because your copy couldn't be taken away",
             plural(done.blocked, "better file", "better files")
         ));
     }
-    let waiting = done.waiting;
+    // Skipped and kept files wait in the held list too; each is counted
+    // once, under why.
+    let waiting = done
+        .waiting
+        .saturating_sub(done.occupied)
+        .saturating_sub(done.blocked);
     if waiting > 0 {
         parts.push(format!(
             "{} left for review",

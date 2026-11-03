@@ -12,8 +12,8 @@
 
 	import {
 		getAlbumHistoryQuery,
-		undoAlbumFold,
-		undoArtistRepair,
+		createUndoAlbumFoldMutation,
+		createUndoArtistRepairMutation,
 		type AlbumHistoryEntry
 	} from '$lib/queries/library/LibraryAlbumHistoryQueries.svelte';
 	import { authStore } from '$lib/stores/authStore.svelte';
@@ -35,8 +35,8 @@
 		() => albumId
 	);
 
-	const undoFold = undoAlbumFold();
-	const undoArtist = undoArtistRepair();
+	const undoFold = createUndoAlbumFoldMutation();
+	const undoArtist = createUndoArtistRepairMutation();
 	let undoing = $state<{ id: string; artist: boolean } | null>(null);
 	let confirming = $state(false);
 
@@ -99,6 +99,8 @@
 				return `${old} was joined into this album after its files were retagged outside DroppedNeedle.`;
 			case 'retag_half_left_alone':
 				return `Left unmanaged like ${old}, whose files were being retagged as this album.`;
+			case 'retag_dismissal_ended':
+				return `The tracks came back from ${old}, so "Keep them apart" no longer applies.`;
 			case 'leftover_joined':
 				return `${old}, left over from an earlier version as a separate album, was folded into this album.`;
 			case 'artist_from_tracks':
@@ -107,6 +109,8 @@
 				return 'DroppedNeedle moved this album to another edition.';
 			case 'edition_chosen':
 				return 'DroppedNeedle picked an edition for this album.';
+			case 'match_withdrawn':
+				return "DroppedNeedle took this album's match off.";
 			case 'edition_change_undone':
 				if (entry.by === 'you') return "You undid DroppedNeedle's edition change.";
 				if (entry.by === 'person') return "An admin undid DroppedNeedle's edition change.";

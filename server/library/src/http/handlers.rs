@@ -4,8 +4,9 @@
 //! publisher runs on a blocking thread; only the in-memory root registry
 //! answers inline.
 
-use crate::manage::Publishing;
+use crate::management::after_apply::UndoBundleError;
 use crate::management::service::Management;
+use crate::publish::session::Publishing;
 use crate::scans::Scans;
 use axum::{
     Json,
@@ -16,10 +17,10 @@ use droppedneedle_kernel::extract::{ValidJson, ValidQuery};
 use droppedneedle_kernel::page::{Page, PageRequest};
 
 use super::blocking;
+use super::error::refused;
 use super::models::{
     AggregateScope, ManageUndoBody, ManageUndoResponse, PluginFileState, PluginFileView,
-    PluginFilesQuery, RunDetailResponse, ScanFileView, ScanRunView, ScanRunsResponse,
-    ScanScopeView,
+    PluginFilesQuery, RunDetailResponse, ScanFileView, ScanRunView, ScanScopeView,
 };
 use crate::scan::models::{ScanRun, ScanScope};
 use droppedneedle_auth::{Admin, Curator, Principal, User};
@@ -80,28 +81,6 @@ fn scope_view(scope: &ScanScope) -> ScanScopeView {
 // Scan runs.
 // ---------------------------------------------------------------------------
 
-/// List current plus recent scan runs.
-#[utoipa::path(
-    get,
-    tag = "library management",
-    path = "/api/v3/library/scan/runs",
-    responses(
-        (status = 200, description = "Scan runs", body = ScanRunsResponse),
-        (status = 401, description = "Not authenticated"),
-    )
-)]
-pub async fn list_runs(
-    State(state): State<Scans>,
-    User(caller): User,
-) -> Result<Json<ScanRunsResponse>, ApiError> {
-    let (current, history) = blocking(move || state.recent_scan_runs(20)).await?;
-    let view = |run: &ScanRun| caller_run_view(&caller, run);
-    Ok(Json(ScanRunsResponse {
-        current: current.iter().map(view).collect(),
-        history: history.iter().map(view).collect(),
-    }))
-}
-
 /// Get one scan run with its scopes and discovered files.
 #[utoipa::path(
     get,
@@ -139,6 +118,18 @@ pub async fn get_run(
 // Managed changes: undo and plugin files.
 // ---------------------------------------------------------------------------
 
+impl From<UndoBundleError> for ApiError {
+    fn from(error: UndoBundleError) -> Self {
+        match error {
+            UndoBundleError::RunBundle => refused(
+                axum::http::StatusCode::CONFLICT,
+                crate::reasons::UNDO_RUN_FROM_HISTORY,
+            ),
+            UndoBundleError::Service(error) => error.into(),
+        }
+    }
+}
+
 /// Undo one published bundle as a new operation.
 #[utoipa::path(
     post,
@@ -151,7 +142,7 @@ pub async fn get_run(
         (status = 401, description = "Not authenticated"),
         (status = 403, description = "Curator role required"),
         (status = 404, description = "Unknown bundle id, or one a curator did not apply"),
-        (status = 409, description = "Undo blocked for a file, or the library is off"),
+        (status = 409, description = "Undo blocked for a file, a Library Management run's change (undone from History), or the library is off"),
     )
 )]
 pub async fn manage_undo(

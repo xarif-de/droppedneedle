@@ -3,22 +3,22 @@
 	import Button from '$lib/ui/Button.svelte';
 	import Card from '$lib/ui/Card.svelte';
 	import Input from '$lib/ui/Input.svelte';
-	import type { LibraryAlbumDetail, NativeTrackListItem } from '$lib/types';
+	import type { AlbumDetailView, TrackView } from '$lib/types';
 	import type { MembershipPreviewResponse } from '$lib/queries/library/LibraryOperationsTypes';
 	import {
 		getLibraryAlbumDetailQuery,
 		getLibraryAlbumsQuery
 	} from '$lib/queries/library/LibraryQueries.svelte';
 	import {
-		applyAlbumMembership,
-		previewAlbumMembership,
+		createApplyAlbumMembershipMutation,
+		createPreviewAlbumMembershipMutation,
 		type MembershipPreviewInput
 	} from '$lib/queries/library/LibraryCatalogMutations.svelte';
 
 	type Action = 'split' | 'merge' | 'move' | 'reset';
 	interface Props {
-		album: LibraryAlbumDetail;
-		tracks: NativeTrackListItem[];
+		album: AlbumDetailView;
+		tracks: TrackView[];
 	}
 	let { album, tracks }: Props = $props();
 	let dialog: HTMLDialogElement;
@@ -39,15 +39,16 @@
 		order: 'asc',
 		...(targetSearch ? { q: targetSearch } : {})
 	}));
+	const sourceAlbum = getLibraryAlbumDetailQuery(() => album.id);
 	const targetAlbum = getLibraryAlbumDetailQuery(() => targetAlbumId ?? '');
-	const splitPreview = previewAlbumMembership('split');
-	const mergePreview = previewAlbumMembership('merge');
-	const movePreview = previewAlbumMembership('move');
-	const resetPreview = previewAlbumMembership('reset');
-	const splitApply = applyAlbumMembership('split');
-	const mergeApply = applyAlbumMembership('merge');
-	const moveApply = applyAlbumMembership('move');
-	const resetApply = applyAlbumMembership('reset');
+	const splitPreview = createPreviewAlbumMembershipMutation('split');
+	const mergePreview = createPreviewAlbumMembershipMutation('merge');
+	const movePreview = createPreviewAlbumMembershipMutation('move');
+	const resetPreview = createPreviewAlbumMembershipMutation('reset');
+	const splitApply = createApplyAlbumMembershipMutation('split');
+	const mergeApply = createApplyAlbumMembershipMutation('merge');
+	const moveApply = createApplyAlbumMembershipMutation('move');
+	const resetApply = createApplyAlbumMembershipMutation('reset');
 
 	const previewMutation = $derived(
 		action === 'split'
@@ -92,13 +93,9 @@
 		previewResult = null;
 	}
 
-	// Revisions are sent only when the page knows them; the preview token
-	// guards the change either way.
 	function request(): MembershipPreviewInput {
-		const revisions: Record<string, number> = {};
-		if (album.row_revision > 0) revisions[album.id] = album.row_revision;
-		if (targetAlbum.data && targetAlbum.data.row_revision > 0)
-			revisions[targetAlbum.data.id] = targetAlbum.data.row_revision;
+		const revisions: Record<string, number> = { [album.id]: album.row_revision };
+		if (targetAlbum.data) revisions[targetAlbum.data.id] = targetAlbum.data.row_revision;
 		return {
 			track_ids: selectedTrackIds,
 			expected_album_revisions: revisions,
@@ -116,6 +113,13 @@
 		void preview();
 	}
 
+	// A refused change may mean the page's revisions are old: the next preview
+	// needs the current ones.
+	function reloadRevisions(): void {
+		void sourceAlbum.refetch();
+		if (targetAlbumId) void targetAlbum.refetch();
+	}
+
 	async function preview(): Promise<void> {
 		confirmed = false;
 		stalePreview = false;
@@ -126,6 +130,7 @@
 			});
 		} catch {
 			previewResult = null;
+			reloadRevisions();
 		}
 	}
 
@@ -141,6 +146,7 @@
 		} catch {
 			confirmed = false;
 			stalePreview = true;
+			reloadRevisions();
 			previewMutation.reset();
 			previewResult = null;
 		}

@@ -30,11 +30,14 @@ use tracing::instrument::WithSubscriber as _;
 
 use super::{PATIENCE, ScratchDir, busy_open, closed_outbound, migrated_db, through_busy};
 
-/// The app's shutdown grace in tests. On a loaded host the database close
-/// alone has taken half a minute, so the production ten seconds would fail
-/// a shutdown that is slow but finishing. Something that holds the app
-/// still waits out the whole grace, which [`TestApp::stop`] refuses.
-const SHUTDOWN_GRACE: Duration = Duration::from_secs(60);
+/// The app's shutdown grace in tests: the tests' patience, the bound on
+/// every wait for work the app does in its own time. A shutdown that stops
+/// everything in order takes milliseconds, and seconds at a load of 90,
+/// but three ran past a minute in one full run on a busy host. The grace
+/// only bounds the wait: something that holds the app still waits out all
+/// of it, which [`TestApp::stop`] refuses with the warnings the shutdown
+/// logged.
+const SHUTDOWN_GRACE: Duration = PATIENCE;
 
 const ADMIN_NAME: &str = "admin";
 const ADMIN_PASSWORD: &str = "correct horse battery";
@@ -408,21 +411,16 @@ impl TestApp {
         let run = self
             .until("the new folder's first scan", || async {
                 let (status, body) = self
-                    .call_through_busy("GET", "/api/v3/library/scan/runs", &headers, None)
+                    .call_through_busy("GET", "/api/v3/library/scan/runs/current", &headers, None)
                     .await;
                 assert_eq!(status, StatusCode::OK, "{body}");
-                if body["current"]
-                    .as_array()
-                    .is_none_or(|runs| !runs.is_empty())
-                {
+                if !body["active"].is_null() || !body["queued"].is_null() {
                     return None;
                 }
-                body["history"]
-                    .as_array()?
-                    .iter()
-                    .filter_map(|run| run["id"].as_str())
+                self.finished_scans(&headers)
+                    .await
+                    .into_iter()
                     .find(|run| !before.iter().any(|seen| seen == run))
-                    .map(str::to_owned)
             })
             .await;
         self.scan_ended(&run).await;
@@ -471,9 +469,8 @@ impl TestApp {
             let owing: bool = self
                 .db()
                 .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM library_scan_failures \
-                     WHERE run_id = ?1 AND failure_code = ?2)",
-                    [run, FailureCode::RunEndPending.as_str()],
+                    "SELECT next_end_pass IS NOT NULL FROM library_scan_runs WHERE id = ?1",
+                    [run],
                     |row| row.get(0),
                 )
                 .expect("end passes read");
@@ -484,10 +481,15 @@ impl TestApp {
 
     async fn finished_scans(&self, headers: &[(&str, &str)]) -> Vec<String> {
         let (status, body) = self
-            .call_through_busy("GET", "/api/v3/library/scan/runs", headers, None)
+            .call_through_busy(
+                "GET",
+                "/api/v3/library/scan/runs/history?limit=50",
+                headers,
+                None,
+            )
             .await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        body["history"]
+        body["items"]
             .as_array()
             .expect("scan history")
             .iter()

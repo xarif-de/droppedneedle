@@ -108,6 +108,11 @@ pub struct PluginRuntimeInfo {
     /// until it has answered.
     #[serde(default)]
     pub health: Option<PluginHealth>,
+    /// Why the plugin's last library write was refused. Cleared when a
+    /// write lands, the plugin is switched off or removed, or the server
+    /// restarts.
+    #[serde(default)]
+    pub library_refusal: Option<String>,
 }
 
 /// What a plugin says about itself.
@@ -251,8 +256,13 @@ pub struct PluginInstallRequest {
     /// `.../commit/<sha>`.
     pub repository_url: String,
     /// A release tag, tag, branch or commit; overrides any in the URL.
+    /// With `ref_kind`, the reference a preview showed for this URL.
     #[serde(default)]
     pub reference: Option<String>,
+    /// What the preview's `reference` is. Sent with `reference` and `commit`,
+    /// so a plain URL need not be resolved a second time.
+    #[serde(default)]
+    pub ref_kind: Option<PluginRefKind>,
     /// The exact commit from a preview. When set, exactly that commit
     /// installs, whatever the ref points at by now.
     #[serde(default)]

@@ -57,6 +57,7 @@ const EXPECTED: Record<keyof typeof EFFECTS, Sweep[]> = {
 	appPasswordsChanged: [key(U, 'connect-apps', 'app-passwords')],
 	appPasswordRosterChanged: [key('admin', 'connect-apps', 'app-passwords')],
 	connectAppsSettingsChanged: [key('shared', 'connect-apps', 'settings')],
+	myConnectAppsChanged: [key(U, 'connect-apps', 'mine')],
 	connectionsChanged: [key(U, 'me', 'connections')],
 	sourcePlaylistsChanged: [key(U, 'source-playlists', 'job')],
 	spotifyPlaylistsChanged: [key(U, 'spotify', 'playlists')],
@@ -79,10 +80,7 @@ const EXPECTED: Record<keyof typeof EFFECTS, Sweep[]> = {
 		key('admin', 'downloads', 'indexers')
 	],
 	sourcePriorityChanged: [key('admin', 'downloads', 'source-priority')],
-	downloadPolicyChanged: [
-		key('admin', 'downloads', 'policy'),
-		key('shared', 'downloads', 'policy-summary')
-	],
+	downloadPolicyChanged: [key('admin', 'downloads', 'policy')],
 	wantedSettingsChanged: [key('admin', 'downloads', 'wanted-settings')],
 	anyDownloadChanged: [every('downloads')],
 	anyRequestChanged: [every('requests')],
@@ -159,6 +157,13 @@ const EXPECTED: Record<keyof typeof EFFECTS, Sweep[]> = {
 	albumCopiesChanged: [key(U, 'album-match', 'job')],
 	albumCopiesStale: [{ key: [U, 'album-match', 'job'], mark: true }],
 	artistChanged: [key('shared', 'artist', 'u')],
+	artistLinkChanged: [
+		key(U, 'library', 'artist-link', 'job'),
+		key(U, 'library', 'catalog', 'artist-detail', 'job'),
+		key(U, 'library', 'catalog', 'artist-detail', 'x'),
+		key('shared', 'artist', 'x'),
+		every('library', 'artist-reconciliation')
+	],
 	playlistSourcesDropped: [
 		{ key: [U, 'playlists', 'sources', 'job'], exact: true, dropSaved: true }
 	],

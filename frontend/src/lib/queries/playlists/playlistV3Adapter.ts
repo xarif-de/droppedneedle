@@ -1,3 +1,4 @@
+import { ApiError } from '$lib/api/errors';
 import type { components } from '$lib/api/v3/openapi';
 import type {
 	PlaylistDetail,
@@ -21,10 +22,24 @@ export function epochSecToIso(epochSec: number): string {
 }
 
 /** Narrow a V3 list row to its redacted stub. */
-export function isRedactedListItemV3(
+function isRedactedListItemV3(
 	item: PlaylistListItemV3
 ): item is components['schemas']['RedactedPlaylist'] {
 	return item.is_redacted === true;
+}
+
+/** The stub a 403 carries when the playlist is someone else's and private. */
+export function privatePlaylistStub(
+	error: unknown
+): components['schemas']['RedactedPlaylist'] | null {
+	if (!(error instanceof ApiError) || error.code !== 'PLAYLIST_PRIVATE') return null;
+	return error.details as components['schemas']['RedactedPlaylist'];
+}
+
+/** "4 tracks · owned by Cara", the one line a private playlist shows. */
+export function privatePlaylistLine(stub: { track_count: number; owner_name?: string | null }) {
+	const tracks = `${stub.track_count} track${stub.track_count === 1 ? '' : 's'}`;
+	return `${tracks} · ${stub.owner_name ? `owned by ${stub.owner_name}` : 'No owner'}`;
 }
 
 /** V3 track row to the page track shape. */
@@ -47,12 +62,13 @@ export function toPageTrack(track: PlaylistTrackV3): PlaylistTrack {
 		duration: track.duration ?? null,
 		created_at: epochSecToIso(track.created_at),
 		plex_rating_key: track.plex_rating_key ?? null,
-		library_file_id: track.library_file_id ?? null
+		library_file_id: track.library_file_id ?? null,
+		recording_mbid: track.recording_mbid ?? null
 	};
 }
 
 /** V3 summary to the page summary shape (provenance passes through). */
-export function toPageSummary(summary: PlaylistSummaryV3): PlaylistSummary {
+function toPageSummary(summary: PlaylistSummaryV3): PlaylistSummary {
 	return {
 		id: summary.id,
 		name: summary.name,
@@ -65,6 +81,7 @@ export function toPageSummary(summary: PlaylistSummaryV3): PlaylistSummary {
 		updated_at: epochSecToIso(summary.updated_at),
 		is_public: summary.is_public,
 		is_owner: summary.is_owner,
+		can_delete: summary.can_delete,
 		owner_name: summary.owner_name ?? null,
 		is_redacted: false
 	};
@@ -85,6 +102,7 @@ export function toPageListItem(item: PlaylistListItemV3): PlaylistListItem {
 			id: item.id,
 			track_count: item.track_count,
 			owner_name: item.owner_name ?? null,
+			can_delete: item.can_delete,
 			is_redacted: true
 		};
 		return redacted;
@@ -113,7 +131,8 @@ export function trackDataToV3Input(data: TrackData): TrackInputV3 {
 		track_number: data.track_number ?? null,
 		disc_number: data.disc_number ?? null,
 		duration: data.duration ?? null,
-		plex_rating_key: data.plex_rating_key ?? null
+		plex_rating_key: data.plex_rating_key ?? null,
+		recording_mbid: data.recording_mbid ?? null
 	};
 }
 

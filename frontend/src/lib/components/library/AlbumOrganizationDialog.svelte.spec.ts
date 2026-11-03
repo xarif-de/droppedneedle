@@ -1,50 +1,35 @@
 import { page } from 'vitest/browser';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { render } from 'vitest-browser-svelte';
-import type { LibraryAlbumDetail, NativeTrackListItem } from '$lib/types';
+import type { AlbumDetailView, TrackView } from '$lib/types';
 import type { MembershipPreviewResponse } from '$lib/queries/library/LibraryOperationsTypes';
 
-const album: LibraryAlbumDetail = {
+const album: AlbumDetailView = {
 	id: 'album-1',
 	title: 'Grouped Album',
 	artist_name: 'Local Artist',
 	artist_id: 'artist-1',
-	musicbrainz_release_group_id: 'rg-1',
-	musicbrainz_release_id: null,
-	musicbrainz_artist_id: null,
-	album_identity_state: 'release_group_linked',
+	release_group_mbid: 'rg-1',
+	release_mbid: null,
+	artist_mbid: null,
+	identity_state: 'linked',
 	track_count: 2,
 	total_duration_seconds: 300,
 	total_size_bytes: 1000,
 	format: 'flac',
 	year: 2024,
 	is_compilation: false,
-	release_type: 'album',
 	cover_available: false,
+	art_missing: false,
+	favorite: false,
 	date_added: 1,
-	sort_name: null,
-	original_release_date: null,
 	row_revision: 5,
-	input_revision: 'input-5',
-	identification_status: 'identified',
-	review_id: null,
-	review_revision: null,
-	management_identity_readiness: 'ready',
-	mapped_track_count: 2,
-	management_identity_kind: null,
-	custom_manifest_id: null,
-	custom_manifest_version: null,
-	custom_manifest_track_count: 0,
-	custom_manifest_recognized_track_count: 0,
-	custom_manifest_stale: false,
-	active_edition_conversion: null,
+	pending_review_id: null,
 	contribution_id: null,
-	contribution_state: null,
-	display_release_mbid: null,
-	pick_basis: null
+	contribution_state: null
 };
 
-function track(id: string, number: number): NativeTrackListItem {
+function track(id: string, number: number): TrackView {
 	return {
 		id,
 		title: `Track ${number}`,
@@ -54,10 +39,10 @@ function track(id: string, number: number): NativeTrackListItem {
 		artist_name: album.artist_name,
 		album_artist_id: album.artist_id,
 		album_artist_name: album.artist_name,
-		musicbrainz_recording_id: null,
-		musicbrainz_release_group_id: album.musicbrainz_release_group_id,
-		musicbrainz_artist_id: null,
-		musicbrainz_album_artist_id: null,
+		recording_mbid: null,
+		release_group_mbid: album.release_group_mbid,
+		artist_mbid: null,
+		album_artist_mbid: null,
 		disc_number: 1,
 		track_number: number,
 		year: 2024,
@@ -71,8 +56,9 @@ function track(id: string, number: number): NativeTrackListItem {
 		file_size_bytes: 500,
 		date_added: 1,
 		cover_available: false,
-		current_tier: null,
-		below_cutoff: false
+		art_missing: false,
+		favorite: false,
+		row_revision: 1
 	};
 }
 
@@ -99,10 +85,10 @@ const h = vi.hoisted(() => ({
 
 vi.mock('$lib/queries/library/LibraryQueries.svelte', () => ({
 	getLibraryAlbumsQuery: () => ({ data: { items: [] } }),
-	getLibraryAlbumDetailQuery: () => ({ data: undefined })
+	getLibraryAlbumDetailQuery: () => ({ data: undefined, refetch: vi.fn() })
 }));
 vi.mock('$lib/queries/library/LibraryCatalogMutations.svelte', () => ({
-	previewAlbumMembership: (kind: string) => {
+	createPreviewAlbumMembershipMutation: (kind: string) => {
 		h.previewKinds.push(kind);
 		return {
 			mutateAsync: async (input: unknown) => {
@@ -119,7 +105,7 @@ vi.mock('$lib/queries/library/LibraryCatalogMutations.svelte', () => ({
 			}
 		};
 	},
-	applyAlbumMembership: (kind: string) => {
+	createApplyAlbumMembershipMutation: (kind: string) => {
 		h.applyKinds.push(kind);
 		return { mutateAsync: h.apply, isPending: false };
 	}

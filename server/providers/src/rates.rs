@@ -49,7 +49,7 @@ pub const RATES: &[RateRow] = &[
         per_second: Rate::Fixed(0.5),
         burst: 1,
         max_in_flight: None,
-        verified_on: "2026-10-24",
+        verified_on: "2026-10-18",
         basis: "About 1 request per second per IP; over it every request is declined \
                 with HTTP 503. No burst, so two callers never share an instant. \
                 xarif build: held at 0.5.",
@@ -244,6 +244,52 @@ pub const RATES: &[RateRow] = &[
                 past it 429 with Retry-After in seconds. Held at 2 per second, so a \
                 playlist import of a few dozen pages stays well under it.",
         url: "https://developer.spotify.com/documentation/web-api/concepts/rate-limits",
+    },
+    RateRow {
+        source: "plextv",
+        per_second: Rate::Fixed(1.0),
+        burst: 5,
+        max_in_flight: None,
+        verified_on: "2026-10-30",
+        basis: "No published limit; the only 429 documented is for JWT nonce requests, \
+                which DroppedNeedle does not make. Plex's auth guide asks apps to check a \
+                PIN once per second. Held at 1 per second with a burst of 5, so a \
+                sign-in's reads after its PIN go together.",
+        url: "https://developer.plex.tv/pms/",
+    },
+    RateRow {
+        source: "newznab",
+        per_second: Rate::Fixed(1.0),
+        burst: 5,
+        max_in_flight: None,
+        verified_on: "2026-10-30",
+        basis: "No documented limit common to Newznab indexers: each sets its own daily \
+                API and grab caps, which it reports on its answers and the client holds \
+                it to. Each indexer gets a bucket of its own of this shape, 1 per second \
+                with a burst of 5, so one search's caps and query calls go together.",
+        url: "",
+    },
+    RateRow {
+        source: "hibp",
+        per_second: Rate::Fixed(5.0),
+        burst: 5,
+        max_in_flight: Some(4),
+        verified_on: "2026-10-30",
+        basis: "There is no rate limit on the Pwned Passwords API. Held at 5 per second \
+                with 4 in flight, so a burst of sign-ups stays a modest load on a free \
+                service.",
+        url: "https://haveibeenpwned.com/API/v3",
+    },
+    RateRow {
+        source: "oidc",
+        per_second: Rate::Fixed(10.0),
+        burst: 20,
+        max_in_flight: None,
+        verified_on: "2026-10-30",
+        basis: "No documented limit: the provider is whichever one the admin set, often \
+                self-hosted, and paced all the same. 10 per second with a burst of 20 is \
+                far above sign-in volume; a sign-in makes at most five calls.",
+        url: "",
     },
     RateRow {
         source: "ticketmaster",

@@ -22,16 +22,15 @@ use rusqlite::{OptionalExtension, params_from_iter};
 
 use super::RequestsState;
 use super::error::RequestsError;
+use super::ledger::ApprovalState;
 use super::models::AlbumIntake;
 use super::service::RequestsService;
 
 use droppedneedle_auth::{Principal, Role};
-use droppedneedle_catalog::reads::catalog::library::LocalCatalog;
-use droppedneedle_catalog::reads::collections::store::playlists::{
-    NewEntry, PlaylistStore, Written,
-};
-use droppedneedle_catalog::reads::discover::models::QueueItemLight;
-use droppedneedle_catalog::reads::discover::queue::select::{self, Shuffler};
+use droppedneedle_catalog::collections::store::playlists::{NewEntry, PlaylistStore, Written};
+use droppedneedle_catalog::discover::models::QueueItemLight;
+use droppedneedle_catalog::discover::queue::select::{self, Shuffler};
+use droppedneedle_catalog::metadata::library::LocalCatalog;
 use droppedneedle_kernel::db::DbError;
 use droppedneedle_kernel::db::statement::ListLen;
 use droppedneedle_kernel::events::{
@@ -277,10 +276,12 @@ impl PersonalMixBuilder {
                 None
             }
         };
-        match (toggle_on, state.as_deref()) {
-            (true, Some(state)) => state.to_owned(),
+        match (toggle_on, state) {
+            (true, Some(state)) => state.as_str().to_owned(),
             (true, None) => "none".to_owned(),
-            (false, Some(state @ ("rejected" | "revoked"))) => state.to_owned(),
+            (false, Some(state @ (ApprovalState::Rejected | ApprovalState::Revoked))) => {
+                state.as_str().to_owned()
+            }
             (false, _) => "none".to_owned(),
         }
     }
@@ -699,7 +700,7 @@ impl PersonalMixBuilder {
         if role.is_curator() {
             return Ok(true);
         }
-        Ok(self.requests.mixes.state(user_id).await?.as_deref() == Some("approved"))
+        Ok(self.requests.mixes.state(user_id).await? == Some(ApprovalState::Approved))
     }
 
     /// Request up to [`MAX_AUTO_REQUESTS`] missing albums under the
@@ -817,7 +818,7 @@ fn entry_for(track: &MixTrack) -> NewEntry {
     }
 }
 
-fn store_fault(error: droppedneedle_catalog::reads::collections::db::StoreError) -> RequestsError {
+fn store_fault(error: droppedneedle_catalog::collections::db::StoreError) -> RequestsError {
     RequestsError::internal(&error)
 }
 

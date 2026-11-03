@@ -18,7 +18,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use droppedneedle_auth::app_connect::AppConnectState;
 use droppedneedle_auth::app_connect::codes::CODE_TTL_SECS;
 use droppedneedle_auth::app_connect::routes::*;
-use droppedneedle_auth::compat_auth::prod::ProdCompatPasswords;
+use droppedneedle_auth::compat_auth::prod::CompatPasswords;
 use droppedneedle_auth::compat_auth::subsonic::{SubsonicParams, authenticate};
 use droppedneedle_auth::session::store::SessionKind;
 use droppedneedle_auth::users::Role;
@@ -316,8 +316,7 @@ async fn a_code_trades_once_for_exactly_its_app_address_and_verifier() {
     assert_eq!(row.user_id, user.id);
 
     // The password signs in to Subsonic as the user.
-    let compat =
-        ProdCompatPasswords::new(rig.rig.deps.clone(), Arc::clone(&rig.rig.platform.crypto));
+    let compat = CompatPasswords::new(rig.rig.deps.clone(), Arc::clone(&rig.rig.platform.crypto));
     let params = SubsonicParams::new(vec![("apiKey", secret.as_str())]);
     let principal = authenticate(&compat, &params).await.expect("apiKey works");
     assert_eq!(principal.user_id, user.id);
@@ -399,8 +398,7 @@ async fn signing_in_again_on_the_device_replaces_its_password() {
     let rig = Rig::new("app-connect-replace", apps()).await;
     let user = rig.rig.seed_user("molly", Role::User).await;
     let other = rig.rig.seed_user("other", Role::User).await;
-    let compat =
-        ProdCompatPasswords::new(rig.rig.deps.clone(), Arc::clone(&rig.rig.platform.crypto));
+    let compat = CompatPasswords::new(rig.rig.deps.clone(), Arc::clone(&rig.rig.platform.crypto));
 
     let code = rig.code_for(&user.id, connect_request()).await;
     let first = rig.trade(token_body(&code, VERIFIER)).await.1;
@@ -664,7 +662,7 @@ async fn journey_app_connect_through_the_app() {
     );
     assert_eq!(listed["app_passwords"][0]["id"], minted["id"]);
 
-    let compat = ProdCompatPasswords::new(e2e.users(), e2e.crypto());
+    let compat = CompatPasswords::new(e2e.users(), e2e.crypto());
     let params = SubsonicParams::new(vec![("apiKey", minted["app_password"].as_str().unwrap())]);
     let principal = authenticate(&compat, &params).await.expect("apiKey works");
     assert_eq!(principal.user_id, owner["id"].as_str().unwrap());

@@ -42,7 +42,7 @@ use super::downloads::sources::DownloadSource;
 use super::downloads::store::{NewTask, TaskDetails, TaskRow};
 use super::edition::library_holds;
 use super::requests::error::RequestsError;
-use super::requests::ledger::{WantedWatch, WatchState};
+use super::requests::ledger::{WantedWatch, WatchKind, WatchState};
 use super::requests::quota::QuotaLedger;
 use super::requests::sqlite::WantedStore;
 use super::target::{SearchTarget, Targets};
@@ -375,12 +375,19 @@ impl SearchJobs {
         if row.status == SEARCHING && !self.running().contains_key(job_id) {
             // Nothing runs it any more: the server restarted mid-search.
             let reason = SearchReason::Interrupted.code();
-            self.store
+            let moved = self
+                .store
                 .transition(job_id, FAILED, &[SEARCHING], Some(reason))
                 .await
                 .map_err(SearchJobError::Internal)?;
-            row.status = FAILED.to_owned();
-            row.error_message = Some(reason.to_owned());
+            if moved {
+                row.status = FAILED.to_owned();
+                row.error_message = Some(reason.to_owned());
+            } else {
+                // The run stored its result and left between the read and
+                // the check: answer what it stored.
+                row = self.owned(principal, job_id, false).await?;
+            }
         }
         let payload = JobPayload::decode(&row.blob);
         let task_id = self
@@ -563,7 +570,7 @@ impl SearchJobs {
                         artist_mbid: None,
                         year: row.year,
                         cover_url: None,
-                        kind: "missing".to_owned(),
+                        kind: WatchKind::Missing,
                         state: WatchState::Watching,
                         created_at: now,
                         first_release_date: date.found,

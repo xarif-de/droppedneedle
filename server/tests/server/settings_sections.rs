@@ -63,13 +63,7 @@ fn scratch_service() -> (SettingsService, Arc<RecorderEffects>, ScratchDir) {
     tokio::spawn(runner.run(droppedneedle_kernel::jobs::CancellationToken::new()));
     let ids = Arc::new(FixedIdGenerator::new(FIXED_ID));
     (
-        SettingsService::new(
-            store,
-            settled,
-            ids,
-            Arc::new(FakeProbes::passing()),
-            Arc::new(droppedneedle_kernel::clock::SystemClock),
-        ),
+        SettingsService::new(store, settled, ids, Arc::new(FakeProbes::passing())),
         effects,
         dir,
     )
@@ -178,6 +172,13 @@ impl VerifyProbes for FakeProbes {
                 message: "fake listenbrainz".to_owned(),
                 rate_limited: self.rate_limited,
             }
+        })
+    }
+
+    fn lastfm<'a>(&'a self, key: &'a str, secret: &'a str) -> BoxFuture<'a, ProbeVerdict> {
+        Box::pin(async move {
+            self.recorded("lastfm", &[key, secret]);
+            self.verdict("lastfm")
         })
     }
 
@@ -321,8 +322,7 @@ async fn advanced_round_trip_masks() {
         .expect("raw reads");
     assert_eq!(stored.audiodb_api_key.expose(), "audiodb-secret");
 
-    let ttls = service.get_cache_ttls().expect("reads ttls");
-    assert!(!ttls.discover_queue_auto_generate);
+    assert!(!stored.discover_queue_auto_generate);
 }
 
 /// Library settings round-trip with CAS: a stale token is a 409, and
@@ -353,10 +353,6 @@ async fn library_round_trip_cas_and_paths() {
         droppedneedle_kernel::runtime_config::settings_error::SettingsError::StaleRevision { .. }
     ));
 
-    let dir = ScratchDir::new("settings-library");
-    std::fs::create_dir_all(dir.join("music")).expect("fixture dir builds");
-    let root = dir.join("music").to_string_lossy().into_owned();
-
     let saved = service
         .save_library(
             request(
@@ -375,29 +371,6 @@ async fn library_round_trip_cas_and_paths() {
     );
     let stored = service.store.get_raw::<TypedLibrary>().expect("raw reads");
     assert_eq!(stored.acoustid_api_key.expose(), "acoustid-secret");
-
-    let added = service.add_library_path(&root).await.expect("adds path");
-    assert_eq!(added.settings.library_roots.len(), 1);
-    assert_eq!(added.settings.library_roots[0].path, root);
-    // Re-adding is a silent no-op; the key survives path edits.
-    let again = service.add_library_path(&root).await.expect("re-adds");
-    assert_eq!(again.settings.library_roots.len(), 1);
-    assert_eq!(again.settings.acoustid_api_key.expose(), SECRET_MASK);
-    let stored = service.store.get_raw::<TypedLibrary>().expect("raw reads");
-    assert_eq!(stored.acoustid_api_key.expose(), "acoustid-secret");
-
-    let missing = service.add_library_path("").await.expect_err("blank fails");
-    assert!(format!("{missing:?}").contains("required"));
-
-    let removed = service
-        .remove_library_path(&root, false)
-        .await
-        .expect("removes");
-    assert!(removed.settings.library_roots.is_empty());
-    service
-        .remove_library_path("/nothing/here", false)
-        .await
-        .expect("unknown remove is silent");
 }
 
 /// Two saves holding the same revision: exactly one lands, the other is
@@ -526,7 +499,6 @@ async fn settings_routes_are_admin_gated() {
         ("POST", "/api/v3/settings/indexers/test"),
         ("GET", "/api/v3/settings/musicbrainz"),
         ("POST", "/api/v3/settings/musicbrainz/brainzmash/stage"),
-        ("GET", "/api/v3/settings/library/sync"),
         ("GET", "/api/v3/settings/library-management"),
         (
             "POST",
@@ -637,6 +609,34 @@ async fn verify_resolves_masks_and_maps_verdicts() {
         rig.probes.calls()
     );
 
+    // The Last.fm pair resolves its masks to the stored values too.
+    let (status, saved) = call(
+        rig.admin_app(),
+        "PUT",
+        "/api/v3/settings/lastfm",
+        Some(json!({"enabled": true, "api_key": "lfm-live", "shared_secret": "lfm-secret"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(saved["api_key"], SECRET_MASK);
+    let (status, verdict) = call(
+        rig.admin_app(),
+        "POST",
+        "/api/v3/settings/lastfm/verify",
+        Some(saved),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(verdict["valid"], true);
+    assert!(
+        rig.probes
+            .calls()
+            .iter()
+            .any(|call| call == "lastfm(lfm-live,lfm-secret)"),
+        "probe saw the stored Last.fm pair: {:?}",
+        rig.probes.calls()
+    );
+
     // A failing probe maps to a body verdict, never an error status.
     let rig = Rig::open(false).await;
     let (status, verdict) = call(
@@ -731,21 +731,6 @@ async fn lyrics_lookup_on_by_default_off_stays_off() {
     let (status, read) = call(rig.admin_app(), "GET", "/api/v3/settings/lyrics", None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(read["enabled"], false);
-}
-
-/// The dropped catalog-sync section answers 410 on both methods.
-#[tokio::test]
-async fn dropped_routes_answer_gone() {
-    let rig = Rig::open(true).await;
-    for (method, uri) in [
-        ("GET", "/api/v3/settings/library/sync"),
-        ("PUT", "/api/v3/settings/library/sync"),
-    ] {
-        let body = (method == "PUT").then(|| json!({}));
-        let (status, gone) = call(rig.admin_app(), method, uri, body).await;
-        assert_eq!(status, StatusCode::GONE, "{method} {uri}");
-        assert_eq!(gone["error"]["code"], "SECTION_DROPPED");
-    }
 }
 
 /// The BrainzMash ceremony runs over HTTP: stage, consent, verify the
@@ -1205,6 +1190,113 @@ async fn live_probes_hit_stubs() {
     assert!(oidc.valid);
     assert!(!probes.oidc(&format!("{base}/noidc")).await.valid);
     assert!(!probes.oidc("  ").await.valid);
+}
+
+/// A Last.fm stand-in that knows one key pair and counts its requests.
+/// Error bodies follow Last.fm's envelope as recorded live on 2026-10-26
+/// (tests/fixtures/lastfm/invalid_key.json: a 403 with error 10). Codes
+/// 13 (invalid method signature) and 26 (suspended key) are taken from
+/// https://www.last.fm/api/errorcodes and were not provoked live; they are
+/// assumed to come in the same envelope and status.
+fn lastfm_stub(hits: Arc<std::sync::atomic::AtomicUsize>) -> Router {
+    use axum::Json;
+    use axum::extract::Query;
+    use axum::response::IntoResponse;
+
+    let api = move |Query(query): Query<HashMap<String, String>>| {
+        let hits = Arc::clone(&hits);
+        async move {
+            hits.fetch_add(1, Ordering::SeqCst);
+            let refuse = |code: i64, message: &str| {
+                (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({"error": code, "message": message})),
+                )
+                    .into_response()
+            };
+            match query.get("api_key").map(String::as_str) {
+                Some("lfm-key") => {}
+                Some("lfm-suspended") => return refuse(26, "Suspended API key"),
+                _ => return refuse(10, "Invalid API key - You must be granted a valid key"),
+            }
+            match query.get("method").map(String::as_str) {
+                Some("chart.getTopArtists") => {
+                    Json(json!({"artists": {"artist": []}})).into_response()
+                }
+                Some("auth.getToken") => {
+                    let unsigned: Vec<(String, String)> = query
+                        .iter()
+                        .filter(|(key, _)| *key != "api_sig")
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect();
+                    let expected =
+                        droppedneedle_providers::lastfm::api_sig(&unsigned, "lfm-secret");
+                    if query.get("api_sig") == Some(&expected) {
+                        Json(json!({"token": "lfm-token"})).into_response()
+                    } else {
+                        refuse(13, "Invalid method signature supplied")
+                    }
+                }
+                _ => refuse(3, "Invalid Method"),
+            }
+        }
+    };
+    Router::new().route("/2.0/", axum::routing::get(api))
+}
+
+/// The Last.fm test tells a bad key from a wrong secret by Last.fm's own
+/// error code, and sends nothing for a blank key.
+#[tokio::test]
+async fn lastfm_probe_names_the_wrong_credential() {
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("stub binds");
+    let base = format!("http://{}/2.0/", listener.local_addr().expect("addr reads"));
+    let app = lastfm_stub(Arc::clone(&hits));
+    tokio::spawn(async move { axum::serve(listener, app).await.expect("stub serves") });
+    let http = droppedneedle_kernel::http_client::HttpClientFactory::new().expect("http");
+    let probes = LiveProbes::new(
+        reqwest::Client::new(),
+        &droppedneedle_providers::Providers::unpaced_at(
+            Arc::new(droppedneedle_providers::ReqwestWire::new(&http)),
+            droppedneedle_providers::ProviderEndpoints {
+                lastfm: base,
+                ..droppedneedle_providers::ProviderEndpoints::closed()
+            },
+        ),
+    );
+
+    let blank = probes.lastfm("  ", "lfm-secret").await;
+    assert!(!blank.valid);
+    assert_eq!(blank.message, "An API key is required.");
+    assert_eq!(hits.load(Ordering::SeqCst), 0, "a blank key sends nothing");
+
+    let good = probes.lastfm("lfm-key", "lfm-secret").await;
+    assert!(good.valid, "{}", good.message);
+    assert_eq!(good.message, "Connected to Last.fm.");
+
+    for (key, secret, message) in [
+        (
+            "wrong",
+            "lfm-secret",
+            "Last.fm says the API key is invalid.",
+        ),
+        (
+            "lfm-key",
+            "wrong",
+            "The shared secret does not match the key.",
+        ),
+        (
+            "lfm-suspended",
+            "lfm-secret",
+            "Last.fm has suspended this API key.",
+        ),
+    ] {
+        let verdict = probes.lastfm(key, secret).await;
+        assert!(!verdict.valid, "{key}/{secret}");
+        assert_eq!(verdict.message, message, "{key}/{secret}");
+    }
 }
 
 /// Live fan-out kicks the events sweep only for the Events section.

@@ -11,6 +11,7 @@
 //! steps so the tests can prove that restart recovery always resumes
 //! or compensates. Production never sets a crash point.
 
+use crate::identity::ReleaseIdentity;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -28,7 +29,7 @@ use super::journal::{
 use super::paths::Sandbox;
 use super::planner::{
     AlbumJoin, CapabilityGate, CollisionGate, CommitSeal, DiskPreflight, JoinedTrack, PlanBundle,
-    ReleaseIdentity, SealError, SealRecheck, SealedPreview, SpaceProbe,
+    SealError, SealRecheck, SealedPreview, SpaceProbe,
 };
 use super::snapshots::{BlobStore, SnapshotStore, sha256_hex};
 use super::step::{AdoptionFrom, Advanced, Hooks, Run};
@@ -111,14 +112,13 @@ pub(super) fn enqueue_after_commit(
         })
 }
 
-/// The catalog revision: a change counter every commit bumps once. Read
-/// caches key on it, so a commit invalidates them.
+/// The catalog revision: a change counter bumped once by every commit that
+/// changes catalog rows. Read caches key on it, so such a commit
+/// invalidates them.
 pub fn read_revision(conn: &Connection) -> Result<u64, PublishError> {
-    let rev: i64 = conn.query_row(
-        "SELECT value FROM library_catalog_revision WHERE singleton = 1",
-        [],
-        |row| row.get(0),
-    )?;
+    let rev: i64 = conn.query_row(crate::publish::sql::READ_REVISION.text(), [], |row| {
+        row.get(0)
+    })?;
     Ok(rev as u64)
 }
 
@@ -138,20 +138,15 @@ pub struct Located {
 /// `library_track_management_state`.
 pub fn locate(conn: &Connection, track_id: &str) -> Result<Option<Located>, PublishError> {
     conn.query_row(
-        "SELECT t.root_id, t.relative_path, COALESCE(m.applied_projection_hash, ''), \
-             m.last_outcome \
-             FROM local_tracks t \
-             LEFT JOIN library_track_management_state m ON m.local_track_id = t.id \
-             WHERE t.id = ?1",
+        crate::publish::sql::LOCATE.text(),
         rusqlite::params![track_id],
         |row| {
+            let row = crate::publish::sql::LocateRow::read(row)?;
             Ok(Located {
-                root_id: row.get(0)?,
-                rel_path: row.get(1)?,
-                published_sha256: row.get(2)?,
-                last_outcome: row
-                    .get::<_, Option<String>>(3)?
-                    .filter(|outcome| !outcome.is_empty()),
+                root_id: row.root_id,
+                rel_path: row.relative_path,
+                published_sha256: row.applied_projection_hash,
+                last_outcome: row.last_outcome.filter(|outcome| !outcome.is_empty()),
             })
         },
     )
@@ -161,7 +156,8 @@ pub fn locate(conn: &Connection, track_id: &str) -> Result<Option<Located>, Publ
 
 /// Commit one bundle: check every moved track's rows are still as
 /// sealed, move every track row (and its album's root) to its
-/// published location, and bump the catalog revision once. Track and
+/// published location, and bump the catalog revision once. A file added
+/// with no track, or its undo, moves no row and skips the bump. Track and
 /// album ids stay as they are. Files an import fetched for a library
 /// album join it, and are placed on its edition in the same
 /// transaction. An import's match is sealed in it too
@@ -179,6 +175,9 @@ pub(super) fn commit_bundle(
     if commit.tracks.is_empty() && commit.removal.is_none() && commit.put_back.is_none() {
         return Ok(());
     }
+    // Before any row moves: a removal in this commit takes files off the
+    // copy it reads.
+    check_copy_seals(conn, commit)?;
     if let Some(removal) = &commit.removal {
         super::remove::commit(conn, &commit.bundle_id, removal, clock.now_secs())?;
     }
@@ -251,28 +250,19 @@ pub(super) fn commit_bundle(
             move_track(conn, track)?;
         }
         conn.execute(
-            "INSERT INTO library_track_management_state (local_track_id, managed_root_id, \
-                 applied_projection_hash, written_sha256, last_outcome, last_managed_at) \
-                 VALUES (?1, ?2, ?3, ?6, ?4, ?5) \
-                 ON CONFLICT (local_track_id) DO UPDATE SET \
-                 managed_root_id = excluded.managed_root_id, \
-                 applied_projection_hash = excluded.applied_projection_hash, \
-                 written_sha256 = excluded.written_sha256, \
-                 last_outcome = excluded.last_outcome, \
-                 last_managed_at = excluded.last_managed_at, \
-                 row_revision = library_track_management_state.row_revision + 1",
+            crate::publish::sql::COMMIT_BUNDLE.text(),
             rusqlite::params![
                 track.track_id,
                 track.root_id,
                 track.fingerprint,
                 track.mgmt_state.as_str(),
-                now,
+                crate::clock::ms(now),
                 written
             ],
         )?;
     }
     for (album, (release, files)) in &placing {
-        crate::operations::choice::place_imported(tx, album, release, files, now)?;
+        crate::edition::choice::place_imported(tx, album, release, files, now)?;
     }
     // After the placements: a person's edition keeps them, and the
     // seal never writes over a person's rows.
@@ -290,8 +280,8 @@ pub(super) fn mark_missing(
     clock: &dyn Clock,
 ) -> Result<(), PublishError> {
     conn.execute(
-        "UPDATE local_tracks SET availability = 'missing', missing_since = ?2 WHERE id = ?1",
-        rusqlite::params![track_id, clock.now_secs()],
+        crate::publish::sql::MARK_MISSING.text(),
+        rusqlite::params![track_id, clock.now_ms()],
     )?;
     crate::catalog_revision::bump_catalog(conn)?;
     Ok(())
@@ -320,16 +310,13 @@ fn retire_replaced(
         track.rel_path
     );
     let retired_rows = conn.execute(
-        "UPDATE local_tracks SET availability = 'missing', missing_since = ?5, \
-         relative_path = ?4, file_path = ?6, path_hash = ?7, \
-         row_revision = row_revision + 1 \
-         WHERE id = ?1 AND root_id = ?2 AND relative_path = ?3",
+        crate::publish::sql::RETIRE_REPLACED_TRACK.text(),
         rusqlite::params![
             replaced,
             track.root_id,
             track.rel_path,
             retired,
-            now,
+            crate::clock::ms(now),
             recycle_to,
             sha256_hex(retired.as_bytes())
         ],
@@ -340,9 +327,7 @@ fn retire_replaced(
     // Its file is in the recycle bin: no record of it may make a file on
     // its album look like it took its place.
     conn.execute(
-        "UPDATE library_track_management_state SET written_sha256 = NULL, \
-         managed_path_revision = NULL, row_revision = row_revision + 1 \
-         WHERE local_track_id = ?1",
+        crate::publish::sql::FORGET_REPLACED_STATE.text(),
         rusqlite::params![replaced],
     )?;
     Ok(())
@@ -357,16 +342,18 @@ fn changed_under(track_id: &str, bundle_id: &str) -> PublishError {
 /// placed there and placement refuses a taken name, so another row still
 /// on that path describes a file that is gone. A missing or excluded row
 /// gives the path up for a hidden name of its own and keeps everything
-/// else: its id, availability, `missing_since`, album and record. A row
+/// else: its id, availability, `missing_at`, album and record. A row
 /// the catalog still lists as indexed fails the commit until a scan has
 /// seen its file go.
 fn give_up_destination(conn: &Connection, track: &TrackCommit) -> Result<(), PublishError> {
     let occupant: Option<(String, String)> = conn
         .query_row(
-            "SELECT id, availability FROM local_tracks \
-             WHERE root_id = ?1 AND relative_path = ?2 AND id <> ?3",
+            crate::publish::sql::GIVE_UP_DESTINATION.text(),
             rusqlite::params![track.root_id, track.rel_path, track.track_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| {
+                let row = crate::publish::sql::TrackAvailability::read(row)?;
+                Ok((row.id, row.availability))
+            },
         )
         .optional()?;
     let Some((occupant, availability)) = occupant else {
@@ -424,8 +411,7 @@ pub(super) fn give_up(
 /// track and album ids (and with them the identity) stay.
 fn move_track(conn: &Connection, track: &TrackCommit) -> Result<(), PublishError> {
     let moved = conn.execute(
-        "UPDATE local_tracks SET root_id = ?2, relative_path = ?3, file_path = ?4, \
-         path_hash = ?5, row_revision = row_revision + 1 WHERE id = ?1",
+        crate::publish::sql::WRITE_TRACK_PLACE.text(),
         rusqlite::params![
             track.track_id,
             track.root_id,
@@ -440,11 +426,7 @@ fn move_track(conn: &Connection, track: &TrackCommit) -> Result<(), PublishError
         ));
     }
     conn.execute(
-        "UPDATE local_albums SET root_id = ?2, row_revision = row_revision + 1 \
-         WHERE id = (SELECT local_album_id FROM local_tracks WHERE id = ?1) \
-         AND root_id <> ?2 AND NOT EXISTS (SELECT 1 FROM local_tracks t \
-         WHERE t.local_album_id = local_albums.id AND t.root_id <> ?2 \
-         AND t.availability = 'indexed')",
+        crate::publish::sql::MOVE_ALBUM_ROOT.text(),
         rusqlite::params![track.track_id, track.root_id],
     )?;
     Ok(())
@@ -467,13 +449,12 @@ pub(crate) fn joined_album(
 ) -> rusqlite::Result<Option<JoinedAlbum>> {
     let found: Option<(String, Option<String>, Option<String>)> = conn
         .query_row(
-            "SELECT b.id, i.release_mbid, i.release_group_mbid FROM local_albums b \
-             LEFT JOIN local_album_external_identities i \
-             ON i.local_album_id = b.id AND i.provider = 'musicbrainz' \
-             WHERE b.id = (SELECT COALESCE(retired_into_album_id, id) FROM local_albums \
-             WHERE id = ?1)",
+            crate::publish::sql::JOINED_ALBUM.text(),
             rusqlite::params![join.album_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| {
+                let row = crate::publish::sql::JoinedAlbumRow::read(row)?;
+                Ok((row.id, row.release_mbid, row.release_group_mbid))
+            },
         )
         .optional()?;
     let Some((album_id, release, group)) = found else {
@@ -500,6 +481,71 @@ pub(crate) fn joined_album(
     })
 }
 
+/// The library folder and the one folder in it that hold the album's
+/// indexed files on `disc` (all of its indexed files when none is on that
+/// disc). `None` when they sit in several folders or at the top of a
+/// library folder.
+pub(crate) fn copy_folder(
+    conn: &Connection,
+    album_id: &str,
+    disc: u32,
+) -> rusqlite::Result<Option<(String, String)>> {
+    let rows: Vec<(String, String, i64)> = conn
+        .prepare(crate::publish::sql::COPY_FOLDER.text())?
+        .query_map(rusqlite::params![album_id], |row| {
+            let row = crate::publish::sql::CopyFolderRow::read(row)?;
+            Ok((row.root_id, row.relative_path, row.disc_number))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let disc = i64::from(disc.max(1));
+    let on_disc: Vec<&(String, String, i64)> =
+        rows.iter().filter(|row| row.2.max(1) == disc).collect();
+    let files = if on_disc.is_empty() {
+        rows.iter().collect()
+    } else {
+        on_disc
+    };
+    let mut folders = files.iter().map(|(root, rel, _)| {
+        let folder = Path::new(rel)
+            .parent()
+            .map(|parent| parent.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        (root.as_str(), folder)
+    });
+    let Some(first) = folders.next() else {
+        return Ok(None);
+    };
+    let one = folders.all(|folder| folder == first);
+    Ok((one && !first.1.is_empty()).then(|| (first.0.to_owned(), first.1)))
+}
+
+/// Refuse the bundle when a file's joined copy no longer sits where its
+/// placement read it: the file would be on that album in the wrong folder.
+fn check_copy_seals(conn: &Connection, commit: &BundleCommit) -> Result<(), PublishError> {
+    for track in &commit.tracks {
+        let Some(adoption) = &track.adopt else {
+            continue;
+        };
+        let (Some(join), Some(seal)) = (&adoption.join, &adoption.copy_seal) else {
+            continue;
+        };
+        let folder = match joined_album(conn, join)? {
+            Some(joined) => copy_folder(conn, &joined.album_id, seal.disc)?,
+            None => None,
+        };
+        if folder != seal.folder {
+            return Err(PublishError::JoinChanged(
+                format!(
+                    "the album of track {} moved while it was being written",
+                    track.track_id
+                )
+                .into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Add a file the bundle brought into the library: index the published
 /// file from its own tags and header, exactly as a scan would, at the
 /// track id the plan pinned. A file fetched for a library album joins it
@@ -523,10 +569,12 @@ fn adopt_track(
     if adoption.join.is_some() {
         let at_path: Option<(String, String)> = conn
             .query_row(
-                "SELECT id, local_album_id FROM local_tracks \
-                 WHERE root_id = ?1 AND relative_path = ?2",
+                crate::publish::sql::TRACK_AT_PATH.text(),
                 rusqlite::params![track.root_id, track.rel_path],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| {
+                    let row = crate::publish::sql::TrackAtPath::read(row)?;
+                    Ok((row.id, row.local_album_id))
+                },
             )
             .optional()?;
         match at_path {
@@ -571,16 +619,14 @@ fn adopt_track(
     }
     if joined.is_some() {
         conn.execute(
-            "UPDATE local_tracks SET membership_source = 'manual', membership_locked = 1, \
-             row_revision = row_revision + 1 WHERE id = ?1",
+            crate::publish::sql::LOCK_TRACK_MEMBERSHIP.text(),
             rusqlite::params![adopted],
         )?;
     }
     // Provenance, as v2 recorded it: how the file came in, and which
     // download (if any) brought it.
     conn.execute(
-        "UPDATE local_tracks SET ingest_source = ?4, download_task_id = ?2, \
-         source_path = ?3 WHERE id = ?1",
+        crate::publish::sql::SET_TRACK_INGEST.text(),
         rusqlite::params![
             adopted,
             adoption.download_task_id,
@@ -942,10 +988,7 @@ impl<P: SpaceProbe> Publisher<P> {
         live: &SealRecheck,
         bytes: Vec<u8>,
     ) -> Result<PublishOutcome, PublishError> {
-        self.added_bytes = Some(bytes);
-        let outcome = self.publish_recorded(sealed, live, &BTreeMap::new(), None, None);
-        self.added_bytes = None;
-        outcome
+        self.publish_adding(sealed, live, &BTreeMap::new(), None, Some(bytes), None)
     }
 
     /// [`Self::publish_add`] within `terms`: a file not placed by its
@@ -958,13 +1001,14 @@ impl<P: SpaceProbe> Publisher<P> {
         bytes: Vec<u8>,
         terms: AddTerms<'_>,
     ) -> Result<PublishOutcome, PublishError> {
-        self.added_bytes = Some(bytes);
-        self.add_budget = Some((terms.deadline, terms.cancelled));
-        let outcome =
-            self.publish_recorded(sealed, live, &BTreeMap::new(), None, Some(terms.on_record));
-        self.added_bytes = None;
-        self.add_budget = None;
-        outcome
+        self.publish_adding(
+            sealed,
+            live,
+            &BTreeMap::new(),
+            None,
+            Some(bytes),
+            Some(terms),
+        )
     }
 
     /// [`Self::publish`], recording the account that applied the bundle
@@ -981,7 +1025,36 @@ impl<P: SpaceProbe> Publisher<P> {
         docs: &BTreeMap<String, TagDocument>,
         applied_by: Option<&str>,
     ) -> Result<PublishOutcome, PublishError> {
-        self.publish_recorded(sealed, live, docs, applied_by, None)
+        self.publish_adding(sealed, live, docs, applied_by, None, None)
+    }
+
+    /// Every publish starts here: it sets the added file's bytes and
+    /// budget for this publish alone, so a publish that stopped partway
+    /// never leaves them to the next one, and clears them after.
+    fn publish_adding(
+        &mut self,
+        sealed: &SealedPreview,
+        live: &SealRecheck,
+        docs: &BTreeMap<String, TagDocument>,
+        applied_by: Option<&str>,
+        bytes: Option<Vec<u8>>,
+        terms: Option<AddTerms<'_>>,
+    ) -> Result<PublishOutcome, PublishError> {
+        self.added_bytes = bytes;
+        let on_record = match terms {
+            Some(terms) => {
+                self.add_budget = Some((terms.deadline, terms.cancelled));
+                Some(terms.on_record)
+            }
+            None => {
+                self.add_budget = None;
+                None
+            }
+        };
+        let outcome = self.publish_recorded(sealed, live, docs, applied_by, on_record);
+        self.added_bytes = None;
+        self.add_budget = None;
+        outcome
     }
 
     /// [`Self::publish_as`], running `on_record` in the transaction that
@@ -1004,10 +1077,10 @@ impl<P: SpaceProbe> Publisher<P> {
         // pass, before the first byte stages. Rows for operations that
         // then fail linger harmlessly: undo of one compares the published
         // bytes, which never landed, so it stays put.
-        let (today, now) = (self.today_day, self.now_ms);
+        let now = self.now_ms;
         self.db
             .write_blocking(Lane::Background, "publish.record_operation", |tx| {
-                super::operations::record_operation(tx, bundle, today, now, applied_by)?;
+                super::operations::record_operation(tx, bundle, now, applied_by)?;
                 match on_record {
                     Some(on_record) => on_record(tx, &bundle.id, now),
                     None => Ok(()),
@@ -1178,7 +1251,8 @@ impl<P: SpaceProbe> Publisher<P> {
                         let place: Option<(String, String, String)> = conn
                             .prepare_cached(super::sql::TRACK_PLACE.text())?
                             .query_row(rusqlite::params![track_id], |row| {
-                                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                                let row = super::sql::TrackPlace::read(row)?;
+                                Ok((row.root_id, row.relative_path, row.availability))
                             })
                             .optional()?;
                         let ready = place.is_some_and(|(root, rel, availability)| {
@@ -1237,24 +1311,40 @@ impl<P: SpaceProbe> Publisher<P> {
         }
         // A replaced file's bin entry is checked before anything moves.
         // While the bins are unknown the publish waits, as a busy database
-        // makes it.
+        // makes it. An entry in a bin the session no longer holds is
+        // rebound after the commit to the bin that serves its root now, so
+        // it passes while that root has one, and waits while it has none.
         let entries = items
             .iter()
-            .filter_map(|item| item.replaces.as_ref())
-            .map(|replaced| replaced.recycle_to.as_str())
-            .chain(
-                removal
-                    .into_iter()
-                    .flat_map(|removal| super::remove::files(&sealed.bundle.id, removal))
-                    .map(|(_, file)| file.recycle_to.as_str()),
-            );
-        for recycle_to in entries {
+            .filter_map(|item| {
+                item.replaces
+                    .as_ref()
+                    .map(|replaced| (item.dest_root.as_str(), replaced.recycle_to.as_str()))
+            })
+            .chain(removal.into_iter().flat_map(|removal| {
+                let tracks = removal.items.iter().filter_map(|item| {
+                    item.file
+                        .as_ref()
+                        .map(|file| (item.seal.root_id.as_str(), file.recycle_to.as_str()))
+                });
+                let sidecars = removal
+                    .sidecars
+                    .iter()
+                    .map(|sidecar| (sidecar.root_id.as_str(), sidecar.file.recycle_to.as_str()));
+                tracks.chain(sidecars)
+            }));
+        for (root_id, recycle_to) in entries {
             if let Some(cause) = self.sandbox.bins_unknown() {
+                return Err(PublishError::BinsUnknown(cause));
+            }
+            let recycle_to = Path::new(recycle_to);
+            if self.sandbox.bin_holding(recycle_to).is_some() {
+                self.sandbox.ensure_under_bin(recycle_to)?;
+            } else if self.sandbox.bin_for(root_id).is_err() {
                 return Err(PublishError::Interrupted(format!(
-                    "no recycle bin is known while {cause}"
+                    "library root {root_id} has no usable recycle bin"
                 )));
             }
-            self.sandbox.ensure_under_bin(Path::new(recycle_to))?;
         }
         let bin_copies = put_back
             .into_iter()
@@ -1262,9 +1352,7 @@ impl<P: SpaceProbe> Publisher<P> {
             .filter(|item| !item.home_already && item.copy_in == super::planner::CopyIn::Bin);
         for item in bin_copies {
             if let Some(cause) = self.sandbox.bins_unknown() {
-                return Err(PublishError::Interrupted(format!(
-                    "no recycle bin is known while {cause}"
-                )));
+                return Err(PublishError::BinsUnknown(cause));
             }
             self.sandbox.ensure_under_bin(Path::new(&item.copy))?;
         }
@@ -1709,6 +1797,30 @@ impl<P: SpaceProbe> Publisher<P> {
                 parent,
             )?;
         }
+        // The file it replaces must still be the one planned against, and
+        // have a bin entry to go to; it lends the new file its permissions.
+        let mut mode = None;
+        if let Some(replaced) = &output.replaces {
+            if replaced.recycle_to.is_empty() {
+                return Err(PublishError::Validation(
+                    format!("the file {} replaces has no bin entry", output.dest_rel).into(),
+                ));
+            }
+            let holds = paths::hash_regular_file(&dest)
+                .ok()
+                .filter(|hashed| hashed.sha256 == replaced.sha256);
+            let Some(holds) = holds else {
+                return Err(PublishError::Validation(
+                    format!(
+                        "the file {} replaces changed after planning",
+                        output.dest_rel
+                    )
+                    .into(),
+                ));
+            };
+            self.known.record(holds.stat, &holds.sha256);
+            mode = Some(paths::permission_bits(&dest)?);
+        }
         let temp = self.sandbox.temp_path_for(&dest, &journal_id)?;
         self.sandbox.ensure_under_roots(&temp)?;
         self.journal_insert(&FileJournal {
@@ -1726,9 +1838,14 @@ impl<P: SpaceProbe> Publisher<P> {
             commit_as: None,
             state: JournalState::Prepared,
             seq: 0,
-            replaces: None,
+            replaces: output.replaces.as_ref().map(|replaced| JournalReplacement {
+                rel: output.dest_rel.clone(),
+                sha256: replaced.sha256.clone(),
+                track_id: None,
+                recycle_to: replaced.recycle_to.clone(),
+            }),
         })?;
-        write_staged_temp(&temp, &bytes, None)?;
+        write_staged_temp(&temp, &bytes, mode)?;
         self.journal_staged(&journal_id)
     }
 
@@ -1969,6 +2086,7 @@ impl<P: SpaceProbe> Publisher<P> {
             PublishError::InjectedCrash(_)
                 | PublishError::Cleanup(_)
                 | PublishError::Interrupted(_)
+                | PublishError::BinsUnknown(_)
         )
     }
 

@@ -9,7 +9,10 @@
 //!   compact JSON, never decoded into its section, normalized, validated or
 //!   decrypted, so every secret stays the ciphertext it was), except that
 //!   each download policy recipe step loses `target_bitrate_kbps`, a field
-//!   that was removed and that the step's strict decode would refuse;
+//!   that was removed and that the step's strict decode would refuse, and
+//!   the download policy's `recycle_bin_path` and `recycle_retention_days`
+//!   move to Library Management ([`move_recycle_bin`],
+//!   [`move_recycle_retention`]);
 //! - unknown and dropped keys are not copied, and the record names them;
 //! - the record (`config_ingests`) is written in the same transaction, so a
 //!   crash before the commit repeats the copy and one after it stops it.
@@ -36,7 +39,9 @@ use sha2::{Digest, Sha256};
 use crate::db::{Db, DbError, DurableLane};
 
 use super::error::ConfigError;
-use super::sections::{DownloadPolicy, Section as _};
+use super::sections::{
+    DownloadPolicy, LibraryManagement, LibraryScanSchedule, Section as _, current_scan_frequency,
+};
 use super::store::encode_text;
 use super::{KNOWN_TOP_LEVEL_KEYS, sql};
 use crate::clock::Clock;
@@ -187,9 +192,12 @@ fn parse_file(path: &Path) -> Result<LegacyFile, ConfigError> {
     let bytes = std::fs::read(path).map_err(|error| refused(error.to_string()))?;
     let value: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|error| refused(format!("it is not valid JSON ({error})")))?;
-    let serde_json::Value::Object(object) = value else {
+    let serde_json::Value::Object(mut object) = value else {
         return Err(refused("it is not a JSON object".to_owned()));
     };
+    move_recycle_bin(&mut object);
+    move_recycle_retention(&mut object);
+    retire_fast_scan_schedule(&mut object);
     let mut rows = Vec::new();
     let mut left_behind = Vec::new();
     for (key, mut value) in object {
@@ -227,6 +235,94 @@ fn strip_removed_recipe_fields(policy: &mut serde_json::Value) {
             step.remove("target_bitrate_kbps");
         }
     }
+}
+
+/// What [`move_recycle_bin`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BinMoved {
+    /// The Library Management path the policy's replaced, if another.
+    pub replaced: Option<String>,
+}
+
+/// Move the download policy's `recycle_bin_path` to Library Management,
+/// the one place the bin is set now, in a settings object keyed by
+/// section. A non-blank policy path wins, because it is the one removals
+/// used. With a blank one, a path Library Management holds stays, because
+/// a person chose it. `None` when no path moved. The v2 import uses it too.
+pub fn move_recycle_bin(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+) -> Option<BinMoved> {
+    const FIELD: &str = "recycle_bin_path";
+    let path = object
+        .get_mut(DownloadPolicy::KEY)
+        .and_then(serde_json::Value::as_object_mut)
+        .and_then(|policy| policy.remove(FIELD))?;
+    if path.as_str().is_none_or(|path| path.trim().is_empty()) {
+        return None;
+    }
+    let management = object
+        .entry(LibraryManagement::KEY)
+        .or_insert(serde_json::Value::Null);
+    if management.is_null() {
+        *management = serde_json::Value::Object(serde_json::Map::new());
+    }
+    let management = management.as_object_mut()?;
+    let replaced = management
+        .insert(FIELD.to_owned(), path.clone())
+        .and_then(|old| old.as_str().map(str::to_owned))
+        .filter(|old| !old.trim().is_empty() && path.as_str() != Some(old));
+    Some(BinMoved { replaced })
+}
+
+/// Move the download policy's `recycle_retention_days` to Library
+/// Management in a settings object keyed by section, as it was stored, so a
+/// value that does not read still does not read there and expiry waits. A
+/// policy that is not an object may have held one, so Library Management
+/// gets a null, which does not read either. True when anything moved. With
+/// no value there, a retention Library Management holds stays. The v2
+/// import uses it too.
+pub fn move_recycle_retention(object: &mut serde_json::Map<String, serde_json::Value>) -> bool {
+    const FIELD: &str = "recycle_retention_days";
+    let days = match object.get_mut(DownloadPolicy::KEY) {
+        None | Some(serde_json::Value::Null) => return false,
+        Some(serde_json::Value::Object(policy)) => match policy.remove(FIELD) {
+            Some(days) => days,
+            None => return false,
+        },
+        Some(_) => serde_json::Value::Null,
+    };
+    let management = object
+        .entry(LibraryManagement::KEY)
+        .or_insert(serde_json::Value::Null);
+    if management.is_null() {
+        *management = serde_json::Value::Object(serde_json::Map::new());
+    }
+    let Some(management) = management.as_object_mut() else {
+        return false;
+    };
+    management.insert(FIELD.to_owned(), days);
+    true
+}
+
+/// Rewrite a retired scan schedule in a settings object keyed by section,
+/// so it lands as 30 minutes rather than as a section that does not read.
+/// Says whether it changed anything. The v2 import uses it too.
+pub fn retire_fast_scan_schedule(object: &mut serde_json::Map<String, serde_json::Value>) -> bool {
+    let Some(frequency) = object
+        .get_mut(LibraryScanSchedule::KEY)
+        .and_then(|schedule| schedule.get_mut("scan_frequency"))
+    else {
+        return false;
+    };
+    let Some(stored) = frequency.as_str() else {
+        return false;
+    };
+    let current = current_scan_frequency(stored);
+    if current == stored {
+        return false;
+    }
+    *frequency = serde_json::Value::String(current.to_owned());
+    true
 }
 
 /// Run the one-time copy for a store opening on `db`. See the module doc.

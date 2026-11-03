@@ -4,13 +4,13 @@
 	import Input from '$lib/ui/Input.svelte';
 	import SelectField from '$lib/ui/SelectField.svelte';
 	import { getLibraryScanScheduleQuery } from '$lib/queries/library/LibraryQueries.svelte';
-	import { saveLibraryScanSchedule } from '$lib/queries/library/LibraryMutations.svelte';
+	import { createSaveLibraryScanScheduleMutation } from '$lib/queries/library/LibraryMutations.svelte';
 	import { SCAN_FREQUENCY_OPTIONS } from '$lib/utils/scanFrequency';
 	import { toastStore } from '$lib/stores/toast';
 	import type { ScanFrequency } from '$lib/types';
 
 	const scheduleQuery = getLibraryScanScheduleQuery();
-	const save = saveLibraryScanSchedule();
+	const save = createSaveLibraryScanScheduleMutation();
 
 	let frequency = $state<ScanFrequency>('24hr');
 	let dailyTime = $state('03:00');
@@ -32,13 +32,6 @@
 		seeded && (scheduleQuery.data?.scan_frequency !== frequency || timeChanged)
 	);
 	const lastScan = $derived(scheduleQuery.data?.last_scan_at ?? null);
-
-	// Hide the legacy 5/10-minute options unless one is already selected.
-	const options = $derived(
-		SCAN_FREQUENCY_OPTIONS.filter(
-			(o) => !o.legacy || o.value === scheduleQuery.data?.scan_frequency
-		)
-	);
 
 	async function handleSave() {
 		try {
@@ -66,10 +59,7 @@
 		<SelectField
 			label="Scheduled scan frequency"
 			bind:value={frequency}
-			options={options.map((opt) => ({
-				value: opt.value,
-				label: `${opt.label}${opt.legacy ? ' (legacy)' : ''}`
-			}))}
+			options={SCAN_FREQUENCY_OPTIONS}
 		/>
 		{#if isDaily}
 			<Field label="Time of day">

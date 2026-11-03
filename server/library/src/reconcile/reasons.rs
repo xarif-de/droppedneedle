@@ -1,7 +1,7 @@
 //! Why a duplicate group needs a look, or why a request was refused: one
 //! stable code, one plain sentence, and what to do about it.
 
-pub use crate::operations::reasons::Reason;
+pub use crate::reasons::Reason;
 
 const fn reason(code: &'static str, message: &'static str, action: &'static str) -> Reason {
     Reason {
@@ -37,9 +37,19 @@ pub const CREDITS_MOVED: Reason = reason(
     "A tag edit moved this record's songs to another record.",
     "Merge them if it is one artist, or mark them as distinct.",
 );
+pub const SHARED_PROVIDER_IDENTITY: Reason = reason(
+    "SHARED_PROVIDER_IDENTITY",
+    "A link set by hand names the MusicBrainz artist another record already is.",
+    "Merge them if it is one artist, or mark them as distinct.",
+);
 pub const RESOLVED_BY_NAME: Reason = reason(
     crate::corrections::artist_convergence::MERGED_BY_NAME,
     "A tag edit changed only how this artist's name is written or sorted, so the records were merged.",
+    "Nothing to do.",
+);
+pub const RESOLVED_V2_PLACEHOLDER: Reason = reason(
+    crate::corrections::artist_convergence::V2_PLACEHOLDER_FOLDED,
+    "The upgrade merged v2's Unknown Artist into this one.",
     "Nothing to do.",
 );
 pub const RESOLVED_AUTOMATICALLY: Reason = reason(
@@ -74,7 +84,9 @@ pub fn for_code(code: &str) -> Reason {
         "INCOMPLETE_PROVIDER_PROOF" => INCOMPLETE_PROVIDER_PROOF,
         "NAME_MATCH_WITHOUT_PROVIDER_PROOF" => NAME_MATCH_WITHOUT_PROVIDER_PROOF,
         "CREDITS_MOVED_WITHOUT_PROOF" => CREDITS_MOVED,
+        "SHARED_PROVIDER_IDENTITY" => SHARED_PROVIDER_IDENTITY,
         code if code == RESOLVED_BY_NAME.code => RESOLVED_BY_NAME,
+        code if code == RESOLVED_V2_PLACEHOLDER.code => RESOLVED_V2_PLACEHOLDER,
         _ => RESOLVED_AUTOMATICALLY,
     }
 }

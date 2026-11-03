@@ -9,17 +9,18 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use droppedneedle_kernel::db::statement::ListLen;
 use rusqlite::types::Value;
 use rusqlite::{OptionalExtension as _, Transaction, params, params_from_iter};
 use serde::Serialize;
 
-use super::edition::{self, Settle, placeholders};
+use super::edition::{self, Settle};
 use super::models::{
     AlbumGroup, CorrectionError, EditionChange, EditionChangeKind, IdentityChoice, MembershipKind,
     MembershipOutcome, MembershipRequest,
 };
 use super::reasons;
-use crate::identify::sqlite::{offer_album, retarget_references};
+use crate::identify::sqlite::{bump_identification_stream, offer_album, retarget_references};
 use crate::management::takeover;
 
 /// One stored track the change reads.
@@ -59,7 +60,7 @@ struct Material<'a> {
     title: Option<&'a str>,
     album_artist_name: Option<&'a str>,
     identity_choice: IdentityChoice,
-    albums: Vec<(String, i64, i64)>,
+    albums: Vec<(String, i64, String)>,
     tracks: Vec<(String, String, i64)>,
     groups: Vec<(String, Vec<String>)>,
     retired: Vec<(String, Option<String>)>,
@@ -78,7 +79,7 @@ type EditionMaterial = (
 
 pub(super) fn material(
     request: &MembershipRequest,
-    albums: &[(String, i64, i64)],
+    albums: &[(String, i64, String)],
     tracks: &[TrackRow],
     outcome: &MembershipOutcome,
 ) -> String {
@@ -195,12 +196,10 @@ pub(super) fn load_tracks(
     tx: &Transaction<'_>,
     ids: &[String],
 ) -> Result<Vec<TrackRow>, CorrectionError> {
-    let marks = placeholders(ids.len());
     let rows: Vec<TrackRow> = tx
-        .prepare(&format!(
-            "SELECT id, local_album_id, row_revision FROM local_tracks WHERE id IN ({marks}) \
-             ORDER BY relative_path, id"
-        ))?
+        .prepare(&crate::corrections::sql::track_rows_in(ListLen::new(
+            ids.len(),
+        )))?
         .query_map(params_from_iter(ids.iter()), |row| {
             Ok(TrackRow {
                 id: row.get(0)?,
@@ -222,8 +221,7 @@ pub(super) fn load_album(
 ) -> Result<Option<AlbumRow>, CorrectionError> {
     Ok(tx
         .query_row(
-            "SELECT id, title, COALESCE(album_artist_name, ''), row_revision, grouping_source \
-             FROM local_albums WHERE id = ?1 AND retired_into_album_id IS NULL",
+            crate::corrections::sql::LOAD_ALBUM.text(),
             params![album_id],
             |row| {
                 Ok(AlbumRow {
@@ -242,7 +240,7 @@ pub(super) fn album_track_ids(
     tx: &Transaction<'_>,
     album_id: &str,
 ) -> rusqlite::Result<Vec<String>> {
-    tx.prepare("SELECT id FROM local_tracks WHERE local_album_id = ?1 ORDER BY relative_path, id")?
+    tx.prepare(crate::corrections::sql::ALBUM_TRACK_IDS.text())?
         .query_map(params![album_id], |row| row.get(0))?
         .collect()
 }
@@ -266,36 +264,38 @@ pub(super) fn check_expected(
     Ok(())
 }
 
-/// Albums with their revision and their edition's revision (0 for none).
+/// Albums with their revision and their edition's identity token.
 pub(super) fn album_state(
     tx: &Transaction<'_>,
     albums: &[&AlbumRow],
-) -> Result<Vec<(String, i64, i64)>, CorrectionError> {
+) -> Result<Vec<(String, i64, String)>, CorrectionError> {
     let mut state = Vec::with_capacity(albums.len());
     for album in albums {
-        let identity = edition::identity(tx, &album.id)?.map_or(0, |found| found.row_revision);
-        state.push((album.id.clone(), album.row_revision, identity));
+        let identity = edition::identity(tx, &album.id)?;
+        let token = edition::identity_token(identity.as_ref());
+        state.push((album.id.clone(), album.row_revision, token));
     }
     Ok(state)
 }
 
-/// Albums by id with their revision and their edition's revision.
+/// Albums by id with their revision and their edition's identity token.
 pub(super) fn identity_state(
     tx: &Transaction<'_>,
     albums: &[String],
-) -> Result<Vec<(String, i64, i64)>, CorrectionError> {
+) -> Result<Vec<(String, i64, String)>, CorrectionError> {
     let mut state = Vec::with_capacity(albums.len());
     for album in albums {
         let revision: i64 = tx
             .query_row(
-                "SELECT row_revision FROM local_albums WHERE id = ?1",
+                crate::corrections::sql::IDENTITY_STATE.text(),
                 params![album],
                 |row| row.get(0),
             )
             .optional()?
             .unwrap_or(0);
-        let identity = edition::identity(tx, album)?.map_or(0, |found| found.row_revision);
-        state.push((album.clone(), revision, identity));
+        let identity = edition::identity(tx, album)?;
+        let token = edition::identity_token(identity.as_ref());
+        state.push((album.clone(), revision, token));
     }
     Ok(state)
 }
@@ -312,26 +312,24 @@ pub(crate) fn retire(
     now: f64,
 ) -> rusqlite::Result<()> {
     tx.execute(
-        "UPDATE local_albums SET retired_into_album_id = ?2, grouping_locked = 1, \
-         updated_at = ?3, row_revision = row_revision + 1 WHERE id = ?1",
-        params![album_id, successor, now],
+        crate::corrections::sql::RETIRE_ALBUM.text(),
+        params![album_id, successor, crate::clock::ms(now)],
     )?;
     tx.execute(
-        "UPDATE local_albums SET retired_into_album_id = ?2 WHERE retired_into_album_id = ?1",
+        crate::corrections::sql::REPOINT_RETIRED_ALBUMS.text(),
         params![album_id, successor],
     )?;
     tx.execute(
-        "DELETE FROM library_retag_pairs WHERE old_album_id = ?1 AND state = 'open'",
+        crate::corrections::sql::DROP_OPEN_RETAG_PAIRS.text(),
         params![album_id],
     )?;
     tx.execute(
-        "UPDATE local_album_aliases SET local_album_id = ?2 WHERE local_album_id = ?1",
+        crate::corrections::sql::REPOINT_ALBUM_ALIASES.text(),
         params![album_id, successor],
     )?;
     tx.execute(
-        "INSERT OR IGNORE INTO local_album_aliases (alias, local_album_id, kind, created_at) \
-         VALUES (?1, ?2, 'merged_album', ?3)",
-        params![album_id, successor, now],
+        crate::corrections::sql::ADD_MERGED_ALBUM_ALIAS.text(),
+        params![album_id, successor, crate::clock::ms(now)],
     )?;
     retarget_references(tx, "album", album_id, successor)?;
     // What a curator set on the old album carries over, unless the
@@ -339,48 +337,39 @@ pub(crate) fn retire(
     // album field overrides. So does the app's own step back from it.
     takeover::copy_mark(tx, album_id, successor)?;
     tx.execute(
-        "DELETE FROM library_album_takeovers WHERE local_album_id = ?1",
+        crate::corrections::sql::DROP_ALBUM_TAKEOVER.text(),
         params![album_id],
     )?;
     tx.execute(
-        "INSERT OR IGNORE INTO library_management_exclusions (local_album_id, reason, \
-         excluded_by_user_id, excluded_at) SELECT ?2, reason, excluded_by_user_id, excluded_at \
-         FROM library_management_exclusions WHERE local_album_id = ?1",
+        crate::corrections::sql::COPY_EXCLUSION.text(),
         params![album_id, successor],
     )?;
     tx.execute(
-        "DELETE FROM library_management_exclusions WHERE local_album_id = ?1",
+        crate::corrections::sql::DROP_EXCLUSION.text(),
         params![album_id],
     )?;
     tx.execute(
-        "UPDATE OR IGNORE library_management_overrides SET local_album_id = ?2, \
-         updated_at = ?3, row_revision = row_revision + 1 \
-         WHERE local_album_id = ?1 AND subject_kind = 'album'",
-        params![album_id, successor, now],
+        crate::corrections::sql::REPOINT_ALBUM_OVERRIDES.text(),
+        params![album_id, successor, crate::clock::ms(now)],
     )?;
     tx.execute(
-        "UPDATE library_identify_reviews SET state = 'rejected', updated_ms = ?2 \
-         WHERE local_album_id = ?1 AND state = 'pending'",
+        crate::corrections::sql::REJECT_PENDING_REVIEWS.text(),
         params![album_id, crate::clock::ms(now)],
     )?;
     tx.execute(
-        "DELETE FROM library_identify_jobs WHERE local_album_id = ?1 \
-         AND state IN ('queued', 'deferred')",
+        crate::corrections::sql::DROP_WAITING_JOBS.text(),
         params![album_id],
     )?;
-    Ok(())
+    // Its reviews and queued jobs went: open review screens refetch.
+    bump_identification_stream(tx)
 }
 
 /// Lock tracks to `album_id` by hand.
 fn lock_to(tx: &Transaction<'_>, album_id: &str, tracks: &[String]) -> rusqlite::Result<()> {
-    let marks = placeholders(tracks.len());
     let mut values = vec![Value::Text(album_id.to_owned())];
     values.extend(tracks.iter().cloned().map(Value::Text));
     tx.execute(
-        &format!(
-            "UPDATE local_tracks SET local_album_id = ?1, membership_source = 'manual', \
-             membership_locked = 1, row_revision = row_revision + 1 WHERE id IN ({marks})"
-        ),
+        &crate::corrections::sql::lock_tracks_to_album(ListLen::new(tracks.len())),
         params_from_iter(values),
     )?;
     Ok(())
@@ -393,8 +382,7 @@ pub(super) fn offer(tx: &Transaction<'_>, albums: &[String], now: f64) -> rusqli
     let now_ms = crate::clock::ms(now);
     for album in albums {
         let live: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM local_albums WHERE id = ?1 \
-             AND retired_into_album_id IS NULL)",
+            crate::corrections::sql::OFFER.text(),
             params![album],
             |row| row.get(0),
         )?;
@@ -517,9 +505,8 @@ pub(super) fn regroup(
     }
     for album in live_sources.iter().chain(std::iter::once(&dest.id)) {
         tx.execute(
-            "UPDATE local_albums SET grouping_source = 'manual', grouping_locked = 1, \
-             updated_at = ?2, row_revision = row_revision + 1 WHERE id = ?1",
-            params![album, now],
+            crate::corrections::sql::REGROUP.text(),
+            params![album, crate::clock::ms(now)],
         )?;
     }
     let settled = edition::settle(
@@ -589,27 +576,19 @@ fn create_split_album(
         .unwrap_or(&source.album_artist_name)
         .to_owned();
     tx.execute(
-        "INSERT INTO local_albums (id, root_id, grouping_key, title, title_folded, \
-         album_artist_name, album_artist_name_folded, album_artist_id, album_artist_sort_name, \
-         year, original_release_date, primary_genre, is_compilation, grouping_source, \
-         grouping_locked, created_at, updated_at) \
-         SELECT ?1, root_id, 'manual:' || ?1, ?2, ?3, ?4, ?5, album_artist_id, \
-         album_artist_sort_name, year, original_release_date, primary_genre, is_compilation, \
-         'manual', 1, ?6, ?6 FROM local_albums WHERE id = ?7",
+        crate::corrections::sql::ADD_SPLIT_ALBUM.text(),
         params![
             id,
             title,
             droppedneedle_kernel::db::fold_text(&title),
             artist,
             droppedneedle_kernel::db::fold_text(&artist),
-            now,
+            crate::clock::ms(now),
             source.id,
         ],
     )?;
     tx.execute(
-        "INSERT INTO local_album_artists (local_album_id, position, local_artist_id, role, \
-         credited_name, join_phrase) SELECT ?1, position, local_artist_id, role, credited_name, \
-         join_phrase FROM local_album_artists WHERE local_album_id = ?2",
+        crate::corrections::sql::COPY_SPLIT_ALBUM_CREDITS.text(),
         params![id, source.id],
     )?;
     Ok(AlbumRow {

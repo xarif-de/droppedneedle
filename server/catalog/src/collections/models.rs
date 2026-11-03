@@ -1,0 +1,497 @@
+//! Transport DTOs for the collections routes. Wire format is snake_case.
+
+use std::collections::HashMap;
+
+use serde::{Deserialize, Serialize};
+use utoipa::{IntoParams, ToSchema};
+
+use super::state::AutoDownloadState;
+use super::store::ratings::RatedKind;
+
+// Playlists.
+
+/// One track inside a playlist.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PlaylistTrack {
+    /// Track row id.
+    pub id: String,
+    /// Zero-based position in the playlist.
+    pub position: usize,
+    /// Track title.
+    pub track_name: String,
+    /// Artist name.
+    pub artist_name: String,
+    /// Album name.
+    pub album_name: String,
+    /// Album id, when the track resolved to the library.
+    pub album_id: Option<String>,
+    /// Artist id, when resolved.
+    pub artist_id: Option<String>,
+    /// Library track source id, when resolved.
+    pub track_source_id: Option<String>,
+    /// Cover art URL, when known.
+    pub cover_url: Option<String>,
+    /// Preferred source type, empty when unresolved.
+    pub source_type: String,
+    /// Sources carrying this track, when known.
+    pub available_sources: Option<Vec<String>>,
+    /// Audio format, when known.
+    pub format: Option<String>,
+    /// Track number, when known.
+    pub track_number: Option<i32>,
+    /// Disc number, when known.
+    pub disc_number: Option<i32>,
+    /// Duration in seconds, when known.
+    pub duration: Option<f64>,
+    /// Row creation time, epoch seconds.
+    pub created_at: u64,
+    /// Plex rating key, when the track came from Plex.
+    pub plex_rating_key: Option<String>,
+    /// Local library file id, when the track resolved locally.
+    pub library_file_id: Option<String>,
+    /// The MusicBrainz recording `source_type` gave for this entry, when
+    /// known.
+    pub recording_mbid: Option<String>,
+}
+
+/// Playlist summary for lists and visibility answers.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PlaylistSummary {
+    /// Playlist id.
+    pub id: String,
+    /// Display name.
+    pub name: String,
+    /// Track count.
+    pub track_count: usize,
+    /// Total duration in seconds, when any track reports one.
+    pub total_duration: Option<f64>,
+    /// Up to four track covers for the list tile.
+    pub cover_urls: Vec<String>,
+    /// Custom cover URL, when one was uploaded.
+    pub custom_cover_url: Option<String>,
+    /// Import provenance (`<source>:<id>`), when the playlist was imported.
+    pub source_ref: Option<String>,
+    /// Creation time, epoch seconds.
+    pub created_at: u64,
+    /// Last mutation time, epoch seconds.
+    pub updated_at: u64,
+    /// Public playlists are visible to other users.
+    pub is_public: bool,
+    /// True when the caller owns the playlist.
+    pub is_owner: bool,
+    /// True when the caller may delete it: its owner, or an admin when it
+    /// has no owner.
+    pub can_delete: bool,
+    /// Owner display name.
+    pub owner_name: Option<String>,
+    /// Always false on a full summary; true on redacted rows.
+    pub is_redacted: bool,
+}
+
+/// Full playlist detail: summary fields plus tracks.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PlaylistDetail {
+    /// Playlist id.
+    pub id: String,
+    /// Display name.
+    pub name: String,
+    /// Up to four track covers for the header.
+    pub cover_urls: Vec<String>,
+    /// Custom cover URL, when one was uploaded.
+    pub custom_cover_url: Option<String>,
+    /// Import provenance (`<source>:<id>`), when the playlist was imported.
+    pub source_ref: Option<String>,
+    /// Tracks in position order.
+    pub tracks: Vec<PlaylistTrack>,
+    /// Track count.
+    pub track_count: usize,
+    /// Total duration in seconds, when any track reports one.
+    pub total_duration: Option<f64>,
+    /// Creation time, epoch seconds.
+    pub created_at: u64,
+    /// Last mutation time, epoch seconds.
+    pub updated_at: u64,
+    /// Public playlists are visible to other users.
+    pub is_public: bool,
+    /// True when the caller owns the playlist.
+    pub is_owner: bool,
+    /// True when the caller may delete it: its owner, or an admin when it
+    /// has no owner.
+    pub can_delete: bool,
+    /// Owner display name.
+    pub owner_name: Option<String>,
+    /// Always false on a full detail; true on redacted rows.
+    pub is_redacted: bool,
+}
+
+/// A private playlist the caller may not read: existence, count, and owner
+/// only. Never the name, tracks, or covers. An admin also gets the ones with
+/// no owner, which they may delete.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RedactedPlaylist {
+    /// Playlist id.
+    pub id: String,
+    /// Track count.
+    pub track_count: usize,
+    /// Owner display name. None when it has no owner.
+    pub owner_name: Option<String>,
+    /// True for an admin when it has no owner.
+    pub can_delete: bool,
+    /// Always true.
+    pub is_redacted: bool,
+}
+
+/// One row of the playlist list: a full summary or a redacted stub.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(untagged)]
+pub enum PlaylistListItem {
+    /// Full summary for owned and public playlists.
+    Full(PlaylistSummary),
+    /// Redacted stub for other users' private playlists.
+    Redacted(RedactedPlaylist),
+}
+
+/// Playlist list answer.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PlaylistListResponse {
+    /// Playlists visible to the caller.
+    pub playlists: Vec<PlaylistListItem>,
+}
+
+/// Create-playlist body.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CreatePlaylistBody {
+    /// Display name. Must not be blank.
+    pub name: String,
+    /// Import provenance (`<source>:<id>`), when the playlist was imported.
+    pub source_ref: Option<String>,
+}
+
+/// Rename-playlist body. A missing name leaves the playlist unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct UpdatePlaylistBody {
+    /// New display name. Must not be blank when present.
+    pub name: Option<String>,
+}
+
+/// Visibility-toggle body.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct VisibilityBody {
+    /// True makes the playlist public; false makes it private.
+    pub is_public: bool,
+}
+
+/// One track to add.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct TrackInput {
+    /// Track title.
+    pub track_name: String,
+    /// Artist name.
+    pub artist_name: String,
+    /// Album name.
+    pub album_name: String,
+    /// Album id, when known.
+    pub album_id: Option<String>,
+    /// Artist id, when known.
+    pub artist_id: Option<String>,
+    /// Library track source id, when known.
+    pub track_source_id: Option<String>,
+    /// Cover art URL, when known.
+    pub cover_url: Option<String>,
+    /// Preferred source type.
+    #[serde(default)]
+    pub source_type: String,
+    /// Sources carrying this track, when known.
+    pub available_sources: Option<Vec<String>>,
+    /// Audio format, when known.
+    pub format: Option<String>,
+    /// Track number, when known.
+    pub track_number: Option<i32>,
+    /// Disc number, when known.
+    pub disc_number: Option<i32>,
+    /// Duration in seconds, when known.
+    pub duration: Option<f64>,
+    /// Plex rating key, when the track came from Plex.
+    pub plex_rating_key: Option<String>,
+    /// The MusicBrainz recording `source_type` gave for this entry. Anything
+    /// that is not an MBID is left out.
+    pub recording_mbid: Option<String>,
+}
+
+/// Add-tracks body.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AddTracksBody {
+    /// Tracks to append or insert.
+    pub tracks: Vec<TrackInput>,
+    /// Insert position. Missing appends; past-the-end clamps.
+    pub position: Option<usize>,
+}
+
+/// Added-tracks answer.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AddTracksResponse {
+    /// The added tracks with their ids and positions.
+    pub tracks: Vec<PlaylistTrack>,
+}
+
+/// Bulk-remove body.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RemoveTracksBody {
+    /// Track row ids to remove.
+    pub track_ids: Vec<String>,
+}
+
+/// Bulk-remove answer.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RemoveTracksResponse {
+    /// Always "ok".
+    pub status: String,
+    /// Human message.
+    pub message: String,
+    /// How many rows were removed.
+    pub removed: usize,
+}
+
+/// Reorder body.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ReorderBody {
+    /// Track row id to move.
+    pub track_id: String,
+    /// Desired position. Past-the-end clamps to the last slot.
+    pub new_position: usize,
+}
+
+/// Reorder answer.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ReorderResponse {
+    /// Always "ok".
+    pub status: String,
+    /// Human message.
+    pub message: String,
+    /// Where the track actually landed.
+    pub actual_position: usize,
+}
+
+/// Track source-update body.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct UpdateTrackBody {
+    /// Preferred source type.
+    pub source_type: Option<String>,
+    /// Sources carrying this track.
+    pub available_sources: Option<Vec<String>>,
+}
+
+/// Track identity for membership checks.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct TrackIdentifier {
+    /// Track title.
+    pub track_name: String,
+    /// Artist name.
+    pub artist_name: String,
+    /// Album name.
+    pub album_name: String,
+}
+
+/// Membership-check body.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CheckTracksBody {
+    /// Tracks to look up.
+    pub tracks: Vec<TrackIdentifier>,
+}
+
+/// Membership-check answer: each request index maps to the ids of the
+/// caller's visible playlists holding that track.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CheckTracksResponse {
+    /// Request index (as a string) to playlist ids.
+    pub membership: HashMap<String, Vec<String>>,
+}
+
+/// Source-resolution answer: each track id maps to its known sources.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ResolveSourcesResponse {
+    /// Track id to sources.
+    pub sources: HashMap<String, Vec<String>>,
+}
+
+/// Cover-upload body. Base64 JSON instead of multipart: the app has no
+/// multipart feature and the frontend regenerates against this contract.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CoverUploadBody {
+    /// Base64-encoded image bytes (png, jpeg, or webp, max 5 MiB decoded).
+    pub image_base64: String,
+    /// Mime type of the image.
+    pub content_type: String,
+}
+
+/// Cover-upload answer.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CoverUploadResponse {
+    /// URL serving the uploaded cover.
+    pub cover_url: String,
+}
+
+/// Generic status answer for deletes.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct StatusResponse {
+    /// Always "ok".
+    pub status: String,
+    /// Human message.
+    pub message: String,
+}
+
+// Favorites.
+
+/// Set-favorite body.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SetFavoriteBody {
+    /// True favorites the item; false unfavorites it.
+    pub favorited: bool,
+    /// Display name to keep, when favoriting.
+    pub name: Option<String>,
+}
+
+/// Favorite-status answer.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct FavoriteStatusResponse {
+    /// Favorited kind.
+    pub kind: String,
+    /// The id the favourite is stored under: the item's current id, which
+    /// differs from the one sent after a merge.
+    pub item_id: String,
+    /// Current state.
+    pub favorited: bool,
+}
+
+// Ratings.
+
+/// Set-rating body.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SetRatingBody {
+    /// 1 to 5 stars, or 0 to clear the rating.
+    pub rating: u8,
+}
+
+/// Rating-status answer.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RatingStatusResponse {
+    /// Rated kind.
+    pub kind: RatedKind,
+    /// The id the rating is stored under: the item's current id, which
+    /// differs from the one sent after a merge.
+    pub item_id: String,
+    /// The caller's rating now, 0 when cleared.
+    pub rating: u8,
+}
+
+/// Rating-lookup body: local ids of each kind, at most 1000 of each.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct RatingLookupBody {
+    /// Album ids.
+    #[serde(default)]
+    pub album_ids: Vec<String>,
+    /// Track ids.
+    #[serde(default)]
+    pub track_ids: Vec<String>,
+    /// Artist ids.
+    #[serde(default)]
+    pub artist_ids: Vec<String>,
+}
+
+/// The caller's ratings of the looked-up ids. Each map holds only the ids
+/// the caller rated: an absent id is not rated.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RatingLookupResponse {
+    /// Album id to rating.
+    pub albums: HashMap<String, u8>,
+    /// Track id to rating.
+    pub tracks: HashMap<String, u8>,
+    /// Artist id to rating.
+    pub artists: HashMap<String, u8>,
+}
+
+// Follows.
+
+/// Follow-status answer for one artist.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct FollowStatusResponse {
+    /// Artist MBID.
+    pub artist_mbid: String,
+    /// Whether the caller follows the artist.
+    pub followed: bool,
+    /// Whether auto-download is wanted.
+    pub auto_download: bool,
+    /// Approval state of the auto-download ask.
+    pub auto_download_state: AutoDownloadState,
+}
+
+/// One followed artist.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct FollowedArtist {
+    /// Artist MBID.
+    pub artist_mbid: String,
+    /// Artist name as known when followed.
+    pub name: String,
+    /// Whether auto-download is wanted.
+    pub auto_download: bool,
+    /// Approval state of the auto-download ask.
+    pub auto_download_state: AutoDownloadState,
+    /// When the follow started, epoch seconds.
+    pub followed_at: u64,
+}
+
+/// Followed-artist list answer.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct FollowedArtistListResponse {
+    /// Followed artists.
+    pub artists: Vec<FollowedArtist>,
+}
+
+/// One new-release sighting.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct NewReleaseItem {
+    /// Release-group MBID.
+    pub release_group_mbid: String,
+    /// Release title.
+    pub title: String,
+    /// Artist name.
+    pub artist_name: String,
+    /// Artist MBID.
+    pub artist_mbid: String,
+    /// Release-group primary type, when known.
+    pub primary_type: Option<String>,
+    /// First release date, when known.
+    pub first_release_date: Option<String>,
+    /// True when the library already holds the album (only the release
+    /// log shows owned albums).
+    pub in_library: bool,
+}
+
+/// Release log window: `days` 1-365 (default 30), `limit` 1-500
+/// (default 8), `include_owned` (default true).
+#[derive(Debug, Clone, Default, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct RecentReleasesQuery {
+    /// Window in days, 1-365 (default 30).
+    pub days: Option<u32>,
+    /// Most rows returned, 1-500 (default 8).
+    pub limit: Option<usize>,
+    /// Keep albums the library already holds (default true).
+    pub include_owned: Option<bool>,
+}
+
+/// New-release list answer.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct NewReleaseListResponse {
+    /// Sightings for followed artists, newest first.
+    pub items: Vec<NewReleaseItem>,
+    /// Rows the filter matches, beyond this page too.
+    pub total: usize,
+}
+
+/// Unseen-count answer.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct UnseenCountResponse {
+    /// Sightings newer than the caller's seen watermark.
+    pub count: usize,
+}

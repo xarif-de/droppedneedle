@@ -14,8 +14,8 @@ use super::models::{
     AdminAppPasswordView, AdminUserListResponse, AppPasswordAuth, AppPasswordCreate,
     AppPasswordCreatedResponse, AppPasswordListResponse, AppPasswordRecord, AppPasswordView,
     DeviceSessionMint, DeviceSessionResponse, LastFmConnection, LastFmSessionResponse,
-    LastFmStatusResponse, LastFmTokenResponse, LocalCredential, PasswordReset, ProfileResponse,
-    RecoveryCode, RecoveryCodeResponse, SessionListResponse, SessionView, UserRecord, UserResponse,
+    LastFmTokenResponse, LocalCredential, PasswordReset, ProfileResponse, RecoveryCode,
+    RecoveryCodeResponse, SessionListResponse, SessionView, UserRecord, UserResponse,
 };
 use super::roles::{Admin, Principal, Role};
 use super::stores::{LastFmError, LastFmKeys, RoleChange, StoreError, UserDeletion};
@@ -53,16 +53,6 @@ pub const ALLOWED_AVATAR_TYPES: &[&str] = &["image/jpeg", "image/png", "image/we
 pub const MAX_AUTH_VALUE_LEN: usize = 1024;
 /// Prefix marking companion rows in the shared token table, kept from v2.
 pub const COMPANION_LABEL_PREFIX: &str = "DroppedNeedle companion \u{b7} ";
-
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    out
-}
 
 /// Fill a buffer from the OS generator. Failure is a 500, never a fallback.
 fn random_bytes<const N: usize>() -> Result<[u8; N], UsersError> {
@@ -199,7 +189,7 @@ async fn check_password(
 /// No hashing slot in time is busy; a failed hashing task is a fault.
 fn slot_error(error: SlotError) -> UsersError {
     match error {
-        SlotError::Busy => UsersError::Busy,
+        SlotError::Busy => UsersError::HashingBusy,
         SlotError::Failed => UsersError::internal(&error),
     }
 }
@@ -363,7 +353,8 @@ pub async fn change_password(
             message: "No local password is set for this account".to_owned(),
         })?;
     if !check_password(deps, current_password, &local.scheme, &local.hash).await? {
-        return Err(UsersError::Unauthorized {
+        // Not a 401: the session is fine, and the web UI signs out on a 401.
+        return Err(UsersError::InvalidInput {
             message: "Current password is incorrect".to_owned(),
         });
     }
@@ -468,7 +459,7 @@ pub async fn upload_avatar(
         .save(caller.user_id(), content_type, &bytes)
         .await
         .map_err(store_internal)?;
-    let nonce = hex_encode(&random_bytes::<3>()?);
+    let nonce = hex::encode(random_bytes::<3>()?);
     let version = format!("{}-{nonce}", clock_now(deps));
     let url = avatar_url(caller.user_id(), &version);
     deps.users
@@ -647,21 +638,6 @@ pub async fn admin_list_users(
         users: views,
         total,
     })
-}
-
-/// GET /admin/users/{id}: one user.
-pub async fn admin_get_user(
-    deps: &UsersDeps,
-    _admin: &Admin,
-    user_id: &str,
-) -> Result<UserResponse, UsersError> {
-    let user = deps
-        .users
-        .get_by_id(user_id)
-        .await
-        .map_err(store_internal)?
-        .ok_or(UsersError::NotFound)?;
-    user_response(deps, &user).await
 }
 
 /// POST /admin/users: create a local account. Conflicts stay vague on
@@ -1152,26 +1128,6 @@ fn lastfm_error(error: LastFmError) -> UsersError {
     }
 }
 
-/// GET /me/connections/lastfm: link status. Never carries secrets.
-pub async fn lastfm_status(
-    deps: &UsersDeps,
-    user_id: &str,
-) -> Result<LastFmStatusResponse, UsersError> {
-    let link = deps.lastfm.get(user_id).await.map_err(store_internal)?;
-    match link {
-        None => Ok(LastFmStatusResponse {
-            configured: false,
-            linked: false,
-            username: None,
-        }),
-        Some(link) => Ok(LastFmStatusResponse {
-            configured: link.configured,
-            linked: link.username.is_some() && link.session_key_encrypted.is_some(),
-            username: link.username,
-        }),
-    }
-}
-
 /// PUT /me/connections/lastfm: store the user's own API credentials, which
 /// override the instance pair for this user.
 /// The `********` mask keeps the stored value per field; storing
@@ -1609,7 +1565,7 @@ pub async fn verify_app_password(
         .get_active_by_sha256(&digest)
         .await
         .ok()??;
-    if !tokens::constant_time_eq(&row.secret_sha256, &digest) {
+    if !tokens::secret_eq(&row.secret_sha256, &digest) {
         return None;
     }
     let owner = deps.users.get_by_id(&row.user_id).await.ok()??;

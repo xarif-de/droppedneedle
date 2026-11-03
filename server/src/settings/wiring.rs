@@ -15,17 +15,15 @@
 
 use std::sync::Arc;
 
-use droppedneedle_kernel::clock::Clock;
-
 use crate::bootstrap::Outbound;
 use crate::settings::effects::Effects;
 use crate::settings::library_policy_service::LibraryPolicyService;
-use crate::settings::models::{DownloadPolicyView, LibraryScanScheduleResponse};
+use crate::settings::models::LibraryScanScheduleResponse;
 use crate::settings::musicbrainz::MusicBrainzLifecycle;
 use crate::settings::section_prefs::{LinkStatus, SectionPrefsStore};
 use crate::settings::services::SettingsService;
 use crate::settings::verify::{LiveProbes, VerifyProbes};
-use droppedneedle_catalog::reads::catalog::library::LocalCatalog;
+use droppedneedle_catalog::metadata::library::LocalCatalog;
 use droppedneedle_kernel::ids::IdGenerator;
 use droppedneedle_kernel::mount::{Routes, routes};
 use droppedneedle_kernel::platform::Platform;
@@ -34,6 +32,7 @@ use droppedneedle_kernel::runtime_config::settings_error::SettingsError;
 use droppedneedle_library::management::settings::service::LibraryManagementService;
 use droppedneedle_library::policy::LibraryPolicyCatalog;
 use droppedneedle_library::publish::bin::BinSource;
+use droppedneedle_library::settings_models::LibraryManagementSettingsResponse;
 use droppedneedle_providers::Providers;
 
 /// Section-prefs backends: the toggle store plus per-user link state.
@@ -52,8 +51,8 @@ pub struct SettingsSetup {
     management: Arc<LibraryManagementService>,
     prefs: Option<Arc<SectionPrefsDeps>>,
     policy: Arc<LibraryPolicyService>,
-    /// Checks the recycle bin path the download settings show; test
-    /// bundles have none.
+    /// Checks the recycle bin path the Library Management settings show;
+    /// test bundles have none.
     bins: Option<BinSource>,
     /// The scan history the schedule shows its last scan from; test
     /// bundles have none.
@@ -71,8 +70,8 @@ impl SettingsSetup {
     /// own service, so an activation dry run and a page save never save
     /// over each other. The schedule reads its last scan from `scans`, the
     /// Verify probes check keys through the clients in `providers`, and the
-    /// download settings say through `bins` when the recycle bin path is
-    /// not used.
+    /// Library Management settings say through `bins` when the recycle bin
+    /// path is not used.
     pub fn build(
         platform: &Platform,
         effects: Effects,
@@ -96,7 +95,6 @@ impl SettingsSetup {
             platform.config.timezone.clone(),
             outbound.clone(),
             management,
-            platform.clock.clone(),
         );
         setup.scans = Some(scans);
         setup.bins = Some(bins);
@@ -112,10 +110,9 @@ impl SettingsSetup {
         timezone: Option<String>,
         outbound: Outbound,
         management: Arc<LibraryManagementService>,
-        clock: Arc<dyn Clock>,
     ) -> Self {
         let service = Arc::new(
-            SettingsService::new(store.clone(), effects.clone(), ids, probes, clock)
+            SettingsService::new(store.clone(), effects.clone(), ids, probes)
                 .with_timezone(timezone),
         );
         Self {
@@ -160,9 +157,11 @@ impl SettingsSetup {
     #[cfg(any(test, feature = "test-support"))]
     pub fn for_tests(ids: Arc<dyn IdGenerator>) -> Result<Self, String> {
         let providers = Providers::closed();
+        let factory = droppedneedle_kernel::http_client::HttpClientFactory::new()
+            .map_err(|error| error.to_string())?;
         Self::for_tests_with_probes(
             ids,
-            Arc::new(LiveProbes::new(reqwest::Client::new(), &providers)),
+            Arc::new(LiveProbes::new(factory.shared().clone(), &providers)),
         )
     }
 
@@ -203,7 +202,6 @@ impl SettingsSetup {
             None,
             Outbound::live(),
             management,
-            Arc::new(droppedneedle_kernel::clock::SystemClock),
         );
         setup.prefs = Some(Arc::new(SectionPrefsDeps {
             store: Arc::new(MemorySectionPrefsStore::new()),
@@ -221,20 +219,23 @@ impl SettingsSetup {
         &self.service
     }
 
-    /// `view` with the reason its recycle bin path is not used, if it is
-    /// not. The check resolves paths, so it runs on the blocking pool.
-    pub async fn with_bin_warning(&self, mut view: DownloadPolicyView) -> DownloadPolicyView {
+    /// `response` with the reason its recycle bin path is not used, if it
+    /// is not. The check resolves paths, so it runs on the blocking pool.
+    pub async fn with_bin_warning(
+        &self,
+        mut response: LibraryManagementSettingsResponse,
+    ) -> LibraryManagementSettingsResponse {
         let Some(bins) = self.bins.clone() else {
-            return view;
+            return response;
         };
-        let configured = view.policy.recycle_bin_path.clone();
+        let configured = response.settings.recycle_bin_path.clone();
         match tokio::task::spawn_blocking(move || bins.refusal(&configured)).await {
             Ok(refusal) => {
-                view.recycle_bin_warning = refusal.map(|refusal| refusal.message().to_owned());
+                response.recycle_bin_warning = refusal.map(|refusal| refusal.message().to_owned());
             }
             Err(error) => tracing::warn!(%error, "recycle bin check did not run"),
         }
-        view
+        response
     }
 
     /// The library policy routes' service.
@@ -295,19 +296,17 @@ pub fn routes() -> Routes<SettingsSetup> {
     super::registry::routes()
         .admin(routes!(h::get_schedule, h::put_schedule))
         .admin(routes!(h::get_library, h::put_library))
-        .admin(routes!(h::add_library_path, h::remove_library_path))
         .admin(routes!(h::get_library_policy_tree))
         .admin(routes!(h::preview_library_policy_impact))
         .admin(routes!(h::preview_library_policy_apply))
         .admin(routes!(h::get_restorable_library_roots))
         .admin(routes!(h::restore_library_roots))
-        .admin(routes!(h::get_library_path_mapping))
-        .admin(routes!(h::get_cache_ttls))
         .admin(routes!(h::verify_jellyfin))
         .admin(routes!(h::verify_navidrome))
         .admin(routes!(h::verify_plex))
         .admin(routes!(h::get_plex_libraries))
         .admin(routes!(h::verify_listenbrainz))
+        .admin(routes!(h::verify_lastfm))
         .admin(routes!(h::verify_youtube))
         .admin(routes!(h::test_ticketmaster))
         .admin(routes!(h::test_skiddle))
@@ -323,7 +322,6 @@ pub fn routes() -> Routes<SettingsSetup> {
         .admin(routes!(h::test_sabnzbd))
         .admin(routes!(h::get_source_priority, h::put_source_priority))
         .admin(routes!(h::get_policy, h::put_policy))
-        .admin(routes!(h::get_policy_summary))
         .admin(routes!(h::list_indexers, h::create_indexer))
         .admin(routes!(h::get_search_backend, h::put_search_backend))
         .admin(routes!(h::update_indexer, h::delete_indexer))
@@ -331,22 +329,13 @@ pub fn routes() -> Routes<SettingsSetup> {
         .admin(routes!(h::test_indexer))
         .admin(routes!(h::test_prowlarr))
         .admin(routes!(
-            h::dropped_library_sync,
-            h::dropped_library_sync_put
-        ))
-        .admin(routes!(
             h::get_library_management,
             h::put_library_management
         ))
         .admin(routes!(h::get_library_management_activation_health))
         .admin(routes!(h::preview_library_management_impact))
         .admin(routes!(h::validate_library_management))
-        .admin(routes!(h::create_library_management_profile))
-        .admin(routes!(
-            h::get_library_management_profile,
-            h::update_library_management_profile,
-            h::delete_library_management_profile
-        ))
+        .admin(routes!(h::delete_library_management_profile))
         .admin(routes!(h::copy_library_management_profile))
         .admin(routes!(h::get_library_management_preset_diff))
         .admin(routes!(h::export_library_management_profile))

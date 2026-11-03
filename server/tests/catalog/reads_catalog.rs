@@ -15,15 +15,15 @@ use droppedneedle_auth::session::middleware::require_session;
 use droppedneedle_auth::session::store::SessionKind;
 use droppedneedle_auth::users::models::LastFmConnection;
 use droppedneedle_auth::users::roles::Role;
-use droppedneedle_catalog::reads::catalog::{
+use droppedneedle_catalog::metadata::{
     self, Catalog, CatalogDeps,
     library::LocalCatalog,
     upstream::{CatalogSettings, Upstream},
 };
-use droppedneedle_catalog::reads::search::{self, SearchDeps, service::SearchService};
+use droppedneedle_catalog::search::{self, SearchDeps, service::SearchService};
 use droppedneedle_kernel::runtime_config::secret_sections::AdvancedSettings;
 use droppedneedle_kernel::runtime_config::sections::{
-    ListenSource, MbSourceMode, MusicBrainzSettings, UserPreferences,
+    MbSourceMode, MusicBrainzSettings, UserPreferences,
 };
 use droppedneedle_providers::Providers;
 use serde_json::{Value, json};
@@ -40,6 +40,7 @@ const USER: &str = "user-ada";
 const ARTIST: &str = "a74b1b7f-71a5-4011-9441-d0b5e4122711";
 const OK_COMPUTER: &str = "b1392450-e666-3926-a536-22c65f834433";
 const KID_A: &str = "1c6d2e3b-0a5f-4d8e-9f3a-5d6e8b2c4a10";
+const LIVE: &str = "2d7e3f4c-1b6a-4e9f-8a4b-6e7f9c3d5b21";
 const RELEASE_CD: &str = "6b1c7d8a-5f0e-4cd3-8e8f-0c1d3a7b9f65";
 const UNKNOWN_ALBUM: &str = "00000000-1111-4222-8333-444444444444";
 const DUMMY_RELEASE: &str = "3c4d5e6f-7a8b-4c9d-8e0f-1a2b3c4d5e6f";
@@ -291,10 +292,6 @@ impl CatalogSettings for TestSettings {
         true
     }
 
-    fn primary_source(&self) -> ListenSource {
-        ListenSource::Listenbrainz
-    }
-
     fn store_region(&self) -> Option<String> {
         Some("US".to_owned())
     }
@@ -357,6 +354,29 @@ async fn seed_library(pool: &SqlitePool) {
              ('{KID_A}', '{KID_A}', 'Radiohead', 'Kid A', 1788220800000, 'pending', \
              'album')"
         ),
+        // Radiohead also guests on someone else's album.
+        "INSERT INTO local_artists (id, display_name, folded_name, kind, created_at, updated_at) \
+         VALUES ('artist-host', 'Host Band', 'host band', 'group', 0, 0)"
+            .to_owned(),
+        "INSERT INTO local_albums (id, root_id, grouping_key, title, title_folded, \
+         album_artist_name, album_artist_name_folded, album_artist_id, grouping_source, \
+         created_at, updated_at) VALUES ('album-host', 'root-1', 'g-host', 'Guest Spot', \
+         'guest spot', 'Host Band', 'host band', 'artist-host', 'manual', 0, 0)"
+            .to_owned(),
+        "INSERT INTO local_album_artists (local_album_id, position, local_artist_id, role) \
+         VALUES ('album-host', 0, 'artist-host', 'primary')"
+            .to_owned(),
+        "INSERT INTO local_tracks (id, local_album_id, root_id, file_path, relative_path, \
+         path_hash, file_size_bytes, file_mtime_ns, stat_revision, title, title_folded, \
+         artist_name, artist_name_folded, album_title, album_title_folded, disc_number, \
+         track_number, duration_seconds, file_format, ingest_source, imported_at, \
+         membership_source) VALUES ('track-host', 'album-host', 'root-1', '/music/host.flac', \
+         'host.flac', 'hash-host', 1000, 0, 'stat-host', 'Duet', 'duet', 'Host Band', \
+         'host band', 'Guest Spot', 'guest spot', 1, 1, 200.0, 'flac', 'scan', 0, 'manual')"
+            .to_owned(),
+        "INSERT INTO local_track_artists (local_track_id, position, local_artist_id, role) \
+         VALUES ('track-host', 0, 'artist-radiohead', 'guest')"
+            .to_owned(),
     ];
     for statement in statements {
         sqlx::query(&statement).execute(pool).await.unwrap();
@@ -368,8 +388,20 @@ async fn seed_library(pool: &SqlitePool) {
 /// and is signed in with [`TOKEN`]. Hold the rig and the app while the
 /// router serves: the rig's database and the request wrapper go with them.
 async fn app_with(fixtures: &Fixtures, mb_url: String) -> (axum::Router, (AuthRig, TestApp)) {
+    app_seeded(fixtures, mb_url, &[]).await
+}
+
+/// As [`app_with`], with `extra` statements run after the shared seed.
+async fn app_seeded(
+    fixtures: &Fixtures,
+    mb_url: String,
+    extra: &[String],
+) -> (axum::Router, (AuthRig, TestApp)) {
     let (pool, dir) = crate::common::migrated_pool("reads-catalog").await;
     seed_library(&pool).await;
+    for statement in extra {
+        sqlx::query(statement).execute(&pool).await.unwrap();
+    }
     let rig = AuthRig::new("reads-catalog").await;
     rig.seed_user("ada", Role::User).await;
     rig.sign_in(USER, TOKEN).await;
@@ -394,13 +426,17 @@ async fn app_with(fixtures: &Fixtures, mb_url: String) -> (axum::Router, (AuthRi
     );
     let catalog = Catalog::new(upstream, local_catalog(&dir));
     let search = SearchDeps::new(
-        SearchService::new(pool).with_remote(catalog.clone()),
+        SearchService::new(
+            droppedneedle_kernel::db::Db::open_for_tests(pool.connect_options().get_filename())
+                .unwrap(),
+        )
+        .with_remote(catalog.clone()),
         Arc::new(search::ports::UnconfiguredEnrichment),
     );
     let scope = TestApp::start("reads-catalog").await;
     let app = scope
         .request_scope(
-            catalog::routes()
+            metadata::routes()
                 .with_state(CatalogDeps { catalog })
                 .into_router()
                 .merge(search::routes().with_state(search).into_router())
@@ -499,7 +535,7 @@ async fn artist_header_reads_musicbrainz_once_and_flags_the_library() {
     assert_eq!(titles(&body["singles"]), ["Creep"]);
     assert_eq!(body["albums"][1]["in_library"], true);
     assert_eq!(body["release_group_count"], 6);
-    assert_eq!(body["appears_in_library"], false);
+    assert_eq!(body["appears_in_library"], true);
     assert_eq!(body["followed"], false);
     assert_eq!(body["auto_download_state"], "none");
 
@@ -523,33 +559,53 @@ async fn artist_header_reads_musicbrainz_once_and_flags_the_library() {
     );
 }
 
+/// The artist header's TheAudioDB images and fanart come from the cache
+/// only: TheAudioDB's free key allows one call every two seconds, so a
+/// cold header answers its biography and portrait without asking it, and
+/// shows the images once the background fill has stored them.
 #[tokio::test]
-async fn artist_extended_fetches_biography_and_images_for_the_header() {
+async fn a_cold_artist_header_never_asks_audiodb() {
     let fixtures = Fixtures::start().await;
-    let (app, _auth) = app(&fixtures).await;
+    let (_pool, dir) = crate::common::migrated_pool("reads-catalog-header").await;
+    let rig = AuthRig::new("reads-catalog-header").await;
+    let http = droppedneedle_kernel::http_client::HttpClientFactory::new().unwrap();
+    let catalog = Catalog::new(
+        Upstream::new(
+            Arc::new(fixtures.providers(&http)),
+            Arc::new(TestSettings {
+                mb_url: format!("{}/mb/ws/2", fixtures.base),
+            }),
+            rig.deps.clone(),
+        ),
+        local_catalog(&dir),
+    );
 
-    let before = get(&app, &format!("/api/v3/artists/{ARTIST}")).await;
+    let cold = catalog.artist_extended(ARTIST).await.unwrap();
+    assert_eq!(
+        cold.description.as_deref(),
+        Some("Radiohead are an English rock band formed in Abingdon, Oxfordshire, in 1985.")
+    );
+    assert_eq!(
+        cold.image.as_deref(),
+        Some("https://upload.wikimedia.org/wikipedia/commons/a/a1/Radiohead_2016.jpg")
+    );
+    assert_eq!(cold.images, Default::default());
+    assert_eq!(
+        fixtures.hits("/audiodb/123/artist-mb.php"),
+        0,
+        "the header never dials out to TheAudioDB"
+    );
+
     assert!(
-        before["images"]["thumb_url"].is_null(),
-        "the header never dials out to AudioDB"
+        catalog.fill_artist_images(ARTIST).await,
+        "the fill stores them"
     );
-
-    let extended = get(&app, &format!("/api/v3/artists/{ARTIST}/extended")).await;
+    let warm = catalog.artist_extended(ARTIST).await.unwrap();
     assert_eq!(
-        extended["description"],
-        "Radiohead are an English rock band formed in Abingdon, Oxfordshire, in 1985."
+        warm.images.thumb_url.as_deref(),
+        Some("https://r2.theaudiodb.com/images/media/artist/thumb/radiohead.jpg")
     );
-    assert_eq!(
-        extended["image"],
-        "https://upload.wikimedia.org/wikipedia/commons/a/a1/Radiohead_2016.jpg"
-    );
-    assert_eq!(
-        extended["images"]["thumb_url"],
-        "https://r2.theaudiodb.com/images/media/artist/thumb/radiohead.jpg"
-    );
-
-    let after = get(&app, &format!("/api/v3/artists/{ARTIST}")).await;
-    assert_eq!(after["images"], extended["images"]);
+    assert_eq!(fixtures.hits("/audiodb/123/artist-mb.php"), 1);
 }
 
 #[tokio::test]
@@ -599,6 +655,99 @@ async fn discography_filters_flags_and_pages() {
     );
 }
 
+/// A popular song the library holds points at the user's own copy, at
+/// its place on that album, so the row plays the file; a song not held
+/// stays as the listening service names it.
+#[tokio::test]
+async fn a_popular_song_in_the_library_points_at_its_own_copy() {
+    let fixtures = Fixtures::start().await;
+    let (app, _auth) = app_seeded(
+        &fixtures,
+        format!("{}/mb/ws/2", fixtures.base),
+        &[
+            "INSERT INTO local_tracks (id, local_album_id, root_id, file_path, relative_path, \
+             path_hash, file_size_bytes, file_mtime_ns, stat_revision, title, title_folded, \
+             artist_name, artist_name_folded, album_title, album_title_folded, disc_number, \
+             track_number, duration_seconds, file_format, ingest_source, imported_at, \
+             membership_source) VALUES ('track-surprises', 'album-okc', 'root-1', \
+             '/music/surprises.flac', 'surprises.flac', 'hash-3', 1000, 0, 'stat-3', \
+             'No Surprises', 'no surprises', 'Radiohead', 'radiohead', 'OK Computer', \
+             'ok computer', 1, 10, 229.0, 'flac', 'scan', 0, 'manual')"
+                .to_owned(),
+            "INSERT INTO local_track_artists (local_track_id, position, local_artist_id, role) \
+             VALUES ('track-surprises', 0, 'artist-radiohead', 'primary')"
+                .to_owned(),
+        ],
+    )
+    .await;
+
+    let songs = get(&app, &format!("/api/v3/artists/{ARTIST}/top-songs")).await;
+    assert_eq!(titles(&songs["songs"]), ["Creep", "No Surprises"]);
+    let held = &songs["songs"][1];
+    assert_eq!(
+        (
+            &held["release_group_mbid"],
+            &held["disc_number"],
+            &held["track_number"]
+        ),
+        (&json!(OK_COMPUTER), &json!(1), &json!(10)),
+        "the owned song points at its place on the user's album"
+    );
+    assert_eq!(
+        songs["songs"][0]["track_number"],
+        Value::Null,
+        "a song not held stays as listed"
+    );
+}
+
+#[tokio::test]
+async fn owned_releases_list_every_held_group_whatever_its_type() {
+    let fixtures = Fixtures::start().await;
+    // The bootleg turns out to be the live album: a group the release-type
+    // preferences keep out of the discography.
+    let (app, _auth) = app_seeded(
+        &fixtures,
+        format!("{}/mb/ws/2", fixtures.base),
+        &[format!(
+            "INSERT INTO local_album_external_identities \
+             (local_album_id, provider, release_group_mbid, decision_source, selected_at) \
+             VALUES ('album-bootleg', 'musicbrainz', '{LIVE}', 'automatic', 0)"
+        )],
+    )
+    .await;
+
+    let releases = get(&app, &format!("/api/v3/artists/{ARTIST}/releases")).await;
+    assert_eq!(titles(&releases["albums"]), ["Kid A", "OK Computer"]);
+
+    let owned = get(&app, &format!("/api/v3/artists/{ARTIST}/owned-releases")).await;
+    assert_eq!(
+        owned["items"],
+        json!([
+            {
+                "id": LIVE,
+                "title": "I Might Be Wrong: Live Recordings",
+                "primary_type": "Album",
+                "secondary_types": ["Live"],
+                "year": 2001
+            },
+            {
+                "id": OK_COMPUTER,
+                "title": "OK Computer",
+                "primary_type": "Album",
+                "secondary_types": [],
+                "year": 1997
+            }
+        ]),
+        "every held group, newest first, the filtered one included"
+    );
+    assert_eq!(owned["complete"], true);
+    assert_eq!(
+        fixtures.hits("/mb/ws/2/release-group"),
+        1,
+        "the discography browse serves both"
+    );
+}
+
 #[tokio::test]
 async fn artist_sections_use_listenbrainz_then_lastfm() {
     let fixtures = Fixtures::start().await;
@@ -632,6 +781,12 @@ async fn artist_sections_use_listenbrainz_then_lastfm() {
     );
     assert_eq!(titles(&songs["songs"]), ["Creep", "No Surprises"]);
     assert_eq!(songs["songs"][0]["listen_count"], 9_182_736);
+    assert_eq!(
+        (&songs["asked_source"], &songs["unavailable_sources"]),
+        (&json!("listenbrainz"), &json!([])),
+        "the page can tell Last.fm stood in for an empty ListenBrainz"
+    );
+    assert_eq!(similar["asked_source"], "listenbrainz");
 
     let lastfm_albums = get(
         &app,
@@ -691,7 +846,8 @@ async fn album_page_shows_the_owned_edition_and_where_to_buy() {
     let fixtures = Fixtures::start().await;
     let (app, _auth) = app(&fixtures).await;
 
-    let album = get(&app, &format!("/api/v3/albums/{OK_COMPUTER}")).await;
+    let album = get(&app, &format!("/api/v3/albums/{OK_COMPUTER}/basic")).await;
+    let tracks = get(&app, &format!("/api/v3/albums/{OK_COMPUTER}/tracks")).await;
     assert_eq!(album["title"], "OK Computer");
     assert_eq!(album["artist_name"], "Radiohead");
     assert_eq!(album["artist_id"], ARTIST);
@@ -701,12 +857,12 @@ async fn album_page_shows_the_owned_edition_and_where_to_buy() {
         album["cover_url"],
         format!("/api/v3/covers/release-group/{OK_COMPUTER}?size=500")
     );
-    assert_eq!(album["selected_release_mbid"], RELEASE_CD);
-    assert_eq!(album["pick_basis"], "owned");
-    assert_eq!(titles(&album["tracks"]), ["Airbag", "Paranoid Android"]);
-    assert_eq!(album["tracks"][0]["length"], 284_000);
-    assert_eq!(album["total_length"], 667_000);
-    assert_eq!(album["label"], "Parlophone");
+    assert_eq!(tracks["selected_release_mbid"], RELEASE_CD);
+    assert_eq!(tracks["pick_basis"], "owned");
+    assert_eq!(titles(&tracks["tracks"]), ["Airbag", "Paranoid Android"]);
+    assert_eq!(tracks["tracks"][0]["length"], 284_000);
+    assert_eq!(tracks["total_length"], 667_000);
+    assert_eq!(tracks["label"], "Parlophone");
     let by_local = get(&app, "/api/v3/albums/album-okc/basic").await;
     assert_eq!(
         by_local["musicbrainz_id"], OK_COMPUTER,
@@ -776,9 +932,10 @@ async fn musicbrainz_outage_falls_back_to_the_library() {
     assert_eq!(releases["source"], "library");
     assert_eq!(titles(&releases["albums"]), ["OK Computer"]);
 
-    let album = get(&app, &format!("/api/v3/albums/{OK_COMPUTER}")).await;
+    let album = get(&app, &format!("/api/v3/albums/{OK_COMPUTER}/basic")).await;
     assert_eq!(album["source"], "library");
-    assert_eq!(titles(&album["tracks"]), ["Airbag"]);
+    let tracks = get(&app, &format!("/api/v3/albums/{OK_COMPUTER}/tracks")).await;
+    assert_eq!(titles(&tracks["tracks"]), ["Airbag"]);
 
     let (status, headers, body) = call_full(
         &app,
@@ -901,12 +1058,12 @@ async fn auth_matrix_rejects_anonymous_callers_and_bad_ids() {
         format!("/api/v3/artists/{ARTIST}"),
         format!("/api/v3/artists/{ARTIST}/extended"),
         format!("/api/v3/artists/{ARTIST}/releases"),
+        format!("/api/v3/artists/{ARTIST}/owned-releases"),
         format!("/api/v3/artists/{ARTIST}/similar"),
         format!("/api/v3/artists/{ARTIST}/top-songs"),
         format!("/api/v3/artists/{ARTIST}/top-albums"),
         format!("/api/v3/artists/{ARTIST}/lastfm?artist_name=Radiohead"),
         format!("/api/v3/artists/{ARTIST}/purchase-options"),
-        format!("/api/v3/albums/{OK_COMPUTER}"),
         format!("/api/v3/albums/{OK_COMPUTER}/basic"),
         format!("/api/v3/albums/{OK_COMPUTER}/tracks"),
         format!("/api/v3/albums/{OK_COMPUTER}/editions"),
@@ -943,12 +1100,12 @@ async fn auth_matrix_rejects_anonymous_callers_and_bad_ids() {
 /// again after the short outage wait, never held blank for hours.
 #[tokio::test]
 async fn a_failed_portrait_lookup_keeps_the_short_outage_marker() {
-    use droppedneedle_catalog::reads::catalog::precache::CatalogArtistImages;
-    use droppedneedle_catalog::reads::platform::artwork::{
+    use droppedneedle_catalog::artwork::{
         ArtworkService, OUTAGE_TTL_SECS,
         cache::{ArtworkCache, KeyEntry},
         local::LocalArtwork,
     };
+    use droppedneedle_catalog::metadata::precache::CatalogArtistImages;
 
     let mut routes = routes();
     for route in &mut routes {
@@ -981,7 +1138,10 @@ async fn a_failed_portrait_lookup_keeps_the_short_outage_marker() {
             1024 * 1024,
             std::sync::Arc::new(droppedneedle_kernel::clock::SystemClock),
         ),
-        LocalArtwork::new(pool),
+        LocalArtwork::new(
+            droppedneedle_kernel::db::Db::open_for_tests(pool.connect_options().get_filename())
+                .unwrap(),
+        ),
         None,
         config.live(),
     )
@@ -1017,10 +1177,10 @@ async fn a_failed_portrait_lookup_keeps_the_short_outage_marker() {
 /// for.
 #[tokio::test]
 async fn an_audiodb_picture_named_over_http_is_fetched_over_https() {
-    use droppedneedle_catalog::reads::catalog::precache::CatalogArtistImages;
-    use droppedneedle_catalog::reads::platform::artwork::{
+    use droppedneedle_catalog::artwork::{
         ArtworkService, cache::ArtworkCache, local::LocalArtwork,
     };
+    use droppedneedle_catalog::metadata::precache::CatalogArtistImages;
     use droppedneedle_providers::executor::ScriptedWire;
     use droppedneedle_providers::{ProviderEndpoints, audiodb, musicbrainz};
 
@@ -1086,7 +1246,10 @@ async fn an_audiodb_picture_named_over_http_is_fetched_over_https() {
             1024 * 1024,
             std::sync::Arc::new(droppedneedle_kernel::clock::SystemClock),
         ),
-        LocalArtwork::new(pool),
+        LocalArtwork::new(
+            droppedneedle_kernel::db::Db::open_for_tests(pool.connect_options().get_filename())
+                .unwrap(),
+        ),
         None,
         config.live(),
     )
@@ -1106,8 +1269,8 @@ async fn an_audiodb_picture_named_over_http_is_fetched_over_https() {
 /// TheAudioDB, with nothing cached, is left to the background fill.
 #[tokio::test]
 async fn a_cold_artist_image_waits_out_a_busy_musicbrainz() {
-    use droppedneedle_catalog::reads::catalog::precache::CatalogArtistImages;
-    use droppedneedle_catalog::reads::platform::artwork::ArtistImageSource as _;
+    use droppedneedle_catalog::artwork::ArtistImageSource as _;
+    use droppedneedle_catalog::metadata::precache::CatalogArtistImages;
     use droppedneedle_providers::executor::ScriptedWire;
     use droppedneedle_providers::{
         ProviderEndpoints, RequestPriority, audiodb, musicbrainz, wikidata,
@@ -1207,11 +1370,11 @@ async fn a_cold_artist_image_waits_out_a_busy_musicbrainz() {
 /// text, and a link to the file page.
 #[tokio::test]
 async fn a_commons_portrait_answers_its_credit_as_plain_text() {
-    use droppedneedle_catalog::reads::catalog::precache::CatalogArtistImages;
-    use droppedneedle_catalog::reads::platform::artwork::{
+    use droppedneedle_catalog::artwork::covers::{self, CoversState};
+    use droppedneedle_catalog::artwork::{
         ArtworkService, cache::ArtworkCache, local::LocalArtwork,
     };
-    use droppedneedle_catalog::reads::platform::covers::{self, CoversState};
+    use droppedneedle_catalog::metadata::precache::CatalogArtistImages;
     use droppedneedle_providers::executor::ScriptedWire;
     use droppedneedle_providers::{ProviderEndpoints, wikidata};
 
@@ -1277,7 +1440,10 @@ async fn a_commons_portrait_answers_its_credit_as_plain_text() {
             1024 * 1024,
             std::sync::Arc::new(droppedneedle_kernel::clock::SystemClock),
         ),
-        LocalArtwork::new(pool),
+        LocalArtwork::new(
+            droppedneedle_kernel::db::Db::open_for_tests(pool.connect_options().get_filename())
+                .unwrap(),
+        ),
         None,
         config.live(),
     )
@@ -1328,7 +1494,7 @@ async fn a_commons_portrait_answers_its_credit_as_plain_text() {
 /// while the read behind them fails.
 #[tokio::test]
 async fn a_passing_failure_is_not_cached_as_a_short_section() {
-    use droppedneedle_catalog::reads::catalog::models::AlbumRef;
+    use droppedneedle_catalog::metadata::models::AlbumRef;
     use droppedneedle_kernel::runtime_config::sections::ListenSource;
     use droppedneedle_providers::executor::{Method, Scripted, ScriptedWire};
     use droppedneedle_providers::{
@@ -1541,6 +1707,86 @@ async fn provider_answers_survive_a_restart() {
         "answered from the cache file"
     );
     app.stop().await;
+}
+
+/// The test settings with TheAudioDB's key saved as the test sets it.
+struct KeyedSettings {
+    inner: TestSettings,
+    audiodb_key: Mutex<String>,
+}
+
+impl CatalogSettings for KeyedSettings {
+    fn musicbrainz(&self) -> Option<MusicBrainzSettings> {
+        self.inner.musicbrainz()
+    }
+
+    fn preferences(&self) -> UserPreferences {
+        self.inner.preferences()
+    }
+
+    fn advanced(&self) -> AdvancedSettings {
+        AdvancedSettings {
+            audiodb_api_key: self.audiodb_key.lock().unwrap().as_str().into(),
+            ..self.inner.advanced()
+        }
+    }
+
+    fn listenbrainz_enabled(&self) -> bool {
+        self.inner.listenbrainz_enabled()
+    }
+
+    fn store_region(&self) -> Option<String> {
+        self.inner.store_region()
+    }
+}
+
+/// TheAudioDB answers depend on the key they were asked with: once the
+/// saved key changes, art kept under the old key is not served, and the
+/// new key is asked.
+#[tokio::test]
+async fn audiodb_art_is_kept_per_api_key() {
+    let mut routes = routes();
+    routes.push(Route {
+        path: "/audiodb/premium-key/artist-mb.php".to_owned(),
+        param: Some(("i", ARTIST)),
+        status: 200,
+        body: r#"{"artists": null}"#.to_owned(),
+    });
+    let fixtures = Fixtures::start_with(routes).await;
+    let dir = crate::common::ScratchDir::new("reads-catalog-audiodb-key");
+    crate::common::migrated_db(&dir.join("app.db"));
+    let rig = AuthRig::new("reads-catalog-audiodb-key").await;
+    let http = droppedneedle_kernel::http_client::HttpClientFactory::new().unwrap();
+    let settings = Arc::new(KeyedSettings {
+        inner: TestSettings {
+            mb_url: format!("{}/mb/ws/2", fixtures.base),
+        },
+        audiodb_key: Mutex::new(String::new()),
+    });
+    let catalog = Catalog::new(
+        Upstream::new(
+            Arc::new(fixtures.providers(&http)),
+            settings.clone(),
+            rig.deps.clone(),
+        ),
+        local_catalog(&dir),
+    );
+
+    assert!(
+        catalog.fill_artist_images(ARTIST).await,
+        "the free key's fill stores them"
+    );
+    let free = catalog.artist_extended(ARTIST).await.unwrap();
+    assert_eq!(
+        free.images.thumb_url.as_deref(),
+        Some("https://r2.theaudiodb.com/images/media/artist/thumb/radiohead.jpg")
+    );
+
+    *settings.audiodb_key.lock().unwrap() = "premium-key".to_owned();
+    catalog.fill_artist_images(ARTIST).await;
+    let premium = catalog.artist_extended(ARTIST).await.unwrap();
+    assert_eq!(fixtures.hits("/audiodb/premium-key/artist-mb.php"), 1);
+    assert_eq!(premium.images.thumb_url, None);
 }
 
 /// Now, by the system clock the cache under test runs on.

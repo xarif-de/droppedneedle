@@ -1,0 +1,869 @@
+//! Content-addressed cover cache on disk, bounded by size.
+//!
+//! Layout under `<cache_dir>/covers`:
+//!
+//! - `blobs/<aa>/<hash>`: image bytes, named by the SHA-256 of the bytes,
+//!   so the same picture fetched for a release and its release group, or
+//!   found in a folder and served through two routes, is stored once.
+//! - `keys/<aa>/<key hash>`: a small text record mapping a lookup key (for
+//!   example `caa:release-group:<mbid>:500`) to a blob, or recording that
+//!   the archive had no art, or could not be asked, until a given time. A record may also carry the
+//!   image's credit (see [`ImageCredit`]). TheAudioDB album
+//!   thumbnails keep theirs under `keys-audiodb/` instead, so they can be
+//!   forgotten on their own.
+//!
+//! When the blobs pass `COVER_CACHE_MAX_SIZE_MB` the least recently used
+//! ones are deleted. A key whose blob was evicted reads as a miss, so the
+//! art is fetched again. Eviction also deletes the key records that point
+//! at the evicted blobs (a reverse map tracks them). A full pass over the
+//! key records, dropping orphans and miss markers past their time, runs
+//! when the cache loads and at most hourly after that. The index also
+//! keeps which key records hold an image and which a fresh "no art"
+//! marker, so a library view can tell, without touching the disk, that a
+//! cover route would answer that it has no art. Every file operation runs on a blocking thread,
+//! and writes go through a temporary file and a rename so a crash never
+//! leaves a half-written image behind.
+
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use droppedneedle_kernel::clock::Clock;
+
+/// Least time between two full passes over the key records.
+const FULL_CLEAN_EVERY: Duration = Duration::from_secs(3600);
+/// Key records, by key hash.
+const KEYS_DIR: &str = "keys";
+/// Key records of TheAudioDB album thumbnails, kept apart so the AudioDB
+/// clear can drop them without touching other art.
+const AUDIODB_KEYS_DIR: &str = "keys-audiodb";
+/// Keys that live in [`AUDIODB_KEYS_DIR`].
+pub const AUDIODB_KEY_PREFIX: &str = "audiodb:";
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
+
+/// Which marker [`ArtworkCache::put_marker`] writes.
+#[derive(Debug, Clone, Copy)]
+enum Marker {
+    Miss,
+    Unreachable,
+}
+
+/// What a key file says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyEntry {
+    /// Art stored under this content hash.
+    Hit {
+        /// SHA-256 of the image bytes.
+        hash: String,
+        /// MIME type of the bytes.
+        content_type: String,
+    },
+    /// The source had no art; do not ask again before `until` (unix secs).
+    Miss {
+        /// Unix second the marker expires.
+        until: u64,
+    },
+    /// The source could not be asked (down, refusing, or resting); nothing
+    /// is known about the art. Ask again after `until` (unix secs).
+    Unreachable {
+        /// Unix second the marker expires.
+        until: u64,
+    },
+}
+
+/// Where a credited picture came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CreditSource {
+    /// A Wikimedia Commons file.
+    WikimediaCommons,
+}
+
+/// The credit a picture's source asks for, kept in the picture's key record
+/// so the two are stored and dropped together. Text is plain, never HTML.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageCredit {
+    /// Where the picture came from.
+    pub source: CreditSource,
+    /// Who made it.
+    pub author: Option<String>,
+    /// The licence's short name.
+    pub licence: Option<String>,
+    /// The licence's page, http or https.
+    pub licence_url: Option<String>,
+    /// The picture's page at its source, http or https.
+    pub file_url: String,
+}
+
+/// Prefix of the key record line that holds an [`ImageCredit`] as JSON.
+const CREDIT_LINE: &str = "credit ";
+
+/// One blob's bookkeeping for eviction.
+#[derive(Debug, Clone, Copy)]
+struct BlobUse {
+    size: u64,
+    last_used: u64,
+}
+
+/// In-memory view of the blob directory, built on first use.
+#[derive(Debug, Default)]
+struct Index {
+    blobs: HashMap<String, BlobUse>,
+    total: u64,
+    clock: u64,
+    /// Key record paths per blob hash, so eviction can drop them.
+    keys_by_hash: HashMap<String, HashSet<PathBuf>>,
+    /// When the last full pass over the key records ran.
+    last_full_clean: Option<Instant>,
+    /// "No art" markers by key record path, with the second they expire.
+    misses: HashMap<PathBuf, u64>,
+    /// Key records that point at an image.
+    held: HashSet<PathBuf>,
+}
+
+impl Index {
+    fn touch(&mut self, hash: &str) {
+        self.clock += 1;
+        let clock = self.clock;
+        if let Some(entry) = self.blobs.get_mut(hash) {
+            entry.last_used = clock;
+        }
+    }
+}
+
+/// The bounded disk cache. Cheap to clone.
+#[derive(Clone)]
+pub struct ArtworkCache {
+    root: PathBuf,
+    max_bytes: u64,
+    index: Arc<Mutex<Option<Index>>>,
+    clock: Arc<dyn Clock>,
+    /// Set once a background index load has been started.
+    load_started: Arc<AtomicBool>,
+}
+
+impl std::fmt::Debug for ArtworkCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ArtworkCache")
+            .field("root", &self.root)
+            .field("max_bytes", &self.max_bytes)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Hex SHA-256 of some bytes.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(64);
+    for byte in digest {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+impl ArtworkCache {
+    /// A cache rooted at `root` (normally `<cache_dir>/covers`), holding at
+    /// most `max_bytes` of images, its markers dated by `clock`. Nothing
+    /// touches the disk until first use.
+    pub fn new(root: PathBuf, max_bytes: u64, clock: Arc<dyn Clock>) -> Self {
+        Self {
+            root,
+            max_bytes,
+            index: Arc::new(Mutex::new(None)),
+            clock,
+            load_started: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Whether the index is in memory. When it is not, start loading it in
+    /// the background, once, and answer false: a caller that must not wait
+    /// on the disk treats the cache as knowing nothing yet.
+    pub fn loaded_or_start(&self) -> bool {
+        if self.lock().is_some() {
+            return true;
+        }
+        if !self.load_started.swap(true, Ordering::AcqRel) {
+            let cache = self.clone();
+            tokio::spawn(async move { cache.ensure_index().await });
+        }
+        false
+    }
+
+    /// Whether `key` holds a "no art" marker that has not expired, and no
+    /// image. False while the index is not loaded.
+    pub fn knows_missing(&self, key: &str) -> bool {
+        let path = self.key_path(key);
+        let now = self.unix_now();
+        self.lock().as_ref().is_some_and(|index| {
+            !index.held.contains(&path) && index.misses.get(&path).is_some_and(|until| *until > now)
+        })
+    }
+
+    /// Whether `key` points at an image, as far as the loaded index knows.
+    pub fn holds(&self, key: &str) -> bool {
+        let path = self.key_path(key);
+        self.lock()
+            .as_ref()
+            .is_some_and(|index| index.held.contains(&path))
+    }
+
+    /// Seconds since the epoch, by the cache's clock.
+    pub fn unix_now(&self) -> u64 {
+        u64::try_from(self.clock.now_unix()).unwrap_or(0)
+    }
+
+    /// Read a key record.
+    pub async fn key(&self, key: &str) -> Option<KeyEntry> {
+        self.ensure_index().await;
+        let path = self.key_path(key);
+        let text = blocking(move || std::fs::read_to_string(path).ok()).await??;
+        parse_key(&text)
+    }
+
+    /// Whether a blob is on disk, by a metadata check only: no read, and
+    /// its place in the eviction order stays as it was.
+    pub async fn has_blob(&self, hash: &str) -> bool {
+        if !is_hash(hash) {
+            return false;
+        }
+        let path = self.blob_path(hash);
+        blocking(move || path.is_file()).await.unwrap_or(false)
+    }
+
+    /// Read a blob by content hash, marking it recently used.
+    pub async fn blob(&self, hash: &str) -> Option<Vec<u8>> {
+        if !is_hash(hash) {
+            return None;
+        }
+        let path = self.blob_path(hash);
+        let bytes = blocking(move || std::fs::read(path).ok()).await??;
+        if let Some(index) = self.lock().as_mut() {
+            index.touch(hash);
+        }
+        Some(bytes)
+    }
+
+    /// The credit stored with the image under `key`, while that image is on
+    /// disk. A record without one, written before credits were kept
+    /// included, reads as `None`.
+    pub async fn credit(&self, key: &str) -> Option<ImageCredit> {
+        let path = self.key_path(key);
+        let text = blocking(move || std::fs::read_to_string(path).ok()).await??;
+        let Some(KeyEntry::Hit { hash, .. }) = parse_key(&text) else {
+            return None;
+        };
+        if !self.has_blob(&hash).await {
+            return None;
+        }
+        parse_credit(&text)
+    }
+
+    /// Store image bytes, optionally under a key, and return their hash.
+    /// Evicts old blobs when the cache grows past its bound.
+    pub async fn put(&self, key: Option<&str>, bytes: Vec<u8>, content_type: &str) -> String {
+        self.put_credited(key, bytes, content_type, None).await
+    }
+
+    /// [`ArtworkCache::put`], with `credit` kept in the key record beside
+    /// the image.
+    pub async fn put_credited(
+        &self,
+        key: Option<&str>,
+        bytes: Vec<u8>,
+        content_type: &str,
+        credit: Option<&ImageCredit>,
+    ) -> String {
+        let hash = sha256_hex(&bytes);
+        let size = bytes.len() as u64;
+        let blob = self.blob_path(&hash);
+        let key_path = key.map(|key| self.key_path(key));
+        let key_file = key_path
+            .clone()
+            .map(|path| (path, hit_record(&hash, content_type, credit)));
+        let written = blocking(move || -> std::io::Result<bool> {
+            let fresh = !blob.exists();
+            if fresh {
+                write_atomic(&blob, &bytes)?;
+            }
+            if let Some((path, text)) = key_file {
+                write_atomic(&path, text.as_bytes())?;
+            }
+            Ok(fresh)
+        })
+        .await;
+        match written {
+            Some(Ok(fresh)) => {
+                self.ensure_index().await;
+                let over = {
+                    let mut guard = self.lock();
+                    let Some(index) = guard.as_mut() else {
+                        return hash;
+                    };
+                    if fresh && !index.blobs.contains_key(&hash) {
+                        index.total += size;
+                    }
+                    index.clock += 1;
+                    let clock = index.clock;
+                    index.blobs.insert(
+                        hash.clone(),
+                        BlobUse {
+                            size,
+                            last_used: clock,
+                        },
+                    );
+                    if let Some(path) = key_path {
+                        index.misses.remove(&path);
+                        index.held.insert(path.clone());
+                        index
+                            .keys_by_hash
+                            .entry(hash.clone())
+                            .or_default()
+                            .insert(path);
+                    }
+                    index.total > self.max_bytes
+                };
+                if over {
+                    self.evict(&hash).await;
+                }
+            }
+            Some(Err(error)) => {
+                tracing::warn!(%error, "cover cache write failed; serving without caching");
+            }
+            None => {}
+        }
+        hash
+    }
+
+    /// Point `key` at a blob already stored under `hash`, without reading
+    /// or hashing the bytes again.
+    pub async fn put_key(&self, key: &str, hash: &str, content_type: &str) {
+        if !is_hash(hash) {
+            return;
+        }
+        let path = self.key_path(key);
+        let text = hit_record(hash, content_type, None);
+        let target = path.clone();
+        match blocking(move || write_atomic(&target, text.as_bytes())).await {
+            Some(Ok(())) => {
+                if let Some(index) = self.lock().as_mut() {
+                    index.touch(hash);
+                    index.misses.remove(&path);
+                    index.held.insert(path.clone());
+                    index
+                        .keys_by_hash
+                        .entry(hash.to_owned())
+                        .or_default()
+                        .insert(path);
+                }
+            }
+            Some(Err(error)) => tracing::warn!(%error, "cover cache key not written"),
+            None => {}
+        }
+    }
+
+    /// Record that the source had no art for `key` for `ttl_secs`. A key
+    /// that already holds an image still on disk keeps it: a failed fetch
+    /// running beside one that succeeded never blanks the stored image.
+    pub async fn put_miss(&self, key: &str, ttl_secs: u64) {
+        self.put_marker(key, Marker::Miss, ttl_secs).await;
+    }
+
+    /// Record that the source could not be asked about `key`, for
+    /// `ttl_secs`. Like [`ArtworkCache::put_miss`], a stored image is kept.
+    pub async fn put_unreachable(&self, key: &str, ttl_secs: u64) {
+        self.put_marker(key, Marker::Unreachable, ttl_secs).await;
+    }
+
+    async fn put_marker(&self, key: &str, marker: Marker, ttl_secs: u64) {
+        if let Some(KeyEntry::Hit { hash, .. }) = self.key(key).await
+            && self.has_blob(&hash).await
+        {
+            return;
+        }
+        let path = self.key_path(key);
+        let until = self.unix_now() + ttl_secs;
+        let kind = match marker {
+            Marker::Miss => "miss",
+            Marker::Unreachable => "unreachable",
+        };
+        let text = format!("{kind}\n{until}\n");
+        let target = path.clone();
+        let written = match blocking(move || write_atomic(&target, text.as_bytes())).await {
+            Some(Ok(())) => true,
+            Some(Err(error)) => {
+                tracing::warn!(%error, "cover cache miss marker not written");
+                false
+            }
+            None => false,
+        };
+        if let Some(index) = self.lock().as_mut() {
+            index.held.remove(&path);
+            match marker {
+                Marker::Miss if written => {
+                    index.misses.insert(path, until);
+                }
+                _ => {
+                    index.misses.remove(&path);
+                }
+            }
+        }
+        let due = self.lock().as_ref().is_some_and(|index| {
+            index
+                .last_full_clean
+                .is_none_or(|last| last.elapsed() >= FULL_CLEAN_EVERY)
+        });
+        if due {
+            self.full_clean().await;
+        }
+    }
+
+    /// Images held and their total size in bytes.
+    pub async fn usage(&self) -> (u64, u64) {
+        self.ensure_index().await;
+        self.lock()
+            .as_ref()
+            .map_or((0, 0), |index| (index.blobs.len() as u64, index.total))
+    }
+
+    /// Delete every image and key record (the admin "clear covers"). Art
+    /// is fetched or read again on the next request. Returns how many
+    /// images went.
+    pub async fn clear(&self) -> u64 {
+        self.ensure_index().await;
+        let cleared = {
+            let mut guard = self.lock();
+            let count = guard.as_ref().map_or(0, |index| index.blobs.len() as u64);
+            *guard = Some(Index {
+                last_full_clean: Some(Instant::now()),
+                ..Index::default()
+            });
+            count
+        };
+        let root = self.root.clone();
+        let removed = blocking(move || {
+            for dir in ["blobs", KEYS_DIR, AUDIODB_KEYS_DIR] {
+                let path = root.join(dir);
+                if let Err(error) = std::fs::remove_dir_all(&path)
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    tracing::warn!(%error, path = %path.display(), "cover cache clear incomplete");
+                }
+            }
+        })
+        .await;
+        if removed.is_none() {
+            tracing::warn!("cover cache clear task failed");
+        }
+        cleared
+    }
+
+    /// Load the blob index from disk once, by scanning the blob folders.
+    async fn ensure_index(&self) {
+        if self.lock().is_some() {
+            return;
+        }
+        let blobs_dir = self.root.join("blobs");
+        let scanned = blocking(move || scan_blobs(&blobs_dir))
+            .await
+            .unwrap_or_default();
+        {
+            let mut guard = self.lock();
+            if guard.is_some() {
+                return;
+            }
+            let total = scanned.values().map(|entry| entry.size).sum();
+            let clock = scanned.len() as u64;
+            *guard = Some(Index {
+                blobs: scanned,
+                total,
+                clock,
+                keys_by_hash: HashMap::new(),
+                last_full_clean: None,
+                misses: HashMap::new(),
+                held: HashSet::new(),
+            });
+        }
+        self.full_clean().await;
+    }
+
+    /// One pass over every key record: drop those whose blob is gone, miss
+    /// markers past their time, and unreadable records, and rebuild the
+    /// reverse map from the rest.
+    async fn full_clean(&self) {
+        let live: HashSet<String> = {
+            let mut guard = self.lock();
+            let Some(index) = guard.as_mut() else {
+                return;
+            };
+            index.last_full_clean = Some(Instant::now());
+            index.blobs.keys().cloned().collect()
+        };
+        let root = self.root.clone();
+        let now = self.unix_now();
+        let Some((removed, kept, misses)) = blocking(move || {
+            let mut removed = 0;
+            let mut kept = Vec::new();
+            let mut misses = Vec::new();
+            for dir in [KEYS_DIR, AUDIODB_KEYS_DIR] {
+                let found = clean_key_files(&root.join(dir), &live, now);
+                removed += found.removed;
+                kept.extend(found.held);
+                misses.extend(found.misses);
+            }
+            (removed, kept, misses)
+        })
+        .await
+        else {
+            return;
+        };
+        if let Some(index) = self.lock().as_mut() {
+            // Merged, never replaced: a write made while the pass ran has
+            // already updated the index, and an image it stored wins.
+            index.misses.retain(|_, until| *until > now);
+            for (path, until) in misses {
+                if !index.held.contains(&path) {
+                    index.misses.entry(path).or_insert(until);
+                }
+            }
+            for (hash, path) in kept {
+                index.held.insert(path.clone());
+                index.keys_by_hash.entry(hash).or_default().insert(path);
+            }
+        }
+        if removed > 0 {
+            tracing::debug!(removed, "cover cache dropped stale key records");
+        }
+    }
+
+    /// Delete least recently used blobs until the cache fits, never the one
+    /// just written.
+    async fn evict(&self, keep: &str) {
+        let victims = {
+            let mut guard = self.lock();
+            let Some(index) = guard.as_mut() else {
+                return;
+            };
+            let mut order: Vec<(u64, String, u64)> = index
+                .blobs
+                .iter()
+                .filter(|(hash, _)| hash.as_str() != keep)
+                .map(|(hash, entry)| (entry.last_used, hash.clone(), entry.size))
+                .collect();
+            order.sort();
+            let mut victims = Vec::new();
+            for (_, hash, size) in order {
+                if index.total <= self.max_bytes {
+                    break;
+                }
+                index.blobs.remove(&hash);
+                index.total = index.total.saturating_sub(size);
+                let keys = index.keys_by_hash.remove(&hash).unwrap_or_default();
+                victims.push((self.blob_path(&hash), hash, keys));
+            }
+            victims
+        };
+        if victims.is_empty() {
+            return;
+        }
+        let count = victims.len();
+        let dropped = blocking(move || {
+            let mut dropped = Vec::new();
+            for (blob, hash, keys) in victims {
+                if let Err(error) = std::fs::remove_file(&blob)
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    tracing::warn!(%error, path = %blob.display(), "cover cache eviction failed");
+                }
+                // Only records still pointing at this blob go; a key may
+                // have moved on to newer art since.
+                for key in keys {
+                    let points_here = std::fs::read_to_string(&key)
+                        .ok()
+                        .and_then(|text| parse_key(&text))
+                        .is_some_and(|entry| {
+                            matches!(entry, KeyEntry::Hit { hash: pointed, .. } if pointed == hash)
+                        });
+                    if points_here && std::fs::remove_file(&key).is_ok() {
+                        dropped.push(key);
+                    }
+                }
+            }
+            dropped
+        })
+        .await
+        .unwrap_or_default();
+        if let Some(index) = self.lock().as_mut() {
+            for key in &dropped {
+                index.held.remove(key);
+            }
+        }
+        tracing::debug!(count, "cover cache evicted old images");
+    }
+
+    fn blob_path(&self, hash: &str) -> PathBuf {
+        let shard = hash.get(..2).unwrap_or("00");
+        self.root.join("blobs").join(shard).join(hash)
+    }
+
+    fn key_path(&self, key: &str) -> PathBuf {
+        let name = sha256_hex(key.as_bytes());
+        let shard = name.get(..2).unwrap_or("00").to_owned();
+        let dir = if key.starts_with(AUDIODB_KEY_PREFIX) {
+            AUDIODB_KEYS_DIR
+        } else {
+            KEYS_DIR
+        };
+        self.root.join(dir).join(shard).join(name)
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<Index>> {
+        self.index
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+/// Run blocking file or image work off the async workers. `None` if the
+/// task panicked, which is logged.
+pub(crate) async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    match tokio::task::spawn_blocking(work).await {
+        Ok(value) => Some(value),
+        Err(error) => {
+            tracing::error!(%error, "cover blocking task failed");
+            None
+        }
+    }
+}
+
+fn parse_key(text: &str) -> Option<KeyEntry> {
+    let mut lines = text.lines();
+    match lines.next()? {
+        "hit" => {
+            let hash = lines.next()?.to_owned();
+            let content_type = lines.next()?.to_owned();
+            is_hash(&hash).then_some(KeyEntry::Hit { hash, content_type })
+        }
+        "miss" => Some(KeyEntry::Miss {
+            until: lines.next()?.parse().ok()?,
+        }),
+        "unreachable" => Some(KeyEntry::Unreachable {
+            until: lines.next()?.parse().ok()?,
+        }),
+        _ => None,
+    }
+}
+
+/// A key record pointing at a blob, with the image's credit on a line of its
+/// own when it has one.
+fn hit_record(hash: &str, content_type: &str, credit: Option<&ImageCredit>) -> String {
+    let mut record = format!("hit\n{hash}\n{content_type}\n");
+    match credit.map(serde_json::to_string) {
+        Some(Ok(json)) => {
+            record.push_str(CREDIT_LINE);
+            record.push_str(&json);
+            record.push('\n');
+        }
+        Some(Err(error)) => tracing::warn!(%error, "image credit not stored"),
+        None => {}
+    }
+    record
+}
+
+/// The credit line of a key record. A record without one, or with one that
+/// does not read, has no credit.
+fn parse_credit(text: &str) -> Option<ImageCredit> {
+    let json = text
+        .lines()
+        .skip(3)
+        .find_map(|line| line.strip_prefix(CREDIT_LINE))?;
+    serde_json::from_str(json).ok()
+}
+
+fn is_hash(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let Some(dir) = path.parent() else {
+        return Err(std::io::Error::other("cache path has no parent"));
+    };
+    std::fs::create_dir_all(dir)?;
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    // Unique per write, so two writers of the same blob never share a
+    // temporary file.
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let temp = dir.join(format!(".{name}.{}.{seq}.tmp", std::process::id()));
+    std::fs::write(&temp, bytes)?;
+    std::fs::rename(&temp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&temp);
+    })
+}
+
+/// What one pass over a folder of key records found.
+#[derive(Default)]
+struct KeyPass {
+    /// Records deleted.
+    removed: usize,
+    /// (hash, path) of every record kept that points at a blob.
+    held: Vec<(String, PathBuf)>,
+    /// Path and expiry of every "no art" marker kept.
+    misses: Vec<(PathBuf, u64)>,
+}
+
+/// Delete key records that point at a blob not in `live`, expired miss
+/// markers, and records that do not parse, and list what is kept.
+fn clean_key_files(dir: &Path, live: &HashSet<String>, now: u64) -> KeyPass {
+    let mut pass = KeyPass::default();
+    let Ok(shards) = std::fs::read_dir(dir) else {
+        return pass;
+    };
+    for shard in shards.flatten() {
+        let Ok(files) = std::fs::read_dir(shard.path()) else {
+            continue;
+        };
+        for file in files.flatten() {
+            let path = file.path();
+            if file.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
+            let stale = match std::fs::read_to_string(&path)
+                .ok()
+                .as_deref()
+                .map(parse_key)
+            {
+                Some(Some(KeyEntry::Hit { hash, .. })) => {
+                    if live.contains(&hash) {
+                        pass.held.push((hash, path.clone()));
+                        false
+                    } else {
+                        true
+                    }
+                }
+                Some(Some(KeyEntry::Miss { until })) => {
+                    if until > now {
+                        pass.misses.push((path.clone(), until));
+                    }
+                    until <= now
+                }
+                Some(Some(KeyEntry::Unreachable { until })) => until <= now,
+                Some(None) => true,
+                None => false,
+            };
+            if stale && std::fs::remove_file(&path).is_ok() {
+                pass.removed += 1;
+            }
+        }
+    }
+    pass
+}
+
+/// Every blob on disk with its size; older files count as less recently
+/// used, so a restart keeps a sensible eviction order.
+fn scan_blobs(dir: &Path) -> HashMap<String, BlobUse> {
+    let mut found: Vec<(SystemTime, String, u64)> = Vec::new();
+    let Ok(shards) = std::fs::read_dir(dir) else {
+        return HashMap::new();
+    };
+    for shard in shards.flatten() {
+        let Ok(files) = std::fs::read_dir(shard.path()) else {
+            continue;
+        };
+        for file in files.flatten() {
+            let name = file.file_name().to_string_lossy().into_owned();
+            if !is_hash(&name) {
+                continue;
+            }
+            if let Ok(meta) = file.metadata() {
+                let modified = meta.modified().unwrap_or(UNIX_EPOCH);
+                found.push((modified, name, meta.len()));
+            }
+        }
+    }
+    found.sort();
+    found
+        .into_iter()
+        .enumerate()
+        .map(|(order, (_, hash, size))| {
+            (
+                hash,
+                BlobUse {
+                    size,
+                    last_used: order as u64,
+                },
+            )
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A failure marker never overwrites a stored image: a background
+    /// fetch that fails beside a page fetch that stored the cover leaves
+    /// the cover in place.
+    #[tokio::test]
+    async fn a_failure_never_blanks_a_stored_image() {
+        let root = std::env::temp_dir().join(format!(
+            "dn-artwork-cache-{}-{}",
+            std::process::id(),
+            droppedneedle_kernel::clock::SystemClock.now_ms()
+        ));
+        let cache = ArtworkCache::new(
+            root.clone(),
+            1024 * 1024,
+            Arc::new(droppedneedle_kernel::clock::SystemClock),
+        );
+        let key = "caa:release-group:aff0622e-7bd3-4fb6-9ca3-0fa19dd2340b:500";
+        let hash = cache.put(Some(key), b"cover".to_vec(), "image/jpeg").await;
+
+        cache.put_miss(key, 900).await;
+
+        assert_eq!(
+            cache.key(key).await,
+            Some(KeyEntry::Hit {
+                hash,
+                content_type: "image/jpeg".to_owned()
+            })
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A "no art" marker is known in memory until it expires by the
+    /// cache's clock, and an image stored under its key ends it at once.
+    #[tokio::test]
+    async fn a_known_miss_ends_when_it_expires_or_art_arrives() {
+        let root = std::env::temp_dir().join(format!(
+            "dn-artwork-known-{}-{}",
+            std::process::id(),
+            droppedneedle_kernel::clock::SystemClock.now_ms()
+        ));
+        let clock = Arc::new(droppedneedle_kernel::clock::ManualClock::at(1_000_000));
+        let cache = ArtworkCache::new(root.clone(), 1024 * 1024, clock.clone());
+        let key = "caa:release-group:aff0622e-7bd3-4fb6-9ca3-0fa19dd2340b:500";
+        assert!(!cache.loaded_or_start(), "nothing is known before the load");
+        cache.ensure_index().await;
+
+        cache.put_miss(key, 60).await;
+        assert!(cache.knows_missing(key));
+        clock.advance(60_000);
+        assert!(!cache.knows_missing(key), "expired with the marker");
+
+        cache.put_miss(key, 60).await;
+        cache.put(Some(key), b"cover".to_vec(), "image/jpeg").await;
+        assert!(!cache.knows_missing(key), "stored art ends the miss");
+        assert!(cache.holds(key));
+        let _ = std::fs::remove_dir_all(root);
+    }
+}

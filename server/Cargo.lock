@@ -444,6 +444,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "cookie"
+version = "0.18.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1a373e3602691c3cdea496d2f0ee5935151e6168fe87739483c463db1b2f2f87"
+dependencies = [
+ "time",
+ "version_check",
+]
+
+[[package]]
 name = "core_detect"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -620,6 +630,7 @@ dependencies = [
  "droppedneedle-tool",
  "flate2",
  "futures-util",
+ "hex",
  "image",
  "libc",
  "lofty",
@@ -664,7 +675,6 @@ dependencies = [
  "getrandom 0.3.4",
  "libc",
  "percent-encoding",
- "quick-xml",
  "reqwest",
  "rusqlite",
  "serde",
@@ -687,10 +697,12 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "bcrypt",
+ "cookie",
  "droppedneedle-kernel",
  "droppedneedle-providers",
  "futures-util",
  "getrandom 0.3.4",
+ "hex",
  "hmac",
  "md5",
  "reqwest",
@@ -700,11 +712,13 @@ dependencies = [
  "serde_json",
  "sha2",
  "sqlx",
+ "subtle",
  "thiserror",
  "time",
  "tokio",
  "tower-http",
  "tracing",
+ "url",
  "utoipa",
  "uuid",
 ]
@@ -723,15 +737,12 @@ dependencies = [
  "droppedneedle-providers",
  "futures-util",
  "image",
- "libc",
- "lofty",
  "md5",
  "reqwest",
  "rusqlite",
  "serde",
  "serde_json",
  "sha2",
- "sqlx",
  "thiserror",
  "time",
  "tokio",
@@ -759,11 +770,11 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "sqlx",
  "time",
  "tokio",
  "tower",
  "tracing",
+ "utoipa",
  "uuid",
 ]
 
@@ -779,6 +790,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.3.4",
  "hmac",
+ "ipnet",
  "libc",
  "reqwest",
  "rusqlite",
@@ -900,6 +912,7 @@ dependencies = [
  "getrandom 0.3.4",
  "md5",
  "percent-encoding",
+ "quick-xml",
  "reqwest",
  "serde",
  "serde_json",
@@ -2380,6 +2393,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "futures-core",
+ "futures-util",
  "http",
  "http-body",
  "http-body-util",
@@ -2388,6 +2402,7 @@ dependencies = [
  "hyper-util",
  "js-sys",
  "log",
+ "mime_guess",
  "percent-encoding",
  "pin-project-lite",
  "quinn",

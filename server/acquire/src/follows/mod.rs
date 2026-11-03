@@ -1,7 +1,7 @@
 //! Follows: who follows which artist, the auto-download asks and their
 //! verdicts, and the follow poll's cursors.
 //!
-//! [`Follows`] alone writes `user_followed_artists`,
+//! [`Follows`] alone writes `acquire_followed_artists`,
 //! `auto_download_approvals` and `acquire_follow_cursors`, and each action
 //! is one writer-lane transaction: the auto-download toggle sets the
 //! intent and files or withdraws the ask together, a verdict moves the
@@ -23,6 +23,7 @@ pub mod approvals;
 pub mod cursors;
 pub mod http;
 pub mod models;
+pub mod rows;
 pub(crate) mod sql;
 
 use std::collections::HashSet;
@@ -37,15 +38,15 @@ use self::models::{
 };
 use crate::db::{AcquireDb, epoch_secs, unix_secs_f64};
 use crate::requests::error::RequestsError;
-use crate::requests::ledger::{ApprovalState, validate_mbid};
+use crate::requests::ledger::{ApprovalState, FollowApproval, validate_mbid};
 use crate::requests::models::ActionResponse;
 use crate::requests::sqlite::{lane_error, ms_from_secs, read};
 use droppedneedle_auth::{Admin, Principal, Role};
-use droppedneedle_catalog::reads::collections::db::CollectionsDb;
-use droppedneedle_catalog::reads::collections::error::CollectionsError;
-use droppedneedle_catalog::reads::collections::models::FollowStatusResponse;
-use droppedneedle_catalog::reads::collections::service::follow_status;
-use droppedneedle_catalog::reads::collections::store::FollowStore;
+use droppedneedle_catalog::collections::db::CollectionsDb;
+use droppedneedle_catalog::collections::error::CollectionsError;
+use droppedneedle_catalog::collections::models::FollowStatusResponse;
+use droppedneedle_catalog::collections::service::follow_status;
+use droppedneedle_catalog::collections::store::FollowStore;
 use droppedneedle_kernel::clock::Clock;
 use droppedneedle_kernel::db::statement::ListLen;
 
@@ -338,21 +339,24 @@ impl Follows {
 
     /// Pending single asks, oldest first, as the admin list shows them.
     pub async fn approval_list(&self) -> Result<AutoDownloadApprovalListResponse, RequestsError> {
+        let item = |row: FollowApproval| AutoDownloadApprovalItem {
+            user_id: row.user_id,
+            user_name: Some(row.user_name),
+            artist_mbid: row.artist_mbid,
+            artist_name: row.artist_name,
+            requested_at: row.requested_at,
+        };
         let items = self
             .pending()
             .await?
             .into_iter()
-            .map(|row| AutoDownloadApprovalItem {
-                user_id: row.user_id,
-                user_name: Some(row.user_name),
-                artist_mbid: row.artist_mbid,
-                artist_name: row.artist_name,
-                requested_at: row.requested_at,
-            })
+            .map(item)
             .collect::<Vec<_>>();
+        let granted = self.approved().await?.into_iter().map(item).collect();
         Ok(AutoDownloadApprovalListResponse {
             count: items.len(),
             items,
+            granted,
         })
     }
 
@@ -472,7 +476,12 @@ pub(crate) fn now_ms(clock: &dyn Clock) -> i64 {
     ms_from_secs(epoch_secs(clock))
 }
 
-/// Float unix seconds, for the REAL follow columns, from unix milliseconds.
+/// A follow row's time in milliseconds, from the seconds a request carries.
+fn follow_ms(now: f64) -> i64 {
+    (now * 1000.0).round() as i64
+}
+
+/// Float unix seconds, from unix milliseconds.
 fn real_secs(now_ms: i64) -> f64 {
     now_ms.max(0) as f64 / 1000.0
 }
@@ -503,7 +512,7 @@ pub(crate) fn set_follow_tx(
             sql::UNFOLLOW.text(),
             params![user_id, artist_mbid.to_lowercase()],
         )?;
-        Ok(())
+        end_waiting_follows(tx, user_id, &artist_mbid.to_lowercase(), now)
     }
 }
 
@@ -533,6 +542,7 @@ pub(crate) fn set_auto_download_tx(
     set_intent(tx, user_id, &lower, enabled, real_secs(now_ms))?;
     if !enabled {
         approvals::withdraw_pending(tx, user_id, &lower)?;
+        end_waiting_follows(tx, user_id, &lower, real_secs(now_ms))?;
     } else if !self_approves {
         approvals::file_pending(tx, user_id, &mbid, &name, now_ms)?;
     }
@@ -556,7 +566,7 @@ fn upsert_follow(
             artist_mbid.to_lowercase(),
             artist_name,
             UNKNOWN_ARTIST,
-            now
+            follow_ms(now)
         ],
     )?;
     Ok(())
@@ -573,7 +583,7 @@ fn set_intent(
 ) -> rusqlite::Result<()> {
     tx.execute(
         sql::SET_INTENT.text(),
-        params![i64::from(enabled), now, user_id, mbid_lower],
+        params![i64::from(enabled), follow_ms(now), user_id, mbid_lower],
     )?;
     Ok(())
 }
@@ -596,11 +606,34 @@ fn apply_verdict(
                 artist_mbid,
                 artist_mbid.to_lowercase(),
                 artist_name,
-                now
+                follow_ms(now)
             ],
         )?;
         Ok(())
     } else {
-        set_intent(tx, user_id, &artist_mbid.to_lowercase(), false, now)
+        let lower = artist_mbid.to_lowercase();
+        set_intent(tx, user_id, &lower, false, now)?;
+        end_waiting_follows(tx, user_id, &lower, now)
     }
+}
+
+/// End the user's waiting follow downloads of one artist: an unfollow,
+/// auto-download turned off, or an approval rejected or revoked takes
+/// back the standing ask they were made under.
+fn end_waiting_follows(
+    tx: &Transaction,
+    user_id: &str,
+    mbid_lower: &str,
+    now: f64,
+) -> rusqlite::Result<()> {
+    let at = (now * 1000.0) as i64;
+    let ended: Vec<String> = tx
+        .prepare_cached(sql::END_WAITING_FOLLOWS.text())?
+        .query_map(params![user_id, mbid_lower, at], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    // As with any cancel, the album's watch stops too.
+    for key in ended {
+        tx.execute(crate::requests::sql::STOP_ROW_WATCH.text(), params![key])?;
+    }
+    Ok(())
 }

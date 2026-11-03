@@ -35,6 +35,11 @@
 //! play guard holds and no administrator marked them distinct. Any other
 //! row a scan emptied stays, and the duplicate artists list offers it.
 //!
+//! The upgrade from v2 folds a carried row named exactly "Unknown Artist"
+//! into the built-in one ([`fold_v2_placeholder`]) when nothing on it names
+//! a real id and every credit it holds is under that name. The scan never
+//! calls it.
+//!
 //! The app's links among a run end's candidates are settled first, so a
 //! link whose support is gone does not lead a group. MusicBrainz's
 //! special-purpose artist ids are never candidates.
@@ -43,15 +48,18 @@
 
 use std::collections::BTreeSet;
 
-use rusqlite::{Connection, Transaction, params};
+use rusqlite::{Connection, OptionalExtension as _, Transaction, params};
 
-use super::artists::{CREDITS_MOVED, retire_artist};
-pub(crate) use super::artists::{MERGED_BY_NAME, MOVED_BY_NAME, MOVED_WITH_ID};
-use super::merge_basis::{Follow, MergeBasis};
+pub(crate) use super::artists::{
+    CREDITS_MOVED, MERGED_BY_NAME, MOVED_BY_NAME, MOVED_WITH_ID, V2_PLACEHOLDER_FOLDED,
+};
+use super::artists::{retarget_retired, retire_artist};
+use super::merge_basis::{Follow, MergeBasis, V2PlaceholderKept};
+use crate::catalog_actions::ArtistAction;
+use crate::catalog_actions::record_artist_action;
 use crate::catalog_revision::bump_catalog;
-use crate::identify::artist_links::{MovedProof, placeholder, settle};
-use crate::identity::sql::REVISABLE;
-use crate::operations::decisions::{ArtistAction, record_artist_action};
+use crate::identify::artist_links::{MovedProof, placeholder, settle_holders};
+use crate::scan::naming::{UNKNOWN_ARTIST, UNKNOWN_ARTIST_ID};
 use crate::scan::sqlite_store::artists::SENTINEL_ARTIST_IDS;
 use droppedneedle_kernel::db::savepoint;
 
@@ -76,28 +84,11 @@ pub(crate) fn converge_artists(tx: &Transaction<'_>, now: f64) -> rusqlite::Resu
     follow_renamed(tx, now)
 }
 
-/// Settle the app's links to any of `ids` before their groups are judged.
-/// A failure is rolled back and logged; the groups are judged anyway.
+/// Settle the app's links of every row holding any of `ids`
+/// ([`settle_holders`]) before their groups are judged. A failure is
+/// rolled back and logged; the groups are judged anyway.
 fn settle_automatic(tx: &Transaction<'_>, ids: &[String], now: f64) -> rusqlite::Result<()> {
-    if ids.is_empty() {
-        return Ok(());
-    }
-    let wanted = serde_json::to_string(ids).unwrap_or_default();
-    let settled = savepoint(tx, "artist_links", || {
-        let rows: Vec<String> = tx
-            .prepare_cached(&format!(
-                "SELECT local_artist_id FROM local_artist_external_identities \
-                 WHERE provider = 'musicbrainz' AND decision_source IN {REVISABLE} \
-                 AND lower(provider_artist_id) IN (SELECT value FROM json_each(?1))"
-            ))?
-            .query_map(params![wanted], |row| row.get(0))?
-            .collect::<rusqlite::Result<_>>()?;
-        settle(tx, &rows, (now * 1000.0) as i64)
-    })?;
-    if let Err(error) = settled {
-        tracing::warn!(%error, "the app's artist links could not be settled; next scan tries again");
-    }
-    Ok(())
+    settle_holders(tx, ids, (now * 1000.0) as i64)
 }
 
 /// Merge the groups of live rows proven to be each of `ids`
@@ -149,19 +140,7 @@ pub(crate) fn converge_ids(tx: &Transaction<'_>, ids: &[String], now: f64) -> ru
 /// special-purpose ids are left out.
 fn candidate_ids(tx: &Transaction<'_>) -> rusqlite::Result<Vec<String>> {
     let ids: Vec<String> = tx
-        .prepare_cached(
-            "SELECT c.mbid FROM ( \
-             SELECT artist_mbid AS mbid, local_artist_id AS artist FROM local_track_artists \
-              WHERE artist_mbid IS NOT NULL \
-             UNION SELECT artist_mbid, local_artist_id FROM local_album_artists \
-              WHERE artist_mbid IS NOT NULL \
-             UNION SELECT lower(provider_artist_id), local_artist_id \
-              FROM local_artist_external_identities WHERE provider = 'musicbrainz' \
-             UNION SELECT artist_mbid, source_local_artist_id FROM library_artist_credit_proofs \
-              WHERE source_local_artist_id IS NOT NULL) c \
-             JOIN local_artists a ON a.id = c.artist AND a.retired_into_artist_id IS NULL \
-             GROUP BY c.mbid HAVING COUNT(*) > 1 ORDER BY c.mbid",
-        )?
+        .prepare_cached(crate::corrections::sql::CANDIDATE_IDS.text())?
         .query_map([], |row| row.get(0))?
         .collect::<rusqlite::Result<_>>()?;
     Ok(ids.into_iter().filter(|id| !placeholder(id)).collect())
@@ -242,18 +221,14 @@ pub(crate) fn follow_moved(
         match follow_one(tx, from, to, mbid, now)? {
             Followed::Merged => merged += 1,
             Followed::Waiting(survivor) => {
-                tx.prepare_cached(
-                    "INSERT OR IGNORE INTO local_artist_merge_candidates (id, left_artist_id, \
-                     right_artist_id, reason_code, created_at, updated_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
-                )?
-                .execute(params![
-                    waiting_id(from, mbid),
-                    from,
-                    survivor,
-                    CREDITS_MOVED,
-                    now
-                ])?;
+                tx.prepare_cached(crate::corrections::sql::FOLLOW_MOVED.text())?
+                    .execute(params![
+                        waiting_id(from, mbid),
+                        from,
+                        survivor,
+                        CREDITS_MOVED,
+                        crate::clock::ms(now)
+                    ])?;
             }
             Followed::Stays => {}
         }
@@ -266,11 +241,8 @@ pub(crate) fn follow_moved(
 
 /// Whether a row waits to follow its credits ([`follow_waiting`]).
 pub(crate) fn any_waiting(conn: &Connection) -> rusqlite::Result<bool> {
-    conn.prepare_cached(
-        "SELECT EXISTS (SELECT 1 FROM local_artist_merge_candidates \
-         WHERE reason_code = ?1 AND state = 'open')",
-    )?
-    .query_row(params![CREDITS_MOVED], |row| row.get(0))
+    conn.prepare_cached(crate::corrections::sql::ANY_WAITING.text())?
+        .query_row(params![CREDITS_MOVED], |row| row.get(0))
 }
 
 /// Look again at every row waiting to follow its credits
@@ -279,10 +251,7 @@ pub(crate) fn any_waiting(conn: &Connection) -> rusqlite::Result<bool> {
 /// still waiting stays open.
 pub(crate) fn follow_waiting(tx: &Transaction<'_>, now: f64) -> rusqlite::Result<()> {
     let waiting: Vec<(String, String, String)> = tx
-        .prepare_cached(
-            "SELECT id, left_artist_id, right_artist_id FROM local_artist_merge_candidates \
-             WHERE reason_code = ?1 AND state = 'open' ORDER BY id",
-        )?
+        .prepare_cached(crate::corrections::sql::FOLLOW_WAITING.text())?
         .query_map(params![CREDITS_MOVED], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })?
@@ -348,8 +317,8 @@ fn merge_group(
         retire_artist(tx, basis, now)?;
     }
     tx.execute(
-        "UPDATE local_artists SET updated_at = ?2, row_revision = row_revision + 1 WHERE id = ?1",
-        params![survivor, now],
+        crate::corrections::sql::BUMP_ARTIST_REVISION.text(),
+        params![survivor, crate::clock::ms(now)],
     )?;
     record_artist_action(
         tx,
@@ -393,19 +362,14 @@ pub(crate) fn record_move(
     } else {
         (MOVED_BY_NAME, "moved-by-name")
     };
-    tx.prepare_cached(
-        "INSERT OR IGNORE INTO local_artist_merge_candidates (id, left_artist_id, \
-         right_artist_id, reason_code, created_at, updated_at) \
-         SELECT ?1, ?2, ?3, ?4, ?5, ?5 WHERE NOT EXISTS (SELECT 1 FROM local_artists \
-          WHERE id IN (?2, ?3) AND kind = 'various_artists')",
-    )?
-    .execute(params![
-        format!("{kind}:{from}:{to}"),
-        from,
-        to,
-        reason,
-        now
-    ])?;
+    tx.prepare_cached(crate::corrections::sql::RECORD_MOVE.text())?
+        .execute(params![
+            format!("{kind}:{from}:{to}"),
+            from,
+            to,
+            reason,
+            crate::clock::ms(now)
+        ])?;
     Ok(())
 }
 
@@ -416,17 +380,7 @@ pub(crate) fn record_move(
 /// duplicate artists list reads; a merge resolves them.
 pub(crate) fn follow_renamed(tx: &Transaction<'_>, now: f64) -> rusqlite::Result<()> {
     let rows: Vec<String> = tx
-        .prepare_cached(
-            "SELECT DISTINCT m.left_artist_id FROM local_artist_merge_candidates m \
-             WHERE m.reason_code IN (?1, ?2) AND m.state = 'open' \
-             AND NOT EXISTS (SELECT 1 FROM local_album_artists \
-              WHERE local_artist_id = m.left_artist_id) \
-             AND NOT EXISTS (SELECT 1 FROM local_track_artists \
-              WHERE local_artist_id = m.left_artist_id) \
-             AND NOT EXISTS (SELECT 1 FROM local_albums \
-              WHERE album_artist_id = m.left_artist_id) \
-             ORDER BY m.left_artist_id",
-        )?
+        .prepare_cached(crate::corrections::sql::FOLLOW_RENAMED.text())?
         .query_map(params![MOVED_BY_NAME, MOVED_WITH_ID], |row| row.get(0))?
         .collect::<rusqlite::Result<_>>()?;
     let mut merged = 0;
@@ -460,5 +414,120 @@ pub(crate) fn follow_renamed(tx: &Transaction<'_>, now: f64) -> rusqlite::Result
     if merged > 0 {
         bump_catalog(tx)?;
     }
+    Ok(())
+}
+
+/// What the upgrade did with one carried v2 "Unknown Artist" row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum V2Fold {
+    /// The row merged into the built-in one.
+    Folded,
+    /// The row had folded already.
+    AlreadyFolded {
+        /// Rows that landed on it since and moved on.
+        moved: u64,
+        /// Links, source links and credits that stay on it.
+        left: u64,
+    },
+    /// The row stays apart.
+    Kept(V2PlaceholderKept),
+}
+
+/// Fold v2's placeholder row `retiree` into the built-in Unknown Artist
+/// ([`MergeBasis::v2_placeholder`]), or move on what a later import landed
+/// on a row that already folded ([`retarget_retired`]), with no second audit
+/// row. Repeating it writes nothing. A failure is rolled back and answered
+/// as a row kept.
+pub fn fold_v2_placeholder(
+    tx: &Transaction<'_>,
+    retiree: &str,
+    now: f64,
+) -> rusqlite::Result<V2Fold> {
+    let retired_into: Option<String> = tx
+        .prepare_cached(crate::corrections::sql::ARTIST_RETIRED_INTO.text())?
+        .query_row(params![retiree], |row| row.get(0))
+        .optional()?
+        .flatten();
+    let (outcome, failed) = if retired_into.as_deref() == Some(UNKNOWN_ARTIST_ID) {
+        let late = savepoint(tx, "artist_v2_placeholder", || late_rows(tx, retiree, now))?;
+        (late, V2PlaceholderKept::LateRowsFailed)
+    } else {
+        let basis = match MergeBasis::v2_placeholder(tx, retiree)? {
+            Ok(basis) => basis,
+            Err(kept) => return Ok(V2Fold::Kept(kept)),
+        };
+        let merged = savepoint(tx, "artist_v2_placeholder", || {
+            merge_v2_placeholder(tx, basis, now).map(|()| V2Fold::Folded)
+        })?;
+        (merged, V2PlaceholderKept::MergeFailed)
+    };
+    Ok(outcome.unwrap_or_else(|error: rusqlite::Error| {
+        tracing::warn!(
+            %error,
+            retired_artist_id = retiree,
+            "v2 Unknown Artist row could not be merged; it stays as it is"
+        );
+        V2Fold::Kept(failed)
+    }))
+}
+
+fn late_rows(tx: &Transaction<'_>, retiree: &str, now: f64) -> rusqlite::Result<V2Fold> {
+    let moved = retarget_retired(tx, retiree, UNKNOWN_ARTIST_ID, UNKNOWN_ARTIST, now)?;
+    if moved > 0 {
+        touch_built_in(tx, now)?;
+    }
+    let left = tx
+        .prepare_cached(crate::corrections::sql::LEFT_ON_RETIRED.text())?
+        .query_row(params![retiree], |row| row.get(0))?;
+    Ok(V2Fold::AlreadyFolded { moved, left })
+}
+
+/// Retire the row and write the merge's one audit row. Rows v2 merged into
+/// it, and their aliases, now answer through an alias on the built-in row,
+/// which is all that opens them once it is retired too.
+fn merge_v2_placeholder(
+    tx: &Transaction<'_>,
+    basis: MergeBasis<'_>,
+    now: f64,
+) -> rusqlite::Result<()> {
+    let retiree = basis.retiree().to_owned();
+    let audit = basis.audit();
+    retire_artist(tx, basis, now)?;
+    tx.execute(
+        crate::corrections::sql::REPOINT_ALIASES_OF_ROWS_MERGED_INTO.text(),
+        params![retiree, UNKNOWN_ARTIST_ID],
+    )?;
+    tx.execute(
+        crate::corrections::sql::ALIAS_ROWS_MERGED_INTO.text(),
+        params![retiree, UNKNOWN_ARTIST_ID, now],
+    )?;
+    touch_built_in(tx, now)?;
+    record_artist_action(
+        tx,
+        ArtistAction {
+            actor: "system",
+            kind: "merge_artist",
+            artist_id: UNKNOWN_ARTIST_ID,
+            before: serde_json::json!({ "artist_ids": [retiree] }),
+            after: serde_json::json!({
+                "kind": "v2_placeholder_fold",
+                "surviving_artist_id": UNKNOWN_ARTIST_ID,
+                "retired_artist_ids": [retiree],
+                "filesystem_writes": 0,
+                "basis": audit,
+            }),
+            reason: V2_PLACEHOLDER_FOLDED,
+        },
+        now,
+    )?;
+    Ok(())
+}
+
+fn touch_built_in(tx: &Transaction<'_>, now: f64) -> rusqlite::Result<()> {
+    tx.execute(
+        crate::corrections::sql::BUMP_ARTIST_REVISION.text(),
+        params![UNKNOWN_ARTIST_ID, crate::clock::ms(now)],
+    )?;
+    bump_catalog(tx)?;
     Ok(())
 }

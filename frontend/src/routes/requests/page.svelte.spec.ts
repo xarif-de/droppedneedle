@@ -12,17 +12,18 @@ const { location, emptyComponent } = vi.hoisted(() => ({
 }));
 
 vi.mock('$app/state', () => ({ page: location }));
-vi.mock('$app/navigation', () => ({ replaceState: vi.fn() }));
+vi.mock('$app/navigation', () => ({ goto: vi.fn() }));
 vi.mock('$lib/stores/authStore.svelte', () => ({
 	authStore: { isAdmin: true, isTrusted: true, user: { id: 'user-1' } },
 	LAST_USER_ID_KEY: 'msr:last_user_id'
 }));
 vi.mock('$lib/queries/requests/RequestQueries.svelte', () => ({
-	getActiveRequestCountQuery: () => ({ data: { count: 0 } })
+	getActiveRequestCountQuery: () => ({ data: { count: 0 } }),
+	getActiveRequestsQuery: () => ({ data: { items: [], count: 0 }, isFetching: false })
 }));
 vi.mock('$lib/queries/downloads/UpgradeQueries.svelte', () => ({
 	getCutoffUnmetQuery: () => ({ data: undefined, isPending: false, isError: false }),
-	requestUpgradeAlbum: () => ({ mutateAsync: vi.fn(), isPending: false })
+	createRequestUpgradeAlbumMutation: () => ({ mutateAsync: vi.fn(), isPending: false })
 }));
 vi.mock('./ActiveTab.svelte', emptyComponent);
 vi.mock('./HistoryTab.svelte', emptyComponent);

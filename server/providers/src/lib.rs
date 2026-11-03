@@ -5,8 +5,10 @@
 //! one client per service (MusicBrainz, the Cover Art Archive,
 //! ListenBrainz, Last.fm, TheAudioDB, AcoustID, Discogs, iTunes, Deezer,
 //! LRCLIB, Wikidata, Ticketmaster, Skiddle, Open-Meteo, YouTube, GitHub,
-//! Spotify and the image hosts), the limiters, the provider answer cache and the
-//! service health registry. Each client sends through its own [`Executor`].
+//! Spotify, plex.tv, Pwned Passwords, the configured OIDC provider, the
+//! user's Newznab indexers and the image hosts), the limiters, the provider
+//! answer cache and the service health registry. Each client sends through
+//! its own [`Executor`].
 //!
 //! - [`executor`]: sends one request. It waits for a token at the caller's
 //!   priority, sends with a deadline, reads the body under a cap, types the
@@ -50,6 +52,7 @@ pub mod executor;
 pub mod geocoding;
 pub mod github;
 pub mod health;
+pub mod hibp;
 pub mod images;
 pub mod itunes;
 pub mod lastfm;
@@ -57,6 +60,8 @@ pub mod limiter;
 pub mod listenbrainz;
 pub mod lrclib;
 pub mod musicbrainz;
+pub mod newznab;
+pub mod oidc;
 pub mod plextv;
 pub mod preview;
 pub mod rates;
@@ -75,11 +80,11 @@ use droppedneedle_kernel::db::cache::CacheDb;
 use droppedneedle_kernel::platform::Platform;
 
 pub use cache::{CacheKey, Fetched, Policy, ProviderCacheStore, Source};
-pub use calls::{CallCount, CallOutcome};
-pub use degradation::{DegradationContext, IntegrationStatus, record_current, scoped};
-pub use error::{MAX_RETRY_AFTER, PayloadKind, ProviderError, TransportKind};
+pub use calls::CallOutcome;
+pub use degradation::{IntegrationStatus, record_current, scoped};
+pub use error::{PayloadKind, ProviderError, TransportKind};
 pub use executor::{Executor, ReqwestWire, Wire};
-pub use limiter::{LimiterSet, OverCapacity, RateLimiter, RatePolicy, RequestPriority};
+pub use limiter::{LimiterSet, RateLimiter, RatePolicy, RequestPriority};
 pub use singleflight::Singleflight;
 pub use web_address::WebAddress;
 
@@ -139,6 +144,10 @@ pub struct ProviderEndpoints {
     pub spotify_cover_cdn: Option<String>,
     /// The origin Deezer serves artist pictures from.
     pub deezer_images: String,
+    /// plex.tv account API root.
+    pub plex_tv: String,
+    /// The Pwned Passwords range API, up to the hash prefix.
+    pub pwned_passwords: String,
 }
 
 impl ProviderEndpoints {
@@ -173,6 +182,8 @@ impl ProviderEndpoints {
             spotify_accounts: "http://127.0.0.1:9/spotify-accounts".to_owned(),
             spotify_cover_cdn: None,
             deezer_images: "http://127.0.0.1:9".to_owned(),
+            plex_tv: "http://127.0.0.1:9/plex".to_owned(),
+            pwned_passwords: "http://127.0.0.1:9/range".to_owned(),
         }
     }
 }
@@ -233,6 +244,17 @@ pub struct Providers {
     pub github_repos: github::GitHubRepos,
     /// Spotify: the token grants and the playlist reads of an import.
     pub spotify: spotify::SpotifyClient,
+    /// plex.tv: the Plex sign-in, the Plex user import and the media
+    /// server adapter's token lookup, on one bucket.
+    pub plextv: plextv::PlexTvClient,
+    /// The user's Newznab indexers, each on a bucket of its own shaped by
+    /// the `newznab` row, held to the daily caps it reports.
+    pub newznab: newznab::NewznabIndexers,
+    /// Pwned Passwords range lookups for the password screen.
+    pub hibp: hibp::HibpClient,
+    /// The OIDC provider an admin configured: discovery, signing keys,
+    /// the token endpoint and userinfo, on one bucket.
+    pub oidc: oidc::OidcClient,
 }
 
 impl Providers {
@@ -281,9 +303,25 @@ impl Providers {
     #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn unpaced_at(wire: Arc<dyn Wire>, endpoints: ProviderEndpoints) -> Self {
-        Self::assemble(
+        Self::unpaced_on(
             wire,
             Arc::new(droppedneedle_kernel::clock::SystemClock),
+            endpoints,
+        )
+    }
+
+    /// [`unpaced_at`](Self::unpaced_at) reading wall time from `clock`, so
+    /// a journey can age the cache.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn unpaced_on(
+        wire: Arc<dyn Wire>,
+        clock: Arc<dyn Clock>,
+        endpoints: ProviderEndpoints,
+    ) -> Self {
+        Self::assemble(
+            wire,
+            clock,
             endpoints,
             LimiterSet::unpaced(),
             CacheDb::scratch(),
@@ -394,6 +432,22 @@ impl Providers {
             &endpoints.spotify_api,
             &endpoints.spotify_accounts,
         );
+        let plextv =
+            plextv::PlexTvClient::new(executor(&plextv::SPEC, plextv::SOURCE), &endpoints.plex_tv);
+        let newznab = newznab::NewznabIndexers::new(
+            limiters.for_executor(newznab::SOURCE),
+            Arc::clone(&wire),
+            Arc::clone(&health),
+            Arc::clone(&clock),
+        );
+        let hibp = hibp::HibpClient::new(
+            executor(&hibp::SPEC, hibp::SOURCE),
+            &endpoints.pwned_passwords,
+        );
+        let oidc = oidc::OidcClient::new(
+            executor(&oidc::SPEC, oidc::SOURCE),
+            executor(&oidc::TOKEN_SPEC, oidc::SOURCE),
+        );
         Self {
             limiters,
             cache,
@@ -417,6 +471,10 @@ impl Providers {
             github,
             github_repos,
             spotify,
+            plextv,
+            newznab,
+            hibp,
+            oidc,
         }
     }
 

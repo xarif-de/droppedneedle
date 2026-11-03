@@ -1,5 +1,4 @@
 //! Browse handlers: ping through search.
-//! v2: the Subsonic router's endpoint functions.
 
 use std::collections::BTreeMap;
 
@@ -10,13 +9,13 @@ use super::models::{
     SArtistID3, SArtistsID3, SChild, SDirectory, SIndex, SIndexID3, SIndexes, SLicense,
     SMusicFolder, SOpenSubsonicExtension, SSearchResult, Wrap,
 };
-use super::store::AlbumSort;
+use super::records::AlbumSort;
 use super::{Ctx, Outcome};
 
-/// Articles stripped for A-Z bucketing (v2 `_IGNORED_ARTICLES`).
+/// Articles stripped for A-Z bucketing.
 pub const IGNORED_ARTICLES: &str = "The El La Los Las Le Les";
 
-/// Album-list types (v2 `_ALBUMLIST_TYPES`).
+/// Album-list types.
 pub const ALBUMLIST_TYPES: &[&str] = &[
     "newest",
     "alphabeticalByName",
@@ -62,10 +61,10 @@ pub fn validate_music_folder(
     Ok(())
 }
 
-/// Missing/empty query means match-all (Navidrome/gonic parity for
-/// Arpeggi's "all songs" view). Symfonium's full-library sync sends the
-/// literal `""` (verified in sentriz/gonic#229 request logs), so
-/// surrounding quotes strip before the empty check (issue #129).
+/// Missing/empty query means match-all. Quirk: Arpeggi's "all songs" view and
+/// Symfonium's full-library sync send the literal `""` (verified in the
+/// sentriz/gonic#229 request logs), so surrounding quotes strip before the empty check
+/// (Symfonium #129).
 pub fn normalize_search_query(raw: Option<&str>) -> Option<String> {
     let raw = raw?;
     let query = raw.trim().trim_matches(['"', '\'']).trim();
@@ -268,7 +267,7 @@ pub async fn song(ctx: &Ctx<'_>) -> Result<Outcome, SubsonicError> {
     Outcome::keyed("song", ctx.child(&track))
 }
 
-/// Shared album-list query (v2 `_album_list`).
+/// Shared album-list query.
 pub async fn album_list_query(
     ctx: &Ctx<'_>,
 ) -> Result<Vec<super::views::ViewAlbum>, SubsonicError> {
@@ -318,7 +317,7 @@ pub async fn album_list_query(
     let mut genre: Option<String> = None;
     if list_type == "byYear" {
         // Clients use year 0 as an unbounded endpoint; param ORDER sets
-        // the direction (v2 `_album_list`).
+        // the direction.
         let first = ctx.pint("fromYear", None, Some(0), Some(9999))?;
         let last = ctx.pint("toYear", None, Some(0), Some(9999))?;
         match (first, last) {
@@ -526,7 +525,12 @@ pub async fn music_directory(ctx: &Ctx<'_>) -> Result<Outcome, SubsonicError> {
     }
 }
 
-/// Shared search query with per-type count+offset (v2 `_search`).
+/// Largest artistCount, albumCount and songCount that search2 and search3
+/// accept. Syncing clients page a library through these counts; a count
+/// above this answers the parameter error, never a shorter page.
+const MAX_SEARCH_COUNT: i64 = 2000;
+
+/// Shared search query with per-type count+offset.
 pub async fn search_query(
     ctx: &Ctx<'_>,
 ) -> Result<
@@ -540,7 +544,7 @@ pub async fn search_query(
     validate_music_folder(&ctx.params)?;
     let query = normalize_search_query(ctx.p("query")?.as_deref());
     let artist_count = ctx
-        .pint("artistCount", Some(20), Some(0), Some(500))?
+        .pint("artistCount", Some(20), Some(0), Some(MAX_SEARCH_COUNT))?
         .unwrap_or(0)
         .max(0) as usize;
     let artist_offset = ctx
@@ -548,7 +552,7 @@ pub async fn search_query(
         .unwrap_or(0)
         .max(0) as usize;
     let album_count = ctx
-        .pint("albumCount", Some(20), Some(0), Some(500))?
+        .pint("albumCount", Some(20), Some(0), Some(MAX_SEARCH_COUNT))?
         .unwrap_or(0)
         .max(0) as usize;
     let album_offset = ctx
@@ -556,7 +560,7 @@ pub async fn search_query(
         .unwrap_or(0)
         .max(0) as usize;
     let song_count = ctx
-        .pint("songCount", Some(20), Some(0), Some(500))?
+        .pint("songCount", Some(20), Some(0), Some(MAX_SEARCH_COUNT))?
         .unwrap_or(0)
         .max(0) as usize;
     let song_offset = ctx

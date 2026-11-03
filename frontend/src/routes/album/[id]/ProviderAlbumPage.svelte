@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
-	import { useIntegrationStatus } from '$lib/queries/HomeIntegrationStatusQuery.svelte';
+	import { useIntegrationStatus } from '$lib/queries/home.svelte';
 	import BackButton from '$lib/components/BackButton.svelte';
 	import Button from '$lib/ui/Button.svelte';
 	import Card from '$lib/ui/Card.svelte';
@@ -23,16 +23,15 @@
 	import ManagementHoldSection from '$lib/components/library/ManagementHoldSection.svelte';
 	import RecycledRemovals from '$lib/components/library/RecycledRemovals.svelte';
 	import AlbumHistory from '$lib/components/library/AlbumHistory.svelte';
-	import RetagPairCard from '$lib/components/library/RetagPairCard.svelte';
-	import { getRetagPairsQuery } from '$lib/queries/library/LibraryRetagPairQueries.svelte';
+	import AlbumRetagPairs from '$lib/components/library/AlbumRetagPairs.svelte';
 	import {
 		getLibraryAlbumCopiesQuery,
 		getLibraryAlbumDetailQuery,
 		getLibraryAlbumStatusQuery
 	} from '$lib/queries/library/LibraryQueries.svelte';
 	import LocalAlbumPage from './LocalAlbumPage.svelte';
-	import { getRatingsQuery, ratingOf, setRating } from '$lib/queries/ratings/RatingQueries.svelte';
-	import { setFavorite } from '$lib/queries/library/FavoriteMutations.svelte';
+	import { getRatingsQuery, ratingOf, createSetRatingMutation } from '$lib/queries/ratings.svelte';
+	import { createSetFavoriteMutation } from '$lib/queries/library/FavoriteMutations.svelte';
 
 	const integrations = useIntegrationStatus();
 
@@ -72,16 +71,8 @@
 				}
 			: null
 	);
-	const rate = setRating();
-	const heart = setFavorite();
-	const retagPairsQuery = getRetagPairsQuery(() => authStore.isAdmin);
-	const retagPairs = $derived(
-		localAlbumId
-			? (retagPairsQuery.data?.pairs ?? []).filter(
-					(pair) => pair.old_album.id === localAlbumId || pair.new_album.id === localAlbumId
-				)
-			: []
-	);
+	const rate = createSetRatingMutation();
+	const heart = createSetFavoriteMutation();
 	const primaryError = $derived(state.primaryError);
 	const albumNotFound = $derived(primaryError instanceof ApiError && primaryError.status === 404);
 	const providerUnavailable = $derived.by(() => {
@@ -175,7 +166,7 @@
 				releaseGroupMbid={album.musicbrainz_id}
 				{localCopies}
 				editionPick={state.editionPick}
-				downloadAllowed={state.localMatch?.download_allowed !== false}
+				downloadAllowed={state.downloadAllowed}
 				rating={ratingOf(ratingsQuery.data, 'album', localAlbumId)}
 				onrate={localAlbumId
 					? (rating) => rate.mutate({ kind: 'album', itemId: localAlbumId, rating })
@@ -202,9 +193,9 @@
 				/>
 			{/if}
 
-			{#each retagPairs as pair (`${pair.old_album.id}/${pair.new_album.id}`)}
-				<RetagPairCard {pair} currentAlbumId={localAlbumId} />
-			{/each}
+			{#if authStore.isAdmin && localAlbumId}
+				<AlbumRetagPairs albumId={localAlbumId} />
+			{/if}
 
 			{#if localCopies.length > 1}
 				<Card variant="bordered" padding="md" as="section" aria-label="Copies in your library">

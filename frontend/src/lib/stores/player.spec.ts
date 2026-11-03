@@ -61,10 +61,10 @@ vi.stubGlobal('localStorage', {
 	})
 });
 
-vi.mock('$lib/stores/playbackToast.svelte', () => ({
-	playbackToast: {
-		show: vi.fn(),
-		dismiss: vi.fn(),
+vi.mock('$lib/stores/toast', () => ({
+	toastStore: {
+		notify: vi.fn(),
+		hide: vi.fn(),
 		get visible() {
 			return false;
 		},
@@ -87,7 +87,7 @@ vi.mock('$lib/api/client', () => ({
 }));
 
 import { playerStore } from './player.svelte';
-import { playbackToast } from '$lib/stores/playbackToast.svelte';
+import { toastStore } from '$lib/stores/toast';
 import { radioSession } from '$lib/stores/radioSession.svelte';
 import { authStore } from '$lib/stores/authStore.svelte';
 import { startPlaybackSession, stopPlaybackSession } from '$lib/player/playbackGateway';
@@ -229,7 +229,7 @@ describe('playerStore queue methods', () => {
 			const beforeSource = playerStore.queue[currentIdx].sourceType;
 			playerStore.changeTrackSource(currentIdx, 'jellyfin');
 			expect(playerStore.queue[currentIdx].sourceType).toBe(beforeSource);
-			expect(playbackToast.show).toHaveBeenCalled();
+			expect(toastStore.notify).toHaveBeenCalled();
 		});
 
 		it('updates streamUrl for target source', () => {
@@ -482,11 +482,19 @@ describe('Jellyfin session lifecycle', () => {
 		});
 	}
 
-	it('calls startSession when a Jellyfin track is loaded', async () => {
+	it('starts the session when a Jellyfin track plays, not when it loads', async () => {
 		playerStore.playQueue([makeJellyfinItem()]);
 		await vi.advanceTimersByTimeAsync(0);
+		expect(startPlaybackSession).not.toHaveBeenCalled();
 
-		expect(startPlaybackSession).toHaveBeenCalledWith({ source: 'jellyfin', track_id: 'jf-1' });
+		capturedStateCallbacks.forEach((cb) => cb('playing'));
+		await vi.advanceTimersByTimeAsync(0);
+
+		expect(startPlaybackSession).toHaveBeenCalledWith({
+			source: 'jellyfin',
+			track_id: 'jf-1',
+			position_ms: 0
+		});
 	});
 
 	it('calls reportStop when switching tracks', async () => {
@@ -506,7 +514,8 @@ describe('Jellyfin session lifecycle', () => {
 		expect(stopPlaybackSession).toHaveBeenCalledWith({
 			source: 'jellyfin',
 			track_id: 'jf-1',
-			position_ms: expect.any(Number)
+			position_ms: expect.any(Number),
+			start_position_ms: 0
 		});
 	});
 });
@@ -574,6 +583,7 @@ describe('beforeunload beacon', () => {
 		playerStore.playQueue([makeJellyfinItem()]);
 		await vi.advanceTimersByTimeAsync(0);
 
+		capturedStateCallbacks.forEach((cb) => cb('playing'));
 		capturedProgressCallbacks.forEach((cb) => cb(45, 180));
 
 		const beforeUnloadHandler = addEventListenerSpy.mock.calls.find(
@@ -589,7 +599,13 @@ describe('beforeunload beacon', () => {
 		expect(sentBlob.type).toBe('application/json');
 		const text = await sentBlob.text();
 		const parsed = JSON.parse(text);
-		expect(parsed).toEqual({ source: 'jellyfin', track_id: 'jf-beacon', position_ms: 45000 });
+		expect(parsed).toEqual({
+			source: 'jellyfin',
+			track_id: 'jf-beacon',
+			position_ms: 45000,
+			start_position_ms: 0,
+			duration_ms: 180000
+		});
 	});
 });
 
@@ -645,7 +661,7 @@ describe('track failure reporting', () => {
 
 		// Retry reloads the same track instead of skipping onward.
 		expect(playerStore.currentIndex).toBe(0);
-		expect(playbackToast.show).toHaveBeenLastCalledWith(
+		expect(toastStore.notify).toHaveBeenLastCalledWith(
 			'"Track 1" failed on local (stream failed), retrying...',
 			'warning'
 		);
@@ -654,7 +670,7 @@ describe('track failure reporting', () => {
 		await vi.advanceTimersByTimeAsync(2100);
 
 		expect(playerStore.currentIndex).toBe(1);
-		expect(playbackToast.show).toHaveBeenLastCalledWith(
+		expect(toastStore.notify).toHaveBeenLastCalledWith(
 			'"Track 1" failed on local (stream failed), skipping...',
 			'warning'
 		);
@@ -684,7 +700,7 @@ describe('track failure reporting', () => {
 		expect(playerStore.currentIndex).toBe(0);
 		expect(playerStore.queue[0].sourceType).toBe('local');
 		expect(playerStore.queue[0].trackSourceId).toBe('file-1');
-		expect(playbackToast.show).toHaveBeenLastCalledWith(
+		expect(toastStore.notify).toHaveBeenLastCalledWith(
 			'"Plex Track" failed on plex, trying local...',
 			'warning'
 		);
@@ -693,7 +709,7 @@ describe('track failure reporting', () => {
 		await vi.advanceTimersByTimeAsync(2100);
 
 		expect(playerStore.currentIndex).toBe(1);
-		expect(playbackToast.show).toHaveBeenLastCalledWith(
+		expect(toastStore.notify).toHaveBeenLastCalledWith(
 			'"Plex Track" failed on local (stream failed), skipping...',
 			'warning'
 		);
@@ -712,11 +728,8 @@ describe('track failure reporting', () => {
 		expect(mockApiHead).toHaveBeenCalledTimes(1);
 		expect(playerStore.queue.map((item) => item.trackSourceId)).toEqual(['vid-1', 'vid-2']);
 		expect(playerStore.nowPlaying?.trackName).toBe('Track 2');
-		expect(playbackToast.show).toHaveBeenCalledWith(
-			'"Track 1" is no longer in the library',
-			'info'
-		);
-		expect(playbackToast.show).not.toHaveBeenCalledWith(
+		expect(toastStore.notify).toHaveBeenCalledWith('"Track 1" is no longer in the library', 'info');
+		expect(toastStore.notify).not.toHaveBeenCalledWith(
 			expect.stringContaining('retrying'),
 			'warning'
 		);
@@ -736,10 +749,7 @@ describe('track failure reporting', () => {
 		expect(playerStore.queue.map((item) => item.trackSourceId)).toEqual(['vid-1']);
 		expect(playerStore.nowPlaying?.trackName).toBe('Track 2');
 		expect(playerStore.isPlaying).toBe(false);
-		expect(playbackToast.show).toHaveBeenCalledWith(
-			'"Track 1" is no longer in the library',
-			'info'
-		);
+		expect(toastStore.notify).toHaveBeenCalledWith('"Track 1" is no longer in the library', 'info');
 	});
 
 	it('takes the tracks a removal took out of the queue', async () => {

@@ -63,8 +63,8 @@ const OPENS: &[Place] = &[
         "the offline export reads the v2 database and writes its bundle",
     ),
     place(
-        "tool/src/import/pipeline.rs",
-        "the offline import runs its rows in one sqlx transaction on the pool the upgrade hands it",
+        "tool/src/import/apply.rs",
+        "the offline import runs on a connection of its own, with its bundle attached",
     ),
     place(
         "src/admin/backups.rs",
@@ -274,8 +274,12 @@ const IDENTITY_RULES: &[Rule] = &[
             IDENTITY,
             IDENTITY_TOOL,
             place(
-                "catalog/src/reads/library/perf_tests.rs",
+                "catalog/src/local/perf_tests.rs",
                 "the read benchmarks seed their own database",
+            ),
+            place(
+                "library/src/identify/sqlite/tests.rs",
+                "a unit test seeds two chosen matches that disagree, which the module refuses to write",
             ),
         ],
     },
@@ -359,6 +363,10 @@ fn only_the_identity_module_writes_identity_rows() {
 const IDENTITY_USES: &[(&str, &str)] = &[
     ("catalog_revision", "moves the catalog revision"),
     (
+        "clock",
+        "turns the seconds it is given into the milliseconds its rows keep",
+    ),
+    (
         "corrections::continuation",
         "carries a file's history onto the files a match placed; reads identity rows, writes none",
     ),
@@ -375,23 +383,13 @@ const IDENTITY_USES: &[(&str, &str)] = &[
         "offers the album to identification and reads its input revision",
     ),
     ("identify::models", "the identity rows' data types"),
+    ("catalog_actions::CatalogAction", "the audit row"),
+    ("catalog_actions::record_action", "the audit row"),
     (
-        "operations::decisions::CatalogAction",
-        "the audit row, until the audit writer has a module of its own",
-    ),
-    (
-        "operations::decisions::record_action",
-        "the audit row, until the audit writer has a module of its own",
-    ),
-    (
-        "operations::decisions::settle_reviews",
-        "review writes, until reviews have a service of their own",
+        "reviews::settle_reviews",
+        "closes an album's pending reviews",
     ),
     ("matching::Release", "the stored release document's type"),
-    (
-        "publish::planner::ReleaseIdentity",
-        "an import's journaled match, a data type",
-    ),
 ];
 
 /// The identity module uses only what [`IDENTITY_USES`] lists from the
@@ -476,6 +474,7 @@ const BENCHMARKS: &str = "the read benchmarks, a test-only module";
 const IMAGE_WORK: &str = "image work off the async workers, awaited by the request";
 const COVER_FLIGHT: &str =
     "a cover fetch that still lands in the cache when its request stops waiting";
+const COVER_INDEX_LOAD: &str = "the cover cache index load a library view starts once, so the view never waits on the disk; its file work logs its own failure";
 const TEST_TEMPLATE: &str = "the test template migrates on its own thread, once per test process";
 const LOOP_STEP: &str =
     "a blocking step awaited inside a supervised loop, its stop checked between steps";
@@ -487,10 +486,11 @@ const PLUGIN_REPLACED: &str =
     "stops a replaced plugin runtime off the request path; plugin lifecycle";
 const PLUGIN_CHILD: &str =
     "the plugin child's I/O pumps and host-call answers, ended with its pipes";
+const SHARED_FLIGHT: &str = "a coalesced flight that runs to its end, and gives back what it holds, when every caller stopped waiting";
 const PROVIDER_FETCH: &str = "a provider fetch shared by its callers, which stores its answer when they stop waiting and logs a panic";
 const BOOT_STEP: &str = "boot-time file work, awaited before serving";
 const HTTP_SERVER: &str = "the HTTP server, joined by serve at the shutdown deadline";
-const OFFLINE_TOOL: &str = "the offline tool's file work, awaited";
+const OFFLINE_TOOL: &str = "the offline tool's file and database work, awaited";
 
 const SPAWN_SITES: &[(&str, usize, &str)] = &[
     ("acquire/src/drop_import/http.rs", 1, UPLOAD_CLEANUP),
@@ -515,39 +515,35 @@ const SPAWN_SITES: &[(&str, usize, &str)] = &[
     ("auth/src/passwords.rs", 1, REQUEST),
     ("auth/src/sqlite/sessions.rs", 1, SESSION_TOUCH),
     ("auth/src/users/hibp.rs", 1, REQUEST),
-    ("catalog/src/reads/catalog/artist.rs", 1, CATALOG_WARM),
-    ("catalog/src/reads/catalog/discovery.rs", 1, CATALOG_WARM),
-    ("catalog/src/reads/discover/content.rs", 1, DISCOVER_BUILD),
-    ("catalog/src/reads/discover/home/mod.rs", 1, DISCOVER_BUILD),
-    ("catalog/src/reads/discover/page/mod.rs", 2, DISCOVER_BUILD),
-    ("catalog/src/reads/discover/queue/mod.rs", 1, DISCOVER_BUILD),
-    ("catalog/src/reads/library/file_lyrics.rs", 1, REQUEST),
-    ("catalog/src/reads/library/perf_tests.rs", 1, BENCHMARKS),
-    ("catalog/src/reads/library/tags.rs", 1, REQUEST),
-    ("catalog/src/reads/platform/artwork/cache.rs", 1, IMAGE_WORK),
-    ("catalog/src/reads/platform/artwork/local.rs", 2, IMAGE_WORK),
-    ("catalog/src/reads/platform/artwork/mod.rs", 2, COVER_FLIGHT),
-    ("catalog/src/reads/platform/artwork/mod.rs", 2, IMAGE_WORK),
-    (
-        "catalog/src/reads/platform/artwork/warm.rs",
-        1,
-        WARM_ENQUEUE,
-    ),
-    ("compat/src/adapters/library.rs", 1, REQUEST),
-    ("compat/src/adapters/subsonic_store.rs", 1, REQUEST),
+    ("catalog/src/metadata/artist.rs", 1, CATALOG_WARM),
+    ("catalog/src/metadata/discovery.rs", 2, CATALOG_WARM),
+    ("catalog/src/discover/content.rs", 1, DISCOVER_BUILD),
+    ("catalog/src/discover/home/mod.rs", 1, DISCOVER_BUILD),
+    ("catalog/src/discover/page/mod.rs", 2, DISCOVER_BUILD),
+    ("catalog/src/discover/queue/mod.rs", 1, DISCOVER_BUILD),
+    ("catalog/src/local/file_lyrics.rs", 1, REQUEST),
+    ("catalog/src/local/perf_tests.rs", 1, BENCHMARKS),
+    ("catalog/src/artwork/cache.rs", 1, IMAGE_WORK),
+    ("catalog/src/artwork/cache.rs", 1, COVER_INDEX_LOAD),
+    ("catalog/src/artwork/local.rs", 2, IMAGE_WORK),
+    ("catalog/src/artwork/mod.rs", 2, COVER_FLIGHT),
+    ("catalog/src/artwork/mod.rs", 2, IMAGE_WORK),
+    ("catalog/src/artwork/warm.rs", 1, WARM_ENQUEUE),
+    ("compat/src/library.rs", 1, REQUEST),
+    ("compat/src/subsonic/store.rs", 1, REQUEST),
     ("kernel/src/runtime_config/store.rs", 4, AWAITED),
     ("kernel/src/schema/template.rs", 1, TEST_TEMPLATE),
     ("library/src/contrib/live.rs", 1, LOOP_STEP),
     ("library/src/http/mod.rs", 1, REQUEST),
-    ("library/src/identify/sources.rs", 2, LOOP_STEP),
+    ("library/src/edition/service.rs", 9, LOOP_STEP),
+    ("library/src/identify/sources.rs", 3, LOOP_STEP),
     ("library/src/identify/stores.rs", 2, LOOP_STEP),
-    ("library/src/loops.rs", 4, LOOP_STEP),
-    ("library/src/manage.rs", 1, LOOP_STEP),
+    ("library/src/jobs/worker.rs", 2, LOOP_STEP),
+    ("library/src/loops.rs", 3, LOOP_STEP),
     ("library/src/management/mod.rs", 2, LOOP_STEP),
-    ("library/src/mutations.rs", 1, REQUEST),
-    ("library/src/operations/mod.rs", 2, LOOP_STEP),
-    ("library/src/operations/service.rs", 9, LOOP_STEP),
-    ("library/src/recycle_bin.rs", 1, JOB_STEP),
+    ("library/src/publish/session.rs", 1, LOOP_STEP),
+    ("library/src/removal/mod.rs", 1, REQUEST),
+    ("library/src/removal/recycle_bin.rs", 1, JOB_STEP),
     ("library/src/repairs/mod.rs", 1, LOOP_STEP),
     ("library/src/scan/coordinator.rs", 1, LOOP_STEP),
     ("library/src/scan/pool.rs", 1, LOOP_STEP),
@@ -564,6 +560,7 @@ const SPAWN_SITES: &[(&str, usize, &str)] = &[
     ("plugins/src/host.rs", 1, PLUGIN_REPLACED),
     ("plugins/src/process.rs", 5, PLUGIN_CHILD),
     ("providers/src/cache.rs", 1, PROVIDER_FETCH),
+    ("providers/src/singleflight.rs", 1, SHARED_FLIGHT),
     ("providers/src/youtube.rs", 1, REQUEST),
     ("src/admin/handlers.rs", 1, REQUEST),
     ("src/bootstrap/key_check.rs", 1, BOOT_STEP),
@@ -574,9 +571,7 @@ const SPAWN_SITES: &[(&str, usize, &str)] = &[
     ("src/settings/library_policy_service.rs", 1, REQUEST),
     ("src/settings/services.rs", 3, REQUEST),
     ("src/settings/wiring.rs", 2, REQUEST),
-    ("tool/src/import/carry/avatars.rs", 2, OFFLINE_TOOL),
-    ("tool/src/import/carry/bundle.rs", 1, OFFLINE_TOOL),
-    ("tool/src/import/carry/held.rs", 2, OFFLINE_TOOL),
+    ("tool/src/import/apply.rs", 1, OFFLINE_TOOL),
     ("tool/src/tooling/reset_key.rs", 1, OFFLINE_TOOL),
     ("tool/src/tooling/upgrade.rs", 1, OFFLINE_TOOL),
 ];

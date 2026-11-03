@@ -13,17 +13,17 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use droppedneedle_auth::users::roles::{Role, SessionKind};
-use droppedneedle_catalog::reads::collections::remote_import::PlaylistImportSink;
+use droppedneedle_catalog::collections::remote_import::PlaylistImportSink;
 use droppedneedle_kernel::platform::Platform;
 use droppedneedle_kernel::runtime_config::Secret;
 use droppedneedle_kernel::runtime_config::secret_sections::{
     JellyfinConnection, NavidromeConnection, PlexConnection,
 };
+use droppedneedle_providers::RequestPriority;
 use droppedneedle_testkit::remotes::{
     JELLYFIN_KEY, MATCH_MBID, MockAlbum, MockOptions, NAVIDROME_USER, PLEX_TOKEN, serve_jellyfin,
     serve_navidrome, serve_navidrome_with, serve_plex, serve_plex_with,
 };
-use remotes::adapter::{AdapterError, AlbumBrowse, ArtistBrowse, RemoteHandle, TrackBrowse};
 use remotes::connections::{ConnectionResolver, ResolveError, UserLink};
 use remotes::folders::{FolderPreference, SqliteFolderStore, resolve_scope};
 use remotes::handlers::{self as remotes_handlers, RemotesDeps};
@@ -32,6 +32,7 @@ use remotes::models::SourceName;
 use remotes::navidrome::NavidromeAdapter;
 use remotes::plex::PlexAdapter;
 use remotes::service::RemotesService;
+use remotes::source::{AdapterError, AlbumBrowse, ArtistBrowse, RemoteHandle, TrackBrowse};
 use remotes::warmup::{MbidIndex, Warmups};
 use serde_json::Value;
 use tower::ServiceExt as _;
@@ -666,7 +667,11 @@ async fn own_link_wins_over_the_shared_admin_account() {
         .await;
     let resolver = rig.resolver();
     let shared = resolver
-        .resolve(USER_ID, SourceName::Navidrome)
+        .resolve(
+            USER_ID,
+            SourceName::Navidrome,
+            RequestPriority::UserInitiated,
+        )
         .await
         .expect("shared resolves");
     assert_eq!(shared.account_mode, "shared");
@@ -695,7 +700,11 @@ async fn own_link_wins_over_the_shared_admin_account() {
     assert!(!row.data.contains("s3cret"));
 
     let own = resolver
-        .resolve(USER_ID, SourceName::Navidrome)
+        .resolve(
+            USER_ID,
+            SourceName::Navidrome,
+            RequestPriority::UserInitiated,
+        )
         .await
         .expect("own resolves");
     assert_eq!(own.account_mode, "linked");
@@ -705,7 +714,11 @@ async fn own_link_wins_over_the_shared_admin_account() {
         .await
         .expect("row writes");
     let fallback = resolver
-        .resolve(USER_ID, SourceName::Navidrome)
+        .resolve(
+            USER_ID,
+            SourceName::Navidrome,
+            RequestPriority::UserInitiated,
+        )
         .await
         .expect("stale link falls back");
     assert_eq!(fallback.account_mode, "shared");
@@ -728,7 +741,13 @@ async fn links_need_the_admin_server() {
         .await
         .expect("link saves");
     assert!(matches!(
-        resolver.resolve(USER_ID, SourceName::Navidrome).await,
+        resolver
+            .resolve(
+                USER_ID,
+                SourceName::Navidrome,
+                RequestPriority::UserInitiated
+            )
+            .await,
         Err(ResolveError::NotConfigured)
     ));
 }
@@ -738,7 +757,7 @@ async fn links_need_the_admin_server() {
 /// rest.
 #[tokio::test]
 async fn linked_connections_survive_a_restart() {
-    use droppedneedle_kernel::db::{DbConfig, open_runtime};
+    use droppedneedle_kernel::db::{DbConfig, LaneLimits, TEST_PATIENCE, open_runtime};
     use remotes::folders::FolderStore as _;
 
     let rig = Rig::open("remotes-durable").await;
@@ -780,9 +799,23 @@ async fn linked_connections_survive_a_restart() {
     } = rig;
     drop(platform);
     runtime.shutdown().await;
-    let runtime = open_runtime(&DbConfig::new(&dir.join("app.db")))
-        .await
-        .expect("db reopens");
+    // Reopened with the patient limits the rig opened it with, so a loaded
+    // host slows the reads below instead of answering busy.
+    let config = DbConfig::new(&dir.join("app.db"))
+        .with_lane_limits(LaneLimits::patient())
+        .with_read_wait(TEST_PATIENCE);
+    let deadline = std::time::Instant::now() + crate::common::PATIENCE;
+    let runtime = loop {
+        match open_runtime(&config).await {
+            Ok(runtime) => break runtime,
+            Err(error)
+                if crate::common::busy_open(&error) && std::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            Err(error) => panic!("db reopens: {error}"),
+        }
+    };
     let platform = crate::common::TestPlatform::on(runtime.db(), &dir)
         .build()
         .await;
@@ -794,7 +827,11 @@ async fn linked_connections_survive_a_restart() {
     };
     let resolved = rig
         .resolver()
-        .resolve(USER_ID, SourceName::Navidrome)
+        .resolve(
+            USER_ID,
+            SourceName::Navidrome,
+            RequestPriority::UserInitiated,
+        )
         .await
         .expect("link resolves after restart");
     assert_eq!(resolved.account_mode, "linked");
@@ -805,12 +842,17 @@ async fn linked_connections_survive_a_restart() {
 
 /// A Plex link saved without a server token (v2 rows from the login flow)
 /// looks the token up once through the server's machine id and plex.tv,
-/// stores it, and browses with it.
+/// stores it, and browses with it. That lookup and the Plex sign-in read
+/// plex.tv `/resources` through the one plex.tv client, so both are paced
+/// and counted on its `plextv` row at user priority.
 #[tokio::test]
 async fn plex_links_without_a_server_token_look_one_up_and_keep_it() {
+    use droppedneedle_auth::federated::plex_http::PlexTv;
+    use droppedneedle_auth::federated::settings::InstallIds;
     use droppedneedle_kernel::runtime_config::sections::InternalState;
-    use droppedneedle_testkit::remotes::PLEX_ACCOUNT_TOKEN;
-    use remotes::plex::PlexTokenProbe;
+    use droppedneedle_providers::{CallOutcome, Providers, plextv};
+    use droppedneedle_testkit::remotes::{PLEX_ACCOUNT_TOKEN, PLEX_MACHINE_ID};
+    use remotes::plex::{ConfiguredPlexServer, PlexTokenProbe};
 
     let mock = serve_plex().await.expect("mock serves");
     let rig = Rig::open("remotes-plex-token").await;
@@ -823,11 +865,19 @@ async fn plex_links_without_a_server_token_look_one_up_and_keep_it() {
         })
         .await
         .expect("client id saves");
+    let providers = Providers::build(
+        &rig.platform,
+        droppedneedle_providers::ProviderEndpoints {
+            plex_tv: format!("{}/api/v2", mock.base_url),
+            ..droppedneedle_providers::ProviderEndpoints::closed()
+        },
+        droppedneedle_kernel::db::cache::CacheDb::scratch(),
+    );
     let resolver = rig
         .resolver()
-        .with_plex_tokens(Arc::new(PlexTokenProbe::with_plex_tv(
+        .with_plex_tokens(Arc::new(PlexTokenProbe::new(
             http_client(),
-            format!("{}/api/v2", mock.base_url),
+            providers.plextv.clone(),
         )));
     resolver
         .save_link(
@@ -843,7 +893,7 @@ async fn plex_links_without_a_server_token_look_one_up_and_keep_it() {
         .expect("link saves");
 
     let resolved = resolver
-        .resolve(USER_ID, SourceName::Plex)
+        .resolve(USER_ID, SourceName::Plex, RequestPriority::UserInitiated)
         .await
         .expect("link resolves");
     assert_eq!(resolved.account_mode, "linked");
@@ -855,6 +905,35 @@ async fn plex_links_without_a_server_token_look_one_up_and_keep_it() {
     assert!(
         matches!(stored, Some(UserLink::Plex { server_access_token, .. }) if server_access_token == PLEX_TOKEN),
         "server token stored"
+    );
+
+    let settings = Arc::clone(&rig.platform.settings);
+    let sign_in = PlexTv::new(
+        providers.plextv.clone(),
+        Arc::clone(&settings),
+        Arc::new(ConfiguredPlexServer::new(
+            http_client(),
+            settings.live(),
+            InstallIds::new(Arc::clone(&settings)),
+        )),
+    );
+    let access = sign_in
+        .server_access(PLEX_ACCOUNT_TOKEN, PLEX_MACHINE_ID)
+        .await
+        .expect("the sign-in reads plex.tv");
+    assert!(access.member);
+    assert_eq!(access.token.as_deref(), Some(PLEX_TOKEN));
+    let calls: Vec<_> = providers
+        .limiter(plextv::SOURCE)
+        .expect("plex.tv has a rate row")
+        .calls()
+        .into_iter()
+        .map(|count| (count.priority, count.outcome, count.calls))
+        .collect();
+    assert_eq!(
+        calls,
+        vec![(RequestPriority::UserInitiated, CallOutcome::Ok, 2)],
+        "both /resources reads went through the plextv row"
     );
 }
 
@@ -895,7 +974,7 @@ async fn folders_fail_closed_on_server_change_or_outage() {
 // ---------------------------------------------------------------------------
 
 /// A plain user with no links of their own, on an instance where the admin
-/// configured all three servers with shared credentials (the v2 shared
+/// configured all three servers with shared credentials (the shared
 /// mode). Every route below runs through the admin's accounts.
 async fn connected_testbed() -> (Router, Rig) {
     // Mocks leak for the life of the test process; routes need their URLs
@@ -1324,6 +1403,25 @@ async fn navidrome_track_rows_show_the_disc_cover() {
 /// drawn from its members. A track row points at its album's cover, a
 /// playlist cover is the playlist's own, and an item with no image is
 /// absent (404), never a server failure.
+/// A Jellyfin track's recording is its `MusicBrainzRecording`, never its
+/// `MusicBrainzTrack`, which is the release track.
+#[tokio::test]
+async fn jellyfin_tracks_carry_the_recording_not_the_release_track() {
+    let (app, _rig) = connected_testbed().await;
+    let (status, body) = get_json(app, "/api/v3/remotes/jellyfin/albums/jf-al-1/tracks").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let dawn = body["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|track| track["id"] == "jf-t-1")
+        .unwrap_or_else(|| panic!("no jf-t-1 in {body}"));
+    assert_eq!(
+        dawn["recording_mbid"],
+        droppedneedle_testkit::remotes::JELLYFIN_RECORDING
+    );
+}
+
 #[tokio::test]
 async fn jellyfin_art_follows_the_servers_image_tags() {
     let (app, _rig) = connected_testbed().await;
@@ -1600,7 +1698,7 @@ async fn images_over_the_cap_by_declared_length_are_refused() {
         Router::new()
             .fallback(move || async move { ([(CONTENT_TYPE, "image/jpeg")], vec![0u8; bytes]) })
     };
-    let (too_big, big_task) = serve_fake(serve(remotes::adapter::MAX_IMAGE_BYTES + 1)).await;
+    let (too_big, big_task) = serve_fake(serve(remotes::transport::MAX_IMAGE_BYTES + 1)).await;
     for (source, handle) in every_source(&too_big) {
         let outcome = handle.image_bytes("any", 300).await;
         assert!(
@@ -1611,10 +1709,10 @@ async fn images_over_the_cap_by_declared_length_are_refused() {
     }
     big_task.abort();
 
-    let (at_cap, cap_task) = serve_fake(serve(remotes::adapter::MAX_IMAGE_BYTES)).await;
+    let (at_cap, cap_task) = serve_fake(serve(remotes::transport::MAX_IMAGE_BYTES)).await;
     for (_, handle) in every_source(&at_cap) {
         let (bytes, content_type) = handle.image_bytes("any", 300).await.expect("image loads");
-        assert_eq!(bytes.len(), remotes::adapter::MAX_IMAGE_BYTES);
+        assert_eq!(bytes.len(), remotes::transport::MAX_IMAGE_BYTES);
         assert_eq!(content_type, "image/jpeg");
     }
     cap_task.abort();
@@ -1624,38 +1722,58 @@ async fn images_over_the_cap_by_declared_length_are_refused() {
 /// as soon as it crosses it: most of the body is never read.
 #[tokio::test]
 async fn images_streaming_past_the_cap_are_cut_off() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
     const CHUNK: usize = 64 * 1024;
-    const TOTAL: usize = remotes::adapter::MAX_IMAGE_BYTES * 4;
+    const TOTAL: usize = remotes::transport::MAX_IMAGE_BYTES * 4;
 
-    use futures_util::StreamExt as _;
-    let sent = Arc::new(AtomicUsize::new(0));
-    let counter = sent.clone();
-    let app = Router::new().fallback(move || {
-        let counter = counter.clone();
-        async move {
-            let chunks = futures_util::stream::iter(0..TOTAL / CHUNK).map(move |_| {
-                counter.fetch_add(CHUNK, Ordering::SeqCst);
-                Ok::<_, std::io::Error>(vec![0u8; CHUNK])
-            });
-            Body::from_stream(chunks)
+    /// The bytes one answer handed out, reported when its body is dropped:
+    /// the server has stopped sending, so the count is final.
+    struct Sent {
+        bytes: usize,
+        report: tokio::sync::mpsc::UnboundedSender<usize>,
+    }
+    impl Drop for Sent {
+        fn drop(&mut self) {
+            let _ = self.report.send(self.bytes);
         }
-    });
-    let (base_url, task) = serve_fake(app).await;
-    for (source, handle) in every_source(&base_url) {
-        sent.store(0, Ordering::SeqCst);
+    }
+
+    for source in ["jellyfin", "navidrome", "plex"] {
+        let (report, mut reports) = tokio::sync::mpsc::unbounded_channel();
+        let app = Router::new().fallback(move || {
+            let sent = Sent {
+                bytes: 0,
+                report: report.clone(),
+            };
+            async move {
+                let chunks = futures_util::stream::unfold(sent, |mut sent| async move {
+                    (sent.bytes < TOTAL).then(|| {
+                        sent.bytes += CHUNK;
+                        (Ok::<_, std::io::Error>(vec![0u8; CHUNK]), sent)
+                    })
+                });
+                Body::from_stream(chunks)
+            }
+        });
+        let (base_url, task) = serve_fake(app).await;
+        let handle = every_source(&base_url)
+            .into_iter()
+            .find_map(|(name, handle)| (name == source).then_some(handle))
+            .expect("a source by that name");
         let outcome = handle.image_bytes("any", 300).await;
         assert!(
             matches!(outcome, Err(AdapterError::NotFound)),
             "{source} kept an endless image: {:?}",
             outcome.map(|(bytes, _)| bytes.len())
         );
-        assert!(
-            sent.load(Ordering::SeqCst) < TOTAL / 2,
-            "{source} read most of the oversized body"
-        );
+        // The server notices the dropped connection in its own time; wait
+        // for that rather than reading a count it may still be adding to.
+        let sent = tokio::time::timeout(crate::common::PATIENCE, reports.recv())
+            .await
+            .expect("the server stops sending")
+            .expect("the answer reports its bytes");
+        assert!(sent < TOTAL / 2, "{source} read most of the oversized body");
+        task.abort();
     }
-    task.abort();
 }
 
 /// An API answer that declares a length over the cap is an upstream
@@ -1678,7 +1796,7 @@ async fn api_answers_over_the_cap_are_refused() {
                 let _ = socket.read(&mut request).await;
                 let head = format!(
                     "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{{",
-                    remotes::adapter::MAX_API_BYTES + 1
+                    remotes::transport::MAX_API_BYTES + 1
                 );
                 let _ = socket.write_all(head.as_bytes()).await;
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;

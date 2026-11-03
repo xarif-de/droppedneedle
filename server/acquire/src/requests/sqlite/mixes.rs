@@ -49,34 +49,56 @@ impl PersonalMixStore {
     }
 
     /// One user's approval state, if a row exists.
-    pub async fn state(&self, user_id: &str) -> Result<Option<String>, RequestsError> {
+    pub async fn state(&self, user_id: &str) -> Result<Option<ApprovalState>, RequestsError> {
         let user_id = user_id.to_owned();
         read(&self.db, "mix.state", move |conn| {
             conn.query_row(sql::MIX_APPROVAL_STATE.text(), params![user_id], |row| {
-                Ok(approval_state(row, 0)?.as_str().to_owned())
+                approval_state(row, 0)
             })
             .optional()
         })
         .await
     }
 
-    /// Pending approvals, oldest first.
+    /// Pending approvals of plain users, oldest first.
     pub async fn pending(&self) -> Result<Vec<MixApproval>, RequestsError> {
-        read(&self.db, "mix.pending", |conn| {
-            let mut statement = conn.prepare_cached(sql::PENDING_MIX_APPROVALS.text())?;
+        self.rows_of(sql::PENDING_MIX_APPROVALS.text()).await
+    }
+
+    /// Granted approvals of plain users, oldest first.
+    pub async fn approved(&self) -> Result<Vec<MixApproval>, RequestsError> {
+        self.rows_of(sql::APPROVED_MIX_APPROVALS.text()).await
+    }
+
+    async fn rows_of(&self, text: &'static str) -> Result<Vec<MixApproval>, RequestsError> {
+        read(&self.db, "mix.approvals", move |conn| {
+            let mut statement = conn.prepare_cached(text)?;
             let rows = statement.query_map([], |row| {
                 let user_id: String = row.get(0)?;
                 let user_name: Option<String> = row.get(1)?;
                 Ok(MixApproval {
                     user_name: user_name.unwrap_or_else(|| user_id.clone()),
                     user_id,
-                    state: approval_state(row, 2)?.as_str().to_owned(),
+                    state: approval_state(row, 2)?,
                     requested_at: secs_from_ms(row.get(3)?),
                 })
             })?;
             rows.collect()
         })
         .await
+    }
+
+    /// Drop the pending approvals of admins and trusted users, filed
+    /// before their role approved itself or brought over from v2. Answers
+    /// how many went.
+    pub async fn clear_curator_pending(&self) -> Result<u64, RequestsError> {
+        self.db
+            .write("mix.clear_curator_pending", |tx| {
+                let cleared = tx.execute(sql::CLEAR_CURATOR_MIX_PENDING.text(), [])?;
+                Ok(u64::try_from(cleared).unwrap_or(u64::MAX))
+            })
+            .await
+            .map_err(|error| lane_error("mix.clear_curator_pending", error))
     }
 
     /// Pending approval count for the badge.

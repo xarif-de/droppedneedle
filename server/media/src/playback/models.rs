@@ -3,9 +3,8 @@
 //! ListenBrainz links never carry the token: the status shape holds the
 //! username only.
 //!
-//! Clean-slate native shapes for the playback reporting routes. Field names
-//! stay close to the v2 scrobble and now-playing schemas so the web player
-//! keeps its vocabulary; validation
+//! Native shapes for the playback reporting routes. Field names keep the
+//! scrobble and now-playing vocabulary the web player already uses; validation
 //! (timestamp bounds, non-negative durations) lives in the services, not
 //! here, because it needs the clock.
 
@@ -14,9 +13,51 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+use crate::remotes::models::SourceName;
+
 /// Default playback source: the local library.
 fn default_source() -> String {
     "local".to_owned()
+}
+
+/// Where a session's track plays from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PlaybackSource {
+    /// A library track.
+    #[default]
+    Local,
+    /// A YouTube pick standing in for a library track.
+    Youtube,
+    /// The admin's Jellyfin server.
+    Jellyfin,
+    /// The admin's Navidrome server.
+    Navidrome,
+    /// The admin's Plex server.
+    Plex,
+}
+
+impl PlaybackSource {
+    /// Lowercase wire name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Youtube => "youtube",
+            Self::Jellyfin => "jellyfin",
+            Self::Navidrome => "navidrome",
+            Self::Plex => "plex",
+        }
+    }
+
+    /// The media server a play from this source is reported to, if any.
+    pub fn remote(self) -> Option<SourceName> {
+        match self {
+            Self::Local | Self::Youtube => None,
+            Self::Jellyfin => Some(SourceName::Jellyfin),
+            Self::Navidrome => Some(SourceName::Navidrome),
+            Self::Plex => Some(SourceName::Plex),
+        }
+    }
 }
 
 /// Default reporting device slug.
@@ -28,17 +69,25 @@ fn default_device() -> String {
 // Session lifecycle: start / progress / stop
 // ---------------------------------------------------------------------------
 
-/// Open a playback session for one catalog track.
+/// Open a playback session for one track.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct PlaybackStartRequest {
-    /// Catalog track id.
+    /// The library track id for `local` and `youtube`; for a media server,
+    /// that server's item id (the Plex rating key).
     pub track_id: String,
-    /// Playback source (`local`, `youtube`, `jellyfin`, `navidrome`, `plex`).
-    #[serde(default = "default_source")]
-    pub source: String,
+    /// Where the track plays from.
+    #[serde(default)]
+    pub source: PlaybackSource,
     /// Reporting device slug.
     #[serde(default = "default_device")]
     pub device: String,
+    /// Where playback starts in milliseconds, when not at the beginning (a
+    /// resumed track). Read for media-server plays only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position_ms: Option<i64>,
+    /// Track length in milliseconds, when the player knows it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<i64>,
 }
 
 /// Answer to a session start.
@@ -53,17 +102,21 @@ pub struct PlaybackStartResponse {
 /// Heartbeat for a live session: keeps presence alive and the scrubber live.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct PlaybackProgressRequest {
-    /// Catalog track id.
+    /// The library track id for `local` and `youtube`; for a media server,
+    /// that server's item id (the Plex rating key).
     pub track_id: String,
-    /// Playback source.
-    #[serde(default = "default_source")]
-    pub source: String,
+    /// Where the track plays from.
+    #[serde(default)]
+    pub source: PlaybackSource,
     /// Reporting device slug.
     #[serde(default = "default_device")]
     pub device: String,
     /// Position in milliseconds, when the player knows it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub position_ms: Option<i64>,
+    /// Track length in milliseconds, when the player knows it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<i64>,
     /// True while paused.
     #[serde(default)]
     pub is_paused: bool,
@@ -76,21 +129,30 @@ pub struct PlaybackProgressResponse {
     pub accepted: bool,
 }
 
-/// Close a session. A stop past the scrobble threshold counts the play.
+/// Close a session. A library play past the scrobble threshold counts.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct PlaybackStopRequest {
-    /// Catalog track id.
+    /// The library track id for `local` and `youtube`; for a media server,
+    /// that server's item id (the Plex rating key).
     pub track_id: String,
-    /// Playback source.
-    #[serde(default = "default_source")]
-    pub source: String,
+    /// Where the track plays from.
+    #[serde(default)]
+    pub source: PlaybackSource,
     /// Reporting device slug.
     #[serde(default = "default_device")]
     pub device: String,
     /// Final position in milliseconds, when the player knows it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub position_ms: Option<i64>,
-    /// Skip the scrobble even past threshold (private session).
+    /// Where this play started in milliseconds, for a resumed track; absent
+    /// means the beginning. Read for media-server plays only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_position_ms: Option<i64>,
+    /// Track length in milliseconds, when the player knows it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<i64>,
+    /// Skip the scrobble even past threshold (private session). A media
+    /// server counts a play by its own rule.
     #[serde(default)]
     pub ignore_scrobble: bool,
 }
@@ -101,6 +163,8 @@ pub struct PlaybackStopResponse {
     /// Always true: reporting never fails the player.
     pub accepted: bool,
     /// True when the play counted (history recorded, forwarding attempted).
+    /// Always false for a media-server play: the web player's scrobble
+    /// submit records that one.
     pub scrobbled: bool,
 }
 
@@ -108,7 +172,7 @@ pub struct PlaybackStopResponse {
 // Native scrobble submit / now-playing forward
 // ---------------------------------------------------------------------------
 
-/// One native scrobble, by name (v2 `ScrobbleRequest` fields).
+/// One native scrobble, by name.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ScrobbleSubmitRequest {
     /// Track title.
@@ -139,7 +203,7 @@ pub struct ScrobbleSubmitRequest {
     pub track_id: Option<String>,
 }
 
-/// One native now-playing forward, by name (v2 `NowPlayingRequest` fields).
+/// One native now-playing forward, by name.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ScrobbleNowPlayingRequest {
     /// Track title.
@@ -176,13 +240,13 @@ pub struct ServiceResult {
     pub error: Option<String>,
 }
 
-/// Answer to a scrobble or now-playing forward (v2 `ScrobbleResponse`).
+/// Answer to a scrobble or now-playing forward.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ScrobbleResponse {
     /// Whether the play counted. Submit is true when history recorded it,
     /// even with no linked account, and false when the play could not be
-    /// saved; now-playing is true only when at least one service has it
-    /// (the v2 accepted-quirk, kept).
+    /// saved. Quirk (v2): now-playing is true only when at least one service
+    /// has it.
     pub accepted: bool,
     /// Per-service outcomes, keyed by service name.
     #[serde(default)]
@@ -193,7 +257,7 @@ pub struct ScrobbleResponse {
 // Now-playing presence
 // ---------------------------------------------------------------------------
 
-/// Native heartbeat (v2 `NowPlayingReport` fields).
+/// Native heartbeat.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct NowPlayingHeartbeat {
     /// Track title.
@@ -226,7 +290,7 @@ pub struct NowPlayingHeartbeat {
 /// Query for clearing presence: which device stopped.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NowPlayingDeleteQuery {
-    /// Device slug (`web` default, the v2 spelling).
+    /// Device slug. Defaults to `web`.
     #[serde(default)]
     pub device: Option<String>,
 }

@@ -1,10 +1,8 @@
+import { v3 } from '$lib/api/v3/endpoint';
 import { api } from '$lib/api/client';
 import { toastStore } from '$lib/stores/toast';
-import { LibraryV3Api } from './LibraryV3Api';
-import { toOperationResponse } from './libraryOperationAdapters';
 import type {
 	IdentificationControlResponse,
-	LibraryWorkState,
 	OperationResponse,
 	ScanControlResponse,
 	ScanKind,
@@ -18,24 +16,13 @@ import {
 
 const work = () => [anyLibraryActivityChanged(), libraryOperationsChanged()];
 
-export function requestLibraryRun() {
+export function createRequestLibraryRunMutation() {
 	return createAppMutation(() => ({
-		mutationFn: async (input: {
+		mutationFn: (input: {
 			kind: ScanKind;
 			scope_ids: string[];
 			expected_policy_revision: string;
-		}): Promise<ScanRunRequestedResponse> => {
-			const response = await api.v3.POST(LibraryV3Api.scanRuns(), input);
-			return {
-				run_id: response.run_id,
-				disposition: response.disposition,
-				state: response.state as LibraryWorkState,
-				row_revision: response.row_revision,
-				queued_reason: response.queued_reason ?? null,
-				conflicting_kind: (response.conflicting_kind ?? null) as ScanKind | null,
-				estimated_file_count: null
-			};
-		},
+		}): Promise<ScanRunRequestedResponse> => api.v3.POST(v3('/api/v3/library/scan/runs'), input),
 		effects: work,
 		onSuccess: () => {
 			toastStore.show({ message: 'Library work queued', type: 'success' });
@@ -44,35 +31,32 @@ export function requestLibraryRun() {
 	}));
 }
 
-export function controlLibraryRun(action: 'pause' | 'resume' | 'stop') {
+export function createControlLibraryRunMutation(action: 'pause' | 'resume' | 'stop') {
 	return createAppMutation(() => ({
-		mutationFn: async (input: {
+		mutationFn: (input: {
 			runId: string;
 			expectedRevision: number;
 		}): Promise<ScanControlResponse> => {
 			const url =
 				action === 'pause'
-					? LibraryV3Api.pauseScanRun(input.runId)
+					? v3('/api/v3/library/scan/runs/{id}/pause', { path: { id: input.runId } })
 					: action === 'resume'
-						? LibraryV3Api.resumeScanRun(input.runId)
-						: LibraryV3Api.stopScanRun(input.runId);
-			const response = await api.v3.POST(url, {
-				expected_revision: input.expectedRevision
-			});
-			return { ...response, state: response.state as LibraryWorkState };
+						? v3('/api/v3/library/scan/runs/{id}/resume', { path: { id: input.runId } })
+						: v3('/api/v3/library/scan/runs/{id}/stop', { path: { id: input.runId } });
+			return api.v3.POST(url, { expected_revision: input.expectedRevision });
 		},
 		effects: work,
 		onError: () => toastStore.show({ message: `Could not ${action} the scan`, type: 'error' })
 	}));
 }
 
-export function controlIdentification(action: 'pause' | 'resume') {
+export function createControlIdentificationMutation(action: 'pause' | 'resume') {
 	return createAppMutation(() => ({
 		mutationFn: (expectedRevision: number): Promise<IdentificationControlResponse> =>
 			api.v3.POST(
 				action === 'pause'
-					? LibraryV3Api.pauseIdentification()
-					: LibraryV3Api.resumeIdentification(),
+					? v3('/api/v3/library/identification/pause')
+					: v3('/api/v3/library/identification/resume'),
 				{ expected_revision: expectedRevision }
 			),
 		effects: work,
@@ -81,22 +65,22 @@ export function controlIdentification(action: 'pause' | 'resume') {
 }
 
 export function operationControlUrl(action: 'pause' | 'resume' | 'stop', jobId: string) {
-	if (action === 'pause') return LibraryV3Api.pauseOperation(jobId);
-	if (action === 'resume') return LibraryV3Api.resumeOperation(jobId);
-	return LibraryV3Api.stopOperation(jobId);
+	if (action === 'pause')
+		return v3('/api/v3/library/operations/{job_id}/pause', { path: { job_id: jobId } });
+	if (action === 'resume')
+		return v3('/api/v3/library/operations/{job_id}/resume', { path: { job_id: jobId } });
+	return v3('/api/v3/library/operations/{job_id}/stop', { path: { job_id: jobId } });
 }
 
-export function controlLibraryOperation(action: 'pause' | 'resume' | 'stop') {
+export function createControlLibraryOperationMutation(action: 'pause' | 'resume' | 'stop') {
 	return createAppMutation(() => ({
 		mutationFn: async (input: {
 			jobId: string;
 			expectedRevision: number;
 		}): Promise<OperationResponse> =>
-			toOperationResponse(
-				await api.v3.POST(operationControlUrl(action, input.jobId), {
-					expected_row_revision: input.expectedRevision
-				})
-			),
+			await api.v3.POST(operationControlUrl(action, input.jobId), {
+				expected_row_revision: input.expectedRevision
+			}),
 		effects: work,
 		onError: () => toastStore.show({ message: `Could not ${action} this job`, type: 'error' })
 	}));
@@ -107,7 +91,9 @@ export const createScanDiagnosticsExportMutation = () =>
 	createAppMutation(() => ({
 		effects: () => [],
 		mutationFn: async (runId: string): Promise<{ blob: Blob; filename: string }> => {
-			const response = await api.raw(LibraryV3Api.scanDiagnostics(runId));
+			const response = await api.raw(
+				v3('/api/v3/library/scan/runs/{id}/diagnostics', { path: { id: runId } })
+			);
 			if (!response.ok) throw new Error('Diagnostic export failed');
 			const disposition = response.headers.get('content-disposition') ?? '';
 			return {

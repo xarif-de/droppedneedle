@@ -3,8 +3,8 @@
 	import Button from '$lib/ui/Button.svelte';
 	import { launchRadio, type RadioMode } from '$lib/player/launchRadio';
 	import { deckSampler, type SampleEntry } from '$lib/stores/deckSampler.svelte';
-	import { useIntegrationStatus } from '$lib/queries/HomeIntegrationStatusQuery.svelte';
-	import { playbackToast } from '$lib/stores/playbackToast.svelte';
+	import { useIntegrationStatus } from '$lib/queries/home.svelte';
+	import { toastStore } from '$lib/stores/toast';
 	import type { RadioPlanRequest } from '$lib/queries/discover/types';
 
 	interface Props {
@@ -55,7 +55,7 @@
 		// fall through to a full-track station when there are no albums to sample
 		if (forcePreviews && previewStation) {
 			if (previewStation.entries.length === 0) {
-				playbackToast.show('No previews available for this yet', 'warning');
+				toastStore.notify('No previews available for this yet', 'warning');
 				return;
 			}
 			const entries = shuffle ? shuffled(previewStation.entries) : previewStation.entries;

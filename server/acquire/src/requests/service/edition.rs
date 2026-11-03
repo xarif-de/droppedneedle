@@ -29,14 +29,16 @@ use crate::held::store::HeldRows;
 use crate::requests::error::RequestsError;
 use crate::requests::ledger::{EditionMark, validate_mbid};
 use crate::requests::models::{
-    EditionAcquireResponse, EditionFetchResponse, EditionFetchState, EditionFetchTrack,
-    EditionFetchTrackState, EditionFetchView,
+    EditionAcquireResponse, EditionAcquireStatus, EditionFetchResponse, EditionFetchState,
+    EditionFetchTrack, EditionFetchTrackState, EditionFetchView,
 };
 use crate::requests::sql;
 use droppedneedle_auth::Curator;
 use droppedneedle_kernel::db::DbError;
-use droppedneedle_library::operations::models::OperationError;
-use droppedneedle_library::operations::plan::{EditionPlan, FileFate, PlanTrack};
+use droppedneedle_library::edition::plan::EditionPlan;
+use droppedneedle_library::edition::plan::FileFate;
+use droppedneedle_library::edition::plan::PlanTrack;
+use droppedneedle_library::jobs::models::OperationError;
 use rusqlite::OptionalExtension;
 
 /// Bytes a track takes in staging, at least.
@@ -324,7 +326,7 @@ fn fetch_facts(
 /// The answer while another download of the album is still working.
 fn already_in_progress(task_id: String) -> EditionAcquireResponse {
     EditionAcquireResponse {
-        status: "already_in_progress".to_owned(),
+        status: EditionAcquireStatus::AlreadyInProgress,
         message: "This album is already downloading. Wait for that download to finish, \
                   then try again."
             .to_owned(),
@@ -386,7 +388,7 @@ impl RequestsService {
         };
         if let Some(gap) = &gap {
             if gap.missing.is_empty() && gap.upgrades.is_empty() && gap.versions.is_empty() {
-                response.status = "already_complete".to_owned();
+                response.status = EditionAcquireStatus::AlreadyComplete;
                 response.message = if gap.other_versions > 0 {
                     format!(
                         "Every track of this edition is in your library, {} of them in another \
@@ -466,7 +468,7 @@ impl RequestsService {
                         started_at: now,
                     })
                     .await?;
-                response.status = "started".to_owned();
+                response.status = EditionAcquireStatus::Started;
                 response.message = if waiting {
                     "No download source is set up, so this edition waits. It starts by \
                      itself once Soulseek, Usenet or a plugin source is saved."
@@ -526,9 +528,8 @@ impl RequestsService {
     }
 
     /// The library copy a fetch with no plan is for: the copy asked for
-    /// (followed to the album it was merged into), else the group's copy
-    /// with an edition, a person's first, then the oldest. `None` when that
-    /// copy's identity names no release.
+    /// (followed to the album it was merged into), else the copy the album
+    /// page shows. `None` when that copy's identity names no release.
     async fn planned_copy(
         &self,
         album_id: Option<&str>,
@@ -540,12 +541,23 @@ impl RequestsService {
             .library
             .db()
             .read("editions.planned_copy", move |conn| {
-                conn.query_row(
-                    sql::PLANNED_COPY.text(),
-                    rusqlite::params![group, album_id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()
+                match album_id {
+                    Some(album_id) => conn
+                        .query_row(
+                            sql::PLANNED_COPY.text(),
+                            rusqlite::params![group, album_id],
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        )
+                        .optional(),
+                    None => droppedneedle_library::identity::reads::copy_for_group(conn, &group)
+                        .map(|copy| {
+                            copy.and_then(|copy| {
+                                let release =
+                                    copy.release_mbid.filter(|id| !id.trim().is_empty())?;
+                                Some((copy.album_id, release))
+                            })
+                        }),
+                }
                 .map_err(DbError::from)
             })
             .await
@@ -675,7 +687,9 @@ impl RequestsService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use droppedneedle_library::operations::plan::{EditionFacts, FileFate, PlanFile};
+    use droppedneedle_library::edition::plan::EditionFacts;
+    use droppedneedle_library::edition::plan::FileFate;
+    use droppedneedle_library::edition::plan::PlanFile;
 
     fn track(position: u32, file: Option<&str>) -> PlanTrack {
         PlanTrack {

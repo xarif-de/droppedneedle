@@ -36,16 +36,16 @@ use utoipa::IntoParams;
 
 use super::error::ImportsError;
 use super::health::HealthProbes;
-use super::jobs::{ImportState, SETTINGS_UNREADABLE, SpotifyImports};
+use super::jobs::SpotifyImports;
 use super::lidarr::{
     LIDARR_NOT_CONNECTED, LidarrClient, LidarrError, LidarrImportService, ServiceError,
     normalize_lidarr_url,
 };
 use super::models::{
-    AcquireHealth, LidarrArtistListResponse, LidarrConnectionSettings, LidarrImportRequest,
-    LidarrImportResponse, LidarrTestResponse, SabnzbdStatusResponse, SlskdStatusResponse,
-    SpotifyAuthUrlResponse, SpotifyImportRequest, SpotifyImportResponse, SpotifyJobStatus,
-    SpotifyPlaylistListResponse, SpotifyRedirectUri, SpotifySettings,
+    LidarrArtistListResponse, LidarrConnectionSettings, LidarrImportRequest, LidarrImportResponse,
+    LidarrTestResponse, SabnzbdStatusResponse, SlskdStatusResponse, SpotifyAuthUrlResponse,
+    SpotifyImportRequest, SpotifyImportResponse, SpotifyPlaylistListResponse, SpotifyRedirectUri,
+    SpotifySettings,
 };
 use super::spotify::{ImportFailure, SpotifyImportService};
 use super::spotify_albums::AlbumResolver;
@@ -82,10 +82,8 @@ pub struct ImportsDeps {
     pub resolver: Arc<AlbumResolver>,
     /// Queues Spotify imports on the jobs table and reads their state.
     pub spotify_imports: SpotifyImports,
-    /// Health probes behind the smoke and gates.
+    /// Probes behind the download client status reads.
     pub probes: Arc<HealthProbes>,
-    /// Whether a download source is on, for the smoke.
-    pub readiness: crate::readiness::SourceReadiness,
     /// Fresh ids, the OAuth state fallback when the OS RNG fails.
     pub ids: Arc<dyn IdGenerator>,
     /// Deployment base path (between origin and callback, exactly once).
@@ -141,9 +139,7 @@ pub fn routes() -> Routes<ImportsDeps> {
         .public(routes!(spotify_callback))
         .user(routes!(list_spotify_playlists))
         .user(routes!(import_spotify_playlist))
-        .user(routes!(get_spotify_job))
         .user(routes!(disconnect_spotify))
-        .user(routes!(get_health))
         .user(routes!(get_slskd_status))
         .admin(routes!(get_sabnzbd_status))
 }
@@ -519,7 +515,10 @@ pub async fn disconnect_spotify(
 /// The caller's owned Spotify playlists. Unlinked reads as a 400,
 /// upstream failures as a 502.
 #[utoipa::path(get, tag = "imports", path = "/api/v3/acquire/spotify/playlists",
-    responses((status = 200, description = "Owned playlists", body = SpotifyPlaylistListResponse)))]
+    responses(
+        (status = 200, description = "Owned playlists", body = SpotifyPlaylistListResponse),
+        (status = 503, description = "Spotify is rate limiting this server")
+    ))]
 pub async fn list_spotify_playlists(
     State(deps): State<ImportsDeps>,
     User(principal): User,
@@ -545,6 +544,7 @@ fn spotify_failed(error: SpotifyError) -> ImportsError {
         SpotifyError::Unavailable(detail) => ImportsError::Unavailable {
             cause: format!("spotify playlist list failed: {detail}"),
         },
+        SpotifyError::RateLimited { retry_after } => ImportsError::SpotifyPaced { retry_after },
         SpotifyError::Store(cause) => ImportsError::internal(&cause),
         SpotifyError::Busy => ImportsError::Busy {
             cause: "spotify store busy".to_owned(),
@@ -600,77 +600,6 @@ pub async fn import_spotify_playlist(
         .await
         .map_err(job_failed)?;
     Ok(Json(SpotifyImportResponse { playlist_id }))
-}
-
-/// Latest known state of one Spotify playlist import.
-#[utoipa::path(get, tag = "imports", path = "/api/v3/acquire/spotify/jobs/{id}",
-    params(("id" = String, Path, description = "Spotify playlist id the import runs for")),
-    responses((status = 200, description = "Job state", body = SpotifyJobStatus)))]
-pub async fn get_spotify_job(
-    State(deps): State<ImportsDeps>,
-    User(principal): User,
-    Path(id): Path<String>,
-) -> Result<Json<SpotifyJobStatus>, ApiError> {
-    let user_id = principal.user_id();
-    let Some(state) = deps
-        .spotify_imports
-        .state(user_id, &id)
-        .await
-        .map_err(|error| job_failed(error.into()))?
-    else {
-        return Err(ImportsError::NotFound.into());
-    };
-    // The import fills the record its start made; a record deleted since
-    // leaves nothing to report.
-    let Some(playlist_id) = deps
-        .spotify_playlists
-        .get_by_source_ref(&format!("spotify:{id}"), user_id)
-        .await
-        .map_err(|cause| ImportsError::internal(&cause))?
-    else {
-        return Err(ImportsError::NotFound.into());
-    };
-    let status = match state {
-        // An import waiting on settings that do not read says so.
-        ImportState::Running => SpotifyJobStatus {
-            state: "running".to_owned(),
-            playlist_id,
-            track_count: None,
-            message: deps
-                .spotify_settings
-                .get_raw()
-                .is_err()
-                .then(|| SETTINGS_UNREADABLE.to_owned()),
-        },
-        ImportState::Done => {
-            let tracks = deps
-                .spotify_playlists
-                .track_count(user_id, &playlist_id)
-                .await
-                .map_err(|cause| ImportsError::internal(&cause))?;
-            SpotifyJobStatus {
-                state: "done".to_owned(),
-                playlist_id,
-                track_count: Some(i64::try_from(tracks).unwrap_or(i64::MAX)),
-                message: None,
-            }
-        }
-        ImportState::Error { message } => SpotifyJobStatus {
-            state: "error".to_owned(),
-            playlist_id,
-            track_count: None,
-            message: Some(message),
-        },
-    };
-    Ok(Json(status))
-}
-
-/// Acquisition health smoke: whether a download source is on, plus the
-/// independent per-source release gates.
-#[utoipa::path(get, tag = "imports", path = "/api/v3/acquire/health",
-    responses((status = 200, description = "Acquisition health", body = AcquireHealth)))]
-pub async fn get_health(State(deps): State<ImportsDeps>, _user: User) -> Json<AcquireHealth> {
-    Json(super::health::smoke(&deps.probes, &deps.readiness.now()))
 }
 
 /// Live slskd client status (any signed-in user may read it).

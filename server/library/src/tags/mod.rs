@@ -19,6 +19,7 @@ pub mod fields;
 pub mod fingerprint;
 pub mod loudness;
 pub mod lyrics;
+pub mod mpeg_length;
 pub mod picard;
 pub mod probe;
 pub mod read;
@@ -27,7 +28,7 @@ pub mod save;
 pub use fields::TagField;
 pub use fingerprint::{Fingerprint, generate_fingerprint};
 pub use probe::{AudioInfo, probe};
-pub use read::{AudioArtistCredit, AudioTag, read_cover_art, read_tags};
+pub use read::{AudioArtistCredit, AudioTag, read_cover_art, read_cover_art_from, read_tags};
 pub use save::{
     CapturedAtom, CapturedTags, CapturedValue, FieldDocument, Refusal, SaveReport, TagEdit,
     document_from_captured, read_document, read_fields, save_tags,

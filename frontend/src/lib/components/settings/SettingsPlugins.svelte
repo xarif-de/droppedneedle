@@ -3,10 +3,10 @@
 	import { outsideLink } from '$lib/components/outsideLink';
 	import { getPluginsQuery } from '$lib/queries/plugins/PluginQueries.svelte';
 	import {
-		uninstallPluginMutation,
-		updatePluginMutation
+		createUninstallPluginMutation,
+		createUpdatePluginMutation
 	} from '$lib/queries/plugins/PluginMutations.svelte';
-	import { updatePluginFromSourceMutation } from '$lib/queries/plugins/PluginInstallMutations.svelte';
+	import { createUpdatePluginFromSourceMutation } from '$lib/queries/plugins/PluginInstallMutations.svelte';
 	import type { PluginInfo } from '$lib/queries/plugins/types';
 	import { SECRET_MASK } from '$lib/ui/secretMask';
 	import { authStore } from '$lib/stores/authStore.svelte';
@@ -22,9 +22,9 @@
 	import PluginPanel from './PluginPanel.svelte';
 
 	const pluginsQuery = getPluginsQuery();
-	const update = updatePluginMutation();
-	const uninstall = uninstallPluginMutation();
-	const sourceUpdate = updatePluginFromSourceMutation();
+	const update = createUpdatePluginMutation();
+	const uninstall = createUninstallPluginMutation();
+	const sourceUpdate = createUpdatePluginFromSourceMutation();
 	const plugins = $derived(pluginsQuery.data?.plugins ?? []);
 
 	let confirmingRemoval = $state<string | null>(null);
@@ -138,15 +138,6 @@
 										{#each plugin.targets ?? [] as target (target)}
 											<span class="badge badge-sm badge-success badge-outline">dst:{target}</span>
 										{/each}
-										{#if plugin.capabilities?.includes('scheduler')}
-											<span class="badge badge-sm badge-warning badge-outline">scheduler</span>
-										{/if}
-										{#if plugin.capabilities?.includes('streaming_source')}
-											<span class="badge badge-sm badge-accent badge-outline">streaming</span>
-										{/if}
-										{#if plugin.capabilities?.includes('metadata_provider')}
-											<span class="badge badge-sm badge-secondary badge-outline">metadata</span>
-										{/if}
 									</div>
 								</div>
 								<label class="flex cursor-pointer items-center gap-2">
@@ -180,6 +171,11 @@
 											<span class="min-w-0 break-words text-base-content/60">{health.message}</span>
 										{/if}
 									</div>
+								{/if}
+								{#if plugin.runtime.library_refusal}
+									<p class="mt-1 text-xs break-words text-warning">
+										Library write refused: {plugin.runtime.library_refusal}
+									</p>
 								{/if}
 								{#if plugin.runtime.last_error && plugin.runtime.state !== 'running'}
 									<div

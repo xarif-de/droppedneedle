@@ -22,8 +22,8 @@ use axum::http::{Request, StatusCode};
 use droppedneedle_auth::Principal;
 use droppedneedle_auth::session::store::SessionKind;
 use droppedneedle_auth::users::roles::Role;
-use droppedneedle_catalog::reads::catalog::plugin_sources::PluginDetailsSource;
-use droppedneedle_catalog::reads::catalog::{
+use droppedneedle_catalog::metadata::plugin_sources::PluginDetailsSource;
+use droppedneedle_catalog::metadata::{
     Catalog,
     library::LocalCatalog,
     upstream::{CatalogSettings, Upstream},
@@ -39,7 +39,7 @@ use droppedneedle_kernel::runtime_config::ConfigStore;
 use droppedneedle_kernel::runtime_config::crypto::Crypto;
 use droppedneedle_kernel::runtime_config::secret_sections::AdvancedSettings;
 use droppedneedle_kernel::runtime_config::sections::{
-    ListenSource, MbSourceMode, MusicBrainzSettings, UserPreferences,
+    MbSourceMode, MusicBrainzSettings, UserPreferences,
 };
 use droppedneedle_library::wiring::LibraryCore;
 use droppedneedle_plugins::handlers::{ExtRateLimiter, PluginsDeps, plugin_routes};
@@ -410,6 +410,57 @@ async fn install_previews_permissions_then_pins_the_previewed_commit() {
     let (status, update) = send(admin, "POST", "/api/v3/plugins/toy/update", Some(json!({}))).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(update["updated"], false);
+}
+
+/// A pinned install reads only the repository and the archive: from a URL
+/// naming its ref, and from a plain URL that brings its preview's reference.
+/// The record says what the preview said, and an update of the same commit
+/// downloads nothing.
+#[tokio::test]
+async fn a_pinned_install_makes_two_github_reads() {
+    let rig = rig("pinned-reads").await;
+    let remote = FakeGitHub::new();
+    github(&remote);
+    let deps = deps_for(&rig, &remote);
+    let admin = with_test_principal(
+        plugin_routes().with_state(deps).into_router(),
+        session("admin-1"),
+    );
+    let archive = format!("https://codeload.github.com/acme/toy/zip/{SHA}");
+    let two_reads = vec![REPOSITORY.to_owned(), archive.clone()];
+
+    for (body, kind, reference) in [
+        (
+            json!({"repository_url": "https://github.com/acme/toy/tree/main", "commit": SHA}),
+            "branch",
+            "main",
+        ),
+        (
+            json!({
+                "repository_url": "https://github.com/acme/toy",
+                "commit": SHA,
+                "reference": "v1.0.0",
+                "ref_kind": "release",
+            }),
+            "release",
+            "v1.0.0",
+        ),
+    ] {
+        remote.requested.lock().unwrap().clear();
+        let (status, installed) =
+            send(admin.clone(), "POST", "/api/v3/plugins/install", Some(body)).await;
+        assert_eq!(status, StatusCode::CREATED, "{installed}");
+        assert_eq!(installed["install"]["commit"], SHA);
+        assert_eq!(installed["install"]["ref_kind"], kind);
+        assert_eq!(installed["install"]["reference"], reference);
+        assert_eq!(*remote.requested.lock().unwrap(), two_reads);
+    }
+
+    remote.requested.lock().unwrap().clear();
+    let (status, update) = send(admin, "POST", "/api/v3/plugins/toy/update", Some(json!({}))).await;
+    assert_eq!(status, StatusCode::OK, "{update}");
+    assert_eq!(update["updated"], false);
+    assert!(!remote.requested.lock().unwrap().contains(&archive));
 }
 
 const LATEST_RELEASE: &str = "https://api.github.com/repos/acme/toy/releases/latest";
@@ -1160,6 +1211,14 @@ const WRITER_MANIFEST: &str = "[plugin]\n\
 
 /// Make `<rig>/music` the one library folder.
 async fn music_root(rig: &Rig) -> std::path::PathBuf {
+    music_root_with(rig, Vec::new()).await
+}
+
+/// Make `<rig>/music` the one library folder, with `rules` under it.
+async fn music_root_with(
+    rig: &Rig,
+    rules: Vec<droppedneedle_kernel::runtime_config::secret_sections::LibraryPathRule>,
+) -> std::path::PathBuf {
     use droppedneedle_kernel::runtime_config::secret_sections::{LibraryRoot, TypedLibrary};
 
     let music = rig.dir.join("music");
@@ -1172,6 +1231,7 @@ async fn music_root(rig: &Rig) -> std::path::PathBuf {
             library.library_roots = vec![LibraryRoot {
                 id: "music".to_owned(),
                 path,
+                rules,
                 ..LibraryRoot::default()
             }];
             Ok(library)
@@ -1194,14 +1254,31 @@ async fn a_plugin_write_is_journaled_and_keeps_no_ledger() {
     let rig = rig("library-write").await;
     let music = music_root(&rig).await;
     let runtime = enable_toy(&rig, WRITER_MANIFEST);
+    // A write that outran its budget on a loaded host added nothing and
+    // says so; the plugin asks again, as the answer tells it to.
     let write = |data: &[u8]| {
-        runtime.host_request(
-            methods::HOST_LIBRARY_WRITE,
-            json!({
-                "rel_path": "notes/one.txt",
-                "data_base64": base64::engine::general_purpose::STANDARD.encode(data),
-            }),
-        )
+        let params = json!({
+            "rel_path": "notes/one.txt",
+            "data_base64": base64::engine::general_purpose::STANDARD.encode(data),
+        });
+        let runtime = &runtime;
+        async move {
+            let deadline = std::time::Instant::now() + crate::common::PATIENCE;
+            loop {
+                match runtime
+                    .host_request(methods::HOST_LIBRARY_WRITE, params.clone())
+                    .await
+                {
+                    Err(refused)
+                        if refused.message.contains("stayed busy")
+                            && std::time::Instant::now() < deadline =>
+                    {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    answer => return answer,
+                }
+            }
+        }
     };
 
     let answer = write(b"first").await.unwrap();
@@ -1229,6 +1306,16 @@ async fn a_plugin_write_is_journaled_and_keeps_no_ledger() {
     assert_eq!(refused.code, -32001);
     assert!(refused.message.contains("already exists"), "{refused:?}");
     assert_eq!(std::fs::read(&placed).unwrap(), b"first");
+
+    std::fs::write(music.join("notes/Two.txt"), b"theirs").unwrap();
+    let lookalike = runtime
+        .host_request(
+            methods::HOST_LIBRARY_WRITE,
+            json!({"rel_path": "notes/two.txt", "data_base64": "eA=="}),
+        )
+        .await
+        .unwrap_err();
+    assert!(lookalike.message.contains("letter case"), "{lookalike:?}");
     assert!(
         !rig.dir.join("plugins/.data/.library-writes").exists(),
         "no ledger folder"
@@ -1363,6 +1450,181 @@ async fn the_daily_allowance_survives_a_restart() {
     assert!(!music.join("notes/after.txt").exists());
 }
 
+/// Record that the toy plugin wrote `count` one-byte files just now, each
+/// in a change that landed.
+fn seed_files(rig: &Rig, count: usize) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let seeds = format!(
+        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < {count})"
+    );
+    let conn = droppedneedle_kernel::db::open_connection(&rig.dir.join("app.db")).unwrap();
+    conn.execute_batch(&format!(
+        "{seeds} INSERT INTO library_publish_journal (id, bundle_id, kind, dest_root, dest_rel, \
+             staged, staged_sha256, state) \
+         SELECT 'many-' || i || '-add-000', 'many-' || i, 'add', 'music', 'seed/many-' || i, \
+             '.dn-seed', 'abc', 'cleaned' FROM n; \
+         {seeds} INSERT INTO plugin_library_writes (bundle_id, plugin, bytes, written_at) \
+         SELECT 'many-' || i, 'toy', 1, {now} FROM n;"
+    ))
+    .unwrap();
+}
+
+/// A plugin may add 1000 files a day: the 1000th lands, the 1001st is
+/// refused and never placed, and the refusal shows with the plugin's
+/// health in the admin view until a write lands or the plugin is switched
+/// off.
+#[tokio::test]
+async fn the_1001st_file_in_a_day_is_refused_and_shown() {
+    use droppedneedle_plugins::capabilities::library_files::QUOTA_FILES_PER_DAY;
+
+    let rig = rig("write-files-a-day").await;
+    let music = music_root(&rig).await;
+    enable_toy(&rig, WRITER_MANIFEST);
+    seed_files(&rig, QUOTA_FILES_PER_DAY - 1);
+    rig.host
+        .write_library_file("toy", "notes/last.txt", b"1".to_vec())
+        .await
+        .unwrap();
+    let refused = rig
+        .host
+        .write_library_file("toy", "notes/over.txt", b"1".to_vec())
+        .await
+        .unwrap_err();
+    assert!(refused.contains("1000 files a day"), "{refused}");
+    assert!(!music.join("notes/over.txt").exists());
+
+    let (status, body) = send(router_as(&rig, "admin-1"), "GET", "/api/v3/plugins", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["plugins"][0]["runtime"]["library_refusal"],
+        json!(refused),
+        "{body}"
+    );
+
+    rig.host
+        .update_settings("toy", false, HashMap::new())
+        .unwrap();
+    assert_eq!(rig.host.library_refusal("toy"), None);
+}
+
+/// While another write holds the library, a write still waiting at its
+/// deadline is refused as busy and places nothing, and a plugin over its
+/// allowance is refused at once without waiting for the library.
+#[tokio::test]
+async fn a_held_library_refuses_late_and_over_allowance_writes() {
+    use droppedneedle_library::publish::session::PluginFileRefusal;
+    use droppedneedle_plugins::capabilities::library_files::QUOTA_FILES_PER_DAY;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Instant;
+
+    let rig = rig("write-held").await;
+    let music = music_root(&rig).await;
+    // A host over a whole library, so the test can hold its publisher.
+    let (library, _) = crate::common::library::library_at(&rig.platform);
+    let host = PluginHost::new(
+        rig.dir.join("plugins"),
+        Arc::clone(&rig.config),
+        Arc::new(FakeLauncher::new()),
+        rig.ticks.clone(),
+        library.core.clone(),
+    );
+    write_plugin(&rig.dir, "toy", WRITER_MANIFEST);
+    host.load_all();
+    host.update_settings("toy", true, HashMap::new()).unwrap();
+    let (reached, at_place) = std::sync::mpsc::channel::<()>();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    library.publishing.set_publish_hooks(
+        Some(Box::new(move |_: &Path| {
+            let _ = reached.send(());
+            let _ = released.recv();
+        })),
+        None,
+    );
+    let writer = Arc::clone(&host);
+    let first = tokio::spawn(async move {
+        writer
+            .write_library_file("toy", "notes/first.txt", b"first".to_vec())
+            .await
+    });
+    tokio::task::spawn_blocking(move || at_place.recv_timeout(Duration::from_secs(10)))
+        .await
+        .unwrap()
+        .expect("the first write reaches placement");
+
+    let core = library.core.clone();
+    let late = tokio::task::spawn_blocking(move || {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        core.add_plugin_file(
+            "toy",
+            "notes/late.txt",
+            b"late".to_vec(),
+            Instant::now() + Duration::from_millis(200),
+            &cancelled,
+            &|_: &rusqlite::Connection, _: i64| Ok(true),
+            &|_: &rusqlite::Connection, _: &str, _: i64| Ok(()),
+        )
+    })
+    .await
+    .unwrap();
+    assert!(matches!(late, Err(PluginFileRefusal::Busy)), "{late:?}");
+    assert!(!music.join("notes/late.txt").exists());
+
+    seed_files(&rig, QUOTA_FILES_PER_DAY);
+    let refused = host
+        .write_library_file("toy", "notes/over.txt", b"1".to_vec())
+        .await
+        .unwrap_err();
+    assert!(refused.contains("allowance"), "{refused}");
+
+    release.send(()).unwrap();
+    first.await.unwrap().unwrap();
+    library.publishing.set_publish_hooks(None, None);
+    assert!(!music.join("notes/over.txt").exists());
+}
+
+/// A plugin's file never lands under an Excluded path rule, whatever case
+/// its path is written in: the rule covers `live/` on every disk. A path
+/// outside the rule still lands.
+#[tokio::test]
+async fn a_plugin_write_under_an_excluded_path_rule_is_refused() {
+    use droppedneedle_kernel::runtime_config::secret_sections::{
+        IdentificationPolicy, LibraryPathRule,
+    };
+
+    let rig = rig("write-excluded-rule").await;
+    let music = music_root_with(
+        &rig,
+        vec![LibraryPathRule {
+            id: "live".to_owned(),
+            relative_path: "Live".to_owned(),
+            policy: IdentificationPolicy::Excluded,
+        }],
+    )
+    .await;
+    write_plugin(&rig.dir, "toy", WRITER_MANIFEST);
+    rig.host.load_all();
+    rig.host
+        .update_settings("toy", true, HashMap::new())
+        .unwrap();
+
+    let refused = rig
+        .host
+        .write_library_file("toy", "live/late.txt", b"late".to_vec())
+        .await
+        .unwrap_err();
+    assert!(refused.contains("path rule"), "{refused}");
+    assert!(!music.join("live/late.txt").exists());
+
+    rig.host
+        .write_library_file("toy", "notes/kept.txt", b"kept".to_vec())
+        .await
+        .unwrap();
+    assert!(music.join("notes/kept.txt").exists());
+}
+
 const BIG_MANIFEST: &str = "[plugin]\n\
      name = \"big\"\n\
      api_version = 2\n\
@@ -1472,10 +1734,6 @@ impl CatalogSettings for RecordedMusicBrainz {
 
     fn listenbrainz_enabled(&self) -> bool {
         false
-    }
-
-    fn primary_source(&self) -> ListenSource {
-        ListenSource::Listenbrainz
     }
 
     fn store_region(&self) -> Option<String> {

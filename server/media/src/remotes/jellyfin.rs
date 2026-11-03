@@ -24,9 +24,8 @@
 
 use serde::de::DeserializeOwned;
 
-use super::adapter::{
-    AdapterError, AlbumBrowse, ArtistBrowse, RemoteHttp, RemotePage, TrackBrowse, request_id,
-};
+use super::source::{AdapterError, AlbumBrowse, ArtistBrowse, RemotePage, TrackBrowse};
+
 use super::jellyfin_models::{
     AuthenticatedUser, AuthenticationResult, Item, ItemPage, Lyrics, NamedPage, PlaybackReport,
     QueryFilters, SearchHints, Session, SystemInfo,
@@ -36,9 +35,10 @@ use super::models::{
     InfoView, LyricLine, LyricsView, PlaylistDetail, PlaylistSummary, SearchResults, SessionView,
     SessionsView, SourceName, StatsView, TrackView,
 };
+use super::transport::{RemoteHttp, request_id};
 use super::warmup::{INDEX_MAX_PAGES, IndexedAlbum, indexed};
 
-/// MBID index scan batch size, matching the v2 repository.
+/// MBID index scan batch size.
 const MBID_BATCH: i64 = 500;
 
 /// Jellyfin ticks per millisecond (ticks are 100ns).
@@ -556,7 +556,7 @@ impl JellyfinAdapter {
     }
 
     /// Most-played artists with the play data behind them: play count and
-    /// the last play (v2 `get_most_played_artists` as Rediscover reads it).
+    /// the last play, shaped the way Rediscover reads it.
     pub async fn most_played_artist_plays(
         &self,
         limit: i64,
@@ -587,31 +587,7 @@ impl JellyfinAdapter {
             .collect())
     }
 
-    /// Most-played albums: `PlayCount` sort with the zero-play filter
-    /// (v2 `get_most_played_albums`).
-    pub async fn most_played_albums(&self, limit: i64) -> Result<Vec<AlbumView>, AdapterError> {
-        self.require_configured()?;
-        if self.user_id.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut query = params(&[
-            ("includeItemTypes", "MusicAlbum"),
-            ("sortBy", "PlayCount"),
-            ("sortOrder", "Descending"),
-            ("enableUserData", "true"),
-            ("recursive", "true"),
-        ]);
-        query.push(("limit".to_owned(), limit.to_string()));
-        let page = self.items("/Items", &query).await?;
-        Ok(page
-            .items
-            .iter()
-            .filter(|item| item.play_count() > 0)
-            .map(album_view)
-            .collect())
-    }
-
-    /// Album filter facets via `/Items/Filters` (v2 `get_filter_facets`):
+    /// Album filter facets via `/Items/Filters`:
     /// years newest first, tags and studios sorted, empty studios dropped.
     pub async fn filter_facets(&self) -> Result<FilterFacetsView, AdapterError> {
         self.require_configured()?;
@@ -648,7 +624,7 @@ impl JellyfinAdapter {
     }
 
     /// Trade a Jellyfin username and password for a user session via
-    /// `POST /Users/AuthenticateByName` (v2 `_authenticate_with_jellyfin`).
+    /// `POST /Users/AuthenticateByName`.
     /// 401 and 403 read as a rejected login; the password is not kept.
     pub async fn authenticate_by_name(
         client: &reqwest::Client,
@@ -858,8 +834,8 @@ impl JellyfinAdapter {
         Ok(tracks)
     }
 
-    /// Instant mix for an item, artist, or genre. Preserved from v2 (three
-    /// routes); a genre name is percent-encoded as one path segment.
+    /// Instant mix for an item, artist, or genre. Quirk (v2): three routes, kept
+    /// as they were; a genre name is percent-encoded as one path segment.
     pub async fn mix(&self, seed: &MixSeed, limit: i64) -> Result<Vec<TrackView>, AdapterError> {
         self.require_configured()?;
         let mut query = params(&[("Fields", "ProviderIds"), ("EnableUserData", "true")]);
@@ -948,7 +924,7 @@ impl JellyfinAdapter {
     }
 
     /// The direct audio request for one item (`/Audio/{id}/stream?static=true`,
-    /// v2 `get_playback_url` direct landing without the playback-info round
+    /// the direct landing, without the playback-info round
     /// trip; server-side transcode is not supported here). The caller
     /// sends it, by range when it seeks.
     pub fn audio_request(&self, id: &str) -> Result<reqwest::Request, AdapterError> {
@@ -972,12 +948,12 @@ impl JellyfinAdapter {
             .header("Authorization", self.auth_header())
             .query(&query)
             .build()
-            .map_err(super::adapter::transport)
+            .map_err(super::transport::transport)
     }
 
     /// Session report to `/Sessions/Playing`, `/Sessions/Playing/Progress`,
-    /// or `/Sessions/Playing/Stopped` (v2 `report_playback_*`; the play
-    /// session id is empty because v3 never opens a playback session).
+    /// or `/Sessions/Playing/Stopped`; the play
+    /// session id is empty because this server never opens a playback session.
     pub async fn report_session(
         &self,
         endpoint: &str,
@@ -1116,7 +1092,7 @@ impl JellyfinAdapter {
         if bytes.is_empty() {
             return Ok(None);
         }
-        super::adapter::decode(SourceName::Jellyfin, endpoint, &bytes).map(Some)
+        super::transport::decode(SourceName::Jellyfin, endpoint, &bytes).map(Some)
     }
 
     /// POST a JSON body, discarding the response. Used only for session
@@ -1241,7 +1217,9 @@ fn track_view(item: &Item) -> TrackView {
         year: item
             .production_year
             .and_then(|year| i32::try_from(year).ok()),
-        recording_mbid: item.provider("MusicBrainzTrack"),
+        // `MusicBrainzTrack` is the release track id, not the recording. Not
+        // yet checked against a running Jellyfin.
+        recording_mbid: item.provider("MusicBrainzRecording"),
         part_key: None,
     }
 }

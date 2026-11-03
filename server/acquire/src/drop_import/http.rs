@@ -13,7 +13,7 @@ use std::sync::Arc;
 use axum::{
     Json,
     extract::{
-        DefaultBodyLimit, Multipart, Path, State,
+        DefaultBodyLimit, Multipart, State,
         multipart::{MultipartError, MultipartRejection},
     },
     http::{HeaderMap, StatusCode, header},
@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt as _;
 use utoipa::{IntoParams, ToSchema};
 
-use super::store::{ItemRecord, JobRecord};
+use super::store::{DropItemStatus, DropJobStatus, ItemRecord, JobRecord};
 use super::{DropError, DropImports, MAX_FILES_PER_DROP, Viewer, extract};
 use crate::reason::Reason;
 use crate::requests::error::RequestsError;
@@ -40,9 +40,7 @@ const MAX_UPLOAD_BYTES: usize = 8 * (1 << 30);
 pub struct DropImportItemResponse {
     pub id: i64,
     pub folder_name: String,
-    /// `processing`, `imported`, `skipped`, `needs_review`, `failed` or
-    /// `discarded`.
-    pub status: String,
+    pub status: DropItemStatus,
     pub updated_at: f64,
     pub release_group_mbid: Option<String>,
     pub album_title: Option<String>,
@@ -61,8 +59,7 @@ pub struct DropImportItemResponse {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct DropImportJobResponse {
     pub id: String,
-    /// `processing`, `completed` or `failed`.
-    pub status: String,
+    pub status: DropJobStatus,
     pub created_at: f64,
     pub upload_name: String,
     pub user_id: String,
@@ -135,6 +132,7 @@ impl From<DropError> for ApiError {
             DropError::NotFound => RequestsError::NotFound,
             DropError::Conflict(message) => RequestsError::Conflict { message },
             DropError::Unavailable(cause) => RequestsError::internal(&cause),
+            DropError::Busy(operation) => RequestsError::Busy { operation },
         })
     }
 }
@@ -145,7 +143,14 @@ fn invalid(message: impl Into<String>) -> ApiError {
     })
 }
 
-fn too_large() -> ApiError {
+/// An upload refused as over the limit, logged with the size the sender
+/// declared (none when the body ran past the limit as it streamed).
+fn too_large(declared: Option<u64>) -> ApiError {
+    tracing::warn!(
+        bytes = declared,
+        limit = MAX_UPLOAD_BYTES,
+        "drop upload refused: over the size limit"
+    );
     ApiError::new(
         StatusCode::PAYLOAD_TOO_LARGE,
         PAYLOAD_TOO_LARGE,
@@ -157,7 +162,7 @@ fn too_large() -> ApiError {
 /// form part way is a cut-off or malformed upload.
 fn unreadable(error: MultipartError) -> ApiError {
     if error.status() == StatusCode::PAYLOAD_TOO_LARGE {
-        too_large()
+        too_large(None)
     } else {
         invalid("The upload was cut off or malformed.")
     }
@@ -194,7 +199,7 @@ pub async fn upload_handler(
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok());
     if declared.is_some_and(|length| length > MAX_UPLOAD_BYTES as u64) {
-        return Err(too_large());
+        return Err(too_large(declared));
     }
     let multipart = multipart.map_err(|_| invalid("Send the files as a multipart form."))?;
     tracing::info!(bytes = declared, "drop upload started");
@@ -319,23 +324,6 @@ pub async fn list_jobs_handler(
     }))
 }
 
-/// One import job. `GET /api/v3/import/jobs/{job_id}`.
-#[utoipa::path(
-    get,
-    tag = "imports",
-    path = "/api/v3/import/jobs/{job_id}",
-    params(("job_id" = String, Path, description = "Import job id")),
-    responses((status = 200, body = DropImportJobResponse))
-)]
-pub async fn get_job_handler(
-    State(service): State<Arc<DropImports>>,
-    curator: Curator,
-    Path(job_id): Path<String>,
-) -> Result<Json<DropImportJobResponse>, ApiError> {
-    let viewer = viewer(&curator);
-    Ok(Json(service.get_job(&viewer, &job_id).await?.into()))
-}
-
 /// Drop-import routes, for an admin or trusted user. The upload takes a
 /// body up to `MAX_UPLOAD_BYTES`.
 pub fn routes() -> Routes<Arc<DropImports>> {
@@ -344,5 +332,4 @@ pub fn routes() -> Routes<Arc<DropImports>> {
     Routes::new()
         .curator((schemas, paths, upload))
         .curator(routes!(list_jobs_handler))
-        .curator(routes!(get_job_handler))
 }

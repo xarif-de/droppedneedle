@@ -215,15 +215,21 @@ Run from the repo root. `make help` lists every target.
   `CACHE_DIR`, or beside `library.db` when that folder is refused), a
   throwaway file opened in `kernel/src/db/cache/` under a lock of its own,
   with its own writer and readers that only the providers' cache store
-  holds. It has no migrations (a file of another schema or release, or one
-  that does not read, is deleted and rebuilt at start), is never backed up
-  or exported, keeps its rows under 512 MB, and holds nothing that cannot be
+  holds. It has no migrations (a file of another schema or cache version, or
+  one that does not read, is deleted and rebuilt at start; rows otherwise
+  carry across releases, and a release that must clear stale answers bumps
+  `CACHE_VERSION`), a row that does not decode reads as a miss, it is never
+  backed up or exported, keeps its rows under 512 MB, and holds nothing that cannot be
   fetched again. A cache key starts with its source and carries every value
   that changes the answer, so no settings save clears it, and a lookup that
   met any failure stores nothing.
 - All writes go through the single writer lane, one transaction per atomic
   change. No network calls inside one: writes run one at a time, so a slow one
   stalls the rest.
+  The offline upgrade tool is the one exception: with the server stopped and the
+  data lock held, the importer writes on one connection, because it attaches
+  the export (which a transaction refuses) and a large section outlasts the
+  lane's time limit.
 - A write closure fails with the caller's own error type
   (`E: From<DbError>`); an outcome a caller branches on is a variant of that
   type, never the text of a database error. A chunked write commits chunk by
@@ -239,11 +245,25 @@ Run from the repo root. `make help` lists every target.
   `server/sql-outside-registry.txt`, and a gate then keeps raw SQL out.
   A `sql!` block whose statements read a v2 database starts with
   `schema = V2;` and is prepared against the v2 fixture.
+- A statement that answers more than one column is read through a `row` in its
+  `sql!` block, whose fields the schema test holds to the statement's columns.
+  A family's row names its builders (`row Name for family [builder]`).
+- `db::time` (`kernel/src/db/time.rs`) says what a stored time is: a row reads
+  an `_at` column it turns into seconds as `Millis`, whose decode fails on
+  anything but an integer, and the library converts it with `clock::at_secs`.
+- SQLite is built with its memory counters off (`SQLITE_DEFAULT_MEMSTATUS=0`), in
+  `.cargo/config.toml` and the Dockerfile: on every allocation they take one
+  process-wide mutex. `persist_schema` holds it.
 - Migrations are numbered and forward-only. Never edit or renumber a shipped
   one. Each new one ships an upgrade test. They land on `v3` in number
   order: the runner skips any migration below the database's version, so a
   later number landing first loses the earlier one on every database that
   boots in between.
+- A migration that rebuilds a table other tables reference starts with
+  `-- no-transaction`, turns foreign keys off around one transaction, keeps
+  `rowid`, indexes and triggers, refuses to commit when `foreign_key_check`
+  finds more rows than before, and turns foreign keys back on. It never
+  renames the old table first.
 - Back up with the SQLite backup API, never a copy of the live file, which can
   miss what is still in the WAL.
 - New tables follow the schema conventions: a point in time is integer
@@ -306,6 +326,46 @@ Run from the repo root. `make help` lists every target.
   `server/tests/server/providers_gate.rs` refuses a rate written anywhere
   else, an HTTP client in a provider file and a priority nobody chose.
   Change a limit only after re-verifying it against the provider's docs.
+- Pace per install is not enough. MetaBrainz counts the total across every
+  install, so ListenBrainz and MusicBrainz reads are cached for as long as the
+  data allows, background work never refetches what a kept row can answer, and
+  a user's chosen source is honoured. A change that adds calls to them says how
+  many a day, for one active install.
+- The User-Agent is `DroppedNeedleApp/v<version> (<contact>; <site>)`, the form
+  MetaBrainz's gateway matches. Never change it, or send another name to get
+  past a refusal, without asking the provider first.
+- The limits, from `rates.rs`, with the day each was last read at its source
+  ("theirs" is a published limit we must keep, "ours" a pace we chose where none
+  is published). `providers_gate.rs` holds this table to `rates.rs`:
+
+  | Source | Keep to | Basis | Last read |
+  |---|---|---|---|
+  | `musicbrainz` | 1 a second, no burst | theirs: about 1 a second per address, 503 past it | 2026-10-18 |
+  | `brainzmash` | 10 a second, one in flight | ours: no published number, cools down on 429 | 2026-10-18 |
+  | `musicbrainz-mirror` | set by the admin; a public host uses the `musicbrainz` row | ours | 2026-10-18 |
+  | `listenbrainz` | 1 a second, no burst | theirs: at most 1 a second, 429 past it | 2026-10-18 |
+  | `lastfm` | 5 a second, burst 10 | ours: no published number | 2026-10-18 |
+  | `audiodb` | 30 a minute, held at 0.48 a second | theirs: the shared key is banned if over-used, never raise it | 2026-10-18 |
+  | `audiodb-premium` | 100 a minute, held at 1.6 a second | theirs | 2026-10-18 |
+  | `audiodb-media` | 5 a second, burst 2 | ours: no published number | 2026-10-18 |
+  | `acoustid` | 3 a second, no burst | theirs | 2026-10-18 |
+  | `coverartarchive` | 10 a second, no burst | ours: no published number, 503 past it | 2026-10-18 |
+  | `wikimedia-api` | 4 a second, one in flight | theirs: below 5 a second, one in flight | 2026-10-18 |
+  | `wikimedia-media` | 5 a second, two in flight | theirs: two in flight; the pace is ours | 2026-10-18 |
+  | `discogs` | 25 a minute, one every 2.4 seconds | copies of their spec: the official page refused the fetch | 2026-10-18 |
+  | `itunes` | 20 a minute, held at 0.3 a second, burst 2 | theirs: approximate | 2026-10-18 |
+  | `deezer` | 5 a second, burst 5 | ours: half the 50 per 5 seconds a third party cites | 2026-10-18 |
+  | `lrclib` | 1 a second, no burst | ours: a volunteer service | 2026-10-18 |
+  | `youtube` | 1 a second, burst 2 | theirs: 100 searches a day; the pace is ours | 2026-10-18 |
+  | `github` | 50 an hour, burst 10 | theirs: 60 an hour unauthenticated | 2026-10-18 |
+  | `spotify` | 2 a second, burst 5 | ours: no published number, 429 past it | 2026-10-30 |
+  | `plextv` | 1 a second, burst 5 | ours: no published limit | 2026-10-30 |
+  | `newznab` | 1 a second, burst 5, per indexer | ours: each indexer also reports its own daily caps, which the client holds to | 2026-10-30 |
+  | `hibp` | 5 a second, four in flight | ours: no limit on Pwned Passwords | 2026-10-30 |
+  | `oidc` | 10 a second, burst 20 | ours: no published number | 2026-10-30 |
+  | `ticketmaster` | 2 a second, no burst | theirs: 5 a second and 5000 a day | 2026-10-18 |
+  | `skiddle` | 1 a second, no burst | ours: no published number | 2026-10-18 |
+  | `open-meteo` | 2 a second, no burst | theirs: under 600 a minute | 2026-10-18 |
 - Addresses of outside services that are fixed in code live in
   `bootstrap::Outbound`. `Outbound::live()` is the only production source:
   never read one from the environment or from settings.
@@ -318,7 +378,9 @@ Run from the repo root. `make help` lists every target.
   download client or plugin reports is read only from inside that client's
   folder: a downloaded file is copied or removed only through
   `acquire/src/landing/confine.rs`, which opens it beneath the folder's
-  real path one component at a time and never follows a link.
+  real path one component at a time and never follows a link. That
+  opener is the kernel's one no-follow opener (`kernel/src/beneath.rs`),
+  which local cover art and the scan's folder images also read through.
 - Response security headers are added in one place,
   `server/src/security_headers.rs`: the web UI's content-security policy,
   a "nothing runs here" policy and `nosniff` on every other native
@@ -355,6 +417,8 @@ Run from the repo root. `make help` lists every target.
   there.
 - The audio stack is decided: lofty behind its save
   wrapper, symphonia, rusty-chromaprint, ffmpeg for transcoding, no WMA.
+  The image's ffmpeg is a slim LGPL-only build: a new codec goes on its lists in
+  the Dockerfile with a transcode in `server/scripts/e2e-container.sh`.
   Unrelated tags survive every mutation.
 - Prefer a healthy, maintained crate over home-made parser, crypto or retry
   code. New licenses and advisory ignores are reviewed edits to
@@ -391,15 +455,35 @@ Run from the repo root. `make help` lists every target.
   The one other link followed is a library folder's `.recycle`, and only
   once its target is checked to lie outside every library and download
   folder.
+- A configured recycle bin that cannot be reached makes removals and
+  upgrades wait; files never fall back to a library folder's `.recycle`
+  while it is down.
 - "Never overwrite" is enforced by the operating system call that places the
   file, not by a check made before it. A library on a filesystem that offers
   no such call still works and shows a warning.
 - A managed write keeps the file's permission bits, and its journal row is on
   disk before the file moves.
+- A recycle bin copy is deleted only when the identity recorded when it
+  landed in the bin (device, inode, size, mtime, ctime) still matches, or its
+  bytes match the plan hash. Anything else is kept.
 - A scan judges a track gone (walked past) in one place, `walked_past!`
-  in `library/src/scan/sqlite_store/`, and never while a publish journal
-  row naming it is open or was written after its scope's walk began. A
-  trigger on the journal stamps that revision, so no write can skip it.
+  in `library/src/scan/sqlite_store/`, and never under a folder the run
+  refused as a link (`refused_scope!`, a rule's scope or a link the walk
+  met with rows under it: a folder replaced by a link keeps its tracks and
+  they do not count toward the mass-missing guard), and never while a
+  publish journal
+  row naming it is open, needs attention and is not marked handled, or
+  was written after its scope's walk began (marking one handled counts as
+  a write). A scan writes no row for a file whose track such a row names
+  (open or written after the walk began), whose path such a row moved a
+  file away from, or whose path an open row, or a move that needs
+  attention and is not marked handled, is placing a file at. A trigger on
+  the journal stamps that revision, so no write can skip it.
+- A track a scan judged gone continues into a track an earlier scan read
+  only in the run end's late pass (`scan_end_continue_moved`): the match
+  `find_moved_track` makes, unambiguous both ways and timed by
+  `release_join::judge`. It reads rows already missing and never judges a
+  track gone.
 - A publish records each folder it makes, durably, right after making it and
   before anything is written into it. An unwind, forward or after a crash,
   removes exactly those folders, deepest first and only while empty, and
@@ -428,10 +512,18 @@ Run from the repo root. `make help` lists every target.
   merge is in the audit. Any other record emptied without provider proof is
   never merged by itself; when a scan recorded the move and it holds a
   favourite, rating or play, it is listed in Duplicate artists.
+- A third exception: at the upgrade, a carried v2 row named exactly "Unknown
+  Artist" merges into the built-in one when it has no MusicBrainz link other
+  than a special-purpose id and no source link, nothing names a real id at any
+  of its credits or proofs, every credit it holds is under that name, and an
+  admin has not marked them distinct. Any other such row stays, and the
+  upgrade report names it.
 - Retired IDs stay as aliases.
 - Every artist merge goes through `retire_artist` with a `MergeBasis`
   built in `corrections/merge_basis.rs` from rows read in the same
   transaction; the merge history shows each basis.
+- Setting or clearing an artist's link by hand never starts a merge; when
+  it would, it is refused and the records are merged by an admin.
 - MusicBrainz's special-purpose artist ids (Various Artists, unknown and
   the like) are never proof and never key an artist row.
 - A release group that every file's tags name, or that a revisable match
@@ -443,6 +535,8 @@ Run from the repo root. `make help` lists every target.
   evidence: identification waits and retries rather than marking an
   album unmatched, and an unreadable tagged release leaves only an
   unconfirmed guess.
+- An AcoustID answer that could not be had is never "heard nothing":
+  identification and landings wait.
 - Album and track identities, match state and their undo rows are written
   only through `library/src/identity/`; a source gate holds it.
 
@@ -453,8 +547,9 @@ Run from the repo root. `make help` lists every target.
 - Which Jellyfin routes are public is the one route table in
   `compat/src/jellyfin/router.rs`; every other row is signed in by its
   layer before the handler runs, and the limiter reads the same table.
-- A Jellyfin id is stored in `compat_jellyfin_ids` by compat's fill loop
-  and never minted again, a data-key reset included. A request resolves
+- A Jellyfin id is stored in `compat_jellyfin_ids` by compat's fill loop,
+  or carried from v2 by the upgrade, and never minted again, a data-key
+  reset included. A request resolves
   ids from that table and never lists the catalog.
 - A plugin is trusted, unsandboxed code. Nothing runs until an admin enables
   it. `PLUGINS.md` is the public contract: change the manifest, protocol or
@@ -465,11 +560,10 @@ Run from the repo root. `make help` lists every target.
 - Never gate "can acquire" on slskd alone: acquisition health is slskd or
   Usenet or an enabled plugin download source, answered by one readiness
   value in acquire (`readiness.rs`) that requests, search, the download
-  queue, the health smoke and Discover all read. A source counts once it
-  is turned on, whether or not it answers right now. Release readiness is
-  a separate gate per source. A request made
-  while no source is ready is held and starts by itself when one is saved.
-  It is never refused or lost.
+  queue and Discover all read. A source counts once it is turned on,
+  whether or not it answers right now. A request made while no source is
+  ready is held and starts by itself when one is saved. It is never
+  refused or lost.
 - Every file kept for a person's decision (a held download, an upload
   waiting for review) is an entry in acquire's one held list
   (`acquire/src/held/`), kept 90 days and then removed by its prune. An
@@ -501,9 +595,15 @@ Run from the repo root. `make help` lists every target.
   user's keys never leak to another. A query is saved to the browser only
   when its `meta.persist` says so, and a query whose answer depends on the
   metadata source carries `meta.provider`, so a source switch drops it.
+- An effect that seeds a form from `query.data` guards itself: any change to
+  the query re-runs it.
+- A small feature's queries are one file, `lib/queries/<feature>.svelte.ts`; a
+  hook names its route, with no alias file. The keys `effects.ts` sweeps live
+  in `lib/queries/featureKeys.ts`, so it imports no hooks.
 - Change the cache only through `setQueryDataWithPersister` and
   `invalidateQueriesWithPersister`. Mutations invalidate every affected
   prefix, including other features'.
+- Mutation hooks are `create<Action>Mutation`; lint refuses another shape.
 - What a change invalidates is a named effect in `lib/queries/effects.ts`;
   only that module invalidates. Mutations are built with
   `createAppMutation` and declare their `effects` (`() => []` when they
@@ -536,10 +636,14 @@ Run from the repo root. `make help` lists every target.
   `app.css` stops motion under `prefers-reduced-motion`; motion that
   carries meaning opts out with `motion-keep`, and Svelte transitions come
   from `$lib/ui/motion`.
+- In-app links and `goto` go through `withBasePath`; lint refuses a bare root
+  path.
+- A library view says `art_missing` when the server knows the cover routes
+  would answer 404; the web UI asks for no cover a view marks missing.
 - Navigation destinations live in `lib/components/shell/navItems.ts`; the
   sidebar, the bottom bar and the More sheet all render from it.
 - A Discover or Home section is one entry in the registry in
-  `catalog/src/reads/discover/sections.rs` (its page, zone, settings
+  `catalog/src/discover/sections.rs` (its page, zone, settings
   title, the reads it needs, its dedupe); the page build, the section
   settings and the web UI's lookups all read it, and nothing else lists
   sections.

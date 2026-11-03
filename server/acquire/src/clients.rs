@@ -9,22 +9,21 @@ use std::time::Duration;
 use crate::downloads::journal::Journal;
 use crate::downloads::sources::DownloadSource;
 use crate::downloads::worker::SourceSet;
-use crate::imports::lidarr::LidarrClient;
 use crate::probes::ProbeInputs;
 use crate::slskd::{DownloadPolicy as SlskdPolicy, ReqwestSlskdHttp, SlskdClient, SlskdRepository};
 use crate::sources::{SabnzbdSource, SlskdSource};
 use crate::target::Targets;
-use crate::usenet::newznab::{NewznabClient, NewznabIndexer, NewznabIndexerEntry};
+use crate::usenet::newznab::{NewznabIndexer, NewznabIndexerEntry};
 use crate::usenet::policy::UsenetPolicy;
 use crate::usenet::prowlarr::{ProwlarrClient, ProwlarrIndexer};
 use crate::usenet::sabnzbd::{SabnzbdClient, SabnzbdQueue};
 use crate::wiring::{ClientLives, usenet_indexers};
 use droppedneedle_kernel::runtime_config::secret_sections::{
-    DownloadClients, LidarrImportConnection, NewznabIndexer as ConfigIndexer, ProwlarrConnection,
-    SlskdConnection,
+    DownloadClients, NewznabIndexer as ConfigIndexer, ProwlarrConnection, SlskdConnection,
 };
 use droppedneedle_kernel::runtime_config::sections::{DownloadPolicy, UsenetBackendSetting};
 use droppedneedle_plugins::host::PluginHost;
+use droppedneedle_providers::newznab::NewznabIndexers;
 use tokio::sync::watch;
 
 /// The settings one client set is built from.
@@ -33,7 +32,6 @@ pub(crate) struct ClientSettings {
     pub(crate) sabnzbd: DownloadClients,
     pub(crate) indexers: Vec<ConfigIndexer>,
     pub(crate) prowlarr: ProwlarrConnection,
-    pub(crate) lidarr: LidarrImportConnection,
     /// `None` when the download policy does not read.
     pub(crate) policy: Option<DownloadPolicy>,
     pub(crate) backend: UsenetBackendSetting,
@@ -61,6 +59,8 @@ struct Built {
 /// between uses while a saved setting takes effect on the next use.
 pub struct LiveClients {
     http: reqwest::Client,
+    /// Newznab indexers, called through the providers' executor.
+    newznab: NewznabIndexers,
     pub(crate) settings: ClientLives,
     slskd_downloads: PathBuf,
     journal: Arc<Journal>,
@@ -73,9 +73,11 @@ pub struct LiveClients {
 
 impl LiveClients {
     /// Clients over the live sections. `slskd_downloads` is the slskd
-    /// downloads mount (`SLSKD_DOWNLOADS_PATH`).
+    /// downloads mount (`SLSKD_DOWNLOADS_PATH`); `newznab` hands out the
+    /// indexers' clients.
     pub fn new(
         http: reqwest::Client,
+        newznab: NewznabIndexers,
         settings: ClientLives,
         slskd_downloads: PathBuf,
         journal: Arc<Journal>,
@@ -84,6 +86,7 @@ impl LiveClients {
     ) -> Self {
         Self {
             http,
+            newznab,
             settings,
             slskd_downloads,
             journal,
@@ -175,7 +178,7 @@ impl LiveClients {
         let slskd_repo =
             slskd_repository(http, &settings.slskd, &self.slskd_downloads, slskd_policy);
         let sab_queue = sabnzbd_queue(http, &settings.sabnzbd, &usenet_policy);
-        let newznab = Arc::new(newznab_indexer(http, &settings.indexers));
+        let newznab = Arc::new(newznab_indexer(&self.newznab, &settings.indexers));
         let prowlarr = Arc::new(prowlarr_indexer(http, &settings.prowlarr));
         let mut sources: Vec<Arc<dyn DownloadSource>> = Vec::new();
         if let Some(repo) = slskd_repo.clone()
@@ -209,12 +212,6 @@ impl LiveClients {
             library_roots: settings.library_roots.clone(),
             sabnzbd: sab_queue,
             sabnzbd_section: settings.sabnzbd.clone(),
-            newznab,
-            newznab_entries: settings.indexers.clone(),
-            prowlarr,
-            prowlarr_section: settings.prowlarr.clone(),
-            lidarr: LidarrClient::new(http.clone()),
-            lidarr_section: settings.lidarr.clone(),
         });
         ClientSet {
             sources: Arc::new(sources),
@@ -281,17 +278,11 @@ fn sabnzbd_queue(
 }
 
 /// Native indexer fan-out over the configured entries.
-fn newznab_indexer(http: &reqwest::Client, entries: &[ConfigIndexer]) -> NewznabIndexer {
+fn newznab_indexer(indexers: &NewznabIndexers, entries: &[ConfigIndexer]) -> NewznabIndexer {
     let entries = entries
         .iter()
         .map(|entry| NewznabIndexerEntry {
-            client: NewznabClient::new(
-                http.clone(),
-                &entry.url,
-                entry.api_key.expose(),
-                &entry.id,
-                &entry.name,
-            ),
+            client: indexers.client(&entry.id, &entry.name, &entry.url, entry.api_key.expose()),
             id: entry.id.clone(),
             name: entry.name.clone(),
             categories: entry.categories.iter().map(|cat| *cat as i32).collect(),
@@ -300,13 +291,7 @@ fn newznab_indexer(http: &reqwest::Client, entries: &[ConfigIndexer]) -> Newznab
             limit: 100,
         })
         .collect();
-    NewznabIndexer::new(
-        entries,
-        Duration::from_secs(300),
-        Duration::from_secs(60),
-        Duration::from_secs(300),
-        Duration::from_secs(30),
-    )
+    NewznabIndexer::new(entries, Duration::from_secs(300), Duration::from_secs(60))
 }
 
 /// Prowlarr fan-out over the single connection.

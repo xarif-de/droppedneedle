@@ -910,7 +910,7 @@ async fn lastfm_hooks() {
         (
             "error 10 in a 403",
             answer(403, &[], &envelope(10)),
-            |result| matches!(result, Err(ProviderError::Unauthorized { .. })),
+            |result| matches!(result, Err(ProviderError::Rejected { code: 10, .. })),
             1,
             Duration::ZERO,
         ),
@@ -1000,8 +1000,9 @@ async fn audiodb_rows_follow_the_saved_key() {
     );
 }
 
-/// The AcoustID rules: a 4xx naming error code 4 is a refused key, any
-/// other 4xx a rejection, and a 200 whose status is not "ok" an outage.
+/// The AcoustID rules: a 4xx naming error code 4 is a refused key, a 4xx
+/// naming another code waits on that code, and a 200 whose status is not
+/// "ok" an outage.
 #[tokio::test(start_paused = true)]
 async fn acoustid_hooks() {
     let lookup = format!("{}/v2/lookup", acoustid::DEFAULT_BASE_URL);
@@ -1014,7 +1015,7 @@ async fn acoustid_hooks() {
                 &[],
                 r#"{"status": "error", "error": {"code": 4, "message": "invalid API key"}}"#,
             ),
-            |outcome| matches!(outcome, acoustid::BatchOutcome::Rejected { message } if message.contains("401")),
+            |outcome| *outcome == acoustid::BatchOutcome::KeyRefused,
         ),
         (
             "another 400",
@@ -1023,7 +1024,9 @@ async fn acoustid_hooks() {
                 &[],
                 r#"{"status": "error", "error": {"code": 2, "message": "missing parameter"}}"#,
             ),
-            |outcome| matches!(outcome, acoustid::BatchOutcome::Rejected { message } if message.contains("400")),
+            |outcome| {
+                *outcome == acoustid::BatchOutcome::Unavailable(acoustid::Unanswered::Code(2))
+            },
         ),
         (
             "a 200 that did not succeed",
@@ -1048,6 +1051,42 @@ async fn acoustid_hooks() {
             .await;
         assert!(check(&outcome), "{name}: got {outcome:?}");
     }
+
+    // AcoustID's "too many requests" code rests the client as a 429 does.
+    let wire = Arc::new(ScriptedWire::new());
+    wire.on(
+        Method::Post,
+        &lookup,
+        answer(
+            400,
+            &[],
+            r#"{"status": "error", "error": {"code": 14, "message": "too many requests"}}"#,
+        ),
+    );
+    let providers = providers_over(&wire);
+    let outcome = providers
+        .acoustid
+        .lookup_batch_request(
+            "key",
+            &[acoustid::BatchQuery {
+                fingerprint: "print",
+                duration_secs: 200,
+            }],
+            RequestPriority::UserInitiated,
+        )
+        .await;
+    assert_eq!(
+        outcome,
+        acoustid::BatchOutcome::Unavailable(acoustid::Unanswered::Paused)
+    );
+    assert!(
+        !providers
+            .limiter("acoustid")
+            .expect("the AcoustID limiter")
+            .cooling_for()
+            .is_zero(),
+        "code 14 rests AcoustID"
+    );
 }
 
 /// GitHub: a 403 that says the allowance is spent rests until
@@ -1410,4 +1449,108 @@ fn a_key_in_the_url_never_reaches_an_error_or_a_log() {
     assert!(logs.contains("provider"), "the failure is logged: {logs}");
     assert!(!logs.contains("SECRET"), "{logs}");
     assert!(!logs.contains("/api/"), "{logs}");
+}
+
+/// A Newznab indexer at its daily cap is not called again until the cap
+/// frees up: a day after the oldest call it counts, as its answer says.
+#[tokio::test]
+async fn a_newznab_indexer_at_its_daily_cap_waits_for_the_reset() {
+    use droppedneedle_kernel::clock::ManualClock;
+    use droppedneedle_providers::newznab::NewznabError;
+
+    const NOW: i64 = 1_800_000_000;
+    // An hour before NOW.
+    const OLDEST: &str = "Fri, 15 Jan 2027 07:00:00 GMT";
+    let wire = Arc::new(ScriptedWire::new());
+    wire.answer(
+        "https://indexer.test/api",
+        200,
+        &[],
+        format!(
+            r#"<rss xmlns:newznab="http://www.newznab.com/DTD/2010/feeds/attributes/"><channel>
+<newznab:apilimits apiCurrent="100" apiMax="100" grabCurrent="3" grabMax="50" apiOldestTime="{OLDEST}"/>
+</channel></rss>"#
+        ),
+    );
+    let clock = Arc::new(ManualClock::at(NOW * 1000));
+    let providers = Providers::over_wire(wire.clone(), clock.clone(), ProviderEndpoints::closed());
+    let client = providers
+        .newznab
+        .client("idx", "Indexer", "https://indexer.test/api", "KEY");
+    let search = || client.search("Radiohead", &[], 0, 100, RequestPriority::UserInitiated);
+
+    let (releases, _) = search().await.expect("the answer that reports the cap");
+    assert!(releases.is_empty());
+    assert_eq!(wire.sent().len(), 1);
+
+    let refusals = [
+        search().await.map(|_| ()),
+        client
+            .caps(RequestPriority::BackgroundSync)
+            .await
+            .map(|_| ()),
+    ];
+    for refused in refusals {
+        match refused {
+            Err(NewznabError::Provider(ProviderError::RateLimited {
+                retry_after: Some(wait),
+                ..
+            })) => assert_eq!(wait, Duration::from_secs(23 * 3600)),
+            other => panic!("not held to the cap: {other:?}"),
+        }
+    }
+    assert_eq!(wire.sent().len(), 1, "nothing sent while the cap holds");
+
+    clock.advance(23 * 3600 * 1000);
+    search().await.expect("the cap freed up");
+    assert_eq!(wire.sent().len(), 2);
+}
+
+/// An NZB grab spends the indexer's grab cap and shows on the `newznab`
+/// row, and is not sent once the cap is reached.
+#[tokio::test]
+async fn an_nzb_grab_counts_on_the_indexers_row_and_cap() {
+    use droppedneedle_kernel::clock::ManualClock;
+
+    const NOW: i64 = 1_800_000_000;
+    const NZB: &str = "https://cdn.indexer.test/getnzb/1.nzb";
+    let wire = Arc::new(ScriptedWire::new());
+    wire.answer(
+        "https://indexer.test/api",
+        200,
+        &[],
+        r#"<rss xmlns:newznab="http://www.newznab.com/DTD/2010/feeds/attributes/"><channel>
+<newznab:apilimits apiCurrent="1" apiMax="100" grabCurrent="4" grabMax="5"/>
+</channel></rss>"#,
+    );
+    wire.answer(NZB, 200, &[], "<nzb></nzb>");
+    let providers = Providers::over_wire(
+        wire.clone(),
+        Arc::new(ManualClock::at(NOW * 1000)),
+        ProviderEndpoints::closed(),
+    );
+    let client = providers
+        .newznab
+        .client("idx", "Indexer", "https://indexer.test/api", "KEY");
+    let priority = RequestPriority::BackgroundSync;
+    client
+        .search("Radiohead", &[], 0, 100, priority)
+        .await
+        .expect("the answer that reports the counts");
+
+    let nzb = client.fetch_nzb(NZB, priority).await.expect("the grab");
+    assert_eq!(nzb, b"<nzb></nzb>");
+    let row = providers.limiter("newznab").expect("the newznab row");
+    let sent: u64 = row.calls().iter().map(|count| count.calls).sum();
+    assert_eq!(sent, 2, "the search and the grab show on the row");
+
+    assert!(matches!(
+        client.fetch_nzb(NZB, priority).await,
+        Err(ProviderError::RateLimited { .. })
+    ));
+    assert_eq!(
+        wire.sent().len(),
+        2,
+        "nothing sent while the grab cap holds"
+    );
 }

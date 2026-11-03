@@ -4,7 +4,8 @@
 	import AlbumImage from './AlbumImage.svelte';
 	import DeleteAlbumModal from './DeleteAlbumModal.svelte';
 	import type { RequestItem, RequestKind } from '$lib/queries/requests/types';
-	import { reimportDownload } from '$lib/queries/downloads/DownloadMutations.svelte';
+	import { liveRequestStatus } from '$lib/queries/requests/liveStatus';
+	import { createReimportDownloadMutation } from '$lib/queries/downloads/DownloadMutations.svelte';
 	import { createFromAlbumMutation } from '$lib/queries/requests/RequestMutations.svelte';
 	import { authStore } from '$lib/stores/authStore.svelte';
 	import Button from '$lib/ui/Button.svelte';
@@ -25,7 +26,6 @@
 		CircleX,
 		TriangleAlert,
 		Ban,
-		Pause,
 		Music,
 		Radar,
 		Upload,
@@ -35,9 +35,6 @@
 	interface Props {
 		item: RequestItem;
 		mode: 'active' | 'history';
-		// The linked download's own state on an active card (searching, awaiting
-		// review, downloading...), which the request row alone cannot tell.
-		liveStatus?: string;
 		// still being worked on despite the terminal status: 'retrying' = auto-retry
 		// ladder, 'watching' = wanted watcher. Renders a chip linking to the Wanted tab.
 		watchState?: 'retrying' | 'watching';
@@ -55,7 +52,6 @@
 	let {
 		item,
 		mode,
-		liveStatus,
 		watchState,
 		selectable = false,
 		selected = false,
@@ -67,7 +63,7 @@
 		onreimported
 	}: Props = $props();
 
-	const reimport = reimportDownload();
+	const reimport = createReimportDownloadMutation();
 	const fromAlbum = createFromAlbumMutation();
 
 	let confirmingCancel = $state(false);
@@ -128,12 +124,16 @@
 				return 'Waiting: request quota full';
 			case 'storage_full':
 				return 'Waiting: storage full';
+			case 'waiting_to_start':
+				return 'Waiting to start';
 			default:
 				return null;
 		}
 	});
 	const waiting = $derived(waitingNote !== null);
-	const status = $derived(mode === 'active' && liveStatus ? liveStatus : item.status);
+	// An active card shows the linked download's own state (searching,
+	// awaiting review...), which the request row alone cannot tell.
+	const status = $derived(mode === 'active' ? liveRequestStatus(item) : item.status);
 
 	const statusConfig = $derived.by((): StatusConfig => {
 		if (waiting) {
@@ -158,14 +158,6 @@
 				};
 			case 'importing':
 				return { badgeClass: 'badge-info', label: 'Importing', icon: Upload };
-			case 'paused':
-				return { badgeClass: 'badge-warning', label: 'Paused', icon: Pause };
-			case 'downloadClientUnavailable':
-				return { badgeClass: 'badge-error', label: 'Client Unavailable', icon: TriangleAlert };
-			case 'importFailed':
-				return { badgeClass: 'badge-error', label: 'Import Failed', icon: CircleX };
-			case 'importBlocked':
-				return { badgeClass: 'badge-warning', label: 'Import Blocked', icon: TriangleAlert };
 			case 'cancelling':
 				return { badgeClass: 'badge-ghost', label: 'Cancelling', icon: Loader };
 			case 'incomplete':
@@ -188,12 +180,7 @@
 	});
 
 	let showStatusDetails = $state(false);
-	const isFailedState = $derived(
-		item.status === 'importFailed' ||
-			item.status === 'importBlocked' ||
-			item.status === 'failed' ||
-			item.status === 'downloadClientUnavailable'
-	);
+	const isFailedState = $derived(item.status === 'failed');
 	const requestKind = $derived<RequestKind>(item.request_kind === 'track' ? 'track' : 'album');
 	const isTrackRequest = $derived(requestKind === 'track');
 	const trackTitle = $derived(
@@ -251,9 +238,7 @@
 
 	const isActive = $derived(mode === 'active');
 	const hasProgress = $derived(
-		isActive &&
-			!waiting &&
-			(status === 'downloading' || status === 'importing' || status === 'paused')
+		isActive && !waiting && (status === 'downloading' || status === 'importing')
 	);
 	const hasStatusMessages = $derived(
 		isActive && item.status_messages && item.status_messages.length > 0
@@ -386,11 +371,7 @@
 				>
 					<div class="flex items-center gap-2 w-full">
 						<div class="progress-track flex-1">
-							<div
-								class="progress-fill"
-								class:progress-fill-paused={status === 'paused'}
-								style="width: {item.progress ?? 0}%"
-							></div>
+							<div class="progress-fill" style="width: {item.progress ?? 0}%"></div>
 						</div>
 						<span
 							class="text-xs text-base-content/70 min-w-[3ch] text-right tabular-nums font-medium"
@@ -585,12 +566,6 @@
 			transparent 100%
 		);
 		animation: shimmer 2s ease-in-out infinite;
-	}
-	.progress-fill-paused {
-		background: oklch(from var(--color-warning) l c h / 0.6);
-	}
-	.progress-fill-paused::after {
-		animation: none;
 	}
 
 	@keyframes shimmer {

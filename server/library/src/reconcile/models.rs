@@ -13,6 +13,8 @@ pub enum GroupState {
     SameNameOnly,
     /// A retag moved a record's credits to records of another name.
     CreditsMoved,
+    /// A person's link named a MusicBrainz artist another record holds.
+    SharedProviderIdentity,
     ResolvedAutomatically,
 }
 
@@ -24,6 +26,7 @@ impl GroupState {
             Self::AmbiguousCreditStructure => "ambiguous_credit_structure",
             Self::SameNameOnly => "same_name_only",
             Self::CreditsMoved => "credits_moved",
+            Self::SharedProviderIdentity => "shared_provider_identity",
             Self::ResolvedAutomatically => "resolved_automatically",
         }
     }
@@ -36,6 +39,7 @@ impl GroupState {
                 | Self::AmbiguousCreditStructure
                 | Self::SameNameOnly
                 | Self::CreditsMoved
+                | Self::SharedProviderIdentity
         )
     }
 }
@@ -104,6 +108,8 @@ pub enum MergeBasisLabel {
     /// A retag moved every credit to a record of the same name, with only
     /// its sort name, capitals or spacing changed.
     SameName,
+    /// The upgrade folded v2's Unknown Artist into the built-in one.
+    V2Placeholder,
 }
 
 impl MergeBasisLabel {
@@ -114,6 +120,9 @@ impl MergeBasisLabel {
             "AUTOMATIC_PROVIDER_PROVEN_ARTIST_CONVERGENCE"
             | "AUTOMATIC_PROVIDER_ANCHORED_ARTIST_CONVERGENCE" => Some(Self::MusicbrainzProof),
             crate::corrections::artist_convergence::MERGED_BY_NAME => Some(Self::SameName),
+            crate::corrections::artist_convergence::V2_PLACEHOLDER_FOLDED => {
+                Some(Self::V2Placeholder)
+            }
             _ => None,
         }
     }
@@ -138,6 +147,9 @@ pub struct GroupInputs {
     /// Records a retag emptied into records of another name, each first
     /// in its list, followed by the records its credits went to.
     pub moved: Vec<Vec<Candidate>>,
+    /// Pairs of records offered as one artist because a person's link
+    /// named a MusicBrainz artist the other holds.
+    pub shared: Vec<Vec<Candidate>>,
     pub dismissals: Vec<Dismissal>,
     /// Album artists of albums whose credit could not be split cleanly.
     pub ambiguous_artist_ids: Vec<String>,

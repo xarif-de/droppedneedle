@@ -74,3 +74,64 @@ describe('a request card for a single found only on its album', () => {
 			.not.toBeInTheDocument();
 	});
 });
+
+describe('an active request card', () => {
+	it("shows the linked download's own state, not the request row's", async () => {
+		fakeApi({});
+		await renderWithQuery(RequestCard, {
+			item: {
+				...held,
+				status: 'downloading',
+				completed_at: undefined,
+				album_version_only: undefined,
+				user_id: 'user-2',
+				requester_count: 1,
+				task_id: 'task-1',
+				task_state: 'searching'
+			},
+			mode: 'active'
+		});
+
+		await expect.element(page.getByText('Searching')).toBeVisible();
+		await expect.element(page.getByText('Downloading')).not.toBeInTheDocument();
+	});
+});
+
+describe('an active request card that waits to start', () => {
+	const waiting: RequestItem = {
+		musicbrainz_id: '6d0b7a1e-0000-4000-8000-000000000029',
+		artist_name: 'Massive Attack',
+		album_title: 'Mezzanine',
+		requested_at: 1_700_000_000,
+		status: 'queued',
+		request_kind: 'album',
+		origin: 'follow',
+		user_id: 'user-1',
+		requester_count: 0
+	};
+
+	it.each([
+		['request_quota_full', 'Waiting: request quota full'],
+		['storage_full', 'Waiting: storage full'],
+		['no_download_source', 'Waiting: no download source configured'],
+		['waiting_to_start', 'Waiting to start']
+	] as const)('shows why it waits (%s)', async (reason, note) => {
+		fakeApi({});
+		await renderWithQuery(RequestCard, {
+			item: { ...waiting, waiting_reason: reason },
+			mode: 'active'
+		});
+
+		await expect.element(page.getByLabelText('Status: Waiting')).toBeVisible();
+		await expect.element(page.getByText(note)).toBeVisible();
+		await expect.element(page.getByText('Followed artist')).toBeVisible();
+	});
+
+	it('reads as queued once nothing holds it back', async () => {
+		fakeApi({});
+		await renderWithQuery(RequestCard, { item: waiting, mode: 'active' });
+
+		await expect.element(page.getByLabelText('Status: Queued')).toBeVisible();
+		await expect.element(page.getByText(/^Waiting/)).not.toBeInTheDocument();
+	});
+});

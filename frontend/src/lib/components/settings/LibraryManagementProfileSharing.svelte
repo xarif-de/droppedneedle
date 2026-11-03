@@ -13,9 +13,9 @@
 	} from 'lucide-svelte';
 
 	import {
-		exportLibraryManagementProfileMutation,
-		importLibraryManagementProfileMutation,
-		previewLibraryManagementProfileImportMutation
+		createExportLibraryManagementProfileMutation,
+		createImportLibraryManagementProfileMutation,
+		createPreviewLibraryManagementProfileImportMutation
 	} from '$lib/queries/library-management/LibraryManagementMutations.svelte';
 	import type {
 		LibraryManagementProfile,
@@ -47,9 +47,9 @@
 		onimportclose,
 		onimported
 	}: Props = $props();
-	const exportProfile = exportLibraryManagementProfileMutation();
-	const previewImport = previewLibraryManagementProfileImportMutation();
-	const importProfile = importLibraryManagementProfileMutation();
+	const exportProfile = createExportLibraryManagementProfileMutation();
+	const previewImport = createPreviewLibraryManagementProfileImportMutation();
+	const importProfile = createImportLibraryManagementProfileMutation();
 	let shareDialog: HTMLDialogElement;
 	let shareHeading: HTMLHeadingElement;
 	let shareResult = $state<LibraryManagementProfileExportResponse | null>(null);
@@ -414,10 +414,10 @@
 					<section class="flex flex-col">
 						<TextAreaField
 							label="Or paste a text code"
-							help="Codes begin with DNLP1:. Pasting a code replaces the selected file."
+							help="Codes begin with DNLP2:. Pasting a code replaces the selected file."
 							mono
 							rows={6}
-							placeholder="DNLP1:…"
+							placeholder="DNLP2:…"
 							value={importFilename ? '' : importContent}
 							oninput={updateContent}
 						/>

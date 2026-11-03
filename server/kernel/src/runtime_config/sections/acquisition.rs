@@ -275,10 +275,10 @@ pub const QUALITY_KBPS_MAX: i64 = 2048;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct QualityRecipeEntry {
-    /// Container: `flac` or `mp3`.
-    pub format: String,
-    /// Quality id (per-format closed set, or `custom`).
-    pub quality: String,
+    /// Container.
+    pub format: RecipeFormat,
+    /// Quality id: one of the format's own, or `custom`.
+    pub quality: RecipeQuality,
     /// Custom MP3 lower bound, or canonical standard bound.
     pub min_bitrate_kbps: Option<i64>,
     /// Custom MP3 upper bound (`None` when open-ended), or canonical.
@@ -289,28 +289,109 @@ pub struct QualityRecipeEntry {
     pub sample_rate_hz: Option<i64>,
 }
 
-/// Canonical MP3 standard bounds: (min, max).
-fn mp3_standard_bounds(quality: &str) -> Option<(i64, Option<i64>)> {
-    match quality {
-        "below_192" => Some((16, Some(191))),
-        "192_255" => Some((192, Some(255))),
-        "256_319" => Some((256, Some(319))),
-        "320_plus" => Some((320, None)),
-        _ => None,
+/// A recipe entry's container.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RecipeFormat {
+    Flac,
+    Mp3,
+}
+
+impl RecipeFormat {
+    /// Stored and wire form.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Flac => "flac",
+            Self::Mp3 => "mp3",
+        }
     }
 }
 
-fn is_mp3_quality(quality: &str) -> bool {
-    matches!(
-        quality,
-        "below_192" | "192_255" | "256_319" | "320_plus" | "custom"
-    )
+impl std::fmt::Display for RecipeFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
-fn is_flac_quality(quality: &str) -> bool {
+/// A recipe entry's quality: MP3 bitrate bands, FLAC resolutions, or
+/// `custom` for either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub enum RecipeQuality {
+    #[serde(rename = "below_192")]
+    Below192,
+    #[serde(rename = "192_255")]
+    Kbps192To255,
+    #[serde(rename = "256_319")]
+    Kbps256To319,
+    #[serde(rename = "320_plus")]
+    Kbps320Plus,
+    #[serde(rename = "cd")]
+    Cd,
+    #[serde(rename = "24_48")]
+    Bit24Khz48,
+    #[serde(rename = "24_96")]
+    Bit24Khz96,
+    #[serde(rename = "24_192")]
+    Bit24Khz192,
+    #[serde(rename = "hi_res")]
+    HiRes,
+    #[serde(rename = "custom")]
+    Custom,
+}
+
+impl RecipeQuality {
+    /// Stored and wire form.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Below192 => "below_192",
+            Self::Kbps192To255 => "192_255",
+            Self::Kbps256To319 => "256_319",
+            Self::Kbps320Plus => "320_plus",
+            Self::Cd => "cd",
+            Self::Bit24Khz48 => "24_48",
+            Self::Bit24Khz96 => "24_96",
+            Self::Bit24Khz192 => "24_192",
+            Self::HiRes => "hi_res",
+            Self::Custom => "custom",
+        }
+    }
+}
+
+impl std::fmt::Display for RecipeQuality {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Canonical MP3 standard bounds: (min, max).
+fn mp3_standard_bounds(quality: RecipeQuality) -> Option<(i64, Option<i64>)> {
+    match quality {
+        RecipeQuality::Below192 => Some((16, Some(191))),
+        RecipeQuality::Kbps192To255 => Some((192, Some(255))),
+        RecipeQuality::Kbps256To319 => Some((256, Some(319))),
+        RecipeQuality::Kbps320Plus => Some((320, None)),
+        RecipeQuality::Cd
+        | RecipeQuality::Bit24Khz48
+        | RecipeQuality::Bit24Khz96
+        | RecipeQuality::Bit24Khz192
+        | RecipeQuality::HiRes
+        | RecipeQuality::Custom => None,
+    }
+}
+
+fn is_mp3_quality(quality: RecipeQuality) -> bool {
+    mp3_standard_bounds(quality).is_some() || quality == RecipeQuality::Custom
+}
+
+fn is_flac_quality(quality: RecipeQuality) -> bool {
     matches!(
         quality,
-        "cd" | "24_48" | "24_96" | "24_192" | "hi_res" | "custom"
+        RecipeQuality::Cd
+            | RecipeQuality::Bit24Khz48
+            | RecipeQuality::Bit24Khz96
+            | RecipeQuality::Bit24Khz192
+            | RecipeQuality::HiRes
+            | RecipeQuality::Custom
     )
 }
 
@@ -325,17 +406,11 @@ fn recipe_error(reason: String) -> ConfigError {
 impl QualityRecipeEntry {
     /// Strict per-entry validation (v2 `_validate_recipe_entry_fields`).
     pub fn validate_entry(&self) -> Result<(), ConfigError> {
-        if self.format != "flac" && self.format != "mp3" {
-            return Err(recipe_error(format!(
-                "unsupported quality recipe format: {:?}",
-                self.format
-            )));
-        }
-        if self.format == "mp3" {
-            if !is_mp3_quality(&self.quality) {
+        if self.format == RecipeFormat::Mp3 {
+            if !is_mp3_quality(self.quality) {
                 return Err(recipe_error(format!(
                     "unsupported mp3 quality recipe value: {:?}",
-                    self.quality
+                    self.quality.as_str()
                 )));
             }
             if self.bit_depth.is_some() || self.sample_rate_hz.is_some() {
@@ -343,33 +418,31 @@ impl QualityRecipeEntry {
                     "MP3 recipe entries cannot define FLAC resolution".to_owned(),
                 ));
             }
-            if self.quality == "custom" {
+            if self.quality == RecipeQuality::Custom {
                 let (Some(minimum), Some(maximum)) = (self.min_bitrate_kbps, self.max_bitrate_kbps)
                 else {
                     return Err(recipe_error(
                         "custom MP3 recipe requires min and max bitrates".to_owned(),
                     ));
                 };
-                for (name, value) in [("min_bitrate_kbps", minimum), ("max_bitrate_kbps", maximum)]
-                {
+                for (name, value) in [("minimum bitrate", minimum), ("maximum bitrate", maximum)] {
                     if !(QUALITY_KBPS_MIN..=QUALITY_KBPS_MAX).contains(&value) {
                         return Err(recipe_error(format!(
-                            "{name} must be an integer between {QUALITY_KBPS_MIN} and {QUALITY_KBPS_MAX}"
+                            "{name} must be between {QUALITY_KBPS_MIN} and {QUALITY_KBPS_MAX} kbps"
                         )));
                     }
                 }
                 if minimum > maximum {
                     return Err(recipe_error(
-                        "custom MP3 recipe requires min_bitrate_kbps <= max_bitrate_kbps"
-                            .to_owned(),
+                        "custom MP3 needs a minimum bitrate no higher than its maximum".to_owned(),
                     ));
                 }
                 return Ok(());
             }
-            let Some((exp_min, exp_max)) = mp3_standard_bounds(&self.quality) else {
+            let Some((exp_min, exp_max)) = mp3_standard_bounds(self.quality) else {
                 return Err(recipe_error(format!(
                     "unsupported mp3 quality recipe value: {:?}",
-                    self.quality
+                    self.quality.as_str()
                 )));
             };
             let actual = (self.min_bitrate_kbps, self.max_bitrate_kbps);
@@ -380,10 +453,10 @@ impl QualityRecipeEntry {
             }
             return Ok(());
         }
-        if !is_flac_quality(&self.quality) {
+        if !is_flac_quality(self.quality) {
             return Err(recipe_error(format!(
                 "unsupported flac quality recipe value: {:?}",
-                self.quality
+                self.quality.as_str()
             )));
         }
         if self.min_bitrate_kbps.is_some() || self.max_bitrate_kbps.is_some() {
@@ -391,20 +464,20 @@ impl QualityRecipeEntry {
                 "FLAC recipe entries cannot define a bitrate".to_owned(),
             ));
         }
-        if self.quality == "custom" {
+        if self.quality == RecipeQuality::Custom {
             let (Some(depth), Some(rate)) = (self.bit_depth, self.sample_rate_hz) else {
                 return Err(recipe_error(
-                    "custom FLAC recipe requires bit_depth and sample_rate_hz".to_owned(),
+                    "custom FLAC needs a bit depth and a sample rate".to_owned(),
                 ));
             };
             if !(1..=64).contains(&depth) {
                 return Err(recipe_error(
-                    "bit_depth must be an integer between 1 and 64".to_owned(),
+                    "bit depth must be between 1 and 64".to_owned(),
                 ));
             }
             if !(8000..=768000).contains(&rate) {
                 return Err(recipe_error(
-                    "sample_rate_hz must be an integer between 8000 and 768000".to_owned(),
+                    "sample rate must be between 8000 and 768000 Hz".to_owned(),
                 ));
             }
             return Ok(());
@@ -419,9 +492,9 @@ impl QualityRecipeEntry {
 
     /// Fill canonical MP3 standard bounds (v2 canonicalization).
     fn canonicalize(&mut self) {
-        if self.format == "mp3"
-            && self.quality != "custom"
-            && let Some((min, max)) = mp3_standard_bounds(&self.quality)
+        if self.format == RecipeFormat::Mp3
+            && self.quality != RecipeQuality::Custom
+            && let Some((min, max)) = mp3_standard_bounds(self.quality)
         {
             self.min_bitrate_kbps = Some(min);
             self.max_bitrate_kbps = max;
@@ -449,21 +522,21 @@ pub fn validate_quality_recipe(entries: &[QualityRecipeEntry]) -> Result<(), Con
     let mut mp3_ranges: Vec<(i64, Option<i64>)> = Vec::new();
     let mut flac_custom_pairs = Vec::new();
     for entry in entries {
-        if entry.quality != "custom" {
-            let key = (entry.format.clone(), entry.quality.clone());
+        if entry.quality != RecipeQuality::Custom {
+            let key = (entry.format, entry.quality);
             if seen_standard.contains(&key) {
                 return Err(recipe_error(format!(
-                    "quality_recipe contains duplicate {}/{}",
+                    "lists {}/{} twice",
                     entry.format, entry.quality
                 )));
             }
             seen_standard.push(key);
         }
-        if entry.format == "mp3" {
+        if entry.format == RecipeFormat::Mp3 {
             let mut bounds = (entry.min_bitrate_kbps, entry.max_bitrate_kbps);
-            if entry.quality != "custom"
+            if entry.quality != RecipeQuality::Custom
                 && bounds == (None, None)
-                && let Some((min, max)) = mp3_standard_bounds(&entry.quality)
+                && let Some((min, max)) = mp3_standard_bounds(entry.quality)
             {
                 bounds = (Some(min), max);
             }
@@ -474,7 +547,7 @@ pub fn validate_quality_recipe(entries: &[QualityRecipeEntry]) -> Result<(), Con
             };
             for (existing_min, existing_max) in &mp3_ranges {
                 if intervals_overlap(minimum, maximum, *existing_min, *existing_max) {
-                    if entry.quality == "custom" {
+                    if entry.quality == RecipeQuality::Custom {
                         return Err(recipe_error(
                             "custom MP3 quality recipe overlaps another MP3 range".to_owned(),
                         ));
@@ -483,12 +556,12 @@ pub fn validate_quality_recipe(entries: &[QualityRecipeEntry]) -> Result<(), Con
                 }
             }
             mp3_ranges.push((minimum, maximum));
-        } else if entry.quality == "custom"
+        } else if entry.quality == RecipeQuality::Custom
             && let (Some(depth), Some(rate)) = (entry.bit_depth, entry.sample_rate_hz)
         {
             if flac_custom_pairs.contains(&(depth, rate)) {
                 return Err(recipe_error(
-                    "quality_recipe contains duplicate custom FLAC resolution".to_owned(),
+                    "lists the same custom FLAC resolution twice".to_owned(),
                 ));
             }
             flac_custom_pairs.push((depth, rate));
@@ -498,7 +571,7 @@ pub fn validate_quality_recipe(entries: &[QualityRecipeEntry]) -> Result<(), Con
 }
 
 /// Download policy: quality tiers, recipe v2, timeouts, retry, retention,
-/// recycle bin, quotas, and the upgrade scan.
+/// quotas, and the upgrade scan.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(default)]
 pub struct DownloadPolicy {
@@ -542,10 +615,6 @@ pub struct DownloadPolicy {
     pub quality_cutoff: String,
     /// Background upgrades switch.
     pub upgrade_allowed: bool,
-    /// Recycle-bin path ("" disables).
-    pub recycle_bin_path: String,
-    /// Recycle retention in days.
-    pub recycle_retention_days: i64,
     /// Library size cap in GB (0 unlimited).
     pub max_library_size_gb: i64,
     /// Default per-user request quota (0 unlimited).
@@ -590,8 +659,6 @@ impl Default for DownloadPolicy {
             required_terms: Vec::new(),
             quality_cutoff: "lossless".to_owned(),
             upgrade_allowed: false,
-            recycle_bin_path: String::new(),
-            recycle_retention_days: 30,
             max_library_size_gb: 0,
             default_request_quota_count: 0,
             default_request_quota_days: 7,
@@ -696,13 +763,6 @@ impl Section for DownloadPolicy {
         )?;
         check_range(
             key,
-            "recycle_retention_days",
-            self.recycle_retention_days,
-            1,
-            3650,
-        )?;
-        check_range(
-            key,
             "max_library_size_gb",
             self.max_library_size_gb,
             0,
@@ -787,19 +847,14 @@ impl Section for DownloadPolicy {
             return Err(validation(
                 key,
                 "quality_min",
-                format!(
-                    "quality_min {:?} ranks above quality_max {:?}",
-                    self.quality_min, self.quality_max
-                ),
+                "the lowest quality ranks above the highest".to_owned(),
             ));
         }
         if !self.quality_recipe.is_empty() && !self.flac_mp3_only {
             return Err(validation(
                 key,
                 "quality_recipe",
-                "quality_recipe requires flac_mp3_only=true; \
-                 replace the non-convertible policy first"
-                    .to_owned(),
+                "only works with FLAC and MP3 only on; replace the old policy first".to_owned(),
             ));
         }
         validate_quality_recipe(&self.quality_recipe)?;
@@ -810,7 +865,7 @@ impl Section for DownloadPolicy {
             return Err(validation(
                 key,
                 "search_review",
-                format!("invalid search_review: {:?}", self.search_review),
+                format!("unknown choice {:?}", self.search_review),
             ));
         }
         Ok(())

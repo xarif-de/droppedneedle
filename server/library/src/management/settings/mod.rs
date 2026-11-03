@@ -2,7 +2,7 @@
 //! scripts, revisions, impact classification, activation health, and
 //! profile sharing.
 //!
-//! Ports v2's profile service over the `library_management` section and
+//! The profile service over the `library_management` section and
 //! works on the section types directly. All content revisions (settings,
 //! profile, script, naming-policy) hash byte-compatibly with v2
 //! (ASCII-escaped canonical JSON), so migrated activations and CAS tokens
@@ -16,6 +16,8 @@
 //! ones; a stored script the compiler refuses is kept and fails per item.
 
 use droppedneedle_kernel::runtime_config::settings_error::SettingsError;
+pub use normalize::{complete_fields, migration_carry, normalize, validate_preset_provenance};
+pub(crate) use script::validate_naming_language;
 
 mod activation;
 mod bundle;
@@ -36,14 +38,14 @@ pub use bundle::{
     MAX_PROFILE_SHARE_CODE_CHARS, MaterializedProfileBundle, PROFILE_BUNDLE_FORMAT,
     PROFILE_BUNDLE_MIME_TYPE, PROFILE_BUNDLE_VERSION, PROFILE_PREVIEW_NAMESPACE,
     PROFILE_SHARE_CODE_PREFIX, ParsedProfileBundle, PortableDocument, PortablePayload,
-    PortableScript, ProfileImportWarning, export_profile_bundle, materialize_profile_bundle,
-    parse_profile_bundle, preview_materialized_profile, profile_aspects, profile_bundle_filename,
-    profile_import_warnings, resolve_import_names, unique_import_name,
+    PortableProfile, PortableScript, ProfileImportWarning, export_profile_bundle,
+    materialize_profile_bundle, parse_profile_bundle, preview_materialized_profile,
+    profile_aspects, profile_bundle_filename, profile_import_warnings, resolve_import_names,
+    unique_import_name,
 };
 pub use impact::{
     ChangeImpact, active_automatic, classify, is_restrictive_profile_change, scope_payload,
 };
-pub use normalize::{complete_fields, migration_carry, normalize, validate_preset_provenance};
 pub use presets::{
     COMPLETE_LIBRARY_ORGANIZER_PROFILE_ID, LEGACY_DEFAULT_SIDECAR_PATTERNS,
     LEGACY_NAMING_PROFILE_ID, LEGACY_NAMING_SCRIPT_ID, LegacyConversion, MANAGED_FIELDS,
@@ -59,7 +61,6 @@ pub use revision::{
     naming_policy_revision, naming_script_revision, profile_revision, settings_revision,
     tagging_script_revision,
 };
-pub(crate) use script::validate_naming_language;
 
 /// A caller fault with a v2 message (400).
 fn invalid(message: &str) -> SettingsError {

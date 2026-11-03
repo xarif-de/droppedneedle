@@ -1,12 +1,11 @@
 <script lang="ts">
-	import { TriangleAlert } from 'lucide-svelte';
-
 	import {
 		getDownloadPolicyQuery,
-		saveDownloadPolicy
+		createSaveDownloadPolicyMutation
 	} from '$lib/queries/downloads/DownloadClientsQueries.svelte';
 	import type { DownloadPolicySettings as DownloadPolicyView } from '$lib/queries/downloads/DownloadClientsQueries.svelte';
 	import Card from '$lib/ui/Card.svelte';
+	import NumberField from '$lib/ui/NumberField.svelte';
 	import QueryBoundary from '$lib/ui/QueryBoundary.svelte';
 	import SaveBar from '$lib/ui/SaveBar.svelte';
 	import { createSettingsSection } from '$lib/ui/settingsSection.svelte';
@@ -41,7 +40,7 @@
 	}
 
 	// The stored policy plus the editable recipe. Fields this form does not
-	// edit, such as ignored terms and the recycle bin, are sent back as stored.
+	// edit, such as ignored terms, are sent back as stored.
 	type PolicyDraft = DownloadPolicyView & { recipe: RecipeDraftEntry[] };
 
 	function toDraft(view: DownloadPolicyView): PolicyDraft {
@@ -70,7 +69,7 @@
 	}
 
 	const policyQuery = getDownloadPolicyQuery();
-	const save = saveDownloadPolicy();
+	const save = createSaveDownloadPolicyMutation();
 
 	const section = createSettingsSection<PolicyDraft>(
 		{
@@ -112,6 +111,13 @@
 			(range.quality_min !== saved.quality_min || range.quality_max !== saved.quality_max)
 		);
 	});
+
+	// The quality range is worked out from the recipe, so all three show under it.
+	const qualityRefusal = $derived(
+		section.fieldError('quality_recipe', 'Quality order') ??
+			section.fieldError('quality_min', 'Quality order') ??
+			section.fieldError('quality_max', 'Quality order')
+	);
 
 	function recipeError(recipe: RecipeDraftEntry[]): string | null {
 		for (let index = 0; index < recipe.length; index += 1) {
@@ -158,13 +164,6 @@
 					</p>
 				</div>
 
-				{#if section.saved?.recycle_bin_warning}
-					<div class="alert alert-warning items-start text-sm" role="status">
-						<TriangleAlert class="mt-0.5 h-5 w-5" aria-hidden="true" />
-						<p class="min-w-0 flex-1">{section.saved.recycle_bin_warning}</p>
-					</div>
-				{/if}
-
 				<QualityOrderSection
 					bind:qualityRecipe={draft.recipe}
 					baseline={recipeFingerprint(baselineRecipe)}
@@ -174,6 +173,9 @@
 					saving={section.saving}
 					ondiscard={() => (draft.recipe = cloneRecipe(baselineRecipe))}
 				/>
+				{#if qualityRefusal}
+					<p class="text-sm text-error" role="alert">{qualityRefusal}</p>
+				{/if}
 
 				<div class="divider my-1"></div>
 
@@ -194,6 +196,11 @@
 						When an album should wait for you to pick which copy to download.
 					</p>
 					<SearchReviewSection bind:searchReview={draft.search_review} />
+					{#if section.fieldError('search_review', 'Picking a copy')}
+						<p class="text-sm text-error" role="alert">
+							{section.fieldError('search_review', 'Picking a copy')}
+						</p>
+					{/if}
 				</div>
 
 				<AdvancedBehaviorSection
@@ -204,7 +211,21 @@
 					bind:preferredQualityWait={draft.preferred_quality_wait_minutes}
 					bind:autoRetryEnabled={draft.auto_retry_enabled}
 					bind:autoRetryMax={draft.auto_retry_max_attempts}
+					fieldError={section.fieldError}
 				/>
+				<div>
+					<h3 class="font-medium">Retention</h3>
+					<div class="mt-3 grid gap-4 sm:grid-cols-2">
+						<NumberField
+							label="Usenet Retention (days)"
+							help="Skip Usenet releases older than this; 0 turns the check off (default: 0)"
+							bind:value={draft.usenet_retention_days}
+							min={0}
+							max={100000}
+							error={section.fieldError('usenet_retention_days')}
+						/>
+					</div>
+				</div>
 				<!-- The recipe editor above has its own Discard, so the bar shows none. -->
 				<div class="border-t border-base-300 pt-4">
 					<SaveBar

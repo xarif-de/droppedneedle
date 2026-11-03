@@ -12,13 +12,13 @@
 	} from 'lucide-svelte';
 
 	import {
-		deleteIndexerMutation,
+		createDeleteIndexerMutation,
 		getIndexersQuery,
 		getSearchBackendQuery,
-		reorderIndexersMutation,
-		saveIndexerMutation,
-		saveSearchBackendMutation,
-		testIndexerMutation
+		createReorderIndexersMutation,
+		createSaveIndexerMutation,
+		createSaveSearchBackendMutation,
+		createTestIndexerMutation
 	} from '$lib/queries/downloads/IndexerQueries.svelte';
 	import { getProwlarrConfigQuery } from '$lib/queries/downloads/ProwlarrQueries.svelte';
 	import { getPluginSourcesQuery } from '$lib/queries/plugins/PluginSourceQueries.svelte';
@@ -36,6 +36,7 @@
 
 	import PluginHealthBadge from './PluginHealthBadge.svelte';
 	import SettingsProwlarr from './SettingsProwlarr.svelte';
+	import { refusedField } from '$lib/ui/settingsSection.svelte';
 	import SettingsSectionCollapse from './SettingsSectionCollapse.svelte';
 
 	// The common audio categories; 3000 (Audio) expands to all subcats on most indexers.
@@ -49,11 +50,11 @@
 	const indexersQuery = getIndexersQuery();
 	const backendQuery = getSearchBackendQuery();
 	const prowlarrQuery = getProwlarrConfigQuery();
-	const save = saveIndexerMutation();
-	const remove = deleteIndexerMutation();
-	const reorder = reorderIndexersMutation();
-	const test = testIndexerMutation();
-	const saveBackend = saveSearchBackendMutation();
+	const save = createSaveIndexerMutation();
+	const remove = createDeleteIndexerMutation();
+	const reorder = createReorderIndexersMutation();
+	const test = createTestIndexerMutation();
+	const saveBackend = createSaveSearchBackendMutation();
 	const indexers = $derived(indexersQuery.data ?? []);
 	const backend = $derived<UsenetSearchBackendName>(backendQuery.data?.backend ?? 'indexers');
 	const enabledCount = $derived(indexers.filter((i) => i.enabled).length);
@@ -75,14 +76,20 @@
 		}
 	});
 
+	let backendRefusal = $state<string | null>(null);
+
 	async function selectBackend(next: UsenetSearchBackendName) {
 		if (next === backend) return;
+		backendRefusal = null;
 		try {
 			await saveBackend.mutateAsync(next);
 			indexersOpen = next === 'indexers';
 			prowlarrOpen = next === 'prowlarr';
-		} catch {
-			toastStore.show({ message: 'Could not switch search backend', type: 'error' });
+		} catch (error) {
+			backendRefusal = refusedField(error)?.reason ?? null;
+			if (!backendRefusal) {
+				toastStore.show({ message: 'Could not switch search backend', type: 'error' });
+			}
 		}
 	}
 	const pluginSourcesQuery = getPluginSourcesQuery();
@@ -280,6 +287,9 @@
 					</span>
 				</label>
 			</div>
+			{#if backendRefusal}
+				<p class="text-sm text-error" role="alert">{backendRefusal}</p>
+			{/if}
 		</div>
 	</Card>
 

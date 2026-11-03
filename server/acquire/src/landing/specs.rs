@@ -22,13 +22,15 @@ use std::path::PathBuf;
 
 use serde::Serialize;
 
-use super::matching::{FoundRelease, MatchState, MatchSummary, file_name_parts, is_various};
+use super::matching::{
+    FoundRelease, MatchState, MatchSummary, album_tag, file_name_parts, is_various,
+};
 use super::probe::Landing;
 use crate::downloads::quarantine::QuarantineReason;
 use crate::reason::Reason;
 use droppedneedle_library::matching::decide::{ACCEPT_ALBUM, ACCEPT_TRACK};
 use droppedneedle_library::matching::model::credit_text;
-use droppedneedle_library::matching::score::{NAME_GATE, Support, TrackPair};
+use droppedneedle_library::matching::score::{NAME_GATE, SAME_MASTER_SECS, Support, TrackPair};
 use droppedneedle_library::matching::strings::{
     artist_subset, fold, string_dist, strip_edition_words,
 };
@@ -41,6 +43,9 @@ pub enum Disposition {
     Permanent,
     /// It could pass later (files still settling, MusicBrainz down).
     Temporary,
+    /// A service outage says nothing about the files and can outlast every
+    /// wait: it never uses them up.
+    Outage,
     /// Our side failed (mount, disk): never blame or blocklist the source.
     LocalFault,
 }
@@ -127,6 +132,12 @@ pub struct Target {
     /// album, so the album's track stands for the requested recording
     /// when it is the right track.
     pub album_version: bool,
+    /// For a track download whose file looks like its album's copy of the
+    /// song ([`album_version`]): something other than the album tag shows
+    /// it is (the file's own MusicBrainz tags, or MusicBrainz listing the
+    /// song on an album of that name by the artist). Without it the file
+    /// is a weak match and the next source is tried.
+    pub album_copy_proven: bool,
     /// For a track download: the album release acquisition resolved the
     /// track to and the track's (disc, track) position on it.
     pub album_positions: Option<(String, Vec<crate::downloads::TrackPosition>)>,
@@ -478,14 +489,14 @@ impl ImportSpec for WrongEdition {
         for file in audio {
             // The album tag when there is one: a peer's folder layout
             // ("Artist/Discography/...") says nothing about the files.
-            let text = if file.tag.album.trim().is_empty() {
+            let text = if album_tag(file).is_empty() {
                 file.path
                     .parent()
                     .and_then(|dir| dir.file_name())
                     .map(|name| words(&name.to_string_lossy()))
                     .unwrap_or_default()
             } else {
-                words(&file.tag.album)
+                words(album_tag(file))
             };
             if let Some(marker) = EDITION_MARKERS
                 .iter()
@@ -567,7 +578,7 @@ impl ImportSpec for WrongAlbum {
             .landing
             .audio
             .iter()
-            .filter(|file| !file.tag.album.trim().is_empty())
+            .filter(|file| !album_tag(file).is_empty())
             .collect();
         if tagged.is_empty() {
             return Verdict::accept();
@@ -584,7 +595,7 @@ impl ImportSpec for WrongAlbum {
                 let same_artist = artist.trim().is_empty()
                     || words(artist).iter().any(|word| artist_words.contains(word));
                 same_artist
-                    && content_words(&file.tag.album, &artist_words)
+                    && content_words(album_tag(file), &artist_words)
                         .iter()
                         .any(|word| !wanted.contains(word))
             })
@@ -719,11 +730,20 @@ impl ImportSpec for PinnedEdition {
             Some(release) => release.answers_to(id),
             None => id.eq_ignore_ascii_case(pin),
         };
+        // The album copy of a single the person chose to take from its
+        // album names the album's release, not another edition.
+        let album_copy = |index: &usize| {
+            subject
+                .matched
+                .is_some_and(|matched| matched.album_copies.contains_key(index))
+        };
         let tagged: Vec<&str> = subject
             .landing
             .audio
             .iter()
-            .filter_map(|file| file.tag.musicbrainz_release_id.as_deref())
+            .enumerate()
+            .filter(|(index, _)| !album_copy(index))
+            .filter_map(|(_, file)| file.tag.musicbrainz_release_id.as_deref())
             .map(str::trim)
             .filter(|id| !id.is_empty())
             .collect();
@@ -765,8 +785,9 @@ impl ImportSpec for IdsAgree {
 
 /// Lidarr's `CloseAlbumMatch`: the album as a whole must be close, and
 /// its title and artist must agree with the release. A single found only
-/// as its album's track is held with its own reason, and passes only once
-/// the person chose to take it from the album.
+/// as its album's track, shown to be that album's copy, is held with its
+/// own reason, and passes once the person chose to take it from the
+/// album.
 struct CloseAlbumMatch;
 
 impl ImportSpec for CloseAlbumMatch {
@@ -793,15 +814,19 @@ impl ImportSpec for CloseAlbumMatch {
             return Verdict::accept();
         };
         // A single whose only copy is its album's track waits for the
-        // person, who can choose to take it from the album.
+        // person, who can choose to take it from the album. An album tag
+        // alone ("Singles 2020") does not show that: the next source is
+        // tried.
         if let Some(album) = album_version(subject.target, subject.landing, found) {
             if subject.target.album_version {
                 return Verdict::note(format!("the track from '{album}', taken as this song"));
             }
-            return Verdict::hold(
-                Reason::AlbumVersionOnly,
-                format!("the only copy found is the track on '{album}'"),
-            );
+            if subject.target.album_copy_proven {
+                return Verdict::hold(
+                    Reason::AlbumVersionOnly,
+                    format!("the only copy found is the track on '{album}'"),
+                );
+            }
         }
         Verdict::hold(Reason::WeakMatch, weak)
     }
@@ -814,8 +839,9 @@ impl ImportSpec for CloseAlbumMatch {
 /// does not pass) and at its length ([`wrong_track`] finds nothing; a
 /// track with no known length leaves the title as the guard), the files'
 /// artist is the release's, and their album tag names a different
-/// release. Answers that album's name.
-fn album_version(target: &Target, landing: &Landing, found: &FoundRelease) -> Option<String> {
+/// release (a placeholder such as "Unknown Album" names none). Answers
+/// that album's name.
+pub fn album_version(target: &Target, landing: &Landing, found: &FoundRelease) -> Option<String> {
     if !target.is_track {
         return None;
     }
@@ -837,7 +863,7 @@ fn album_version(target: &Target, landing: &Landing, found: &FoundRelease) -> Op
         return None;
     }
     let tag = &file.tag;
-    let album = tag.album.trim();
+    let album = album_tag(file);
     if album.is_empty()
         || string_dist(
             &strip_edition_words(album),
@@ -1293,7 +1319,8 @@ impl ImportSpec for CloseTrackMatch {
 
 /// Files the release does not account for (bonus tracks MusicBrainz
 /// lacks, scene extras) are left out; a download that is
-/// mostly such files is not this release.
+/// mostly such files is not this release, unless it is the album a
+/// single was taken from, as the person chose.
 struct FilesAccountedFor;
 
 impl ImportSpec for FilesAccountedFor {
@@ -1309,7 +1336,9 @@ impl ImportSpec for FilesAccountedFor {
         if extra == 0 {
             return Verdict::accept();
         }
-        if extra > found.scored.pairs.len() {
+        let from_album = subject.target.album_version
+            && album_version(subject.target, subject.landing, found).is_some();
+        if extra > found.scored.pairs.len() && !from_album {
             return Verdict::hold(
                 Reason::MostlyUnmatched,
                 format!("{extra} of the files match no track of the release"),
@@ -1394,23 +1423,24 @@ impl ImportSpec for NotAlreadyImported {
 // Fingerprints.
 // ---------------------------------------------------------------------------
 
-/// How far a file's length may be off its track and still vouch for it
-/// against a fingerprint that names another recording. Copies of one
-/// master differ by a second or two (pregap, encoder padding, MusicBrainz
-/// rounding to the second), while another recording of a song is rarely
-/// within 3 s of it: a `max(15 s, 10%)` window lets most same-length pop songs
-/// through whatever AcoustID heard.
-pub const SAME_MASTER_SECS: f64 = 3.0;
-
 /// For the ids our lookup returns: AcoustID
 /// confidently heard recordings, none of them the expected one, and the
-/// file's length is not within [`SAME_MASTER_SECS`] of the expected
-/// track's. A length that agrees outranks a conflicting fingerprint, and
-/// no answer never holds anything.
+/// file's measured length is not within [`SAME_MASTER_SECS`] of the
+/// expected track's. A measured length that agrees outranks a conflicting
+/// fingerprint, and no answer never holds anything. Callers pass `None`
+/// for a length the container only estimated (an MP3 with no frame
+/// count), which can be off by far more than the margin.
+///
+/// That margin is how far a file's length may be off its track and still
+/// vouch for it against a fingerprint that names another recording.
+/// Copies of one master differ by a second or two (pregap, encoder
+/// padding, MusicBrainz rounding to the second), while another recording
+/// of a song is rarely within 3 s of it: a `max(15 s, 10%)` window lets
+/// most same-length pop songs through whatever AcoustID heard.
 pub fn fingerprint_disagrees(
     heard: &[String],
     expected_recording: &str,
-    file_seconds: Option<f64>,
+    measured_seconds: Option<f64>,
     expected_seconds: Option<f64>,
 ) -> bool {
     if heard.is_empty() || expected_recording.is_empty() {
@@ -1422,7 +1452,7 @@ pub fn fingerprint_disagrees(
     {
         return false;
     }
-    let length_agrees = match (file_seconds, expected_seconds) {
+    let length_agrees = match (measured_seconds, expected_seconds) {
         (Some(file), Some(expected)) if expected > 0.0 => {
             (file - expected).abs() <= SAME_MASTER_SECS
         }

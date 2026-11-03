@@ -147,7 +147,7 @@ Pre-releases are published to the same image under their own version tag, for ex
 | Drop imports | Drag in a zip or loose files from anywhere you buy music; identified, tagged, and shelved, or held for a manual match |
 | Playlists | Mix Jellyfin, Navidrome, Plex, local, YouTube, and Spotify imports in one place, share read-only with one toggle |
 | YouTube links | Find an album or its tracks on YouTube from the album page and play them there. Paste your own links on the YouTube library page. Each search spends one unit of the daily quota set under Settings > YouTube; a saved link never searches again |
-| Library Management | Optional MusicBrainz Picard-style tags, artwork, and organization behind an admin preview with dry run and typed confirmation. Off until you enable it |
+| Library Management | Optional MusicBrainz Picard-style tags, artwork, and organization behind an admin preview with dry run and typed confirmation. A file whose tags a write could not keep whole, such as one holding a frame twice, is refused with the reason. Off until you enable it |
 
 How a request moves:
 
@@ -233,6 +233,8 @@ The second source is Usenet through SABnzbd. For searching, either add Newznab-c
 2. Under Settings > Download Client, enable Usenet and enter your SABnzbd URL and API key.
 3. Under Settings > Indexers / Prowlarr, pick one search backend: add each indexer's URL plus API key, or enter your Prowlarr URL plus API key. Then Test and Save.
 
+Indexers added one by one are asked at most about once a second each. Many cap API calls and NZB grabs per day and report how much is used; DroppedNeedle keeps to those caps, skipping an indexer that has used up its day until its allowance comes back, and waits out any slow-down an indexer asks for.
+
 slskd and Usenet can run side by side; the source priority control picks who goes first.
 
 ### Drop imports
@@ -280,6 +282,7 @@ Behind a reverse proxy, list the proxy in `TRUSTED_PROXY_IPS` and have it pass `
 | `LIBRARY_DB_PATH` | `/app/cache/library.db` | The database file; backups go in `backups/` and Undo's saved copies in `undo/` next to it. `droppedneedle-tool restore` writes a backup back under this file name |
 | `CONFIG_DIR` | `/app/config` | Holds `data_enc.key`, the key that seals stored secrets. Replaces `CONFIG_FILE_PATH`, which now stops the start: set `CONFIG_DIR` to that file's folder |
 | `DROPPEDNEEDLE_STATIC_DIR` | `/app/static` | The web UI build shipped in the image |
+| `TMPDIR` | `/tmp` | Folder for plugin stream spools, up to 2 GB at once |
 
 </details>
 
@@ -307,7 +310,7 @@ Where things live in the UI:
 | Setting | Location |
 |-|-|
 | Library paths, import naming script, scan schedule, folder watching, AcoustID key | Settings > Library |
-| Library Management profiles, previews, recovery | Library Management (admin) |
+| Library Management profiles, previews, recovery, the recycle bin folder and retention | Library Management (admin) |
 | Download clients (slskd, SABnzbd), source priority, quality tiers, picking a copy, wanted watcher | Settings > Download Client |
 | Newznab indexers or Prowlarr | Settings > Indexers / Prowlarr |
 | Edition preferences, managing unconfirmed matches | Settings > Editions |
@@ -338,6 +341,8 @@ Where things live in the UI:
 | Wrapped API | Settings > Wrapped API |
 | Outbound provider calls, rate limits and background jobs | Settings > Diagnostics |
 | Discover queue and top picks tuning | Settings > Advanced |
+| Request history, ignored albums and clean-up interval | Settings > Advanced |
+| Usenet retention days | Settings > Download Client |
 
 ---
 
@@ -446,3 +451,5 @@ If DroppedNeedle earns its keep, fuel it. Monthly or one-off, both welcome.
 </div>
 
 DroppedNeedle is [AGPL-3.0](LICENSE). Copyright (c) 2025 DroppedNeedle and contributors. For commercial licensing, write to contact@droppedneedle.com.
+
+The Docker image bundles [FFmpeg](https://ffmpeg.org) under the LGPL, built with libmp3lame and libopus, to transcode FLAC, MP3, Ogg Vorbis, Opus, AAC, ALAC and WAV. Its licence files, configure line and source are in `/usr/share/doc/ffmpeg/` inside the image.

@@ -3,8 +3,7 @@
 //! [`SqliteScanStore::refresh_album_artwork`] walks the indexed albums and
 //! records the cover each one has in `local_album_artwork`: an image in the
 //! album folder first (`cover.jpg`, `folder.png`, ...), else the first
-//! picture embedded in one of its tracks. That is the same order v2 used
-//! for local art, and the one Navidrome uses.
+//! picture embedded in one of its tracks. Navidrome uses the same order.
 //!
 //! Only the reference is stored (the folder image path, or the id of the
 //! track holding the picture) plus a hash of the image bytes. The hash is
@@ -18,6 +17,11 @@
 //! unchanged are skipped, so a scan that changed nothing costs one stat per
 //! folder. Adding or replacing a folder image changes the folder's
 //! modification time, which brings the album back in.
+//!
+//! An album with a track file that cannot be reached (its folder is away,
+//! a share is unmounted, or a read fails) is left as it is, with no new
+//! check row: only a file that was read says an album has no art. The scan
+//! is what judges a track gone, and then the album comes back without it.
 //!
 //! Manual art is never touched. Provider rows (Cover Art Archive art kept
 //! from v2) are replaced only when local art turns up.
@@ -33,6 +37,7 @@
 //! already saved, so the next sweep carries on from there.
 
 use std::collections::HashMap;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -41,15 +46,15 @@ use sha2::{Digest as _, Sha256};
 
 use super::{Lane, RunStop, ScanStoreError, SqliteScanStore};
 use crate::clock::LibraryClock as _;
+use crate::tags::TagsError;
+use droppedneedle_kernel::beneath::{RootLinks, open_file_beneath};
 use droppedneedle_providers::coverart::sniff_image_content_type;
 
-/// Folder image names, most deliberate first, matched case-insensitively
-/// (v2 `_LOCAL_COVER_STEMS`).
+/// Folder image names, most deliberate first, matched case-insensitively.
 const COVER_STEMS: [&str; 5] = ["cover", "folder", "front", "album", "artwork"];
-/// Folder image extensions (v2 `_LOCAL_COVER_EXTENSIONS`).
+/// Folder image extensions.
 const COVER_EXTENSIONS: [&str; 4] = ["jpg", "jpeg", "png", "webp"];
-/// Folder images and embedded pictures larger than this are ignored (v2
-/// `_LOCAL_COVER_MAX_BYTES`).
+/// Folder images and embedded pictures larger than this are ignored.
 const COVER_MAX_BYTES: u64 = 25 * 1024 * 1024;
 /// Longest stretch one sweep runs before handing back to the scan loop.
 pub const SWEEP_SLICE: std::time::Duration = std::time::Duration::from_secs(30);
@@ -67,6 +72,8 @@ pub struct ArtworkSweep {
     pub changed: usize,
     /// Albums whose local art disappeared.
     pub cleared: usize,
+    /// Albums left as they are because a file could not be reached or read.
+    pub unreachable: usize,
     /// False when the sweep stopped early; run it again to finish.
     pub complete: bool,
 }
@@ -76,6 +83,8 @@ pub(super) struct TrackFile {
     pub(super) id: String,
     pub(super) path: PathBuf,
     pub(super) stat_revision: String,
+    /// The size the scan read.
+    pub(super) size_bytes: i64,
 }
 
 /// The art row an album has now.
@@ -93,10 +102,18 @@ struct FoundArt {
     folder_image: Option<PathBuf>,
 }
 
+/// What looking for an album's art came to.
+struct ArtSearch {
+    found: Option<FoundArt>,
+    /// A folder or file could not be read, so the answer may be incomplete.
+    unread: bool,
+}
+
 /// One album's result, waiting to be written.
 struct Checked {
     album_id: String,
-    signature: String,
+    /// `None` when a file could not be read: the album is looked at again.
+    signature: Option<String>,
     found: Option<FoundArt>,
 }
 
@@ -140,7 +157,7 @@ impl SqliteScanStore {
         let mut pending = Vec::new();
         for (album_id, tracks) in &snapshot.albums {
             let slice_spent = started.is_some_and(|at| at.elapsed() >= SWEEP_SLICE)
-                && sweep.checked >= MIN_PER_SLICE;
+                && sweep.checked + sweep.unreachable >= MIN_PER_SLICE;
             if stop() || slice_spent {
                 sweep.complete = false;
                 break;
@@ -159,11 +176,26 @@ impl SqliteScanStore {
                 continue;
             }
             started.get_or_insert_with(std::time::Instant::now);
+            if any_file_away(tracks) {
+                sweep.unreachable += 1;
+                continue;
+            }
             sweep.checked += 1;
-            let found = find_art(tracks, &dirs);
+            let ArtSearch { found, unread } = find_art(tracks, &dirs);
+            // A failed read only stands aside for art that adds to an album
+            // with none: an unreadable cover must not cost the embedded one.
+            // The album is still looked at again, as fixing a file's
+            // permissions leaves every time the signature reads alone.
+            if unread {
+                sweep.unreachable += 1;
+                if found.is_none() || current.is_some() {
+                    continue;
+                }
+            }
             // Sign with the image actually found, so the next sweep (which
             // signs with the stored folder image) sees the same value.
-            let signature = album_signature(tracks, &dirs, found_folder(&found).as_slice());
+            let signature =
+                (!unread).then(|| album_signature(tracks, &dirs, found_folder(&found).as_slice()));
             pending.push(Checked {
                 album_id: album_id.clone(),
                 signature,
@@ -181,6 +213,12 @@ impl SqliteScanStore {
                 cleared = sweep.cleared,
                 complete = sweep.complete,
                 "album art sweep finished"
+            );
+        }
+        if sweep.unreachable > 0 {
+            tracing::warn!(
+                albums = sweep.unreachable,
+                "album art sweep cleared nothing for albums with files it could not reach"
             );
         }
         sweep
@@ -219,51 +257,30 @@ impl SqliteScanStore {
                         });
                         if !same {
                             changed += tx.execute(
-                                "INSERT INTO local_album_artwork \
-                                 (local_album_id, source, source_locator, content_hash, \
-                                  updated_at, version) \
-                                 SELECT ?1, ?2, ?3, ?4, ?5, COALESCE((SELECT art_version \
-                                     FROM local_album_artwork_checks \
-                                     WHERE local_album_id = ?1), 0) + 1 \
-                                 WHERE EXISTS (SELECT 1 FROM local_albums WHERE id = ?1) \
-                                 ON CONFLICT(local_album_id) DO UPDATE SET \
-                                 source = excluded.source, \
-                                 source_locator = excluded.source_locator, \
-                                 cover_url = NULL, \
-                                 version = CASE WHEN content_hash IS excluded.content_hash \
-                                     THEN version ELSE MAX(version + 1, excluded.version) END, \
-                                 content_hash = excluded.content_hash, \
-                                 updated_at = excluded.updated_at, \
-                                 row_revision = row_revision + 1",
+                                crate::scan::sql::WRITE_ARTWORK_ROW.text(),
                                 params![
                                     checked.album_id,
                                     found.source,
                                     found.locator,
                                     found.content_hash,
-                                    now
+                                    crate::clock::ms(now)
                                 ],
                             )?;
                         }
                     }
                     None => {
                         cleared += tx.execute(
-                            "DELETE FROM local_album_artwork \
-                             WHERE local_album_id = ?1 AND source IN ('folder', 'embedded')",
+                            crate::scan::sql::DROP_FILE_ARTWORK.text(),
                             params![checked.album_id],
                         )?;
                     }
                 }
-                tx.execute(
-                    "INSERT INTO local_album_artwork_checks \
-                     (local_album_id, signature, checked_at, art_version) \
-                     SELECT ?1, ?2, ?3, COALESCE((SELECT version FROM local_album_artwork \
-                         WHERE local_album_id = ?1), 0) \
-                     WHERE EXISTS (SELECT 1 FROM local_albums WHERE id = ?1) \
-                     ON CONFLICT(local_album_id) DO UPDATE SET \
-                     signature = excluded.signature, checked_at = excluded.checked_at, \
-                     art_version = MAX(art_version, excluded.art_version)",
-                    params![checked.album_id, checked.signature, now],
-                )?;
+                if let Some(signature) = &checked.signature {
+                    tx.execute(
+                        crate::scan::sql::WRITE_ARTWORK_CHECK.text(),
+                        params![checked.album_id, signature, crate::clock::ms(now)],
+                    )?;
+                }
             }
             Ok((changed, cleared))
         });
@@ -285,19 +302,16 @@ pub(super) fn album_tracks(
     conn: &rusqlite::Connection,
 ) -> rusqlite::Result<Vec<(String, Vec<TrackFile>)>> {
     let mut albums: Vec<(String, Vec<TrackFile>)> = Vec::new();
-    let mut tracks = conn.prepare(
-        "SELECT t.local_album_id, t.id, t.file_path, t.stat_revision \
-         FROM local_tracks t JOIN local_albums a ON a.id = t.local_album_id \
-         WHERE t.availability = 'indexed' AND a.retired_into_album_id IS NULL \
-         ORDER BY t.local_album_id, t.disc_number, t.track_number, t.id",
-    )?;
+    let mut tracks = conn.prepare(crate::scan::sql::ALBUM_TRACKS.text())?;
     let mut rows = tracks.query([])?;
     while let Some(row) = rows.next()? {
-        let album_id: String = row.get(0)?;
+        let row = crate::scan::sql::AlbumTrackFile::read(row)?;
+        let album_id = row.local_album_id;
         let track = TrackFile {
-            id: row.get(1)?,
-            path: PathBuf::from(row.get::<_, String>(2)?),
-            stat_revision: row.get(3)?,
+            id: row.id,
+            path: PathBuf::from(row.file_path),
+            stat_revision: row.stat_revision,
+            size_bytes: row.file_size_bytes,
         };
         match albums.last_mut() {
             Some((last, files)) if *last == album_id => files.push(track),
@@ -307,9 +321,22 @@ pub(super) fn album_tracks(
     Ok(albums)
 }
 
+/// True when any of an album's indexed track files cannot be reached. A
+/// missing file counts: a share that is down reads as an empty folder or
+/// no folder at all, and only the scan judges a track gone. So does an
+/// empty file where the scan read a size: a share can leave stubs behind.
+pub(super) fn any_file_away(tracks: &[TrackFile]) -> bool {
+    tracks
+        .iter()
+        .any(|track| match std::fs::symlink_metadata(&track.path) {
+            Ok(meta) => meta.len() == 0 && track.size_bytes > 0,
+            Err(_) => true,
+        })
+}
+
 /// Folders an album's tracks live in, in track order. Disc folders
 /// (`Album/CD1/...`) keep their art one level up, so when every track
-/// folder shares one parent, that parent is probed last (v2 rule).
+/// folder shares one parent, that parent is probed last.
 pub(super) fn album_dirs(tracks: &[TrackFile]) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
     for track in tracks {
@@ -374,51 +401,82 @@ fn found_folder(found: &Option<FoundArt>) -> Option<&Path> {
 }
 
 /// Folder image first, then the first embedded picture.
-fn find_art(tracks: &[TrackFile], dirs: &[PathBuf]) -> Option<FoundArt> {
-    if let Some((path, bytes)) = folder_image(dirs) {
-        return Some(FoundArt {
-            source: "folder",
-            locator: path.to_string_lossy().into_owned(),
-            content_hash: content_hash(&bytes),
-            folder_image: Some(path),
-        });
+fn find_art(tracks: &[TrackFile], dirs: &[PathBuf]) -> ArtSearch {
+    let mut unread = false;
+    if let Some((path, bytes)) = folder_image(dirs, &mut unread) {
+        return ArtSearch {
+            found: Some(FoundArt {
+                source: "folder",
+                locator: path.to_string_lossy().into_owned(),
+                content_hash: content_hash(&bytes),
+                folder_image: Some(path),
+            }),
+            unread,
+        };
     }
     for track in tracks {
-        match crate::tags::read_cover_art(&track.path) {
+        match read_track_art(&track.path) {
             Ok(Some(bytes))
                 if bytes.len() as u64 <= COVER_MAX_BYTES
                     && sniff_image_content_type(&bytes).is_some() =>
             {
-                return Some(FoundArt {
-                    source: "embedded",
-                    locator: track.id.clone(),
-                    content_hash: content_hash(&bytes),
-                    folder_image: None,
-                });
+                return ArtSearch {
+                    found: Some(FoundArt {
+                        source: "embedded",
+                        locator: track.id.clone(),
+                        content_hash: content_hash(&bytes),
+                        folder_image: None,
+                    }),
+                    unread,
+                };
             }
             Ok(_) => {}
             Err(error) => {
+                unread |= matches!(error, TagsError::Io { .. });
                 tracing::debug!(%error, path = %track.path.display(), "embedded art read failed");
             }
         }
     }
-    None
+    ArtSearch {
+        found: None,
+        unread,
+    }
+}
+
+/// The first picture in a track file, opened without following a link. A
+/// FIFO or device fails rather than hanging the sweep.
+fn read_track_art(path: &Path) -> Result<Option<Vec<u8>>, TagsError> {
+    let file = path
+        .parent()
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))
+        .and_then(|folder| open_file_beneath(folder, path, RootLinks::Follow))
+        .map_err(|source| TagsError::Io {
+            path: path.display().to_string(),
+            source,
+        })?;
+    crate::tags::read_cover_art_from(&file, path)
 }
 
 /// The first readable raster image named like a cover in the folders.
-fn folder_image(dirs: &[PathBuf]) -> Option<(PathBuf, Vec<u8>)> {
+/// `unread` is set when a folder or image could not be read.
+fn folder_image(dirs: &[PathBuf], unread: &mut bool) -> Option<(PathBuf, Vec<u8>)> {
     for dir in dirs {
         let Ok(entries) = std::fs::read_dir(dir) else {
+            *unread = true;
             continue;
         };
         let mut by_name: HashMap<String, PathBuf> = HashMap::new();
-        for entry in entries.flatten() {
+        for entry in entries {
             // Symlinks are never followed, as in the walk.
-            if entry.file_type().is_ok_and(|kind| kind.is_file()) {
-                by_name.insert(
-                    entry.file_name().to_string_lossy().to_lowercase(),
-                    entry.path(),
-                );
+            match entry.and_then(|entry| Ok((entry.file_type()?, entry))) {
+                Ok((kind, entry)) if kind.is_file() => {
+                    by_name.insert(
+                        entry.file_name().to_string_lossy().to_lowercase(),
+                        entry.path(),
+                    );
+                }
+                Ok(_) => {}
+                Err(_) => *unread = true,
             }
         }
         for stem in COVER_STEMS {
@@ -426,20 +484,35 @@ fn folder_image(dirs: &[PathBuf]) -> Option<(PathBuf, Vec<u8>)> {
                 let Some(path) = by_name.get(&format!("{stem}.{extension}")) else {
                     continue;
                 };
-                let readable = std::fs::metadata(path)
-                    .is_ok_and(|meta| meta.len() > 0 && meta.len() <= COVER_MAX_BYTES);
-                if !readable {
-                    continue;
-                }
-                if let Ok(bytes) = std::fs::read(path)
-                    && sniff_image_content_type(&bytes).is_some()
-                {
-                    return Some((path.clone(), bytes));
+                match read_listed_image(dir, path) {
+                    Ok(Some(bytes)) if sniff_image_content_type(&bytes).is_some() => {
+                        return Some((path.clone(), bytes));
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::debug!(%error, path = %path.display(), "folder art read failed");
+                        *unread = true;
+                    }
                 }
             }
         }
     }
     None
+}
+
+/// The bytes of image `path`, listed in `dir` as a regular file. The open
+/// does not follow a link, so a file swapped for one after the listing is
+/// not read. `None` when it is empty or too large, an error when it does
+/// not open or read.
+fn read_listed_image(dir: &Path, path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    let file = open_file_beneath(dir, path, RootLinks::Follow)?;
+    let size = file.metadata()?.len();
+    if size == 0 || size > COVER_MAX_BYTES {
+        return Ok(None);
+    }
+    let mut bytes = Vec::new();
+    file.take(COVER_MAX_BYTES + 1).read_to_end(&mut bytes)?;
+    Ok((bytes.len() as u64 <= COVER_MAX_BYTES).then_some(bytes))
 }
 
 /// Hex SHA-256 of image bytes: the art's identity and cache key.
@@ -462,31 +535,32 @@ fn sweep_snapshot(conn: &rusqlite::Connection) -> rusqlite::Result<Snapshot> {
         albums: album_tracks(conn)?,
         ..Snapshot::default()
     };
-    let mut current = conn.prepare(
-        "SELECT local_album_id, source, source_locator, content_hash FROM local_album_artwork",
-    )?;
+    let mut current = conn.prepare(crate::scan::sql::ALL_ARTWORK.text())?;
     let mut rows = current.query([])?;
     while let Some(row) = rows.next()? {
+        let row = crate::scan::sql::ArtworkRow::read(row)?;
         snapshot.current.insert(
-            row.get(0)?,
+            row.local_album_id,
             CurrentArt {
-                source: row.get(1)?,
-                locator: row.get(2)?,
-                content_hash: row.get(3)?,
+                source: row.source,
+                locator: row.source_locator,
+                content_hash: row.content_hash,
             },
         );
     }
-    let mut checks =
-        conn.prepare("SELECT local_album_id, signature FROM local_album_artwork_checks")?;
+    let mut checks = conn.prepare(crate::scan::sql::ALL_ARTWORK_CHECKS.text())?;
     let mut rows = checks.query([])?;
     while let Some(row) = rows.next()? {
-        snapshot.checks.insert(row.get(0)?, row.get(1)?);
+        let row = crate::scan::sql::AlbumCheck::read(row)?;
+        snapshot.checks.insert(row.local_album_id, row.signature);
     }
-    let mut checks =
-        conn.prepare("SELECT local_album_id, signature FROM local_album_lyrics_checks")?;
+    let mut checks = conn.prepare(crate::scan::sql::ALL_LYRICS_CHECKS.text())?;
     let mut rows = checks.query([])?;
     while let Some(row) = rows.next()? {
-        snapshot.lyrics_checks.insert(row.get(0)?, row.get(1)?);
+        let row = crate::scan::sql::AlbumCheck::read(row)?;
+        snapshot
+            .lyrics_checks
+            .insert(row.local_album_id, row.signature);
     }
     Ok(snapshot)
 }

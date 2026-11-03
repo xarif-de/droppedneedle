@@ -1,3 +1,4 @@
+import { v3 } from '$lib/api/v3/endpoint';
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 
 vi.mock('$lib/queries/effects', async (importOriginal) => ({
@@ -21,8 +22,10 @@ vi.mock('../QueryClient', () => ({
 }));
 
 import { api } from '$lib/api/client';
-import { removeLibraryAlbum, saveLibraryScanSchedule } from './LibraryMutations.svelte';
-import { LibraryV3Api } from './LibraryV3Api';
+import {
+	createRemoveLibraryAlbumMutation,
+	createSaveLibraryScanScheduleMutation
+} from './LibraryMutations.svelte';
 import { LibraryQueryKeyFactory } from './LibraryQueryKeyFactory';
 import { setQueryDataWithPersister } from '../QueryClient';
 import type { Effect } from '../effects';
@@ -35,30 +38,45 @@ beforeEach(() => {
 	mockDelete.mockResolvedValue({});
 });
 
+type RemoveInput = {
+	mbid: string;
+	albumId: string;
+	expectedRevision: number;
+	expectedTrackCount: number;
+	stopWanted: boolean;
+};
+
 describe('album removal mutation', () => {
 	it('clears exact membership and declares the catalog and wanted changed', async () => {
-		const result = {
-			success: true,
-			album_mbid: 'rg-1',
-			removed_mbids: ['release-1', 'rg-1'],
-			artist_removed: false,
-			artist_name: null
-		};
+		const result = { id: 'rg-1', removed_track_ids: [] };
 		mockDelete.mockResolvedValueOnce(result);
-		const mutation = removeLibraryAlbum() as unknown as {
-			mutationFn: (input: { mbid: string; stopWanted: boolean }) => Promise<typeof result>;
-			onSuccess: (
-				data: typeof result,
-				input: { mbid: string; stopWanted: boolean }
-			) => Promise<void>;
+		const mutation = createRemoveLibraryAlbumMutation() as unknown as {
+			mutationFn: (input: RemoveInput) => Promise<typeof result>;
+			onSuccess: (data: typeof result, input: RemoveInput) => Promise<void>;
 			effects: () => Effect[];
 		};
 
-		const input = { mbid: 'release-1', stopWanted: true };
+		const input = {
+			mbid: 'release-1',
+			albumId: 'local-1',
+			expectedRevision: 4,
+			expectedTrackCount: 2,
+			stopWanted: true
+		};
 		const data = await mutation.mutationFn(input);
 		await mutation.onSuccess(data, input);
 
-		expect(mockDelete).toHaveBeenCalledWith(LibraryV3Api.removeAlbum('release-1', true));
+		expect(mockDelete).toHaveBeenCalledWith(
+			v3('/api/v3/library/albums/{id}', {
+				path: { id: 'local-1' },
+				query: {
+					expected_revision: 4,
+					expected_track_count: 2,
+					delete_files: true,
+					stop_wanted: true
+				}
+			})
+		);
 		expect(mockRemoveMbid).toHaveBeenCalledWith('release-1');
 		expect(mockRemoveMbid).toHaveBeenCalledWith('rg-1');
 		expect(setQueryDataWithPersister).toHaveBeenCalledWith(
@@ -72,25 +90,22 @@ describe('album removal mutation', () => {
 	});
 
 	it('does not report cache housekeeping failures as removal failures', async () => {
-		const result = {
-			success: true,
-			album_mbid: 'rg-1',
-			removed_mbids: ['rg-1'],
-			artist_removed: false,
-			artist_name: null
-		};
+		const result = { id: 'rg-1', removed_track_ids: [] };
 		mockDelete.mockResolvedValueOnce(result);
 		vi.mocked(setQueryDataWithPersister).mockRejectedValueOnce(new Error('IndexedDB unavailable'));
 		const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
-		const mutation = removeLibraryAlbum() as unknown as {
-			mutationFn: (input: { mbid: string; stopWanted: boolean }) => Promise<typeof result>;
-			onSuccess: (
-				data: typeof result,
-				input: { mbid: string; stopWanted: boolean }
-			) => Promise<void>;
+		const mutation = createRemoveLibraryAlbumMutation() as unknown as {
+			mutationFn: (input: RemoveInput) => Promise<typeof result>;
+			onSuccess: (data: typeof result, input: RemoveInput) => Promise<void>;
 		};
 
-		const input = { mbid: 'rg-1', stopWanted: false };
+		const input = {
+			mbid: 'rg-1',
+			albumId: 'local-1',
+			expectedRevision: 4,
+			expectedTrackCount: 2,
+			stopWanted: false
+		};
 		const data = await mutation.mutationFn(input);
 
 		await expect(mutation.onSuccess(data, input)).resolves.toBeUndefined();
@@ -100,8 +115,8 @@ describe('album removal mutation', () => {
 });
 
 describe('library scan mutations', () => {
-	it('saveLibraryScanSchedule puts to the schedule endpoint', async () => {
-		const m = saveLibraryScanSchedule();
+	it('createSaveLibraryScanScheduleMutation puts to the schedule endpoint', async () => {
+		const m = createSaveLibraryScanScheduleMutation();
 		await (m as unknown as { mutationFn: (s: unknown) => Promise<unknown> }).mutationFn({
 			scan_frequency: '6hr',
 			daily_scan_time: '03:00'

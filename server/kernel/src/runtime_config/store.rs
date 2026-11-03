@@ -336,6 +336,13 @@ impl ConfigStore {
         Ok(section)
     }
 
+    /// One field of a section as stored, whether or not the section decodes.
+    #[must_use]
+    pub fn stored_field(&self, key: &str, field: &str) -> Option<serde_json::Value> {
+        self.entry(key)
+            .and_then(|entry| entry.value.get(field).cloned())
+    }
+
     /// The stored revision of one section, 0 when it has never been stored.
     #[must_use]
     pub fn revision(&self, key: &str) -> i64 {
@@ -965,6 +972,15 @@ impl ConfigStore {
             &LegacyConfig::at(dir, false),
         )
         .map_err(|error| error.to_string())
+    }
+
+    /// Store `text` as one section, undecoded, for tests of a row that does
+    /// not read.
+    pub fn replace_stored_for_test(&self, key: &str, text: &str) -> Result<(), ConfigError> {
+        let value = decode_text(text)?;
+        self.change(DurableLane::Foreground, "config.test_replace", key, |_| {
+            Ok::<_, ConfigError>(Change::Write(value, ()))
+        })
     }
 
     /// The stored text of one section, for tests that check what reaches

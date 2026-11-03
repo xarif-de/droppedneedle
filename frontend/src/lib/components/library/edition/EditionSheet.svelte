@@ -19,30 +19,30 @@
 	import QueryBoundary from '$lib/ui/QueryBoundary.svelte';
 	import SelectField from '$lib/ui/SelectField.svelte';
 	import { authStore } from '$lib/stores/authStore.svelte';
-	import { useIntegrationStatus } from '$lib/queries/HomeIntegrationStatusQuery.svelte';
-	import type { LibraryAlbumSummary } from '$lib/types';
+	import { useIntegrationStatus } from '$lib/queries/home.svelte';
+	import type { AlbumView } from '$lib/types';
 	import { getLibraryAlbumDetailQuery } from '$lib/queries/library/LibraryQueries.svelte';
 	import { getReleaseEditionSearchQuery } from '$lib/queries/library/LibraryEditionQueries.svelte';
 	import {
-		acquireEdition,
-		chooseAlbumEdition,
-		confirmAlbumEdition,
+		createAcquireEditionMutation,
+		createChooseAlbumEditionMutation,
+		createConfirmAlbumEditionMutation,
 		getAlbumEditionStatusQuery,
 		getAlbumEditionsQuery,
 		getEditionPlanQuery,
 		getEditionTracksQuery,
-		handBackAlbumEdition,
-		leaveAlbumUnmanaged,
-		matchEditionFile,
-		removeEditionExtras,
-		sealCustomEdition,
-		undoAlbumEdition,
-		unmatchEditionFile,
+		createHandBackAlbumEditionMutation,
+		createLeaveAlbumUnmanagedMutation,
+		createMatchEditionFileMutation,
+		createRemoveEditionExtrasMutation,
+		createSealCustomEditionMutation,
+		createUndoAlbumEditionMutation,
+		createUnmatchEditionFileMutation,
 		type EditionChoice
 	} from '$lib/queries/albums/EditionQueries.svelte';
 	import {
 		getAlbumRemovalsQuery,
-		putBackRemoval
+		createPutBackRemovalMutation
 	} from '$lib/queries/library/RemovalQueries.svelte';
 	import EditionList, { type EditionGroup, type EditionRow } from './EditionList.svelte';
 	import EditionListSkeleton from './EditionListSkeleton.svelte';
@@ -73,7 +73,7 @@
 	interface Props {
 		open: boolean;
 		/** The album's library copies; the first is the one the page shows. */
-		copies: LibraryAlbumSummary[];
+		copies: AlbumView[];
 		/** The release group the page shows, empty on a local album's page. */
 		groupMbid: string;
 		/** `movedTo` is the release group a choice moved the album to, if it did. */
@@ -192,22 +192,22 @@
 		() => open && canEdit && Boolean(searchArgs)
 	);
 
-	const choose = chooseAlbumEdition();
-	const confirm = confirmAlbumEdition();
-	const handBack = handBackAlbumEdition();
-	const undo = undoAlbumEdition();
-	const removeExtras = removeEditionExtras();
-	const putBackFiles = putBackRemoval();
+	const choose = createChooseAlbumEditionMutation();
+	const confirm = createConfirmAlbumEditionMutation();
+	const handBack = createHandBackAlbumEditionMutation();
+	const undo = createUndoAlbumEditionMutation();
+	const removeExtras = createRemoveEditionExtrasMutation();
+	const putBackFiles = createPutBackRemovalMutation();
 	// The newest removal of extras from this copy that can be put back.
 	const removalsQuery = getAlbumRemovalsQuery(() => (open && canEdit ? copyId : ''));
 	const lastRemoval = $derived(
 		(removalsQuery.data ?? []).find((removal) => removal.kind === 'extras' && !removal.held) ?? null
 	);
-	const acquire = acquireEdition();
-	const sealCustom = sealCustomEdition();
-	const leaveUnmanaged = leaveAlbumUnmanaged();
-	const matchFile = matchEditionFile();
-	const unmatchFile = unmatchEditionFile();
+	const acquire = createAcquireEditionMutation();
+	const sealCustom = createSealCustomEditionMutation();
+	const leaveUnmanaged = createLeaveAlbumUnmanagedMutation();
+	const matchFile = createMatchEditionFileMutation();
+	const unmatchFile = createUnmatchEditionFileMutation();
 
 	// A new copy starts over on its own edition.
 	$effect(() => {

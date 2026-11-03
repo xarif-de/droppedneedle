@@ -22,14 +22,14 @@ use axum::http::{HeaderMap, Request, StatusCode};
 use droppedneedle::docs::ApiDoc;
 use droppedneedle::{AppState, create_app};
 use droppedneedle_auth::compat_auth::jellyfin::{authenticate_by_name, resolve_token};
-use droppedneedle_auth::compat_auth::prod::ProdCompatPasswords;
+use droppedneedle_auth::compat_auth::prod::CompatPasswords;
 use droppedneedle_auth::compat_auth::subsonic::{
     SubsonicDenied, SubsonicParams, WRONG_CREDENTIALS, authenticate, md5_hex,
 };
 use droppedneedle_auth::passwords::Passwords;
 use droppedneedle_auth::prod::ProdAuth;
 use droppedneedle_auth::users::UsersDeps;
-use droppedneedle_auth::wiring::{AuthSetup, Upstreams};
+use droppedneedle_auth::wiring::AuthSetup;
 use droppedneedle_kernel::config::AppConfig;
 use droppedneedle_kernel::config::DEFAULT_PORT;
 use droppedneedle_kernel::db::{DbConfig, DbRuntime, open_runtime};
@@ -60,8 +60,8 @@ pub(crate) struct E2e {
     platform: Platform,
     bundle: ProdAuth,
     pub(crate) store: Arc<ConfigStore>,
-    upstreams: Upstreams,
     lastfm: String,
+    plex_tv: String,
     crypto: Arc<Crypto>,
     db_path: std::path::PathBuf,
     _scratch: crate::common::ScratchDir,
@@ -76,6 +76,7 @@ impl E2e {
     pub(crate) async fn open_with(tag: &str, tune: impl FnOnce(DbConfig) -> DbConfig) -> Self {
         let scratch = crate::common::ScratchDir::new(&format!("auth-e2e-{tag}"));
         let dir = scratch.to_path_buf();
+        crate::common::migrated_db(&dir.join("app.db"));
         let runtime = open_runtime(&tune(DbConfig::new(&dir.join("app.db"))))
             .await
             .expect("scratch runtime opens");
@@ -101,13 +102,10 @@ impl E2e {
             bundle: ProdAuth::new(&platform),
             store,
             // Nothing listens on the discard port: no test reaches the real
-            // plex.tv, Last.fm or breach check unless it points these at
-            // its own mock.
-            upstreams: Upstreams {
-                plex_tv: "http://127.0.0.1:9".to_owned(),
-                pwned_passwords: "http://127.0.0.1:9/range/".to_owned(),
-            },
+            // plex.tv or Last.fm unless it points these at its own mock;
+            // the breach check stays on the closed address.
             lastfm: "http://127.0.0.1:9/".to_owned(),
+            plex_tv: "http://127.0.0.1:9/plex".to_owned(),
             crypto: Arc::clone(&platform.crypto),
             platform,
             db_path: dir.join("app.db"),
@@ -115,9 +113,9 @@ impl E2e {
         }
     }
 
-    /// Point the plex.tv and breach-check clients at local mocks.
-    pub(crate) fn with_upstreams(mut self, upstreams: Upstreams) -> Self {
-        self.upstreams = upstreams;
+    /// Point the plex.tv client at a local mock.
+    pub(crate) fn with_plex_tv(mut self, plex_tv: String) -> Self {
+        self.plex_tv = plex_tv;
         self
     }
 
@@ -125,6 +123,11 @@ impl E2e {
     pub(crate) fn with_lastfm(mut self, lastfm: String) -> Self {
         self.lastfm = lastfm;
         self
+    }
+
+    /// The auth stores over the scratch database.
+    pub(crate) fn bundle(&self) -> &ProdAuth {
+        &self.bundle
     }
 
     /// The scratch database pool, for assertions on stored rows.
@@ -148,14 +151,14 @@ impl E2e {
             Arc::new(droppedneedle_providers::ReqwestWire::new(&p.http)),
             droppedneedle_providers::ProviderEndpoints {
                 lastfm: self.lastfm.clone(),
+                plex_tv: self.plex_tv.clone(),
                 ..droppedneedle_providers::ProviderEndpoints::closed()
             },
         );
         AuthSetup::build(
             p,
             self.bundle.clone(),
-            &self.upstreams,
-            &providers.lastfm,
+            &providers,
             Arc::new(
                 droppedneedle_media::remotes::plex::ConfiguredPlexServer::new(
                     p.http.shared().clone(),
@@ -175,6 +178,19 @@ impl E2e {
         create_app(self.state())
     }
 
+    /// [`E2e::router`] with its rate buckets emptied before each request, for
+    /// a journey of many sign-in steps from one client on one app.
+    pub(crate) fn router_with_fresh_buckets(&self) -> Router {
+        let state = self.state();
+        let limits = Arc::clone(&state.auth.limits);
+        create_app(state).layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                limits.reset();
+                next.run(request)
+            },
+        ))
+    }
+
     /// A fresh application state over the same database, for tests that
     /// also reach a bundle (the event hub) behind the router.
     pub(crate) fn state(&self) -> AppState {
@@ -188,17 +204,17 @@ impl E2e {
             &library,
             &collections.stores,
         );
-        let reads = crate::common::bundles::reads_at(
+        let catalog_setup = crate::common::bundles::catalog_setup_at(
             p,
             auth.users.clone(),
-            droppedneedle_catalog::reads::ReadsInputs {
+            droppedneedle_catalog::wiring::CatalogInputs {
                 // Unpaced: no provider answers here, so
                 // pacing would only add whole seconds of waiting to rows
                 // that are bound to answer "provider down" anyway.
                 providers: Arc::new(Providers::unpaced(Arc::new(
                     droppedneedle_providers::executor::ScriptedWire::new(),
                 ))),
-                ..crate::common::reads_inputs(p)
+                ..crate::common::catalog_inputs(p)
             },
             &library,
             collections.wired(),
@@ -212,12 +228,12 @@ impl E2e {
             auth.users.clone(),
             library.core.root_source(),
             Arc::new(
-                droppedneedle_catalog::reads::collections::remote_import::PlaylistImportSink::new(
-                    reads.collections.clone(),
+                droppedneedle_catalog::collections::remote_import::PlaylistImportSink::new(
+                    catalog_setup.collections.clone(),
                 ),
             ),
             crate::common::bundles::idle_host(p, library.core.clone()),
-            droppedneedle_media::MediaSetup::remotes(p, crate::common::closed_outbound().plex_tv),
+            droppedneedle_media::MediaSetup::remotes(p, providers.plextv.clone()),
             None,
             &providers,
             Arc::new(droppedneedle_acquire::requests::mix::MixGrantHooks::new(
@@ -235,7 +251,7 @@ impl E2e {
                 media.playback.clone(),
                 media.stream.engine.clone(),
                 library.scans.clone(),
-                &reads,
+                &catalog_setup,
             ),
         );
         let backup_dir = p.config.root_app_dir.join("backups");
@@ -293,7 +309,7 @@ impl E2e {
             Arc::clone(&p.ids),
             p.config.clone(),
             auth,
-            reads,
+            catalog_setup,
             media,
             acquire,
             droppedneedle_library::wiring::LibraryServices::build(&library),
@@ -337,7 +353,7 @@ pub(crate) async fn call(
 }
 
 /// One request, answered as it came: a busy answer is not asked again.
-async fn call_once(
+pub(crate) async fn call_once(
     app: Router,
     method: &str,
     uri: &str,
@@ -793,7 +809,7 @@ async fn the_secure_cookie_outranks_the_plain_one_and_sign_out_ends_both() {
             .iter()
             .any(|value| value.starts_with(&format!("{SECURE_COOKIE}=; "))
                 && value.contains("Max-Age=0")
-                && value.ends_with("; Secure")),
+                && value.contains("; Secure; ")),
         "{cleared:?}"
     );
     assert_eq!(me(format!("{PLAIN_COOKIE}={a}")).await, None);
@@ -961,7 +977,7 @@ async fn journey_c_app_password_compat_accepts_native_rejects() {
     let admin_token = admin_token.as_str().expect("admin token").to_owned();
     let admin_auth = bearer(admin_token.as_str());
     let admin_headers = [("authorization", admin_auth.as_str())];
-    let compat = ProdCompatPasswords::new(e2e.users(), Arc::clone(&e2e.crypto));
+    let compat = CompatPasswords::new(e2e.users(), Arc::clone(&e2e.crypto));
 
     // Create one app password; the secret shows exactly once.
     let (status, body, _) = call(
@@ -1960,6 +1976,62 @@ async fn rate_limits_key_by_client_and_username() {
         StatusCode::UNAUTHORIZED,
         "another client can still try the same username"
     );
+}
+
+/// The v1 callbacks kept for migrated apps are limited like their v3 twins:
+/// each reaches a write, and the OIDC one shares the sign-in class.
+#[tokio::test]
+async fn the_legacy_callbacks_meet_the_limiter() {
+    let e2e = E2e::open("legacy-burst").await;
+    let app = held_clock_router(&e2e);
+    let mut limited = 0;
+    for _ in 0..30 {
+        let (status, _, _) = call_raw(
+            app.clone(),
+            "GET",
+            "/api/v1/auth/oidc/callback?code=c&state=s",
+            &[],
+        )
+        .await;
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            limited += 1;
+        }
+    }
+    assert_eq!(limited, 25, "the v1 OIDC callback");
+    let (status, _, _) = call(
+        app.clone(),
+        "POST",
+        "/api/v3/auth/oidc/authorize",
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "one bucket");
+    for uri in [
+        "/api/v1/me/connections/spotify/auth/callback",
+        "/api/v1/library/contributions/musicbrainz/callback",
+    ] {
+        let (_, headers, _) = call_raw(app.clone(), "GET", uri, &[]).await;
+        assert_eq!(headers["x-ratelimit-limit"], "60", "{uri}");
+    }
+}
+
+/// One unauthenticated client bursting at a sign-in route is limited on its
+/// own class before it can spend the provider row every client shares.
+#[tokio::test]
+async fn a_burst_at_the_sign_in_routes_stops_at_the_clients_own_class() {
+    let e2e = E2e::open("sign-in-burst").await;
+    let app = held_clock_router(&e2e);
+    for uri in ["/api/v3/auth/oidc/authorize", "/api/v3/auth/plex/start"] {
+        let mut limited = 0;
+        for _ in 0..30 {
+            let (status, _, _) = call(app.clone(), "POST", uri, &[], None).await;
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                limited += 1;
+            }
+        }
+        assert_eq!(limited, 25, "{uri}");
+    }
 }
 
 #[tokio::test]

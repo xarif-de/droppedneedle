@@ -1,13 +1,15 @@
+import { v3 } from '$lib/api/v3/endpoint';
 import { api } from '$lib/api/client';
+import { ApiError } from '$lib/api/errors';
 import { authStore } from '$lib/stores/authStore.svelte';
 import { toastStore } from '$lib/stores/toast';
 import type { RequestKind } from './types';
 
-import { REQUESTS_ENDPOINTS } from './endpoints';
 import {
 	albumStatusChanged,
 	anyDownloadChanged,
 	anyRequestChanged,
+	applyEffects,
 	createAppMutation,
 	type Effect,
 	pendingApprovalsChanged
@@ -46,10 +48,21 @@ function sameUser(contextUserId: string | undefined): boolean {
 	return !!contextUserId && authStore.user?.id === contextUserId;
 }
 
+// A 404 means the request is gone from the caller's list: refresh it so the
+// stale row goes too.
+function refreshIfGone(err: unknown): void {
+	if (err instanceof ApiError && err.status === 404) void applyEffects(anyRequestChanged());
+}
+
 export const createCancelRequestMutation = () =>
 	createAppMutation(() => ({
 		mutationFn: (vars: RequestActionVars) =>
-			api.v3.DELETE(REQUESTS_ENDPOINTS.cancel(vars.mbid, vars.kind)),
+			api.v3.DELETE(
+				v3('/api/v3/requests/active/{musicbrainz_id}', {
+					path: { musicbrainz_id: vars.mbid },
+					query: { kind: vars.kind }
+				})
+			),
 		onMutate: () => ({ userId: authStore.user?.id }),
 		// Track rows carry no album context in v3, so only album rows refresh
 		// a library key.
@@ -61,17 +74,24 @@ export const createCancelRequestMutation = () =>
 			if (!sameUser(context.userId)) return;
 			toastStore.show({ message: data.message || 'Request cancelled', type: 'info' });
 		},
-		onError: (err) =>
+		onError: (err) => {
+			refreshIfGone(err);
 			toastStore.show({
 				message: errorMessage(err, 'Could not cancel that request'),
 				type: 'error'
-			})
+			});
+		}
 	}));
 
 export const createRetryRequestMutation = () =>
 	createAppMutation(() => ({
 		mutationFn: (vars: RequestActionVars) =>
-			api.v3.POST(REQUESTS_ENDPOINTS.retry(vars.mbid, vars.kind)),
+			api.v3.POST(
+				v3('/api/v3/requests/retry/{musicbrainz_id}', {
+					path: { musicbrainz_id: vars.mbid },
+					query: { kind: vars.kind }
+				})
+			),
 		onMutate: () => ({ userId: authStore.user?.id }),
 		effects: (_data, vars, context) =>
 			sameUser(context.userId)
@@ -81,15 +101,25 @@ export const createRetryRequestMutation = () =>
 			if (!sameUser(context.userId)) return;
 			toastStore.show({ message: data.message || 'Request retried', type: 'success' });
 		},
-		onError: (err) =>
-			toastStore.show({ message: errorMessage(err, 'Could not retry that request'), type: 'error' })
+		onError: (err) => {
+			refreshIfGone(err);
+			toastStore.show({
+				message: errorMessage(err, 'Could not retry that request'),
+				type: 'error'
+			});
+		}
 	}));
 
 // A single found only on its album: fetch it again and take the album's
 // track as the song.
 export const createFromAlbumMutation = () =>
 	createAppMutation(() => ({
-		mutationFn: (recordingMbid: string) => api.v3.POST(REQUESTS_ENDPOINTS.fromAlbum(recordingMbid)),
+		mutationFn: (recordingMbid: string) =>
+			api.v3.POST(
+				v3('/api/v3/requests/tracks/{musicbrainz_id}/from-album', {
+					path: { musicbrainz_id: recordingMbid }
+				})
+			),
 		onMutate: () => ({ userId: authStore.user?.id }),
 		effects: (_data, _mbid, context) => (sameUser(context.userId) ? requestSurface([], false) : []),
 		onSuccess: (data, _vars, context) => {
@@ -106,7 +136,12 @@ export const createFromAlbumMutation = () =>
 export const createApproveRequestMutation = () =>
 	createAppMutation(() => ({
 		mutationFn: (vars: RequestActionVars) =>
-			api.v3.POST(REQUESTS_ENDPOINTS.approve(vars.mbid, vars.kind)),
+			api.v3.POST(
+				v3('/api/v3/requests/approvals/{musicbrainz_id}/approve', {
+					path: { musicbrainz_id: vars.mbid },
+					query: { kind: vars.kind }
+				})
+			),
 		onMutate: () => ({ userId: authStore.user?.id }),
 		effects: (_data, vars, context) =>
 			sameUser(context.userId)
@@ -126,7 +161,12 @@ export const createApproveRequestMutation = () =>
 export const createRejectRequestMutation = () =>
 	createAppMutation(() => ({
 		mutationFn: (vars: RequestActionVars) =>
-			api.v3.POST(REQUESTS_ENDPOINTS.reject(vars.mbid, vars.kind)),
+			api.v3.POST(
+				v3('/api/v3/requests/approvals/{musicbrainz_id}/reject', {
+					path: { musicbrainz_id: vars.mbid },
+					query: { kind: vars.kind }
+				})
+			),
 		onMutate: () => ({ userId: authStore.user?.id }),
 		effects: (_data, vars, context) =>
 			sameUser(context.userId)
@@ -146,7 +186,7 @@ export const createRejectRequestMutation = () =>
 export const createBatchCancelRequestsMutation = () =>
 	createAppMutation(() => ({
 		mutationFn: (vars: BatchCancelVars) =>
-			api.v3.POST(REQUESTS_ENDPOINTS.batchCancel(), {
+			api.v3.POST(v3('/api/v3/requests/batches/cancel'), {
 				musicbrainz_ids: vars.mbids,
 				kind: vars.kind
 			}),
@@ -174,7 +214,12 @@ export const createBatchCancelRequestsMutation = () =>
 export const createClearHistoryMutation = () =>
 	createAppMutation(() => ({
 		mutationFn: (vars: RequestActionVars) =>
-			api.v3.DELETE(REQUESTS_ENDPOINTS.clearHistory(vars.mbid, vars.kind)),
+			api.v3.DELETE(
+				v3('/api/v3/requests/history/{musicbrainz_id}', {
+					path: { musicbrainz_id: vars.mbid },
+					query: { kind: vars.kind }
+				})
+			),
 		onMutate: () => ({ userId: authStore.user?.id }),
 		effects: (_data, _vars, context) => (sameUser(context.userId) ? requestSurface([], false) : []),
 		onSuccess: (_data, _vars, context) => {

@@ -8,12 +8,12 @@
 		getTargetLibrarySettingsQuery
 	} from '$lib/queries/library/LibraryPolicyQueries.svelte';
 	import {
-		previewLibraryPolicyApply,
-		previewLibraryPolicyImpact,
-		restoreLibraryRoots,
-		saveTargetLibrarySettings
+		createPreviewLibraryPolicyApplyMutation,
+		createPreviewLibraryPolicyImpactMutation,
+		createRestoreLibraryRootsMutation,
+		createSaveTargetLibrarySettingsMutation
 	} from '$lib/queries/library/LibraryPolicyMutations.svelte';
-	import { requestLibraryRun } from '$lib/queries/library/LibraryOperationMutations.svelte';
+	import { createRequestLibraryRunMutation } from '$lib/queries/library/LibraryOperationMutations.svelte';
 	import {
 		createSaveLibraryWatcherSettingsMutation,
 		getLibraryWatcherSettingsQuery
@@ -21,7 +21,7 @@
 	import { getLibraryStatsQuery } from '$lib/queries/library/LibraryQueries.svelte';
 	import {
 		getDownloadPolicyQuery,
-		saveDownloadPolicy
+		createSaveDownloadPolicyMutation
 	} from '$lib/queries/downloads/DownloadClientsQueries.svelte';
 	import LibraryRootPolicyEditor from '$lib/components/library/LibraryRootPolicyEditor.svelte';
 	import LibraryNamingExample from '$lib/components/library/LibraryNamingExample.svelte';
@@ -48,13 +48,13 @@
 
 	const settingsQuery = getTargetLibrarySettingsQuery(() => authStore.isAdmin);
 	const restorableQuery = getLibraryRestorableRootsQuery(() => authStore.isAdmin);
-	const impact = previewLibraryPolicyImpact();
-	const save = saveTargetLibrarySettings();
-	const restore = restoreLibraryRoots();
-	const applyPreview = previewLibraryPolicyApply();
-	const requestRun = requestLibraryRun();
+	const impact = createPreviewLibraryPolicyImpactMutation();
+	const save = createSaveTargetLibrarySettingsMutation();
+	const restore = createRestoreLibraryRootsMutation();
+	const applyPreview = createPreviewLibraryPolicyApplyMutation();
+	const requestRun = createRequestLibraryRunMutation();
 	const policyQuery = getDownloadPolicyQuery(() => authStore.isAdmin);
-	const savePolicy = saveDownloadPolicy();
+	const savePolicy = createSaveDownloadPolicyMutation();
 	const statsQuery = getLibraryStatsQuery();
 	// Only the switch is shown; the poll and batch intervals keep their values.
 	const watcher = createSettingsSection(
@@ -382,6 +382,7 @@
 								help="Where downloads and dropped files are filed. Same script language as Library Management."
 								mono
 								bind:value={draft.naming_script}
+								error={section.fieldError('naming_script', 'Import naming script')}
 							/>
 							<LibraryNamingExample example={currentSettings?.naming_example ?? null} />
 						</section>
@@ -394,6 +395,7 @@
 							placeholder="Enter AcoustID API key"
 							help="Identifies untagged music by its audio and checks downloads."
 							bind:value={draft.acoustid_api_key}
+							error={section.fieldError('acoustid_api_key', 'AcoustID API key')}
 						/>
 
 						<div class="space-y-2 border-t border-base-content/10 pt-5">
@@ -436,6 +438,7 @@
 								bind:value={
 									() => draft.max_library_size_gb ?? 0, (next) => (draft.max_library_size_gb = next)
 								}
+								error={cap.fieldError('max_library_size_gb', 'Maximum library size')}
 							/>
 						</div>
 						<SaveBar {...cap.bar} saveLabel="Save cap" />

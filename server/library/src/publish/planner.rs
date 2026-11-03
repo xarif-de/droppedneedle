@@ -12,6 +12,7 @@
 //! requires an enabled root, an enabled trigger, an accepted exact
 //! MusicBrainz release, and a full track mapping.
 
+use crate::identity::ReleaseIdentity;
 use std::collections::{BTreeMap, HashSet};
 
 use super::PublishError;
@@ -26,27 +27,6 @@ pub struct FileFingerprint {
     pub size: u64,
     /// SHA-256 of the file bytes at plan time.
     pub sha256: String,
-}
-
-/// Accepted exact-edition identity for one file.
-///
-/// The release-track MBID is distinct from the recording MBID and is
-/// never inferred from it.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct ReleaseIdentity {
-    /// Accepted MusicBrainz release MBID.
-    pub release_mbid: String,
-    /// Release-group MBID the release belongs to.
-    pub release_group_mbid: String,
-    /// Recording MBID for this track.
-    pub recording_mbid: String,
-    /// Release-track MBID for this track on the accepted release.
-    pub release_track_mbid: String,
-    /// Accepted album identity revision, pinned separately from the
-    /// per-track mapping revision.
-    pub album_identity_revision: u64,
-    /// Per-track mapping revision.
-    pub mapping_revision: u64,
 }
 
 /// One independently toggleable management capability.
@@ -139,7 +119,8 @@ pub struct PlanItem {
     pub replaces: Option<Replacement>,
     /// Files this item writes that come from no source file: a cover
     /// image or a lyrics file. Their bytes wait in the blob store; each
-    /// one only ever lands on an empty path.
+    /// one lands on an empty path, or on the one file it names in
+    /// [`GeneratedOutput::replaces`].
     #[serde(default)]
     pub outputs: Vec<GeneratedOutput>,
     /// Files an earlier run generated that undo takes away: each is set
@@ -162,6 +143,13 @@ pub struct GeneratedOutput {
     pub sha256: String,
     pub size: u64,
     pub kind: OutputKind,
+    /// The file at the destination this one replaces (a cover that came
+    /// with imported files, which the archive's cover replaces): set aside
+    /// under the journal, recycled after the commit, put back if the
+    /// publish unwinds. No track goes with it. The bin entry is chosen at
+    /// apply; a plan that still names none is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaces: Option<Replacement>,
 }
 
 /// What a generated file is.
@@ -232,6 +220,19 @@ pub struct Adoption {
     /// edition.
     #[serde(default)]
     pub track: Option<JoinedTrack>,
+    /// What the placement read of the joined copy's folder. The commit
+    /// refuses the bundle when the copy has moved since; a resumed commit
+    /// has none and finishes.
+    #[serde(skip)]
+    pub copy_seal: Option<CopySeal>,
+}
+
+/// The joined copy's folder as a placement read it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopySeal {
+    pub disc: u32,
+    /// The library folder and the folder in it.
+    pub folder: Option<(String, String)>,
 }
 
 /// The album files fetched for a library copy join. The commit follows
@@ -287,6 +288,7 @@ impl Adoption {
             ingest_source,
             join: journaled.and_then(|adopt| adopt.join.clone()).or(join),
             track: journaled.and_then(|adopt| adopt.track.clone()).or(track),
+            copy_seal: None,
         }
     }
 
@@ -377,8 +379,8 @@ pub struct PutBackItem {
     /// copied or deleted, and the commit only lists its track again.
     #[serde(default)]
     pub home_already: bool,
-    /// The copy is on the disk of home's folder and can be linked home,
-    /// so it needs no free space there.
+    /// The copy is on the disk of home's folder and holds the removed
+    /// bytes, so it is linked home and needs no free space there.
     #[serde(default)]
     pub linkable: bool,
     /// The removal's journal row for this file, marked once its copy has
@@ -637,20 +639,21 @@ fn own_rows<'a>(
     let ids = serde_json::to_string(&track_ids.collect::<Vec<_>>())?;
     let mut stmt = conn.prepare_cached(super::sql::OWN_ROWS.text())?;
     let rows = stmt.query_map([ids], |row| {
+        let row = super::sql::OwnRowRead::read(row)?;
         Ok((
-            row.get::<_, String>(0)?,
+            row.id,
             OwnRow {
-                root_id: row.get(1)?,
-                relative_path: row.get(2)?,
-                availability: row.get(3)?,
-                stat_revision: row.get(4)?,
-                album_id: row.get(5)?,
-                album_revision: row.get(6)?,
-                album_release_group_mbid: row.get(7)?,
-                album_release_mbid: row.get(8)?,
-                mapping_revision: row.get(9)?,
-                recording_mbid: row.get(10)?,
-                release_track_mbid: row.get(11)?,
+                root_id: row.root_id,
+                relative_path: row.relative_path,
+                availability: row.availability,
+                stat_revision: row.stat_revision,
+                album_id: row.local_album_id,
+                album_revision: row.album_revision,
+                album_release_group_mbid: row.release_group_mbid,
+                album_release_mbid: row.release_mbid,
+                mapping_revision: row.mapping_revision,
+                recording_mbid: row.recording_mbid,
+                release_track_mbid: row.release_track_mbid,
             },
         ))
     })?;
@@ -887,7 +890,7 @@ impl CollisionGate {
                     output.kind.as_str(),
                     &output.dest_root,
                     &output.dest_rel,
-                    SamePathSelf::absent(),
+                    SamePathSelf::replacing(output.replaces.as_ref()),
                 )?;
             }
         }
@@ -1079,6 +1082,15 @@ impl SamePathSelf {
             sha256: None,
             move_source: None,
             replaces_sha256: None,
+        }
+    }
+
+    /// A generated file's view: its destination is free, or holds the one
+    /// file it replaces, still with the bytes the plan saw.
+    fn replacing(replaced: Option<&Replacement>) -> Self {
+        Self {
+            replaces_sha256: replaced.map(|replaced| replaced.sha256.clone()),
+            ..Self::absent()
         }
     }
 

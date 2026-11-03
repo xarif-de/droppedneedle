@@ -1486,8 +1486,6 @@ impl Run<'_> {
         plan: Option<&PlanBundle>,
     ) -> Result<(), PublishError> {
         let sandbox = self.sandbox;
-        let now = std::time::UNIX_EPOCH
-            + std::time::Duration::from_millis(u64::try_from(self.now_ms).unwrap_or(0));
         match journal.kind {
             JournalKind::Delete => {
                 let aside = Path::new(&journal.staged);
@@ -1506,10 +1504,11 @@ impl Run<'_> {
                     replaced,
                     Path::new(&journal.staged),
                     self.bin_seams,
-                    now,
+                    self.clock,
                     removal_stat(plan, journal),
                 )?;
-                if !moved {
+                // A put-back from the hidden name took the file home.
+                if !moved && !super::put_back::taken_back(self.db, &journal.bundle_id) {
                     tracing::warn!(journal_id = %journal.id, "the file to recycle is gone; nothing was moved");
                 }
                 // The folders the removal emptied go with it, once the
@@ -1548,7 +1547,7 @@ impl Run<'_> {
                 replaced,
                 Path::new(backup_text),
                 self.bin_seams,
-                now,
+                self.clock,
                 self.known.vouch(Path::new(backup_text), &replaced.sha256),
             )?;
             if !moved {

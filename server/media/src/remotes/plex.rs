@@ -15,12 +15,12 @@
 //!   expands to a comma-separated `2020..=2029` list.
 //! - Playlist art prefers the playlist's own `composite` path and falls
 //!   back to `/playlists/{id}/composite` when empty.
-//! - Plex.tv account calls (OAuth pins) belong to the login flow and live
-//!   outside this adapter. The one exception is the per-server
-//!   `accessToken` lookup for links saved without one ([`PlexTokenProbe`]),
-//!   per the Plex API 1.2.2 resource contract verified 2026-07-17: an
-//!   account token authorizes `plex.tv/api/v2/resources`, and each server
-//!   resource's `accessToken` is used for requests to that server.
+//! - Plex.tv account calls belong to the providers crate's plex.tv client,
+//!   not this adapter. [`PlexTokenProbe`] reads `/resources` through it for
+//!   links saved without a server token, per the Plex API 1.2.2 resource
+//!   contract verified 2026-07-17: an account token authorizes
+//!   `plex.tv/api/v2/resources`, and each server resource's `accessToken`
+//!   is used for requests to that server.
 //!
 //! Payloads decode into the typed shapes in [`super::plex_models`]; a row
 //! a view needs without its `ratingKey` is an upstream error.
@@ -28,9 +28,8 @@
 use std::collections::HashSet;
 use std::sync::RwLock;
 
-use super::adapter::{
-    AdapterError, AlbumBrowse, ArtistBrowse, RemoteHttp, RemotePage, TrackBrowse, request_id,
-};
+use super::source::{AdapterError, AlbumBrowse, ArtistBrowse, RemotePage, TrackBrowse};
+
 use super::connections::{
     ConnectionResolver, PlexServerTokens, ResolvedConnection, ServerSettings,
 };
@@ -40,13 +39,15 @@ use super::models::{
     SearchResults, SessionView, SessionsView, SourceName, StatsView, TrackView,
 };
 use super::plex_models::{Container, Envelope, Metadata};
+use super::transport::{RemoteHttp, request_id};
 use super::warmup::{INDEX_MAX_PAGES, INDEX_PAGE, IndexedAlbum, indexed};
 use droppedneedle_auth::federated::FederatedError;
 use droppedneedle_auth::federated::plex::PlexServerIdentity;
 use droppedneedle_auth::federated::settings::InstallIds;
 use droppedneedle_kernel::runtime_config::Live;
 use droppedneedle_kernel::runtime_config::secret_sections::PlexConnection;
-use droppedneedle_providers::plextv::Resource;
+use droppedneedle_providers::plextv::{self, PlexTvClient};
+use droppedneedle_providers::{ProviderError, RequestPriority};
 
 /// Query pairs, owned.
 type Params = Vec<(String, String)>;
@@ -59,8 +60,7 @@ fn params(pairs: &[(&str, &str)]) -> Params {
 }
 
 /// Plex browse client. Section ids pin the music libraries; when empty the
-/// adapter resolves every `artist`-typed section instead of answering empty
-/// (v2 answered empty; a pinned id behaves exactly like v2).
+/// adapter resolves every `artist`-typed section.
 pub struct PlexAdapter {
     http: RemoteHttp,
     base_url: RwLock<String>,
@@ -158,46 +158,13 @@ impl PlexAdapter {
     }
 
     /// The server's machine id (`/identity`); `None` when the server does
-    /// not name one or answers with an error (v2 `get_machine_identifier`).
+    /// not name one or answers with an error.
     pub async fn machine_identifier(&self) -> Result<Option<String>, AdapterError> {
         match self.request("/identity", &[]).await {
             Ok(container) => Ok(non_empty(container.machine_identifier.as_deref())),
             Err(AdapterError::Api(_)) => Ok(None),
             Err(error) => Err(error),
         }
-    }
-
-    /// The account's token for the server `machine_id`, from plex.tv
-    /// `/resources` under this adapter's token (an account token here).
-    /// `None` when the account has no server device with that id.
-    pub async fn server_access_token(
-        &self,
-        plex_tv: &str,
-        machine_id: &str,
-    ) -> Result<Option<String>, AdapterError> {
-        let request = self
-            .http
-            .client()
-            .get(RemoteHttp::url(
-                plex_tv.trim_end_matches('/'),
-                "/resources",
-            )?)
-            .query(&[("includeHttps", "1"), ("includeRelay", "1")])
-            .headers(self.headers());
-        // Lenient per device: client devices without a token still list.
-        let devices: Vec<serde_json::Value> =
-            self.http.send("/resources", request).await?.json().await?;
-        Ok(devices
-            .into_iter()
-            .filter_map(|device| serde_json::from_value::<Resource>(device).ok())
-            .find(|device| {
-                device.client_identifier.as_deref() == Some(machine_id)
-                    && device
-                        .provides
-                        .as_deref()
-                        .is_some_and(|provides| provides.contains("server"))
-            })
-            .and_then(|device| non_empty(device.access_token.as_deref())))
     }
 
     /// Music library sections (`type == "artist"`).
@@ -647,9 +614,8 @@ impl PlexAdapter {
     }
 
     /// Discovery shelves via `/hubs/sections/{section}?count=`, album-type
-    /// hubs only (v2 `get_discovery_hubs` semantics: first configured
-    /// section, `Metadata` rows as albums). Empty shelves when nothing
-    /// resolves or the hubs call is declined.
+    /// hubs only: the first configured section, `Metadata` rows as albums.
+    /// Empty shelves when nothing resolves or the hubs call is declined.
     pub async fn discovery(&self, count: i64) -> Result<DiscoveryView, AdapterError> {
         self.require_configured()?;
         let empty = || DiscoveryView {
@@ -804,8 +770,8 @@ impl PlexAdapter {
         .await
     }
 
-    /// The direct audio request for one part key (v2 `proxy_get_stream`
-    /// target). A leading slash is added, and a key that is not a plain
+    /// The direct audio request for one part key.
+    /// A leading slash is added, and a key that is not a plain
     /// path under `/library/parts/` is rejected without any request. The
     /// caller sends it, by range when it seeks.
     pub fn audio_request(&self, part_key: &str) -> Result<reqwest::Request, AdapterError> {
@@ -820,34 +786,48 @@ impl PlexAdapter {
             .get(url)
             .headers(self.headers())
             .build()
-            .map_err(super::adapter::transport)
+            .map_err(super::transport::transport)
     }
 
-    /// Playback-state report via `/:/timeline` (v2 `now_playing`): `state`
-    /// is `playing`, `paused`, or `stopped`.
-    pub async fn timeline(&self, rating_key: &str, state: &str) -> Result<(), AdapterError> {
+    /// Playback-state report via `/:/timeline`: `state` is `playing`,
+    /// `paused` or `stopped`, at `time_ms` into a track `duration_ms` long.
+    /// The parameters follow python-plexapi's `updateTimeline`; no real
+    /// Plex server was probed and the answer's shape is unrecorded, so it
+    /// is read for its status only.
+    pub async fn timeline(
+        &self,
+        rating_key: &str,
+        state: &str,
+        time_ms: i64,
+        duration_ms: Option<i64>,
+    ) -> Result<(), AdapterError> {
         self.require_configured()?;
+        let rating_key = request_id(rating_key)?;
         let key = format!("/library/metadata/{rating_key}");
-        self.request(
-            "/:/timeline",
-            &params(&[("ratingKey", rating_key), ("state", state), ("key", &key)]),
-        )
-        .await?;
-        Ok(())
-    }
-
-    /// Scrobble via `/:/scrobble` (v2 `scrobble`).
-    pub async fn scrobble(&self, rating_key: &str) -> Result<(), AdapterError> {
-        self.require_configured()?;
-        self.request(
-            "/:/scrobble",
-            &params(&[
-                ("key", rating_key),
-                ("identifier", "com.plexapp.plugins.library"),
-            ]),
-        )
-        .await?;
-        Ok(())
+        let time = time_ms.to_string();
+        let mut pairs = vec![
+            ("ratingKey", rating_key),
+            ("key", key.as_str()),
+            ("state", state),
+            ("time", time.as_str()),
+            ("identifier", "com.plexapp.plugins.library"),
+        ];
+        let duration = duration_ms.map(|duration| duration.to_string());
+        if let Some(duration) = &duration {
+            pairs.push(("duration", duration.as_str()));
+        }
+        let endpoint = "/:/timeline";
+        let request = self
+            .http
+            .client()
+            .get(self.url(endpoint)?)
+            .query(&params(&pairs))
+            .headers(self.headers());
+        self.http
+            .send(endpoint, request)
+            .await?
+            .acknowledged()
+            .await
     }
 
     /// Playlist composite bytes: the playlist's own `composite` path when
@@ -1368,7 +1348,7 @@ fn playlist_summary(playlist: &Metadata) -> Result<PlaylistSummary, AdapterError
     })
 }
 
-/// UI sort names to Plex `field:direction`, ported from the v2 route map.
+/// UI sort names to Plex `field:direction`.
 fn plex_sort(sort_by: &str, descending: bool) -> String {
     let field = match sort_by {
         "name" | "" => "titleSort",
@@ -1471,13 +1451,25 @@ fn non_empty(value: Option<&str>) -> Option<String> {
 #[derive(Debug, Clone)]
 pub struct PlexTokenProbe {
     http: reqwest::Client,
-    plex_tv: String,
+    plextv: PlexTvClient,
 }
 
 impl PlexTokenProbe {
-    /// A probe against the given plex.tv root.
-    pub fn with_plex_tv(http: reqwest::Client, plex_tv: String) -> Self {
-        Self { http, plex_tv }
+    /// A probe that asks the server over `http` and plex.tv through
+    /// `plextv`.
+    pub fn new(http: reqwest::Client, plextv: PlexTvClient) -> Self {
+        Self { http, plextv }
+    }
+}
+
+/// What a plex.tv failure means for the lookup: a refused account token is
+/// a stale link, everything else a failed lookup.
+fn lookup_failed(error: ProviderError) -> AdapterError {
+    match error {
+        ProviderError::Unauthorized { .. } | ProviderError::Forbidden { .. } => AdapterError::Auth,
+        ProviderError::NotFound { .. } => AdapterError::NotFound,
+        ProviderError::Transport { kind, .. } => AdapterError::Transport(kind.to_string()),
+        other => AdapterError::Api(other.to_string()),
     }
 }
 
@@ -1486,7 +1478,8 @@ impl PlexServerTokens for PlexTokenProbe {
         &'a self,
         server: &'a ServerSettings,
         auth_token: &'a str,
-    ) -> super::adapter::BoxFuture<'a, Result<Option<String>, AdapterError>> {
+        priority: RequestPriority,
+    ) -> super::source::BoxFuture<'a, Result<Option<String>, AdapterError>> {
         Box::pin(async move {
             let handle = ConnectionResolver::unsaved_client(
                 &self.http,
@@ -1503,7 +1496,12 @@ impl PlexServerTokens for PlexTokenProbe {
             let Some(machine_id) = probe.machine_identifier().await? else {
                 return Ok(None);
             };
-            probe.server_access_token(&self.plex_tv, &machine_id).await
+            let devices = self
+                .plextv
+                .resources(auth_token, &server.client_id, priority)
+                .await
+                .map_err(lookup_failed)?;
+            Ok(plextv::server_access_token(&devices, &machine_id))
         })
     }
 }
@@ -1530,7 +1528,7 @@ impl ConfiguredPlexServer {
 }
 
 impl PlexServerIdentity for ConfiguredPlexServer {
-    fn machine_id(&self) -> super::adapter::BoxFuture<'_, Result<Option<String>, FederatedError>> {
+    fn machine_id(&self) -> super::source::BoxFuture<'_, Result<Option<String>, FederatedError>> {
         Box::pin(async move {
             let unreadable = || {
                 FederatedError::ProviderUnavailable(
@@ -1581,8 +1579,8 @@ const MAX_PLEX_PATH_BYTES: usize = 512;
 /// segments of ASCII letters, digits, `.`, `-` and `_`, none of them
 /// empty, `.` or `..`. A part key is `/library/parts/{id}/{time}/file.{ext}`
 /// and a playlist cover is `/playlists/{id}/composite/{time}`, both
-/// numeric apart from the words (the shapes v2 handled and the in-repo
-/// Plex mock serves; not probed against a live server here). Neither has
+/// numeric apart from the words (the shapes the in-repo Plex mock serves;
+/// not probed against a live server here). Neither has
 /// a `%`, so none is allowed: the address parser reads `%2e%2e` as `..`
 /// and would walk the request up to another Plex path. A query, a
 /// fragment and a backslash are refused the same way.

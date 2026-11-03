@@ -2,9 +2,9 @@
 
 use super::RequestsService;
 use crate::requests::error::RequestsError;
-use crate::requests::ledger::ApprovalState;
+use crate::requests::ledger::{ApprovalState, MixApproval};
 use crate::requests::models::{
-    PersonalMixApprovalItem, PersonalMixApprovalsResponse, RefreshResponse,
+    MixRefreshStatus, PersonalMixApprovalItem, PersonalMixApprovalsResponse, RefreshResponse,
 };
 use droppedneedle_auth::{Admin, Principal};
 
@@ -36,20 +36,23 @@ impl RequestsService {
         &self,
         _admin: &Admin,
     ) -> Result<PersonalMixApprovalsResponse, RequestsError> {
+        let item = |row: MixApproval| PersonalMixApprovalItem {
+            user_id: row.user_id,
+            user_name: row.user_name,
+            requested_at: row.requested_at,
+        };
         let items = self
             .mixes
             .pending()
             .await?
             .into_iter()
-            .map(|row| PersonalMixApprovalItem {
-                user_id: row.user_id,
-                user_name: row.user_name,
-                requested_at: row.requested_at,
-            })
+            .map(item)
             .collect::<Vec<_>>();
+        let granted = self.mixes.approved().await?.into_iter().map(item).collect();
         Ok(PersonalMixApprovalsResponse {
             count: items.len() as u32,
             items,
+            granted,
         })
     }
 
@@ -138,12 +141,12 @@ impl RequestsService {
         }
         if !self.mixes.refresh_start(principal.user_id())? {
             return Ok(RefreshResponse {
-                status: "already_running".to_owned(),
+                status: MixRefreshStatus::AlreadyRunning,
             });
         }
         mixer.spawn_refresh(principal.user_id().to_owned());
         Ok(RefreshResponse {
-            status: "started".to_owned(),
+            status: MixRefreshStatus::Started,
         })
     }
 }

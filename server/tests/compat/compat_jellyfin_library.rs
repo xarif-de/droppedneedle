@@ -830,7 +830,9 @@ async fn a_failed_read_is_a_server_error_not_an_empty_answer() {
     let playlists: i64 = rig
         .app
         .db()
-        .query_row("SELECT COUNT(*) FROM playlists", [], |row| row.get(0))
+        .query_row("SELECT COUNT(*) FROM catalog_playlists", [], |row| {
+            row.get(0)
+        })
         .expect("playlists count");
     assert_eq!(playlists, 0);
     rig.stop().await;
@@ -1538,8 +1540,8 @@ async fn playlists_create_add_move_remove() {
     let detail = json(&rig, &format!("/jellyfin/Playlists/{pid2}"), &auth).await;
     assert_eq!(detail["Name"], "Playlist");
 
-    // Another user's public playlist is listed beside the caller's own;
-    // their private one is not.
+    // Other users' playlists stay off the caller's list; the two-user
+    // journey covers the switch that adds the public ones.
     let bob = rig.app.login_user("bob").await;
     let bob = [("authorization", bob.authorization.as_str())];
     for (name, public) in [("Bob Public", true), ("Bob Private", false)] {
@@ -1573,7 +1575,7 @@ async fn playlists_create_add_move_remove() {
         .filter_map(|item| item["Name"].as_str())
         .collect();
     listed.sort_unstable();
-    assert_eq!(listed, ["Bob Public", "Playlist", "Road"]);
+    assert_eq!(listed, ["Playlist", "Road"]);
 
     // A playlist id on a track route is a bare 404, never a native envelope.
     let reply = get(&rig, &format!("/jellyfin/Audio/{pid}/stream"), Some(&auth)).await;
@@ -1787,7 +1789,9 @@ fn walk() -> Vec<(&'static str, String, Access, &'static str)> {
 
 /// Who may call a route is the table's access column and nothing else:
 /// with no token, every signed-in route answers an empty 401 and no public
-/// one does. With the API off, every route is the empty 404.
+/// one does, and a method a route does not serve is a 405. With the API
+/// off, every route is the empty 404, a wrong method included, with no
+/// `Allow` to tell a real route from a missing one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_route_is_public_or_signed_in_by_the_table() {
     let mut public: Vec<(&str, &str)> = ROUTES
@@ -1823,6 +1827,13 @@ async fn every_route_is_public_or_signed_in_by_the_table() {
         assert_eq!(reply.status, StatusCode::OK, "{path}");
         assert_eq!(reply.json(), json!([]), "{path}");
     }
+    for (unserved, path) in unserved_methods() {
+        let from = walker_address();
+        let headers = vec![("x-forwarded-for", from.as_str())];
+        let reply = raw(&rig, unserved, &path, headers, None, None).await;
+        let what = format!("{unserved} {path}");
+        assert_eq!(reply.status, StatusCode::METHOD_NOT_ALLOWED, "{what}");
+    }
 
     set_jellyfin(&rig, false).await;
     for (verb, path, _, _) in walk() {
@@ -1838,6 +1849,7 @@ async fn every_route_is_public_or_signed_in_by_the_table() {
         let what = format!("{unserved} {path} with the API off");
         assert_eq!(reply.bare(), (404, 0), "{what}");
         assert_eq!(reply.header("access-control-allow-origin"), "*", "{what}");
+        assert_eq!(reply.header("allow"), "", "{what}");
     }
     rig.stop().await;
 }
@@ -1871,8 +1883,8 @@ async fn failed_sign_ins_lock_out_and_public_routes_do_not() {
     let rig = CompatApp::start("jf-sign-in-lockout").await;
     let login = "/jellyfin/Users/AuthenticateByName";
     let guesser = vec![("x-forwarded-for", "10.78.0.1")];
-    for _ in 0..5 {
-        let body = json!({"Username": PLAYER, "Pw": "nope"});
+    for guess in 0..5 {
+        let body = json!({"Username": PLAYER, "Pw": format!("guess-{guess}")});
         let reply = raw(&rig, "POST", login, guesser.clone(), None, Some(body)).await;
         assert_eq!(reply.bare(), (401, 0));
     }
@@ -1893,6 +1905,33 @@ async fn failed_sign_ins_lock_out_and_public_routes_do_not() {
         .await;
         assert_eq!(reply.status, StatusCode::OK);
     }
+    rig.stop().await;
+}
+
+/// A device repeating one wrong password or token is refused every time but
+/// counted once a minute, so it does not lock out its address: another app
+/// behind it then signs in. The sign-ins stay under the public bucket's
+/// burst of 20.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_repeated_wrong_credential_does_not_lock_out_its_address() {
+    let rig = CompatApp::start("jf-repeat-lockout").await;
+    let household = vec![("x-forwarded-for", "10.78.2.1")];
+    let login = "/jellyfin/Users/AuthenticateByName";
+    for _ in 0..19 {
+        let body = json!({"Username": PLAYER, "Pw": "mistyped"});
+        let reply = raw(&rig, "POST", login, household.clone(), None, Some(body)).await;
+        assert_eq!(reply.bare(), (401, 0));
+    }
+    let stale = finamp("a-deleted-users-token");
+    for _ in 0..50 {
+        let me = "/jellyfin/Users/Me";
+        let reply = raw(&rig, "GET", me, household.clone(), Some(&stale), None).await;
+        assert_eq!(reply.bare(), (401, 0));
+    }
+
+    let body = json!({"Username": PLAYER, "Pw": rig.secret});
+    let signed_in = raw(&rig, "POST", login, household, None, Some(body)).await;
+    assert_eq!(signed_in.status, StatusCode::OK);
     rig.stop().await;
 }
 
@@ -1958,6 +1997,66 @@ async fn a_revoked_app_password_does_not_lock_out_its_address() {
     )
     .await;
     assert_eq!(me.status, StatusCode::OK);
+    rig.stop().await;
+}
+
+/// A track id the upgrade carried from v2 is the id: after a restart the
+/// listing answers it, since Finamp matches answers by the id it asked for,
+/// and it streams with ranges and its auth. Before the row lands it is a 404.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_track_id_carried_from_v2_streams_and_is_handed_out() {
+    const CARRIED: &str = "c0ffeec0ffeec0ffeec0ffeec0ffee00";
+    let mut rig = CompatApp::start("jf-carried-id").await;
+    let auth = finamp(&rig.secret);
+    let one = track_id(&rig, &auth, "One").await;
+    let stream = format!("/jellyfin/Audio/{CARRIED}/stream");
+    assert_eq!(get(&rig, &stream, Some(&auth)).await.status, 404);
+
+    let track: String = rig
+        .app
+        .db()
+        .query_row(
+            "SELECT internal_id FROM compat_jellyfin_ids WHERE jellyfin_id = ?1",
+            [&one],
+            |row| row.get(0),
+        )
+        .expect("the track's id is stored");
+    rig.app
+        .seed_with(
+            "DELETE FROM compat_jellyfin_ids WHERE jellyfin_id = ?1",
+            [&one],
+        )
+        .await;
+    rig.app
+        .seed_with(
+            "INSERT INTO compat_jellyfin_ids (jellyfin_id, kind, internal_id, current) \
+             VALUES (?1, 'track', ?2, 1)",
+            [CARRIED, track.as_str()],
+        )
+        .await;
+    rig.app = rig.app.restart().await;
+    rig.jellyfin_ids_caught_up().await;
+
+    assert_eq!(track_id(&rig, &auth, "One").await, CARRIED);
+    let file = rig.file("one");
+    assert_eq!(
+        refused(&rig, "GET", &stream, None, None).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+    let whole = get(&rig, &stream, Some(&auth)).await;
+    assert_eq!(whole.status, StatusCode::OK);
+    assert!(whole.body == file, "stream serves another file");
+    let part = raw(
+        &rig,
+        "GET",
+        &stream,
+        vec![("range", "bytes=0-9")],
+        Some(&auth),
+        None,
+    )
+    .await;
+    assert_eq!(part.status, StatusCode::PARTIAL_CONTENT);
+    assert!(part.body == file[..10], "the range serves another part");
     rig.stop().await;
 }
 

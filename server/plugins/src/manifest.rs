@@ -293,7 +293,13 @@ impl PluginManifest {
                         .unwrap_or(60);
                     format!("Runs on its own every {minutes} minutes")
                 }
-                Capability::LibraryWriter => "Can add new files to your music library (never replaces one), up to 100 MiB a day".to_owned(),
+                Capability::LibraryWriter => {
+                    use super::capabilities::library_files::{QUOTA_BYTES_PER_DAY, QUOTA_FILES_PER_DAY};
+                    format!(
+                        "Can add new files to your music library (never replaces one), up to {} MiB and {QUOTA_FILES_PER_DAY} files a day",
+                        QUOTA_BYTES_PER_DAY / (1024 * 1024)
+                    )
+                }
                 Capability::StreamingSource => "Can serve audio for tracks missing from your library, from a file or a web address".to_owned(),
             };
             lines.push(line);
@@ -568,7 +574,9 @@ fn validate_manifest(dir_name: &str, raw: RawManifest) -> Result<PluginManifest,
     }
 
     let homepage = plugin.homepage.trim().to_owned();
-    if !homepage.is_empty() && droppedneedle_auth::federated::web_address(&homepage).is_none() {
+    if !homepage.is_empty()
+        && droppedneedle_providers::web_address::web_address(&homepage).is_none()
+    {
         return Err(fail(format!(
             "{name}: homepage must be an http or https address"
         )));
@@ -780,8 +788,7 @@ fn validate_ui(name: &str, table: RawUi) -> Result<(String, Vec<String>, String)
     if !entry.is_empty() {
         let normalized = entry.replace('\\', "/");
         if normalized.starts_with('/')
-            || normalized.starts_with("http://")
-            || normalized.starts_with("https://")
+            || droppedneedle_providers::web_address::web_address(&normalized).is_some()
             || normalized.split('/').any(|part| part == "..")
         {
             return Err(ManifestError(format!(

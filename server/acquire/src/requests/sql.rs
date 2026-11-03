@@ -41,6 +41,22 @@ droppedneedle_kernel::sql! {
          WHERE state = 'watching' AND release_group_mbid_lower IN ( \
            SELECT musicbrainz_id_lower FROM request_history \
            WHERE download_task_id = ?1 AND request_kind = 'album' AND status = 'cancelled')";
+    /// The release date the stopped wanted watch of album `?1` holds; no
+    /// row when the album has no stopped watch.
+    pub(crate) STOPPED_WATCH_DATE = "SELECT first_release_date FROM wanted_watches \
+         WHERE release_group_mbid_lower = ?1 AND state = 'stopped'";
+    /// Arm the stopped wanted watch of album `?1` (lowercased) again for
+    /// owner `?4` (the old one when NULL), armed at `?2`, due at `?3`, with
+    /// fresh counters.
+    pub(crate) REARM_STOPPED_WATCH = "UPDATE wanted_watches SET state = 'watching', \
+         user_id = COALESCE(?4, user_id), created_at = ?2, check_count = 0, quiet_streak = 0, \
+         last_checked_at = NULL, next_check_at = ?3, last_outcome = NULL, \
+         new_candidate_count = 0 \
+         WHERE release_group_mbid_lower = ?1 AND state = 'stopped'";
+    /// Make album row `?1` user `?2`'s own ask when it is their followed
+    /// artist's release: they asked for it by hand.
+    pub(crate) OWN_FOLLOW_ROW = "UPDATE request_history SET origin = 'user' \
+         WHERE musicbrainz_id_lower = ?1 AND user_id = ?2 AND origin = 'follow'";
     /// Stop the wanted watch of album `?1` (lowercased).
     pub(crate) STOP_ROW_WATCH = "UPDATE wanted_watches SET state = 'stopped' \
          WHERE release_group_mbid_lower = ?1 AND state = 'watching'";
@@ -188,9 +204,17 @@ droppedneedle_kernel::sql! {
     pub(crate) REQUEUE_WAITING = "UPDATE request_history SET status = 'queued', \
          generation = generation + 1 WHERE musicbrainz_id_lower = ?1 \
          AND status = 'pending' AND download_task_id IS NULL AND generation = ?2";
-    /// Rows waiting for quota room, oldest first.
+    /// Rows waiting to start, oldest first: waiting for quota room, or
+    /// put back by a busy database.
     pub(crate) WAITING_FOR_QUOTA = RECORD_SELECT
         + " WHERE rh.status = 'queued' AND rh.download_task_id IS NULL \
+         ORDER BY rh.requested_at ASC, rh.musicbrainz_id_lower";
+    /// Authorized pending rows with no task, asked or approved before `?1`,
+    /// oldest first.
+    pub(crate) STALLED_STARTS = RECORD_SELECT
+        + " WHERE rh.status = 'pending' AND rh.download_task_id IS NULL \
+           AND rh.dispatch_authorized = 1 \
+           AND MAX(COALESCE(rh.reviewed_at, 0), rh.requested_at) < ?1 \
          ORDER BY rh.requested_at ASC, rh.musicbrainz_id_lower";
     /// One account's role.
     pub(crate) ROLE_OF = "SELECT role FROM auth_users WHERE id = ?1";
@@ -255,6 +279,12 @@ droppedneedle_kernel::sql! {
     pub(crate) ROWS_IN_STATUS_OF_KIND = RECORD_SELECT
         + " WHERE rh.status = ?1 AND rh.request_kind = ?2 \
          ORDER BY rh.requested_at ASC, rh.musicbrainz_id_lower";
+    /// Album rows in status `?1` a person has not removed the watch of since
+    /// their last write, oldest first.
+    pub(crate) ROWS_TO_WATCH = RECORD_SELECT
+        + " WHERE rh.status = ?1 AND rh.request_kind = 'album' \
+           AND rh.watch_removed_generation IS NOT rh.generation \
+         ORDER BY rh.requested_at ASC, rh.musicbrainz_id_lower";
     /// Terminal rows settled before `?1` that no live watch points at.
     pub(crate) PRUNE_TERMINAL = "DELETE FROM request_history \
          WHERE status IN ('imported', 'incomplete', 'failed', 'cancelled', 'rejected') \
@@ -288,6 +318,23 @@ droppedneedle_kernel::sql! {
     pub(crate) PRUNE_WATCHES = "DELETE FROM wanted_watches \
          WHERE state IN ('stopped', 'fulfilled') \
          AND COALESCE(last_checked_at, created_at) < ?1";
+    /// Remember on album row `?1` that its watch was removed.
+    pub(crate) NOTE_WATCH_REMOVED = "UPDATE request_history \
+         SET watch_removed_generation = generation \
+         WHERE musicbrainz_id_lower = ?1 AND request_kind = 'album'";
+    /// Delete watch `?1`; its seen candidates cascade.
+    pub(crate) DELETE_WATCH = "DELETE FROM wanted_watches WHERE release_group_mbid_lower = ?1";
+    /// Remember the removal on the album rows of the stopped and fulfilled
+    /// watches of user `?2`, or everyone's when `?1`.
+    pub(crate) NOTE_FINISHED_WATCHES_REMOVED = "UPDATE request_history \
+         SET watch_removed_generation = generation \
+         WHERE request_kind = 'album' AND musicbrainz_id_lower IN ( \
+           SELECT release_group_mbid_lower FROM wanted_watches \
+           WHERE state IN ('stopped', 'fulfilled') AND (?1 OR user_id = ?2))";
+    /// Delete the stopped and fulfilled watches of user `?2`, or everyone's
+    /// when `?1`; their seen candidates cascade.
+    pub(crate) DELETE_FINISHED_WATCHES = "DELETE FROM wanted_watches \
+         WHERE state IN ('stopped', 'fulfilled') AND (?1 OR user_id = ?2)";
     /// Enrol a new watch; an existing one is left alone.
     pub(crate) ENROL_WATCH = "INSERT INTO wanted_watches (release_group_mbid_lower, \
          release_group_mbid, user_id, artist_name, album_title, artist_mbid, year, cover_url, \
@@ -353,14 +400,26 @@ droppedneedle_kernel::sql! {
     /// One user's approval state.
     pub(crate) MIX_APPROVAL_STATE = "SELECT state FROM personal_mix_approvals \
          WHERE user_id = ?1";
-    /// Pending approvals, oldest first.
+    /// Pending approvals of plain users, oldest first: an admin's or a
+    /// trusted user's grant never waits for review.
     pub(crate) PENDING_MIX_APPROVALS = "SELECT m.user_id, u.display_name, m.state, \
          m.requested_at FROM personal_mix_approvals m LEFT JOIN auth_users u ON u.id = m.user_id \
-         WHERE m.state = 'pending' ORDER BY m.requested_at ASC, m.user_id";
-    /// Move user `?1`'s approval from `?6` to `?2`.
+         WHERE m.state = 'pending' AND COALESCE(u.role, 'user') NOT IN ('admin', 'trusted') \
+         ORDER BY m.requested_at ASC, m.user_id";
+    /// Granted approvals of plain users, oldest first.
+    pub(crate) APPROVED_MIX_APPROVALS = "SELECT m.user_id, u.display_name, m.state, \
+         m.requested_at FROM personal_mix_approvals m LEFT JOIN auth_users u ON u.id = m.user_id \
+         WHERE m.state = 'approved' AND COALESCE(u.role, 'user') NOT IN ('admin', 'trusted') \
+         ORDER BY m.requested_at ASC, m.user_id";
+    /// Move plain user `?1`'s approval from `?6` to `?2`.
     pub(crate) MIX_APPROVAL_TRANSITION = "UPDATE personal_mix_approvals SET state = ?2, \
          reviewed_by_id = ?3, reviewed_by_name = ?4, reviewed_at = ?5 \
-         WHERE user_id = ?1 AND state = ?6";
+         WHERE user_id = ?1 AND state = ?6 AND NOT EXISTS (SELECT 1 FROM auth_users u \
+           WHERE u.id = ?1 AND u.role IN ('admin', 'trusted'))";
+    /// Drop the pending approvals of admins and trusted users.
+    pub(crate) CLEAR_CURATOR_MIX_PENDING = "DELETE FROM personal_mix_approvals \
+         WHERE state = 'pending' AND user_id IN (SELECT id FROM auth_users \
+           WHERE role IN ('admin', 'trusted'))";
 
     // What requests read from the library and the accounts.
 
@@ -382,17 +441,15 @@ droppedneedle_kernel::sql! {
     /// Users with a live ListenBrainz link.
     pub(crate) LISTENBRAINZ_USERS = "SELECT user_id FROM user_connections \
          WHERE service = 'listenbrainz' AND enabled = 1 ORDER BY user_id";
-    /// The library copy of group `?1` a fetch with no plan is for: album
-    /// `?2` followed to the album it was merged into, else the group's copy
-    /// with an edition, a person's first, then the oldest.
+    /// The copy of group `?1` a fetch for album `?2` is for: that album,
+    /// followed to the album it was merged into, with the release it names.
     pub(crate) PLANNED_COPY = "SELECT e.local_album_id, e.release_mbid \
          FROM local_album_external_identities e \
          JOIN local_albums b ON b.id = e.local_album_id \
          WHERE b.retired_into_album_id IS NULL AND e.provider = 'musicbrainz' \
            AND lower(e.release_group_mbid) = ?1 AND trim(e.release_mbid) <> '' \
-           AND (?2 IS NULL OR e.local_album_id = (SELECT COALESCE(retired_into_album_id, id) \
-             FROM local_albums WHERE id = ?2)) \
-         ORDER BY e.decision_source <> 'manual', b.created_at LIMIT 1";
+           AND e.local_album_id = (SELECT COALESCE(retired_into_album_id, id) \
+             FROM local_albums WHERE id = ?2)";
     /// Whether the app leaves album `?1`'s files as they are.
     pub(crate) COPY_IS_HELD = "SELECT EXISTS(SELECT 1 FROM library_management_exclusions \
          WHERE local_album_id = ?1) \
@@ -437,21 +494,21 @@ droppedneedle_kernel::sql! {
              AND user_id IS NOT NULL AND user_id != ?2) \
          OR EXISTS (SELECT 1 FROM request_history_requesters \
              WHERE musicbrainz_id_lower = ?1 AND user_id != ?2) \
-         OR EXISTS (SELECT 1 FROM library_user_favorites f WHERE f.user_id != ?2 AND ( \
+         OR EXISTS (SELECT 1 FROM catalog_user_favorites f WHERE f.user_id != ?2 AND ( \
              (f.item_kind = 'album' AND f.item_id IN (SELECT e.local_album_id \
                  FROM local_album_external_identities e \
                  WHERE lower(e.release_group_mbid) = ?1)) \
              OR (f.item_kind = 'track' AND f.item_id IN (SELECT t.id FROM local_tracks t \
                  JOIN local_album_external_identities e ON e.local_album_id = t.local_album_id \
                  WHERE lower(e.release_group_mbid) = ?1)))) \
-         OR EXISTS (SELECT 1 FROM library_user_ratings r WHERE r.user_id != ?2 AND ( \
+         OR EXISTS (SELECT 1 FROM catalog_user_ratings r WHERE r.user_id != ?2 AND ( \
              (r.item_kind = 'album' AND r.item_id IN (SELECT e.local_album_id \
                  FROM local_album_external_identities e \
                  WHERE lower(e.release_group_mbid) = ?1)) \
              OR (r.item_kind = 'track' AND r.item_id IN (SELECT t.id FROM local_tracks t \
                  JOIN local_album_external_identities e ON e.local_album_id = t.local_album_id \
                  WHERE lower(e.release_group_mbid) = ?1)))) \
-         OR EXISTS (SELECT 1 FROM library_user_play_marks k WHERE k.user_id != ?2 \
+         OR EXISTS (SELECT 1 FROM catalog_user_play_marks k WHERE k.user_id != ?2 \
              AND k.local_track_id IN (SELECT t.id FROM local_tracks t \
                  JOIN local_album_external_identities e ON e.local_album_id = t.local_album_id \
                  WHERE lower(e.release_group_mbid) = ?1)) \

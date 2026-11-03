@@ -3,8 +3,8 @@
 
 	import {
 		getProwlarrConfigQuery,
-		saveProwlarrConfigMutation,
-		testProwlarrMutation
+		createSaveProwlarrConfigMutation,
+		createTestProwlarrMutation
 	} from '$lib/queries/downloads/ProwlarrQueries.svelte';
 	import Card from '$lib/ui/Card.svelte';
 	import QueryBoundary from '$lib/ui/QueryBoundary.svelte';
@@ -14,14 +14,18 @@
 	import { SECRET_MASK } from '$lib/ui/secretMask';
 	import { createSettingsSection } from '$lib/ui/settingsSection.svelte';
 
-	const test = testProwlarrMutation();
+	const test = createTestProwlarrMutation();
 
-	const section = createSettingsSection(getProwlarrConfigQuery(), saveProwlarrConfigMutation(), {
-		test: async (draft) => {
-			const result = await test.mutateAsync(draft);
-			return { passed: result.valid, message: result.message };
+	const section = createSettingsSection(
+		getProwlarrConfigQuery(),
+		createSaveProwlarrConfigMutation(),
+		{
+			test: async (draft) => {
+				const result = await test.mutateAsync(draft);
+				return { passed: result.valid, message: result.message };
+			}
 		}
-	});
+	);
 </script>
 
 <section class="space-y-4">
@@ -56,6 +60,7 @@
 						placeholder="http://localhost:9696"
 						help="Your Prowlarr address. A plain http:// LAN URL is fine."
 						bind:value={draft.url}
+						error={section.fieldError('url', 'URL')}
 					/>
 
 					<SecretField
@@ -63,6 +68,7 @@
 						mask={SECRET_MASK}
 						placeholder="Prowlarr → Settings → General → Security → API Key"
 						bind:value={draft.api_key}
+						error={section.fieldError('api_key', 'API key')}
 					/>
 
 					<SaveBar {...section.bar} disabled={!draft.url.trim()} />

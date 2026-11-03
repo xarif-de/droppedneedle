@@ -6,26 +6,31 @@
 //! and whose own write is done; a row whose track a put-back holds waits.
 //! Each copy is checked outside the publish lock: it must be the
 //! `<bin>/<entry>/<name>` its row names, under a bin set now, with no link
-//! at or below the bin's folder, a regular file holding the bytes that
-//! were recycled. Then, under the lock, taken a chunk of rows at a time so
-//! other writes get their turn, each one is checked again (its file
-//! unchanged since it was hashed) and deleted with its emptied entry
+//! at or below the bin's folder, a regular file that is still exactly the
+//! copy that landed (its recorded identity, change time included) or holds
+//! the bytes the removal read. Then, under the lock, taken a chunk of rows
+//! at a time so other writes get their turn, each one is checked again
+//! (its file unchanged since it was looked at) and deleted with its emptied entry
 //! folder, and its row is marked. A copy whose bytes changed, in a bin no
 //! longer set, or behind a link is kept and logged once. A copy already
 //! gone is marked, but only where the bin shows it is there to look in
 //! (its entry folder, or another entry, still in it): an empty folder may
 //! be a share that is not mounted. Every gone copy is decided before the
 //! pass deletes anything, so its own deletes never take that proof away.
+//! One pass runs at a time. A deleted copy's entry folder is removed only
+//! once its row is marked, so a crash or a failed write between the two
+//! leaves the folder that proves the copy gone to the next pass.
 
 use std::collections::{HashMap, HashSet};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Mutex, MutexGuard, PoisonError, TryLockError};
 
 use droppedneedle_kernel::db::{CancelFlag, Db, Lane};
 use rusqlite::params;
 use sha2::{Digest as _, Sha256};
 
+use super::journal::{JournalKind, JournalState};
 use super::paths::{FileStat, Sandbox, incoming_temp};
 use super::{PublishError, sql};
 
@@ -36,9 +41,26 @@ use super::{PublishError, sql};
 pub struct ExpiryMemory {
     logged: Mutex<HashMap<String, String>>,
     changed: Mutex<HashMap<String, FileStat>>,
+    /// Held by the pass that is running.
+    pass: Mutex<()>,
 }
 
 impl ExpiryMemory {
+    /// Wait for a running pass to end, and hold off others until the
+    /// guard drops.
+    pub fn one_pass(&self) -> MutexGuard<'_, ()> {
+        self.pass.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Hold off other passes, or `None` while one runs.
+    pub fn try_one_pass(&self) -> Option<MutexGuard<'_, ()>> {
+        match self.pass.try_lock() {
+            Ok(guard) => Some(guard),
+            Err(TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+            Err(TryLockError::WouldBlock) => None,
+        }
+    }
+
     /// Log `text` about `key` once, until it changes; `None` clears it.
     pub fn note(&self, key: &str, text: Option<String>) {
         let mut logged = self.logged.lock().unwrap_or_else(PoisonError::into_inner);
@@ -125,9 +147,10 @@ pub struct ExpiryReport {
 }
 
 impl ExpiryReport {
-    /// Whether the pass found anything to count.
+    /// Whether the pass took anything out of the bin. What it kept or
+    /// left waiting is logged once per change, not every pass.
     pub fn did_anything(&self) -> bool {
-        self.deleted + self.gone + self.changed + self.kept + self.waited + self.legacy_deleted > 0
+        self.deleted + self.gone + self.legacy_deleted > 0
     }
 
     fn keep(&mut self, row: &DueRow, why: KeptWhy) {
@@ -178,6 +201,9 @@ struct DueRow {
     recycle_to: PathBuf,
     sha256: String,
     track_id: Option<String>,
+    /// The copy's identity when it landed in the bin: `None` for rows
+    /// from before it was recorded, `Some(Err)` when it does not read.
+    binned: Option<Result<FileStat, serde_json::Error>>,
 }
 
 /// What the check outside the lock found a copy to be.
@@ -209,6 +235,7 @@ pub fn expire<G>(
         return Ok(report);
     };
     let cutoff = pass.cutoff_secs();
+    let mut empty_bins: HashSet<String> = HashSet::new();
     let mut due: Vec<(DueRow, FileStat)> = Vec::new();
     let mut gone: Vec<DueRow> = Vec::new();
     let held = held_tracks(db)?;
@@ -220,7 +247,7 @@ pub fn expire<G>(
             report.waited += 1;
             continue;
         }
-        match examine(&sandbox, &row, memory, &mut report) {
+        match examine(&sandbox, &row, memory, &mut report, &mut empty_bins) {
             Some(Found::Due(stat)) => due.push((row, stat)),
             Some(Found::Gone) => gone.push(row),
             None => {}
@@ -259,7 +286,7 @@ pub fn expire<G>(
                 continue;
             }
             report.gone += 1;
-            marked.push(row.journal_id.as_str());
+            marked.push(row.journal_id.clone());
             emptied.push(row.recycle_to.clone());
         }
         mark(db, &marked, pass.now_ms)?;
@@ -275,7 +302,7 @@ pub fn expire<G>(
         };
         let held = held_tracks(db)?;
         let mut marked = Vec::new();
-        let mut touched = HashSet::new();
+        let mut deleted = Vec::new();
         for (row, stat) in chunk {
             if is_held(&held, row) {
                 report.waited += 1;
@@ -296,12 +323,19 @@ pub fn expire<G>(
             }
             report.deleted += 1;
             report.deleted_bytes += stat.size;
-            drop_entry(&row.recycle_to);
-            touched.insert(bin.dir.clone());
-            marked.push(row.journal_id.as_str());
+            deleted.push((row.recycle_to.as_path(), bin.dir.clone()));
+            marked.push(row.journal_id.clone());
+        }
+        // The entry folders stay until the marks are on disk: an entry
+        // folder with its copy gone is what proves the copy gone to a
+        // later pass, after a crash or a failed write here.
+        mark(db, &marked, pass.now_ms)?;
+        let mut touched = HashSet::new();
+        for (copy, bin) in deleted {
+            drop_entry(copy);
+            touched.insert(bin);
         }
         sync_dirs(&touched);
-        mark(db, &marked, pass.now_ms)?;
     }
 
     if !go_on() {
@@ -320,22 +354,41 @@ pub fn expire<G>(
     }
     sync_dirs(&touched);
     report.legacy_deleted = legacy(db, &sandbox, cutoff, memory)?;
+    for bin in sandbox.bins()? {
+        if !empty_bins.contains(&bin.id) {
+            memory.note(&empty_key(&bin.id), None);
+        }
+    }
+    memory.note(
+        "waiting",
+        (report.waited > 0).then(|| {
+            format!(
+                "recycle bin expiry leaves {} due copies for a later pass",
+                report.waited
+            )
+        }),
+    );
     report.finished = true;
     Ok(report)
 }
 
 /// Record that the copies of rows `ids` left the bin at `now_ms`.
-pub(super) fn mark(db: &Db, ids: &[&str], now_ms: i64) -> Result<(), PublishError> {
+pub(super) fn mark<S: AsRef<str>>(db: &Db, ids: &[S], now_ms: i64) -> Result<(), PublishError> {
     if ids.is_empty() {
         return Ok(());
     }
     db.write_blocking(Lane::Background, "publish.expiry_mark", |tx| {
         let mut mark = tx.prepare_cached(sql::EXPIRY_MARK.text())?;
         for id in ids {
-            mark.execute(params![id, now_ms])?;
+            mark.execute(params![id.as_ref(), now_ms])?;
         }
         Ok::<_, PublishError>(())
     })
+}
+
+/// The log key for a bin that looks empty.
+fn empty_key(bin: &str) -> String {
+    format!("empty:{bin}")
 }
 
 fn sync_dirs(dirs: &HashSet<PathBuf>) {
@@ -354,7 +407,18 @@ pub(super) fn held_tracks(db: &Db) -> Result<HashSet<Option<String>>, PublishErr
     db.read_long("publish.expiry_held", &CancelFlag::never(), |conn| {
         let mut statement = conn.prepare_cached(sql::EXPIRY_HELD_TRACKS.text())?;
         let tracks = statement
-            .query_map([], |row| row.get::<_, Option<String>>(0))?
+            .query_map(
+                params![
+                    JournalState::Prepared,
+                    JournalState::Staged,
+                    JournalState::Published,
+                    JournalState::Committed,
+                    JournalState::CleanupPending,
+                    JournalState::NeedsAttention,
+                    JournalKind::PutBack,
+                ],
+                |row| row.get::<_, Option<String>>(0),
+            )?
             .collect::<Result<HashSet<_>, _>>()?;
         Ok::<_, PublishError>(tracks)
     })
@@ -368,33 +432,45 @@ fn is_held(held: &HashSet<Option<String>>, row: &DueRow) -> bool {
 /// reached the bin, so a row kept for good never holds up the rows behind
 /// it.
 fn due_rows(db: &Db, cutoff: f64, page: usize) -> Result<Vec<DueRow>, PublishError> {
-    type Due = (String, String, String, f64, Option<String>);
+    type Due = (String, String, String, i64, Option<String>, Option<String>);
     let mut rows = Vec::new();
-    let mut cursor = (f64::MIN, String::new());
+    let mut cursor = (i64::MIN, String::new());
     loop {
         let found: Vec<Due> = db.read_long("publish.expiry_due", &CancelFlag::never(), |conn| {
             let mut statement = conn.prepare_cached(sql::EXPIRY_DUE.text())?;
             let found = statement
-                .query_map(params![cutoff, cursor.0, cursor.1, page as i64], |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                    ))
-                })?
+                .query_map(
+                    params![
+                        crate::clock::ms(cutoff),
+                        cursor.0,
+                        cursor.1,
+                        page as i64,
+                        JournalState::Cleaned,
+                    ],
+                    |row| {
+                        let row = sql::ExpiryDueRow::read(row)?;
+                        Ok((
+                            row.journal_id,
+                            row.recycle_to,
+                            row.replaced_sha256,
+                            row.recycled_at,
+                            row.replaced_track_id,
+                            row.binned_stat_json,
+                        ))
+                    },
+                )?
                 .collect::<Result<Vec<_>, _>>()?;
             Ok::<_, PublishError>(found)
         })?;
         let last = found.len() < page;
-        for (journal_id, recycle_to, sha256, recycled_at, track_id) in found {
+        for (journal_id, recycle_to, sha256, recycled_at, track_id, binned) in found {
             cursor = (recycled_at, journal_id.clone());
             rows.push(DueRow {
                 journal_id,
                 recycle_to: PathBuf::from(recycle_to),
                 sha256,
                 track_id,
+                binned: binned.map(|json| serde_json::from_str(&json)),
             });
         }
         if last {
@@ -410,6 +486,7 @@ fn examine(
     row: &DueRow,
     memory: &ExpiryMemory,
     report: &mut ExpiryReport,
+    empty_bins: &mut HashSet<String>,
 ) -> Option<Found> {
     let key = row.journal_id.as_str();
     let keep = |report: &mut ExpiryReport, why: KeptWhy, text: String| {
@@ -425,14 +502,26 @@ fn examine(
     let shaped = entry
         .and_then(|entry| entry.file_name())
         .is_some_and(|entry| super::bin::entry_name(&entry.to_string_lossy()));
+    // Logged once per folder and reason, and forgotten once the folder is
+    // fine again: a bin no longer set holds many copies.
+    let folder = entry
+        .and_then(Path::parent)
+        .map_or_else(String::new, |dir| dir.display().to_string());
+    let outside = format!("outside:{folder}");
     let bin = match sandbox.ensure_under_bin(&row.recycle_to) {
-        Ok(bin) => bin,
+        Ok(bin) => {
+            memory.note(&outside, None);
+            bin
+        }
         Err(error) => {
-            return keep(
-                report,
-                KeptWhy::NotInBin,
-                format!("recycle bin expiry keeps the copy of journal {key}: {error}"),
+            memory.note(
+                &outside,
+                Some(format!(
+                    "recycle bin expiry keeps the copies in {folder}: {error}"
+                )),
             );
+            report.keep(row, KeptWhy::NotInBin);
+            return None;
         }
     };
     if !shaped || name.is_none() || entry.and_then(Path::parent) != Some(bin.dir.as_path()) {
@@ -448,10 +537,11 @@ fn examine(
             if gone_for_sure(&bin.dir, entry) {
                 return Some(Found::Gone);
             }
+            empty_bins.insert(bin.id.clone());
             memory.note(
-                key,
+                &empty_key(&bin.id),
                 Some(format!(
-                    "recycle bin expiry waits for the copy of journal {key}: its bin {} looks empty",
+                    "recycle bin expiry waits for the copies missing from recycle bin {}: it looks empty",
                     bin.id
                 )),
             );
@@ -474,6 +564,23 @@ fn examine(
         );
     }
     let stat = FileStat::of(&meta);
+    // Still exactly the copy that landed: any write since moves its change
+    // time. It goes whatever bytes it was given, an edit made before it
+    // reached the bin included. FAT, exFAT and some FUSE mounts keep no
+    // real change time, so there an edit that keeps size and mtime passes.
+    match &row.binned {
+        Some(Ok(binned)) if *binned == stat => return Some(Found::Due(stat)),
+        Some(Err(error)) => {
+            return keep(
+                report,
+                KeptWhy::Unreadable,
+                format!(
+                    "recycle bin expiry keeps the copy of journal {key}: its recorded identity does not read: {error}"
+                ),
+            );
+        }
+        Some(Ok(_)) | None => {}
+    }
     if memory.known_changed(key, &stat) {
         report.keep(row, KeptWhy::Changed);
         return None;
@@ -503,15 +610,22 @@ fn examine(
 }
 
 /// Whether a copy missing from `entry` is really gone: its entry folder
-/// is still in the bin, or the bin holds some other entry. An empty bin
-/// folder may be a share that is not mounted, so it proves nothing.
+/// is still in the bin, or the bin holds another entry folder (named
+/// `<stamp>-<hex>`). An empty bin folder may be a share that is not
+/// mounted, so it proves nothing, and nor does a stray file such as a
+/// `.DS_Store` beside it.
 pub(super) fn gone_for_sure(bin: &Path, entry: Option<&Path>) -> bool {
     if entry.is_some_and(|entry| {
         std::fs::symlink_metadata(entry).is_ok_and(|meta| meta.file_type().is_dir())
     }) {
         return true;
     }
-    std::fs::read_dir(bin).is_ok_and(|mut children| children.next().is_some())
+    std::fs::read_dir(bin).is_ok_and(|children| {
+        children.flatten().any(|child| {
+            super::bin::entry_name(&child.file_name().to_string_lossy())
+                && child.file_type().is_ok_and(|kind| kind.is_dir())
+        })
+    })
 }
 
 /// The SHA-256 of the file at `path`, read in pieces. `None` when the
@@ -572,6 +686,7 @@ pub(super) fn drop_entry(copy: &Path) {
 /// the retention loses its plain files, then itself. A folder holding
 /// anything else is kept and logged; a name not like ours is never
 /// touched (a `.recycle` may be a Samba share's). Answers how many went.
+/// An empty entry folder whose rows are all marked goes too.
 ///
 /// Every entry made since removals went through the publisher has a row,
 /// recorded before the file moves, and rows are never purged, so this
@@ -586,8 +701,10 @@ fn legacy(
     cutoff: f64,
     memory: &ExpiryMemory,
 ) -> Result<usize, PublishError> {
+    let names = entry_names(db)?;
+    drop_spent_entries(sandbox, &names)?;
     let mut deleted = 0;
-    for path in legacy_entries(db, sandbox, cutoff)? {
+    for path in legacy_from(sandbox, cutoff, &names)? {
         let name = path
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
@@ -613,7 +730,27 @@ pub(crate) fn legacy_entries(
     sandbox: &Sandbox,
     cutoff: f64,
 ) -> Result<Vec<PathBuf>, PublishError> {
-    let named = entry_names(db)?;
+    legacy_from(sandbox, cutoff, &entry_names(db)?)
+}
+
+fn legacy_from(
+    sandbox: &Sandbox,
+    cutoff: f64,
+    names: &HashMap<String, bool>,
+) -> Result<Vec<PathBuf>, PublishError> {
+    Ok(entry_folders(sandbox)?
+        .into_iter()
+        .filter(|(name, _)| {
+            !names.contains_key(name)
+                && super::bin::entry_stamp(name).is_some_and(|stamp| (stamp as f64) < cutoff)
+        })
+        .map(|(_, path)| path)
+        .collect())
+}
+
+/// The folders at the top of every bin of `sandbox` with an entry's
+/// name (`<stamp>-<hex>`), with that name. Only names are read.
+fn entry_folders(sandbox: &Sandbox) -> Result<Vec<(String, PathBuf)>, PublishError> {
     let mut found = Vec::new();
     for bin in sandbox.bins()? {
         if sandbox.ensure_bin_dir(bin).is_err() {
@@ -624,13 +761,44 @@ pub(crate) fn legacy_entries(
         };
         for child in children.flatten() {
             let name = child.file_name().to_string_lossy().into_owned();
-            let old = super::bin::entry_stamp(&name).is_some_and(|stamp| (stamp as f64) < cutoff);
-            if old && !named.contains(&name) && child.file_type().is_ok_and(|kind| kind.is_dir()) {
-                found.push(child.path());
+            if super::bin::entry_stamp(&name).is_some()
+                && child.file_type().is_ok_and(|kind| kind.is_dir())
+            {
+                found.push((name, child.path()));
             }
         }
     }
     Ok(found)
+}
+
+/// Remove each entry folder whose rows are all marked as having left the
+/// bin, while it is empty: a stop between a mark and the folder's removal
+/// leaves one behind.
+fn drop_spent_entries(
+    sandbox: &Sandbox,
+    names: &HashMap<String, bool>,
+) -> Result<(), PublishError> {
+    let mut touched = HashSet::new();
+    for (name, path) in entry_folders(sandbox)? {
+        if names.get(&name) != Some(&true) {
+            continue;
+        }
+        match std::fs::remove_dir(&path) {
+            Ok(()) => {
+                if let Some(bin) = path.parent() {
+                    touched.insert(bin.to_path_buf());
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+                ) => {}
+            Err(error) => tracing::debug!(%error, "a spent recycle bin entry folder was kept"),
+        }
+    }
+    sync_dirs(&touched);
+    Ok(())
 }
 
 /// Delete the plain files in `entry`, then `entry`, when it holds nothing
@@ -668,21 +836,27 @@ fn empty_of_plain_files(entry: &Path, memory: &ExpiryMemory) -> Result<bool, Pub
     Ok(true)
 }
 
-/// The entry folder name of every bin entry a row names, expired or not.
-fn entry_names(db: &Db) -> Result<HashSet<String>, PublishError> {
+/// The entry folder name of every bin entry a row names, each true when
+/// every row naming it is marked as having left the bin.
+fn entry_names(db: &Db) -> Result<HashMap<String, bool>, PublishError> {
     db.read_long("publish.expiry_entries", &CancelFlag::never(), |conn| {
         let mut statement = conn.prepare_cached(sql::EXPIRY_ENTRIES.text())?;
-        let paths = statement
-            .query_map([], |row| row.get::<_, String>(0))?
+        let rows = statement
+            .query_map([], |row| {
+                let row = sql::BinEntry::read(row)?;
+                Ok((row.recycle_to, row.left_bin))
+            })?
             .collect::<Result<Vec<_>, _>>()?;
-        Ok::<_, PublishError>(
-            paths
-                .iter()
-                .filter_map(|path| {
-                    let entry = Path::new(path).parent()?.file_name()?;
-                    Some(entry.to_string_lossy().into_owned())
-                })
-                .collect(),
-        )
+        let mut names: HashMap<String, bool> = HashMap::new();
+        for (path, left) in rows {
+            let Some(entry) = Path::new(&path).parent().and_then(Path::file_name) else {
+                continue;
+            };
+            let spent = names
+                .entry(entry.to_string_lossy().into_owned())
+                .or_insert(true);
+            *spent &= left;
+        }
+        Ok::<_, PublishError>(names)
     })
 }

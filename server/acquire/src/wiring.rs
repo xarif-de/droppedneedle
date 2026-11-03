@@ -56,7 +56,7 @@ use crate::usenet::newznab::NewznabIndexer;
 use crate::usenet::prowlarr::ProwlarrIndexer;
 use axum::Router;
 use droppedneedle_auth::users::UsersDeps;
-use droppedneedle_catalog::reads::collections::store::Stores as CollectionsStores;
+use droppedneedle_catalog::collections::store::Stores as CollectionsStores;
 use droppedneedle_kernel::db::DbError;
 use droppedneedle_kernel::events::EventHub;
 use droppedneedle_kernel::ids::IdGenerator;
@@ -64,16 +64,15 @@ use droppedneedle_kernel::jobs::queue::JobQueue;
 use droppedneedle_kernel::jobs::{AlreadyRunning, Supervisor};
 use droppedneedle_kernel::platform::Platform;
 use droppedneedle_kernel::runtime_config::secret_sections::{
-    DownloadClients, Indexers as ConfigIndexers, LidarrImportConnection, ProwlarrConnection,
-    SlskdConnection, TypedLibrary,
+    DownloadClients, Indexers as ConfigIndexers, ProwlarrConnection, SlskdConnection, TypedLibrary,
 };
 use droppedneedle_kernel::runtime_config::sections::{
     DownloadPolicy, UsenetBackend, UsenetBackendSetting,
 };
 use droppedneedle_kernel::runtime_config::{ConfigStore, Live, Section};
-use droppedneedle_library::mutations::Mutations;
-use droppedneedle_library::operations::port::EditionPlans;
+use droppedneedle_library::edition::port::EditionPlans;
 use droppedneedle_library::publish::bin::DownloadTrees;
+use droppedneedle_library::removal::Mutations;
 use droppedneedle_media::playback::listening::ListeningStore;
 use droppedneedle_plugins::host::PluginHost;
 use droppedneedle_providers::Providers;
@@ -97,7 +96,6 @@ pub struct ClientLives {
     slskd: Live<SlskdConnection>,
     sabnzbd: Live<DownloadClients>,
     prowlarr: Live<ProwlarrConnection>,
-    lidarr: Live<LidarrImportConnection>,
     policy: Live<DownloadPolicy>,
     backend: Live<UsenetBackendSetting>,
     library: Live<TypedLibrary>,
@@ -114,7 +112,6 @@ impl ClientLives {
             slskd: store.live(),
             sabnzbd: store.live(),
             prowlarr: store.live(),
-            lidarr: store.live(),
             policy: store.live(),
             backend: store.live(),
             library: store.live(),
@@ -128,7 +125,6 @@ impl ClientLives {
             self.slskd.subscribe(),
             self.sabnzbd.subscribe(),
             self.prowlarr.subscribe(),
-            self.lidarr.subscribe(),
             self.policy.subscribe(),
             self.backend.subscribe(),
             self.library.subscribe(),
@@ -154,7 +150,6 @@ impl ClientLives {
             sabnzbd: (**self.sabnzbd.read().unwrap_or_default()).clone(),
             indexers,
             prowlarr: (**self.prowlarr.read().unwrap_or_default()).clone(),
-            lidarr: (**self.lidarr.read().unwrap_or_default()).clone(),
             policy: self.policy.read().map(|policy| (**policy).clone()),
             backend: **self.backend.read().unwrap_or_default(),
             library_roots: self
@@ -214,8 +209,8 @@ pub struct AcquireSetup {
     pub probes: Arc<LiveProbes>,
     /// Probe cache the refresh loop fills.
     pub probe_cache: Arc<ProbeCache>,
-    /// Whether a download source is on: requests, search, the queue, the
-    /// health smoke and Discover all read this one answer.
+    /// Whether a download source is on: requests, search, the queue and
+    /// Discover all read this one answer.
     pub readiness: SourceReadiness,
     /// What the readiness reads changes on: the source settings and, in
     /// production, the plugin host.
@@ -333,7 +328,7 @@ pub struct AcquirePorts {
 struct MixInputs {
     providers: Arc<Providers>,
     listening: ListeningStore,
-    playlists: droppedneedle_catalog::reads::collections::store::playlists::PlaylistStore,
+    playlists: droppedneedle_catalog::collections::store::playlists::PlaylistStore,
 }
 
 /// What the durable core reaches outside acquisition. The test bundle
@@ -383,6 +378,7 @@ fn core(
         upgrade_policy: Some(settings.live()),
         readiness: ports.readiness,
         albums: ports.albums,
+        events: Some(events.clone()),
         ..RequestsState::new(db, quota, dispatch.clone())
     };
     let mixer = ports.mix.map(|mix| {
@@ -434,24 +430,56 @@ pub(crate) fn usenet_indexers(
     indexers
 }
 
-/// The download folders no recycle bin may overlap: the staging folder
-/// and SABnzbd's completed-downloads folder. An empty folder setting names
-/// no folder, so it guards nothing.
-fn download_trees(staging_root: &Path, sab_mount: Option<PathBuf>) -> Vec<PathBuf> {
+/// The download folders no recycle bin may overlap: the staging folder,
+/// slskd's downloads and incomplete folders while slskd is set up, and
+/// SABnzbd's completed-downloads folder. An empty folder setting names no
+/// folder, so it guards nothing.
+fn download_trees(
+    staging_root: &Path,
+    slskd: Option<(PathBuf, PathBuf)>,
+    sab_mount: Option<PathBuf>,
+) -> Vec<PathBuf> {
     std::iter::once(staging_root.to_owned())
+        .chain(
+            slskd
+                .into_iter()
+                .flat_map(|(downloads, incomplete)| [downloads, incomplete]),
+        )
         .chain(sab_mount)
         .filter(|tree| !tree.as_os_str().is_empty())
         .collect()
 }
 
+/// slskd's downloads mount (`slskd_downloads`, the whole of it, whatever
+/// subfolder slskd saves to) and incomplete folder, while slskd is set up.
+fn slskd_trees(section: &SlskdConnection, slskd_downloads: &Path) -> Option<(PathBuf, PathBuf)> {
+    (!section.url.is_empty()).then(|| {
+        (
+            slskd_downloads.to_owned(),
+            PathBuf::from(section.slskd_incomplete_mount.trim()),
+        )
+    })
+}
+
 /// The download folders a configured recycle bin must stay clear of, read
-/// live from the SABnzbd settings, for the library's builder. `None` while
-/// those settings cannot be read.
-pub fn recycle_guard(store: &ConfigStore, staging_root: PathBuf) -> DownloadTrees {
+/// live from the slskd and SABnzbd settings, for the library's builder.
+/// `None` while those settings cannot be read.
+pub fn recycle_guard(
+    store: &ConfigStore,
+    staging_root: PathBuf,
+    slskd_downloads: PathBuf,
+) -> DownloadTrees {
+    let slskd: Live<SlskdConnection> = store.live();
     let sabnzbd: Live<DownloadClients> = store.live();
     Arc::new(move || {
+        let slskd_section = slskd.read()?;
+        let slskd_folders = slskd_trees(&slskd_section, &slskd_downloads);
         let section = sabnzbd.read()?;
-        Some(download_trees(&staging_root, sabnzbd_mount(&section)))
+        Some(download_trees(
+            &staging_root,
+            slskd_folders,
+            sabnzbd_mount(&section),
+        ))
     })
 }
 
@@ -480,6 +508,7 @@ impl AcquireSetup {
         let quota = Arc::new(QuotaLedger::new(config_store.live(), db.clone()));
         let clients = Arc::new(LiveClients::new(
             http.clone(),
+            ports.providers.newznab.clone(),
             ClientLives::new(&config_store),
             config.slskd_downloads_path.clone(),
             stores.journal.clone(),
@@ -493,10 +522,7 @@ impl AcquireSetup {
         let search_quota = quota.clone();
         let worker_settings = Arc::new(WorkerSettings::new(&config_store, clients.clone()));
         let probe_cache = Arc::new(ProbeCache::new(clients.clone()));
-        let readiness = SourceReadiness::new(
-            SourceList::Live(worker_settings.clone()),
-            probe_cache.clone(),
-        );
+        let readiness = SourceReadiness::new(SourceList::Live(worker_settings.clone()));
         let source_notices = SourceNotices {
             settings: worker_settings.clone(),
             plugins: Some(ports.plugins.clone()),
@@ -567,7 +593,6 @@ impl AcquireSetup {
             resolver,
             spotify_imports,
             probes: Arc::new(LiveProbes::bundle(&probes)),
-            readiness: readiness.clone(),
             ids: ids.clone(),
             base_path: config.base_path.clone(),
             trusted_proxies: config.trusted_proxies.clone(),
@@ -683,11 +708,12 @@ impl AcquireSetup {
                 RequestsError::Busy { operation } => RecoveryError::Busy { operation },
                 other => RecoveryError::Failed(format!("request recovery failed: {other:?}")),
             })?;
-        if requests.cancelled > 0 || requests.relinked > 0 || requests.redispatched > 0 {
+        if requests != crate::requests::service::RequestRecovery::default() {
             tracing::info!(
                 cancelled = requests.cancelled,
                 relinked = requests.relinked,
                 redispatched = requests.redispatched,
+                mix_asks_cleared = requests.mix_asks_cleared,
                 "requests recovered"
             );
         }

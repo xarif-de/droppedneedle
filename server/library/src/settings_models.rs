@@ -52,6 +52,16 @@ pub struct LibraryManagementSettingsResponse {
     /// Every tag field a profile can manage, in the editor's order, with
     /// the genre row last.
     pub managed_fields: Vec<ManagedFieldInfo>,
+    /// Why the recycle bin path is not used, when it is not: each library
+    /// folder's `.recycle` takes its place, or files wait for a folder
+    /// that can't be reached. Set on the settings read and save only.
+    #[serde(default)]
+    pub recycle_bin_warning: Option<String>,
+    /// The stored settings cannot be read, so these are the seeded ones
+    /// and a save replaces the row. Removals, upgrades and automatic work
+    /// wait until then.
+    #[serde(default)]
+    pub settings_unreadable: bool,
 }
 
 /// One row of a profile's field table.
@@ -178,60 +188,6 @@ pub struct LibraryRestorableRoot {
     pub indexed_file_count: i64,
 }
 
-/// Where a mapped path came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum PathMappingSource {
-    /// A catalog track file.
-    LibraryFile,
-}
-
-/// Why a path did not map to a root.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum PathMappingError {
-    /// The path sits under more than one root.
-    Ambiguous,
-    /// The path sits under no root.
-    OutOfRoot,
-}
-
-/// One catalog path and the root it maps to under the saved settings.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct LibraryPathMappingItem {
-    /// Source kind.
-    pub source_kind: PathMappingSource,
-    /// Track id.
-    pub source_id: String,
-    /// Absolute file path the catalog holds.
-    pub absolute_path: String,
-    /// Root the path maps to, when it maps.
-    pub root_id: Option<String>,
-    /// Path relative to that root, when it maps.
-    pub relative_path: Option<String>,
-    /// Why it did not map.
-    pub error: Option<PathMappingError>,
-}
-
-/// Dry run: does every catalog path map to exactly one saved root.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct LibraryPathMappingReport {
-    /// Saved revision the report was built from.
-    pub policy_revision: String,
-    /// Paths checked.
-    pub source_count: i64,
-    /// Paths that map to one root.
-    pub mapped_count: i64,
-    /// Paths under more than one root.
-    pub ambiguous_count: i64,
-    /// Paths under no root.
-    pub out_of_root_count: i64,
-    /// Some path does not map.
-    pub blocking: bool,
-    /// Every checked path, ordered by track id.
-    pub items: Vec<LibraryPathMappingItem>,
-}
-
 /// Profile-mutation acknowledgement: the saved profile plus the fresh
 /// revision (a second read, so concurrent saves surface as staleness on
 /// the next write instead of silently winning).
@@ -253,7 +209,7 @@ pub struct LibraryManagementProfileExportResponse {
     pub mime_type: String,
     /// Portable document (JSON).
     pub document: String,
-    /// Share code (`DNLP1:...`).
+    /// Share code (`DNLP2:...`).
     pub share_code: String,
     /// Bundle hash (import pins to the reviewed hash).
     pub bundle_hash: String,

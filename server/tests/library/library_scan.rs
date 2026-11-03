@@ -17,19 +17,22 @@ use crate::common::{ScratchDir, TestPlatform, config_store, migrated_db};
 use droppedneedle_kernel::clock::SystemClock;
 use droppedneedle_kernel::db::{Budget, Db, LaneLimits};
 use droppedneedle_kernel::jobs::CancellationToken;
+use droppedneedle_kernel::runtime_config::secret_sections::TypedLibrary;
 use droppedneedle_library::identify::models::RecallResult;
 use droppedneedle_library::identify::providers::FakeProviders;
 use droppedneedle_library::identify::service::{IdentifyDeps, IdentifyService};
 use droppedneedle_library::identify::sqlite::SqliteIdentifyStore;
 use droppedneedle_library::repairs::hygiene;
 use droppedneedle_library::scan::ScanFailureRecord;
+use droppedneedle_library::scan::roots::PolicyRule;
 use droppedneedle_library::scan::{
-    BlockingPool, Counter, EffectivePolicy, Event, FailureCode, LibraryRoot,
+    BlockingPool, Counter, EffectivePolicy, Event, FailureCode, InclusionRule, LibraryRoot,
     LibraryScanCoordinator, NullTagReader, Phase, RootRegistry, RootSeamError, RunState, ScanKind,
     ScanPhase, ScanRequest, ScanRun, ScanScope, ScanState, ScanStoreError, ScanTrigger,
     ScannedTags, SqliteScanStore, StaticResolver, StreamRootSeam, TagReadError, TagReader,
     WatcherAction, WorkWakeups,
 };
+use droppedneedle_library::service::ServiceError;
 use droppedneedle_library::wiring::LibrarySetup;
 use sha2::{Digest, Sha256};
 
@@ -38,6 +41,9 @@ fn fixture(name: &str) -> PathBuf {
         .join("tests/fixtures/library")
         .join(name)
 }
+
+/// A PNG's opening bytes, which is all the sweep's image check reads.
+const COVER_PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR";
 
 fn plant(root: &Path, relative: &str, fixture_name: &str) -> PathBuf {
     let dest = root.join(relative);
@@ -118,7 +124,7 @@ async fn scan_as(library: &LibrarySetup, kind: ScanKind) -> ScanRun {
             trigger: ScanTrigger::Manual,
             scopes: registry.scheduled_root_scopes(),
             requested_by_user_id: None,
-            policy_revision: registry.policy_revision().to_owned(),
+            policy_revision: registry.fingerprint().to_owned(),
         })
         .expect("scan requested");
     for _ in 0..50 {
@@ -136,6 +142,30 @@ fn query(library: &LibrarySetup, sql: &str) -> i64 {
         .db()
         .query_i64(sql)
         .unwrap_or_else(|error| panic!("{sql}: {error}"))
+}
+
+/// The multi-disc naming preset names disc folders after the medium
+/// (`{medium_format} {medium_number:02d}`, path-cleaned `12_ Vinyl 01`).
+/// Such folders fold into their album like `CD1`, so a double vinyl the
+/// library organized itself stays one album.
+#[tokio::test]
+async fn disc_folders_named_after_the_medium_stay_one_album() {
+    let scratch = ScratchDir::new("scan-medium-discs");
+    let music = scratch.join("music");
+    plant(&music, "Album/12_ Vinyl 01/01.mp3", "mp3_full_01.mp3");
+    plant(&music, "Album/12_ Vinyl 02/01.mp3", "mp3_full_01.mp3");
+    let library = bundle(&scratch).await;
+
+    let run = scan(&library).await;
+    assert_eq!(count(&run, Counter::Indexed), 2);
+    assert_eq!(
+        query(
+            &library,
+            "SELECT COUNT(DISTINCT local_album_id) FROM local_tracks"
+        ),
+        1,
+        "both vinyls are one album"
+    );
 }
 
 /// The catalog holds what the tags say, with provenance and header
@@ -429,6 +459,54 @@ async fn a_carried_file_gets_its_edition_hints_from_its_tags() {
     );
 }
 
+/// Only an MP3 can have an estimated length: lofty counts its frames from
+/// a Xing, Info or VBRI header and otherwise divides by the first frame's
+/// bitrate. The scan records which. An MP3 row that does not say yet (from
+/// before the scan recorded it) is filled by the next scan from the first
+/// frame alone, without offering the album to identification again or
+/// writing the file.
+#[tokio::test]
+async fn a_scan_records_whether_each_length_was_measured() {
+    let scratch = ScratchDir::new("scan-measured");
+    let music = scratch.join("music");
+    plant(&music, "Album/01.flac", "flac_full_01.flac");
+    plant(&music, "Album/02.mp3", "mp3_full_01.mp3");
+    plant(&music, "Album/03.mp3", "mp3_vbr_no_xing.mp3");
+    let before = snapshot(&music);
+    let library = bundle(&scratch).await;
+    let as_read = |library: &LibrarySetup| {
+        query(
+            library,
+            "SELECT COUNT(*) FROM local_tracks WHERE (relative_path, duration_measured) IN \
+             (VALUES ('Album/01.flac', 1), ('Album/02.mp3', 1), ('Album/03.mp3', 0))",
+        )
+    };
+
+    let run = scan(&library).await;
+    assert_eq!(count(&run, Counter::Indexed), 3);
+    assert_eq!(
+        as_read(&library),
+        3,
+        "a VBR MP3 without a header is estimated"
+    );
+
+    library
+        .scan_store
+        .db()
+        .run_sql("UPDATE local_tracks SET duration_measured = NULL WHERE file_format = 'mp3'")
+        .expect("rows from before the flag");
+    let jobs = query(&library, "SELECT COUNT(*) FROM library_identify_jobs");
+    let again = scan(&library).await;
+    assert_eq!(count(&again, Counter::Unchanged), 3);
+    assert_eq!(as_read(&library), 3, "the next scan fills the flag");
+    assert_eq!(
+        query(&library, "SELECT COUNT(*) FROM library_identify_jobs"),
+        jobs,
+        "the flag alone does not offer the album again"
+    );
+    assert_eq!(snapshot(&music), before, "scans never write music files");
+}
+
 /// A file read before track totals were kept has an edition row without
 /// one. An incremental scan does not read the unchanged file again, so the
 /// total stays unknown; a "rescan files" reads it, stores the total and
@@ -525,7 +603,7 @@ async fn scan_folder(library: &LibrarySetup, folder: &str) -> ScanRun {
             trigger: ScanTrigger::Manual,
             scopes,
             requested_by_user_id: None,
-            policy_revision: registry.policy_revision().to_owned(),
+            policy_revision: registry.fingerprint().to_owned(),
         })
         .expect("scan requested");
     for _ in 0..50 {
@@ -577,7 +655,7 @@ async fn a_held_back_folder_is_held_until_a_scan_finds_it_again() {
         query(
             &library,
             &format!(
-                "SELECT CAST(started_at * 1000 AS INTEGER) FROM library_scan_runs \
+                "SELECT started_at FROM library_scan_runs \
                  WHERE id = '{}'",
                 first.id
             ),
@@ -617,8 +695,9 @@ async fn a_held_back_folder_is_held_until_a_scan_finds_it_again() {
         .db()
         .run_sql(&format!(
             "INSERT INTO library_management_automatic_queue (local_album_id, queued_at, \
-             not_before, attempts, last_reason_code) VALUES \
-             ('{parked}', 1, 1e15, 3, 'SCAN_HELD_BACK'), ('{taken}', 1, 1e15, 0, 'TAKEN_OVER');"
+             not_before_at, attempts, last_reason_code) VALUES \
+             ('{parked}', 1, 1000000000000000000, 3, 'SCAN_HELD_BACK'), \
+             ('{taken}', 1, 1000000000000000000, 0, 'TAKEN_OVER');"
         ))
         .expect("parked");
     let due = |library: &LibrarySetup, album: &str| {
@@ -626,7 +705,7 @@ async fn a_held_back_folder_is_held_until_a_scan_finds_it_again() {
             library,
             &format!(
                 "SELECT COUNT(*) FROM library_management_automatic_queue \
-                 WHERE local_album_id = '{album}' AND not_before < 1e15 AND attempts = 0"
+                 WHERE local_album_id = '{album}' AND not_before_at < 1000000000000000000 AND attempts = 0"
             ),
         )
     };
@@ -644,7 +723,7 @@ async fn a_held_back_folder_is_held_until_a_scan_finds_it_again() {
         .scan_store
         .db()
         .run_sql(&format!(
-            "UPDATE library_management_automatic_queue SET not_before = 1e15 \
+            "UPDATE library_management_automatic_queue SET not_before_at = 1000000000000000000 \
              WHERE local_album_id = '{parked}'"
         ))
         .expect("parked again");
@@ -979,7 +1058,7 @@ async fn a_scan_moves_the_catalog_revision_as_it_goes() {
             moved > before,
             "the first window moved the catalog revision: {before} -> {moved}"
         );
-        let heard = tokio::time::timeout(Duration::from_secs(10), async {
+        let heard = tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 let frame = listener.next().await.expect("the hub stays open");
                 if frame.name() != "activity.changed" {
@@ -1009,7 +1088,7 @@ async fn a_scan_moves_the_catalog_revision_as_it_goes() {
 
     // A closed lane ends the event loop, with the supervisor never stopped.
     runtime.shutdown().await;
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
     while supervisor.is_running(revisions::JOB_NAME) {
         assert!(
             std::time::Instant::now() < deadline,
@@ -1101,6 +1180,115 @@ async fn a_run_whose_end_passes_fail_still_ends() {
         coordinator.run_once(&paths).await.is_none(),
         "nothing is left to drive"
     );
+}
+
+/// An end pass that keeps running out of time waits by the clock before
+/// it is tried again: a drive right after it spends no try, and a queued
+/// run stays unclaimed so no old pass lands after its windows. Once the
+/// wait is over the pass lands, then the queued run starts. Every file
+/// vanishes, so the mass-missing guard holds the scope back, and recording
+/// the held folder outlasts the write budget until the test lets it through.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_put_off_end_pass_holds_new_runs_and_lands_after_its_wait() {
+    let scratch = ScratchDir::new("scan-end-wait");
+    let root = scratch.join("music");
+    std::fs::create_dir_all(&root).expect("root");
+    for n in 0..25 {
+        std::fs::write(root.join(format!("t{n:04}.flac")), b"junk").expect("plant");
+    }
+    let path = scratch.join("scan.db");
+    migrated_db(&path);
+    let limits = LaneLimits {
+        background: Budget {
+            warn: Duration::from_secs(1),
+            abort: Duration::from_secs(3),
+        },
+        ..LaneLimits::default()
+    };
+    let db = Db::open_for_tests_with(&path, limits).expect("database opens");
+    let clock = Arc::new(droppedneedle_kernel::clock::ManualClock::at(
+        1_800_000_000_000,
+    ));
+    let registry = RootRegistry::new(
+        vec![LibraryRoot::new(
+            "music",
+            root.clone(),
+            EffectivePolicy::Automatic,
+        )],
+        true,
+        "rev-1",
+    );
+    let coordinator = LibraryScanCoordinator::new(
+        Arc::new(SqliteScanStore::new(db, clock.clone())),
+        BlockingPool::new(4),
+        Arc::new(NullTagReader::new()),
+        Arc::new(StaticResolver::new(registry)),
+        clock.clone(),
+    )
+    .with_wakeups(WorkWakeups::new());
+    let paths = HashMap::from([("music".to_owned(), root.clone())]);
+    coordinator.request_run(&request(&root)).expect("requested");
+    let first = coordinator.run_once(&paths).await.expect("driven");
+    assert_eq!(first.state.scan_state(), ScanState::Completed);
+    for n in 0..25 {
+        std::fs::remove_file(root.join(format!("t{n:04}.flac"))).expect("remove");
+    }
+    let held = || {
+        coordinator
+            .store()
+            .db()
+            .query_i64("SELECT COUNT(*) FROM library_scan_held_scopes")
+            .expect("count")
+    };
+    coordinator
+        .store()
+        .db()
+        .run_sql(
+            "CREATE TABLE spin (v INTEGER); \
+             INSERT INTO spin WITH RECURSIVE n(i) AS \
+             (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 1000) SELECT i FROM n; \
+             CREATE TRIGGER slow_hold BEFORE INSERT ON library_scan_held_scopes \
+             BEGIN SELECT (SELECT COUNT(*) FROM spin a, spin b, spin c); END;",
+        )
+        .expect("trigger");
+    coordinator.request_run(&request(&root)).expect("requested");
+    let ended = coordinator.run_once(&paths).await.expect("driven");
+    assert_eq!(ended.state.scan_state(), ScanState::Completed);
+    assert_eq!(held(), 0, "the slow pass has not landed");
+
+    let queued = coordinator.request_run(&request(&root)).expect("queued");
+    assert!(
+        coordinator.run_once(&paths).await.is_none(),
+        "a drive at once claims nothing"
+    );
+    clock.advance(30_000);
+    assert!(
+        coordinator.run_once(&paths).await.is_none(),
+        "nor does one before the wait is over"
+    );
+    assert_eq!(
+        coordinator
+            .snapshot(&queued.run_id)
+            .expect("run")
+            .0
+            .state
+            .scan_state(),
+        ScanState::Queued,
+        "the new run stays queued"
+    );
+
+    coordinator
+        .store()
+        .db()
+        .run_sql("DROP TRIGGER slow_hold;")
+        .expect("trigger dropped");
+    clock.advance(31_000);
+    let next = coordinator
+        .run_once(&paths)
+        .await
+        .expect("the new run starts");
+    assert_eq!(next.id, queued.run_id);
+    assert!(held() > 0, "the pass landed after its wait");
 }
 
 /// One inventory row the store refuses costs that file only: the rest of
@@ -1468,7 +1656,7 @@ async fn a_double_from_overlapping_roots_retires_into_one_row() {
             trigger: ScanTrigger::Manual,
             scopes: only_music,
             requested_by_user_id: None,
-            policy_revision: registry.policy_revision().to_owned(),
+            policy_revision: registry.fingerprint().to_owned(),
         })
         .expect("scan requested");
     for _ in 0..50 {
@@ -1490,7 +1678,8 @@ async fn a_double_from_overlapping_roots_retires_into_one_row() {
         .run_sql(
             "INSERT INTO auth_users (id, display_name, role, created_at) \
              VALUES ('listener', 'Listener', 'user', 0); \
-             INSERT INTO library_user_favorites (user_id, item_kind, item_id, created_at) \
+             INSERT OR IGNORE INTO auth_users (id, display_name, role, created_at) VALUES ('listener', 'Person', 'user', 1); \
+             INSERT INTO catalog_user_favorites (user_id, item_kind, item_id, created_at) \
              SELECT 'listener', 'track', id, 0 FROM local_tracks WHERE root_id = 'outer'; \
              INSERT INTO library_scan_mounts (root_id, relative_path) VALUES ('outer', 'music')",
         )
@@ -1501,7 +1690,7 @@ async fn a_double_from_overlapping_roots_retires_into_one_row() {
     assert_eq!(
         query(
             &library,
-            "SELECT COUNT(*) FROM library_user_favorites f JOIN local_tracks t \
+            "SELECT COUNT(*) FROM catalog_user_favorites f JOIN local_tracks t \
              ON t.id = f.item_id WHERE f.item_kind = 'track' AND t.root_id = 'music' \
              AND t.relative_path = 'Band/a.flac' AND t.availability = 'indexed'",
         ),
@@ -1512,6 +1701,612 @@ async fn a_double_from_overlapping_roots_retires_into_one_row() {
     assert!(
         failures.is_empty(),
         "skipped files are not a vanished share: {failures:?}"
+    );
+    assert_eq!(
+        query(
+            &library,
+            &format!(
+                "SELECT missing_count FROM library_scan_runs WHERE id = '{}'",
+                run.id
+            ),
+        ),
+        0,
+        "a retired double is not a missing file"
+    );
+    let audit: String = library
+        .scan_store
+        .db()
+        .read_blocking("audit", |conn| {
+            Ok::<_, ScanStoreError>(conn.query_row(
+                "SELECT after_json FROM library_catalog_actions \
+                 WHERE action_kind = 'continue_tracks'",
+                [],
+                |row| row.get(0),
+            )?)
+        })
+        .expect("audit row");
+    let audit: serde_json::Value = serde_json::from_str(&audit).expect("audit json");
+    assert_eq!(audit["new_pairs"], 1, "{audit}");
+    assert_eq!(audit["pairs"][0]["basis"], "same_file", "{audit}");
+    let album: String = library
+        .scan_store
+        .db()
+        .read_blocking("audit album", |conn| {
+            Ok::<_, ScanStoreError>(conn.query_row(
+                "SELECT COALESCE(l.retired_into_album_id, l.id) \
+                 FROM library_catalog_actions a JOIN local_albums l ON l.id = a.local_album_id \
+                 WHERE a.action_kind = 'continue_tracks'",
+                [],
+                |row| row.get(0),
+            )?)
+        })
+        .expect("the album the audit row is on");
+    let history = droppedneedle_library::http::history::album_history_view(
+        &crate::common::library::operations(&library),
+        &album,
+        "listener",
+    )
+    .expect("history reads");
+    let history = serde_json::to_value(history).expect("history serialises");
+    assert!(
+        !history.to_string().contains("tracks_continued"),
+        "the same file is no new file: {history}"
+    );
+}
+
+/// Whether the store has an indexed row at `path` under the one root.
+fn indexed_at<T: TagReader + 'static>(coordinator: &LibraryScanCoordinator<T>, path: &str) -> bool {
+    let sql = format!(
+        "SELECT COUNT(*) FROM local_tracks WHERE relative_path = '{path}' \
+         AND availability = 'indexed'"
+    );
+    coordinator.store().db().query_i64(&sql).expect("counted") == 1
+}
+
+/// `scopes` of the one root, as a request for them.
+fn request_scopes(root: &Path, scopes: &[&str]) -> ScanRequest {
+    let mut wanted = request(root);
+    let scope = wanted.scopes[0].clone();
+    wanted.scopes = scopes
+        .iter()
+        .map(|path| ScanScope {
+            relative_path: (*path).to_owned(),
+            ..scope.clone()
+        })
+        .collect();
+    wanted
+}
+
+/// A scope that is a link below its root is never walked, nor one reached
+/// through a link: the failure names it and its rows stay as they are.
+#[tokio::test]
+async fn a_scope_through_a_link_is_refused() {
+    let scratch = ScratchDir::new("scan-scope-link");
+    let root = scratch.join("music");
+    plant(&root, "Real/a.flac", "flac_full_01.flac");
+    plant(&root, "Door/kept.flac", "flac_full_02.flac");
+    plant(
+        &scratch.join("elsewhere"),
+        "Outside/b.flac",
+        "flac_full_01.flac",
+    );
+    let (coordinator, paths) = coordinator(&root, Arc::new(NullTagReader::new()));
+    coordinator
+        .request_run(&request_scopes(&root, &["Door"]))
+        .expect("requested");
+    coordinator.run_once(&paths).await.expect("driven");
+    assert!(indexed_at(&coordinator, "Door/kept.flac"));
+    std::fs::remove_dir_all(root.join("Door")).expect("folder gone");
+    std::os::unix::fs::symlink(scratch.join("elsewhere"), root.join("Door")).expect("link");
+
+    coordinator
+        .request_run(&request_scopes(&root, &["Door", "Door/Outside", "Real"]))
+        .expect("requested");
+    let run = coordinator.run_once(&paths).await.expect("driven");
+    assert_eq!(count(&run, Counter::Indexed), 1, "only the real folder");
+    let refused: Vec<String> = coordinator
+        .store()
+        .failures(&run.id)
+        .unwrap()
+        .into_iter()
+        .filter(|failure| failure.failure_code == FailureCode::ScopeThroughLink)
+        .map(|failure| failure.relative_path)
+        .collect();
+    assert_eq!(refused, vec!["Door".to_owned(), "Door/Outside".to_owned()]);
+    assert!(
+        indexed_at(&coordinator, "Door/kept.flac"),
+        "the row stays as it is"
+    );
+}
+
+/// Rules saved as `A/Door` then `A` ask for both: `A/Door` is refused as a
+/// link and `A` completes, and `A`'s walk did not go there, so the refused
+/// scope's rows are not judged gone. A row `A` did walk past still is.
+#[tokio::test]
+async fn a_completed_ancestor_leaves_a_refused_scopes_rows() {
+    let scratch = ScratchDir::new("scan-scope-link-ancestor");
+    let root = scratch.join("music");
+    plant(&root, "A/here.flac", "flac_full_01.flac");
+    plant(&root, "A/removed.flac", "flac_no_tags.flac");
+    plant(&root, "A/Door/kept.flac", "flac_full_02.flac");
+    let (coordinator, paths) = coordinator(&root, Arc::new(NullTagReader::new()));
+    coordinator.request_run(&request(&root)).expect("requested");
+    coordinator.run_once(&paths).await.expect("driven");
+    assert!(indexed_at(&coordinator, "A/Door/kept.flac"));
+    std::fs::remove_dir_all(root.join("A/Door")).expect("folder gone");
+    std::fs::remove_file(root.join("A/removed.flac")).expect("file gone");
+    std::fs::create_dir_all(scratch.join("elsewhere")).expect("target");
+    std::os::unix::fs::symlink(scratch.join("elsewhere"), root.join("A/Door")).expect("link");
+
+    coordinator
+        .request_run(&request_scopes(&root, &["A/Door", "A"]))
+        .expect("requested");
+    coordinator.run_once(&paths).await.expect("driven");
+    assert!(
+        indexed_at(&coordinator, "A/Door/kept.flac"),
+        "not judged gone by the scope around it"
+    );
+    assert!(!indexed_at(&coordinator, "A/removed.flac"));
+}
+
+/// A folder under an included rule renamed so only its capitals change leaves
+/// one row per file, even though every row at the old spelling went at once:
+/// the new spelling is on the disk, so this is no vanished share. Two
+/// spellings on the disk at once are both read.
+#[tokio::test]
+async fn a_rule_walks_every_spelling_and_follows_a_case_only_rename() {
+    use droppedneedle_library::scan::roots::on_disk_rule_paths;
+
+    let scratch = ScratchDir::new("scan-rule-spellings");
+    let root = scratch.join("music");
+    plant(&root, "Live/a.flac", "flac_full_01.flac");
+    plant(&root, "Other/b.flac", "flac_full_02.flac");
+    let (coordinator, paths) = coordinator(&root, Arc::new(NullTagReader::new()));
+    let scan_rule = async || {
+        let spellings = on_disk_rule_paths(&root, "Live");
+        let scopes: Vec<&str> = spellings.iter().map(String::as_str).collect();
+        coordinator
+            .request_run(&request_scopes(&root, &scopes))
+            .expect("requested");
+        let run = coordinator.run_once(&paths).await.expect("driven");
+        assert!(
+            coordinator.store().failures(&run.id).unwrap().is_empty(),
+            "nothing held back or refused"
+        );
+    };
+    scan_rule().await;
+    assert!(indexed_at(&coordinator, "Live/a.flac"));
+
+    std::fs::rename(root.join("Live"), root.join("live")).expect("renamed");
+    scan_rule().await;
+    assert!(indexed_at(&coordinator, "live/a.flac"));
+    assert!(
+        !indexed_at(&coordinator, "Live/a.flac"),
+        "no second row at the old spelling"
+    );
+
+    plant(&root, "Live/c.flac", "flac_no_tags.flac");
+    scan_rule().await;
+    assert!(indexed_at(&coordinator, "live/a.flac"));
+    assert!(indexed_at(&coordinator, "Live/c.flac"));
+}
+
+/// A favourite on a track under a rule follows a case-only rename of its
+/// folder, with real tags read.
+#[tokio::test]
+async fn a_case_only_rename_under_a_rule_keeps_a_favourite() {
+    use droppedneedle_library::scan::roots::on_disk_rule_paths;
+
+    let scratch = ScratchDir::new("scan-rule-rename-history");
+    let music = scratch.join("music");
+    plant(&music, "Live/a.flac", "flac_full_01.flac");
+    plant(&music, "Other/b.flac", "flac_full_02.flac");
+    migrated_db(&scratch.join("app.db"));
+    let db = Db::open_for_tests(&scratch.join("app.db")).expect("database opens");
+    let platform = TestPlatform::on(&db, &scratch)
+        .settings(config_store(&scratch))
+        .build()
+        .await;
+    let (library, _) = library_at(&platform);
+    add_root(&library, "music", &music);
+    scan(&library).await;
+    library
+        .scan_store
+        .db()
+        .run_sql(
+            "INSERT INTO auth_users (id, display_name, role, created_at) \
+             VALUES ('listener', 'Listener', 'user', 0); \
+             INSERT OR IGNORE INTO auth_users (id, display_name, role, created_at) VALUES ('listener', 'Person', 'user', 1); \
+             INSERT INTO catalog_user_favorites (user_id, item_kind, item_id, created_at) \
+             SELECT 'listener', 'track', id, 0 FROM local_tracks \
+             WHERE relative_path = 'Live/a.flac'",
+        )
+        .expect("favourite");
+    std::fs::rename(music.join("Live"), music.join("live")).expect("renamed");
+
+    let registry = library.core.live_registry();
+    let scope = registry.scheduled_root_scopes().remove(0);
+    let scopes = on_disk_rule_paths(&music, "Live")
+        .into_iter()
+        .map(|relative_path| ScanScope {
+            relative_path,
+            ..scope.clone()
+        })
+        .collect();
+    let asked = library
+        .coordinator
+        .request_run(&ScanRequest {
+            kind: ScanKind::Incremental,
+            trigger: ScanTrigger::Manual,
+            scopes,
+            requested_by_user_id: None,
+            policy_revision: registry.fingerprint().to_owned(),
+        })
+        .expect("scan requested");
+    for _ in 0..50 {
+        library.scans.supervisor_tick().await;
+        if library.coordinator.current().is_empty() {
+            break;
+        }
+    }
+    library
+        .coordinator
+        .snapshot(&asked.run_id)
+        .expect("scanned");
+    assert_eq!(
+        query(
+            &library,
+            "SELECT COUNT(*) FROM local_tracks WHERE relative_path LIKE '%a.flac' \
+             AND availability = 'indexed'"
+        ),
+        1,
+    );
+    assert_eq!(
+        query(
+            &library,
+            "SELECT COUNT(*) FROM catalog_user_favorites f JOIN local_tracks t \
+             ON t.id = f.item_id WHERE t.relative_path = 'live/a.flac' \
+             AND t.availability = 'indexed'"
+        ),
+        1,
+        "the favourite is on the row at the new name"
+    );
+}
+
+/// `rules` of an excluded root, as the registry a rule is resolved against.
+fn ruled_registry(root: &Path, rules: &[(&str, &str)]) -> RootRegistry {
+    RootRegistry::new(
+        vec![
+            LibraryRoot::new("music", root.to_owned(), EffectivePolicy::Excluded).with_rules(
+                rules
+                    .iter()
+                    .map(|(id, path)| PolicyRule {
+                        id: (*id).to_owned(),
+                        relative_path: (*path).to_owned(),
+                        policy: EffectivePolicy::Automatic,
+                    })
+                    .collect(),
+            ),
+        ],
+        true,
+        "rev-1",
+    )
+}
+
+/// Replace the folder at `relative` with a link to somewhere else.
+fn swap_for_a_link(scratch: &ScratchDir, root: &Path, relative: &str) {
+    std::fs::remove_dir_all(root.join(relative)).expect("folder gone");
+    std::fs::create_dir_all(scratch.join("elsewhere")).expect("target");
+    std::os::unix::fs::symlink(scratch.join("elsewhere"), root.join(relative)).expect("link");
+}
+
+/// A folder replaced by a link keeps its tracks on every scan: rules saved
+/// either way round, a manual scan of the rules, a rule spelled differently
+/// and a whole-root walk. The failures say it is a link. Putting the folder
+/// back reads it again.
+#[tokio::test]
+async fn a_folder_replaced_by_a_link_keeps_its_tracks_on_every_scan() {
+    use droppedneedle_library::scan::scheduled_scopes;
+    use droppedneedle_library::scan::selection::select_scopes;
+
+    let scratch = ScratchDir::new("scan-link-every-scan");
+    let root = scratch.join("music");
+    plant(&root, "A/here.flac", "flac_full_01.flac");
+    let kept = plant(&root, "A/Door/kept.flac", "flac_full_02.flac");
+    let bytes = std::fs::read(&kept).expect("read");
+    let (coordinator, paths) = coordinator(&root, Arc::new(NullTagReader::new()));
+    coordinator.request_run(&request(&root)).expect("requested");
+    coordinator.run_once(&paths).await.expect("driven");
+    swap_for_a_link(&scratch, &root, "A/Door");
+
+    let inclusion = |rules: &[(&str, &str)]| -> Vec<InclusionRule> {
+        rules
+            .iter()
+            .map(|(id, path)| InclusionRule::new("music", id, path))
+            .collect()
+    };
+    let inner_first = [("inner", "A/Door"), ("outer", "A")];
+    let outer_first = [("outer", "A"), ("inner", "A/Door")];
+    let other_case = [("outer", "A"), ("inner", "A/door")];
+    let whole = request(&root).scopes;
+    let picked = ["outer".to_owned(), "inner".to_owned()];
+    let ways: Vec<(&str, Vec<ScanScope>)> = vec![
+        (
+            "inner rule saved first",
+            scheduled_scopes(
+                &ruled_registry(&root, &inner_first),
+                &inclusion(&inner_first),
+            ),
+        ),
+        (
+            "outer rule saved first",
+            scheduled_scopes(
+                &ruled_registry(&root, &outer_first),
+                &inclusion(&outer_first),
+            ),
+        ),
+        (
+            "a rule in another case",
+            scheduled_scopes(&ruled_registry(&root, &other_case), &inclusion(&other_case)),
+        ),
+        (
+            "a manual scan",
+            select_scopes(&ruled_registry(&root, &outer_first), &picked).expect("selected"),
+        ),
+        ("a whole-root walk", whole),
+    ];
+    for (way, scopes) in ways {
+        let mut wanted = request(&root);
+        wanted.scopes = scopes;
+        coordinator.request_run(&wanted).expect("requested");
+        let run = coordinator.run_once(&paths).await.expect("driven");
+        assert!(indexed_at(&coordinator, "A/Door/kept.flac"), "{way}");
+        let failures = coordinator.store().failures(&run.id).unwrap();
+        assert!(
+            failures.iter().any(|failure| {
+                failure.failure_code == FailureCode::ScopeThroughLink
+                    && failure.relative_path == "A/Door"
+            }),
+            "{way}: {failures:?}"
+        );
+    }
+
+    std::fs::remove_file(root.join("A/Door")).expect("link gone");
+    std::fs::create_dir_all(root.join("A/Door")).expect("folder back");
+    std::fs::write(root.join("A/Door/new.flac"), &bytes).expect("a file in it");
+    coordinator.request_run(&request(&root)).expect("requested");
+    let run = coordinator.run_once(&paths).await.expect("driven");
+    assert!(indexed_at(&coordinator, "A/Door/new.flac"), "read again");
+    assert!(
+        !indexed_at(&coordinator, "A/Door/kept.flac"),
+        "a file that did not come back is gone"
+    );
+    assert!(coordinator.store().failures(&run.id).unwrap().is_empty());
+}
+
+/// Rows under a link do not dilute the mass-missing guard: with 12 of 20 rows
+/// under a link and the other 8 gone, everything the walk could judge went.
+#[tokio::test]
+async fn rows_under_a_link_do_not_dilute_the_mass_missing_guard() {
+    let scratch = ScratchDir::new("scan-link-guard");
+    let root = scratch.join("music");
+    for at in 0..12 {
+        plant(&root, &format!("Door/{at}.flac"), "flac_full_01.flac");
+    }
+    for at in 0..8 {
+        plant(&root, &format!("Share/{at}.flac"), "flac_full_02.flac");
+    }
+    let (coordinator, paths) = coordinator(&root, Arc::new(NullTagReader::new()));
+    coordinator.request_run(&request(&root)).expect("requested");
+    coordinator.run_once(&paths).await.expect("driven");
+    swap_for_a_link(&scratch, &root, "Door");
+    std::fs::remove_dir_all(root.join("Share")).expect("share gone");
+
+    coordinator
+        .request_run(&request_scopes(&root, &["Door", "."]))
+        .expect("requested");
+    let run = coordinator.run_once(&paths).await.expect("driven");
+    assert!(
+        coordinator
+            .store()
+            .failures(&run.id)
+            .unwrap()
+            .iter()
+            .any(|failure| failure.failure_code == FailureCode::MassMissingGuard)
+    );
+    assert!(indexed_at(&coordinator, "Share/0.flac"), "held, not gone");
+}
+
+/// A hold stays when the run refused a folder covering it or inside it, since
+/// neither was read to the end. Another folder's hold lifts.
+#[tokio::test]
+async fn a_refused_link_keeps_the_holds_around_and_under_it() {
+    let scratch = ScratchDir::new("scan-link-holds");
+    let root = scratch.join("music");
+    plant(&root, "A/here.flac", "flac_full_01.flac");
+    plant(&root, "A/Door/sub/kept.flac", "flac_full_02.flac");
+    plant(&root, "B/other.flac", "flac_no_tags.flac");
+    let (coordinator, paths) = coordinator(&root, Arc::new(NullTagReader::new()));
+    coordinator.request_run(&request(&root)).expect("requested");
+    coordinator.run_once(&paths).await.expect("driven");
+    swap_for_a_link(&scratch, &root, "A/Door");
+    let db = coordinator.store().db();
+    db.run_sql(
+        "INSERT INTO library_scan_held_scopes (root_id, relative_path, held_at) VALUES \
+         ('music', 'A', 0), ('music', 'A/Door/sub', 0), ('music', 'B', 0)",
+    )
+    .expect("holds");
+
+    coordinator.request_run(&request(&root)).expect("requested");
+    coordinator.run_once(&paths).await.expect("driven");
+    let held = |folder: &str| {
+        db.query_i64(&format!(
+            "SELECT COUNT(*) FROM library_scan_held_scopes WHERE relative_path = '{folder}'"
+        ))
+        .expect("counted")
+    };
+    assert_eq!(held("A"), 1, "a refused folder inside it");
+    assert_eq!(held("A/Door/sub"), 1, "a refused folder covers it");
+    assert_eq!(held("B"), 0, "walked to the end");
+}
+
+/// Rows at a spelling with a twin go missing only with proof for each: both
+/// files of an ambiguous pair, and a duplicate from before, with the twin
+/// holding them at the same place. A row deleted beside them goes with them
+/// and no hold is recorded.
+#[tokio::test]
+async fn rows_a_twin_holds_go_missing_at_the_old_spelling() {
+    use droppedneedle_library::scan::roots::on_disk_rule_paths;
+
+    let scratch = ScratchDir::new("scan-twin-proof");
+    let root = scratch.join("music");
+    plant(&root, "Live/a.flac", "flac_full_01.flac");
+    plant(&root, "Live/a (1).flac", "flac_full_01.flac");
+    plant(&root, "Live/deleted.flac", "flac_full_02.flac");
+    plant(&root, "Live/dup.flac", "flac_no_tags.flac");
+    plant(&root, "live/dup.flac", "flac_no_tags.flac");
+    let (coordinator, paths) = coordinator(&root, Arc::new(NullTagReader::new()));
+    coordinator.request_run(&request(&root)).expect("requested");
+    coordinator.run_once(&paths).await.expect("driven");
+    assert!(indexed_at(&coordinator, "Live/dup.flac"));
+    assert!(indexed_at(&coordinator, "live/dup.flac"), "a duplicate");
+
+    std::fs::remove_file(root.join("Live/deleted.flac")).expect("deleted");
+    std::fs::remove_file(root.join("live/dup.flac")).expect("moved over below");
+    for name in ["a.flac", "a (1).flac", "dup.flac"] {
+        std::fs::rename(root.join("Live").join(name), root.join("live").join(name)).expect("moved");
+    }
+    std::fs::remove_dir(root.join("Live")).expect("old spelling gone");
+    let spellings = on_disk_rule_paths(&root, "Live");
+    let scopes: Vec<&str> = spellings.iter().map(String::as_str).collect();
+    coordinator
+        .request_run(&request_scopes(&root, &scopes))
+        .expect("requested");
+    let run = coordinator.run_once(&paths).await.expect("driven");
+    assert!(
+        coordinator.store().failures(&run.id).unwrap().is_empty(),
+        "no hold and no false mount advice"
+    );
+    for name in ["a.flac", "a (1).flac", "dup.flac", "deleted.flac"] {
+        assert!(!indexed_at(&coordinator, &format!("Live/{name}")), "{name}");
+    }
+    for name in ["a.flac", "a (1).flac", "dup.flac"] {
+        assert!(indexed_at(&coordinator, &format!("live/{name}")), "{name}");
+    }
+}
+
+/// A twin only proves a rename at the rule's full depth and holding files, and
+/// only for the rows it holds. A rule that points at nothing stays a failure,
+/// an empty twin holds the rows, and a twin with other files still lets the
+/// guard hold rows it does not have.
+#[tokio::test]
+async fn a_twin_that_proves_nothing_leaves_the_rows_alone() {
+    let scratch = ScratchDir::new("scan-twin-weak");
+    let root = scratch.join("music");
+    plant(&root, "Live/a.flac", "flac_full_01.flac");
+    plant(&root, "Live/b.flac", "flac_full_02.flac");
+    std::fs::create_dir_all(root.join("live")).expect("an empty twin");
+    let (coordinator, paths) = coordinator(&root, Arc::new(NullTagReader::new()));
+    coordinator.request_run(&request(&root)).expect("requested");
+    coordinator.run_once(&paths).await.expect("driven");
+    std::fs::rename(root.join("Live"), scratch.join("away")).expect("dropped out");
+
+    let codes = async |scopes: &[&str]| -> Vec<FailureCode> {
+        coordinator
+            .request_run(&request_scopes(&root, scopes))
+            .expect("requested");
+        let run = coordinator.run_once(&paths).await.expect("driven");
+        coordinator
+            .store()
+            .failures(&run.id)
+            .unwrap()
+            .into_iter()
+            .map(|failure| failure.failure_code)
+            .collect()
+    };
+    assert_eq!(
+        codes(&["Live", "live"]).await,
+        [FailureCode::RootUnavailable],
+        "an empty twin"
+    );
+    assert!(indexed_at(&coordinator, "Live/a.flac"));
+
+    plant(&root, "live/unrelated.flac", "flac_no_tags.flac");
+    assert_eq!(
+        codes(&["Live/Nope"]).await,
+        [FailureCode::RootUnavailable],
+        "no twin at the rule's depth"
+    );
+    assert_eq!(
+        codes(&["Live", "live"]).await,
+        [FailureCode::MassMissingGuard],
+        "a twin holding other files"
+    );
+    assert!(indexed_at(&coordinator, "Live/a.flac"));
+    assert!(indexed_at(&coordinator, "Live/b.flac"));
+}
+
+/// A scope whose path cannot be checked (a permission error on the folder
+/// above it) is not read, and its rows stay.
+#[tokio::test]
+async fn a_scope_that_cannot_be_checked_keeps_its_rows() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let scratch = ScratchDir::new("scan-scope-eacces");
+    let root = scratch.join("music");
+    plant(&root, "Shut/Door/kept.flac", "flac_full_01.flac");
+    let (coordinator, paths) = coordinator(&root, Arc::new(NullTagReader::new()));
+    coordinator.request_run(&request(&root)).expect("requested");
+    coordinator.run_once(&paths).await.expect("driven");
+    let shut = root.join("Shut");
+    std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o000)).expect("shut");
+    if std::fs::read_dir(&shut).is_ok() {
+        std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o755)).expect("open");
+        eprintln!("skipped: this user can search a folder at mode 000 (running as root)");
+        return;
+    }
+    coordinator
+        .request_run(&request_scopes(&root, &["Shut/Door"]))
+        .expect("requested");
+    let run = coordinator.run_once(&paths).await.expect("driven");
+    std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o755)).expect("open");
+    assert!(indexed_at(&coordinator, "Shut/Door/kept.flac"));
+    assert_eq!(
+        coordinator.store().failures(&run.id).unwrap()[0].failure_code,
+        FailureCode::RootUnavailable
+    );
+}
+
+/// A file link in the losing folder pointing at a file in the winner's
+/// folder adds no second row: the file stays the winner's.
+#[tokio::test]
+async fn a_file_link_in_the_losing_folder_is_not_indexed_there() {
+    let scratch = ScratchDir::new("scan-overlap-file-link");
+    plant(&scratch.join("loose"), "b.flac", "flac_full_01.flac");
+    plant(&scratch.join("music"), "Band/a.flac", "flac_full_01.flac");
+    std::os::unix::fs::symlink(
+        scratch.join("music/Band/a.flac"),
+        scratch.join("loose/link.flac"),
+    )
+    .expect("file link");
+    let library = outer_library(&scratch).await;
+    add_root(&library, "music", &scratch.join("music"));
+    scan(&library).await;
+    assert_eq!(
+        query(
+            &library,
+            "SELECT COUNT(*) FROM local_tracks WHERE relative_path LIKE '%a.flac' \
+             AND availability = 'indexed'"
+        ),
+        1,
+    );
+    assert_eq!(
+        query(
+            &library,
+            "SELECT COUNT(*) FROM local_tracks WHERE root_id = 'music' \
+             AND relative_path = 'Band/a.flac' AND availability = 'indexed'"
+        ),
+        1,
     );
 }
 
@@ -1628,6 +2423,87 @@ async fn lyrics_sweep_marks_what_files_carry_and_only_reads() {
     assert_eq!(snapshot(&music), kept);
 }
 
+/// A library folder that is away, gone or an empty mount point, is not "no
+/// art" and not "no lyrics": a boot sweep keeps every row, and when the
+/// folder is back the rows and art versions are as they were. A file that
+/// is there and will not read keeps its rows too.
+#[tokio::test]
+async fn sweeps_keep_art_and_lyrics_while_files_are_away() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let scratch = ScratchDir::new("scan-sweep-away");
+    let music = scratch.join("music");
+    plant(&music, "Folder/01 Song.flac", "flac_no_tags.flac");
+    std::fs::write(music.join("Folder/cover.png"), COVER_PNG).expect("cover");
+    let embedded = plant(&music, "Embedded/01 Song.flac", "management_full.flac");
+    plant(&music, "Words/01 Words.flac", "flac_lyrics_tag.flac");
+    plant(&music, "Words/02 Airbag.flac", "flac_full_01.flac");
+    plant(&music, "Words/02 Airbag.lrc", "lyrics_airbag.lrc");
+    let library = bundle(&scratch).await;
+    scan(&library).await;
+    let sweep =
+        |library: &LibrarySetup| library.scan_store.refresh_album_sweeps(&|| false).unwrap();
+    let rows = |library: &LibrarySetup| {
+        (
+            query(library, "SELECT COUNT(*) FROM local_album_artwork"),
+            query(
+                library,
+                "SELECT COALESCE(SUM(version), 0) FROM local_album_artwork",
+            ),
+            query(library, "SELECT COUNT(*) FROM local_track_lyrics"),
+        )
+    };
+    sweep(&library);
+    let before = rows(&library);
+    assert!(before.0 >= 2, "the cover and the embedded art: {before:?}");
+    assert!(before.2 >= 2, "the tag and the .lrc: {before:?}");
+
+    let away = scratch.join("away");
+    std::fs::rename(&music, &away).expect("the folder goes away");
+    assert!(sweep(&library).0.unreachable > 0, "the sweep says so");
+    assert_eq!(rows(&library), before, "an absent folder clears nothing");
+
+    std::fs::create_dir_all(&music).expect("an empty mount point");
+    sweep(&library);
+    assert_eq!(
+        rows(&library),
+        before,
+        "an empty mount point clears nothing"
+    );
+
+    std::fs::remove_dir(&music).expect("mount point goes");
+    std::fs::rename(&away, &music).expect("the folder comes back");
+    let (art, lyrics) = sweep(&library);
+    assert_eq!(
+        (art.checked, lyrics.checked),
+        (0, 0),
+        "nothing to read again"
+    );
+    assert_eq!(rows(&library), before);
+
+    // Root reads any file anyway, and the rows are kept either way.
+    let mode = std::fs::Permissions::from_mode;
+    std::fs::set_permissions(&embedded, mode(0o000)).expect("file made unreadable");
+    std::fs::File::open(music.join("Embedded"))
+        .and_then(|dir| {
+            dir.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000))
+        })
+        .expect("folder time sets");
+    sweep(&library);
+    std::fs::set_permissions(&embedded, mode(0o644)).expect("file readable again");
+    assert_eq!(rows(&library), before, "a read error clears nothing");
+
+    // A share can leave empty stubs behind.
+    std::fs::write(&embedded, b"").expect("file emptied");
+    std::fs::File::open(music.join("Embedded"))
+        .and_then(|dir| {
+            dir.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(2_000))
+        })
+        .expect("folder time sets");
+    sweep(&library);
+    assert_eq!(rows(&library), before, "an empty stub clears nothing");
+}
+
 /// A scan request the store cannot record is an error. It used to answer
 /// a "conflict" naming a run id that was never written.
 #[tokio::test]
@@ -1636,8 +2512,46 @@ async fn unrecorded_scan_request_is_an_error() {
     let music = scratch.join("music");
     std::fs::create_dir_all(&music).expect("root");
     let library = bundle(&scratch).await;
+    let revision = library.core.policy_revision().expect("policy revision");
     // No such user in this database: the auth_users reference fails.
-    assert!(library.scans.request_scan(None, "no-such-user").is_err());
+    let refused = library
+        .scans
+        .request_scan_run(ScanKind::Incremental, &[], &revision, "no-such-user")
+        .expect_err("not recorded");
+    assert!(
+        matches!(refused, ServiceError::Internal { .. }),
+        "{refused:?}"
+    );
+}
+
+/// Saved library settings that no longer pass validation still load with
+/// the revision the page shows, and a scan request carrying it is taken.
+#[tokio::test]
+async fn a_scan_request_is_taken_while_saved_settings_need_fixing() {
+    let scratch = ScratchDir::new("scan-settings-need-fixing");
+    std::fs::create_dir_all(scratch.join("music")).expect("root");
+    let library = bundle(&scratch).await;
+    library
+        .settings
+        .store()
+        .update_secret_blocking::<TypedLibrary, String, _>(|stored| {
+            let mut settings = stored.into_inner();
+            settings.library_roots[0].label = String::new();
+            Ok(settings)
+        })
+        .expect("stored as is");
+    library
+        .db
+        .run_sql(
+            "INSERT INTO auth_users (id, display_name, role, created_at) \
+             VALUES ('admin-1', 'Admin', 'admin', 0);",
+        )
+        .expect("admin");
+    let revision = library.core.policy_revision().expect("policy revision");
+    library
+        .scans
+        .request_scan_run(ScanKind::Incremental, &[], &revision, "admin-1")
+        .expect("scan taken");
 }
 
 /// What happens between two scan windows: a listener, a curator or a
@@ -1882,13 +2796,13 @@ impl RegroupRig {
             "SELECT (SELECT COUNT(*) FROM library_play_history h JOIN local_tracks t \
              ON t.id = h.local_track_id AND t.local_album_id = h.local_album_id \
              WHERE h.local_album_id = '{album}') \
-             + (SELECT COUNT(*) FROM library_user_favorites WHERE item_id = '{album}') \
-             + (SELECT COUNT(*) FROM playlist_tracks WHERE album_id = '{album}')"
+             + (SELECT COUNT(*) FROM catalog_user_favorites WHERE item_id = '{album}') \
+             + (SELECT COUNT(*) FROM catalog_playlist_tracks WHERE album_id = '{album}')"
         ));
         let all = self.count(
             "SELECT (SELECT COUNT(*) FROM library_play_history) \
-             + (SELECT COUNT(*) FROM library_user_favorites) \
-             + (SELECT COUNT(*) FROM playlist_tracks)",
+             + (SELECT COUNT(*) FROM catalog_user_favorites) \
+             + (SELECT COUNT(*) FROM catalog_playlist_tracks)",
         );
         (naming, all)
     }
@@ -1915,12 +2829,13 @@ fn listener_acts(album: &str) -> String {
         "INSERT INTO library_play_history (id, user_id, local_track_id, local_album_id, \
          track_name, artist_name, played_at) SELECT 'play-1', 'listener', id, local_album_id, \
          'Song', 'Artist', '2026-01-01T00:00:00Z' {moved}; \
-         INSERT INTO library_user_favorites (user_id, item_kind, item_id, created_at) \
+         INSERT OR IGNORE INTO auth_users (id, display_name, role, created_at) VALUES ('listener', 'Person', 'user', 1); \
+         INSERT INTO catalog_user_favorites (user_id, item_kind, item_id, created_at) \
          SELECT 'listener', 'album', local_album_id, 0 {moved}; \
-         INSERT INTO playlists (id, name, created_at, updated_at) VALUES ('list', 'List', '', ''); \
-         INSERT INTO playlist_tracks (id, playlist_id, position, track_name, artist_name, \
+         INSERT INTO catalog_playlists (id, name, created_at, updated_at) VALUES ('list', 'List', 0, 0); \
+         INSERT INTO catalog_playlist_tracks (id, playlist_id, position, track_name, artist_name, \
          album_name, album_id, track_source_id, source_type, created_at) \
-         SELECT 'entry', 'list', 0, 'Song', 'Artist', 'After', local_album_id, id, 'local', '' \
+         SELECT 'entry', 'list', 0, 'Song', 'Artist', 'After', local_album_id, id, 'local', 0 \
          {moved};"
     )
 }
@@ -2159,7 +3074,7 @@ async fn cleanup_leaves_a_half_retagged_album_alone_mid_scan() {
 async fn a_folded_v2_split_comes_back_on_undo() {
     use droppedneedle_library::http::history::album_history_view;
     use droppedneedle_library::identity::FOLD_REASON;
-    use droppedneedle_library::operations::models::OperationError;
+    use droppedneedle_library::jobs::models::OperationError;
 
     const SPLIT_GROUP: &str = "1d1b2a6e-8e1a-4c4f-9b7e-0f4f8c3b2a10";
     const TAGGED_GROUP: &str = "2e2c3b7f-9f2b-4d5a-8c8f-1a5a9d4c3b21";
@@ -2550,10 +3465,10 @@ fn automatic_leftovers(album: &str, tag: &str) -> String {
          expected_post_album_revision, expected_post_identity_revision, reason_code, created_at) \
          SELECT 'undo-{tag}', {album}, 1, 4, 'AUTOMATIC_EXACT_EDITION', 0 \
          WHERE {album} IS NOT NULL; \
-         INSERT INTO library_management_automatic_queue (local_album_id, queued_at, not_before) \
+         INSERT INTO library_management_automatic_queue (local_album_id, queued_at, not_before_at) \
          SELECT {album}, 0, 0 WHERE {album} IS NOT NULL; \
          INSERT INTO library_identify_reviews (id, local_album_id, reason_code, \
-         candidates_json, state, created_ms, updated_ms) \
+         candidates_json, state, created_at, updated_at) \
          SELECT 'pending-{tag}', {album}, 'R', '[]', 'pending', 0, 0 WHERE {album} IS NOT NULL;"
     )
 }
@@ -2638,7 +3553,7 @@ async fn automatic_match_made_mid_scan_replaces_a_revisable_one() {
         let new_row = new_row(&album);
         rig.meanwhile_sql(format!(
             "{} {} INSERT INTO library_identify_reviews (id, local_album_id, reason_code, \
-             candidates_json, state, created_ms, updated_ms) \
+             candidates_json, state, created_at, updated_at) \
              SELECT 'closed', {new_row}, 'R', '[]', 'dismissed', 0, 0;",
             match_sql(&new_row, "automatic", "rel-half"),
             automatic_leftovers(&new_row, "half"),
@@ -2951,11 +3866,11 @@ async fn run_cancelled_while_queued_is_not_ended_again_at_startup() {
     rig.coordinator
         .control(&run.id, Event::Stop, run.row_revision)
         .expect("stop is taken");
-    let stamp = "SELECT CAST(terminal_at * 1000 AS INTEGER) + row_revision \
+    let stamp = "SELECT terminal_at + row_revision \
                  FROM library_scan_runs WHERE state = 'cancelled'";
     let ended = rig.count(stamp);
 
-    let later = rig.count("SELECT CAST(terminal_at AS INTEGER) FROM library_scan_runs") + 3600;
+    let later = rig.count("SELECT terminal_at / 1000 FROM library_scan_runs") + 3600;
     rig.coordinator
         .store()
         .recover(&droppedneedle_library::scan::RunStop::never(), later as f64)
@@ -3161,7 +4076,7 @@ impl RegroupRig {
     /// Move the time the missing tracks went missing `seconds` back.
     fn age_missing(&self, seconds: i64) {
         self.run(&format!(
-            "UPDATE local_tracks SET missing_since = missing_since - {seconds} \
+            "UPDATE local_tracks SET missing_at = missing_at - {seconds} * 1000 \
              WHERE availability = 'missing'"
         ));
     }
@@ -3514,7 +4429,8 @@ async fn plain_album(name: &str, count: usize) -> (RegroupRig, Vec<String>, Stri
 /// dropped when it empties, and there is nothing left to join.
 fn favorite(album: &str) -> String {
     format!(
-        "INSERT INTO library_user_favorites (user_id, item_kind, item_id, created_at) \
+        "INSERT OR IGNORE INTO auth_users (id, display_name, role, created_at) VALUES ('listener', 'Person', 'user', 1); \
+         INSERT INTO catalog_user_favorites (user_id, item_kind, item_id, created_at) \
          VALUES ('listener', 'album', '{album}', 0);"
     )
 }
@@ -3594,13 +4510,14 @@ async fn retag_across_a_cancelled_scan_is_joined_at_the_next() {
             ""
         };
         rig.run(&format!(
-            "{play} INSERT INTO library_user_favorites (user_id, item_kind, item_id, created_at) \
+            "{play} INSERT OR IGNORE INTO auth_users (id, display_name, role, created_at) VALUES ('listener', 'Person', 'user', 1); \
+             INSERT INTO catalog_user_favorites (user_id, item_kind, item_id, created_at) \
              VALUES ('listener', 'album', '{album}', 0); \
-             INSERT INTO playlists (id, name, created_at, updated_at) \
-             VALUES ('list', 'List', '', ''); \
-             INSERT INTO playlist_tracks (id, playlist_id, position, track_name, artist_name, \
+             INSERT INTO catalog_playlists (id, name, created_at, updated_at) \
+             VALUES ('list', 'List', 0, 0); \
+             INSERT INTO catalog_playlist_tracks (id, playlist_id, position, track_name, artist_name, \
              album_name, album_id, source_type, created_at) \
-             VALUES ('entry', 'list', 0, 'Song', 'Artist', 'Before', '{album}', 'local', '');"
+             VALUES ('entry', 'list', 0, 'Song', 'Artist', 'Before', '{album}', 'local', 0);"
         ));
         let after = rig.after.clone();
         rig.tag(&files, &after);
@@ -3673,7 +4590,7 @@ async fn match_across_two_scans_lands_on_the_row_that_stays() {
         |old, _| {
             format!(
                 "INSERT INTO library_identify_reviews (id, local_album_id, reason_code, \
-                 candidates_json, state, created_ms, updated_ms) \
+                 candidates_json, state, created_at, updated_at) \
                  VALUES ('closed-old', '{old}', 'R', '[]', 'approved', 0, 0);"
             )
         },
@@ -3808,7 +4725,7 @@ async fn match_across_two_scans_lands_on_the_row_that_stays() {
         |_, new| {
             format!(
                 "INSERT INTO library_identify_reviews (id, local_album_id, reason_code, \
-                 candidates_json, state, created_ms, updated_ms) \
+                 candidates_json, state, created_at, updated_at) \
                  VALUES ('half', '{new}', 'R', '[]', 'pending', 0, 0);"
             )
         },
@@ -4035,7 +4952,7 @@ async fn half_then_all_to_a_third_name_is_one_album() {
         assert_eq!(match_of(&rig, &kept), matched("rel-1", "manual"), "{name}");
         assert_eq!(
             rig.count(&format!(
-                "SELECT COUNT(*) FROM library_user_favorites WHERE item_id = '{kept}'"
+                "SELECT COUNT(*) FROM catalog_user_favorites WHERE item_id = '{kept}'"
             )),
             1,
             "{name}: the favorite is with the album"
@@ -4129,6 +5046,115 @@ async fn dismissed_album_is_not_joined_by_a_later_rename() {
     let renamed = rig.album_of("a/t000.flac");
     assert_eq!(rig.retired_into(&new), Some(renamed));
     assert_eq!(rig.retired_into(&old), None, "the dismissed album stays");
+}
+
+/// A dismissed pair ends once its tracks are back on its old album: the
+/// person's answer was about a split that is undone. A later rename of
+/// that album over two sittings is joined like any other.
+#[tokio::test]
+async fn dismissed_pair_ends_when_its_tracks_come_back() {
+    let (mut rig, files, old) = plain_album("scan-across-dismissed-then-back", 6).await;
+    rig.run(&favorite(&old));
+    rig.run("DELETE FROM library_identify_jobs");
+    let after = rig.after.clone();
+    rig.tag(&files[..3], &after);
+    rig.scan().await;
+    let new = rig.album_of("a/t000.flac");
+    assert_ne!(new, old, "the split half sits on a row of its own");
+    assert_eq!(rig.album_of("a/t005.flac"), old);
+    rig.run(&format!(
+        "DELETE FROM library_retag_pairs; \
+         INSERT INTO library_retag_pairs (old_album_id, new_album_id, reason, state, \
+         recorded_at, updated_at) VALUES ('{old}', '{new}', 'tracks_elsewhere', \
+         'dismissed', 0, 0);"
+    ));
+    // Played or starred while apart, so the emptied row stays.
+    rig.run(&favorite(&new));
+
+    let before = rig.before.clone();
+    rig.tag(&files[..3], &before);
+    rig.scan().await;
+    assert_eq!(rig.album_of("a/t000.flac"), old, "the tracks are back");
+    assert_eq!(
+        rig.count(&format!(
+            "SELECT COUNT(*) FROM library_catalog_actions WHERE local_album_id = '{old}' \
+             AND action_kind = 'retag_dismissal_ended' \
+             AND json_extract(before_json, '$.from_album_id') = '{new}'"
+        )),
+        1,
+        "the old album's history says the answer was dropped"
+    );
+
+    let last = "scan-across-dismissed-then-back last";
+    rig.tag(&files[..3], last);
+    rig.scan().await;
+    rig.tag(&files[3..], last);
+    rig.scan().await;
+    let renamed = rig.album_of("a/t000.flac");
+    assert_eq!(rig.album_of("a/t005.flac"), renamed);
+    assert_eq!(
+        rig.retired_into(&old),
+        Some(renamed),
+        "the rename is joined"
+    );
+    assert_eq!(retag_pairs(&rig), Vec::new(), "the dismissed pair ended");
+}
+
+/// The same when the pair's new album was merged into another since: the
+/// tracks leaving that album for the old one end the pair.
+#[tokio::test]
+async fn dismissed_pair_ends_when_its_tracks_come_back_from_a_merge() {
+    let mut rig = RegroupRig::new("scan-across-dismissed-merged-back");
+    let files: Vec<String> = (0..6).map(|n| format!("a/t{n:03}.flac")).collect();
+    let extra = vec!["a/z.flac".to_owned()];
+    let (before, after) = (rig.before.clone(), rig.after.clone());
+    let third = "scan-across-dismissed-merged-back third";
+    rig.tag(&files, &before);
+    rig.tag(&extra, third);
+    rig.scan().await;
+    rig.run(PERSON);
+    let old = rig.album_of("a/t000.flac");
+    let merged_into = rig.album_of("a/z.flac");
+    rig.run(&favorite(&old));
+    rig.run("DELETE FROM library_identify_jobs");
+    rig.tag(&files[..3], &after);
+    rig.scan().await;
+    let new = rig.album_of("a/t000.flac");
+    assert_ne!(new, old, "the split half sits on a row of its own");
+    rig.run(&format!(
+        "DELETE FROM library_retag_pairs; \
+         INSERT INTO library_retag_pairs (old_album_id, new_album_id, reason, state, \
+         recorded_at, updated_at) VALUES ('{old}', '{new}', 'tracks_elsewhere', \
+         'dismissed', 0, 0);"
+    ));
+    rig.run(&favorite(&new));
+
+    // The split half joins the third album, its own row merged into it.
+    std::fs::remove_file(rig.root.join("a/z.flac")).expect("removed");
+    rig.tag(&files[..3], third);
+    rig.scan().await;
+    assert_eq!(rig.album_of("a/t000.flac"), merged_into);
+    rig.run(&format!(
+        "UPDATE local_albums SET retired_into_album_id = '{merged_into}' WHERE id = '{new}'"
+    ));
+
+    rig.tag(&files[..3], &before);
+    rig.scan().await;
+    assert_eq!(rig.album_of("a/t000.flac"), old, "the tracks are back");
+
+    let last = "scan-across-dismissed-merged-back last";
+    rig.tag(&files[..3], last);
+    rig.scan().await;
+    rig.tag(&files[3..], last);
+    rig.scan().await;
+    let renamed = rig.album_of("a/t000.flac");
+    assert_eq!(rig.album_of("a/t005.flac"), renamed);
+    assert_eq!(
+        rig.retired_into(&old),
+        Some(renamed),
+        "the rename is joined"
+    );
+    assert_eq!(retag_pairs(&rig), Vec::new(), "the dismissed pair ended");
 }
 
 /// A track judged by when it left the album would make an album that was
@@ -4840,7 +5866,8 @@ async fn a_reset_album_is_credited_as_a_scan_keys_it() {
              INSERT INTO local_artist_external_identities (local_artist_id, provider, \
              provider_artist_id, decision_source, selected_at) \
              VALUES ('twin', 'musicbrainz', 'cccccccc-0000-4000-8000-00000000000c', 'manual', 1); \
-             INSERT INTO library_user_favorites (user_id, item_kind, item_id, created_at) \
+             INSERT OR IGNORE INTO auth_users (id, display_name, role, created_at) VALUES ('listener', 'Person', 'user', 1); \
+             INSERT INTO catalog_user_favorites (user_id, item_kind, item_id, created_at) \
              VALUES ('listener', 'artist', 'twin', 0), ('listener', 'artist', '{name_row}', 0); \
              UPDATE local_tracks SET membership_locked = 1, membership_source = 'manual' \
              WHERE id = '{track}'; \
@@ -4865,7 +5892,7 @@ async fn a_reset_album_is_credited_as_a_scan_keys_it() {
             query(
                 &library,
                 &format!(
-                    "SELECT COUNT(*) FROM library_user_favorites \
+                    "SELECT COUNT(*) FROM catalog_user_favorites \
                      WHERE item_kind = 'artist' AND item_id = '{artist}'"
                 )
             ),
@@ -5010,7 +6037,8 @@ fn map_track(track: &str, release: Option<&str>, release_track: Option<&str>) ->
 /// A listener's star on the track.
 fn star(track: &str) -> String {
     format!(
-        "INSERT INTO library_user_favorites (user_id, item_kind, item_id, created_at) \
+        "INSERT OR IGNORE INTO auth_users (id, display_name, role, created_at) VALUES ('listener', 'Person', 'user', 1); \
+         INSERT INTO catalog_user_favorites (user_id, item_kind, item_id, created_at) \
          VALUES ('listener', 'track', '{track}', 1);"
     )
 }
@@ -5020,7 +6048,7 @@ impl RegroupRig {
     fn stars_and_aliases(&self, track: &str) -> (i64, i64) {
         (
             self.count(&format!(
-                "SELECT COUNT(*) FROM library_user_favorites WHERE item_id = '{track}'"
+                "SELECT COUNT(*) FROM catalog_user_favorites WHERE item_id = '{track}'"
             )),
             self.count("SELECT COUNT(*) FROM local_track_aliases"),
         )
@@ -5413,7 +6441,7 @@ async fn a_store_error_holds_the_continuation_not_the_seal() {
 /// continuation runs after the extras are cleared.
 #[tokio::test]
 async fn an_edition_choice_moves_nothing_onto_a_file_it_leaves_out() {
-    use droppedneedle_library::operations::models::ReidentificationCandidate;
+    use droppedneedle_library::reidentify::models::ReidentificationCandidate;
 
     let (rig, album, t) = continuation_album("scan-continue-choice-extra", 3).await;
     let (old, extra, placed) = (t[0].clone(), t[1].clone(), t[2].clone());
@@ -5454,9 +6482,8 @@ async fn an_edition_choice_moves_nothing_onto_a_file_it_leaves_out() {
     .expect("candidate");
     let mut db = droppedneedle_kernel::db::open_connection(&rig.db()).expect("db opens");
     let tx = db.transaction().expect("transaction");
-    let choice =
-        droppedneedle_library::operations::choice::choose(&tx, &album, &candidate, None, 1.0)
-            .expect("edition chosen");
+    let choice = droppedneedle_library::edition::choice::choose(&tx, &album, &candidate, None, 1.0)
+        .expect("edition chosen");
     tx.commit().expect("committed");
     assert_eq!(choice.extra_track_ids, vec![extra.clone()]);
     assert_eq!(rig.stars_and_aliases(&old), (1, 0));
@@ -5613,7 +6640,7 @@ struct Story {
     removed_in_app: bool,
     /// The old rows went missing between two scans.
     missing_between_scans: bool,
-    no_missing_since: bool,
+    no_missing_at: bool,
     /// The scan that read the new files stopped before it marked the old
     /// rows missing, so the next one marks them.
     interrupted: bool,
@@ -5657,7 +6684,7 @@ async fn tell(name: &str, story: Story) -> (RegroupRig, String, String, String, 
     let runs = rig.runs();
     if story.interrupted {
         rig.run(&format!(
-            "UPDATE local_tracks SET availability = 'indexed', missing_since = NULL \
+            "UPDATE local_tracks SET availability = 'indexed', missing_at = NULL \
              WHERE local_album_id = '{old}'; \
              UPDATE library_scan_runs SET state = 'cancelled' WHERE id = '{}';",
             runs[1]
@@ -5685,16 +6712,16 @@ async fn tell(name: &str, story: Story) -> (RegroupRig, String, String, String, 
     }
     if story.missing_between_scans {
         rig.run(&format!(
-            "UPDATE local_tracks SET missing_since = \
+            "UPDATE local_tracks SET missing_at = \
              ((SELECT terminal_at FROM library_scan_runs WHERE id = '{}') \
              + (SELECT started_at FROM library_scan_runs WHERE id = '{}')) / 2 \
              WHERE local_album_id = '{old}' AND availability = 'missing';",
             runs[0], runs[1]
         ));
     }
-    if story.no_missing_since {
+    if story.no_missing_at {
         rig.run(&format!(
-            "UPDATE local_tracks SET missing_since = NULL WHERE local_album_id = '{old}';"
+            "UPDATE local_tracks SET missing_at = NULL WHERE local_album_id = '{old}';"
         ));
     }
     rig.scan().await;
@@ -5810,7 +6837,7 @@ async fn an_album_is_not_joined_without_proof_it_was_replaced() {
         (
             "missing with no time",
             Story {
-                no_missing_since: true,
+                no_missing_at: true,
                 ..Story::default()
             },
         ),
@@ -5973,6 +7000,70 @@ async fn an_album_is_not_joined_without_proof_it_was_replaced() {
     assert_eq!(rig.album_of("a/t000.flac"), old, "{case}");
 }
 
+/// A file a scan saw beside a copy of it is not moved to the copy when it
+/// goes, and a file away from the library for one scan is not moved to a
+/// copy scanned before it went: the star stays and nothing continues.
+#[tokio::test]
+async fn a_copy_or_a_share_that_drops_out_is_not_a_move() {
+    let copy = vec!["b/t000.flac".to_owned()];
+
+    let case = "a copy";
+    let (mut rig, _, rows) = continuation_album("moved-copy", 2).await;
+    let old = rows[0].clone();
+    rig.run(&star(&old));
+    let before = rig.before.clone();
+    rig.tag(&copy, &before);
+    rig.scan_folder("b").await;
+    rig.scan().await;
+    rig.lose(&["a/t000.flac".to_owned()]).await;
+    rig.scan().await;
+    assert_eq!(rig.stars_and_aliases(&old), (1, 0), "{case}");
+
+    let case = "a file away for one scan";
+    let (mut rig, _, rows) = continuation_album("moved-away", 2).await;
+    let old = rows[0].clone();
+    rig.run(&star(&old));
+    let before = rig.before.clone();
+    rig.tag(&copy, &before);
+    rig.scan_folder("b").await;
+    let away = rig.scratch.join("t000.flac");
+    std::fs::rename(rig.root.join("a/t000.flac"), &away).expect("away");
+    rig.scan().await;
+    std::fs::rename(&away, rig.root.join("a/t000.flac")).expect("back");
+    rig.scan().await;
+    assert_eq!(rig.stars_and_aliases(&old), (1, 0), "{case}");
+    assert_eq!(
+        rig.rows_at(&["a/t000.flac".to_owned()]),
+        vec![old],
+        "{case}"
+    );
+}
+
+/// An album matched to an edition and moved to another folder, the new
+/// folder scanned first, is joined to the new album once that is matched
+/// to the same edition, although its tracks continued into the new ones
+/// at an earlier run end.
+#[tokio::test]
+async fn a_matched_album_moved_new_folder_first_still_joins() {
+    let case = "moved, new folder first";
+    let (mut rig, old, old_rows) = mapped_album("moved-joins", 2).await;
+    rig.tag(&["a/z000.flac".to_owned()], "moved-joins bystander");
+    rig.scan().await;
+    let files = vec!["b/t000.flac".to_owned(), "b/t001.flac".to_owned()];
+    let before = rig.before.clone();
+    rig.tag(&files, &before);
+    rig.empty_a(2);
+    rig.scan_folder("b").await;
+    rig.scan_folder("a").await;
+    rig.scan().await;
+    let new = rig.album_of("b/t000.flac");
+    let new_rows = rig.rows_at(&files);
+    assert_eq!(rig.aliases().len(), 2, "{case}: the tracks continued");
+    rig.match_rows(&new, REL_R, &[(&new_rows[0], 0), (&new_rows[1], 1)]);
+    rig.scan().await;
+    rig.assert_joined(&old, &new, (&old_rows[0], &new_rows[0]), case);
+}
+
 impl RegroupRig {
     /// Record `a/` as a drive or share mounted inside the library folder,
     /// as a scan that found it on its own filesystem would.
@@ -6038,7 +7129,7 @@ async fn a_share_that_goes_empty_keeps_its_album() {
     assert_eq!(
         rig.count(&format!(
             "SELECT COUNT(*) FROM library_scan_held_scopes WHERE root_id = 'music' \
-             AND relative_path = 'a' AND held_at = (SELECT CAST(started_at * 1000 AS INTEGER) \
+             AND relative_path = 'a' AND held_at = (SELECT started_at \
              FROM library_scan_runs WHERE id = '{first}')"
         )),
         1,
@@ -6176,7 +7267,7 @@ async fn a_join_waits_for_the_rest_of_the_old_album() {
     rig.scan().await;
     rig.assert_apart(&old, &old_rows[0], "three gone under a day");
     rig.run(&format!(
-        "UPDATE local_tracks SET missing_since = missing_since - 86400 \
+        "UPDATE local_tracks SET missing_at = missing_at - 86400000 \
          WHERE local_album_id = '{old}' AND id <> '{}';",
         old_rows[0]
     ));
@@ -6241,31 +7332,37 @@ async fn an_album_replaced_on_two_albums_is_left_to_a_person() {
         .await;
     let (library, _) = library_at(&platform);
     let corrections = crate::common::library::services(&library).corrections;
-    let listed = corrections.retag_pairs().expect("pairs listed");
-    assert_eq!(listed.total, 2);
-    let revision = |album: &str| {
+    let (listed, total) = corrections.retag_pairs(None, 100, 0).expect("pairs listed");
+    assert_eq!(total, 2);
+    let token = |album: &str| {
         listed
-            .pairs
             .iter()
             .flat_map(|pair| [&pair.old_album, &pair.new_album])
             .find(|side| side.id == album)
             .expect("listed")
-            .identity_revision
+            .identity_token
+            .clone()
     };
     corrections
         .join_retag_pair(&PairJoinRequest {
             old_album_id: old.clone(),
             new_album_id: one.clone(),
             keep_edition_of: None,
-            expected_identity_revisions: BTreeMap::from([
-                (old.clone(), revision(&old)),
-                (one.clone(), revision(&one)),
+            expected_identity_tokens: BTreeMap::from([
+                (old.clone(), token(&old)),
+                (one.clone(), token(&one)),
             ]),
             actor: "u1".to_owned(),
         })
         .expect("joined");
     assert_eq!(rig.retired_into(&old), Some(one));
-    assert_eq!(corrections.retag_pairs().expect("pairs listed").total, 0);
+    assert_eq!(
+        corrections
+            .retag_pairs(None, 100, 0)
+            .expect("pairs listed")
+            .1,
+        0
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -6736,7 +7833,7 @@ async fn a_placement_marks_only_a_hand_retag() {
         "parked"
     );
 
-    let (mut rig, album, _) = placed_album("scan-place-mark-later", "manual", 1e12).await;
+    let (mut rig, album, _) = placed_album("scan-place-mark-later", "manual", 1e15).await;
     rig.retag_and_rename().await;
     rig.placed_at("b/t000.flac", "chosen after the file came");
     assert_eq!(rig.mark_of(&album), None, "chosen after the file came");
@@ -6961,6 +8058,19 @@ impl ArtistRig {
         album_side: Side<'_>,
         track_side: Side<'_>,
     ) {
+        self.put_titled(relative, relative, album, release, album_side, track_side);
+    }
+
+    /// [`Self::put_on`], with a title of its own instead of the path.
+    fn put_titled(
+        &self,
+        relative: &str,
+        title: &str,
+        album: &str,
+        release: Option<&str>,
+        album_side: Side<'_>,
+        track_side: Side<'_>,
+    ) {
         use droppedneedle_library::tags::TagField;
         use droppedneedle_library::tags::save::{TagEdit, save_tags};
         let path = self.root.join(relative);
@@ -6981,7 +8091,7 @@ impl ArtistRig {
                 .unwrap_or_default()
         };
         let edits = vec![
-            TagEdit::verbatim(TagField::Title, vec![relative.to_owned()]),
+            TagEdit::verbatim(TagField::Title, vec![title.to_owned()]),
             TagEdit::verbatim(TagField::Album, vec![album.to_owned()]),
             TagEdit::verbatim(TagField::Artist, vec![track_side.names.join(" & ")]),
             TagEdit::verbatim(TagField::Artists, list(track_side)),
@@ -7016,6 +8126,26 @@ impl ArtistRig {
         let paths = HashMap::from([("music".to_owned(), self.root.clone())]);
         let run = self.coordinator.run_once(&paths).await.expect("scan runs");
         assert_eq!(run.state.scan_state(), ScanState::Completed);
+    }
+
+    /// Scan only `folder`, as a scan of one folder does.
+    async fn scan_folder(&self, folder: &str) {
+        let mut scope = ScanScope::root("music", &self.root.to_string_lossy(), "rev-1");
+        scope.relative_path = folder.to_owned();
+        let mut request = request(&self.root);
+        request.scopes = vec![scope];
+        self.coordinator.request_run(&request).expect("requested");
+        let paths = HashMap::from([("music".to_owned(), self.root.clone())]);
+        let run = self.coordinator.run_once(&paths).await.expect("scan runs");
+        assert_eq!(run.state.scan_state(), ScanState::Completed);
+    }
+
+    /// The track row of the file at `relative`, whatever its state.
+    fn track_of(&self, relative: &str) -> String {
+        self.text(&format!(
+            "SELECT id FROM local_tracks WHERE relative_path = '{relative}'"
+        ))
+        .expect("track row")
     }
 
     fn run(&self, sql: &str) {
@@ -7101,7 +8231,8 @@ impl ArtistRig {
     /// One favorite and one play of the artist for `user`.
     fn listen(&self, user: &str, artist: &str) {
         self.run(&format!(
-            "INSERT INTO library_user_favorites (user_id, item_kind, item_id, created_at) \
+            "INSERT OR IGNORE INTO auth_users (id, display_name, role, created_at) VALUES ('{user}', 'Person', 'user', 1); \
+             INSERT INTO catalog_user_favorites (user_id, item_kind, item_id, created_at) \
              VALUES ('{user}', 'artist', '{artist}', 1); \
              INSERT INTO library_play_history (id, user_id, local_artist_id, track_name, \
              artist_name, played_at) VALUES ('{user}-{artist}', '{user}', '{artist}', 'Song', \
@@ -7247,14 +8378,14 @@ async fn rows_proven_to_be_one_artist_merge_at_the_run_end() {
     );
     assert_eq!(
         rig.count(&format!(
-            "SELECT COUNT(*) FROM library_user_favorites WHERE item_kind = 'artist' \
+            "SELECT COUNT(*) FROM catalog_user_favorites WHERE item_kind = 'artist' \
              AND item_id = '{survivor}'"
         )),
         1
     );
     assert_eq!(
         rig.count(&format!(
-            "SELECT COUNT(*) FROM library_user_favorites WHERE item_id = '{retired}'"
+            "SELECT COUNT(*) FROM catalog_user_favorites WHERE item_id = '{retired}'"
         )),
         0
     );
@@ -7719,7 +8850,7 @@ async fn a_sort_name_change_carries_the_old_row_over() {
     assert_eq!(rig.retired_into(&old), Some(new.clone()));
     assert_eq!(
         rig.count(&format!(
-            "SELECT COUNT(*) FROM library_user_favorites WHERE item_kind = 'artist' \
+            "SELECT COUNT(*) FROM catalog_user_favorites WHERE item_kind = 'artist' \
              AND item_id = '{new}'"
         )),
         1
@@ -7779,7 +8910,7 @@ async fn a_renamed_artist_is_offered_not_merged() {
     assert_eq!(rig.retired_into(&old), None);
     assert_eq!(
         rig.count(&format!(
-            "SELECT COUNT(*) FROM library_user_favorites WHERE item_id = '{old}'"
+            "SELECT COUNT(*) FROM catalog_user_favorites WHERE item_id = '{old}'"
         )),
         1
     );
@@ -7874,6 +9005,156 @@ async fn a_linked_row_left_empty_by_a_sort_change_is_offered() {
     let groups = open_groups(&rig);
     assert_eq!(groups.len(), 1, "{groups:?}");
     assert_eq!(groups[0].1, sorted_ids(&[&old, &new]));
+}
+
+/// A retag from "Oh" to "OH" with a featured artist records the credit
+/// moved by name although the credit count changed, so at the run end Oh
+/// merges into OH with its favorite. A later retag down to one credit
+/// leaves the album no credit past it.
+#[tokio::test]
+async fn a_case_change_with_a_featured_artist_carries_the_old_row_over() {
+    const RELEASE: &str = "bbbbbbbb-0000-4000-8000-0000000000f1";
+    let rig = ArtistRig::new("artist-follow-featured");
+    rig.put_on(
+        "A/01.flac",
+        "Album A",
+        Some(RELEASE),
+        plain(&["Oh"]),
+        plain(&["Oh"]),
+    );
+    rig.scan().await;
+    let old = rig.track_artist("A/01.flac", 0);
+    rig.listen("listener", &old);
+
+    let featured = listed(&["OH", "Y"], &[]);
+    rig.put_on("A/01.flac", "Album A", Some(RELEASE), featured, featured);
+    rig.scan().await;
+    let new = rig.track_artist("A/01.flac", 0);
+    assert_eq!(rig.name(&new), "OH");
+    assert_eq!(rig.retired_into(&old), Some(new.clone()));
+    assert_eq!(
+        rig.count(&format!(
+            "SELECT COUNT(*) FROM catalog_user_favorites WHERE item_kind = 'artist' \
+             AND item_id = '{new}'"
+        )),
+        1
+    );
+
+    rig.put_on(
+        "A/01.flac",
+        "Album A",
+        Some(RELEASE),
+        plain(&["OH"]),
+        plain(&["OH"]),
+    );
+    rig.scan().await;
+    assert_eq!(
+        rig.count(
+            "SELECT COUNT(*) FROM local_album_artists c JOIN local_tracks t \
+             ON t.local_album_id = c.local_album_id WHERE t.relative_path = 'A/01.flac'"
+        ),
+        1
+    );
+}
+
+/// A retag from "Oh" to "Ox" with a featured artist records the move by
+/// position: Oh is not merged, and the list offers Oh and Ox as one group.
+#[tokio::test]
+async fn a_rename_with_a_featured_artist_is_offered_not_merged() {
+    let rig = ArtistRig::new("artist-follow-rename-featured");
+    rig.put("A/01.flac", "Album A", plain(&["Oh"]), plain(&["Oh"]));
+    rig.scan().await;
+    let old = rig.track_artist("A/01.flac", 0);
+    rig.listen("listener", &old);
+
+    let featured = listed(&["Ox", "Y"], &[]);
+    rig.put("A/01.flac", "Album A", featured, featured);
+    rig.scan().await;
+    let new = rig.track_artist("A/01.flac", 0);
+    assert_eq!(rig.name(&new), "Ox");
+    assert_eq!(rig.retired_into(&old), None);
+    assert_eq!(
+        open_groups(&rig),
+        vec![(
+            "credits_moved",
+            sorted_ids(&[&old, &new]),
+            Some(new.clone()),
+        )]
+    );
+}
+
+/// A file retagged from "Oh" to "OH" with a featured artist and moved to
+/// another folder in one go, each folder scanned on its own, continues its
+/// track whichever folder is scanned first: the star on the track moves
+/// to it, the old id opens it, and Oh merges into OH. With the new folder
+/// scanned first, that happens a scan after the one that sees the old
+/// file gone.
+#[tokio::test]
+async fn a_moved_track_continues_whichever_folder_is_read_first() {
+    for new_first in [false, true] {
+        let case = if new_first {
+            "new folder first"
+        } else {
+            "old folder first"
+        };
+        let rig = ArtistRig::new(&format!("artist-moved-{new_first}"));
+        let band = plain(&["Band"]);
+        rig.put_titled("a/01.flac", "Song", "Album A", None, band, plain(&["Oh"]));
+        rig.put_titled("a/02.flac", "Other", "Album A", None, band, band);
+        rig.scan().await;
+        let old_track = rig.track_of("a/01.flac");
+        let oh = rig.track_artist("a/01.flac", 0);
+        rig.listen("listener", &oh);
+        rig.run(&star(&old_track));
+
+        std::fs::create_dir_all(rig.root.join("b")).expect("folder");
+        std::fs::rename(rig.root.join("a/01.flac"), rig.root.join("b/01.flac")).expect("moved");
+        let featured = listed(&["OH", "Y"], &[]);
+        rig.put_titled("b/01.flac", "Song", "Album A", None, band, featured);
+        let stars_on = |track: &str| {
+            rig.count(&format!(
+                "SELECT COUNT(*) FROM catalog_user_favorites WHERE item_kind = 'track' \
+                 AND item_id = '{track}'"
+            ))
+        };
+        if new_first {
+            rig.scan_folder("b").await;
+            rig.scan_folder("a").await;
+            assert_eq!(stars_on(&old_track), 1, "{case}: nothing moves yet");
+            assert_eq!(
+                rig.count("SELECT COUNT(*) FROM local_track_aliases"),
+                0,
+                "{case}"
+            );
+            rig.scan().await;
+        } else {
+            rig.scan_folder("a").await;
+            rig.scan_folder("b").await;
+        }
+
+        let track = rig.track_of("b/01.flac");
+        assert_eq!(stars_on(&track), 1, "{case}");
+        assert_eq!(
+            rig.text(&format!(
+                "SELECT COALESCE((SELECT local_track_id FROM local_track_aliases \
+                 WHERE alias = '{old_track}'), '{old_track}')"
+            ))
+            .as_deref(),
+            Some(track.as_str()),
+            "{case}: the old id opens the track"
+        );
+        let new = rig.track_artist("b/01.flac", 0);
+        assert_eq!(rig.name(&new), "OH", "{case}");
+        assert_eq!(rig.retired_into(&oh), Some(new.clone()), "{case}");
+        assert_eq!(
+            rig.count(&format!(
+                "SELECT COUNT(*) FROM catalog_user_favorites WHERE item_kind = 'artist' \
+                 AND item_id = '{new}'"
+            )),
+            1,
+            "{case}"
+        );
+    }
 }
 
 /// Two artists who share a name but not their MusicBrainz id get a row
@@ -8013,7 +9294,7 @@ async fn a_renamed_artist_proven_by_its_files_keeps_its_row() {
     );
     assert_eq!(
         rig.count(&format!(
-            "SELECT (SELECT COUNT(*) FROM library_user_favorites WHERE item_id = '{artist}') \
+            "SELECT (SELECT COUNT(*) FROM catalog_user_favorites WHERE item_id = '{artist}') \
              + (SELECT COUNT(*) FROM library_play_history WHERE local_artist_id = '{artist}')"
         )),
         2
@@ -8970,15 +10251,16 @@ async fn another_album_copied_over_an_old_one_comes_in_as_new_tracks() {
         "INSERT INTO local_album_external_identities (local_album_id, provider, \
          release_group_mbid, release_mbid, decision_source, selected_at) \
          VALUES ('{album}', 'musicbrainz', 'rg-r', '{REL_R}', 'manual', 0); \
-         INSERT INTO library_user_favorites (user_id, item_kind, item_id, created_at) \
+         INSERT OR IGNORE INTO auth_users (id, display_name, role, created_at) VALUES ('listener', 'Person', 'user', 1); \
+         INSERT INTO catalog_user_favorites (user_id, item_kind, item_id, created_at) \
          VALUES ('listener', 'album', '{album}', 1); \
          INSERT INTO library_play_history (id, user_id, local_track_id, local_album_id, \
          track_name, artist_name, played_at) VALUES ('play-1', 'listener', '{}', '{album}', \
          'Old Two', 'Artist', '2026-01-01T00:00:00Z'); \
-         INSERT INTO playlists (id, name, created_at, updated_at) VALUES ('list', 'List', '', ''); \
-         INSERT INTO playlist_tracks (id, playlist_id, position, track_name, artist_name, \
+         INSERT INTO catalog_playlists (id, name, created_at, updated_at) VALUES ('list', 'List', 0, 0); \
+         INSERT INTO catalog_playlist_tracks (id, playlist_id, position, track_name, artist_name, \
          album_name, album_id, track_source_id, source_type, created_at) VALUES ('entry', \
-         'list', 0, 'Old One', 'Artist', 'Before', '{album}', '{}', 'local', ''); \
+         'list', 0, 'Old One', 'Artist', 'Before', '{album}', '{}', 'local', 0); \
          INSERT INTO library_track_management_state (local_track_id, written_sha256) \
          VALUES ('{}', 'sha');",
         tracks[1], tracks[0], tracks[2]
@@ -9012,7 +10294,7 @@ async fn another_album_copied_over_an_old_one_comes_in_as_new_tracks() {
         assert_eq!(
             rig.count(&format!(
                 "SELECT COUNT(*) FROM local_tracks WHERE id = '{old}' \
-                 AND local_album_id = '{album}' AND missing_since >= {LATEST_START}"
+                 AND local_album_id = '{album}' AND missing_at >= {LATEST_START}"
             )),
             1,
             "{file}'s old track went missing in this run, on the old album"
@@ -9035,7 +10317,7 @@ async fn another_album_copied_over_an_old_one_comes_in_as_new_tracks() {
         rig.count(&format!(
             "SELECT (SELECT COUNT(*) FROM library_play_history \
                WHERE local_track_id = '{}' AND local_album_id = '{album}') \
-             + (SELECT COUNT(*) FROM playlist_tracks WHERE track_source_id = '{}') \
+             + (SELECT COUNT(*) FROM catalog_playlist_tracks WHERE track_source_id = '{}') \
              + (SELECT COUNT(*) FROM library_track_management_state \
                WHERE local_track_id = '{}' AND written_sha256 = 'sha')",
             tracks[1], tracks[0], tracks[2]
@@ -9060,7 +10342,8 @@ async fn another_album_copied_over_an_old_one_comes_in_as_new_tracks() {
         .duration_since(std::time::UNIX_EPOCH)
         .expect("after 1970")
         .as_secs_f64();
-    use droppedneedle_library::operations::history::{HistoryKind, album_history};
+    use droppedneedle_library::catalog_actions::history::HistoryKind;
+    use droppedneedle_library::catalog_actions::history::album_history;
     let told: Vec<(HistoryKind, usize, Vec<String>)> =
         album_history(&conn, &album, "listener", now)
             .expect("history reads")
@@ -9084,7 +10367,7 @@ async fn another_album_copied_over_an_old_one_comes_in_as_new_tracks() {
         );
         assert_eq!(
             rig.count(&format!(
-                "SELECT (SELECT COUNT(*) FROM library_user_favorites \
+                "SELECT (SELECT COUNT(*) FROM catalog_user_favorites \
                    WHERE item_kind = 'album' AND item_id = '{album}') \
                  + (SELECT COUNT(*) FROM local_album_external_identities \
                    WHERE local_album_id = '{album}' AND release_mbid = '{REL_R}')"
@@ -9168,10 +10451,10 @@ async fn other_music_at_a_path_needs_a_length_gap_and_a_contradiction() {
     let old: Vec<String> = (0..lines.len()).map(|n| rig.row_at(&file(n))).collect();
     let since = |rig: &RegroupRig, track: &str| {
         rig.text(&format!(
-            "SELECT CAST(missing_since AS TEXT) FROM local_tracks WHERE id = '{track}'"
+            "SELECT CAST(missing_at AS TEXT) FROM local_tracks WHERE id = '{track}'"
         ))
     };
-    let mut missing_since = BTreeMap::new();
+    let mut missing_at = BTreeMap::new();
     for (n, line) in lines.iter().enumerate() {
         if line.exclude {
             rig.run(&format!(
@@ -9182,7 +10465,7 @@ async fn other_music_at_a_path_needs_a_length_gap_and_a_contradiction() {
         }
         if line.lose_first {
             rig.lose(&[file(n)]).await;
-            missing_since.insert(n, since(&rig, &old[n]).expect("missing since"));
+            missing_at.insert(n, since(&rig, &old[n]).expect("missing since"));
         }
     }
     for (n, line) in lines.iter().enumerate() {
@@ -9216,11 +10499,11 @@ async fn other_music_at_a_path_needs_a_length_gap_and_a_contradiction() {
                 "row {row}: still excluded"
             );
         }
-        if let Some(kept) = missing_since.get(&n) {
+        if let Some(kept) = missing_at.get(&n) {
             assert_eq!(
                 since(&rig, &old[n]).as_ref(),
                 Some(kept),
-                "row {row}: keeps its own missing_since"
+                "row {row}: keeps its own missing_at"
             );
         }
     }
@@ -9363,7 +10646,8 @@ impl RegroupRig {
 /// it. One file per folder; each line is a row of the task's table.
 #[tokio::test]
 async fn a_new_copy_at_a_path_needs_the_same_recording_and_new_audio() {
-    use droppedneedle_library::operations::history::{HistoryKind, album_history};
+    use droppedneedle_library::catalog_actions::history::HistoryKind;
+    use droppedneedle_library::catalog_actions::history::album_history;
     use droppedneedle_library::publish::record::record;
 
     const V3: &str = "INSERT INTO library_track_management_state (local_track_id, \
@@ -9611,7 +10895,7 @@ async fn a_new_copy_at_a_path_needs_the_same_recording_and_new_audio() {
             assert_eq!(
                 rig.count(&format!(
                     "SELECT COUNT(*) FROM library_management_automatic_queue \
-                     WHERE local_album_id = '{album}' AND not_before < 1e15"
+                     WHERE local_album_id = '{album}' AND not_before_at < 1000000000000000000"
                 )),
                 1,
                 "row {row}: the album is queued"

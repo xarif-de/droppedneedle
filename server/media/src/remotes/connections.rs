@@ -1,6 +1,6 @@
 //! Remote server connections: the admin's servers plus per-user links.
 //!
-//! The account rules are v2's: the server URL and enabled flag belong to
+//! The account rules: the server URL and enabled flag belong to
 //! the admin (Settings > Jellyfin, > Navidrome, > Plex) and are read from
 //! the config store on every resolution. A user may link their own account
 //! on that server; the link holds only their credential and lives in
@@ -8,9 +8,8 @@
 //! sealed whole, v2 field names kept). Resolution prefers the caller's own
 //! link (`linked`) and falls back to the admin's credential (`shared`), so
 //! a server the admin configured is usable by every user. A link that no
-//! longer opens falls back too, as in v2. A Plex link saved without a
-//! server-scoped token looks one up once and stores it (v2
-//! `resolve_plex_playlist`).
+//! longer opens falls back too. A Plex link saved without a
+//! server-scoped token looks one up once and stores it.
 //!
 //! Cache scoping keys off the user id plus a hash of the connection
 //! material, so one user's stale password never poisons another's entries.
@@ -30,13 +29,16 @@ use droppedneedle_kernel::runtime_config::secret_sections::{
 };
 use droppedneedle_kernel::runtime_config::sections::InternalState;
 use droppedneedle_kernel::runtime_config::{ConfigStore, Live};
+use droppedneedle_providers::RequestPriority;
 
-use super::adapter::{AdapterError, BoxFuture, RemoteHandle, RemoteHttp, USER_READS_PER_SOURCE};
+use super::source::{AdapterError, BoxFuture, RemoteHandle};
+
 use super::jellyfin::JellyfinAdapter;
 use super::models::SourceName;
 use super::navidrome::NavidromeAdapter;
 use super::plex::PlexAdapter;
 use super::sql;
+use super::transport::{RemoteHttp, USER_READS_PER_SOURCE};
 
 // ---------------------------------------------------------------------------
 // Rows
@@ -107,7 +109,7 @@ pub trait ConnectionStore: Send + Sync {
 #[derive(Clone)]
 pub struct SqliteConnectionStore {
     db: droppedneedle_kernel::db::Db,
-    clock: Arc<dyn droppedneedle_kernel::clock::Clock>,
+    writes: droppedneedle_auth::sqlite::UserConnections,
 }
 
 impl SqliteConnectionStore {
@@ -116,7 +118,8 @@ impl SqliteConnectionStore {
         db: droppedneedle_kernel::db::Db,
         clock: Arc<dyn droppedneedle_kernel::clock::Clock>,
     ) -> Self {
-        Self { db, clock }
+        let writes = droppedneedle_auth::sqlite::UserConnections::new(db.clone(), clock);
+        Self { db, writes }
     }
 }
 
@@ -150,22 +153,9 @@ impl ConnectionStore for SqliteConnectionStore {
         service: &'a str,
         data: String,
     ) -> BoxFuture<'a, Result<(), String>> {
-        let user_id = user_id.to_owned();
-        let service = service.to_owned();
-        let now = droppedneedle_auth::times::to_iso(self.clock.now_unix());
         Box::pin(async move {
-            self.db
-                .write(
-                    droppedneedle_kernel::db::Lane::Foreground,
-                    "remotes.connection.upsert",
-                    move |tx| {
-                        tx.execute(
-                            sql::SAVE_CONNECTION.text(),
-                            rusqlite::params![user_id, service, data, now],
-                        )?;
-                        Ok(())
-                    },
-                )
+            self.writes
+                .save_enabled(user_id, service, &data)
                 .await
                 .map_err(|error: DbError| error.to_string())
         })
@@ -176,22 +166,10 @@ impl ConnectionStore for SqliteConnectionStore {
         user_id: &'a str,
         service: &'a str,
     ) -> BoxFuture<'a, Result<bool, String>> {
-        let user_id = user_id.to_owned();
-        let service = service.to_owned();
         Box::pin(async move {
-            self.db
-                .write(
-                    droppedneedle_kernel::db::Lane::Foreground,
-                    "remotes.connection.delete",
-                    move |tx| {
-                        Ok(tx.execute(
-                            sql::DELETE_CONNECTION.text(),
-                            rusqlite::params![user_id, service],
-                        )?)
-                    },
-                )
+            self.writes
+                .delete(user_id, service)
                 .await
-                .map(|changed| changed > 0)
                 .map_err(|error: DbError| error.to_string())
         })
     }
@@ -238,14 +216,6 @@ impl CredentialCoder {
     pub fn open(&self, sealed: &str) -> Result<String, CryptoError> {
         self.crypto.decrypt(sealed)
     }
-}
-
-/// Delete every link whose document holds a value sealed under a data key
-/// that is gone, inside the caller's transaction: one sealed whole (media
-/// servers, ListenBrainz, Spotify) or plain JSON with sealed fields
-/// (Last.fm). The user links the service again. Answers the rows deleted.
-pub fn forget_sealed(conn: &rusqlite::Connection) -> rusqlite::Result<usize> {
-    conn.execute(sql::FORGET_SEALED.text(), [])
 }
 
 // ---------------------------------------------------------------------------
@@ -641,10 +611,12 @@ pub struct LinkSummary {
 pub trait PlexServerTokens: Send + Sync {
     /// `Ok(None)` when the server or the account's access to it is not
     /// found; [`AdapterError::Auth`] when the account token is refused.
+    /// plex.tv is asked at `priority`.
     fn server_token<'a>(
         &'a self,
         server: &'a ServerSettings,
         auth_token: &'a str,
+        priority: RequestPriority,
     ) -> BoxFuture<'a, Result<Option<String>, AdapterError>>;
 }
 
@@ -770,7 +742,7 @@ impl ConnectionResolver {
 
     /// Look up and store missing Plex server tokens through `probe`.
     /// Without one, a Plex link lacking a server token uses its account
-    /// token (v2 `resolve_plex`).
+    /// token.
     pub fn with_plex_tokens(mut self, probe: Arc<dyn PlexServerTokens>) -> Self {
         self.plex_tokens = Some(probe);
         self
@@ -783,15 +755,18 @@ impl ConnectionResolver {
 
     /// The caller's own link first, then the admin's shared credential.
     /// A stored link that no longer opens or is incomplete falls back to
-    /// the shared account, as v2 `PerUserClientFactory` did; it reads as
-    /// stale only when there is no shared account to fall back to.
+    /// the shared account; it reads as
+    /// stale only when there is no shared account to fall back to. A
+    /// Plex link that needs its server token looked up asks plex.tv at
+    /// `priority`.
     pub async fn resolve(
         &self,
         user_id: &str,
         source: SourceName,
+        priority: RequestPriority,
     ) -> Result<ResolvedConnection, ResolveError> {
         let server = self.server(source)?.ok_or(ResolveError::NotConfigured)?;
-        let stale = match self.usable_link(user_id, &server, source).await {
+        let stale = match self.usable_link(user_id, &server, source, priority).await {
             Ok(Some(link)) => return Ok(linked(user_id, &server, link)),
             Ok(None) => false,
             Err(ResolveError::Stale) => {
@@ -809,21 +784,42 @@ impl ConnectionResolver {
         }
     }
 
+    /// The caller's own link only, never the shared account: work done in
+    /// a person's name on their server (the web player's session reports).
+    /// Not configured when they have no link; stale when it cannot be used.
+    pub async fn resolve_linked(
+        &self,
+        user_id: &str,
+        source: SourceName,
+        priority: RequestPriority,
+    ) -> Result<ResolvedConnection, ResolveError> {
+        let server = self.server(source)?.ok_or(ResolveError::NotConfigured)?;
+        match self.usable_link(user_id, &server, source, priority).await? {
+            Some(link) => Ok(linked(user_id, &server, link)),
+            None => Err(ResolveError::NotConfigured),
+        }
+    }
+
     /// The caller's link, ready to use on `server`: a Plex link without a
-    /// server token gets one first. Stale when it cannot be used.
+    /// server token gets one first, from plex.tv at `priority`. Stale when
+    /// it cannot be used.
     pub async fn usable_link(
         &self,
         user_id: &str,
         server: &ServerSettings,
         source: SourceName,
+        priority: RequestPriority,
     ) -> Result<Option<UserLink>, ResolveError> {
         match self.link(user_id, source).await? {
-            Some(link) => self.server_scoped(user_id, server, link).await.map(Some),
+            Some(link) => self
+                .server_scoped(user_id, server, link, priority)
+                .await
+                .map(Some),
             None => Ok(None),
         }
     }
 
-    /// Port of the v2 machine-id probe: look up the server token for a
+    /// Looks up the server token for a
     /// Plex link that has none, and store it so the lookup runs once. A
     /// refused account or no access to the server means relink; an
     /// outage keeps the account token for this call.
@@ -832,6 +828,7 @@ impl ConnectionResolver {
         user_id: &str,
         server: &ServerSettings,
         link: UserLink,
+        priority: RequestPriority,
     ) -> Result<UserLink, ResolveError> {
         let Some(probe) = &self.plex_tokens else {
             return Ok(link);
@@ -853,7 +850,7 @@ impl ConnectionResolver {
                 username,
             });
         }
-        match probe.server_token(server, &auth_token).await {
+        match probe.server_token(server, &auth_token, priority).await {
             Ok(Some(token)) if !token.is_empty() => {
                 let link = UserLink::Plex {
                     auth_token,
@@ -1054,7 +1051,7 @@ fn cache_scope(user_id: &str, source: SourceName, base_url: &str, credential: &s
 }
 
 /// Stores the media link a Plex or Jellyfin sign-in hands back, so the
-/// account works for playback with no extra setup (v2 auto-link). The
+/// account works for playback with no extra setup. The
 /// sign-in flows decide whether a failure is fatal.
 #[derive(Clone)]
 pub struct SignInLinks {

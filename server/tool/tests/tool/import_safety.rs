@@ -20,7 +20,7 @@ async fn entity_counts(pool: &sqlx::SqlitePool) -> Vec<i64> {
         "auth_providers",
         "auth_app_passwords",
         "auth_password_recovery_codes",
-        "user_followed_artists",
+        "acquire_followed_artists",
         "auto_download_approvals",
         "import_runs",
     ] {
@@ -31,25 +31,17 @@ async fn entity_counts(pool: &sqlx::SqlitePool) -> Vec<i64> {
 
 #[tokio::test]
 async fn mid_import_failure_rolls_back_everything() {
-    // A recovery hash colliding with a row already in the target (across
-    // users, so no validator rule can see it) violates the UNIQUE column
-    // mid-transaction, which must roll the whole import back.
+    // The database refuses a row mid-transaction, after earlier rows were
+    // written, which must roll the whole import back.
     let fixture = Fixture::shared();
     let mut export = fixture.shell();
     export["users"] = json!([fixture.user("u1"), fixture.user("u2")]);
     export["settings"]["wanted"] = json!({"enabled": true});
 
-    let pool = migrated_pool().await;
+    let (pool, _target) = migrated_pool().await;
     sqlx::query(
-        "INSERT INTO auth_users (id, display_name, role, created_at) \
-         VALUES ('prior', 'Prior', 'user', 0)",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO auth_password_recovery_codes (user_id, code_hash, created_at, expires_at) \
-         VALUES ('prior', 'hash-u2', 0, 0)",
+        "CREATE TRIGGER refuse_u2 BEFORE INSERT ON auth_app_passwords \
+         WHEN NEW.user_id = 'u2' BEGIN SELECT RAISE(ABORT, 'refused'); END",
     )
     .execute(&pool)
     .await
@@ -84,7 +76,7 @@ async fn kill_before_commit_recovers_clean() {
     export["follows"] = json!([fixture.follow("u1", MBID)]);
     export["settings"]["wanted"] = json!({"enabled": true});
 
-    let pool = migrated_pool().await;
+    let (pool, _target) = migrated_pool().await;
     seed_settings(&pool, json!({"wanted": {"enabled": false}})).await;
     let settings_before = settings_rows(&pool).await;
     let (_dir, config_path, crypto) = scratch_config("kill");
@@ -116,7 +108,7 @@ async fn crash_after_commit_converges_on_retry() {
     export["users"] = json!([fixture.user("u1")]);
     export["settings"]["wanted"] = json!({"enabled": true});
 
-    let pool = migrated_pool().await;
+    let (pool, _target) = migrated_pool().await;
     let (_dir, config_path, crypto) = scratch_config("split");
     let mut crashed = import_request(&export, pool.clone(), config_path.clone(), test_crypto());
     crashed.fault_after_commit = true;
@@ -156,7 +148,7 @@ async fn dry_run_matches_real_import() {
     export["follows"] = json!([fixture.follow("u1", MBID)]);
     export["settings"]["wanted"] = json!({"enabled": true});
 
-    let pool = migrated_pool().await;
+    let (pool, _target) = migrated_pool().await;
     let (_dir, config_path, crypto) = scratch_config("parity");
     let mut dry = import_request(&export, pool.clone(), config_path.clone(), test_crypto());
     dry.dry_run = true;
@@ -183,7 +175,7 @@ async fn dry_run_matches_conflicts_too() {
     let fixture = Fixture::shared();
     let mut seed = fixture.shell();
     seed["users"] = json!([fixture.user("u1")]);
-    let pool = migrated_pool().await;
+    let (pool, _target) = migrated_pool().await;
     let (_dir, config_path, crypto) = scratch_config("parity-conflict");
     run_import(import_request(
         &seed,
@@ -215,7 +207,7 @@ async fn wrong_passphrase_writes_nothing() {
     export["users"] = json!([fixture.user("u1")]);
     export["settings"]["wanted"] = json!({"enabled": true});
 
-    let pool = migrated_pool().await;
+    let (pool, _target) = migrated_pool().await;
     let (_dir, config_path, crypto) = scratch_config("passphrase");
     let mut request = import_request(&export, pool.clone(), config_path.clone(), crypto);
     request.passphrase = "the wrong passphrase".to_owned();
@@ -234,7 +226,7 @@ async fn wrong_passphrase_preserves_existing_config() {
     export["users"] = json!([fixture.user("u1")]);
     export["settings"]["wanted"] = json!({"enabled": true});
 
-    let pool = migrated_pool().await;
+    let (pool, _target) = migrated_pool().await;
     // The target's settings as they stand once its config.json was copied
     // in.
     seed_settings(&pool, json!({"wanted": {"enabled": false}})).await;
@@ -257,7 +249,7 @@ async fn corrupt_v3_config_refuses_with_zero_db_writes() {
     let mut export = fixture.shell();
     export["users"] = json!([fixture.user("u1")]);
 
-    let pool = migrated_pool().await;
+    let (pool, _target) = migrated_pool().await;
     let (_dir, config_path, crypto) = scratch_config("corrupt-config");
     std::fs::write(&config_path, "{not json").unwrap();
     let report = run_import(import_request(
@@ -281,7 +273,7 @@ async fn validation_failure_writes_nothing() {
     export["users"] = json!([fixture.user("u1")]);
     export["settings"]["_legacy_lidarr"] = json!({"api_key": "must-not-cross"});
 
-    let pool = migrated_pool().await;
+    let (pool, _target) = migrated_pool().await;
     seed_settings(&pool, json!({"wanted": {"enabled": false}})).await;
     let before = settings_rows(&pool).await;
     let (_dir, config_path, crypto) = scratch_config("no-write");
@@ -313,7 +305,7 @@ async fn tampered_export_fails_the_checksum() {
     swapped["users"][0]["app_passwords"][0]["secret"] =
         signed["users"][1]["app_passwords"][0]["secret"].clone();
     for mutant in [promoted, swapped] {
-        let pool = migrated_pool().await;
+        let (pool, _target) = migrated_pool().await;
         let (_dir, config_path, crypto) = scratch_config("checksum");
         let report = run_import(import_request(&mutant, pool.clone(), config_path, crypto)).await;
         assert_eq!(report.exit.code, ExitCode::FailedValidation);
@@ -337,6 +329,7 @@ async fn import_serializes_with_a_concurrent_writer() {
     let options =
         sqlx::sqlite::SqliteConnectOptions::from_str(&format!("sqlite:{}?mode=rwc", db.display()))
             .unwrap()
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
             .busy_timeout(std::time::Duration::from_secs(30));
     let pool = sqlx::sqlite::SqlitePoolOptions::new()
         .max_connections(2)
@@ -353,7 +346,7 @@ async fn import_serializes_with_a_concurrent_writer() {
             "BEGIN IMMEDIATE;
              INSERT INTO auth_users (id, display_name, role, created_at)
                  VALUES ('u1', 'Live', 'user', 0);
-             INSERT INTO user_followed_artists (user_id, artist_mbid, artist_mbid_lower,
+             INSERT INTO acquire_followed_artists (user_id, artist_mbid, artist_mbid_lower,
                  artist_name, auto_download, followed_at, updated_at)
                  VALUES ('u1', '{MBID}', '{MBID}', 'Live', 1, 1, 1);"
         ))
@@ -370,7 +363,7 @@ async fn import_serializes_with_a_concurrent_writer() {
 
     assert_ne!(report.exit.code, ExitCode::FailedInternal, "{report:?}");
     assert_eq!(report.entities["user"].conflict_kept_existing, 1);
-    let auto: i64 = sqlx::query_scalar("SELECT auto_download FROM user_followed_artists")
+    let auto: i64 = sqlx::query_scalar("SELECT auto_download FROM acquire_followed_artists")
         .fetch_one(&pool)
         .await
         .unwrap();

@@ -1,8 +1,8 @@
 //! Library Management tools besides profile runs: the tag editor, back to
 //! the originals (restore previews and the purge), settling a duplicate,
 //! the publish journal's writes that need an administrator, and the dry
-//! run that turns automatic management on. Every route is admin-only, as
-//! in v2. Store and file work runs on a blocking thread.
+//! run that turns automatic management on. Every route is admin-only. Store and
+//! file work runs on a blocking thread.
 
 use std::collections::BTreeMap;
 
@@ -20,7 +20,10 @@ use super::blocking;
 use super::management::{ManagementJobView, ManagementPreviewCreatedResponse};
 use crate::management::activation::{ActivationConfirm, ActivationProof, ActivationRequest};
 use crate::management::duplicates::DuplicateRequest;
-use crate::management::models::{DuplicateAction, DuplicateIntent, Selection, TagEditMode};
+use crate::management::models::{
+    CollisionKind, DuplicateAction, DuplicateIntent, OverrideMode, Selection, TagCardinality,
+    TagEditMode, TagScope,
+};
 use crate::management::recovery::{AttentionBundle, Diagnostics, Resolved};
 use crate::management::restore::{PurgeImpact, PurgeOutcome, PurgeRequest, RestoreRequest};
 use crate::management::service::Management;
@@ -64,15 +67,13 @@ fn key(raw: Option<String>) -> Option<String> {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ManagementTagEditorFieldView {
     pub field_name: String,
-    /// `album` (applies to every file of the album) or `track`.
-    pub scope: String,
-    /// `string`, `integer`, `boolean`, or `ordered_strings`.
-    pub cardinality: String,
+    pub scope: TagScope,
+    pub cardinality: TagCardinality,
     /// The file's value now: text, a number, true/false, a list, or null.
     pub current_value: serde_json::Value,
     pub override_id: Option<String>,
-    /// `replace`, `preserve`, or `clear`.
-    pub override_mode: Option<String>,
+    #[schema(required = true)]
+    pub override_mode: Option<OverrideMode>,
     pub override_row_revision: Option<i64>,
 }
 
@@ -115,8 +116,8 @@ impl From<EditorContext> for ManagementTagEditorView {
                 .into_iter()
                 .map(|field| ManagementTagEditorFieldView {
                     field_name: field.field_name,
-                    scope: field.scope.to_owned(),
-                    cardinality: field.cardinality.to_owned(),
+                    scope: field.scope,
+                    cardinality: field.cardinality,
                     current_value: field.current_value,
                     override_id: field.override_id,
                     override_mode: field.override_mode,
@@ -363,7 +364,7 @@ pub struct ManagementDuplicateBody {
     pub source_job_id: String,
     pub source_plan_item_ordinal: i64,
     pub expected_source_operation_row_revision: i64,
-    pub collision_kind: String,
+    pub collision_kind: CollisionKind,
     pub existing_root_id: String,
     pub existing_relative_path: String,
     pub action: DuplicateAction,
@@ -450,7 +451,7 @@ pub struct ManagementRecoveryView {
     /// retrying.
     pub retrying_bundles: Vec<ManagementAttentionBundleView>,
     /// Hidden temporary files under the library folders that no write
-    /// accounts for, as the check after startup found them. Nothing
+    /// accounts for, as the last check of each folder found them. Nothing
     /// removes them.
     pub leftover_file_count: i64,
     /// The first hundred of them.
@@ -752,6 +753,9 @@ pub struct ManagementTakeoverView {
     pub cause: Cause,
     /// When it stepped back, unix milliseconds.
     pub noticed_at: i64,
+    /// A hand-back since then was given up because the album's files
+    /// could not be read.
+    pub hand_back_given_up: bool,
 }
 
 /// Albums DroppedNeedle stepped back from.
@@ -792,6 +796,7 @@ pub async fn list_management_takeovers(
                 artist_name: album.artist_name,
                 cause: album.cause,
                 noticed_at: album.noticed_at,
+                hand_back_given_up: album.hand_back_given_up,
             })
             .collect(),
         total: waiting.total,

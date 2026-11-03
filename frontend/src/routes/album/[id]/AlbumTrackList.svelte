@@ -31,13 +31,13 @@
 	import RatingStars from '$lib/ui/RatingStars.svelte';
 	import FavoriteHeart from '$lib/components/FavoriteHeart.svelte';
 	import { SvelteSet } from 'svelte/reactivity';
-	import type { LibraryFileMeta, DownloadTask, HeldFileInEntry } from '$lib/types';
+	import type { LibraryStatusTrack, DownloadTask, HeldFileInEntry } from '$lib/types';
 	import TrackRequestButton from '$lib/components/downloads/TrackRequestButton.svelte';
 	import TrackDownloadStatus from '$lib/components/downloads/TrackDownloadStatus.svelte';
 	import HeldFileRow from '$lib/components/downloads/HeldFileRow.svelte';
-	import { useIntegrationStatus } from '$lib/queries/HomeIntegrationStatusQuery.svelte';
+	import { useIntegrationStatus } from '$lib/queries/home.svelte';
 	import { authStore } from '$lib/stores/authStore.svelte';
-	import { requestUpgradeTrack } from '$lib/queries/downloads/UpgradeQueries.svelte';
+	import { createRequestUpgradeTrackMutation } from '$lib/queries/downloads/UpgradeQueries.svelte';
 	import { toastStore } from '$lib/stores/toast';
 
 	const integrations = useIntegrationStatus();
@@ -65,8 +65,8 @@
 		localfilesEnabled: boolean;
 		navidromeEnabled: boolean;
 		plexEnabled: boolean;
-		libraryTracksByRecording?: Map<string, LibraryFileMeta>;
-		libraryTracksByPosition?: Map<string, LibraryFileMeta>;
+		libraryTracksByRecording?: Map<string, LibraryStatusTrack>;
+		libraryTracksByPosition?: Map<string, LibraryStatusTrack>;
 		heldByRecording?: Map<string, HeldFileInEntry>;
 		heldByPosition?: Map<string, HeldFileInEntry>;
 		trackDownloadTasks?: Map<string, DownloadTask>;
@@ -152,7 +152,7 @@
 
 	// Per-track quality upgrade (admin/trusted): shown on
 	// in-library tracks sitting below the cutoff while upgrades are on.
-	const upgradeTrack = requestUpgradeTrack();
+	const upgradeTrack = createRequestUpgradeTrackMutation();
 	const upgradeQueuedRecordings = new SvelteSet<string>();
 	async function handleTrackUpgrade(
 		recordingMbid: string,
@@ -266,8 +266,7 @@
 					: null}
 				{@const showTrackDownload = !libMeta && !!trackTask}
 				{@const showRequest = !libMeta && !trackTask && !heldMeta && !!track.recording_id}
-				{@const upgradeRecordingId =
-					track.recording_id ?? libMeta?.musicbrainz_recording_id ?? null}
+				{@const upgradeRecordingId = track.recording_id ?? libMeta?.recording_mbid ?? null}
 				{@const showUpgrade =
 					!!libMeta?.below_cutoff &&
 					authStore.isTrusted &&

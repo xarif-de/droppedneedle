@@ -7,9 +7,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::operations::reasons::Reason;
 use crate::publish::PublishError;
 use crate::publish::undo::UndoBlock;
+use crate::reasons::Reason;
 
 /// One reason, as the user reads it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,8 +35,7 @@ impl From<Reason> for ItemReason {
     }
 }
 
-/// Lyrics or ReplayGain the profile requires could not be had (v2's
-/// `METADATA_UNAVAILABLE`).
+/// Lyrics or ReplayGain the profile requires could not be had.
 pub fn metadata_unavailable(what: &str) -> ItemReason {
     ItemReason {
         code: "METADATA_UNAVAILABLE".to_owned(),
@@ -396,7 +395,7 @@ pub fn from_publish(error: &PublishError) -> ItemReason {
         PublishError::Collision(_) => path_collision(false),
         PublishError::Validation(_) => file_changed(),
         PublishError::Space { .. } => insufficient_space(),
-        PublishError::Catalog(_) => catalog_changed(),
+        PublishError::Catalog(_) | PublishError::JoinChanged(_) => catalog_changed(),
         PublishError::Journal(_) => recovery_needs_attention(),
         PublishError::Snapshot(_) => ItemReason::new(
             "BASELINE_UNAVAILABLE",
@@ -411,6 +410,7 @@ pub fn from_publish(error: &PublishError) -> ItemReason {
         | PublishError::Archive(_)
         | PublishError::Store(_)
         | PublishError::Interrupted(_)
+        | PublishError::BinsUnknown(_)
         | PublishError::TimedOut(_)
         | PublishError::Io(_)
         | PublishError::InjectedCrash(_) => write_failed(),

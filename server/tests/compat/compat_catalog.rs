@@ -7,20 +7,18 @@ use std::time::Duration;
 
 use axum::http::StatusCode;
 use droppedneedle_auth::users::roles::Role;
-use droppedneedle_catalog::reads::ReadsSetup;
-use droppedneedle_catalog::reads::collections::CollectionsState;
-use droppedneedle_catalog::reads::collections::db::CollectionsDb;
-use droppedneedle_catalog::reads::collections::models::{
-    AddTracksBody, CreatePlaylistBody, TrackInput,
-};
-use droppedneedle_catalog::reads::collections::service::CollectionsService;
-use droppedneedle_compat::adapters::audio::GatewayAudio;
-use droppedneedle_compat::adapters::jellyfin_ids::JellyfinIds;
-use droppedneedle_compat::adapters::jellyfin_library::{CatalogIds, JellyfinLibrary};
-use droppedneedle_compat::adapters::library::CompatLibrary;
-use droppedneedle_compat::adapters::playback::CompatPlayback;
+use droppedneedle_catalog::collections::CollectionsState;
+use droppedneedle_catalog::collections::db::CollectionsDb;
+use droppedneedle_catalog::collections::models::{AddTracksBody, CreatePlaylistBody, TrackInput};
+use droppedneedle_catalog::collections::service::CollectionsService;
+use droppedneedle_catalog::wiring::CatalogSetup;
+use droppedneedle_compat::audio::GatewayAudio;
 use droppedneedle_compat::jellyfin::builders::LIBRARY_INTERNAL_ID;
+use droppedneedle_compat::jellyfin::ids::JellyfinIds;
+use droppedneedle_compat::jellyfin::library::{CatalogIds, JellyfinLibrary};
 use droppedneedle_compat::jellyfin::{JellyfinState, routes};
+use droppedneedle_compat::library::CompatLibrary;
+use droppedneedle_compat::playback::CompatPlayback;
 use droppedneedle_compat::settings::LiveSettings;
 use droppedneedle_compat::shared::address::ListenerConfig;
 use droppedneedle_kernel::config::TrustedProxies;
@@ -722,10 +720,10 @@ async fn playlists_and_stars_are_shared_with_the_native_routes() {
     subsonic(&rig, "star", &[("id", "al-alb-1")]).await;
     let (status, hearts) = rig
         .app
-        .call("GET", "/api/v3/favorites?kind=album", &web, None)
+        .call("GET", "/api/v3/library/albums?favorites=true", &web, None)
         .await;
     assert_eq!(status, StatusCode::OK, "{hearts}");
-    assert_eq!(hearts["items"][0]["item_id"], "alb-1");
+    assert_eq!(hearts["items"][0]["id"], "alb-1");
     let starred = subsonic(&rig, "getStarred2", &[]).await;
     assert!(starred.contains("al-alb-1"), "{starred}");
 
@@ -796,7 +794,7 @@ async fn playlist_refusals_keep_their_codes_and_repeats_stay() {
     .await;
     assert!(refused.contains("\"code\":50"), "{refused}");
 
-    // The same song asked twice is added twice (v2 appends each).
+    // Quirk (v2): the same song asked twice is added twice.
     let created = subsonic(&rig, "createPlaylist", &[("name", "Twice")]).await;
     let ours: Value = serde_json::from_str(&created).expect("json answer");
     let ours = ours["subsonic-response"]["playlist"]["id"]
@@ -818,17 +816,17 @@ async fn playlist_refusals_keep_their_codes_and_repeats_stay() {
     rig.stop().await;
 }
 
-/// The user the reads rig seeds.
+/// The user the catalog rig seeds.
 const USER_ID: &str = "u1";
 
-/// The seeded catalog read through the native reads bundle alone, for the
+/// The seeded catalog read through the native catalog bundle alone, for the
 /// export and the Jellyfin id map.
 struct Rig {
     _dir: ScratchDir,
     runtime: DbRuntime,
     platform: Platform,
     library: LibrarySetup,
-    reads: ReadsSetup,
+    catalog_setup: CatalogSetup,
     auth: AuthRig,
 }
 
@@ -882,16 +880,14 @@ impl Rig {
             .await;
         let auth = AuthRig::on(&platform);
         let (library, _) = crate::common::library::library_at(&platform);
-        let reads = crate::common::bundles::reads_at(
+        let catalog_setup = crate::common::bundles::catalog_setup_at(
             &platform,
             auth.deps.clone(),
-            crate::common::reads_inputs(&platform),
+            crate::common::catalog_inputs(&platform),
             &library,
             CollectionsState::new(
                 CollectionsDb::new(runtime.db().clone(), platform.clock.clone()),
-                droppedneedle_catalog::reads::library::store::LocalCatalog::new(
-                    runtime.db().clone(),
-                ),
+                droppedneedle_catalog::local::store::LocalCatalog::new(runtime.db().clone()),
             ),
             None,
         );
@@ -900,7 +896,7 @@ impl Rig {
             runtime,
             platform,
             library,
-            reads,
+            catalog_setup,
             auth,
         }
     }
@@ -915,7 +911,7 @@ async fn native_playlists_export_to_m3u_with_their_files() {
     use droppedneedle_kernel::jobs::playlist_sync::{PlaylistExporter as _, PlaylistSyncConfig};
 
     let rig = Rig::open().await;
-    let native = CollectionsService::new(&rig.reads.collections);
+    let native = CollectionsService::new(&rig.catalog_setup.collections);
     let made = native
         .create_playlist(
             USER_ID,
@@ -946,6 +942,7 @@ async fn native_playlists_export_to_m3u_with_their_files() {
                     disc_number: None,
                     duration: Some(305.6),
                     plex_rating_key: None,
+                    recording_mbid: None,
                 }],
                 position: None,
             },
@@ -1020,7 +1017,7 @@ async fn booted(rig: &Rig, key: u8) -> (CatalogIds, JellyfinIds) {
     let ids = jellyfin_ids(rig, key, Duration::from_secs(1));
     ids.fill().pass().await.unwrap();
     (
-        CatalogIds::new(ids.clone(), rig.reads.library.catalog.clone()),
+        CatalogIds::new(ids.clone(), rig.catalog_setup.local.catalog.clone()),
         ids,
     )
 }
@@ -1041,8 +1038,8 @@ async fn jellyfin_ids_resolve_after_a_restart_without_reading_the_catalog() {
     let rig = Rig::open().await;
     write_catalog(
         &rig,
-        "INSERT INTO playlists (id, name, created_at, updated_at, user_id) \
-         VALUES ('pl-1', 'Mix', '2024-01-01', '2024-01-01', 'u1');",
+        "INSERT INTO catalog_playlists (id, name, created_at, updated_at, user_id) \
+         VALUES ('pl-1', 'Mix', 1704067200000, 1704067200000, 'u1');",
     )
     .await;
     let (before, _) = booted(&rig, 7).await;
@@ -1058,7 +1055,7 @@ async fn jellyfin_ids_resolve_after_a_restart_without_reading_the_catalog() {
     let wait = Duration::from_secs(2);
     let ids = CatalogIds::new(
         jellyfin_ids(&rig, 7, wait),
-        rig.reads.library.catalog.clone(),
+        rig.catalog_setup.local.catalog.clone(),
     );
     assert_eq!(
         ids.from_jf_anonymous(&handed[0]).await,
@@ -1143,7 +1140,7 @@ async fn stored_jellyfin_ids_survive_a_new_data_key() {
 async fn fill_row(rig: &Rig) -> Option<(Option<i64>, Option<String>)> {
     use sqlx::Row as _;
     sqlx::query("SELECT last_heartbeat_at, last_error FROM durable_loops WHERE name = ?")
-        .bind(droppedneedle_compat::adapters::jellyfin_ids::JOB_NAME)
+        .bind(droppedneedle_compat::jellyfin::ids::JOB_NAME)
         .fetch_optional(rig.runtime.db().sqlx())
         .await
         .expect("loop row reads")
@@ -1246,7 +1243,7 @@ async fn a_busy_fill_pass_runs_again_without_backing_off() {
     for holder in holders {
         holder.await.unwrap().unwrap();
     }
-    let catalog = CatalogIds::new(ids.clone(), rig.reads.library.catalog.clone());
+    let catalog = CatalogIds::new(ids.clone(), rig.catalog_setup.local.catalog.clone());
     let added = ids.computed("album", "alb-2");
     eventually("the added album's id resolves", || async {
         catalog.from_jf(&added).await == Ok(named("album", "alb-2"))
@@ -1269,10 +1266,10 @@ fn jellyfin_router(rig: &Rig, ids: &JellyfinIds) -> axum::Router {
         &rig.platform,
         rig.auth.deps.clone(),
         &rig.library,
-        &rig.reads,
+        &rig.catalog_setup,
         &acquire,
     );
-    let library = CompatLibrary::from_reads(&rig.reads);
+    let library = CompatLibrary::from_catalog(&rig.catalog_setup, rig.platform.db.clone());
     rig.platform
         .settings
         .save_blocking(ConnectApps {

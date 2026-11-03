@@ -13,11 +13,17 @@
 //! go back to pending with it.
 //!
 //! Every function here is plain SQL on the caller's transaction; the
-//! services own the transactions. Times are unix seconds. A caller that
+//! services own the transactions. Callers pass unix seconds, and the rows keep
+//! integer milliseconds. A caller that
 //! queues a job wakes its kind's loop with [`wake`] once the write is in.
 
+pub mod control;
+pub mod models;
+pub mod service;
 pub(crate) mod sql;
 mod states;
+pub mod store;
+pub mod worker;
 
 use droppedneedle_kernel::db::DbError;
 use droppedneedle_kernel::jobs::queue::JobError;
@@ -37,6 +43,9 @@ pub const MANAGEMENT_WAKEUP: &str = "library-management";
 pub const OPERATIONS_WAKEUP: &str = "library-operations";
 /// The wakeup the repairs loop listens on.
 pub const REPAIRS_WAKEUP: &str = "library-repairs";
+/// Asks the scan loop for the album art and lyrics sweeps without a scan:
+/// a publish rewrote files they read.
+pub const SWEEP_WAKEUP: &str = "library-sweep";
 
 /// This table's lease statements, for the kernel's lease core.
 const STATEMENTS: LeaseStatements = LeaseStatements {
@@ -76,23 +85,24 @@ impl OperationJob {
 }
 
 fn map_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<OperationJob> {
+    let row = sql::JobRow::read(row)?;
     Ok(OperationJob {
-        id: row.get(0)?,
-        kind: row.get(1)?,
-        state: row.get(2)?,
-        requested_by_user_id: row.get(3)?,
-        expected_work_count: row.get(4)?,
-        completed_count: row.get(5)?,
-        succeeded_count: row.get(6)?,
-        failed_count: row.get(7)?,
-        skipped_count: row.get(8)?,
-        control_request: row.get(9)?,
-        terminal_code: row.get(10)?,
-        reidentification_attempt_count: row.get(11)?,
-        row_revision: row.get(12)?,
-        event_revision: row.get(13)?,
-        created_at: row.get(14)?,
-        updated_at: row.get(15)?,
+        id: row.id,
+        kind: row.kind,
+        state: row.state,
+        requested_by_user_id: row.requested_by_user_id,
+        expected_work_count: row.expected_work_count,
+        completed_count: row.completed_count,
+        succeeded_count: row.succeeded_count,
+        failed_count: row.failed_count,
+        skipped_count: row.skipped_count,
+        control_request: row.control_request,
+        terminal_code: row.terminal_code,
+        reidentification_attempt_count: row.reidentification_attempt_count,
+        row_revision: row.row_revision,
+        event_revision: row.event_revision,
+        created_at: crate::clock::at_secs(row.created_at),
+        updated_at: crate::clock::at_secs(row.updated_at),
     })
 }
 
@@ -147,7 +157,7 @@ pub fn insert(tx: &Transaction<'_>, new: &NewJob<'_>) -> rusqlite::Result<()> {
             ":catalog_revision": new.catalog_revision,
             ":work_count": new.expected_work_count,
             ":key": new.idempotency_key,
-            ":now": new.now,
+            ":now": crate::clock::ms(new.now),
         })
         .map(drop)
 }
@@ -169,7 +179,7 @@ pub fn insert_done(
             ":kind": kind,
             ":code": code,
             ":key": key,
-            ":now": now,
+            ":now": crate::clock::ms(now),
         })
         .map(drop)
 }
@@ -199,7 +209,7 @@ pub fn insert_work(tx: &Transaction<'_>, new: &NewWork<'_>) -> rusqlite::Result<
             ":input_revision": new.expected_input_revision,
             ":action": new.action,
             ":key": new.idempotency_key,
-            ":now": new.now,
+            ":now": crate::clock::ms(new.now),
         })
         .map(drop)
 }
@@ -222,7 +232,7 @@ pub fn insert_work_with_input(
             ":action": new.action,
             ":key": new.idempotency_key,
             ":input": input,
-            ":now": new.now,
+            ":now": crate::clock::ms(new.now),
         })
         .map(drop)
 }
@@ -247,7 +257,7 @@ pub fn recent(
     limit: u32,
 ) -> rusqlite::Result<Vec<OperationJob>> {
     conn.prepare_cached(sql::RECENT_JOBS.text())?
-        .query_map(params![kind, since, limit], map_job)?
+        .query_map(params![kind, crate::clock::ms(since), limit], map_job)?
         .collect()
 }
 
@@ -259,7 +269,7 @@ pub fn queue_work(
     now: f64,
 ) -> rusqlite::Result<()> {
     tx.prepare_cached(sql::QUEUE_WORK.text())?
-        .execute(named_params! { ":id": job_id, ":work_count": work_count, ":now": now })
+        .execute(named_params! { ":id": job_id, ":work_count": work_count, ":now": crate::clock::ms(now) })
         .map(drop)
 }
 
@@ -267,12 +277,8 @@ pub fn queue_work(
 // The lease.
 // ---------------------------------------------------------------------------
 
-fn millis(seconds: f64) -> i64 {
-    (seconds * 1000.0).round() as i64
-}
-
 fn lease_until(now: f64) -> i64 {
-    millis(now + LEASE_SECS)
+    crate::clock::ms(now + LEASE_SECS)
 }
 
 /// The lease core's error as the database error it carries. The core
@@ -298,9 +304,9 @@ pub fn recover_expired(
 ) -> Result<u64, DbError> {
     // The work and the job compare against the same rounded time, so a
     // job requeued here never leaves its work running.
-    let now_ms = millis(now);
+    let now_ms = crate::clock::ms(now);
     tx.prepare_cached(sql::WORK_RECOVER_EXPIRED.text())?
-        .execute(named_params! { ":kind": kind, ":now": now_ms as f64 / 1000.0 })?;
+        .execute(named_params! { ":kind": kind, ":now": now_ms })?;
     lease::recover_expired(tx, &STATEMENTS, kind.as_str(), now_ms).map_err(db_error)
 }
 
@@ -313,8 +319,8 @@ pub fn recover_at_start(
     now: f64,
 ) -> Result<u64, DbError> {
     tx.prepare_cached(sql::WORK_RECOVER_AT_START.text())?
-        .execute(named_params! { ":kind": kind, ":now": now })?;
-    lease::recover_at_start(tx, &STATEMENTS, kind.as_str(), millis(now)).map_err(db_error)
+        .execute(named_params! { ":kind": kind, ":now": crate::clock::ms(now) })?;
+    lease::recover_at_start(tx, &STATEMENTS, kind.as_str(), crate::clock::ms(now)).map_err(db_error)
 }
 
 /// Requeue the jobs of `kind` whose lease ran out, then claim the next due
@@ -331,7 +337,7 @@ pub fn claim(
         &STATEMENTS,
         kind.as_str(),
         owner,
-        millis(now),
+        crate::clock::ms(now),
         lease_until(now),
     )
     .map_err(db_error)?;
@@ -355,7 +361,15 @@ pub fn heartbeat(
     let Some(rowid) = rowid(tx, job_id)? else {
         return Ok(false);
     };
-    lease::heartbeat(tx, &STATEMENTS, rowid, owner, millis(now), lease_until(now)).map_err(db_error)
+    lease::heartbeat(
+        tx,
+        &STATEMENTS,
+        rowid,
+        owner,
+        crate::clock::ms(now),
+        lease_until(now),
+    )
+    .map_err(db_error)
 }
 
 /// Hand `owner`'s running job back to the queue, its running work back to
@@ -369,7 +383,7 @@ pub fn release(tx: &Transaction<'_>, job_id: &str, owner: &str, now: f64) -> Res
         return Ok(false);
     };
     work_back_to_pending(tx, job_id, None, now)?;
-    lease::release(tx, &STATEMENTS, rowid, owner, millis(now)).map_err(db_error)
+    lease::release(tx, &STATEMENTS, rowid, owner, crate::clock::ms(now)).map_err(db_error)
 }
 
 /// As [`release`], but no claim takes the job again before `retry_at`,
@@ -390,11 +404,11 @@ pub fn release_until(
         return Ok(false);
     };
     work_back_to_pending(tx, job_id, reason, now)?;
-    if !lease::release(tx, &STATEMENTS, rowid, owner, millis(now)).map_err(db_error)? {
+    if !lease::release(tx, &STATEMENTS, rowid, owner, crate::clock::ms(now)).map_err(db_error)? {
         return Ok(false);
     }
     tx.prepare_cached(sql::RETRY_AT.text())?
-        .execute(named_params! { ":id": job_id, ":at": retry_at })?;
+        .execute(named_params! { ":id": job_id, ":at": crate::clock::ms(retry_at) })?;
     Ok(true)
 }
 
@@ -432,7 +446,7 @@ pub fn checkpoint(
         None => return job(tx, job_id),
     };
     tx.prepare_cached(sql::HALT.text())?
-        .execute(named_params! { ":id": job_id, ":state": state, ":code": code, ":now": now })?;
+        .execute(named_params! { ":id": job_id, ":state": state, ":code": code, ":now": crate::clock::ms(now) })?;
     work_back_to_pending(tx, job_id, None, now)?;
     job(tx, job_id)
 }
@@ -444,7 +458,7 @@ fn work_back_to_pending(
     now: f64,
 ) -> rusqlite::Result<()> {
     tx.prepare_cached(sql::WORK_BACK_TO_PENDING.text())?
-        .execute(named_params! { ":job": job_id, ":code": reason, ":now": now })
+        .execute(named_params! { ":job": job_id, ":code": reason, ":now": crate::clock::ms(now) })
         .map(drop)
 }
 
@@ -488,7 +502,7 @@ pub fn finish(
             ":state": state,
             ":code": code,
             ":tally": tally.code(),
-            ":now": now,
+            ":now": crate::clock::ms(now),
         })?;
     Ok(changed == 1)
 }
@@ -503,7 +517,7 @@ pub fn park_ready(
 ) -> rusqlite::Result<bool> {
     let changed = tx
         .prepare_cached(sql::PARK_READY.text())?
-        .execute(named_params! { ":id": job_id, ":owner": owner, ":now": now })?;
+        .execute(named_params! { ":id": job_id, ":owner": owner, ":now": crate::clock::ms(now) })?;
     Ok(changed == 1)
 }
 
@@ -519,7 +533,7 @@ pub fn report_ready(
 ) -> rusqlite::Result<bool> {
     let changed = tx
         .prepare_cached(sql::REPORT_READY.text())?
-        .execute(named_params! { ":id": job_id, ":owner": owner, ":code": code, ":now": now })?;
+        .execute(named_params! { ":id": job_id, ":owner": owner, ":code": code, ":now": crate::clock::ms(now) })?;
     Ok(changed == 1)
 }
 
@@ -533,7 +547,7 @@ pub fn cancel_ready(
 ) -> rusqlite::Result<bool> {
     let changed = tx
         .prepare_cached(sql::CANCEL_READY.text())?
-        .execute(named_params! { ":id": job_id, ":code": code, ":now": now })?;
+        .execute(named_params! { ":id": job_id, ":code": code, ":now": crate::clock::ms(now) })?;
     Ok(changed == 1)
 }
 
@@ -545,7 +559,7 @@ pub fn complete_ready(
     now: f64,
 ) -> rusqlite::Result<()> {
     tx.prepare_cached(sql::COMPLETE_READY.text())?
-        .execute(named_params! { ":id": job_id, ":code": code, ":now": now })
+        .execute(named_params! { ":id": job_id, ":code": code, ":now": crate::clock::ms(now) })
         .map(drop)
 }
 
@@ -564,7 +578,7 @@ pub fn discard_preview(
             ":id": job_id,
             ":code": "DISCARDED",
             ":revision": expected_revision,
-            ":now": now,
+            ":now": crate::clock::ms(now),
         })?;
     Ok(changed == 1)
 }
@@ -601,26 +615,26 @@ pub fn control(
                         ":id": job_id,
                         ":request": request,
                         ":revision": expected_revision,
-                        ":now": now,
+                        ":now": crate::clock::ms(now),
                     })?;
             return Ok(changed == 1);
         }
         ControlChange::StopNow => sql::CONTROL_STOP_NOW,
         ControlChange::Restart => {
             tx.prepare_cached(sql::WORK_RESET_ALL.text())?
-                .execute(named_params! { ":job": job_id, ":now": now })?;
+                .execute(named_params! { ":job": job_id, ":now": crate::clock::ms(now) })?;
             sql::CONTROL_RESTART
         }
         ControlChange::RetryFailed => {
             tx.prepare_cached(sql::WORK_RESET_FAILED.text())?
-                .execute(named_params! { ":job": job_id, ":now": now })?;
+                .execute(named_params! { ":job": job_id, ":now": crate::clock::ms(now) })?;
             sql::CONTROL_RETRY_FAILED
         }
         ControlChange::Continue => sql::CONTROL_CONTINUE,
     };
     let changed = tx
         .prepare_cached(statement.text())?
-        .execute(named_params! { ":id": job_id, ":revision": expected_revision, ":now": now })?;
+        .execute(named_params! { ":id": job_id, ":revision": expected_revision, ":now": crate::clock::ms(now) })?;
     Ok(changed == 1)
 }
 
@@ -635,8 +649,9 @@ pub fn claim_work(tx: &Transaction<'_>, job_id: &str, now: f64) -> rusqlite::Res
         .query_row(named_params! { ":job": job_id }, |row| row.get(0))
         .optional()?;
     if let Some(ordinal) = ordinal {
-        tx.prepare_cached(sql::START_WORK.text())?
-            .execute(named_params! { ":job": job_id, ":ordinal": ordinal, ":now": now })?;
+        tx.prepare_cached(sql::START_WORK.text())?.execute(
+            named_params! { ":job": job_id, ":ordinal": ordinal, ":now": crate::clock::ms(now) },
+        )?;
     }
     Ok(ordinal)
 }
@@ -669,25 +684,25 @@ pub fn work_item(
     conn.prepare_cached(sql::WORK_ITEM.text())?
         .query_row(
             named_params! { ":job": job_id, ":ordinal": ordinal },
-            |row| {
-                Ok(WorkItem {
-                    local_album_id: row.get(0)?,
-                    expected_subject_revision: row.get(1)?,
-                    expected_input_revision: row.get(2)?,
-                    action: row.get(3)?,
-                    input: row.get(4)?,
-                })
-            },
+            sql::WorkItemRow::read,
         )
         .optional()
+        .map(|row| {
+            row.map(|row| WorkItem {
+                local_album_id: row.local_album_id,
+                expected_subject_revision: row.expected_subject_revision,
+                expected_input_revision: row.expected_input_revision,
+                action: row.action,
+                input: row.checkpoint_json,
+            })
+        })
 }
 
 /// A job's skipped work items counted by their failure code, most first.
 pub fn skipped_by_code(conn: &Connection, job_id: &str) -> rusqlite::Result<Vec<(String, i64)>> {
     conn.prepare_cached(sql::SKIPPED_BY_CODE.text())?
-        .query_map(named_params! { ":job": job_id }, |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        })?
+        .query_map(named_params! { ":job": job_id }, sql::SkippedCount::read)?
+        .map(|row| row.map(|row| (row.failure_code, row.total)))
         .collect()
 }
 
@@ -708,10 +723,10 @@ pub fn finish_work(
             ":state": state,
             ":code": failure_code,
             ":result": result_json,
-            ":now": now,
+            ":now": crate::clock::ms(now),
         })?;
     tx.prepare_cached(sql::COUNT_WORK.text())?
-        .execute(named_params! { ":job": job_id, ":state": state, ":now": now })
+        .execute(named_params! { ":job": job_id, ":state": state, ":now": crate::clock::ms(now) })
         .map(drop)
 }
 
@@ -731,7 +746,7 @@ pub fn finish_running_work(
             ":state": state,
             ":code": failure_code,
             ":result": result_json,
-            ":now": now,
+            ":now": crate::clock::ms(now),
         })
         .map(drop)
 }
@@ -769,59 +784,13 @@ pub fn work_of_bundle(
     bundle_id: &str,
 ) -> rusqlite::Result<Option<(String, i64)>> {
     conn.prepare_cached(sql::WORK_OF_BUNDLE.text())?
-        .query_row(named_params! { ":bundle": bundle_id }, |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        })
+        .query_row(
+            named_params! { ":bundle": bundle_id },
+            sql::BundleWork::read,
+        )
         .optional()
-}
-
-/// A condition on `job` (a `library_operation_jobs` row) that holds while
-/// the job still has work coming on its albums: queued, running, paused,
-/// or ready and not past its expiry. A ready preview past its expiry can
-/// never be applied, so it holds nothing back; one with no expiry stored
-/// still does. A dry run for turning automatic management on is never
-/// applied either, so it holds nothing back while ready. `now` is the SQL
-/// parameter holding the current time in seconds.
-pub fn live_job_sql(now: &str) -> String {
-    format!(
-        "(job.state IN ('queued','running','paused') OR (job.state = 'ready' \
-         AND NOT EXISTS(SELECT 1 FROM library_management_job_snapshots expiry \
-         WHERE expiry.job_id = job.id AND (expiry.preview_expires_at <= {now} \
-         OR expiry.proposed_settings_revision IS NOT NULL))))"
-    )
+        .map(|row| row.map(|row| (row.job_id, row.ordinal)))
 }
 
 #[cfg(test)]
-mod tests {
-    use droppedneedle_kernel::db::scratch::ScratchDir;
-    use droppedneedle_kernel::db::{DbConfig, open_runtime};
-    use droppedneedle_kernel::schema::template::copy_to;
-
-    /// The job table's lease statements keep the promises the kernel's
-    /// lease core relies on: a stale owner changes nothing, a lease that
-    /// ran out is requeued for its kind, and every held job is requeued at
-    /// start.
-    #[tokio::test]
-    async fn the_job_table_keeps_the_lease_promises() {
-        let dir = ScratchDir::new("library-jobs-lease").unwrap();
-        let path = dir.join("library.db");
-        copy_to(&path).unwrap();
-        let runtime = open_runtime(&DbConfig::new(&path)).await.unwrap();
-        let kind = super::OperationKind::ExplicitReidentification.as_str();
-        super::lease::check_conformance(runtime.db(), super::STATEMENTS, kind, move |tx| {
-            tx.execute(
-                "INSERT INTO library_operation_jobs (id, kind, state, created_at, updated_at) \
-                 VALUES ('job', ?1, 'queued', 0, 0)",
-                [kind],
-            )?;
-            tx.query_row(
-                "SELECT rowid FROM library_operation_jobs WHERE id = 'job'",
-                [],
-                |row| row.get(0),
-            )
-        })
-        .await
-        .unwrap();
-        runtime.shutdown().await;
-    }
-}
+mod tests;

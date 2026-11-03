@@ -9,7 +9,7 @@ const h = vi.hoisted(() => ({
 	isTrusted: false
 }));
 
-vi.mock('$lib/queries/HomeIntegrationStatusQuery.svelte', () => ({
+vi.mock('$lib/queries/home.svelte', () => ({
 	getIntegrationStatusQuery: () => ({
 		get isLoading() {
 			return !h.loaded;
@@ -41,12 +41,9 @@ vi.mock('$lib/stores/authStore.svelte', () => ({
 	LAST_USER_ID_KEY: 'msr:last_user_id'
 }));
 
-vi.mock('$lib/queries/import/DropImportQueries.svelte', () => ({
-	getDropImportJobsQuery: () => ({ data: { jobs: [] }, isLoading: false })
-}));
-
-vi.mock('$lib/queries/import/DropImportMutations.svelte', () => ({
-	uploadDropMutation: () => ({ mutate: vi.fn(), isPending: false })
+vi.mock('$lib/queries/import.svelte', () => ({
+	getDropImportJobsQuery: () => ({ data: { jobs: [] }, isLoading: false }),
+	createUploadDropMutation: () => ({ mutate: vi.fn(), isPending: false })
 }));
 
 vi.mock('$lib/queries/downloads/HeldQueries.svelte', async (importOriginal) => ({

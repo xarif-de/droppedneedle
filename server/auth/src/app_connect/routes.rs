@@ -27,7 +27,7 @@ use super::AppConnectState;
 use super::codes::Grant;
 use super::request::{ConnectRequest, Rejection, check, verifier_matches};
 use crate::session::login::NO_STORE;
-use crate::session::tokens::constant_time_eq;
+use crate::session::tokens::secret_eq;
 use crate::users::User;
 use crate::users::UsersError;
 use crate::users::services::{self, MAX_ACTIVE_APP_PASSWORDS};
@@ -259,8 +259,8 @@ pub async fn app_connect_token_handler(
         tracing::debug!("app connect trade refused: unknown, used or expired code");
         return Ok(token_error("invalid_grant"));
     };
-    let fits = constant_time_eq(&grant.client_id, &trade.client_id)
-        & constant_time_eq(&grant.redirect_uri, &trade.redirect_uri)
+    let fits = secret_eq(&grant.client_id, &trade.client_id)
+        & secret_eq(&grant.redirect_uri, &trade.redirect_uri)
         & verifier_matches(&trade.code_verifier, &grant.code_challenge);
     // The admin may have taken the app off the list since the user allowed it.
     let listed = apps.client(&grant.client_id, &grant.redirect_uri).is_some();

@@ -16,15 +16,15 @@ use axum::{
 };
 use droppedneedle_auth::Role;
 use droppedneedle_auth::session::store::SessionKind;
-use droppedneedle_catalog::reads::discover::listening::{
+use droppedneedle_catalog::discover::listening::{
     AlbumRow, ArtistFacts, ArtistRow, Ask, JellyfinList, LastFmAlbum, LastFmChartAlbum,
     LastFmFacts, ListenedAlbum, ListeningData, ListeningError, ListeningNetwork, LovedTrack,
     PlayedArtist, RankedAlbum, Read, ReleaseGroupFacts, ScoredArtist, SourceContext, StatsRange,
     TagAlbum, UserMusic, WeeklyPlaylist,
 };
-use droppedneedle_catalog::reads::discover::ports::BoxFuture;
-use droppedneedle_catalog::reads::discover::services::ReadsDeps;
-use droppedneedle_catalog::reads::discover::wiring::{DiscoverInputs, deps_over, live_network};
+use droppedneedle_catalog::discover::ports::BoxFuture;
+use droppedneedle_catalog::discover::services::DiscoverDeps;
+use droppedneedle_catalog::discover::wiring::{DiscoverInputs, deps_over, live_network};
 use droppedneedle_kernel::db::{Db, Lane};
 use droppedneedle_kernel::runtime_config::secret_sections::AdvancedSettings;
 use droppedneedle_providers::{ProviderError, Providers, RequestPriority};
@@ -456,7 +456,7 @@ fn queue_script() -> Script {
         user_artists: vec![ArtistRow {
             name: "Seed".to_owned(),
             mbid: Some(SEED.to_owned()),
-            listen_count: 10,
+            listen_count: Some(10),
         }],
         similar: HashMap::from([(
             SEED.to_owned(),
@@ -464,7 +464,7 @@ fn queue_script() -> Script {
                 artist: ArtistRow {
                     name: "Similar".to_owned(),
                     mbid: Some(SIMILAR.to_owned()),
-                    listen_count: 5,
+                    listen_count: Some(5),
                 },
                 score: 5.0,
             }],
@@ -531,7 +531,7 @@ pub(crate) fn discover_deps(
     dir: &Path,
     providers: Providers,
     script: impl FnOnce(&mut Arc<dyn ListeningNetwork>),
-) -> ReadsDeps {
+) -> DiscoverDeps {
     let inputs = discover_inputs(rig, dir, providers);
     let mut network = live_network(&inputs, &rig.config);
     script(&mut network);
@@ -539,8 +539,8 @@ pub(crate) fn discover_deps(
 }
 
 /// Discover's routes over `deps`, signed in as `user-1`.
-pub(crate) fn discover_routes(deps: ReadsDeps) -> Router {
-    let router = droppedneedle_catalog::reads::discover::routes()
+pub(crate) fn discover_routes(deps: DiscoverDeps) -> Router {
+    let router = droppedneedle_catalog::discover::routes()
         .with_state(deps)
         .into_router();
     with_test_principal(
@@ -811,6 +811,90 @@ async fn an_ignore_during_a_build_never_reaches_the_deck() {
     );
 }
 
+/// A hidden album leaves the deck and the ledger shows it. Once un-hidden
+/// it is off the ledger and the next deck can hold it again. The pool is
+/// smaller than the deck, so every album still allowed is always dealt.
+#[tokio::test]
+async fn an_unhidden_album_returns_to_the_queue() {
+    let dir = crate::common::ScratchDir::new("discover-queue-unhide");
+    let rig = AuthRig::new("discover-queue-unhide").await;
+    let db = rig.platform.db.clone();
+    seed_user(&db).await;
+    let full = queue_script();
+    let script = Script {
+        artist_albums: HashMap::from([(
+            SIMILAR.to_owned(),
+            vec![RankedAlbum {
+                album: album(1, SIMILAR),
+                listen_count: 0,
+            }],
+        )]),
+        sitewide_albums: full.sitewide_albums.into_iter().take(1).collect(),
+        ..queue_script()
+    };
+    let app = queue_app(&rig, &dir, script);
+    let hidden = group(11);
+    let deck_once = |wanted: bool| {
+        let (app, db, hidden) = (&app, &db, &hidden);
+        async move {
+            after_commits(db, "the deck settled", || async {
+                let (_, status) = call(app, "GET", "/api/v3/discover/queue/status", None).await;
+                if status["status"] != "ready" {
+                    return None;
+                }
+                let (_, deck) = call(app, "GET", "/api/v3/discover/queue", None).await;
+                (deck_ids(&deck).contains(hidden) == wanted).then_some(())
+            })
+            .await;
+        }
+    };
+
+    call(
+        &app,
+        "POST",
+        "/api/v3/discover/queue/generate",
+        Some(json!({})),
+    )
+    .await;
+    deck_once(true).await;
+
+    ignore(&app, &hidden).await;
+    deck_once(false).await;
+    let (_, ledger) = call(&app, "GET", "/api/v3/discover/queue/ignored", None).await;
+    assert_eq!(ledger["items"][0]["release_group_mbid"], hidden.as_str());
+    settled(&app, &db).await;
+
+    let (status, body) = call(
+        &app,
+        "DELETE",
+        &format!("/api/v3/discover/queue/ignored/{hidden}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let (_, ledger) = call(&app, "GET", "/api/v3/discover/queue/ignored", None).await;
+    assert_eq!(ledger["items"], json!([]));
+
+    let (_, started) = call(
+        &app,
+        "POST",
+        "/api/v3/discover/queue/generate",
+        Some(json!({"force": true})),
+    )
+    .await;
+    assert_eq!(started["action"], "started");
+    deck_once(true).await;
+
+    let (status, body) = call(
+        &app,
+        "DELETE",
+        "/api/v3/discover/queue/ignored/not-an-mbid",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}
+
 /// A card whose MusicBrainz read failed is not cached for the day: once
 /// MusicBrainz answers, the next read fills the card in.
 #[tokio::test]
@@ -841,7 +925,7 @@ async fn a_user_without_lastfm_leaves_no_empty_answer_for_others() {
         lastfm_chart: vec![ArtistRow {
             name: "Charted".to_owned(),
             mbid: Some(SIMILAR.to_owned()),
-            listen_count: 7,
+            listen_count: Some(7),
         }],
         ..Script::default()
     };

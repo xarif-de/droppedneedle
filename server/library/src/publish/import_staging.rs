@@ -8,6 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use super::HIDDEN_PREFIX;
+use super::journal::JournalState;
 use super::planner::FileFingerprint;
 
 /// The hidden folder, relative to its library root, that an import
@@ -47,16 +48,31 @@ pub(crate) fn staging_settled(
 ) -> rusqlite::Result<bool> {
     let folder = format!("{task_dir}/");
     let unsettled: bool = conn.query_row(
-        "SELECT EXISTS (SELECT 1 FROM library_publish_journal \
-         WHERE bundle_id IN (SELECT bundle_id FROM library_publish_journal \
-         WHERE substr(source_rel, 1, length(?1)) = ?1) \
-         AND state NOT IN ('cleaned', 'compensated', 'cleanup_pending') \
-         AND NOT (state = 'needs_attention' AND bundle_id IN \
-         (SELECT bundle_id FROM library_publish_resolutions)))",
-        rusqlite::params![folder],
+        crate::publish::sql::STAGING_SETTLED.text(),
+        rusqlite::params![
+            folder,
+            JournalState::Cleaned,
+            JournalState::Compensated,
+            JournalState::CleanupPending,
+            JournalState::NeedsAttention,
+        ],
         |row| row.get(0),
     )?;
     Ok(!unsettled)
+}
+
+/// Whether a publish that took files from `task_dir` needs a person: it
+/// needs attention and nobody has closed it yet.
+pub(crate) fn staging_needs_attention(
+    conn: &rusqlite::Connection,
+    task_dir: &str,
+) -> rusqlite::Result<bool> {
+    let folder = format!("{task_dir}/");
+    conn.query_row(
+        crate::publish::sql::STAGING_NEEDS_ATTENTION.text(),
+        rusqlite::params![folder, JournalState::NeedsAttention],
+        |row| row.get(0),
+    )
 }
 
 /// Copy one landed file, opened by the caller, into the hidden import

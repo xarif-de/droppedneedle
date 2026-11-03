@@ -17,11 +17,13 @@ use super::remap::queue_remap;
 use super::sql;
 use super::undo::{Snapshot, keep_choice_undo, record_and_keep, restore_track_row, snapshot};
 use super::{DecisionSource, IdentityError, PROVIDER, Placed, Refusal, Rows, delete_album_row};
+use crate::catalog_actions::CatalogAction;
+use crate::catalog_actions::record_action;
 use crate::catalog_revision::bump_catalog;
 use crate::corrections::continuation::{Scope, continue_tracks};
 use crate::corrections::release_join::join_replaced;
 use crate::identify::models::PriorTrackIdentity;
-use crate::operations::decisions::{CatalogAction, record_action, settle_reviews};
+use crate::reviews::settle_reviews;
 
 /// Reason code on an album whose chosen edition fits none of its files.
 pub(crate) const CHOSEN_FITS_NO_FILE: &str = "CHOSEN_EDITION_FITS_NO_FILE";
@@ -147,14 +149,14 @@ pub(super) fn write_choice_tracks(
                 placement.release_track_mbid,
                 placement.disc,
                 placement.position,
-                now,
+                crate::clock::ms(now),
                 album_id,
             ])?;
         forget_hand_match(tx, &placement.local_track_id)?;
     }
     for track_id in &fit.extra {
         tx.prepare_cached(sql::UNPLACE_CHOSEN_TRACK.text())?
-            .execute(params![track_id, now, PROVIDER, album_id])?;
+            .execute(params![track_id, crate::clock::ms(now), PROVIDER, album_id])?;
         forget_hand_match(tx, track_id)?;
     }
     Ok(())
@@ -192,7 +194,7 @@ pub(super) fn seal_persons_album(
             release_group,
             release,
             actor,
-            now
+            crate::clock::ms(now)
         ])?;
     Ok(())
 }
@@ -343,9 +345,9 @@ fn make_persons(
     now: f64,
 ) -> rusqlite::Result<()> {
     tx.prepare_cached(sql::CONFIRM_ALBUM.text())?
-        .execute(params![album_id, actor, now, PROVIDER])?;
+        .execute(params![album_id, actor, crate::clock::ms(now), PROVIDER])?;
     tx.prepare_cached(sql::CONFIRM_TRACKS.text())?
-        .execute(params![album_id, now, PROVIDER])?;
+        .execute(params![album_id, crate::clock::ms(now), PROVIDER])?;
     drop_satellite(tx, album_id, sql::CLEAR_FLAG)?;
     // A chosen or confirmed edition is what automatic management waits
     // for: the album's files follow that exact edition.
@@ -387,9 +389,9 @@ pub fn hand_back(
         return Ok(false);
     };
     tx.prepare_cached(sql::HAND_BACK_ALBUM.text())?
-        .execute(params![album_id, now, PROVIDER])?;
+        .execute(params![album_id, crate::clock::ms(now), PROVIDER])?;
     tx.prepare_cached(sql::HAND_BACK_TRACKS.text())?
-        .execute(params![album_id, now, PROVIDER])?;
+        .execute(params![album_id, crate::clock::ms(now), PROVIDER])?;
     forget_album_hand_matches(tx, album_id)?;
     for statement in [sql::DROP_REMAP, sql::DROP_CUSTOM] {
         drop_satellite(tx, album_id, statement)?;
@@ -434,13 +436,13 @@ pub fn leave_unmanaged(
     let matched = before.identity.is_some();
     if matched {
         tx.prepare_cached(sql::LEAVE_ALBUM_UNMANAGED.text())?
-            .execute(params![album_id, actor, now, PROVIDER])?;
+            .execute(params![album_id, actor, crate::clock::ms(now), PROVIDER])?;
     }
     tx.prepare_cached(sql::UNPLACE_ALBUM_TRACKS.text())?
-        .execute(params![album_id, now, PROVIDER])?;
+        .execute(params![album_id, crate::clock::ms(now), PROVIDER])?;
     forget_album_hand_matches(tx, album_id)?;
     tx.prepare_cached(sql::EXCLUDE_ALBUM.text())?
-        .execute(params![album_id, actor, now])?;
+        .execute(params![album_id, actor, crate::clock::ms(now)])?;
     for statement in [sql::DROP_CUSTOM, sql::DROP_REMAP] {
         drop_satellite(tx, album_id, statement)?;
     }
@@ -510,8 +512,6 @@ pub fn remove(
     };
     let persons = identity
         .decision_source
-        .as_deref()
-        .and_then(DecisionSource::parse)
         .is_some_and(DecisionSource::is_persons_choice);
     let (reason, actor, job_id, kind, carried) = match removal {
         Removal::Repair { .. } if persons => return Ok(None),
@@ -530,7 +530,7 @@ pub fn remove(
         drop_satellite(tx, album_id, statement)?;
     }
     tx.prepare_cached(sql::MARK_UNMATCHED.text())?
-        .execute(params![album_id, reason, now])?;
+        .execute(params![album_id, reason, crate::clock::ms(now)])?;
     let action = record_action(
         tx,
         CatalogAction {
@@ -639,8 +639,7 @@ pub fn hand_match(tx: &Transaction<'_>, matched: &Matched<'_>) -> rusqlite::Resu
     let persons = before
         .identity
         .as_ref()
-        .and_then(|row| row.decision_source.as_deref())
-        .and_then(DecisionSource::parse)
+        .and_then(|row| row.decision_source)
         .is_some_and(DecisionSource::is_persons_choice);
     if !persons {
         make_persons(tx, album_id, &before, matched.actor, now)?;
@@ -664,7 +663,7 @@ pub fn hand_match(tx: &Transaction<'_>, matched: &Matched<'_>) -> rusqlite::Resu
             matched.release_track_mbid,
             matched.disc,
             matched.position,
-            now,
+            crate::clock::ms(now),
             album_id,
         ])?;
     // The file now fits the edition the person chose.
@@ -759,7 +758,7 @@ pub(crate) fn upsert_track_identity(
             row.medium_position,
             row.release_track_position,
             row.decision_source,
-            now,
+            crate::clock::ms(now),
         ])?;
     forget_hand_match(tx, row.local_track_id)
 }

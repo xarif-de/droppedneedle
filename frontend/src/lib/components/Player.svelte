@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { isValidMbid } from '$lib/utils/formatting';
 	import { playerStore } from '$lib/stores/player.svelte';
 	import { deckFocus } from '$lib/stores/deckFocus.svelte';
 	import { eqStore } from '$lib/stores/eq.svelte';
@@ -15,7 +16,7 @@
 	import AlbumImage from '$lib/components/AlbumImage.svelte';
 	import IconButton from '$lib/ui/IconButton.svelte';
 	import { withBasePath } from '$lib/utils/basePath';
-	import { getLyricsQuery } from '$lib/queries/lyrics/LyricsQuery.svelte';
+	import { getLyricsQuery } from '$lib/queries/lyrics.svelte';
 	import { authStore } from '$lib/stores/authStore.svelte';
 	import { navidromeFolderScope } from '$lib/queries/remotes/RemoteQueries.svelte';
 	import {
@@ -119,7 +120,7 @@
 		>
 			<div class="flex min-w-0 flex-1 items-center gap-2 sm:gap-3 lg:w-1/4 lg:flex-none">
 				<AlbumImage
-					mbid={playerStore.nowPlaying.albumId}
+					mbid={isValidMbid(playerStore.nowPlaying.albumId) ? playerStore.nowPlaying.albumId : ''}
 					customUrl={playerStore.nowPlaying.coverUrl ?? null}
 					alt={playerStore.nowPlaying.albumName}
 					size="full"

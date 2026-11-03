@@ -1,9 +1,9 @@
 //! Bounded playback sessions and their lifecycle: a start resolves the
 //! track and the listener's display name once and the session keeps them,
-//! so progress and stop read neither again. Session reports write
-//! presence, attribute the play to its remote server, and count a scrobble
-//! past threshold. Reporting never fails the player, so remote failures are
-//! logged and swallowed, and only unknown tracks and malformed input error.
+//! so progress and stop read neither again. Session reports write presence
+//! and count a scrobble past threshold. A track played from a media server
+//! takes none of that: its reports are queued for that server and the
+//! route answers at once. Only unknown tracks and malformed input error.
 
 use std::{
     collections::HashMap,
@@ -16,18 +16,19 @@ use super::{
         PlaybackProgressRequest, PlaybackProgressResponse, PlaybackStartRequest,
         PlaybackStartResponse, PlaybackStopRequest, PlaybackStopResponse,
     },
-    ports::{ProviderFailure, RemoteReport, RemoteReporters, TrackInfo},
+    ports::{RemoteReport, TrackInfo},
     presence::{presence_key, write_session_presence},
     report::{forward_now_playing, submit_session_scrobble},
-    rules::{ServiceError, has_remote, normalize_client, should_scrobble_native},
+    rules::{ServiceError, normalize_client, should_scrobble_native},
 };
+use crate::remotes::transport::request_id;
 
-/// Session time-to-live in seconds (v2 `_SESSION_TTL_SECONDS`, 2h).
+/// Session time-to-live in seconds (2h).
 pub const SESSION_TTL_SECS: i64 = 2 * 60 * 60;
-/// Session table cap (v2 `max_sessions`, oldest-first eviction).
+/// Session table cap.
 pub const MAX_SESSIONS: usize = 1_000;
 
-/// Session key (v2 `(user_id, client.casefold(), file_id)`).
+/// Session key: the owner, the normalized client and the catalog track.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SessionKey {
     /// Owning user id.
@@ -46,8 +47,8 @@ struct Resolved {
     user_name: String,
 }
 
-/// One bounded playback session (v2 `_PlaybackSession`, plus the start
-/// instant that becomes the scrobble timestamp on the Jellyfin path).
+/// One bounded playback session, plus the start instant that becomes the
+/// scrobble timestamp on the Jellyfin path.
 #[derive(Debug, Clone)]
 struct Session {
     resolved: Resolved,
@@ -65,8 +66,8 @@ struct FinishView {
     started_at: i64,
 }
 
-/// Bounded session table (v2 `PlaybackReportService` storage: 2h TTL,
-/// 1,000-entry cap, oldest-first eviction).
+/// Bounded session table: 2h TTL, 1,000-entry cap, and the least recently
+/// updated sessions evicted first.
 #[derive(Debug, Clone)]
 pub struct SessionStore {
     inner: Arc<Mutex<HashMap<SessionKey, Session>>>,
@@ -97,8 +98,7 @@ impl SessionStore {
         sessions.get(key).map(|session| session.resolved.clone())
     }
 
-    /// Open a session, discarding any previous one: a start always resets
-    /// (v2 `state == "starting"` branch).
+    /// Open a session, discarding any previous one: a start always resets.
     fn begin(&self, key: SessionKey, resolved: Resolved, now: i64) {
         if let Ok(mut sessions) = self.inner.lock() {
             evict_stale_sessions(&mut sessions, now);
@@ -117,8 +117,7 @@ impl SessionStore {
         }
     }
 
-    /// Record a heartbeat. A stopped session that rewinds restarts fresh
-    /// (v2 `previous.stopped and position < previous.position` branch);
+    /// Record a heartbeat. A stopped session that rewinds restarts fresh;
     /// otherwise the heartbeat joins the live session.
     fn heartbeat(&self, key: SessionKey, resolved: Resolved, position_ms: Option<i64>, now: i64) {
         if let Ok(mut sessions) = self.inner.lock() {
@@ -142,8 +141,7 @@ impl SessionStore {
         }
     }
 
-    /// Mark a session stopped, creating it when the player never said
-    /// hello (v2 `previous or fresh` branch on the stop path).
+    /// Mark a session stopped, creating it when the player never said hello.
     fn finish(
         &self,
         key: SessionKey,
@@ -196,14 +194,13 @@ impl Default for SessionStore {
     }
 }
 
-/// Drop sessions idle past the TTL (v2 `_evict`).
+/// Drop sessions idle past the TTL.
 fn evict_stale_sessions(sessions: &mut HashMap<SessionKey, Session>, now: i64) {
     let cutoff = now - SESSION_TTL_SECS;
     sessions.retain(|_, session| session.updated_at >= cutoff);
 }
 
-/// Hold the cap by dropping the stalest sessions first (v2 pops
-/// insertion-oldest; update time orders the same way here).
+/// Hold the cap by dropping the least recently updated sessions first.
 fn enforce_session_cap(sessions: &mut HashMap<SessionKey, Session>) {
     while sessions.len() > MAX_SESSIONS {
         let oldest = sessions
@@ -219,18 +216,33 @@ fn enforce_session_cap(sessions: &mut HashMap<SessionKey, Session>) {
     }
 }
 
-/// Open a playback session: resolve the track, reset the session, forward
-/// now-playing to the sinks, write presence, and attribute the start to the
-/// remote server (v2 `PlaybackReportService` starting branch feeding
-/// `CompatScrobbleAdapter.now_playing`, plus the outbound start call).
+/// Open a playback session. A media-server track is only reported to its
+/// server. A library or YouTube track resolves, resets the session,
+/// forwards now-playing to the sinks and writes presence.
 pub fn start_playback(
     deps: &PlaybackDeps,
     user_id: &str,
     request: &PlaybackStartRequest,
 ) -> Result<PlaybackStartResponse, ServiceError> {
+    let client = normalize_client(Some(&request.device)).unwrap_or_else(|| "app".to_owned());
+    let session = format!("{user_id}:{client}:{}", request.track_id);
+    if let Some(source) = request.source.remote() {
+        let report = remote_report(
+            user_id,
+            &request.track_id,
+            request.position_ms,
+            None,
+            request.duration_ms,
+            false,
+        )?;
+        deps.remotes.report_start(source, &report);
+        return Ok(PlaybackStartResponse {
+            accepted: true,
+            session,
+        });
+    }
     let resolved = resolve(deps, user_id, &request.track_id)?;
     let now = deps.clock.now_unix();
-    let client = normalize_client(Some(&request.device)).unwrap_or_else(|| "app".to_owned());
     let key = SessionKey {
         user_id: user_id.to_owned(),
         client,
@@ -240,43 +252,46 @@ pub fn start_playback(
     deps.mixed.clear(&key);
     let Resolved { track, user_name } = resolved;
 
-    let source = normalize_client(Some(&request.source));
-    forward_now_playing(deps, user_id, &track, source.as_deref());
+    let source = Some(request.source.as_str());
+    forward_now_playing(deps, user_id, &track, source);
     write_session_presence(
         deps,
         user_id,
         &user_name,
         &request.device,
         &track,
-        source.as_deref(),
+        source,
         false,
         None,
         now,
     );
-    let report = RemoteReport {
-        user_id: user_id.to_owned(),
-        item_id: track.track_id.clone(),
-        device: request.device.clone(),
-        position_ms: None,
-        is_paused: false,
-    };
-    attribute(deps, source.as_deref(), |remotes, source| {
-        remotes.report_start(source, &report)
-    });
     Ok(PlaybackStartResponse {
         accepted: true,
-        session: format!("{}:{}:{}", key.user_id, key.client, key.track_id),
+        session,
     })
 }
 
-/// Record a heartbeat: join the session, refresh presence, and attribute
-/// progress to the remote server. Heartbeats never forward a scrobble (v2
-/// `progress` quirk: counting happens on stop).
+/// Record a heartbeat. A media-server track is only reported to its
+/// server; a library or YouTube track joins the session and refreshes
+/// presence. Quirk (v2): a heartbeat never counts a play, counting happens
+/// on stop.
 pub fn report_progress(
     deps: &PlaybackDeps,
     user_id: &str,
     request: &PlaybackProgressRequest,
 ) -> Result<PlaybackProgressResponse, ServiceError> {
+    if let Some(source) = request.source.remote() {
+        let report = remote_report(
+            user_id,
+            &request.track_id,
+            request.position_ms,
+            None,
+            request.duration_ms,
+            request.is_paused,
+        )?;
+        deps.remotes.report_progress(source, &report);
+        return Ok(PlaybackProgressResponse { accepted: true });
+    }
     let now = deps.clock.now_unix();
     let client = normalize_client(Some(&request.device)).unwrap_or_else(|| "app".to_owned());
     let key = SessionKey {
@@ -288,40 +303,45 @@ pub fn report_progress(
     deps.sessions
         .heartbeat(key, resolved.clone(), request.position_ms, now);
     let Resolved { track, user_name } = resolved;
-    let source = normalize_client(Some(&request.source));
     write_session_presence(
         deps,
         user_id,
         &user_name,
         &request.device,
         &track,
-        source.as_deref(),
+        Some(request.source.as_str()),
         request.is_paused,
         request.position_ms,
         now,
     );
-    let report = RemoteReport {
-        user_id: user_id.to_owned(),
-        item_id: track.track_id.clone(),
-        device: request.device.clone(),
-        position_ms: request.position_ms,
-        is_paused: request.is_paused,
-    };
-    attribute(deps, source.as_deref(), |remotes, source| {
-        remotes.report_progress(source, &report)
-    });
     Ok(PlaybackProgressResponse { accepted: true })
 }
 
-/// Close a session: mark it stopped, always clear presence (even below
-/// threshold, so nothing lingers to the TTL: v2 `_playing_stopped` rule),
-/// attribute the stop, and count the play past the native threshold unless
-/// told to skip or already counted (v2 once-only `submitted` flag).
+/// Close a session. A media-server track is only reported to its server
+/// and never counts here: the web player's scrobble submit records it. A
+/// library or YouTube track marks the session stopped, always clears
+/// presence (even below threshold, so nothing lingers to the TTL), and counts
+/// the play past the native threshold unless told to skip or already counted.
 pub fn stop_playback(
     deps: &PlaybackDeps,
     user_id: &str,
     request: &PlaybackStopRequest,
 ) -> Result<PlaybackStopResponse, ServiceError> {
+    if let Some(source) = request.source.remote() {
+        let report = remote_report(
+            user_id,
+            &request.track_id,
+            request.position_ms,
+            request.start_position_ms,
+            request.duration_ms,
+            false,
+        )?;
+        deps.remotes.report_stop(source, &report);
+        return Ok(PlaybackStopResponse {
+            accepted: true,
+            scrobbled: false,
+        });
+    }
     let now = deps.clock.now_unix();
     let client = normalize_client(Some(&request.device)).unwrap_or_else(|| "app".to_owned());
     let key = SessionKey {
@@ -337,18 +357,6 @@ pub fn stop_playback(
     deps.presence
         .remove(&presence_key(user_id, &request.device));
 
-    let source = normalize_client(Some(&request.source));
-    let report = RemoteReport {
-        user_id: user_id.to_owned(),
-        item_id: track.track_id.clone(),
-        device: request.device.clone(),
-        position_ms: request.position_ms,
-        is_paused: false,
-    };
-    attribute(deps, source.as_deref(), |remotes, source| {
-        remotes.report_stop(source, &report)
-    });
-
     let past_threshold = should_scrobble_native(request.position_ms, Some(track.duration_ms));
     if request.ignore_scrobble || finish.submitted || !past_threshold {
         return Ok(PlaybackStopResponse {
@@ -362,7 +370,7 @@ pub fn stop_playback(
         &key,
         &presence_key(user_id, &request.device),
         &track,
-        source.as_deref(),
+        Some(request.source.as_str()),
         Some(finish.started_at),
         now,
     );
@@ -374,9 +382,6 @@ pub fn stop_playback(
         });
     }
     deps.sessions.mark_submitted(&key);
-    attribute(deps, source.as_deref(), |remotes, source| {
-        remotes.scrobble(source, &report)
-    });
     Ok(PlaybackStopResponse {
         accepted: true,
         scrobbled: true,
@@ -396,8 +401,7 @@ fn session_resolved(
     }
 }
 
-/// Resolve the track or 404 (v2 `LibraryViewService.get_track` miss), and
-/// the listener's display name.
+/// Resolve the track or 404, and the listener's display name.
 fn resolve(deps: &PlaybackDeps, user_id: &str, track_id: &str) -> Result<Resolved, ServiceError> {
     let track = deps
         .store
@@ -409,18 +413,36 @@ fn resolve(deps: &PlaybackDeps, user_id: &str, track_id: &str) -> Result<Resolve
     })
 }
 
-/// Run one attribution call for remote sources only. Failures are logged
-/// and swallowed (v2 playback services return false; the player never
-/// sees them), and per-user attribution fails closed inside the port.
-fn attribute(
-    deps: &PlaybackDeps,
-    source: Option<&str>,
-    call: impl FnOnce(&dyn RemoteReporters, &str) -> Result<(), ProviderFailure>,
-) {
-    let Some(source) = source.filter(|source| has_remote(source)) else {
-        return;
-    };
-    if let Err(cause) = call(deps.remotes.as_ref(), source) {
-        tracing::warn!(%source, %cause, "remote playback report failed; continuing");
+/// A media-server report, once its values are checked: the item id is a
+/// plain id the server's address can carry, and no time is negative.
+fn remote_report(
+    user_id: &str,
+    item_id: &str,
+    position_ms: Option<i64>,
+    start_position_ms: Option<i64>,
+    duration_ms: Option<i64>,
+    is_paused: bool,
+) -> Result<RemoteReport, ServiceError> {
+    if request_id(item_id).is_err() {
+        return Err(ServiceError::InvalidInput(
+            "That is not a media server item id.".to_owned(),
+        ));
     }
+    if [position_ms, start_position_ms, duration_ms]
+        .into_iter()
+        .flatten()
+        .any(i64::is_negative)
+    {
+        return Err(ServiceError::InvalidInput(
+            "A position or length cannot be negative.".to_owned(),
+        ));
+    }
+    Ok(RemoteReport {
+        user_id: user_id.to_owned(),
+        item_id: item_id.to_owned(),
+        position_ms,
+        start_position_ms,
+        duration_ms,
+        is_paused,
+    })
 }

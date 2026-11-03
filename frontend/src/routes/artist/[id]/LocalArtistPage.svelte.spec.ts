@@ -16,8 +16,10 @@ const artist: RouteData<'GET /api/v3/library/artists/{id}'> = {
 	identity_state: 'local_only',
 	album_count: 1,
 	track_count: 4,
+	led_track_count: 2,
 	appearance_album_count: 1,
 	appearance_track_count: 2,
+	art_missing: false,
 	date_added: 1,
 	favorite: false
 };
@@ -35,8 +37,10 @@ const album: RouteData<'GET /api/v3/library/albums/{id}'> = {
 	format: 'flac',
 	year: 2020,
 	cover_available: false,
+	art_missing: false,
 	favorite: false,
-	date_added: 1
+	date_added: 1,
+	row_revision: 1
 };
 
 beforeEach(() => {
@@ -64,11 +68,20 @@ describe('local artist page', () => {
 				total: 1,
 				next: null
 			},
+			'GET /api/v3/library/artists/{id}/musicbrainz-link': {
+				artist_id: artist.id,
+				artist_revision: 1,
+				musicbrainz_artist_id: null,
+				source: null,
+				set_by: null,
+				selected_at: null
+			},
 			'GET /api/v3/library/tracks': { items: [], total: 0, next: null },
 			'POST /api/v3/ratings/lookup': { albums: {}, artists: {}, tracks: {} }
 		});
 		await renderWithQuery(LocalArtistPage, { artistId: artist.id });
 
+		await expect.element(page.getByText('1 album · 2 tracks')).toBeVisible();
 		await expect.element(page.getByText('Appears on 2 local tracks')).toBeVisible();
 		await expect
 			.element(page.getByRole('heading', { name: 'Appears in your library' }))

@@ -5,11 +5,11 @@
 	import {
 		getAdminAppPasswordsQuery,
 		getConnectAppsSettingsQuery
-	} from '$lib/queries/connect-apps/ConnectAppsQueries.svelte';
+	} from '$lib/queries/connect-apps.svelte';
 	import {
-		adminRevokeAppPassword,
-		saveConnectAppsSettings
-	} from '$lib/queries/connect-apps/ConnectAppsMutations.svelte';
+		createAdminRevokeAppPasswordMutation,
+		createSaveConnectAppsSettingsMutation
+	} from '$lib/queries/connect-apps.svelte';
 	import { withBasePath } from '$lib/utils/basePath';
 	import type { AdminAppPasswordView } from '$lib/types';
 	import Button from '$lib/ui/Button.svelte';
@@ -24,15 +24,19 @@
 	import { createSettingsSection } from '$lib/ui/settingsSection.svelte';
 
 	const rosterQuery = getAdminAppPasswordsQuery();
-	const adminRevoke = adminRevokeAppPassword();
+	const adminRevoke = createAdminRevokeAppPasswordMutation();
 
-	const section = createSettingsSection(getConnectAppsSettingsQuery(), saveConnectAppsSettings(), {
-		// A cleared number field binds to null; never send null.
-		normalize: (draft) => ({
-			...draft,
-			transcode_max_bitrate_kbps: draft.transcode_max_bitrate_kbps ?? 320
-		})
-	});
+	const section = createSettingsSection(
+		getConnectAppsSettingsQuery(),
+		createSaveConnectAppsSettingsMutation(),
+		{
+			// A cleared number field binds to null; never send null.
+			normalize: (draft) => ({
+				...draft,
+				transcode_max_bitrate_kbps: draft.transcode_max_bitrate_kbps ?? 320
+			})
+		}
+	);
 
 	let pendingRevoke = $state<AdminAppPasswordView | null>(null);
 
@@ -109,12 +113,14 @@
 									{ value: 'mp3', label: 'MP3' },
 									{ value: 'opus', label: 'Opus' }
 								]}
+								error={section.fieldError('transcode_default_format', 'Default format')}
 							/>
 							<NumberField
 								label="Max bitrate (kbps)"
 								min={32}
 								max={1411}
 								bind:value={draft.transcode_max_bitrate_kbps}
+								error={section.fieldError('transcode_max_bitrate_kbps', 'Max bitrate (kbps)')}
 							/>
 						</div>
 					{/if}

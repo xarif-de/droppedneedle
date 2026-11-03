@@ -8,8 +8,8 @@ use droppedneedle_acquire::db::AcquireDb;
 use droppedneedle_acquire::follows::{self, Follows};
 use droppedneedle_auth::Role;
 use droppedneedle_auth::session::store::SessionKind;
-use droppedneedle_catalog::reads::collections::{self, CollectionsState, db::CollectionsDb};
-use droppedneedle_kernel::db::{DbConfig, DbRuntime, open_runtime};
+use droppedneedle_catalog::collections::{self, CollectionsState, db::CollectionsDb};
+use droppedneedle_kernel::db::{DbConfig, DbRuntime, LaneLimits, TEST_PATIENCE, open_runtime};
 
 use axum::{
     Router,
@@ -101,10 +101,25 @@ impl Rig {
             .unwrap();
     }
 
+    /// Open the database with patient limits, as `scratch_runtime` does:
+    /// a loaded host slows a read or write instead of answering busy, which
+    /// the fault test would read as a wrong status.
     async fn boot(dir: &ScratchDir) -> DbRuntime {
-        open_runtime(&DbConfig::new(&dir.join("app.db")))
-            .await
-            .unwrap()
+        let config = DbConfig::new(&dir.join("app.db"))
+            .with_lane_limits(LaneLimits::patient())
+            .with_read_wait(TEST_PATIENCE);
+        let deadline = std::time::Instant::now() + crate::common::PATIENCE;
+        loop {
+            match open_runtime(&config).await {
+                Ok(runtime) => return runtime,
+                Err(error)
+                    if crate::common::busy_open(&error) && std::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+                Err(error) => panic!("database opens: {error}"),
+            }
+        }
     }
 
     fn state(&self) -> CollectionsState {
@@ -113,9 +128,7 @@ impl Rig {
                 self.runtime.db().clone(),
                 std::sync::Arc::new(droppedneedle_kernel::clock::SystemClock),
             ),
-            droppedneedle_catalog::reads::library::store::LocalCatalog::new(
-                self.runtime.db().clone(),
-            ),
+            droppedneedle_catalog::local::store::LocalCatalog::new(self.runtime.db().clone()),
         )
     }
 
@@ -216,7 +229,7 @@ async fn playlist_auth_matrix() {
     let one = format!("/api/v3/playlists/{id}");
 
     let (status, _) = call(&app, Method::GET, &one, Some(BOB), None).await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "private hides from others");
+    assert_eq!(status, StatusCode::FORBIDDEN, "private answers its stub");
     let (status, _) = call(
         &app,
         Method::PUT,
@@ -271,7 +284,7 @@ async fn playlist_auth_matrix() {
 /// uncovers, empties and deletes Ada's playlist, and nothing changes.
 #[tokio::test]
 async fn cross_user_writes_are_refused_by_the_store() {
-    use droppedneedle_catalog::reads::collections::store::playlists::{
+    use droppedneedle_catalog::collections::store::playlists::{
         CoverImage, NewEntry, PlaylistStore, Written,
     };
 
@@ -453,14 +466,15 @@ async fn playlists_favorites_and_follows_survive_a_restart() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(headers.get("content-type").unwrap(), "image/png");
+    assert_eq!(headers.get("cache-control").unwrap(), "private");
     assert!(!bytes.is_empty());
 
-    let (_, favorites) = call(&app, Method::GET, "/api/v3/favorites", Some(ADA), None).await;
-    assert_eq!(favorites["items"][0]["name"], "First");
-    assert_eq!(
-        favorites["counts"],
-        json!({"album": 1, "artist": 0, "track": 0})
-    );
+    let kept: Vec<String> =
+        sqlx::query_scalar("SELECT item_id FROM catalog_user_favorites WHERE user_id = 'u-ada'")
+            .fetch_all(rig.runtime.db().sqlx())
+            .await
+            .expect("favourites read");
+    assert_eq!(kept, ["alb-1"]);
     let (_, follow) = call(
         &app,
         Method::GET,
@@ -563,22 +577,12 @@ async fn favorites_stay_per_user() {
             (StatusCode::OK, Some(true))
         );
     }
-    let (_, filtered) = call(
-        &app,
-        Method::GET,
-        "/api/v3/favorites?kind=album",
-        Some(ADA),
-        None,
-    )
-    .await;
-    assert_eq!(filtered["items"].as_array().unwrap().len(), 1);
-    assert_eq!(filtered["counts"]["track"], 1, "counts ignore the filter");
-    let (_, other) = call(&app, Method::GET, "/api/v3/favorites", Some(BOB), None).await;
-    assert_eq!(
-        other["items"],
-        json!([]),
-        "favorites never leak across users"
-    );
+    let bobs: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM catalog_user_favorites WHERE user_id = 'u-bob'")
+            .fetch_one(rig.runtime.db().sqlx())
+            .await
+            .expect("favourites read");
+    assert_eq!(bobs, 0, "favorites never leak across users");
     let (status, _) = call(
         &app,
         Method::PUT,
@@ -696,9 +700,9 @@ async fn follow_auto_download_states_and_admin_reads() {
 
 #[tokio::test]
 async fn remote_playlist_import_lands_in_the_users_playlists() {
-    use droppedneedle_catalog::reads::collections::remote_import::PlaylistImportSink;
-    use droppedneedle_media::remotes::adapter::ImportSink as _;
+    use droppedneedle_catalog::collections::remote_import::PlaylistImportSink;
     use droppedneedle_media::remotes::models::{SourceName, TrackView};
+    use droppedneedle_media::remotes::source::ImportSink as _;
 
     let rig = Rig::open().await;
     let sink = PlaylistImportSink::new(rig.state());
@@ -751,33 +755,53 @@ async fn remote_playlist_import_lands_in_the_users_playlists() {
     assert_eq!(detail["tracks"][0]["plex_rating_key"], "1");
 }
 
+/// Entry lengths are stored in milliseconds and the native API answers them
+/// in seconds, fractions kept, each entry and the total.
+#[tokio::test]
+async fn playlist_lengths_answer_in_fractional_seconds() {
+    let rig = Rig::open().await;
+    let app = rig.app();
+    let (_, created) = call(
+        &app,
+        Method::POST,
+        "/api/v3/playlists",
+        Some(ADA),
+        Some(json!({"name": "Lengths"})),
+    )
+    .await;
+    let one = format!("/api/v3/playlists/{}", created["id"].as_str().unwrap());
+    let mut timed = track("Timed");
+    timed["duration"] = json!(215.25);
+    let (status, _) = call(
+        &app,
+        Method::POST,
+        &format!("{one}/tracks"),
+        Some(ADA),
+        Some(json!({"tracks": [timed, track("Untimed")]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (_, detail) = call(&app, Method::GET, &one, Some(ADA), None).await;
+    assert_eq!(detail["tracks"][0]["duration"], 215.25);
+    assert_eq!(detail["tracks"][1]["duration"], Value::Null);
+    assert_eq!(detail["total_duration"], 215.25);
+}
+
 #[tokio::test]
 async fn store_faults_render_fixed_500_envelopes() {
     let rig = Rig::open().await;
     // Every read below fails inside SQLite on a table that is not there.
-    rig.runtime
-        .db()
-        .write(
-            droppedneedle_kernel::db::Lane::Foreground,
-            "break tables",
-            |tx| {
-                tx.execute_batch(
-                    "ALTER TABLE playlists RENAME TO gone_playlists; \
-                     ALTER TABLE library_user_favorites RENAME TO gone_favorites; \
-                     ALTER TABLE user_followed_artists RENAME TO gone_follows;",
-                )?;
-                Ok::<_, droppedneedle_kernel::db::DbError>(())
-            },
-        )
-        .await
-        .unwrap();
+    crate::common::break_schema(
+        rig.runtime.db(),
+        "ALTER TABLE catalog_playlists RENAME TO gone_playlists; \
+         ALTER TABLE catalog_user_favorites RENAME TO gone_favorites; \
+         ALTER TABLE acquire_followed_artists RENAME TO gone_follows;",
+    )
+    .await;
     let scope = TestApp::start("reads-collections-faults").await;
     let app = scope.request_scope(collections::routes().with_state(rig.state()).into_router());
-    for uri in [
-        "/api/v3/playlists",
-        "/api/v3/favorites",
-        "/api/v3/following/artists",
-    ] {
+    for uri in ["/api/v3/playlists", "/api/v3/following/artists"] {
         let (status, headers, bytes) =
             send(&app, Some(ADMIN), request(Method::GET, uri, None)).await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{uri}");
@@ -821,6 +845,8 @@ async fn migration_0010_upgrades_in_place() {
     sqlx::query(
         "INSERT INTO playlists (id, name, created_at, updated_at, user_id) \
          VALUES ('p1', 'Kept', '2024-01-01T00:00:00+00:00', '2024-01-01T00:00:00+00:00', 'u1'); \
+         INSERT INTO auth_users (id, display_name, role, created_at) \
+         VALUES ('u1', 'U', 'user', '2024-01-01T00:00:00+00:00'); \
          INSERT INTO library_user_favorites (user_id, item_kind, item_id, created_at) \
          VALUES ('u1', 'album', 'a1', 1.0);",
     )
@@ -828,24 +854,26 @@ async fn migration_0010_upgrades_in_place() {
     .await
     .unwrap();
 
-    apply_migrations(&pool).await.unwrap();
-    let kept: (String, String) = sqlx::query_as(
-        "SELECT p.name, f.item_id FROM playlists p, library_user_favorites f WHERE p.id = 'p1'",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(kept, ("Kept".to_owned(), "a1".to_owned()));
     let migration = MIGRATOR
         .migrations
         .iter()
         .find(|migration| migration.version == 10)
         .unwrap();
-    sqlx::raw_sql(&migration.sql)
-        .execute(&pool)
-        .await
-        .expect("0010 applies twice");
-    let covers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM playlist_covers")
+    for _ in 0..2 {
+        sqlx::raw_sql(&migration.sql)
+            .execute(&pool)
+            .await
+            .expect("0010 applies twice");
+    }
+    apply_migrations(&pool).await.unwrap();
+    let kept: (String, String) = sqlx::query_as(
+        "SELECT p.name, f.item_id FROM catalog_playlists p, catalog_user_favorites f WHERE p.id = 'p1'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(kept, ("Kept".to_owned(), "a1".to_owned()));
+    let covers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM catalog_playlist_covers")
         .fetch_one(&pool)
         .await
         .unwrap();

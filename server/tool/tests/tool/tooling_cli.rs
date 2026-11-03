@@ -161,6 +161,12 @@ fn validate_accepts_rejects_and_cross_checks() {
         "stderr: {}",
         String::from_utf8_lossy(&status.stderr)
     );
+    // Settings left behind print by name, among the counted tables.
+    let stdout = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        stdout.contains("\n  library_sync_settings (older"),
+        "stdout: {stdout}"
+    );
 
     // A bumped version fails closed.
     let bad_version = root.join("bad-version.json");
@@ -649,6 +655,12 @@ fn upgrade_turns_a_v2_directory_into_v3_in_place() {
     let root = scratch.join("data");
     let fixture =
         droppedneedle_tool::tooling::fixture::build_v2_fixture(&root).expect("fixture builds");
+    let config_path = root.join("config").join("config.json");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config_path).expect("config reads"))
+            .expect("config parses");
+    config["contact_email"] = "ops@example.org".into();
+    std::fs::write(&config_path, config.to_string()).expect("config writes");
 
     let run = tool_in(&root, &["upgrade"]);
     assert!(run.status.success(), "stderr: {}", stderr_of(&run));
@@ -676,6 +688,16 @@ fn upgrade_turns_a_v2_directory_into_v3_in_place() {
     let stdout = String::from_utf8_lossy(&run.stdout);
     assert!(
         stdout.contains("Removed 2 follows and approvals"),
+        "stdout: {stdout}"
+    );
+    // The contact address cannot move to settings, so the summary says what
+    // to do, and names the key among what stayed behind.
+    assert!(
+        stdout.contains("Set CONTACT_EMAIL=ops@example.org in your environment"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("\n  contact_email (v3 reads"),
         "stdout: {stdout}"
     );
     let orphans: i64 = rusqlite::Connection::open(cache_backup.join("library.db"))
@@ -1340,7 +1362,7 @@ async fn run_merge(
     droppedneedle_tool::r#import::run_import(droppedneedle_tool::r#import::ImportRequest {
         export_bytes: std::fs::read(export).expect("export reads"),
         passphrase: "operator-passphrase".to_owned(),
-        pool: pool.clone(),
+        db_path: pool.connect_options().get_filename().to_owned(),
         legacy: droppedneedle_kernel::runtime_config::LegacyConfig::at(config_dir, false),
         crypto,
         v2_config_path: None,
@@ -1402,9 +1424,9 @@ async fn follow_conflict_merges_or_min_max() {
     .await
     .expect("alice seeds");
     sqlx::query(
-        "INSERT INTO user_followed_artists (user_id, artist_mbid, artist_mbid_lower,
+        "INSERT INTO acquire_followed_artists (user_id, artist_mbid, artist_mbid_lower,
              artist_name, auto_download, followed_at, updated_at)
-         VALUES (?, ?, ?, 'Fixture Artist One', 0, 9999999999.0, 100.0)",
+         VALUES (?, ?, ?, 'Fixture Artist One', 0, 9999999999000, 100000)",
     )
     .bind(&fixture.alice_id)
     .bind(&fixture.artist_one_mbid)
@@ -1423,8 +1445,8 @@ async fn follow_conflict_merges_or_min_max() {
         1
     );
 
-    let merged: (i64, f64, f64) = sqlx::query_as(
-        "SELECT auto_download, followed_at, updated_at FROM user_followed_artists
+    let merged: (i64, i64, i64) = sqlx::query_as(
+        "SELECT auto_download, followed_at, updated_at FROM acquire_followed_artists
          WHERE user_id = ? AND artist_mbid_lower = ?",
     )
     .bind(&fixture.alice_id)
@@ -1432,7 +1454,7 @@ async fn follow_conflict_merges_or_min_max() {
     .fetch_one(&pool)
     .await
     .expect("follow reads back");
-    assert_eq!(merged, (1, 1_700_000_000.0, 1_760_000_000.0));
+    assert_eq!(merged, (1, 1_700_000_000_000, 1_760_000_000_000));
 }
 
 /// Approvals keep the most-permissive state with the earliest request.

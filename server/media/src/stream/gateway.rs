@@ -16,18 +16,18 @@
 //! instead, sandboxed to that root, and knows only the file's extension.
 //! The open hands the routes a file body read by range, or the transcode
 //! output chunk by chunk; HEAD answers from file metadata and never starts
-//! ffmpeg. Range slicing, 206/416 decisions, and headers stay in the routes
-//! file.
+//! ffmpeg. Range slicing, 206/416 decisions, and headers stay in
+//! [`framing`](super::framing).
 //!
 //! The open hands its direct lease back inside [`StreamMedia`], so a caller
 //! that moves it into the response body bounds response concurrency, not
-//! only opens (the compat adapters do). A transcode takes the lease into
+//! only opens (compat's `GatewayAudio` does). A transcode takes the lease into
 //! the transcode instead, which frees it with the ffmpeg slot. Remote reads
 //! stream by range and are direct-only (the ffmpeg service takes a local
 //! path; per-source server-side transcode stays a remotes-adapter concern).
 //!
-//! [`StreamEngine`]: super::routes::StreamEngine
-//! [`StreamParams`]: super::routes::StreamParams
+//! [`StreamEngine`]: super::engine::StreamEngine
+//! [`StreamParams`]: super::engine::StreamParams
 //! [`decide()`]: super::transcode::decide
 
 use std::path::{Path, PathBuf};
@@ -41,11 +41,11 @@ use droppedneedle_kernel::runtime_config::sections::ConnectApps;
 use droppedneedle_plugins::capabilities::stream::{open_url, proxy_chunks};
 use futures_util::StreamExt as _;
 
-use super::leases::OwnedDirectLease;
-use super::routes::{
+use super::engine::{
     AudioSource, MediaBody, StreamEngine, StreamFault, StreamMedia, StreamOpen,
     content_type_for_extension,
 };
+use super::leases::OwnedDirectLease;
 use super::transcode::{
     StreamPlan, TrackInfo, TranscodeError, TranscodeSettings, Transcoder, decide, estimate_size,
     out_media_type,
@@ -98,6 +98,8 @@ pub struct Gateway<R, T> {
         Arc<droppedneedle_plugins::host::PluginHost>,
         reqwest::Client,
     )>,
+    /// Where a plugin URL is spooled for a transcode.
+    spool_dir: PathBuf,
     remote: R,
     transcoder: T,
     fixed: TranscodeSettings,
@@ -122,6 +124,7 @@ impl<R, T> Gateway<R, T> {
             local_root,
             library: None,
             plugins: None,
+            spool_dir: PathBuf::new(),
             remote,
             transcoder,
             fixed: settings,
@@ -155,13 +158,16 @@ impl<R, T> Gateway<R, T> {
 
     /// Serve `streaming_source` plugins under [`AudioSource::Plugin`].
     /// `no_redirect` proxies plugin URLs; it must not follow redirects on
-    /// its own, because every hop is re-checked.
+    /// its own, because every hop is re-checked. `spool_dir` holds the
+    /// temp files plugin transcodes read.
     pub fn with_plugins(
         mut self,
         host: Arc<droppedneedle_plugins::host::PluginHost>,
         no_redirect: reqwest::Client,
+        spool_dir: PathBuf,
     ) -> Self {
         self.plugins = Some((host, no_redirect));
+        self.spool_dir = spool_dir;
         self
     }
 }
@@ -355,7 +361,7 @@ impl<R: RemoteReader, T: Transcoder> Gateway<R, T> {
     /// Ask `streaming_source` plugins for one recording. A file answer is
     /// served like a local file (ranges, transcodes). A URL answer is
     /// proxied with every hop re-checked: by range when its size is known,
-    /// and through a temp file when the plan transcodes (v2 behaviour).
+    /// and through a temp file when the plan transcodes.
     async fn stream_plugin(
         &self,
         request: &StreamOpen,
@@ -478,7 +484,7 @@ impl<R: RemoteReader, T: Transcoder> Gateway<R, T> {
             return Ok(media);
         }
         let response = plugin_url_response(client, plugin, url, None).await?;
-        let spool = plugin_url::Spool::fill(response, format)
+        let spool = plugin_url::Spool::fill(response, format, &self.spool_dir)
             .await
             .map_err(|error| StreamFault::Upstream {
                 source: AudioSource::Plugin,
@@ -535,7 +541,7 @@ impl<R: RemoteReader, T: Transcoder> Gateway<R, T> {
 
 /// The catalog row and file of track `track_id`. Unknown tracks and files
 /// gone from disk are 404; a file that resolves outside the library roots
-/// is 403 with v2's message.
+/// is 403 with the message in [`OUTSIDE_MESSAGE`].
 async fn catalog_file(
     library: &LibraryFiles,
     track_id: &str,
@@ -592,7 +598,7 @@ fn estimated_len(request: &StreamOpen, plan: &StreamPlan) -> Option<u64> {
         .filter(|size| *size > 0)
 }
 
-/// v2's refusal for a library file that resolves outside every root.
+/// Refusal for a library file that resolves outside every root.
 pub const OUTSIDE_MESSAGE: &str = "Access denied: path is outside the music directory";
 
 /// Fixed sandbox refusal: the key never reaches the wire.

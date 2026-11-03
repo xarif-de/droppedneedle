@@ -11,12 +11,12 @@ use axum::{
 };
 use droppedneedle_auth::session::store::SessionKind;
 use droppedneedle_auth::users::roles::Role;
-use droppedneedle_catalog::reads::platform::artwork::{
+use droppedneedle_catalog::artwork::covers::{self, CoversState};
+use droppedneedle_catalog::artwork::{
     ArtworkService, MISS_TTL_SECS, UNUSABLE_TTL_SECS,
     cache::{ArtworkCache, KeyEntry},
     local::LocalArtwork,
 };
-use droppedneedle_catalog::reads::platform::covers::{self, CoversState};
 use droppedneedle_kernel::clock::SystemClock;
 use droppedneedle_kernel::db::{DbError, DbRuntime, Lane};
 use droppedneedle_kernel::runtime_config::secret_sections::AdvancedSettings;
@@ -164,7 +164,7 @@ impl Rig {
                 1024 * 1024,
                 std::sync::Arc::new(droppedneedle_kernel::clock::SystemClock),
             ),
-            LocalArtwork::new(self.runtime.db().sqlx().clone()),
+            LocalArtwork::new(self.runtime.db().clone()),
             Some(Arc::new(self.archive.providers.coverart.clone())),
             config.live(),
         );
@@ -341,7 +341,7 @@ async fn a_cover_the_archive_cannot_give_yet_is_warming_until_it_can() {
 /// page's poll is answered at once.
 #[tokio::test]
 async fn a_compat_cover_joins_a_running_fetch() {
-    use droppedneedle_catalog::reads::platform::covers::CoverArt as _;
+    use droppedneedle_catalog::artwork::covers::CoverArt as _;
 
     let rig = rig(None).await;
     let service = rig.service(true);
@@ -362,7 +362,7 @@ async fn a_compat_cover_joins_a_running_fetch() {
     });
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-    let cover = service.album_cover("al1", Some("500")).await;
+    let cover = service.album_cover("al1", Some("500")).await.unwrap();
     assert_eq!(
         cover.map(|cover| cover.bytes),
         Some(PNG_BYTES.to_vec()),
@@ -547,6 +547,48 @@ async fn a_changed_cover_draws_a_new_mosaic() {
     assert_ne!(before, after);
 }
 
+/// Library Management embeds and writes the cover it is given, so that
+/// cover comes from the archive even while the pages prefer local art:
+/// art that came with imported files may be another record's, and handing
+/// it back as "the cover" kept it in the files for good.
+#[tokio::test]
+async fn library_management_gets_the_archive_cover_not_the_files_own() {
+    let files = ScratchDir::new("reads-artwork-management");
+    let track = files.join("01.flac");
+    std::fs::copy("tests/fixtures/library/management_full.flac", &track).unwrap();
+    let rig = rig(Some(&track)).await;
+    let store = SqliteScanStore::new(
+        rig.runtime.db().clone(),
+        std::sync::Arc::new(droppedneedle_kernel::clock::SystemClock),
+    );
+    store.refresh_album_artwork(&|| false).unwrap();
+    let service = rig.service(true);
+
+    let shown = get(
+        Rig::router(service.clone()),
+        &format!("/api/v3/covers/release-group/{RG}?size=500"),
+    )
+    .await;
+    assert_eq!(
+        header(&shown.1, "x-cover-source"),
+        Some("embedded"),
+        "the pages keep showing the album's own art"
+    );
+
+    let cover = service
+        .front_cover(
+            "",
+            RG,
+            Some("500"),
+            droppedneedle_providers::RequestPriority::BackgroundSync,
+        )
+        .await
+        .expect("the archive answered")
+        .expect("the archive has a cover");
+    assert_eq!(cover.bytes, PNG_BYTES);
+    assert_eq!(cover.source, "cover-art-archive");
+}
+
 #[tokio::test]
 async fn embedded_art_from_the_scan_beats_the_archive_when_preferred() {
     let files = ScratchDir::new("reads-artwork-files");
@@ -571,6 +613,11 @@ async fn embedded_art_from_the_scan_beats_the_archive_when_preferred() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, embedded);
     assert_eq!(header(&headers, "x-cover-source"), Some("embedded"));
+    assert_eq!(
+        header(&headers, "cache-control"),
+        Some("private, max-age=300"),
+        "library art under a MusicBrainz id is not kept for a day"
+    );
     assert!(rig.archive.calls().is_empty(), "local art needs no fetch");
 
     let (status, headers, body) =
@@ -588,6 +635,35 @@ async fn embedded_art_from_the_scan_beats_the_archive_when_preferred() {
         header(&headers, "x-cover-source"),
         Some("cover-art-archive")
     );
+    assert_eq!(
+        header(&headers, "cache-control"),
+        Some("private, max-age=86400, stale-while-revalidate=604800")
+    );
+}
+
+/// An album row that could not be read is a failure, not "no art": a
+/// compat client would otherwise keep the placeholder for a day after
+/// one busy moment.
+#[tokio::test]
+async fn a_failed_album_read_is_not_answered_as_no_art() {
+    use droppedneedle_catalog::artwork::covers::CoverArt as _;
+
+    let rig = rig(None).await;
+    let service = rig.service(true);
+    rig.runtime
+        .db()
+        .write(
+            droppedneedle_kernel::db::Lane::Foreground,
+            "drop art identities",
+            |tx| {
+                tx.execute_batch("DROP TABLE local_album_external_identities")?;
+                Ok::<_, droppedneedle_kernel::db::DbError>(())
+            },
+        )
+        .await
+        .unwrap();
+
+    assert!(service.album_cover("al1", Some("500")).await.is_err());
 }
 
 /// Stamp a folder's modification time, so the sweep sees a change however
@@ -609,6 +685,11 @@ async fn art_version(rig: &Rig) -> Option<i64> {
 #[tokio::test]
 async fn art_that_comes_back_gets_a_new_version() {
     let files = ScratchDir::new("reads-artwork-version");
+    std::fs::copy(
+        "tests/fixtures/library/flac_no_tags.flac",
+        files.join("01.flac"),
+    )
+    .unwrap();
     let rig = rig(Some(&files.join("01.flac"))).await;
     let store = SqliteScanStore::new(
         rig.runtime.db().clone(),
@@ -832,6 +913,98 @@ async fn a_built_discover_page_warms_its_covers_onto_disk() {
             .any(|job| job["name"] == "job-runner:artwork.warm"),
         "{stats}"
     );
+    app.stop().await;
+    server.abort();
+}
+
+/// A library album whose release group the archive has no cover for says so
+/// in its view once the cover cache has that answer, and so do its tracks,
+/// so the web UI asks for nothing. An unlinked artist with no album art says
+/// so too. Art that exists keeps them asking: another copy of the group with
+/// a folder image serves the group's cover and the artist's picture.
+#[tokio::test]
+async fn a_cover_the_archive_lacks_is_flagged_on_the_library_views() {
+    let stub = Router::new().fallback(|| async { StatusCode::NOT_FOUND });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
+    let app =
+        crate::common::TestApp::start_with("artwork-missing", crate::common::outbound_at(&origin))
+            .await;
+    app.seed(format!(
+        "INSERT INTO local_artists (id, display_name, folded_name, kind, created_at, updated_at) \
+         VALUES ('a1', 'Aurora', 'aurora', 'group', 1, 1); \
+         INSERT INTO local_albums (id, root_id, grouping_key, title, title_folded, \
+         album_artist_name, album_artist_name_folded, album_artist_id, grouping_source, \
+         created_at, updated_at) VALUES \
+         ('al1', 'r1', 'g1', 'First Light', 'first light', 'Aurora', 'aurora', 'a1', \
+          'automatic', 1, 1), \
+         ('al2', 'r1', 'g2', 'First Light', 'first light', 'Aurora', 'aurora', 'a1', \
+          'automatic', 2, 2); \
+         INSERT INTO local_album_external_identities (local_album_id, provider, \
+         release_group_mbid, decision_source, selected_at) VALUES \
+         ('al1', 'musicbrainz', '{RG}', 'manual', 1), ('al2', 'musicbrainz', '{RG}', 'manual', 2); \
+         INSERT INTO local_tracks (id, local_album_id, root_id, file_path, relative_path, \
+         path_hash, file_size_bytes, file_mtime_ns, stat_revision, title, title_folded, \
+         album_title, album_title_folded, file_format, availability, ingest_source, \
+         imported_at, membership_source) VALUES \
+         ('t1', 'al1', 'r1', '/m/a/t1.flac', 'a/t1.flac', 'h1', 1, 1, 's1', 'Opener', 'opener', \
+          'First Light', 'first light', 'flac', 'indexed', 'scan', 1, 'automatic'), \
+         ('t2', 'al2', 'r1', '/m/b/t2.flac', 'b/t2.flac', 'h2', 1, 1, 's2', 'Opener', 'opener', \
+          'First Light', 'first light', 'flac', 'indexed', 'scan', 2, 'automatic');"
+    ))
+    .await;
+    let user = app.login_user("art").await;
+    let auth = [("authorization", user.authorization.as_str())];
+    let art_missing = |path: &'static str| {
+        let app = &app;
+        let auth = &auth;
+        async move {
+            let (status, view) = app.call("GET", path, auth, None).await;
+            assert_eq!(status, StatusCode::OK, "{path}: {view}");
+            view["art_missing"].clone()
+        }
+    };
+
+    assert_eq!(
+        art_missing("/api/v3/library/artists/a1").await,
+        true,
+        "an unlinked artist with no album art has no picture"
+    );
+
+    app.until("the archive says it has no cover", || async {
+        let (status, _, _) = app
+            .raw(
+                "GET",
+                &format!("/api/v3/covers/release-group/{RG}?size=250"),
+                &auth,
+                None,
+            )
+            .await;
+        (status == StatusCode::NO_CONTENT).then_some(())
+    })
+    .await;
+    assert_eq!(art_missing("/api/v3/library/albums/al1").await, true);
+    let (status, tracks) = app.call("GET", "/api/v3/library/tracks", &auth, None).await;
+    assert_eq!(status, StatusCode::OK, "{tracks}");
+    let track = tracks["items"]
+        .as_array()
+        .and_then(|items| items.iter().find(|track| track["id"] == "t1"))
+        .expect("track listed");
+    assert_eq!(track["art_missing"], true, "{track}");
+
+    app.seed(
+        "INSERT INTO local_album_artwork (local_album_id, source, source_locator, version, \
+         updated_at) VALUES ('al2', 'folder', '/m/b/cover.jpg', 1, 1)",
+    )
+    .await;
+    assert_eq!(
+        art_missing("/api/v3/library/albums/al1").await,
+        false,
+        "another copy's art serves the group's cover"
+    );
+    assert_eq!(art_missing("/api/v3/library/artists/a1").await, false);
+
     app.stop().await;
     server.abort();
 }

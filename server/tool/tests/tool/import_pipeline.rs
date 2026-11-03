@@ -34,7 +34,7 @@ async fn fresh_import_applies_everything() {
     export["settings"]["jellyfin_settings"] =
         json!({"api_key": fixture.seal("jelly-secret"), "jellyfin_url": "http://jelly:8096"});
 
-    let pool = migrated_pool().await;
+    let (pool, _target) = migrated_pool().await;
     let (_dir, config_path, crypto) = scratch_config("fresh");
     let report = run_import(import_request(
         &export,
@@ -48,7 +48,6 @@ async fn fresh_import_applies_everything() {
     assert_eq!(counts(&report, "user"), (1, 0, 0, 0));
     assert_eq!(counts(&report, "provider"), (1, 0, 0, 0));
     assert_eq!(counts(&report, "app_password"), (1, 0, 0, 0));
-    assert_eq!(counts(&report, "recovery_code"), (1, 0, 0, 0));
     assert_eq!(counts(&report, "follow"), (1, 0, 0, 0));
     assert_eq!(counts(&report, "approval"), (1, 0, 0, 0));
     assert_eq!(report.secrets_reencrypted, 2);
@@ -85,13 +84,12 @@ async fn fresh_import_applies_everything() {
         stored.starts_with("v3:"),
         "app secret must be v3 ciphertext"
     );
-    let hash: String = sqlx::query_scalar(
-        "SELECT code_hash FROM auth_password_recovery_codes WHERE user_id = 'u1'",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(hash, "hash-u1");
+    assert_eq!(count(&pool, "auth_password_recovery_codes").await, 0);
+    assert!(
+        report.items.iter().any(|item| item.outcome == "not_carried"
+            && item.detail == "recovery codes from v2 were not carried; make a new one"),
+        "the report says so"
+    );
     let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM import_runs")
         .fetch_one(&pool)
         .await
@@ -125,7 +123,7 @@ async fn provider_binding_conflict_keeps_first_mapping() {
     second["providers"][0]["provider_uid"] = json!("local:u2");
     export["users"] = json!([first.clone(), second]);
 
-    let pool = migrated_pool().await;
+    let (pool, _target) = migrated_pool().await;
     let (_dir, config_path, crypto) = scratch_config("provider-first");
     let first_report = run_import(import_request(
         &export,
@@ -166,7 +164,7 @@ async fn email_and_username_collisions_null_the_field() {
     let fixture = Fixture::shared();
     let mut seed = fixture.shell();
     seed["users"] = json!([fixture.user("u1")]);
-    let pool = migrated_pool().await;
+    let (pool, _target) = migrated_pool().await;
     let (_dir, config_path, crypto) = scratch_config("nulling");
     run_import(import_request(
         &seed,
@@ -201,7 +199,7 @@ async fn email_and_username_collisions_null_the_field() {
 #[tokio::test]
 async fn follow_merge_never_downgrades() {
     let fixture = Fixture::shared();
-    let pool = migrated_pool().await;
+    let (pool, _target) = migrated_pool().await;
     let (_dir, config_path, crypto) = scratch_config("follow-merge");
     sqlx::query(
         "INSERT INTO auth_users (id, display_name, role, created_at) VALUES ('u1', 'U', 'user', 0)",
@@ -210,8 +208,8 @@ async fn follow_merge_never_downgrades() {
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO user_followed_artists (user_id, artist_mbid, artist_mbid_lower, artist_name, \
-         auto_download, followed_at, updated_at) VALUES ('u1', ?, ?, 'Old Name', 1, 100.0, 200.0)",
+        "INSERT INTO acquire_followed_artists (user_id, artist_mbid, artist_mbid_lower, artist_name, \
+         auto_download, followed_at, updated_at) VALUES ('u1', ?, ?, 'Old Name', 1, 100000, 200000)",
     )
     .bind(MBID)
     .bind(MBID.to_lowercase())
@@ -234,8 +232,8 @@ async fn follow_merge_never_downgrades() {
         report.entities["user"].conflict_kept_existing, 1,
         "the seeded same-id user row stands"
     );
-    let row: (i64, f64, f64, String) = sqlx::query_as(
-        "SELECT auto_download, followed_at, updated_at, artist_name FROM user_followed_artists \
+    let row: (i64, i64, i64, String) = sqlx::query_as(
+        "SELECT auto_download, followed_at, updated_at, artist_name FROM acquire_followed_artists \
          WHERE user_id = 'u1'",
     )
     .fetch_one(&pool)
@@ -243,7 +241,7 @@ async fn follow_merge_never_downgrades() {
     .unwrap();
     assert_eq!(
         row,
-        (1, 50.0, 300.0, "Old Name".to_owned()),
+        (1, 50_000, 300_000, "Old Name".to_owned()),
         "OR never downgrades, min/max win, existing name kept"
     );
 }
@@ -251,7 +249,7 @@ async fn follow_merge_never_downgrades() {
 #[tokio::test]
 async fn approval_merge_most_permissive_wins() {
     let fixture = Fixture::shared();
-    let pool = migrated_pool().await;
+    let (pool, _target) = migrated_pool().await;
     let (_dir, config_path, crypto) = scratch_config("approval-merge");
     let mut seed = fixture.shell();
     seed["users"] = json!([fixture.user("u1")]);
@@ -303,7 +301,7 @@ async fn dangling_reviewer_nulled_approval_survives() {
     approval["reviewed_by_name"] = json!("Ghost");
     export["approvals"] = json!([approval]);
 
-    let pool = migrated_pool().await;
+    let (pool, _target) = migrated_pool().await;
     let (_dir, config_path, crypto) = scratch_config("reviewer");
     let report = run_import(import_request(&export, pool.clone(), config_path, crypto)).await;
 
@@ -331,13 +329,13 @@ async fn dangling_user_refs_fail_the_whole_file() {
     export["follows"] = json!([fixture.follow("ghost", MBID)]);
     export["approvals"] = json!([fixture.approval("ghost", MBID)]);
 
-    let pool = migrated_pool().await;
+    let (pool, _target) = migrated_pool().await;
     let (_dir, config_path, crypto) = scratch_config("deleted-ids");
     let report = run_import(import_request(&export, pool.clone(), config_path, crypto)).await;
 
     assert_eq!(report.exit.code, ExitCode::FailedValidation);
     assert_eq!(count(&pool, "auth_users").await, 0);
-    assert_eq!(count(&pool, "user_followed_artists").await, 0);
+    assert_eq!(count(&pool, "acquire_followed_artists").await, 0);
     assert_eq!(count(&pool, "auto_download_approvals").await, 0);
     assert_eq!(count(&pool, "import_runs").await, 0);
 }
@@ -351,7 +349,7 @@ async fn reimport_is_identical_with_zero_writes() {
     export["approvals"] = json!([fixture.approval("u1", MBID)]);
     export["settings"]["wanted"] = json!({"enabled": true});
 
-    let pool = migrated_pool().await;
+    let (pool, _target) = migrated_pool().await;
     let (_dir, config_path, _crypto) = scratch_config("idempotent");
     let first = run_import(import_request(
         &export,
@@ -375,14 +373,7 @@ async fn reimport_is_identical_with_zero_writes() {
     .await;
 
     assert_eq!(second.exit.code, ExitCode::Ok);
-    for entity in [
-        "user",
-        "provider",
-        "app_password",
-        "recovery_code",
-        "follow",
-        "approval",
-    ] {
+    for entity in ["user", "provider", "app_password", "follow", "approval"] {
         let found = &second.entities[entity];
         assert_eq!(found.imported, 0, "{entity} must not re-import");
         assert!(found.skipped_identical > 0, "{entity} must skip identical");
@@ -411,7 +402,7 @@ async fn conflicted_reimport_converges_with_zero_writes() {
     let mut seed = fixture.shell();
     seed["users"] = json!([fixture.user("u1")]);
     seed["settings"]["wanted"] = json!({"enabled": true});
-    let pool = migrated_pool().await;
+    let (pool, _target) = migrated_pool().await;
     let (_dir, config_path, _) = scratch_config("conflict-converge");
     run_import(import_request(
         &seed,
@@ -458,14 +449,7 @@ async fn conflicted_reimport_converges_with_zero_writes() {
         assert_eq!(again.entities["user"].skipped_identical, 0);
         assert_eq!(again.entities["approval"].skipped_identical, 1);
         assert_eq!(again.entities["approval"].nulled_field, 1);
-        for entity in [
-            "user",
-            "provider",
-            "app_password",
-            "recovery_code",
-            "follow",
-            "approval",
-        ] {
+        for entity in ["user", "provider", "app_password", "follow", "approval"] {
             assert_eq!(
                 again.entities[entity].imported, 0,
                 "{entity} wrote nothing twice"
@@ -497,7 +481,7 @@ async fn bare_plugin_strings_pass_through_verbatim() {
         "myplug": {"enabled": true, "settings": {"token": "bare-secret"}}
     });
 
-    let pool = migrated_pool().await;
+    let (pool, _target) = migrated_pool().await;
     let (_dir, config_path, crypto) = scratch_config("plugin-passthrough");
     let report = run_import(import_request(
         &export,
@@ -520,7 +504,7 @@ async fn app_password_name_collision_disambiguates() {
     let fixture = Fixture::shared();
     let mut seed = fixture.shell();
     seed["users"] = json!([fixture.user("u1")]);
-    let pool = migrated_pool().await;
+    let (pool, _target) = migrated_pool().await;
     let (_dir, config_path, crypto) = scratch_config("app-pw-name");
     run_import(import_request(
         &seed,
@@ -571,7 +555,7 @@ async fn settings_replace_filters_and_preserves() {
     export["settings"]["spotify_settings"] =
         json!({"client_id": "v2-app", "client_secret": fixture.seal("sp-secret"), "enabled": true});
 
-    let pool = migrated_pool().await;
+    let (pool, _target) = migrated_pool().await;
     let (_dir, config_path, crypto) = scratch_config("settings");
     std::fs::write(
         &config_path,
@@ -637,7 +621,7 @@ async fn settings_replace_filters_and_preserves() {
 async fn schedule_carry_moves_sync_frequency_once() {
     let fixture = Fixture::shared();
     let export = fixture.shell();
-    let pool = migrated_pool().await;
+    let (pool, _target) = migrated_pool().await;
     let (dir, config_path, crypto) = scratch_config("schedule-carry");
     let v2_config = dir.join("v2-config.json");
     std::fs::write(
@@ -671,7 +655,7 @@ async fn schedule_carry_moves_sync_frequency_once() {
     let mut with_schedule = fixture.shell();
     with_schedule["settings"]["library_scan_schedule"] =
         json!({"scan_frequency": "daily", "daily_scan_time": "03:00"});
-    let pool2 = migrated_pool().await;
+    let (pool2, _target2) = migrated_pool().await;
     let (_dir2, config2, crypto2) = scratch_config("schedule-carry-export-wins");
     let mut direct = import_request(&with_schedule, pool2.clone(), config2.clone(), crypto2);
     direct.v2_config_path = Some(dir.join("v2-config.json"));
@@ -680,6 +664,50 @@ async fn schedule_carry_moves_sync_frequency_once() {
     assert_eq!(
         direct_stored["library_scan_schedule"]["scan_frequency"],
         json!("daily")
+    );
+}
+
+/// v3 has no 5 or 10 minute scan schedule. Either one in a v2 export or in
+/// its `config.json` imports as 30 minutes, and the report says so for the
+/// export's.
+#[tokio::test]
+async fn fast_scan_schedules_import_as_thirty_minutes() {
+    let fixture = Fixture::shared();
+
+    let mut export = fixture.shell();
+    export["settings"]["library_scan_schedule"] =
+        json!({"scan_frequency": "5min", "daily_scan_time": "04:00"});
+    let (pool, _target) = migrated_pool().await;
+    let (_dir, config_path, crypto) = scratch_config("schedule-fast-export");
+    let report = run_import(import_request(&export, pool.clone(), config_path, crypto)).await;
+    assert_eq!(report.exit.code, ExitCode::Ok);
+    let stored = stored_settings(&pool).await;
+    assert_eq!(
+        stored["library_scan_schedule"],
+        json!({"scan_frequency": "30min", "daily_scan_time": "04:00"})
+    );
+    assert!(
+        report
+            .to_json()
+            .contains("library_scan_schedule.scan_frequency"),
+        "the report names the rewrite"
+    );
+
+    let export = fixture.shell();
+    let (pool, _target) = migrated_pool().await;
+    let (dir, config_path, crypto) = scratch_config("schedule-fast-carry");
+    let v2_config = dir.join("v2-config.json");
+    std::fs::write(
+        &v2_config,
+        r#"{"library_sync_settings": {"sync_frequency": "10min"}}"#,
+    )
+    .unwrap();
+    let mut request = import_request(&export, pool.clone(), config_path, crypto);
+    request.v2_config_path = Some(v2_config);
+    assert_eq!(run_import(request).await.exit.code, ExitCode::Ok);
+    assert_eq!(
+        stored_settings(&pool).await["library_scan_schedule"]["scan_frequency"],
+        json!("30min")
     );
 }
 
@@ -708,7 +736,7 @@ async fn reused_secret_keeps_first_registration() {
     second["app_passwords"][0]["secret"] = first["app_passwords"][0]["secret"].clone();
     export["users"] = json!([first, second]);
 
-    let pool = migrated_pool().await;
+    let (pool, _target) = migrated_pool().await;
     let (_dir, config_path, crypto) = scratch_config("reused-secret");
     let report = run_import(import_request(&export, pool.clone(), config_path, crypto)).await;
 
@@ -724,7 +752,7 @@ async fn report_shape_matches_spec() {
     let fixture = Fixture::shared();
     let mut export = fixture.shell();
     export["users"] = json!([fixture.user("u1")]);
-    let pool = migrated_pool().await;
+    let (pool, _target) = migrated_pool().await;
     let (_dir, config_path, crypto) = scratch_config("shape");
     let report = run_import(import_request(&export, pool.clone(), config_path, crypto)).await;
 
@@ -739,7 +767,6 @@ async fn report_shape_matches_spec() {
         "user",
         "provider",
         "app_password",
-        "recovery_code",
         "follow",
         "approval",
         "connection",
@@ -775,7 +802,7 @@ async fn pending_import_reopens_a_rejected_row() {
     // Most-permissive ordering, pinned: pending outranks rejected, so a
     // pending import reopens the decision instead of keeping it.
     let fixture = Fixture::shared();
-    let pool = migrated_pool().await;
+    let (pool, _target) = migrated_pool().await;
     let (_dir, config_path, crypto) = scratch_config("rejected-reopen");
     sqlx::query(
         "INSERT INTO auth_users (id, display_name, role, created_at) VALUES ('u1', 'U', 'user', 0)",
@@ -813,7 +840,7 @@ async fn pending_import_reopens_a_rejected_row() {
 #[tokio::test]
 async fn rejected_and_unknown_states_never_win_a_merge() {
     let fixture = Fixture::shared();
-    let pool = migrated_pool().await;
+    let (pool, _target) = migrated_pool().await;
     let (_dir, config_path, _crypto) = scratch_config("rejected-kept");
     sqlx::query(
         "INSERT INTO auth_users (id, display_name, role, created_at) VALUES ('u1', 'U', 'user', 0)",
@@ -870,7 +897,7 @@ async fn valid_reviewer_survives_verbatim() {
     approval["reviewed_by_name"] = json!("User u2");
     export["approvals"] = json!([approval]);
 
-    let pool = migrated_pool().await;
+    let (pool, _target) = migrated_pool().await;
     let (_dir, config_path, crypto) = scratch_config("reviewer-kept");
     let report = run_import(import_request(&export, pool.clone(), config_path, crypto)).await;
 
@@ -898,7 +925,7 @@ async fn unnamed_app_password_drops_counted() {
     user["app_passwords"][0]["name"] = json!("");
     export["users"] = json!([user]);
 
-    let pool = migrated_pool().await;
+    let (pool, _target) = migrated_pool().await;
     let (_dir, config_path, crypto) = scratch_config("unnamed-secret");
     let report = run_import(import_request(&export, pool.clone(), config_path, crypto)).await;
 
@@ -916,7 +943,7 @@ async fn unknown_settings_section_with_corrupt_blob_is_ignored() {
     export["users"] = json!([fixture.user("u1")]);
     export["settings"]["future_section"] = json!({"api_key": {"$sealed": "!!!not-b64!!!"}});
 
-    let pool = migrated_pool().await;
+    let (pool, _target) = migrated_pool().await;
     let (_dir, config_path, crypto) = scratch_config("unknown-section");
     let report = run_import(import_request(
         &export,
@@ -943,7 +970,7 @@ async fn schedule_carry_instance_mismatch_refuses_with_zero_writes() {
     let fixture = Fixture::shared();
     let mut export = fixture.shell();
     export["users"] = json!([fixture.user("u1")]);
-    let pool = migrated_pool().await;
+    let (pool, _target) = migrated_pool().await;
     let (dir, config_path, crypto) = scratch_config("schedule-carry-mismatch");
     let v2_config = dir.join("v2-config.json");
     std::fs::write(
@@ -995,7 +1022,7 @@ async fn reimport_with_secrets_leaves_settings_rows_untouched() {
     export["settings"]["jellyfin_settings"] =
         json!({"api_key": fixture.seal("jelly-secret"), "jellyfin_url": "http://jelly:8096"});
 
-    let pool = migrated_pool().await;
+    let (pool, _target) = migrated_pool().await;
     let (_dir, config_path, _crypto) = scratch_config("secret-stable");
     let first = run_import(import_request(
         &export,
@@ -1109,7 +1136,7 @@ async fn v2_management_fields_carry_over_as_they_were() {
     let fixture = Fixture::shared();
     let mut export = fixture.shell();
     export["settings"]["library_management"] = management;
-    let pool = migrated_pool().await;
+    let (pool, _target) = migrated_pool().await;
     let (_dir, config_path, crypto) = scratch_config("management-fields");
     let report = run_import(import_request(
         &export,
@@ -1204,7 +1231,7 @@ async fn v2_profile_that_ticked_other_gets_the_role_fields() {
     let mut export = fixture.shell();
     export["settings"]["library_management"] = management;
     let (_dir, config_path, crypto) = scratch_config("management-other-roles");
-    let pool = migrated_pool().await;
+    let (pool, _target) = migrated_pool().await;
     let report = run_import(import_request(
         &export,
         pool.clone(),
@@ -1247,7 +1274,9 @@ async fn v2_profile_that_ticked_other_gets_the_role_fields() {
 
 /// A v2 export carrying settings v3 removed imports, never refused: the
 /// report names each removed setting as dropped, the fields kept beside
-/// them land, and the stored download policy still decodes.
+/// them land, and the stored download policy still decodes. Its recycle
+/// bin path moves to Library Management, where v3 sets the bin, over a path
+/// removals never used, and the report names the path dropped.
 #[tokio::test]
 async fn removed_settings_import_and_are_reported() {
     use droppedneedle_kernel::runtime_config::sections::DownloadPolicy;
@@ -1264,11 +1293,14 @@ async fn removed_settings_import_and_are_reported() {
     export["settings"]["download_policy"] = json!({
         "flac_mp3_only": true,
         "verify_downloads": true,
+        "recycle_bin_path": "/srv/bin",
+        "recycle_retention_days": 12,
         "quality_recipe": [
             {"format": "mp3", "quality": "custom", "min_bitrate_kbps": 192,
              "target_bitrate_kbps": 256, "max_bitrate_kbps": 320},
         ],
     });
+    export["settings"]["library_management"] = json!({"recycle_bin_path": "/srv/stale"});
     export["settings"]["download_clients"] =
         json!({"sabnzbd": {"url": "http://sab:8080", "post_processing": 3}});
     export["settings"]["indexers"] =
@@ -1276,8 +1308,9 @@ async fn removed_settings_import_and_are_reported() {
     export["settings"]["_internal"] =
         json!({"plex_client_id": "plex-1", "brainzmash_consent_admin": "u1"});
     export["settings"]["scrobble_settings"] = json!({"scrobble_to_lastfm": true});
+    export["settings"]["primary_music_source"] = json!({"source": "lastfm"});
 
-    let pool = migrated_pool().await;
+    let (pool, _target) = migrated_pool().await;
     let (_dir, config_path, crypto) = scratch_config("removed");
     let report = run_import(import_request(&export, pool.clone(), config_path, crypto)).await;
 
@@ -1301,6 +1334,8 @@ async fn removed_settings_import_and_are_reported() {
             "download_policy.quality_recipe[0].target_bitrate_kbps",
             "download_policy.verify_downloads",
             "indexers[0].type",
+            "library_management.recycle_bin_path (/srv/stale)",
+            "primary_music_source",
             "scrobble_settings",
         ]
     );
@@ -1312,9 +1347,84 @@ async fn removed_settings_import_and_are_reported() {
     );
     assert_eq!(stored["_internal"], json!({"plex_client_id": "plex-1"}));
     assert!(stored.get("scrobble_settings").is_none());
+    assert!(stored.get("primary_music_source").is_none());
     let policy: DownloadPolicy =
         serde_json::from_value(stored["download_policy"].clone()).expect("the policy decodes");
     assert_eq!(policy.quality_recipe[0].max_bitrate_kbps, Some(320));
+    assert!(stored["download_policy"].get("recycle_bin_path").is_none());
+    assert!(
+        stored["download_policy"]
+            .get("recycle_retention_days")
+            .is_none()
+    );
+    assert_eq!(
+        stored["library_management"],
+        json!({"recycle_bin_path": "/srv/bin", "recycle_retention_days": 12})
+    );
+}
+
+/// With a blank download policy path, the path a person set in v2's Library
+/// Management stays.
+#[tokio::test]
+async fn a_null_section_neither_loses_nor_invents_a_retention() {
+    let fixture = Fixture::shared();
+    let mut export = fixture.shell();
+    export["settings"]["download_policy"] = json!({"recycle_retention_days": 365});
+    export["settings"]["library_management"] = Value::Null;
+    let (pool, _target) = migrated_pool().await;
+    let (_dir, config_path, crypto) = scratch_config("null-management");
+    let report = run_import(import_request(&export, pool.clone(), config_path, crypto)).await;
+    assert_eq!(report.exit.code, ExitCode::Ok, "{}", report.to_json());
+    assert_eq!(
+        stored_settings(&pool).await["library_management"]["recycle_retention_days"],
+        365
+    );
+
+    let mut export = fixture.shell();
+    export["settings"]["download_policy"] = Value::Null;
+    let (pool, _target) = migrated_pool().await;
+    let (_dir, config_path, crypto) = scratch_config("null-policy");
+    let report = run_import(import_request(&export, pool.clone(), config_path, crypto)).await;
+    assert_eq!(report.exit.code, ExitCode::Ok, "{}", report.to_json());
+    assert!(
+        !report
+            .to_json()
+            .to_string()
+            .contains("recycle_retention_days"),
+        "{}",
+        report.to_json()
+    );
+    assert!(
+        stored_settings(&pool).await["library_management"]
+            .get("recycle_retention_days")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn a_chosen_bin_stays_when_the_download_policy_names_none() {
+    let fixture = Fixture::shared();
+    let mut export = fixture.shell();
+    export["settings"]["download_policy"] = json!({"recycle_bin_path": " "});
+    export["settings"]["library_management"] = json!({"recycle_bin_path": "/srv/chosen"});
+
+    let (pool, _target) = migrated_pool().await;
+    let (_dir, config_path, crypto) = scratch_config("chosen-bin");
+    let report = run_import(import_request(&export, pool.clone(), config_path, crypto)).await;
+
+    assert_eq!(report.exit.code, ExitCode::Ok, "{}", report.to_json());
+    let stored = stored_settings(&pool).await;
+    assert_eq!(
+        stored["library_management"]["recycle_bin_path"],
+        "/srv/chosen"
+    );
+    assert!(stored["download_policy"].get("recycle_bin_path").is_none());
+    assert!(
+        stored["library_management"]
+            .get("recycle_retention_days")
+            .is_none(),
+        "with none stored, the default holds"
+    );
 }
 
 #[tokio::test]
@@ -1332,7 +1442,7 @@ async fn event_cities_import_inside_the_city_limits() {
         city("Middle", 53.0, 30.0),
     ]);
 
-    let pool = migrated_pool().await;
+    let (pool, _target) = migrated_pool().await;
     let (_dir, config_path, crypto) = scratch_config("event-cities");
     let report = run_import(import_request(&export, pool.clone(), config_path, crypto)).await;
     assert_eq!(report.exit.code, ExitCode::Ok);
@@ -1354,10 +1464,118 @@ async fn event_cities_import_inside_the_city_limits() {
     );
 }
 
-#[test]
-fn event_city_limits_match_the_concerts_service() {
-    use droppedneedle_catalog::concerts::models::{MAX_CITIES, MAX_RADIUS_KM, MIN_RADIUS_KM};
-    use droppedneedle_tool::import::pipeline::{EVENT_CITY_RADIUS_KM, MAX_EVENT_CITIES};
-    assert_eq!(MAX_EVENT_CITIES, MAX_CITIES);
-    assert_eq!(EVENT_CITY_RADIUS_KM, MIN_RADIUS_KM..=MAX_RADIUS_KM);
+/// An export is imported with only what identifies each record: anything
+/// else a record lacks takes its empty value with a report line, never a
+/// refused file, and the re-import still writes nothing.
+#[tokio::test]
+async fn a_file_with_only_the_required_fields_imports() {
+    let fixture = Fixture::shared();
+    let mut export = fixture.shell();
+    export["users"] = json!([{"id": "u1"}]);
+    export["follows"] = json!([{"user_id": "u1", "artist_mbid": MBID}]);
+    export["approvals"] = json!([{"user_id": "u1", "artist_mbid": MBID}]);
+    let (pool, _target) = migrated_pool().await;
+    let (_dir, config_path, crypto) = scratch_config("minimal");
+    let request = |crypto| import_request(&export, pool.clone(), config_path.clone(), crypto);
+
+    let first = run_import(request(crypto)).await;
+    assert_eq!(first.exit.code, ExitCode::Ok, "{}", first.exit.message);
+    assert_eq!(counts(&first, "user"), (1, 0, 0, 0));
+    let state: String = sqlx::query_scalar("SELECT state FROM auto_download_approvals")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(state, "pending");
+    assert!(
+        first.items.iter().any(|item| item.entity == "approval"
+            && item.outcome == "converted"
+            && item.detail.contains("no state")),
+        "a state the record lacks is reported"
+    );
+
+    let runs = count(&pool, "import_runs").await;
+    let second = run_import(request(test_crypto())).await;
+    assert_eq!(second.exit.code, ExitCode::Ok, "{}", second.exit.message);
+    assert_eq!(counts(&second, "user"), (0, 1, 0, 0));
+    assert_eq!(counts(&second, "follow"), (0, 1, 0, 0));
+    assert_eq!(counts(&second, "approval"), (0, 1, 0, 0));
+    assert_eq!(count(&pool, "import_runs").await, runs, "nothing written");
+}
+
+/// What an area would refuse in a v2 value never fails the import and never
+/// lands as a silent default.
+#[tokio::test]
+async fn values_an_area_would_refuse_are_converted_or_left_behind_with_a_line() {
+    let fixture = Fixture::shared();
+    let mut export = fixture.shell();
+    let mut user = fixture.user("u1");
+    user["role"] = json!("owner");
+    user["created_at"] = json!("not a time");
+    user["last_login_at"] = json!("nor this");
+    export["users"] = json!([user]);
+    let mut approval = fixture.approval("u1", MBID);
+    approval["state"] = json!("maybe");
+    export["approvals"] = json!([approval]);
+    export["event_cities"] = json!([{
+        "user_id": "u1", "city_name": "Far", "latitude": 1.0, "longitude": 2.0,
+        "radius_km": 900.0, "position": 0,
+    }]);
+    let (pool, _target) = migrated_pool().await;
+    let (_dir, config_path, crypto) = scratch_config("refused");
+
+    let report = run_import(import_request(&export, pool.clone(), config_path, crypto)).await;
+    assert_eq!(
+        report.exit.code,
+        ExitCode::OkWithDrops,
+        "{}",
+        report.exit.message
+    );
+
+    let (role, created, login): (String, i64, Option<i64>) =
+        sqlx::query_as("SELECT role, created_at, last_login_at FROM auth_users WHERE id = 'u1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!((role.as_str(), created, login), ("user", 0, None));
+    let radius: f64 = sqlx::query_scalar("SELECT radius_km FROM user_event_cities")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(radius, 500.0);
+    assert_eq!(report.entities["approval"].dropped_invalid, 1);
+    assert_eq!(count(&pool, "auto_download_approvals").await, 0);
+    let converted = |entity: &str, words: &str| {
+        report.items.iter().any(|item| {
+            item.entity == entity && item.outcome == "converted" && item.detail.contains(words)
+        })
+    };
+    assert!(converted("user", "role"));
+    assert!(converted("user", "created_at"));
+    assert!(converted("user", "last_login_at"));
+    assert!(converted("event_city", "radius"));
+}
+
+/// A local row keeps its uid and its password when the account has no
+/// username, which a username taken by someone else leaves it with.
+#[tokio::test]
+async fn a_local_row_keeps_its_uid_on_an_account_with_no_username() {
+    let fixture = Fixture::shared();
+    let mut export = fixture.shell();
+    let mut user = fixture.user("u1");
+    user["username"] = Value::Null;
+    export["users"] = json!([user]);
+    let (pool, _target) = migrated_pool().await;
+    let (_dir, config_path, crypto) = scratch_config("no-username");
+
+    let report = run_import(import_request(&export, pool.clone(), config_path, crypto)).await;
+    assert_eq!(report.exit.code, ExitCode::Ok, "{}", report.exit.message);
+    let (uid, hash, scheme): (String, String, String) = sqlx::query_as(
+        "SELECT provider_uid, password_hash, hash_scheme FROM auth_providers WHERE user_id = 'u1'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(uid, "local:u1");
+    assert_eq!(hash, BCRYPT_HASH);
+    assert_eq!(scheme, "bcrypt");
 }

@@ -7,11 +7,11 @@
 	import { page } from '$app/state';
 	import { ApiError } from '$lib/api/errors';
 	import {
-		authorizeAppConnect,
+		createAuthorizeAppConnectMutation,
 		getAppConnectRequestQuery,
 		type ConnectRequest
 	} from '$lib/queries/auth/AppConnectQueries.svelte';
-	import type { AppConnectQuery } from '$lib/queries/auth/endpoints';
+	import type { AppConnectQuery } from '$lib/queries/auth/AppConnectQueries.svelte';
 	import { authStore } from '$lib/stores/authStore.svelte';
 	import { appAddress, framed, handBack } from '$lib/utils/appHandBack';
 	import { KeyRound, TriangleAlert } from 'lucide-svelte';
@@ -44,7 +44,7 @@
 	// Inside another page nothing is asked: a frame could click Allow.
 	const inFrame = framed();
 	const requestQuery = getAppConnectRequestQuery(() => (inFrame ? null : asQuery(request)));
-	const authorize = authorizeAppConnect();
+	const authorize = createAuthorizeAppConnectMutation();
 	let refused = $state<unknown>(undefined);
 	let busy = $state(false);
 	let handedBack = $state<string | null>(null);

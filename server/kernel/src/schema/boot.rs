@@ -42,11 +42,13 @@
 //!    after the file's `COMMIT` must never run it again). Name each CHECK
 //!    (`CONSTRAINT guard_... CHECK (...)`), so a refusal at boot says
 //!    which guard fired.
-//! 3. Save the rows of `pragma_foreign_key_check` (table, rowid, parent,
-//!    fkid) into a temp table, duplicates kept, so an old orphan elsewhere
-//!    does not block the upgrade. A child copied into a table of a new name
-//!    is saved under that new name, the one its orphans report under after
-//!    the copy.
+//! 3. Save the rows of `pragma_foreign_key_check` (table, rowid, parent)
+//!    into a temp table, duplicates kept, so an old orphan elsewhere does not
+//!    block the upgrade, and index the three columns: step 5 looks each group
+//!    up, and a database can hold many orphans. Leave `fkid` out: a rebuild
+//!    that adds a key renumbers the table's others, and an old orphan would
+//!    then read as new. A child copied into a table of a new name is saved
+//!    under that new name, the one its orphans report under after the copy.
 //! 4. Per table: `CREATE TABLE x_new (...) STRICT`;
 //!    `INSERT INTO x_new (rowid, ...) SELECT rowid, <explicit cast or
 //!    conversion per column> FROM x` (the rowid only when x has one);
@@ -56,7 +58,7 @@
 //!    before the `DROP`). Never rename the old table first: SQLite rewrites
 //!    every child's `REFERENCES` to follow it. An AUTOINCREMENT table carries
 //!    its `sqlite_sequence` value.
-//! 5. Group `pragma_foreign_key_check` by (table, rowid, parent, fkid) and
+//! 5. Group `pragma_foreign_key_check` by (table, rowid, parent) and
 //!    refuse when any group has more rows than step 3 saved for it, rowids
 //!    compared with `IS`. A WITHOUT ROWID child reports a NULL rowid, so all
 //!    of its orphans share one group: a set difference (`EXCEPT`) would let
@@ -314,27 +316,6 @@ async fn user_version(conn: &mut SqliteConnection) -> Result<i64, sqlx::Error> {
     sqlx::query_scalar("PRAGMA user_version")
         .fetch_one(conn)
         .await
-}
-
-/// Apply the pending embedded migrations over one rusqlite connection, for
-/// scratch test databases that never meet the async pool. Production
-/// boots through [`apply_migrations`].
-///
-/// Like the sqlx migrator, a migration already applied is skipped: every
-/// migration stamps `user_version`, so anything at or below the stamp is
-/// done. Running this twice on one database is a no-op, which matters
-/// because SQLite cannot make `ALTER TABLE ... ADD COLUMN` or a table
-/// rebuild safe to replay in SQL alone. `execute_batch` wraps nothing, so a
-/// `-- no-transaction` file runs as written here too.
-#[cfg(any(test, feature = "test-support"))]
-pub fn apply_migrations_blocking(connection: &rusqlite::Connection) -> rusqlite::Result<()> {
-    let applied: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    for migration in MIGRATOR.migrations.iter() {
-        if migration.version > applied {
-            connection.execute_batch(&migration.sql)?;
-        }
-    }
-    Ok(())
 }
 
 /// Refuse to serve when `user_version` differs from the binary.

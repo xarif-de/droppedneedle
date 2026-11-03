@@ -7,6 +7,7 @@
 //! change takes effect without a restart, and the roots survive restarts.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use super::scan::models::EffectivePolicy;
 use super::scan::roots::{LibraryRoot, PolicyRule, RootRegistry, fingerprint_roots};
@@ -19,7 +20,7 @@ use droppedneedle_kernel::runtime_config::secret_sections::{
     IdentificationPolicy, LibraryRoot as StoredRoot, TypedLibrary,
 };
 use droppedneedle_kernel::runtime_config::sections::{
-    DownloadPolicy, FilesystemWatcher, LibraryManagement, LibraryScanSchedule, MusicBrainzSettings,
+    FilesystemWatcher, LibraryManagement, LibraryScanSchedule, MusicBrainzSettings,
 };
 use droppedneedle_kernel::runtime_config::settings_error::SettingsError;
 use droppedneedle_kernel::runtime_config::{ConfigStore, Live, UpdateError};
@@ -37,10 +38,9 @@ pub struct LibrarySettings {
     pub schedule_zone: TimeZone,
     /// The filesystem watcher.
     pub watcher: Live<FilesystemWatcher>,
-    /// Library Management's profiles and undo retention.
+    /// Library Management's profiles, undo retention, recycle bin and its
+    /// retention.
     pub management: Live<LibraryManagement>,
-    /// The recycle bin.
-    pub download_policy: Live<DownloadPolicy>,
     /// Edition preferences, for identification and management.
     pub editions: LivePreferences,
     /// The MusicBrainz source identification asks.
@@ -60,7 +60,6 @@ impl LibrarySettings {
             schedule_zone: schedule_zone(timezone),
             watcher: config.live(),
             management: config.live(),
-            download_policy: config.live(),
             editions: LivePreferences::new(config),
             musicbrainz: config.live(),
             store: config.clone(),
@@ -112,7 +111,7 @@ impl LibrarySettings {
 /// The zone daily scans run in: `TZ` as an IANA name from the system zone
 /// database or a POSIX rule, else the host's own zone (`/etc/localtime`).
 /// One that does not resolve logs a warning and falls back to UTC.
-fn schedule_zone(configured: Option<&str>) -> TimeZone {
+pub fn schedule_zone(configured: Option<&str>) -> TimeZone {
     let resolved = match configured.map(|name| name.trim().trim_start_matches(':')) {
         Some(name) => TimeZone::get(name).or_else(|_| TimeZone::posix(name)),
         None => TimeZone::try_system(),
@@ -127,7 +126,7 @@ fn schedule_zone(configured: Option<&str>) -> TimeZone {
     })
 }
 
-fn policy(stored: IdentificationPolicy) -> EffectivePolicy {
+pub(crate) fn policy(stored: IdentificationPolicy) -> EffectivePolicy {
     match stored {
         IdentificationPolicy::Automatic => EffectivePolicy::Automatic,
         IdentificationPolicy::LocalMetadata => EffectivePolicy::LocalMetadata,
@@ -150,31 +149,37 @@ fn overlaps(a: &Path, b: &Path) -> bool {
 
 /// Build the engine registry from the stored settings. Roots that cannot
 /// be used (relative path, a path another root already covers) are left
-/// out with a warning instead of failing every root. The library is
-/// enabled when the master switch is on and at least one root exists.
+/// out instead of failing every root; [`build_registry`] names them.
 pub fn registry_from(settings: &TypedLibrary) -> RootRegistry {
+    build_registry(settings).0
+}
+
+/// The registry the stored settings describe, and why each root it left
+/// out cannot be used. The library is enabled when the master switch is on
+/// and at least one root exists.
+pub fn build_registry(settings: &TypedLibrary) -> (RootRegistry, Vec<String>) {
     let mut roots: Vec<LibraryRoot> = Vec::new();
+    let mut problems: Vec<String> = Vec::new();
     for stored in &settings.library_roots {
         let Some(path) = clean_absolute(&stored.path) else {
-            tracing::warn!(
-                root_id = stored.id,
-                "library root path is not absolute; skipped"
-            );
+            problems.push(format!(
+                "root {} has a path that is not absolute",
+                stored.id
+            ));
             continue;
         };
         if stored.id.trim().is_empty() {
-            tracing::warn!(path = %path.display(), "library root has no id; skipped");
+            problems.push(format!("the root at {} has no id", path.display()));
             continue;
         }
         if let Some(other) = roots
             .iter()
             .find(|root| root.id == stored.id || overlaps(&root.path, &path))
         {
-            tracing::warn!(
-                root_id = stored.id,
-                other = other.id,
-                "library root duplicates or overlaps another root; skipped"
-            );
+            problems.push(format!(
+                "root {} duplicates or overlaps root {}",
+                stored.id, other.id
+            ));
             continue;
         }
         let rules = stored
@@ -191,7 +196,21 @@ pub fn registry_from(settings: &TypedLibrary) -> RootRegistry {
     }
     let enabled = settings.enabled && !roots.is_empty();
     let revision = fingerprint_roots(&roots, enabled);
-    RootRegistry::new(roots, enabled, &revision)
+    (RootRegistry::new(roots, enabled, &revision), problems)
+}
+
+/// Logs the roots a registry left out, once per settings revision. `latch`
+/// holds the revision last logged and starts at -1; it lives beside the
+/// registry it reports on. `revision` is read before the section the problems
+/// came from: a save between the two logs the newer problems again under its
+/// own revision, and never leaves them unlogged.
+pub(crate) fn log_root_problems(latch: &AtomicI64, revision: i64, problems: &[String]) {
+    if latch.swap(revision, Ordering::Relaxed) == revision {
+        return;
+    }
+    for problem in problems {
+        tracing::warn!(%problem, "library root skipped");
+    }
 }
 
 /// The registry the saved settings describe now.
@@ -291,6 +310,9 @@ fn with_root(mut settings: TypedLibrary, root: &LibraryRoot) -> Result<TypedLibr
         SettingsError::InvalidInput { message } | SettingsError::Conflict { message } => {
             ServiceError::Conflict { message }
         }
+        refused @ SettingsError::InvalidField { .. } => ServiceError::Conflict {
+            message: refused.to_string(),
+        },
         other => ServiceError::internal(&format!("{other:?}")),
     })
 }

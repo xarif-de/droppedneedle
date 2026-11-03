@@ -12,7 +12,10 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use futures_util::TryStreamExt as _;
 use reqwest::Client;
+use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
+use reqwest::multipart::{Form, Part};
 use thiserror::Error;
 use tokio::sync::Mutex;
 
@@ -21,6 +24,9 @@ use crate::client_error::{ClientError, Service, retry_after};
 use crate::landing::DownloadsFolder;
 use crate::landing::confine::{Place, place};
 use droppedneedle_kernel::http_client::{BodyError, read_capped, transport_error};
+use droppedneedle_providers::executor::decode_failure;
+use droppedneedle_providers::newznab::NewznabClient;
+use droppedneedle_providers::{PayloadKind, ProviderError, RequestPriority};
 
 pub use super::sabnzbd_models::{
     AddResponse, Category, Config, History, HistorySlot, Misc, Queue, QueueSlot,
@@ -29,14 +35,7 @@ use super::sabnzbd_models::{
     CategoriesReply, ConfigReply, HistoryReply, QueueReply, StatusReply, VersionReply,
 };
 
-/// The most an NZB may weigh. An NZB lists one segment per posted article:
-/// about 120 bytes of XML for an article of about 750 KB, so roughly
-/// 1/6000 of the release. That is 2 MB for a 10 GB box set and 17 MB for
-/// 100 GB. 50 MB leaves room for older posts with smaller articles and
-/// still bounds what one enqueue holds in memory, since the NZB is handed
-/// to SABnzbd from memory. The figures are arithmetic, not a measurement
-/// of a live indexer.
-pub const MAX_NZB_BYTES: usize = 50 * 1024 * 1024;
+pub use droppedneedle_providers::newznab::MAX_NZB_BYTES;
 
 /// The most one SABnzbd API answer may weigh. The largest are the queue
 /// and a 50-job history page. At a few kilobytes a job, and tens for one
@@ -69,6 +68,13 @@ pub enum SabnzbdError {
     NzbRefused {
         /// The indexer's status code.
         status: u16,
+    },
+    /// The indexer is at its grab cap or asked us to slow down; the release
+    /// is fine, so nothing is held against it.
+    #[error("the indexer is limiting NZB grabs")]
+    NzbPaced {
+        /// Seconds until it takes grabs again, when known.
+        retry_after: Option<u64>,
     },
     /// The indexer's NZB passed [`MAX_NZB_BYTES`].
     #[error("the NZB is larger than {} MB and was not fetched", MAX_NZB_BYTES / (1024 * 1024))]
@@ -123,6 +129,13 @@ pub enum NzbFetchError {
         /// Body snippet.
         snippet: String,
     },
+    /// The indexer's cap or pace turned the grab down. Handing the URL to
+    /// SABnzbd would spend a grab the indexer already said no to.
+    #[error("NZB grab is paced")]
+    Paced {
+        /// Seconds until it takes grabs again, when known.
+        retry_after: Option<u64>,
+    },
     /// The NZB passed [`MAX_NZB_BYTES`]. The indexer answered, so SABnzbd
     /// is not handed the URL either.
     #[error("the NZB is larger than {} MB", MAX_NZB_BYTES / (1024 * 1024))]
@@ -138,12 +151,20 @@ pub enum NzbFetchError {
 ///   (`...nzb&i=1&r=KEY`), anchored so `error=` and the like pass;
 /// - `link`: the other value in Prowlarr's download URL, an opaque
 ///   per-download token. What it encodes is not verified, so it is
-///   scrubbed with the key. Anchored like `r`.
+///   scrubbed with the key. Anchored like `r`;
+/// - `nzbkey` and `nzb_key`: SABnzbd's add-only key;
+/// - `password` and `pass`: a login carried in a query or a JSON answer.
+///   `pass` is anchored so `bypass=` passes.
 ///
-/// `i=` (DrunkenSlug's user id) stays visible.
-const SECRET_QUERY_KEYS: [(&str, bool); 4] = [
+/// `i=` (DrunkenSlug's user id) stays visible. An unanchored key also
+/// matches as the end of a longer JSON member name (`"sabnzbd_apikey"`).
+const SECRET_QUERY_KEYS: [(&str, bool); 8] = [
     ("api_key", false),
     ("apikey", false),
+    ("nzb_key", false),
+    ("nzbkey", false),
+    ("password", false),
+    ("pass", true),
     ("link", true),
     ("r", true),
 ];
@@ -157,10 +178,14 @@ const PATH_KEY_MIN_LEN: usize = 20;
 /// Newznab enclosure URL carries the indexer's key and either may echo it.
 /// A [`SECRET_QUERY_KEYS`] value is scrubbed as `key=value`, percent-encoded
 /// as `key%3Dvalue` (a URL nested in another's query) and as a JSON member
-/// `"key": "value"`. In an `http(s)` URL, a path segment that looks like a
-/// key (long, letters and digits) is scrubbed too, as an indexer may put
-/// its key in the path (`/fetch/<id>/<key>`). Matched without a regex
-/// dependency.
+/// `"key": "value"`, also with its quotes escaped (`\"key\": \"value\"`,
+/// JSON inside a JSON string). In an `http(s)` URL (slashes escaped as
+/// `\/` or not), a password in the authority (`user:password@host`) is
+/// scrubbed, and so is a path segment that looks like a key (long, letters
+/// and digits), as an indexer may put its key in the path
+/// (`/fetch/<id>/<key>`). Matched without a regex dependency. A body is
+/// scrubbed whole before it is cut short, so a cut cannot leave half a key
+/// unmatched.
 pub fn redact_query_secrets(text: &str) -> String {
     let bytes = text.as_bytes();
     let mut out = String::with_capacity(text.len());
@@ -175,6 +200,11 @@ pub fn redact_query_secrets(text: &str) -> String {
         } else if let Some(scheme_end) = url_scheme_end(bytes, index) {
             out.push_str(&text[index..scheme_end]);
             index = scheme_end;
+            if let Some((password, at)) = userinfo_password(bytes, index) {
+                out.push_str(&text[index..password]);
+                out.push_str("***");
+                index = at;
+            }
             in_url_path = true;
         } else if let Some(end) = path_key_end(bytes, index).filter(|_| in_url_path) {
             out.push_str("***");
@@ -219,33 +249,41 @@ fn secret_value_at(bytes: &[u8], index: usize) -> Option<(usize, usize)> {
         if starts_with_ignore_case(&bytes[after..], b"%3D") {
             return Some((key.len() + 3, query_value_end(bytes, after + 3)));
         }
-        // A JSON member: `"key"`, a colon, then the value.
-        if index == 0 || bytes[index - 1] != b'"' || bytes[after] != b'"' {
+        // A JSON member: `"key"` (or `\"key\"`), a colon, then the value.
+        if !json_name_opens_before(bytes, index, *anchored) {
             return None;
         }
-        let colon = skip_space(bytes, after + 1);
+        let closing = quote_len(bytes, after)?;
+        let colon = skip_space(bytes, after + closing);
         if bytes.get(colon) != Some(&b':') {
             return None;
         }
         let start = skip_space(bytes, colon + 1);
-        if bytes.get(start) == Some(&b'"') {
-            return Some((start + 1 - index, json_string_end(bytes, start + 1)));
+        if let Some(quote) = quote_len(bytes, start) {
+            let value = start + quote;
+            let end = if quote == 2 {
+                escaped_string_end(bytes, value)
+            } else {
+                json_string_end(bytes, value)
+            };
+            return Some((value - index, end));
         }
         let end = start
             + bytes[start..]
                 .iter()
                 .take_while(|byte| {
-                    !matches!(byte, b',' | b'}' | b']') && !byte.is_ascii_whitespace()
+                    !matches!(byte, b',' | b'}' | b']' | b'\\') && !byte.is_ascii_whitespace()
                 })
                 .count();
         Some((start - index, end))
     })
 }
 
-/// End of a query value: `&` (plain or as `%26`), a quote or whitespace.
+/// End of a query value: `&` (plain or as `%26`), a quote, a backslash
+/// (an escaped quote) or whitespace.
 fn query_value_end(bytes: &[u8], mut index: usize) -> usize {
     while index < bytes.len()
-        && !matches!(bytes[index], b'&' | b'\'' | b'"')
+        && !matches!(bytes[index], b'&' | b'\'' | b'"' | b'\\')
         && !bytes[index].is_ascii_whitespace()
         && !starts_with_ignore_case(&bytes[index..], b"%26")
     {
@@ -262,6 +300,41 @@ fn json_string_end(bytes: &[u8], mut index: usize) -> usize {
     index.min(bytes.len())
 }
 
+/// Where an escaped JSON string (`\"...\"`) whose text starts at `index`
+/// ends: at the next `\"`, or at a bare `"` should the escaping stop.
+fn escaped_string_end(bytes: &[u8], mut index: usize) -> usize {
+    while index < bytes.len() && bytes[index] != b'"' {
+        if bytes[index] == b'\\' && bytes.get(index + 1) == Some(&b'"') {
+            return index;
+        }
+        index += 1;
+    }
+    index
+}
+
+/// The length of a JSON quote at `index`: 1 for `"`, 2 for an escaped `\"`.
+fn quote_len(bytes: &[u8], index: usize) -> Option<usize> {
+    match bytes.get(index..) {
+        Some([b'"', ..]) => Some(1),
+        Some([b'\\', b'"', ..]) => Some(2),
+        _ => None,
+    }
+}
+
+/// True when a JSON member name opens right before `index` or, for an
+/// unanchored key, before a run of name characters that ends there.
+fn json_name_opens_before(bytes: &[u8], index: usize, anchored: bool) -> bool {
+    let mut start = index;
+    if !anchored {
+        while start > 0
+            && matches!(bytes[start - 1], b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-')
+        {
+            start -= 1;
+        }
+    }
+    start > 0 && bytes[start - 1] == b'"'
+}
+
 fn skip_space(bytes: &[u8], index: usize) -> usize {
     index
         + bytes
@@ -276,13 +349,37 @@ fn starts_with_ignore_case(bytes: &[u8], prefix: &[u8]) -> bool {
     bytes.len() >= prefix.len() && bytes[..prefix.len()].eq_ignore_ascii_case(prefix)
 }
 
-/// When an `http://` or `https://` scheme starts at `index`, where it ends.
+/// When an `http://` or `https://` scheme starts at `index` (its slashes
+/// escaped as `\/` or not), where it ends.
 fn url_scheme_end(bytes: &[u8], index: usize) -> Option<usize> {
     let rest = &bytes[index..];
-    [b"https://".as_slice(), b"http://".as_slice()]
-        .into_iter()
-        .find(|scheme| starts_with_ignore_case(rest, scheme))
-        .map(|scheme| index + scheme.len())
+    [
+        b"https://".as_slice(),
+        b"http://".as_slice(),
+        br"https:\/\/".as_slice(),
+        br"http:\/\/".as_slice(),
+    ]
+    .into_iter()
+    .find(|scheme| starts_with_ignore_case(rest, scheme))
+    .map(|scheme| index + scheme.len())
+}
+
+/// When the URL authority starting at `index` holds `user:password@`,
+/// where the password starts and where its `@` is.
+fn userinfo_password(bytes: &[u8], index: usize) -> Option<(usize, usize)> {
+    let authority = &bytes[index..];
+    let len = authority
+        .iter()
+        .position(|byte| {
+            matches!(
+                byte,
+                b'/' | b'\\' | b'?' | b'#' | b'"' | b'\'' | b'<' | b'>'
+            ) || byte.is_ascii_whitespace()
+        })
+        .unwrap_or(authority.len());
+    let at = authority[..len].iter().rposition(|byte| *byte == b'@')?;
+    let colon = authority[..at].iter().position(|byte| *byte == b':')?;
+    Some((index + colon + 1, index + at))
 }
 
 /// When a URL path segment that looks like a key starts at `index`, where
@@ -428,14 +525,16 @@ impl SabnzbdClient {
             pp_text = value.to_string();
             params.push(("pp", &pp_text));
         }
-        let (body, content_type) = multipart_nzb(job_name, nzb_bytes);
+        let (body, content_type) = multipart_nzb(job_name, nzb_bytes)
+            .await
+            .map_err(|err| ClientError::transport(Service::Sabnzbd, transport_error(err)))?;
         let url = self.api_url();
         let query = self.suffixed(&params);
         let response = self
             .http
             .post(&url)
             .query(&query)
-            .header("content-type", content_type)
+            .header(CONTENT_TYPE, content_type)
             .body(body)
             .timeout(timeout)
             .send()
@@ -561,16 +660,7 @@ impl SabnzbdClient {
                 BodyError::TooLarge => NzbFetchError::TooLarge,
                 BodyError::Transport(detail) => NzbFetchError::Transport(detail),
             })?;
-        let head: Vec<u8> = bytes.iter().take(512).copied().collect();
-        if !looks_like_nzb(&head) {
-            let snippet = String::from_utf8_lossy(&bytes).chars().take(200).collect();
-            return Err(NzbFetchError::ContentRejection {
-                status,
-                content_type,
-                snippet,
-            });
-        }
-        Ok(bytes)
+        checked_nzb(bytes, status, content_type)
     }
 
     fn api_url(&self) -> String {
@@ -604,7 +694,7 @@ impl SabnzbdClient {
             .await
             .map_err(|err| ClientError::transport(Service::Sabnzbd, transport_error(err)))?;
         let data = self.parse_json(response).await?;
-        serde_json::from_value(data).map_err(|err| non_json(err.to_string()))
+        serde_json::from_value(data).map_err(|err| non_json(decode_failure(&err)))
     }
 
     /// Idempotent GETs only: transient transport errors + 5xx retry with
@@ -644,9 +734,10 @@ impl SabnzbdClient {
         response: reqwest::Response,
     ) -> Result<serde_json::Value, SabnzbdError> {
         let status = response.status().as_u16();
-        if status >= 400 {
+        // A 3xx here is a redirect the client did not follow, not an answer.
+        if status >= 300 {
             let wait = retry_after(response.headers());
-            let snippet = redact_query_secrets(&response_snippet(response).await);
+            let snippet = response_snippet(response).await;
             return Err(ClientError::for_status(
                 Service::Sabnzbd,
                 status,
@@ -668,7 +759,7 @@ impl SabnzbdClient {
 
     async fn parse_add(&self, response: reqwest::Response) -> Result<AddResponse, SabnzbdError> {
         let data = self.parse_json(response).await?;
-        serde_json::from_value(data).map_err(|err| non_json(err.to_string()))
+        serde_json::from_value(data).map_err(|err| non_json(decode_failure(&err)))
     }
 }
 
@@ -736,7 +827,7 @@ fn parse_body(text: &str) -> Result<serde_json::Value, SabnzbdError> {
         return Err(api_error(message));
     }
     let data: serde_json::Value =
-        serde_json::from_str(text).map_err(|_| non_json(trimmed.chars().take(120).collect()))?;
+        serde_json::from_str(text).map_err(|err| non_json(decode_failure(&err)))?;
     if let Some(error_text) = data.get("error").and_then(serde_json::Value::as_str)
         && is_false(data.get("status"))
     {
@@ -760,11 +851,19 @@ fn is_auth_error(message: &str) -> bool {
     low.contains("api key incorrect") || low.contains("api key required")
 }
 
-/// The start of an error body. One longer than a few kilobytes reads as
-/// empty.
+/// The start of an error body, credentials scrubbed. One longer than a
+/// few kilobytes reads as empty.
 async fn response_snippet(response: reqwest::Response) -> String {
     let bytes = read_capped(response, 8 * 1024).await.unwrap_or_default();
-    String::from_utf8_lossy(&bytes).chars().take(200).collect()
+    snippet_of(&bytes)
+}
+
+/// The first 200 characters of a body, scrubbed whole before the cut.
+fn snippet_of(bytes: &[u8]) -> String {
+    redact_query_secrets(&String::from_utf8_lossy(bytes))
+        .chars()
+        .take(200)
+        .collect()
 }
 
 /// The NZB head check: `<?xml` or `<nzb` up front, or
@@ -784,21 +883,24 @@ fn looks_like_nzb(head: &[u8]) -> bool {
         || lower.windows(4).any(|w| w == b"<nzb")
 }
 
-/// Hand-rolled multipart/form-data: the crate has no multipart feature,
-/// and the shape is one file field. Field `name`, filename
-/// `{job_name}.nzb`, type `application/x-nzb`.
-fn multipart_nzb(job_name: &str, nzb_bytes: &[u8]) -> (Vec<u8>, String) {
-    let boundary = "droppedneedle-nzb-boundary";
-    let mut body = Vec::new();
-    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
-    body.extend_from_slice(
-        format!("Content-Disposition: form-data; name=\"name\"; filename=\"{job_name}.nzb\"\r\n")
-            .as_bytes(),
-    );
-    body.extend_from_slice(b"Content-Type: application/x-nzb\r\n\r\n");
-    body.extend_from_slice(nzb_bytes);
-    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
-    (body, format!("multipart/form-data; boundary={boundary}"))
+/// The one file field SABnzbd reads: field `name`, filename
+/// `{job_name}.nzb`, type `application/x-nzb`. The filename goes as written,
+/// not percent-encoded, as it always has. Answers the finished body and its
+/// content type: a body in memory can be sent again after a 307 or 308, and a
+/// form's stream cannot.
+async fn multipart_nzb(
+    job_name: &str,
+    nzb_bytes: &[u8],
+) -> Result<(Vec<u8>, String), reqwest::Error> {
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/x-nzb"));
+    let part = Part::bytes(nzb_bytes.to_vec())
+        .file_name(format!("{job_name}.nzb"))
+        .headers(headers);
+    let form = Form::new().percent_encode_noop().part("name", part);
+    let content_type = format!("multipart/form-data; boundary={}", form.boundary());
+    let chunks: Vec<_> = form.into_stream().try_collect().await?;
+    Ok((chunks.concat(), content_type))
 }
 
 // ---------------------------------------------------------------------------
@@ -896,10 +998,71 @@ pub struct Health {
     pub message: String,
 }
 
+/// The bytes, when they are a real NZB and not an indexer's error page.
+fn checked_nzb(
+    bytes: Vec<u8>,
+    status: u16,
+    content_type: Option<String>,
+) -> Result<Vec<u8>, NzbFetchError> {
+    let head: Vec<u8> = bytes.iter().take(512).copied().collect();
+    if looks_like_nzb(&head) {
+        return Ok(bytes);
+    }
+    Err(NzbFetchError::ContentRejection {
+        status,
+        content_type,
+        snippet: snippet_of(&bytes),
+    })
+}
+
+/// Fetch a release's NZB through its indexer's client, so the grab is paced
+/// and counted on the indexer. The download worker asks, so it is background.
+async fn grab_nzb(grab: &NewznabClient, url: &str) -> Result<Vec<u8>, NzbFetchError> {
+    let bytes = grab
+        .fetch_nzb(url, RequestPriority::BackgroundSync)
+        .await
+        .map_err(|error| grab_failed(&error))?;
+    checked_nzb(bytes, 200, None)
+}
+
+/// A failed grab in the terms the enqueue path decides on. The error names
+/// only the provider, never the enclosure URL or its key.
+fn grab_failed(error: &ProviderError) -> NzbFetchError {
+    let status = match error {
+        ProviderError::RateLimited { .. } => {
+            return NzbFetchError::Paced {
+                retry_after: error.retry_after_secs(),
+            };
+        }
+        ProviderError::Payload {
+            kind: PayloadKind::TooLarge,
+            ..
+        } => return NzbFetchError::TooLarge,
+        ProviderError::Transport { .. } | ProviderError::Invalid { .. } => {
+            return NzbFetchError::Transport(error.to_string());
+        }
+        ProviderError::Unauthorized { .. } | ProviderError::Rejected { .. } => 401,
+        ProviderError::Forbidden { .. } => 403,
+        ProviderError::NotFound { .. } => 404,
+        ProviderError::Unavailable { .. } => 503,
+        ProviderError::BadRequest { status, .. }
+        | ProviderError::Redirect { status, .. }
+        | ProviderError::Server { status, .. } => *status,
+        _ => 502,
+    };
+    NzbFetchError::Definitive {
+        status,
+        snippet: String::new(),
+    }
+}
+
 /// The download side of Usenet: enqueue, poll, abort, locate.
 ///
 /// Enqueue fetches the NZB, validates it, and `addfile`s it; only a
-/// no-response transport failure falls back to `addurl`. Status walks
+/// no-response transport failure falls back to `addurl`. A release from a
+/// native Newznab indexer is fetched through that indexer's client; one
+/// from Prowlarr (a service the user runs) or a plugin is fetched directly.
+/// Status walks
 /// queue→history, and only the true `Downloading` state sets
 /// `has_active_transfer`, so Grabbing/Queued/Paused/post-processing never
 /// trip the stall/queued watchdogs.
@@ -1003,19 +1166,30 @@ impl SabnzbdQueue {
         priority: Option<i32>,
         post_processing: Option<i32>,
     ) -> Result<TaskHandle, SabnzbdError> {
-        self.enqueue(task_id, None, nzb_url, category, priority, post_processing)
-            .await
+        self.enqueue(
+            task_id,
+            None,
+            nzb_url,
+            None,
+            category,
+            priority,
+            post_processing,
+        )
+        .await
     }
 
     /// Enqueue one album release under a worker-built job name. The worker
     /// passes `droppedneedle-{task_id}-{candidate_index}`:
     /// the counter keeps failover attempts distinct on the client and is
-    /// the shape the orphan reconciler recognises.
+    /// the shape the orphan reconciler recognises. `grab` is the release's
+    /// indexer, when it has one.
+    #[allow(clippy::too_many_arguments)]
     pub async fn enqueue_album_as(
         &self,
         task_id: &str,
         job_name: &str,
         nzb_url: Option<&str>,
+        grab: Option<&NewznabClient>,
         category: Option<&str>,
         priority: Option<i32>,
         post_processing: Option<i32>,
@@ -1024,6 +1198,7 @@ impl SabnzbdQueue {
             task_id,
             Some(job_name),
             nzb_url,
+            grab,
             category,
             priority,
             post_processing,
@@ -1034,11 +1209,13 @@ impl SabnzbdQueue {
     /// Enqueue one track. Usenet has no reliable single-track search: the
     /// track resolved to its album upstream, so this is the same
     /// release enqueue under a track-derived job name.
+    #[allow(clippy::too_many_arguments)]
     pub async fn enqueue_track(
         &self,
         task_id: &str,
         track_job: &str,
         nzb_url: Option<&str>,
+        grab: Option<&NewznabClient>,
         category: Option<&str>,
         priority: Option<i32>,
         post_processing: Option<i32>,
@@ -1047,6 +1224,7 @@ impl SabnzbdQueue {
             task_id,
             Some(track_job),
             nzb_url,
+            grab,
             category,
             priority,
             post_processing,
@@ -1054,11 +1232,13 @@ impl SabnzbdQueue {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn enqueue(
         &self,
         task_id: &str,
         job_name: Option<&str>,
         nzb_url: Option<&str>,
+        grab: Option<&NewznabClient>,
         category: Option<&str>,
         priority: Option<i32>,
         post_processing: Option<i32>,
@@ -1072,17 +1252,22 @@ impl SabnzbdQueue {
         } else {
             job_name
         };
-        let nzb_bytes = match self
-            .client
-            .fetch_nzb(url, self.policy.enqueue_timeout)
-            .await
-        {
+        let fetched = match grab {
+            Some(grab) => grab_nzb(grab, url).await,
+            None => {
+                self.client
+                    .fetch_nzb(url, self.policy.enqueue_timeout)
+                    .await
+            }
+        };
+        let nzb_bytes = match fetched {
             Ok(bytes) => bytes,
             Err(NzbFetchError::Transport(_)) => {
                 // No-response transport failure: this indexer may be
                 // reachable only from the SABnzbd host, so hand SABnzbd
                 // the enclosure URL. The URL is never logged: enclosures
-                // carry the indexer apikey.
+                // carry the indexer apikey. A grab through the indexer's
+                // client already counted this one against its cap.
                 let response = self
                     .client
                     .add_url(
@@ -1106,12 +1291,14 @@ impl SabnzbdQueue {
             Err(NzbFetchError::Definitive { status, .. }) => {
                 return Err(SabnzbdError::NzbRefused { status });
             }
+            Err(NzbFetchError::Paced { retry_after }) => {
+                return Err(SabnzbdError::NzbPaced { retry_after });
+            }
             Err(NzbFetchError::TooLarge) => return Err(SabnzbdError::NzbTooLarge),
             Err(NzbFetchError::ContentRejection { snippet, .. }) => {
                 // An error page can echo the URL it was asked for.
                 return Err(SabnzbdError::Api(format!(
-                    "indexer returned a non-NZB body (likely an error/limit page): {}",
-                    redact_query_secrets(&snippet)
+                    "indexer returned a non-NZB body (likely an error/limit page): {snippet}"
                 )));
             }
         };
@@ -1717,5 +1904,13 @@ mod tests {
             posix_parts("/complete/../../etc/./job\\..\\x"),
             ["complete", "etc", "job", "x"]
         );
+    }
+
+    #[test]
+    fn a_body_is_scrubbed_before_it_is_cut() {
+        let key = "0123456789abcdef0123456789abcdef";
+        let body = format!("{}https://x/fetch/{key}", "-".repeat(180));
+        let snippet = snippet_of(body.as_bytes());
+        assert!(!snippet.contains("0123"), "{snippet}");
     }
 }

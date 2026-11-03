@@ -9,6 +9,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use droppedneedle_kernel::db::statement::ListLen;
 use rusqlite::{Transaction, params};
 
 use super::edition::{self, Settle};
@@ -40,11 +41,7 @@ pub(super) fn reset(
     let mut state = album_state(tx, &[&album])?;
 
     tx.execute(
-        &format!(
-            "UPDATE local_tracks SET membership_locked = 0, membership_source = 'automatic', \
-             row_revision = row_revision + 1 WHERE id IN ({})",
-            edition::placeholders(track_ids.len())
-        ),
+        &crate::corrections::sql::release_tracks_to_automatic(ListLen::new(track_ids.len())),
         rusqlite::params_from_iter(track_ids.iter()),
     )?;
     // Where each track lands, in path order so names resolve the way a
@@ -56,7 +53,7 @@ pub(super) fn reset(
         };
         if dest != track.album_id {
             tx.execute(
-                "UPDATE local_tracks SET local_album_id = ?2 WHERE id = ?1",
+                crate::corrections::sql::SET_TRACK_ALBUM.text(),
                 params![track.id, dest],
             )?;
         }
@@ -84,16 +81,13 @@ pub(super) fn reset(
         }
     } else {
         let locked: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM local_tracks WHERE local_album_id = ?1 \
-             AND membership_locked = 1)",
+            crate::corrections::sql::ALBUM_HAS_LOCKED_MEMBER.text(),
             params![album.id],
             |row| row.get(0),
         )?;
         tx.execute(
-            "UPDATE local_albums SET grouping_source = CASE WHEN ?2 THEN grouping_source \
-             ELSE 'automatic' END, grouping_locked = ?2, updated_at = ?3, \
-             row_revision = row_revision + 1 WHERE id = ?1",
-            params![album.id, locked, now],
+            crate::corrections::sql::RESET_ALBUM_GROUPING.text(),
+            params![album.id, locked, crate::clock::ms(now)],
         )?;
     }
 
@@ -164,11 +158,7 @@ fn held_by_hand(
         return Ok(true);
     }
     let held: i64 = tx.query_row(
-        &format!(
-            "SELECT COUNT(*) FROM local_tracks WHERE id IN ({}) \
-             AND (membership_locked = 1 OR membership_source <> 'automatic')",
-            edition::placeholders(track_ids.len())
-        ),
+        &crate::corrections::sql::tracks_held_by_hand(ListLen::new(track_ids.len())),
         rusqlite::params_from_iter(track_ids.iter()),
         |row| row.get(0),
     )?;

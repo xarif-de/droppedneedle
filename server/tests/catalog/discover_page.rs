@@ -15,10 +15,8 @@ use axum::{
     body::Body,
     http::{Request, StatusCode},
 };
-use droppedneedle_catalog::reads::discover::cache::{
-    PageKind, Timing, UserPageCache, Variant, clear_all,
-};
-use droppedneedle_catalog::reads::discover::listening::{
+use droppedneedle_catalog::discover::cache::{PageKind, Timing, UserPageCache, Variant, clear_all};
+use droppedneedle_catalog::discover::listening::{
     AlbumRow, ArtistRow, ListenedAlbum, RankedAlbum, ScoredArtist, SourceContext, UserMusic,
 };
 use droppedneedle_kernel::db::Lane;
@@ -70,7 +68,7 @@ pub(crate) fn page_script() -> Script {
             artist: ArtistRow {
                 name: format!("Similar {n}"),
                 mbid: Some(mbid('b', n)),
-                listen_count: i64::from(n) * 100,
+                listen_count: Some(i64::from(n) * 100),
             },
             score: f64::from(n) * 100.0,
         })
@@ -97,13 +95,13 @@ pub(crate) fn page_script() -> Script {
         user_artists: vec![ArtistRow {
             name: "Seed".to_owned(),
             mbid: Some(SEED.to_owned()),
-            listen_count: 50,
+            listen_count: Some(50),
         }],
         fresh: vec![ranked(90, &mbid('f', 1), 0).album],
         sitewide_artists: vec![ArtistRow {
             name: "Everyone's Favourite".to_owned(),
             mbid: Some(mbid('c', 1)),
-            listen_count: 9000,
+            listen_count: Some(9000),
         }],
         sitewide_albums: vec![listened(ranked(70, &mbid('d', 1), 10_000))],
         similar: HashMap::from([(SEED.to_owned(), similar)]),
@@ -392,7 +390,7 @@ fn scored(prefix: char, n: u8, score: f64) -> ScoredArtist {
         artist: ArtistRow {
             name: format!("Artist {prefix}{n}"),
             mbid: Some(mbid(prefix, n)),
-            listen_count: 0,
+            listen_count: None,
         },
         score,
     }
@@ -402,7 +400,7 @@ fn seed(name: &str, n: u8) -> ArtistRow {
     ArtistRow {
         name: name.to_owned(),
         mbid: Some(mbid('e', n)),
-        listen_count: 10,
+        listen_count: Some(10),
     }
 }
 
@@ -456,7 +454,7 @@ async fn because_entries(on: bool) -> Vec<(String, String, String)> {
                     artist: ArtistRow {
                         name: "Artist b6".to_owned(),
                         mbid: None,
-                        listen_count: 0,
+                        listen_count: None,
                     },
                     score: 0.7,
                 },
@@ -515,12 +513,20 @@ async fn both_services_blend_unless_the_server_turns_it_off() {
 }
 
 /// The user's saved discover page, once no build is running.
-async fn settled_page(rig: &AuthRig, app: &Router, what: &str) -> Value {
-    after_commits(&rig.platform.db, what, || async {
-        let (_, page) = call(app, "GET", "/api/v3/discover", None).await;
-        (page["refreshing"] == false && page["generated_at"].is_number()).then_some(page)
+async fn settled_page(_rig: &AuthRig, app: &Router, what: &str) -> Value {
+    // The build's last write comes before its in-flight mark clears, so no
+    // commit follows the clear: this asks until the page says it has settled.
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            let (_, page) = call(app, "GET", "/api/v3/discover", None).await;
+            if page["refreshing"] == false && page["generated_at"].is_number() {
+                return page;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     })
     .await
+    .unwrap_or_else(|_| panic!("never happened: {what}"))
 }
 
 /// While the advanced settings cannot be read no build starts, asked for
@@ -613,7 +619,8 @@ async fn a_shelf_whose_read_failed_is_built_again_soon() {
         (fresh(&page) == Some(1)).then_some(page)
     })
     .await;
-    assert_eq!(page["refreshing"], false);
+    assert_eq!(fresh(&page), Some(1));
+    settled_page(&rig, &app, "the rebuild finished").await;
 
     rig.clock.advance(301_000);
     let (_, page) = call(&app, "GET", "/api/v3/discover", None).await;

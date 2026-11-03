@@ -29,10 +29,10 @@ use rusqlite::{Connection, OptionalExtension as _, Transaction, params};
 
 use super::models::{DroppedEdition, EditionChange, EditionChangeKind, IdentityChoice};
 use super::reasons;
+use crate::edition::choice::queue_placement;
 use crate::identify::models::CandidateEvidence;
 use crate::identity::{self, DecisionSource};
-use crate::operations::choice::queue_placement;
-use crate::operations::reasons::Reason;
+use crate::reasons::Reason;
 
 const PROVIDER: &str = "musicbrainz";
 
@@ -42,7 +42,7 @@ pub(super) struct Identity {
     pub album_id: String,
     pub release_group_mbid: String,
     pub release_mbid: Option<String>,
-    pub decision_source: String,
+    pub decision_source: DecisionSource,
     pub row_revision: i64,
     /// A custom edition is active: it lists this album's own tracks.
     pub custom: bool,
@@ -58,7 +58,7 @@ impl Identity {
     }
 
     fn pinned(&self) -> bool {
-        DecisionSource::parse(&self.decision_source).is_some_and(DecisionSource::is_persons_choice)
+        self.decision_source.is_persons_choice()
     }
 
     fn dropped(&self) -> DroppedEdition {
@@ -66,16 +66,14 @@ impl Identity {
             album_id: self.album_id.clone(),
             release_group_mbid: self.release_group_mbid.clone(),
             release_mbid: self.release_mbid.clone(),
-            decision_source: self.decision_source.clone(),
+            decision_source: self.decision_source,
         }
     }
 }
 
 pub(super) fn identity(conn: &Connection, album_id: &str) -> rusqlite::Result<Option<Identity>> {
     conn.query_row(
-        "SELECT release_group_mbid, release_mbid, decision_source, row_revision, \
-         EXISTS(SELECT 1 FROM library_custom_edition_active c WHERE c.local_album_id = ?1) \
-         FROM local_album_external_identities WHERE local_album_id = ?1 AND provider = ?2",
+        crate::corrections::sql::IDENTITY.text(),
         params![album_id, PROVIDER],
         |row| {
             Ok(Identity {
@@ -91,10 +89,30 @@ pub(super) fn identity(conn: &Connection, album_id: &str) -> rusqlite::Result<Op
     .optional()
 }
 
+/// The edition as a card shows it and as a preview token covers it: its
+/// revision with what it names and how it was chosen. A dropped edition
+/// chosen again starts at revision 1, so the revision alone could match one
+/// seen before the drop.
+pub(super) fn identity_token(identity: Option<&Identity>) -> String {
+    identity.map_or_else(
+        || "0".to_owned(),
+        |found| {
+            format!(
+                "{}:{}:{}:{}:{}",
+                found.row_revision,
+                found.decision_source.as_str(),
+                found.release_group_mbid,
+                found.release_mbid.as_deref().unwrap_or_default(),
+                u8::from(found.custom)
+            )
+        },
+    )
+}
+
 pub(super) fn album_title(conn: &Connection, album_id: &str) -> rusqlite::Result<String> {
     Ok(conn
         .query_row(
-            "SELECT title FROM local_albums WHERE id = ?1",
+            crate::corrections::sql::ALBUM_TITLE.text(),
             params![album_id],
             |row| row.get(0),
         )
@@ -389,8 +407,7 @@ pub(crate) fn open_review(
         .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
     let now_ms = crate::clock::ms(now);
     tx.execute(
-        "INSERT INTO library_identify_reviews (id, local_album_id, reason_code, candidates_json, \
-         state, created_ms, updated_ms) VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?5)",
+        crate::corrections::sql::OPEN_REVIEW.text(),
         params![
             uuid::Uuid::new_v4().to_string(),
             album_id,
@@ -399,17 +416,13 @@ pub(crate) fn open_review(
             now_ms
         ],
     )?;
-    Ok(())
+    crate::identify::sqlite::bump_identification_stream(tx)
 }
 
 fn album_tracks(tx: &Transaction<'_>, album_id: &str) -> rusqlite::Result<Vec<String>> {
-    tx.prepare("SELECT id FROM local_tracks WHERE local_album_id = ?1")?
+    tx.prepare(crate::corrections::sql::ALBUM_TRACKS.text())?
         .query_map(params![album_id], |row| row.get(0))?
         .collect()
-}
-
-pub(super) fn placeholders(n: usize) -> String {
-    vec!["?"; n.max(1)].join(",")
 }
 
 #[cfg(test)]
@@ -421,7 +434,7 @@ mod tests {
             album_id: album.to_owned(),
             release_group_mbid: "rg".to_owned(),
             release_mbid: Some(release.to_owned()),
-            decision_source: source.to_owned(),
+            decision_source: DecisionSource::parse(source).expect("a decision source"),
             row_revision: 1,
             custom: false,
         }

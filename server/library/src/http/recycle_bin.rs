@@ -4,7 +4,7 @@
 //! run of the bin's expiry with no retention. Put back is the album's
 //! removal route.
 
-use crate::manage::Publishing;
+use crate::publish::session::Publishing;
 use axum::{Json, extract::State, http::StatusCode};
 use droppedneedle_auth::Admin;
 use droppedneedle_kernel::error::{ApiError, Unavailable};
@@ -17,7 +17,7 @@ use utoipa::{IntoParams, ToSchema};
 use super::blocking;
 use crate::publish::PublishError;
 use crate::publish::bin_contents::{self, BinGroup, BinKind};
-use crate::recycle_bin::{self, Emptied, EmptyingState};
+use crate::removal::recycle_bin::{self, Emptied, EmptyingState};
 use crate::wiring::LibraryServices;
 
 /// Recycle bin routes.
@@ -153,9 +153,9 @@ pub async fn list_recycle_bin(
     let paging = PageRequest::read(query.limit, query.cursor.as_deref(), 50, 100)?;
     let retention_days = state
         .settings
-        .download_policy
+        .management
         .read()
-        .map(|policy| policy.recycle_retention_days.max(0));
+        .map(|management| management.recycle_retention_days);
     let (page, bins_known) = blocking(move || {
         let sandbox = state.expiry_sandbox();
         bin_contents::page(&state.db, sandbox.as_ref(), paging.after, paging.limit)
@@ -286,7 +286,7 @@ pub async fn empty_recycle_bin(
         if state.core.switched_off() {
             return Err(super::error::refused(
                 StatusCode::CONFLICT,
-                crate::mutations::LIBRARY_OFF,
+                crate::removal::LIBRARY_OFF,
             ));
         }
         recycle_bin::request_empty(&state, body.before, &actor).map_err(|error| {

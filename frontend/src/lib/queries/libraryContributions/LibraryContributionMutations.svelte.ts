@@ -1,3 +1,4 @@
+import { v3 } from '$lib/api/v3/endpoint';
 import {
 	applyEffects,
 	catalogChanged,
@@ -8,7 +9,6 @@ import {
 import { goto } from '$app/navigation';
 import { withBasePath } from '$lib/utils/basePath';
 import { api } from '$lib/api/client';
-import { LibraryContributionApi, asLibraryContribution } from './LibraryContributionApi';
 import type { components } from '$lib/api/v3/openapi';
 import { authStore } from '$lib/stores/authStore.svelte';
 import { toastStore } from '$lib/stores/toast';
@@ -22,7 +22,7 @@ import { LibraryContributionQueryKeyFactory } from './LibraryContributionQueryKe
 const saveContribution = (record: components['schemas']['ContributionRecord']): Promise<void> =>
 	setQueryDataWithPersister(
 		LibraryContributionQueryKeyFactory.detail(authStore.user?.id, record.id),
-		asLibraryContribution(record)
+		record
 	);
 
 const contributions = () => [contributionsChanged(authStore.user?.id)];
@@ -51,7 +51,8 @@ const refreshAfterMutationError = async (
 export const createLibraryContributionMutation = () =>
 	createAppMutation(() => ({
 		effects: contributions,
-		mutationFn: (albumId: string) => api.v3.POST(LibraryContributionApi.create(albumId)),
+		mutationFn: (albumId: string) =>
+			api.v3.POST(v3('/api/v3/library/albums/{id}/contributions', { path: { id: albumId } })),
 		onSuccess: async (contribution) => {
 			await saveContribution(contribution);
 			toastStore.show({ message: 'Contribution draft ready', type: 'success' });
@@ -64,7 +65,7 @@ export const createLibraryContributionMutation = () =>
 			})
 	}));
 
-export const updateLibraryContributionMutation = () =>
+export const createUpdateLibraryContributionMutation = () =>
 	createAppMutation(() => ({
 		effects: contributions,
 		mutationFn: (input: {
@@ -72,10 +73,13 @@ export const updateLibraryContributionMutation = () =>
 			expectedRowRevision: number;
 			draft: ReleaseDraft;
 		}) =>
-			api.v3.PUT(LibraryContributionApi.draft(input.contributionId), {
-				expected_row_revision: input.expectedRowRevision,
-				draft: input.draft
-			}),
+			api.v3.PUT(
+				v3('/api/v3/library/contributions/{id}/draft', { path: { id: input.contributionId } }),
+				{
+					expected_row_revision: input.expectedRowRevision,
+					draft: input.draft
+				}
+			),
 		onSuccess: async (contribution) => {
 			await saveContribution(contribution);
 			toastStore.show({ message: 'Draft saved', type: 'success' });
@@ -94,8 +98,8 @@ const revisionMutation = (
 		mutationFn: (input: { contributionId: string; expectedRowRevision: number }) => {
 			const url =
 				action === 'rebuild'
-					? LibraryContributionApi.rebuild(input.contributionId)
-					: LibraryContributionApi.cancel(input.contributionId);
+					? v3('/api/v3/library/contributions/{id}/rebuild', { path: { id: input.contributionId } })
+					: v3('/api/v3/library/contributions/{id}/cancel', { path: { id: input.contributionId } });
 			return api.v3.POST(url, {
 				expected_row_revision: input.expectedRowRevision
 			});
@@ -113,24 +117,29 @@ const revisionMutation = (
 			refreshAfterMutationError(input.contributionId, errorMessage, error)
 	}));
 
-export const rebuildLibraryContributionMutation = () =>
+export const createRebuildLibraryContributionMutation = () =>
 	revisionMutation('rebuild', 'Draft rebuilt from the current album', "Couldn't rebuild the draft");
 
-export const cancelLibraryContributionMutation = () =>
+export const createCancelLibraryContributionMutation = () =>
 	revisionMutation('cancel', 'Contribution cancelled', "Couldn't cancel the contribution");
 
-export const searchDiscogsReleasesMutation = () =>
+export const createSearchDiscogsReleasesMutation = () =>
 	createAppMutation(() => ({
 		effects: () => [],
 		mutationFn: (input: { contributionId: string; query: string }) =>
-			api.v3.POST(LibraryContributionApi.searchDiscogs(input.contributionId), {
-				query: input.query || null
-			}),
+			api.v3.POST(
+				v3('/api/v3/library/contributions/{id}/discogs/search', {
+					path: { id: input.contributionId }
+				}),
+				{
+					query: input.query || null
+				}
+			),
 		onError: (error) =>
 			toastStore.show({ message: failureMessage("Couldn't search Discogs", error), type: 'error' })
 	}));
 
-export const selectDiscogsReleaseMutation = () =>
+export const createSelectDiscogsReleaseMutation = () =>
 	createAppMutation(() => ({
 		effects: contributions,
 		mutationFn: (input: {
@@ -138,10 +147,15 @@ export const selectDiscogsReleaseMutation = () =>
 			expectedRowRevision: number;
 			releaseIdOrUrl: string;
 		}) =>
-			api.v3.POST(LibraryContributionApi.selectDiscogs(input.contributionId), {
-				expected_row_revision: input.expectedRowRevision,
-				release_id_or_url: input.releaseIdOrUrl
-			}),
+			api.v3.POST(
+				v3('/api/v3/library/contributions/{id}/discogs/select', {
+					path: { id: input.contributionId }
+				}),
+				{
+					expected_row_revision: input.expectedRowRevision,
+					release_id_or_url: input.releaseIdOrUrl
+				}
+			),
 		onSuccess: async (contribution) => {
 			await saveContribution(contribution);
 			toastStore.show({ message: 'Discogs release selected', type: 'success' });
@@ -150,13 +164,18 @@ export const selectDiscogsReleaseMutation = () =>
 			refreshAfterMutationError(input.contributionId, "Couldn't select that Discogs release", error)
 	}));
 
-export const removeDiscogsReleaseMutation = () =>
+export const createRemoveDiscogsReleaseMutation = () =>
 	createAppMutation(() => ({
 		effects: contributions,
 		mutationFn: (input: { contributionId: string; expectedRowRevision: number }) =>
-			api.v3.POST(LibraryContributionApi.removeDiscogs(input.contributionId), {
-				expected_row_revision: input.expectedRowRevision
-			}),
+			api.v3.POST(
+				v3('/api/v3/library/contributions/{id}/discogs/remove', {
+					path: { id: input.contributionId }
+				}),
+				{
+					expected_row_revision: input.expectedRowRevision
+				}
+			),
 		onSuccess: async (contribution) => {
 			await saveContribution(contribution);
 			toastStore.show({ message: 'Discogs source removed', type: 'success' });
@@ -165,7 +184,7 @@ export const removeDiscogsReleaseMutation = () =>
 			refreshAfterMutationError(input.contributionId, "Couldn't remove the Discogs source", error)
 	}));
 
-export const checkMusicBrainzDuplicatesMutation = () =>
+export const createCheckMusicBrainzDuplicatesMutation = () =>
 	createAppMutation(() => ({
 		effects: contributions,
 		mutationFn: (input: {
@@ -173,10 +192,15 @@ export const checkMusicBrainzDuplicatesMutation = () =>
 			expectedRowRevision: number;
 			differentEditionConfirmed: boolean;
 		}) =>
-			api.v3.POST(LibraryContributionApi.checkDuplicates(input.contributionId), {
-				expected_row_revision: input.expectedRowRevision,
-				different_edition_confirmed: input.differentEditionConfirmed
-			}),
+			api.v3.POST(
+				v3('/api/v3/library/contributions/{id}/musicbrainz/duplicates', {
+					path: { id: input.contributionId }
+				}),
+				{
+					expected_row_revision: input.expectedRowRevision,
+					different_edition_confirmed: input.differentEditionConfirmed
+				}
+			),
 		onSuccess: async (contribution) => {
 			await saveContribution(contribution);
 			toastStore.show({ message: 'MusicBrainz check complete', type: 'success' });
@@ -189,17 +213,22 @@ export const checkMusicBrainzDuplicatesMutation = () =>
 			)
 	}));
 
-export const attachExistingMusicBrainzReleaseMutation = () =>
+export const createAttachExistingMusicBrainzReleaseMutation = () =>
 	createAppMutation(() => ({
 		mutationFn: (input: {
 			contributionId: string;
 			expectedRowRevision: number;
 			releaseMbid: string;
 		}) =>
-			api.v3.POST(LibraryContributionApi.attachRelease(input.contributionId), {
-				expected_row_revision: input.expectedRowRevision,
-				release_mbid: input.releaseMbid
-			}),
+			api.v3.POST(
+				v3('/api/v3/library/contributions/{id}/musicbrainz/attach', {
+					path: { id: input.contributionId }
+				}),
+				{
+					expected_row_revision: input.expectedRowRevision,
+					release_mbid: input.releaseMbid
+				}
+			),
 		onSuccess: async (contribution) => {
 			await saveContribution(contribution);
 			toastStore.show({ message: 'Album linked to MusicBrainz', type: 'success' });
@@ -216,15 +245,20 @@ export const attachExistingMusicBrainzReleaseMutation = () =>
 export const createMusicBrainzSeedMutation = () =>
 	createAppMutation(() => ({
 		mutationFn: (input: { contributionId: string; expectedRowRevision: number }) =>
-			api.v3.POST(LibraryContributionApi.seed(input.contributionId), {
-				expected_row_revision: input.expectedRowRevision
-			}),
+			api.v3.POST(
+				v3('/api/v3/library/contributions/{id}/musicbrainz/seed', {
+					path: { id: input.contributionId }
+				}),
+				{
+					expected_row_revision: input.expectedRowRevision
+				}
+			),
 		effects: (_seed, input) => [contributionChanged(authStore.user?.id, input.contributionId)],
 		onError: async (error, input) =>
 			refreshAfterMutationError(input.contributionId, "Couldn't open the MusicBrainz editor", error)
 	}));
 
-export const recordMusicBrainzResultMutation = () =>
+export const createRecordMusicBrainzResultMutation = () =>
 	createAppMutation(() => ({
 		effects: contributions,
 		mutationFn: (input: {
@@ -233,11 +267,16 @@ export const recordMusicBrainzResultMutation = () =>
 			releaseIdOrUrl: string;
 			replaceExistingResult: boolean;
 		}) =>
-			api.v3.PUT(LibraryContributionApi.recordResult(input.contributionId), {
-				expected_row_revision: input.expectedRowRevision,
-				release_id_or_url: input.releaseIdOrUrl,
-				replace_existing_result: input.replaceExistingResult
-			}),
+			api.v3.PUT(
+				v3('/api/v3/library/contributions/{id}/musicbrainz/result', {
+					path: { id: input.contributionId }
+				}),
+				{
+					expected_row_revision: input.expectedRowRevision,
+					release_id_or_url: input.releaseIdOrUrl,
+					replace_existing_result: input.replaceExistingResult
+				}
+			),
 		onSuccess: async (contribution) => {
 			await saveContribution(contribution);
 			toastStore.show({ message: 'MusicBrainz result queued for verification', type: 'success' });
@@ -250,13 +289,18 @@ export const recordMusicBrainzResultMutation = () =>
 			)
 	}));
 
-export const retryMusicBrainzVerificationMutation = () =>
+export const createRetryMusicBrainzVerificationMutation = () =>
 	createAppMutation(() => ({
 		effects: contributions,
 		mutationFn: (input: { contributionId: string; expectedRowRevision: number }) =>
-			api.v3.POST(LibraryContributionApi.retryVerification(input.contributionId), {
-				expected_row_revision: input.expectedRowRevision
-			}),
+			api.v3.POST(
+				v3('/api/v3/library/contributions/{id}/musicbrainz/verify', {
+					path: { id: input.contributionId }
+				}),
+				{
+					expected_row_revision: input.expectedRowRevision
+				}
+			),
 		onSuccess: async (contribution) => {
 			await saveContribution(contribution);
 			toastStore.show({ message: 'Verification queued again', type: 'success' });

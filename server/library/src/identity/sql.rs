@@ -1,6 +1,10 @@
 //! The identity commands' statements, and the two sets of decision
 //! sources every other statement takes from here.
 
+use droppedneedle_kernel::db::time::Millis;
+
+use super::DecisionSource;
+
 droppedneedle_kernel::sql! {
     /// Decision sources automatic work may replace: identification's own
     /// rows and ids the tags carried. Checked against
@@ -214,31 +218,20 @@ droppedneedle_kernel::sql! {
              reason_code = excluded.reason_code, created_at = excluded.created_at, \
              consumed_at = NULL, consumed_action_id = NULL";
 
-    /// The copy the library shows for one release group (`?1`, lowercase;
-    /// provider `?2`): a copy with files first, then one picked by hand
-    /// (`manual`), then the oldest, over live albums. Its release may be
-    /// NULL. The unary plus keeps the planner off the retired-album index,
-    /// as the catalog's album reads do.
-    pub(super) COPY_SHOWN = "SELECT e.release_mbid, e.decision_source, \
+    /// The copy of one release group (`?1`, lowercase; provider `?2`) the
+    /// library shows and acquisition follows: a copy with files first, then
+    /// one picked by hand (`manual`), then the oldest, over live albums. Its
+    /// release may be NULL. The unary plus keeps the planner off the
+    /// retired-album index, as the catalog's album reads do.
+    pub(super) COPY_SHOWN = "SELECT e.local_album_id, e.release_mbid, e.decision_source, \
              (SELECT COUNT(*) FROM local_tracks t WHERE t.local_album_id = b.id \
-              AND t.availability = 'indexed') \
+              AND t.availability = 'indexed') AS file_count \
              FROM local_album_external_identities e \
              JOIN local_albums b ON b.id = e.local_album_id \
              WHERE lower(e.release_group_mbid) = ?1 AND e.provider = ?2 \
              AND +b.retired_into_album_id IS NULL \
-             ORDER BY b.has_indexed_track DESC, e.decision_source <> 'manual', b.created_at \
-             LIMIT 1";
-    /// The copy acquisition fetches for one release group (`?1`, lowercase;
-    /// provider `?2`): the first live copy that names a release, in the
-    /// order of `COPY_SHOWN`.
-    pub(super) COPY_WITH_RELEASE = "SELECT e.release_mbid, e.decision_source, \
-             (SELECT COUNT(*) FROM local_tracks t WHERE t.local_album_id = b.id \
-              AND t.availability = 'indexed') \
-             FROM local_album_external_identities e \
-             JOIN local_albums b ON b.id = e.local_album_id \
-             WHERE b.retired_into_album_id IS NULL AND e.provider = ?2 \
-             AND lower(e.release_group_mbid) = ?1 AND e.release_mbid IS NOT NULL \
-             ORDER BY e.decision_source <> 'manual', b.created_at LIMIT 1";
+             ORDER BY b.has_indexed_track DESC, e.decision_source <> 'manual', b.created_at, \
+             b.id LIMIT 1";
 
     // -----------------------------------------------------------------
     // Reads.
@@ -286,14 +279,18 @@ droppedneedle_kernel::sql! {
              AND trim(COALESCE(i.release_track_mbid, '')) <> '' ORDER BY t.id";
     /// The album's (`?1`) files whose match by hand stands, with the
     /// release track each holds (provider `?2`). The row the hand match
-    /// wrote is `manual`, so only such a row stands for it.
+    /// wrote is `manual`, so only such a row stands for it, and only on
+    /// the album's current release.
     pub(super) HAND_MATCHES_STANDING = "SELECT h.local_track_id, i.release_track_mbid \
              FROM library_track_hand_matches h \
              JOIN " + ALBUM_TRACKS + " ON t.id = h.local_track_id \
              JOIN local_track_external_identities i \
              ON i.local_track_id = h.local_track_id AND i.provider = ?2 \
+             JOIN local_album_external_identities a \
+             ON a.local_album_id = ?1 AND a.provider = ?2 \
              WHERE t.local_album_id = ?1 AND t.availability = 'indexed' \
              AND i.decision_source = 'manual' AND lower(i.release_mbid) = lower(h.release_mbid) \
+             AND lower(h.release_mbid) = lower(a.release_mbid) \
              AND lower(i.release_track_mbid) = lower(h.release_track_mbid) \
              ORDER BY h.local_track_id";
     /// The revisions an automatic-edition undo of the album (`?1`,
@@ -359,6 +356,11 @@ droppedneedle_kernel::sql! {
              SET expected_identity_revision = ?3, \
              prior_hold_json = json_set(prior_hold_json, '$.carried', json('false')) \
              WHERE local_album_id = ?1 AND expected_identity_revision = ?2 AND " + CARRIED;
+    /// Key the album's (`?1`) carried undo still at revision `?2` to `?3`,
+    /// keeping its mark.
+    pub(super) KEEP_CARRIED_CHOICE_UNDO = "UPDATE library_edition_choice_undo \
+             SET expected_identity_revision = ?3 \
+             WHERE local_album_id = ?1 AND expected_identity_revision = ?2 AND " + CARRIED;
     /// Forget the album's (`?1`) choice undo unless it is carried and at
     /// revision `?2`.
     pub(super) FORGET_UNCARRIED_CHOICE_UNDO = "DELETE FROM library_edition_choice_undo \
@@ -382,13 +384,13 @@ droppedneedle_kernel::sql! {
     pub(super) DELETE_EXCLUSION =
         "DELETE FROM library_management_exclusions WHERE local_album_id = ?1";
     /// Put back the album's (`?1`) "leave unmanaged" (reason `?2`, by `?3`
-    /// or else the one undoing, `?5`, at `?4`).
+    /// or else the one undoing, `?5`, at `?4`), with no name when neither is
+    /// an account. `WHERE true` is what lets SQLite parse the upsert.
     pub(super) RESTORE_EXCLUSION = "INSERT INTO library_management_exclusions (local_album_id, \
              reason, excluded_by_user_id, excluded_at, row_revision) \
              SELECT ?1, ?2, chooser, ?4, 1 FROM (SELECT COALESCE( \
              (SELECT id FROM auth_users WHERE id = ?3), \
-             (SELECT id FROM auth_users WHERE id = ?5)) AS chooser) \
-             WHERE chooser IS NOT NULL \
+             (SELECT id FROM auth_users WHERE id = ?5)) AS chooser) WHERE true \
              ON CONFLICT (local_album_id) DO UPDATE SET reason = excluded.reason, \
              excluded_by_user_id = excluded.excluded_by_user_id, \
              excluded_at = excluded.excluded_at, row_revision = row_revision + 1";
@@ -408,7 +410,7 @@ droppedneedle_kernel::sql! {
              VALUES (?1, ?2, (SELECT id FROM auth_users WHERE id = ?3), ?4, ?5) \
              ON CONFLICT (local_album_id) DO UPDATE SET release_mbid = excluded.release_mbid, \
              chosen_by_user_id = excluded.chosen_by_user_id, queued_at = excluded.queued_at, \
-             attempts = 0, not_before = 0, last_code = NULL, origin = excluded.origin";
+             attempts = 0, not_before_at = 0, last_code = NULL, origin = excluded.origin";
     pub(super) PUT_MATCH_STATE = "INSERT INTO library_album_match_state (local_album_id, \
              state, reason_code, release_mbid, candidates_json, updated_at) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)";
@@ -612,7 +614,8 @@ droppedneedle_kernel::sql! {
 
     /// The album (`?1`) as a manifest freezes it, with its artist's match
     /// when a person chose it (provider `?2`).
-    pub(super) CUSTOM_ALBUM_FACTS = "SELECT a.title, COALESCE(a.album_artist_name, ''), \
+    pub(super) CUSTOM_ALBUM_FACTS = "SELECT a.title, \
+             COALESCE(a.album_artist_name, '') AS album_artist_name, \
              i.provider_artist_id, a.album_artist_sort_name, a.year, a.original_release_date, \
              a.primary_genre, a.is_compilation, a.row_revision FROM local_albums a \
              LEFT JOIN local_artist_external_identities i \
@@ -625,7 +628,8 @@ droppedneedle_kernel::sql! {
     pub(super) NEXT_MANIFEST_VERSION = "SELECT COALESCE(MAX(version), 0) + 1 \
              FROM library_custom_edition_manifests WHERE local_album_id = ?1";
     pub(super) MANIFEST_TRACKS = "SELECT id, row_revision, stat_revision, \
-             COALESCE(tag_revision, ''), title, COALESCE(artist_name, ''), album_title, \
+             COALESCE(tag_revision, '') AS tag_revision, title, \
+             COALESCE(artist_name, '') AS artist_name, album_title, \
              disc_number, track_number, embedded_artist_mbid, file_format, duration_seconds, \
              album_artist_name, year, genre, title_sort, artist_sort, album_sort, \
              album_artist_sort, disc_subtitle, is_compilation \
@@ -651,7 +655,7 @@ droppedneedle_kernel::sql! {
     // -----------------------------------------------------------------
 
     pub(super) NEXT_REMAP = "SELECT local_album_id, release_mbid, chosen_by_user_id, attempts, \
-             origin FROM library_edition_remap_queue WHERE not_before <= ?1 \
+             origin FROM library_edition_remap_queue WHERE not_before_at <= ?1 \
              ORDER BY queued_at, local_album_id LIMIT 1";
     pub(super) REMAP_ASK = "SELECT release_mbid, origin FROM library_edition_remap_queue \
              WHERE local_album_id = ?1";
@@ -661,7 +665,7 @@ droppedneedle_kernel::sql! {
              WHERE local_album_id = ?1 AND provider = ?2 AND decision_source IN " + PERSONS
              + " AND lower(release_mbid) = lower(?3))";
     pub(super) RETRY_REMAP = "UPDATE library_edition_remap_queue SET attempts = attempts + 1, \
-             not_before = ?2, last_code = ?3 WHERE local_album_id = ?1";
+             not_before_at = ?2, last_code = ?3 WHERE local_album_id = ?1";
     /// Hand the remap's own sealed row (`?1`, release `?4`, provider `?3`)
     /// back to automatic choice at `?2`. Only a row this app sealed as a
     /// person's (`manual`) goes back; a v2 choice is never handed back.
@@ -683,10 +687,10 @@ droppedneedle_kernel::sql! {
              updated_at = excluded.updated_at";
     pub(super) QUEUE_REMAP = "INSERT INTO library_edition_remap_queue (local_album_id, \
              release_mbid, chosen_by_user_id, queued_at, origin) \
-             VALUES (?1, lower(?2), ?3, ?4, ?5) \
+             VALUES (?1, lower(?2), (SELECT id FROM auth_users WHERE id = ?3), ?4, ?5) \
              ON CONFLICT (local_album_id) DO UPDATE SET release_mbid = excluded.release_mbid, \
              chosen_by_user_id = excluded.chosen_by_user_id, queued_at = excluded.queued_at, \
-             attempts = 0, not_before = 0, last_code = NULL, origin = excluded.origin";
+             attempts = 0, not_before_at = 0, last_code = NULL, origin = excluded.origin";
     /// The release a person's match of the album (`?1`, provider `?2`)
     /// names, while no custom edition is active on it.
     pub(super) PLACEMENT_RELEASE = "SELECT lower(release_mbid) \
@@ -735,7 +739,7 @@ droppedneedle_kernel::sql! {
     /// Close the album's (`?1`) waiting reviews as dismissed by nobody, at
     /// `?2` ms.
     pub(super) DISMISS_PENDING_REVIEWS = "UPDATE library_identify_reviews \
-             SET state = 'dismissed', resolved_by_user_id = NULL, updated_ms = ?2 \
+             SET state = 'dismissed', resolved_by_user_id = NULL, updated_at = ?2 \
              WHERE local_album_id = ?1 AND state = 'pending'";
     pub(super) REMAP_TO_CARRY = "SELECT release_mbid, chosen_by_user_id, origin \
              FROM library_edition_remap_queue WHERE local_album_id = ?1";
@@ -872,4 +876,156 @@ droppedneedle_kernel::sql! {
              JOIN local_track_external_identities i \
              ON i.local_track_id = t.id AND i.provider = ?2 \
              WHERE t.local_album_id = ?1 AND t.availability = 'indexed' ORDER BY t.id";
+
+    // -----------------------------------------------------------------
+    // What the reads answer.
+    // -----------------------------------------------------------------
+
+    pub(super) row AlbumIdentityRow for [ALBUM_IDENTITY] {
+        release_group_mbid: String,
+        release_mbid: Option<String>,
+        decision_source: DecisionSource,
+        row_revision: i64,
+    }
+    pub(super) row TrackIdentityRow for [TRACK_IDENTITY] {
+        recording_mbid: String,
+        release_track_mbid: Option<String>,
+        decision_source: DecisionSource,
+        row_revision: i64,
+    }
+    pub(super) row PriorAlbumRow for [ALBUM_ROW] {
+        release_group_mbid: Option<String>,
+        release_mbid: Option<String>,
+        decision_source: Option<DecisionSource>,
+        matcher_version: Option<String>,
+        attempt_id: Option<String>,
+        selected_by_user_id: Option<String>,
+        selected_at: Option<Millis>,
+        row_revision: Option<i64>,
+    }
+    pub(super) row PriorTrackRow for [TRACK_ROWS, TRACK_ROW] {
+        local_track_id: String,
+        recording_mbid: Option<String>,
+        release_mbid: Option<String>,
+        release_track_mbid: Option<String>,
+        medium_position: Option<i64>,
+        release_track_position: Option<i64>,
+        decision_source: Option<DecisionSource>,
+        attempt_id: Option<String>,
+        selected_at: Option<Millis>,
+    }
+    pub(super) row AlbumHashRow for [ALBUM_HASH_ROW] {
+        release_group_mbid: String,
+        release_mbid: Option<String>,
+        decision_source: DecisionSource,
+        row_revision: i64,
+    }
+    pub(super) row TrackHashRow for [TRACK_HASH_ROWS] {
+        id: String,
+        recording_mbid: String,
+        release_mbid: Option<String>,
+        release_track_mbid: Option<String>,
+        medium_position: Option<i64>,
+        release_track_position: Option<i64>,
+        decision_source: DecisionSource,
+        row_revision: i64,
+    }
+    pub(super) row HandMatchStanding for [HAND_MATCHES_STANDING] {
+        local_track_id: String,
+        release_track_mbid: String,
+    }
+    pub(super) row LiveAutomaticUndo for [LIVE_AUTOMATIC_UNDO] {
+        expected_post_album_revision: i64,
+        expected_post_identity_revision: i64,
+    }
+    pub(super) row CopyRow for [COPY_SHOWN] {
+        local_album_id: String,
+        release_mbid: Option<String>,
+        decision_source: DecisionSource,
+        file_count: i64,
+    }
+    pub(super) row CustomAlbumFacts for [CUSTOM_ALBUM_FACTS] {
+        title: String,
+        album_artist_name: String,
+        provider_artist_id: Option<String>,
+        album_artist_sort_name: Option<String>,
+        year: Option<i64>,
+        original_release_date: Option<String>,
+        primary_genre: Option<String>,
+        is_compilation: bool,
+        row_revision: i64,
+    }
+    pub(super) row TrackRecordingRevision for [TRACK_RECORDING_REVISION] {
+        recording_mbid: String,
+        row_revision: i64,
+    }
+    pub(super) row ManifestTrackRow for [MANIFEST_TRACKS] {
+        id: String,
+        row_revision: i64,
+        stat_revision: String,
+        tag_revision: String,
+        title: String,
+        artist_name: String,
+        album_title: String,
+        disc_number: i64,
+        track_number: i64,
+        embedded_artist_mbid: Option<String>,
+        file_format: String,
+        duration_seconds: Option<f64>,
+        album_artist_name: Option<String>,
+        year: Option<i64>,
+        genre: Option<String>,
+        title_sort: Option<String>,
+        artist_sort: Option<String>,
+        album_sort: Option<String>,
+        album_artist_sort: Option<String>,
+        disc_subtitle: Option<String>,
+        is_compilation: bool,
+    }
+    pub(super) row StoredExclusion for [EXCLUSION_ROW] {
+        reason: String,
+        excluded_by_user_id: Option<String>,
+        excluded_at: Millis,
+        row_revision: i64,
+    }
+    pub(super) row StoredRemap for [REMAP_ROW] {
+        release_mbid: String,
+        chosen_by_user_id: Option<String>,
+        origin: String,
+        queued_at: Millis,
+    }
+    pub(super) row StoredHandMatch for [ALBUM_HAND_MATCHES] {
+        local_track_id: String,
+        release_mbid: String,
+        release_track_mbid: String,
+        prior_identity_json: Option<String>,
+        matched_by_user_id: Option<String>,
+        matched_at: i64,
+    }
+    pub(super) row StoredMatchState for [MATCH_STATE_ROW] {
+        state: String,
+        reason_code: String,
+        release_mbid: Option<String>,
+        candidates_json: String,
+        updated_at: Millis,
+    }
+    pub(super) row ChoiceUndoAt for [CHOICE_UNDO_AT] {
+        id: String,
+        prior_match_state_json: Option<String>,
+    }
+    pub(super) row ChoiceUndoRow for [CHOICE_UNDO] {
+        id: String,
+        prior_identity_json: Option<String>,
+        prior_tracks_json: String,
+        prior_match_state_json: Option<String>,
+        expected_identity_revision: i64,
+        prior_hold_json: Option<String>,
+    }
+    pub(super) row AutomaticUndoRow for [AUTOMATIC_UNDO] {
+        id: String,
+        prior_identity_json: Option<String>,
+        prior_track_identities_json: String,
+        expected_post_album_revision: i64,
+        expected_post_identity_revision: i64,
+    }
 }

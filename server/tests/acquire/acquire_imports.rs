@@ -2,8 +2,7 @@
 //!
 //! Coverage of the Lidarr read-only import (monitored artists
 //! become follows), the Spotify OAuth/playlist import plus settings rows,
-//! the Spotify import jobs, and the acquisition health smoke with
-//! its independent per-source release gates. Every test runs against the
+//! the Spotify import jobs, and the download client status. Every test runs against the
 //! in-repo loopback mocks or scripted probes; nothing touches a live
 //! Lidarr, Spotify, slskd, SABnzbd, or indexer. The Spotify import runs on
 //! the production stores over the rig's database and settings.
@@ -24,15 +23,16 @@ use droppedneedle_acquire::downloads::journal::Journal;
 use droppedneedle_acquire::downloads::worker::SourceList;
 use droppedneedle_acquire::downloads::worker::WorkerSettings;
 use droppedneedle_acquire::follows::Follows;
+use droppedneedle_acquire::imports::jobs::ImportState;
 use droppedneedle_acquire::probes::{LiveProbes, ProbeCache, refresh_probes};
 use droppedneedle_acquire::readiness::SourceReadiness;
 use droppedneedle_acquire::settings::{ConfigLidarrSettings, ConfigSpotifySettings};
 use droppedneedle_acquire::target::Targets;
 use droppedneedle_acquire::wiring::ClientLives;
 use droppedneedle_auth::users::roles::{Role, SessionKind};
-use droppedneedle_catalog::reads::collections::db::CollectionsDb;
-use droppedneedle_catalog::reads::collections::models::PlaylistTrack;
-use droppedneedle_catalog::reads::collections::store::PlaylistStore;
+use droppedneedle_catalog::collections::db::CollectionsDb;
+use droppedneedle_catalog::collections::models::PlaylistTrack;
+use droppedneedle_catalog::collections::store::PlaylistStore;
 use droppedneedle_kernel::jobs::queue::{Handlers, JobQueue, State, start_runners};
 use droppedneedle_kernel::runtime_config::secret_sections::SpotifySettings as SpotifySection;
 use droppedneedle_kernel::runtime_config::secret_sections::{
@@ -175,6 +175,7 @@ fn rig_with(
     let journal = Arc::new(Journal::new(db, quiet_ticks()));
     let clients = Arc::new(LiveClients::new(
         platform.http.shared().clone(),
+        droppedneedle_providers::Providers::closed().newznab,
         ClientLives::new(&platform.settings),
         platform.config.slskd_downloads_path.clone(),
         journal.clone(),
@@ -196,10 +197,6 @@ fn rig_with(
         resolver,
         spotify_imports,
         probes: Arc::new(LiveProbes::bundle(&probes)),
-        readiness: SourceReadiness::new(
-            SourceList::Live(worker_settings.clone()),
-            probe_cache.clone(),
-        ),
         ids: Arc::new(FixedIdGenerator),
         base_path: String::new(),
         trusted_proxies: Default::default(),
@@ -743,16 +740,17 @@ async fn link_spotify_via(
     );
 }
 
-async fn poll_job_done(deps: ImportsDeps, user_id: &str, spotify_id: &str) -> Value {
+/// The import's state once it stops running.
+async fn poll_job_done(deps: ImportsDeps, user_id: &str, spotify_id: &str) -> ImportState {
     for _ in 0..500 {
-        let (status, body) = get_json(
-            authed_app(deps.clone(), user_id, Role::User),
-            &format!("/api/v3/acquire/spotify/jobs/{spotify_id}"),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        if body["state"] != "running" {
-            return body;
+        let state = deps
+            .spotify_imports
+            .state(user_id, spotify_id)
+            .await
+            .expect("job reads");
+        match state {
+            Some(ImportState::Running) | None => {}
+            Some(done) => return done,
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
@@ -1047,9 +1045,13 @@ async fn spotify_import_answers_fast_then_populates_two_tracks() {
         .to_owned();
 
     let done = poll_job_done(bundle.deps.clone(), &user_id, "sp-playlist-1").await;
-    assert_eq!(done["state"], "done");
-    assert_eq!(done["playlist_id"], playlist_id);
-    assert_eq!(done["track_count"], 2);
+    assert_eq!(done, ImportState::Done);
+    assert_eq!(
+        playlist_rows(&bundle.playlists, &user_id, &playlist_id)
+            .await
+            .len(),
+        2
+    );
 
     // The `is_local` row never lands. MusicBrainz proves the first album
     // by its track's ISRC, so it carries its release group. The second
@@ -1088,7 +1090,7 @@ async fn spotify_import_answers_fast_then_populates_two_tracks() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["playlist_id"], playlist_id);
     let done = poll_job_done(bundle.deps.clone(), &user_id, "sp-playlist-1").await;
-    assert_eq!(done["state"], "done");
+    assert_eq!(done, ImportState::Done);
     assert_eq!(
         playlist_rows(&bundle.playlists, &user_id, &playlist_id)
             .await
@@ -1133,15 +1135,40 @@ async fn unreadable_spotify_settings_refuse_an_import() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(body["error"]["code"], "INVALID_INPUT");
-    let (status, _) = get_json(
-        authed_app(deps, &user_id, Role::User),
-        "/api/v3/acquire/spotify/jobs/sp-playlist-1",
-    )
-    .await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
+    let state = deps
+        .spotify_imports
+        .state(&user_id, "sp-playlist-1")
+        .await
+        .expect("job reads");
+    assert_eq!(state, None);
     let after = recorder.snapshot();
     assert_eq!(after.spotify_paths, before.spotify_paths);
     assert_eq!(after.spotify_grants, before.spotify_grants);
+}
+
+/// A Spotify 429 on the playlist listing reaches the person as the honest
+/// wait, not a generic bad gateway.
+#[tokio::test]
+async fn a_rate_limited_playlist_listing_answers_the_wait() {
+    let (auth, admin_id, user_id) = seed_rig().await;
+    let (api, accounts, _covers, recorder) = serve_spotify().await.expect("mock serves");
+    let bundle = rig_for(&auth, &api.base_url, &accounts.base_url, None);
+    seed_spotify_app(bundle.deps.clone(), &admin_id).await;
+    link_spotify(bundle.deps.clone(), &recorder, &user_id).await;
+
+    recorder.limit_playlists();
+
+    let response = authed_app(bundle.deps.clone(), &user_id, Role::User)
+        .oneshot(
+            Request::get("/api/v3/acquire/spotify/playlists")
+                .header("host", "app.test")
+                .body(Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("router answers");
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.headers()["retry-after"], "7");
 }
 
 /// An import queued before the Spotify app settings stopped reading waits
@@ -1191,15 +1218,13 @@ async fn an_import_waits_for_unreadable_spotify_settings() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    let mut waiting = bundle.deps.clone();
-    waiting.spotify_settings = Arc::new(ConfigSpotifySettings::new(broken.clone()));
-    let (_, body) = get_json(
-        authed_app(waiting, &user_id, Role::User),
-        "/api/v3/acquire/spotify/jobs/sp-playlist-1",
-    )
-    .await;
-    assert_eq!(body["state"], "running");
-    assert_eq!(body["message"], "Spotify settings can't be read");
+    let state = bundle
+        .deps
+        .spotify_imports
+        .state(&user_id, "sp-playlist-1")
+        .await
+        .expect("job reads");
+    assert_eq!(state, Some(ImportState::Running));
 
     // A save wakes it: it goes back with its attempt returned, then runs.
     broken
@@ -1228,8 +1253,7 @@ async fn an_import_waits_for_unreadable_spotify_settings() {
     assert_eq!(requeued.attempts, 0);
     auth.clock.advance(10_000);
     let done = poll_job_done(bundle.deps.clone(), &user_id, "sp-playlist-1").await;
-    assert_eq!(done["state"], "done");
-    assert_eq!(done["track_count"], 2);
+    assert_eq!(done, ImportState::Done);
 }
 
 /// A re-import that fails while its tracks are written leaves the playlist
@@ -1261,7 +1285,7 @@ async fn spotify_failed_reimport_keeps_the_old_tracks() {
         .expect("playlist id")
         .to_owned();
     let done = poll_job_done(bundle.deps.clone(), &user_id, "sp-playlist-1").await;
-    assert_eq!(done["state"], "done");
+    assert_eq!(done, ImportState::Done);
     let before = track_ids(&bundle.playlists, &user_id, &playlist_id).await;
     assert_eq!(before.len(), 2);
 
@@ -1269,7 +1293,7 @@ async fn spotify_failed_reimport_keeps_the_old_tracks() {
     AcquireDb::new(auth.platform.db.clone(), auth.platform.clock.clone())
         .write("test.fail_second_track", |tx| {
             tx.execute(
-                "CREATE TRIGGER fail_second_track BEFORE INSERT ON playlist_tracks \
+                "CREATE TRIGGER fail_second_track BEFORE INSERT ON catalog_playlist_tracks \
                  WHEN NEW.track_name = 'Glass Tides' \
                  BEGIN SELECT RAISE(ABORT, 'injected'); END",
                 [],
@@ -1287,7 +1311,7 @@ async fn spotify_failed_reimport_keeps_the_old_tracks() {
     .await;
     assert_eq!(status, StatusCode::OK);
     let done = poll_job_done(bundle.deps.clone(), &user_id, "sp-playlist-1").await;
-    assert_eq!(done["state"], "error", "{done}");
+    assert!(matches!(done, ImportState::Error { .. }), "{done:?}");
     assert_eq!(
         track_ids(&bundle.playlists, &user_id, &playlist_id).await,
         before
@@ -1368,7 +1392,7 @@ async fn spotify_track_without_id_fails_the_import() {
         .to_owned();
 
     let done = poll_job_done(bundle.deps, &user_id, SPOTIFY_PLAYLIST_NO_TRACK_ID).await;
-    assert_eq!(done["state"], "error", "{done}");
+    assert!(matches!(done, ImportState::Error { .. }), "{done:?}");
     assert!(
         playlist_rows(&bundle.playlists, &user_id, &playlist_id)
             .await
@@ -1617,12 +1641,12 @@ async fn spotify_sqlite_stores_persist_and_expire() {
     );
     assert_eq!(links.get("u1").await.expect("store reads"), None);
 
-    let collections = droppedneedle_catalog::reads::collections::db::CollectionsDb::new(
+    let collections = droppedneedle_catalog::collections::db::CollectionsDb::new(
         db.db().clone(),
         db.clock().clone(),
     );
     let bridge = CollectionsPlaylistBridge::new(
-        droppedneedle_catalog::reads::collections::store::PlaylistStore::new(collections),
+        droppedneedle_catalog::collections::store::PlaylistStore::new(collections),
         db.clone(),
     );
     let id = bridge
@@ -1654,7 +1678,7 @@ async fn spotify_sqlite_stores_persist_and_expire() {
             .expect("replaces");
     }
     let rows: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM playlist_tracks WHERE playlist_id = ?1")
+        sqlx::query_scalar("SELECT COUNT(*) FROM catalog_playlist_tracks WHERE playlist_id = ?1")
             .bind(&id)
             .fetch_one(db.db().sqlx())
             .await
@@ -1666,21 +1690,12 @@ async fn spotify_sqlite_stores_persist_and_expire() {
     );
 }
 
-// --- Health smoke + per-source gate tests ---
+// --- Download client status and readiness tests ---
 
 async fn health_rig() -> (AuthRig, String, String, Rig) {
     let (auth, admin_id, user_id) = seed_rig().await;
     let bundle = rig_for(&auth, "http://127.0.0.1:1", "http://127.0.0.1:1", None);
     (auth, admin_id, user_id, bundle)
-}
-
-fn gate<'a>(body: &'a Value, source: &str) -> &'a Value {
-    body["gates"]
-        .as_array()
-        .expect("gates array")
-        .iter()
-        .find(|gate| gate["source"] == source)
-        .unwrap_or_else(|| panic!("{source} gate present"))
 }
 
 /// Save an enabled slskd connection at `url`.
@@ -1727,64 +1742,6 @@ async fn closed_url() -> String {
     let port = listener.local_addr().expect("addr").port();
     drop(listener);
     format!("http://127.0.0.1:{port}")
-}
-
-#[tokio::test]
-async fn health_smoke_is_not_ready_with_no_source() {
-    let (_auth, _, user_id, bundle) = health_rig().await;
-    bundle.refresh_probes().await;
-
-    let (status, body) = get_json(
-        authed_app(bundle.deps, &user_id, Role::User),
-        "/api/v3/acquire/health",
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["status"], "error");
-    assert_eq!(body["ready"], false);
-    assert_eq!(body["ready_via"], json!([]));
-    assert_eq!(gate(&body, "slskd")["open"], false);
-    assert_eq!(gate(&body, "sabnzbd")["open"], false);
-    assert_eq!(gate(&body, "newznab")["open"], false);
-    assert_eq!(gate(&body, "lidarr_import")["open"], false);
-}
-
-#[tokio::test]
-async fn slskd_gate_greens_independently() {
-    let (auth, _, user_id, bundle) = health_rig().await;
-    let slskd = MockSlskd::start().await.expect("mock slskd starts");
-    save_slskd(&auth, &slskd.base_url()).await;
-    bundle.refresh_probes().await;
-
-    let (status, body) = get_json(
-        authed_app(bundle.deps, &user_id, Role::User),
-        "/api/v3/acquire/health",
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(gate(&body, "slskd")["open"], true);
-    assert_eq!(gate(&body, "sabnzbd")["open"], false);
-    assert_eq!(gate(&body, "newznab")["open"], false);
-    assert_eq!(gate(&body, "lidarr_import")["open"], false);
-    assert_eq!(body["ready_via"], json!(["soulseek"]));
-}
-
-#[tokio::test]
-async fn health_degrades_when_an_enabled_path_is_down() {
-    let (auth, _, user_id, bundle) = health_rig().await;
-    save_slskd(&auth, &closed_url().await).await;
-    let _sabnzbd = serve_sabnzbd(&auth).await;
-    bundle.refresh_probes().await;
-
-    let (status, body) = get_json(
-        authed_app(bundle.deps, &user_id, Role::User),
-        "/api/v3/acquire/health",
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["status"], "degraded");
-    assert_eq!(body["ready"], true);
-    assert_eq!(body["ready_via"], json!(["usenet"]));
 }
 
 #[tokio::test]
@@ -1884,16 +1841,16 @@ fn plugin_host_with_download_client(auth: &AuthRig, dir: &std::path::Path) -> Ar
     host
 }
 
-/// What each consumer of the readiness answers for one setup: the health
-/// smoke, Discover's download-client flag, and whether a manual search
+/// What each consumer of the readiness answers for one setup: the
+/// readiness itself, Discover's download-client flag, and whether a manual search
 /// starts. Requests and the download queue read the same answer as
 /// search, through the worker's readiness.
-async fn readiness_answers(setup: SourceSetup) -> (Vec<bool>, Vec<String>) {
+async fn readiness_answers(setup: SourceSetup) -> Vec<bool> {
     use droppedneedle_acquire::downloads::worker::DownloadWorker;
     use droppedneedle_acquire::requests::quota::QuotaLedger;
     use droppedneedle_acquire::search_jobs::store::JobStore;
     use droppedneedle_acquire::search_jobs::{AlbumSearch, SearchJobError, SearchJobs};
-    use droppedneedle_catalog::reads::discover::content::IntegrationSettings;
+    use droppedneedle_catalog::discover::content::IntegrationSettings;
 
     let (auth, _, user_id) = seed_rig().await;
     let scratch = crate::common::ScratchDir::new("readiness-table");
@@ -1931,13 +1888,8 @@ async fn readiness_answers(setup: SourceSetup) -> (Vec<bool>, Vec<String>) {
         None,
     );
     rig.refresh_probes().await;
-    let readiness = rig.deps.readiness.clone();
+    let readiness = SourceReadiness::new(SourceList::Live(rig.worker_settings.clone()));
 
-    let (_, health) = get_json(
-        authed_app(rig.deps.clone(), &user_id, Role::User),
-        "/api/v3/acquire/health",
-    )
-    .await;
     let discover = IntegrationSettings::new(&auth.config, Arc::new(readiness.clone()))
         .status()
         .download_client;
@@ -1979,43 +1931,28 @@ async fn readiness_answers(setup: SourceSetup) -> (Vec<bool>, Vec<String>) {
         Err(other) => panic!("search start failed: {other:?}"),
     };
 
-    let reachable = readiness
-        .now()
-        .reachable
-        .iter()
-        .map(ToString::to_string)
-        .collect();
-    (
-        vec![
-            health["ready"].as_bool().expect("ready flag"),
-            discover,
-            search,
-        ],
-        reachable,
-    )
+    vec![readiness.can_acquire(), discover, search]
 }
 
 /// Whether music can be acquired has one answer. A source counts once it
 /// is turned on, whether or not it answers right now, and a plugin
-/// download client counts like slskd and SABnzbd. The health smoke,
-/// Discover's "set up a download client" prompt and manual search agree
+/// download client counts like slskd and SABnzbd. Discover's "set up a download client" prompt and manual search agree
 /// on every setup.
 #[tokio::test]
 async fn every_consumer_agrees_on_whether_music_can_be_acquired() {
     let table = [
-        (SourceSetup::Nothing, false, Vec::<&str>::new()),
-        (SourceSetup::SlskdOnly, true, vec!["soulseek"]),
-        (SourceSetup::SabnzbdOnlyAndDown, true, Vec::new()),
-        (SourceSetup::PluginOnly, true, vec!["plugin:toy"]),
+        (SourceSetup::Nothing, false),
+        (SourceSetup::SlskdOnly, true),
+        (SourceSetup::SabnzbdOnlyAndDown, true),
+        (SourceSetup::PluginOnly, true),
     ];
-    for (setup, can_acquire, reachable) in table {
-        let (answers, reached) = readiness_answers(setup).await;
+    for (setup, can_acquire) in table {
+        let answers = readiness_answers(setup).await;
         assert_eq!(
             answers,
             vec![can_acquire; answers.len()],
-            "{setup:?}: health, Discover and search"
+            "{setup:?}: readiness, Discover and search"
         );
-        assert_eq!(reached, reachable, "{setup:?}: reachable sources");
     }
 }
 

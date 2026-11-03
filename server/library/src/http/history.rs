@@ -21,9 +21,11 @@ use serde::Serialize;
 use utoipa::ToSchema;
 
 use super::blocking;
-use crate::operations::history::{HistoryActor, HistoryEntry, HistoryKind};
-use crate::operations::models::OperationError;
-use crate::operations::service::Operations;
+use crate::catalog_actions::history::HistoryActor;
+use crate::catalog_actions::history::HistoryEntry;
+use crate::catalog_actions::history::HistoryKind;
+use crate::jobs::models::OperationError;
+use crate::jobs::service::Operations;
 use crate::wiring::LibraryServices;
 use droppedneedle_auth::{Curator, User};
 
@@ -48,6 +50,9 @@ pub enum AlbumHistoryKindView {
     RetagJoined,
     /// Left unmanaged like the album whose files were retagged as this one.
     RetagHalfLeftAlone,
+    /// The tracks came back from the album a person kept apart from this
+    /// one, so that answer was dropped and a later retag is joined again.
+    RetagDismissalEnded,
     /// A leftover album of an earlier version was folded into this one.
     LeftoverJoined,
     /// Other music took the paths of tracks, which came in as new tracks;
@@ -62,6 +67,8 @@ pub enum AlbumHistoryKindView {
     EditionChanged,
     /// The app gave the album, matched to a release group only, an edition.
     EditionChosen,
+    /// The app took the album's match off: new evidence contradicted it.
+    MatchWithdrawn,
     /// Someone undid the app's edition change.
     EditionChangeUndone,
     /// The fold of a leftover album into this one was undone.
@@ -119,12 +126,14 @@ impl From<HistoryEntry> for AlbumHistoryEntryView {
                 HistoryKind::TracksReplaced => AlbumHistoryKindView::TracksReplaced,
                 HistoryKind::RetagJoined => AlbumHistoryKindView::RetagJoined,
                 HistoryKind::RetagHalfLeftAlone => AlbumHistoryKindView::RetagHalfLeftAlone,
+                HistoryKind::RetagDismissalEnded => AlbumHistoryKindView::RetagDismissalEnded,
                 HistoryKind::LeftoverJoined => AlbumHistoryKindView::LeftoverJoined,
                 HistoryKind::TracksOtherMusic => AlbumHistoryKindView::TracksOtherMusic,
                 HistoryKind::TracksNewCopy => AlbumHistoryKindView::TracksNewCopy,
                 HistoryKind::ArtistFromTracks => AlbumHistoryKindView::ArtistFromTracks,
                 HistoryKind::EditionChanged => AlbumHistoryKindView::EditionChanged,
                 HistoryKind::EditionChosen => AlbumHistoryKindView::EditionChosen,
+                HistoryKind::MatchWithdrawn => AlbumHistoryKindView::MatchWithdrawn,
                 HistoryKind::EditionChangeUndone => AlbumHistoryKindView::EditionChangeUndone,
                 HistoryKind::FoldUndone => AlbumHistoryKindView::FoldUndone,
                 HistoryKind::UnfoldedFrom => AlbumHistoryKindView::UnfoldedFrom,

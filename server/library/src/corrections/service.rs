@@ -12,8 +12,7 @@ use super::artists;
 use super::membership::{self, Run};
 use super::models::{
     Applied, ApplyMeta, ArtistMergeOutcome, ArtistMergeRequest, CorrectionError, CorrectionKind,
-    MembershipKind, MembershipOutcome, MembershipRequest, PairJoinRequest, Previewed,
-    RetagPairList,
+    MembershipKind, MembershipOutcome, MembershipRequest, PairJoinRequest, Previewed, RetagPair,
 };
 use super::reasons;
 use super::reset;
@@ -189,10 +188,17 @@ impl Corrections {
 
 /// Retag pairs a person joins or dismisses.
 impl Corrections {
-    /// The open pairs a person decides on, newest first.
-    pub fn retag_pairs(&self) -> Result<RetagPairList, CorrectionError> {
-        self.db
-            .read_blocking("corrections.retag_pairs", retag_pairs::list)
+    /// One page of the open pairs a person decides on, newest first, and
+    /// how many there are; with `album`, only those naming it.
+    pub fn retag_pairs(
+        &self,
+        album: Option<&str>,
+        limit: u32,
+        offset: u32,
+    ) -> Result<(Vec<RetagPair>, u64), CorrectionError> {
+        self.db.read_blocking("corrections.retag_pairs", |conn| {
+            retag_pairs::list(conn, album, limit, offset)
+        })
     }
 
     /// Join a pair; returns the album that stays.
@@ -291,7 +297,7 @@ fn replay(tx: &Transaction<'_>, key: Option<&str>) -> Result<Option<Applied>, Co
     };
     let stored: Option<String> = tx
         .query_row(
-            "SELECT after_json FROM library_catalog_actions WHERE idempotency_key = ?1",
+            crate::corrections::sql::REPLAY.text(),
             params![key],
             |row| row.get(0),
         )
@@ -324,9 +330,7 @@ fn record(
         CorrectionError::Store(format!("correction result unwritable: {error}"))
     })?;
     tx.execute(
-        "INSERT INTO library_catalog_actions (id, idempotency_key, actor_user_id, action_kind, \
-         local_artist_id, local_album_id, before_json, after_json, reason_code, created_at) \
-         VALUES (?1, ?2, (SELECT id FROM auth_users WHERE id = ?3), ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        crate::catalog_actions::sql::RECORD_CORRECTION.text(),
         params![
             uuid::Uuid::new_v4().to_string(),
             audit.meta.idempotency_key,
@@ -337,7 +341,7 @@ fn record(
             audit.before.to_string(),
             after,
             audit.reason,
-            audit.now,
+            crate::clock::ms(audit.now),
         ],
     )?;
     Ok(())

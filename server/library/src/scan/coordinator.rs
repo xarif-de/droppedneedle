@@ -1,7 +1,7 @@
 //! Single durable entry point for every scan trigger.
 //!
-//! Port of v2's library scan coordinator plus the indexing and
-//! reconciliation phases (v2's library indexer and reconciler). Tag reads
+//! Library scan coordinator plus the indexing and reconciliation phases.
+//! Tag reads
 //! ride the [`TagReader`](super::seams::TagReader) seam with bounded
 //! concurrency on the blocking pool; each index window commits its catalog
 //! rows, inventory marks, counters, and identify offers in one transaction,
@@ -26,11 +26,13 @@ use super::models::{
     ScanRun, ScanScope, ScanState, ScopeDiscoveryState, Verdict,
 };
 use super::pool::BlockingPool;
-use super::roots::{PolicyResolver, RootRegistry, yielded_by, yielded_home};
+use super::roots::{PolicyResolver, RootRegistry, scope_covers, yielded_by, yielded_home};
 use super::seams::{Checkpoint, ScannedTags, TagReadError, TagReader};
 use super::sqlite_store::SqliteScanStore;
 use super::stop::RunStop;
-use super::store::{CommitIndexedItem, EditionFill, IndexWindow, ScanStoreError};
+use super::store::{
+    CommitIndexedItem, EditionFill, IndexWindow, LengthFill, ScanStoreError, UnreadRows,
+};
 use super::walk::InventoryScanner;
 use super::watcher::WorkWakeups;
 use crate::clock::LibraryClock as _;
@@ -51,7 +53,7 @@ fn release_scan_memory() {
     }
 }
 
-/// Index batch size between checkpoints (v2 commits per tag batch).
+/// Index batch size between checkpoints.
 pub const INDEX_CHECKPOINT_EVERY: usize = 16;
 /// Inventory rows processed per index page. The coordinator streams the
 /// run's inventory in pages instead of holding all rows resident; 5,000
@@ -61,13 +63,12 @@ pub const INDEX_PAGE_SIZE: usize = 5_000;
 /// [`INDEX_CHECKPOINT_EVERY`] rows; only the SQLite flush is coarser, so
 /// a crash re-offers at most one window next run.
 pub const INDEX_FLUSH_EVERY: usize = 256;
-/// Bound on stale retries when settling control (v2
-/// `SETTLE_STALE_MAX_RETRIES`).
+/// Bound on stale retries when settling control.
 pub const SETTLE_STALE_MAX_RETRIES: u32 = 10;
-/// Counter-event throttle (v2 `COUNTER_EVENT_INTERVAL_SECONDS`).
+/// Counter-event throttle.
 pub const COUNTER_EVENT_INTERVAL_SECS: f64 = 2.0;
 
-/// Live resolver source. v2 re-reads the resolver through a getter every
+/// Live resolver source. The resolver is re-read at every
 /// checkpoint so settings-save rebuilds never strand a run on stale
 /// policy; this trait is that getter.
 pub trait ResolverSource: Send + Sync {
@@ -164,7 +165,7 @@ impl std::fmt::Display for ScanRequestError {
 
 impl std::error::Error for ScanRequestError {}
 
-/// Scan event published to the event bus (v2 `LibraryScanEventPublisher`).
+/// Scan event published to the event bus.
 #[derive(Debug, Clone)]
 pub struct ScanEvent {
     pub id: String,
@@ -179,8 +180,8 @@ pub struct ScanEvent {
     pub changed: bool,
 }
 
-/// Durable-revision scan invalidations with counter-rate throttling (v2
-/// scan events). Terminal states drop their throttle entry; runs end via
+/// Durable-revision scan invalidations with counter-rate throttling.
+/// Terminal states drop their throttle entry; runs end via
 /// store transitions, never publisher callbacks.
 #[derive(Clone)]
 pub struct ScanEventPublisher {
@@ -241,7 +242,7 @@ fn default_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
-/// Scan coordinator (v2 `LibraryScanCoordinator`).
+/// Scan coordinator.
 pub struct LibraryScanCoordinator<T: TagReader> {
     store: Arc<SqliteScanStore>,
     inventory: InventoryScanner,
@@ -400,7 +401,7 @@ impl<T: TagReader + 'static> LibraryScanCoordinator<T> {
         );
     }
 
-    /// Request a scan run (v2 `request_run`, validations included).
+    /// Request a scan run, validations included.
     pub fn request_run(
         &self,
         request: &ScanRequest,
@@ -444,9 +445,8 @@ impl<T: TagReader + 'static> LibraryScanCoordinator<T> {
             .request_run(request, &run_id, self.now())
             .map_err(ScanRequestError::Store)?;
         if result.disposition != Disposition::Conflict {
-            // v2 request_scan_run wakes the supervisor for every accepted
-            // disposition; the store here has no wakeups, so the
-            // coordinator wakes instead.
+            // Every accepted disposition wakes the supervisor. The store here has
+            // no wakeups, so the coordinator wakes instead.
             if let Some(wakeups) = &self.wakeups {
                 wakeups.notify("scan");
             }
@@ -493,8 +493,7 @@ impl<T: TagReader + 'static> LibraryScanCoordinator<T> {
     }
 
     /// One history page, after the `(terminal_at, run_id)` the last page
-    /// ended on, and the key the next page starts after (v2
-    /// `history_page`).
+    /// ended on, and the key the next page starts after.
     pub fn history_page(
         &self,
         limit: usize,
@@ -514,7 +513,7 @@ impl<T: TagReader + 'static> LibraryScanCoordinator<T> {
         Ok((items, next))
     }
 
-    /// One page of a run's failures (v2 `scan_run_failures`). An unknown
+    /// One page of a run's failures. An unknown
     /// run is not-found, never an empty page.
     pub fn scan_run_failures(
         &self,
@@ -526,13 +525,12 @@ impl<T: TagReader + 'static> LibraryScanCoordinator<T> {
         self.store.failures_page(run_id, limit, after)
     }
 
-    /// Approximate file count for the scopes plus when it was taken (v2
-    /// `estimate`).
+    /// Approximate file count for the scopes plus when it was taken.
     pub fn estimate(&self, scopes: &[ScanScope]) -> Result<(u64, f64), ScanStoreError> {
         Ok((self.store.estimate_scopes(scopes)?, self.now()))
     }
 
-    /// Pause, resume, or stop a run (v2 `control`). A pause or stop of the
+    /// Pause, resume, or stop a run. A pause or stop of the
     /// run being driven trips its stop flag, so a long read, a chunked
     /// write or a wait on a busy database ends early. The worker is woken
     /// after every control: a resumed run, a run freed for the next one, or
@@ -584,7 +582,7 @@ impl<T: TagReader + 'static> LibraryScanCoordinator<T> {
         self.store.drop_classify_snapshot();
     }
 
-    /// Boot recovery (v2 `recover` / `recover_stopping`).
+    /// Boot recovery.
     pub fn recover(&self) -> Result<Vec<ScanRun>, ScanStoreError> {
         if !self.resolvers.resolver().enabled() {
             return self.recover_stopping();
@@ -618,7 +616,7 @@ impl<T: TagReader + 'static> LibraryScanCoordinator<T> {
         Ok(runs)
     }
 
-    /// Settle a pausing/stopping run (v2 `_settle_pending_control`). Its
+    /// Settle a pausing/stopping run. Its
     /// writes wait out a busy database: they are the answer to the stop.
     fn settle_pending_control(&self, run_id: &str) -> ScanRun {
         let mut stale_retries = 0u32;
@@ -724,7 +722,7 @@ impl<T: TagReader + 'static> LibraryScanCoordinator<T> {
         }
     }
 
-    /// Drive one run to the next stopping point (v2 `run_once`). Returns
+    /// Drive one run to the next stopping point. Returns
     /// the run, or `None` when no work was available.
     pub async fn run_once(&self, root_paths: &HashMap<String, PathBuf>) -> Option<ScanRun> {
         self.drive(root_paths, &RunStop::default()).await
@@ -737,10 +735,12 @@ impl<T: TagReader + 'static> LibraryScanCoordinator<T> {
     ) -> Option<ScanRun> {
         // Runs that ended without their end passes (a stop request, boot
         // recovery, a crash) settle first; their inventory waits for it.
-        // Finished runs' inventory goes even while the library is off.
-        self.settle_ended_runs(stop).await;
+        // Finished runs' inventory goes even while the library is off. A
+        // drive whose settling failed claims no run, so old passes never
+        // land after a new run's windows.
+        let settled = self.settle_ended_runs(stop).await;
         self.cleanup_terminal_inventory(stop).await;
-        if !self.resolvers.resolver().enabled() {
+        if !settled || !self.resolvers.resolver().enabled() {
             return None;
         }
         let claimed = match self.store.resumable(stop) {
@@ -823,8 +823,8 @@ impl<T: TagReader + 'static> LibraryScanCoordinator<T> {
             return self.settle_pending_control(&run.id);
         }
         if scopes.is_empty() {
-            // v2 indexes scopes[0] and the IndexError becomes
-            // UNEXPECTED_WORKER_FAILURE; fail the same way directly.
+            // Quirk (v2): with no scopes, v2 indexed scopes[0] and its IndexError
+            // became UNEXPECTED_WORKER_FAILURE. Fail the same way directly.
             return self
                 .fail_active(&run, FailureCode::UnexpectedWorkerFailure)
                 .await;
@@ -962,7 +962,7 @@ impl<T: TagReader + 'static> LibraryScanCoordinator<T> {
                 if root.policy == super::models::EffectivePolicy::Excluded {
                     return None;
                 }
-                scope.policy_revision = registry.policy_revision().to_owned();
+                scope.policy_revision = registry.fingerprint().to_owned();
                 scope.effective_policy = root.policy;
                 Some(scope)
             })
@@ -975,7 +975,7 @@ impl<T: TagReader + 'static> LibraryScanCoordinator<T> {
             trigger: run.trigger,
             scopes,
             requested_by_user_id: run.requested_by_user_id.clone(),
-            policy_revision: registry.policy_revision().to_owned(),
+            policy_revision: registry.fingerprint().to_owned(),
         };
         match self.request_run(&request) {
             Ok(result) => tracing::info!(
@@ -1015,7 +1015,7 @@ impl<T: TagReader + 'static> LibraryScanCoordinator<T> {
         }
     }
 
-    /// Fail an active run (v2 `run_once` crash path). Its writes wait out
+    /// Fail an active run. Its writes wait out
     /// a busy database.
     async fn fail_active(&self, run: &ScanRun, code: FailureCode) -> ScanRun {
         let (current, _, _) = match self.store.reread_run(&RunStop::never(), &run.id) {
@@ -1052,14 +1052,19 @@ impl<T: TagReader + 'static> LibraryScanCoordinator<T> {
     }
 
     /// Run the end passes ended runs still owe, on a blocking thread. A
-    /// failure is logged; the next drive resumes where it stopped.
-    async fn settle_ended_runs(&self, stop: &RunStop) {
+    /// failure is logged; the next drive resumes where it stopped. False
+    /// when a pass is put off, or they failed on anything but a stop.
+    async fn settle_ended_runs(&self, stop: &RunStop) -> bool {
         let settled = self
             .on_store(stop, |store, stop| store.settle_ended_runs(stop))
             .await;
         match settled {
-            Ok(()) | Err(ScanStoreError::Stopped | ScanStoreError::ReadCancelled { .. }) => {}
-            Err(error) => tracing::warn!(%error, "scan end passes did not finish"),
+            Ok(settled) => settled,
+            Err(ScanStoreError::Stopped | ScanStoreError::ReadCancelled { .. }) => true,
+            Err(error) => {
+                tracing::warn!(%error, "scan end passes did not finish");
+                false
+            }
         }
     }
 
@@ -1092,7 +1097,7 @@ impl<T: TagReader + 'static> LibraryScanCoordinator<T> {
             })?
     }
 
-    /// Indexing phase (v2 `LibraryIndexer.index`): page through the
+    /// Indexing phase: page through the
     /// unprocessed inventory, read tags for new and changed files with
     /// bounded concurrency, and commit each window of rows atomically.
     /// A pause, stop, or shutdown between windows loses nothing: the rows
@@ -1123,8 +1128,9 @@ impl<T: TagReader + 'static> LibraryScanCoordinator<T> {
                 break;
             }
             let short_page = page.len() < INDEX_PAGE_SIZE;
-            // Unchanged files whose edition hints no scan stored (files
-            // carried over from v2) are read for those hints alone.
+            // Unchanged files whose rows lack what only the file can tell
+            // (edition hints no scan stored, or whether the length was
+            // measured) are read for that alone.
             let unchanged: Vec<String> = if run.kind == ScanKind::Incremental {
                 page.iter()
                     .filter(|item| {
@@ -1137,9 +1143,7 @@ impl<T: TagReader + 'static> LibraryScanCoordinator<T> {
                 Vec::new()
             };
             let unread = self
-                .on_store(stop, move |store, stop| {
-                    store.without_edition_tags(stop, &unchanged)
-                })
+                .on_store(stop, move |store, stop| store.unread(stop, &unchanged))
                 .await?;
             for rows in page.chunks(INDEX_FLUSH_EVERY) {
                 let Some(window) = self
@@ -1203,9 +1207,25 @@ impl<T: TagReader + 'static> LibraryScanCoordinator<T> {
         futures_util::future::join_all(reads).await
     }
 
+    /// Whether each file's length is measured, read without its tags.
+    async fn measure_files(&self, items: &[&ScanInventoryItem]) -> Vec<Result<bool, TagReadError>> {
+        let reads = items.iter().map(|item| {
+            let tags = Arc::clone(&self.tags);
+            let path = PathBuf::from(&item.absolute_path);
+            let pool = self.pool.clone();
+            async move {
+                pool.run(move || tags.length_measured(&path))
+                    .await
+                    .unwrap_or(Err(TagReadError::Fatal))
+            }
+        });
+        futures_util::future::join_all(reads).await
+    }
+
     /// Classify one window of inventory rows and read the tags the
-    /// catalog needs: in full for new and changed files, and the edition
-    /// hints alone for unchanged tracks in `unread`. `None` when the
+    /// catalog needs: in full for new and changed files, the edition
+    /// hints alone for unchanged tracks in `unread`, and only whether the
+    /// length is measured for those that lack just that. `None` when the
     /// checkpoint says stop.
     async fn read_window(
         &self,
@@ -1213,7 +1233,7 @@ impl<T: TagReader + 'static> LibraryScanCoordinator<T> {
         rows: &[ScanInventoryItem],
         after: Option<(String, String)>,
         frozen_policy_revision: &str,
-        unread: &HashSet<String>,
+        unread: &UnreadRows,
         counts: &mut IndexCounts,
     ) -> Option<IndexWindow> {
         let last = rows.last()?;
@@ -1227,6 +1247,7 @@ impl<T: TagReader + 'static> LibraryScanCoordinator<T> {
         let force = run.kind == ScanKind::RescanFiles;
         let mut to_read: Vec<&ScanInventoryItem> = Vec::new();
         let mut to_fill: Vec<&ScanInventoryItem> = Vec::new();
+        let mut to_measure: Vec<&ScanInventoryItem> = Vec::new();
         for item in rows {
             let row = (item.root_id.clone(), item.relative_path.clone());
             window.counters.push((row.clone(), Counter::Inspected, 1));
@@ -1241,12 +1262,12 @@ impl<T: TagReader + 'static> LibraryScanCoordinator<T> {
                 // Reconcile-only runs refresh inventory, never tags.
                 window.counters.push((row, Counter::Unchanged, 1));
                 counts.unchanged += 1;
-                if item
-                    .local_track_id
-                    .as_ref()
-                    .is_some_and(|id| unread.contains(id))
-                {
-                    to_fill.push(item);
+                if let Some(id) = &item.local_track_id {
+                    if unread.edition_tags.contains(id) {
+                        to_fill.push(item);
+                    } else if unread.length.contains(id) {
+                        to_measure.push(item);
+                    }
                 }
             } else if item.comparison_result != Verdict::CandidateMissing {
                 to_read.push(item);
@@ -1320,11 +1341,16 @@ impl<T: TagReader + 'static> LibraryScanCoordinator<T> {
                 let Some(track_id) = item.local_track_id.clone() else {
                     continue;
                 };
-                // A file that cannot be read gets an empty row, so it is not
-                // tried on every scan; changing it brings a full read. A busy
-                // file is tried again next scan.
-                let (edition, disc_number) = match outcome {
-                    Ok(tags) => (tags.tag.edition, tags.tag.disc_number),
+                // A file that cannot be read gets an empty row and an
+                // estimated length, so it is not tried on every scan;
+                // changing it brings a full read. A busy file is tried again
+                // next scan.
+                let (edition, disc_number, measured) = match outcome {
+                    Ok(tags) => (
+                        tags.tag.edition,
+                        tags.tag.disc_number,
+                        tags.header.duration_measured,
+                    ),
                     Err(TagReadError::Fatal) => {
                         tracing::warn!(
                             path = item.relative_path,
@@ -1340,6 +1366,15 @@ impl<T: TagReader + 'static> LibraryScanCoordinator<T> {
                         continue;
                     }
                 };
+                if unread.length.contains(&track_id) {
+                    window.length_fills.push(LengthFill {
+                        root_id: item.root_id.clone(),
+                        relative_path: item.relative_path.clone(),
+                        track_id: track_id.clone(),
+                        stat_revision: item.stat_revision.clone(),
+                        measured,
+                    });
+                }
                 window.edition_fills.push(EditionFill {
                     root_id: item.root_id.clone(),
                     relative_path: item.relative_path.clone(),
@@ -1351,10 +1386,47 @@ impl<T: TagReader + 'static> LibraryScanCoordinator<T> {
                 });
             }
         }
+        for chunk in to_measure.chunks(INDEX_CHECKPOINT_EVERY) {
+            if !self.check(&run.id, frozen_policy_revision) {
+                return None;
+            }
+            let outcomes = self.measure_files(chunk).await;
+            for (item, outcome) in chunk.iter().zip(outcomes) {
+                let Some(track_id) = item.local_track_id.clone() else {
+                    continue;
+                };
+                // As for the edition hints: a file that cannot be read
+                // counts as estimated, a busy one waits for the next scan.
+                let measured = match outcome {
+                    Ok(measured) => measured,
+                    Err(TagReadError::Fatal) => {
+                        tracing::warn!(
+                            path = item.relative_path,
+                            "could not read an unchanged file's audio header"
+                        );
+                        false
+                    }
+                    Err(TagReadError::Deferred) => {
+                        tracing::debug!(
+                            path = item.relative_path,
+                            "audio header of an unchanged file waits for the next scan"
+                        );
+                        continue;
+                    }
+                };
+                window.length_fills.push(LengthFill {
+                    root_id: item.root_id.clone(),
+                    relative_path: item.relative_path.clone(),
+                    track_id,
+                    stat_revision: item.stat_revision.clone(),
+                    measured,
+                });
+            }
+        }
         Some(window)
     }
 
-    /// Reconciliation phase (v2 `LibraryReconciler`): catalog rows under a
+    /// Reconciliation phase: catalog rows under a
     /// cleanly walked scope that the walk did not see are marked missing,
     /// never deleted. Only completed scopes qualify. A scope that would
     /// lose most of its tracks at once (an unmounted share looks exactly
@@ -1416,9 +1488,15 @@ impl<T: TagReader + 'static> LibraryScanCoordinator<T> {
                 .partition(|(_, _, home)| home.is_some());
             let indexed = self
                 .store
-                .indexed_count(stop, &scope.root_id, &scope.relative_path)?
+                .indexed_count(stop, run_id, &scope.root_id, &scope.relative_path)?
                 .saturating_sub(moves.len());
-            if !paths.is_empty() && mass_missing(paths.len(), indexed) {
+            // A renamed scope was judged before indexing, row by row, against
+            // what its twin holds. Indexing has since moved rows off it, so
+            // the few left here are no sign of a vanished share.
+            let renamed =
+                self.store
+                    .scope_renamed(stop, run_id, &scope.root_id, &scope.relative_path)?;
+            if !renamed && !paths.is_empty() && mass_missing(paths.len(), indexed) {
                 self.hold_back_scope(
                     run_id,
                     scope,
@@ -1524,6 +1602,8 @@ impl<T: TagReader + 'static> LibraryScanCoordinator<T> {
                     ))
                 })
                 .await?;
+            let missing =
+                missing.saturating_sub(self.found_at_a_twin(run_id, scope, &scopes, stop)?);
             if mass_missing(missing, total) {
                 self.hold_back_scope(run_id, scope, missing, total, ScanPhase::Discovering, stop)?;
                 continue;
@@ -1592,6 +1672,36 @@ impl<T: TagReader + 'static> LibraryScanCoordinator<T> {
         Ok(())
     }
 
+    /// Rows a renamed scope walked past whose file a twin scope of the run
+    /// holds at the same place. Only these are excused from the mass-missing
+    /// guard: they cannot be a vanished share, since the file was just seen.
+    fn found_at_a_twin(
+        &self,
+        run_id: &str,
+        scope: &ScanScope,
+        scopes: &[ScanScope],
+        stop: &RunStop,
+    ) -> Result<usize, ScanStoreError> {
+        if !self
+            .store
+            .scope_renamed(stop, run_id, &scope.root_id, &scope.relative_path)?
+        {
+            return Ok(0);
+        }
+        let twins: Vec<&str> = scopes
+            .iter()
+            .filter(|other| {
+                other.root_id == scope.root_id
+                    && other.relative_path != scope.relative_path
+                    && scope_covers(&other.relative_path, &scope.relative_path)
+                    && scope_covers(&scope.relative_path, &other.relative_path)
+            })
+            .map(|other| other.relative_path.as_str())
+            .collect();
+        self.store
+            .rows_found_at_twins(stop, run_id, &scope.root_id, &scope.relative_path, &twins)
+    }
+
     /// Record that missing detection is held back for one scope.
     fn hold_back_scope(
         &self,
@@ -1658,7 +1768,7 @@ const MASS_MISSING_MIN_INDEXED: usize = 20;
 /// True when a walk would mark so much of a scope missing that a vanished
 /// mount is the likelier story: a walk that found none of the scope's
 /// files at all (an unmounted share or an empty mount point, whatever its
-/// size, as v2 protects), or more than half of a larger scope.
+/// size), or more than half of a larger scope.
 fn mass_missing(missing: usize, indexed: usize) -> bool {
     let nothing_left = missing > 0 && missing == indexed;
     nothing_left || (indexed >= MASS_MISSING_MIN_INDEXED && missing * 2 > indexed)
@@ -1694,12 +1804,12 @@ fn window_failures(window: &IndexWindow, now: f64) -> Vec<ScanFailureRecord> {
 }
 
 impl<T: TagReader + 'static> Checkpoint for LibraryScanCoordinator<T> {
-    /// v2 `checkpoint`: fast true while policy matches and no control is
+    /// Checkpoint: fast true while policy matches and no control is
     /// pending, otherwise settle or supersede through the store. A run
     /// that cannot be read answers false, logged: the drive ends and the
     /// run keeps its state.
     fn check(&self, run_id: &str, frozen_policy_revision: &str) -> bool {
-        let current_policy_revision = self.resolvers.resolver().policy_revision().to_owned();
+        let current_policy_revision = self.resolvers.resolver().fingerprint().to_owned();
         if current_policy_revision == frozen_policy_revision
             && !self
                 .pending_control

@@ -1,12 +1,11 @@
 //! Remote sources: one adapter for Jellyfin, Navidrome, and Plex.
 //!
-//! The v2 backend carried three parallel browse stacks (~86 endpoints);
-//! v3 collapses them to one adapter surface and one set of native
-//! `/api/v3` routes with unified shapes. [`RemoteHandle`](adapter::RemoteHandle)
-//! is the single browse entry point: per-source adapters translate their
-//! server's payloads into the [`models`] views.
+//! The adapters share one browse surface. [`RemoteHandle`](source::RemoteHandle)
+//! is the single browse entry point, and per-source adapters translate their
+//! server's payloads into the [`models`] views. The native `/api/v3` routes use
+//! the unified shapes.
 //!
-//! Live-version-cited quirks ported from v2 (each cited at its call site):
+//! Quirks, each cited at its call site, with the server version it was seen on:
 //! Jellyfin 10.11 `MediaBrowser` auth (issue #151), the Navidrome 0.62.0
 //! single-folder probe (repeated/unknown `musicFolderId`), the Plex
 //! http-to-https base upgrade and playlist-composite fallback, and the
@@ -16,7 +15,9 @@
 //! connection and runs the call; `connections` holds the admin servers
 //! (read from settings per call) and the per-user links (sealed rows in
 //! `user_connections`); `folders` holds the Navidrome folder preferences;
-//! `adapter` holds the unified surface plus the import sink;
+//! `source` holds the unified surface plus the import sink; `transport`
+//! holds the HTTP side the source clients share (capped reads, status
+//! mapping, decoding, the per-source bound);
 //! `jellyfin`/`navidrome`/`plex` hold the source clients; `analytics`
 //! summarizes listening history; `reader` serves the stream gateway;
 //! `presence_feed` feeds the jobs presence loop from the live registry and
@@ -28,7 +29,6 @@
 //! crate.
 //! `MediaSetup` mounts [`handlers::routes`] inside the session gate.
 
-pub mod adapter;
 pub mod analytics;
 pub mod connections;
 pub mod error;
@@ -46,5 +46,7 @@ pub mod presence_feed;
 pub mod reader;
 pub mod refresh;
 pub mod service;
+pub mod source;
 pub(crate) mod sql;
+pub mod transport;
 pub mod warmup;

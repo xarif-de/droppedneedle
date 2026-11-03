@@ -587,6 +587,7 @@ async fn a_composite_artist_sends_no_musicbrainz_id() {
 
     let answer = subsonic_ok(&rig, &format!("getArtist?id=ar-{artist}")).await;
     assert_eq!(answer["artist"]["musicBrainzId"], json!(""), "{answer}");
+    rig.jellyfin_ids_caught_up().await;
     let token = rig.jellyfin_auth();
     let (status, item) = rig
         .app
@@ -606,6 +607,7 @@ async fn a_composite_artist_sends_no_musicbrainz_id() {
 /// `ProviderIds` of the album a Jellyfin app reaches from its `track`.
 async fn album_ids_sent(rig: &CompatApp, album: &str, track: &str) -> (Value, Value) {
     let subsonic = subsonic_ok(rig, &format!("getAlbum?id=al-{album}")).await;
+    rig.jellyfin_ids_caught_up().await;
     let token = rig.jellyfin_auth();
     let auth = [("X-Emby-Authorization", token.as_str())];
     let (status, item) = rig
@@ -1115,7 +1117,9 @@ async fn transcodes_alike_on_every_stream_route() {
         let runs = rig.ffmpeg_runs("airbag").len();
         let mut answers = Vec::new();
         for (route, url, headers) in routes {
-            let (status, got, bytes) = app.raw(method, url, headers, None).await;
+            // A busy answer streamed nothing, so asking again is safe.
+            let (status, got, bytes) =
+                crate::common::through_busy(|| app.raw(method, url, headers, None)).await;
             let label = format!("{case}: {route}");
             assert_eq!(status, StatusCode::OK, "{label}");
             assert_eq!(header_str(&got, "content-encoding"), "identity", "{label}");
@@ -1213,9 +1217,10 @@ async fn media_path_auth_lockout_blocks_brute_force() {
         .as_str()
         .expect("song id")
         .to_owned();
-    let guess =
-        format!("/subsonic/rest/stream?id={song}&u={PLAYER}&p=wrong&v=1.16.1&c=probe&f=json");
-    for _ in 0..5 {
+    for guess in 0..5 {
+        let guess = format!(
+            "/subsonic/rest/stream?id={song}&u={PLAYER}&p=guess-{guess}&v=1.16.1&c=probe&f=json"
+        );
         app.raw("GET", &guess, &[], None).await;
     }
     let url = rest(&format!("stream?id={song}"), &auth);
@@ -1224,6 +1229,50 @@ async fn media_path_auth_lockout_blocks_brute_force() {
     assert!(!header_str(&headers, "retry-after").is_empty());
     let reject: Value = serde_json::from_slice(&bytes).expect("reject json");
     assert_eq!(reject["subsonic-response"]["error"]["code"], json!(0));
+    rig.stop().await;
+}
+
+/// A Subsonic app still sending a revoked app password as `p` or `apiKey`,
+/// or repeating one wrong password, is refused without locking out its
+/// address. The revoked password goes under a new username each time, so
+/// only its being revoked keeps it from counting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stale_subsonic_app_does_not_lock_out_its_address() {
+    let rig = CompatApp::start("compat-stale-lockout").await;
+    let app = &rig.app;
+    let dave = app.login_user("dave").await;
+    let dave = [("authorization", dave.authorization.as_str())];
+    let (status, created) = app
+        .call_through_busy(
+            "POST",
+            "/api/v3/me/app-passwords",
+            &dave,
+            Some(json!({"name": "Old phone"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id = created["id"].as_str().expect("id");
+    let revoked = created["secret"].as_str().expect("secret");
+    let uri = format!("/api/v3/me/app-passwords/{id}");
+    let revoke = crate::common::through_busy(|| app.raw("DELETE", &uri, &dave, None)).await;
+    assert_eq!(revoke.0, StatusCode::NO_CONTENT);
+
+    let ping = "/subsonic/rest/ping?v=1.16.1&c=stale&f=json";
+    for n in 0..10 {
+        for refused in [
+            format!("{ping}&u=dave{n}&p={revoked}"),
+            format!("{ping}&apiKey={revoked}"),
+            format!("{ping}&u={PLAYER}&p=mistyped"),
+        ] {
+            let (status, body) = app.call("GET", &refused, &[], None).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_ne!(body["subsonic-response"]["error"]["code"], json!(0));
+        }
+    }
+    let (_, body) = app
+        .call("GET", &rest("ping", &rig.subsonic_auth("probe")), &[], None)
+        .await;
+    assert_eq!(body["subsonic-response"]["status"], json!("ok"), "{body}");
     rig.stop().await;
 }
 
@@ -1344,14 +1393,9 @@ async fn subsonic_made_playlist_cover_is_private_to_its_readers() {
     let cover = |auth: String| {
         let id = id.clone();
         async move {
-            let (status, headers, body) = app
-                .raw(
-                    "GET",
-                    &rest(&format!("getCoverArt?id={id}"), &auth),
-                    &[],
-                    None,
-                )
-                .await;
+            let uri = rest(&format!("getCoverArt?id={id}"), &auth);
+            let (status, headers, body) =
+                crate::common::through_busy(|| app.raw("GET", &uri, &[], None)).await;
             assert_eq!(status, StatusCode::OK);
             (
                 header_str(&headers, "content-type"),
@@ -1360,7 +1404,19 @@ async fn subsonic_made_playlist_cover_is_private_to_its_readers() {
             )
         }
     };
-    let (kind, cache, picture) = cover(owner).await;
+    // An album art read that fails on a loaded host (the album's row read
+    // waiting out the read pool) is logged and answers that one request
+    // with the placeholder. The made cover is the same on every ask, so the
+    // owner asks again until it comes.
+    let (kind, cache, picture) = app
+        .until("the owner gets the cover made from the album", || {
+            let asked = cover(owner.clone());
+            async move {
+                let answer = asked.await;
+                (answer.0 != "image/webp").then_some(answer)
+            }
+        })
+        .await;
     assert_eq!(
         (kind.as_str(), cache.as_str()),
         ("image/png", "private, max-age=3600")
@@ -1380,6 +1436,245 @@ async fn subsonic_made_playlist_cover_is_private_to_its_readers() {
             .to_string()
             .contains(&id),
         "{lists}"
+    );
+    rig.stop().await;
+}
+
+/// `(name, id)` of each playlist a user's Subsonic app lists, by name.
+async fn subsonic_playlists(rig: &CompatApp, auth: &str) -> Vec<(String, String)> {
+    let (status, body) = rig
+        .app
+        .call_through_busy("GET", &rest("getPlaylists", auth), &[], None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    listed(
+        &body["subsonic-response"]["playlists"]["playlist"],
+        "name",
+        "id",
+    )
+}
+
+/// `(name, id)` of each playlist a user's Jellyfin app lists, by name.
+async fn jellyfin_playlists(rig: &CompatApp, auth: &str) -> Vec<(String, String)> {
+    let (status, body) = rig
+        .app
+        .call_through_busy(
+            "GET",
+            "/jellyfin/Items?IncludeItemTypes=Playlist",
+            &[("authorization", auth)],
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    listed(&body["Items"], "Name", "Id")
+}
+
+fn listed(items: &Value, name: &str, id: &str) -> Vec<(String, String)> {
+    let mut rows: Vec<(String, String)> = items
+        .as_array()
+        .expect("a playlist list")
+        .iter()
+        .map(|item| {
+            (
+                item[name].as_str().expect("name").to_owned(),
+                item[id].as_str().expect("id").to_owned(),
+            )
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+fn names(rows: &[(String, String)]) -> Vec<&str> {
+    rows.iter().map(|(name, _)| name.as_str()).collect()
+}
+
+fn id_named<'a>(rows: &'a [(String, String)], name: &str) -> &'a str {
+    &rows
+        .iter()
+        .find(|(listed, _)| listed == name)
+        .expect("listed by its owner")
+        .1
+}
+
+/// Whether a Subsonic and a Jellyfin app can each open a playlist by id.
+async fn opens_by_id(
+    rig: &CompatApp,
+    (subsonic, subsonic_id): (&str, &str),
+    (jellyfin, jellyfin_id): (&str, &str),
+) -> (bool, bool) {
+    let (_, read) = rig
+        .app
+        .call_through_busy(
+            "GET",
+            &rest(&format!("getPlaylist?id={subsonic_id}"), subsonic),
+            &[],
+            None,
+        )
+        .await;
+    let (status, _) = rig
+        .app
+        .call_through_busy(
+            "GET",
+            &format!("/jellyfin/Items/{jellyfin_id}"),
+            &[("authorization", jellyfin)],
+            None,
+        )
+        .await;
+    (
+        read["subsonic-response"]["status"] == "ok",
+        status == StatusCode::OK,
+    )
+}
+
+/// The content type a Subsonic app gets for a playlist's cover.
+async fn cover_type(rig: &CompatApp, id: &str, auth: &str) -> String {
+    let uri = rest(&format!("getCoverArt?id={id}"), auth);
+    let (status, headers, _) =
+        crate::common::through_busy(|| rig.app.raw("GET", &uri, &[], None)).await;
+    assert_eq!(status, StatusCode::OK);
+    header_str(&headers, "content-type")
+}
+
+/// Apps list their own user's playlists. A switch on Profile adds other
+/// people's public ones to the lists. A public playlist opens by id, cover
+/// included, with the switch on or off, and a private one never does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn apps_list_other_peoples_public_playlists_only_on_request() {
+    let (rig, [_, _, song]) = covered_album("compat-public-playlists").await;
+    let app = &rig.app;
+
+    let ada = app.login_user("ada").await;
+    let bob = app.login_user("bob").await;
+    let ada_headers = [("authorization", ada.authorization.as_str())];
+    let bob_headers = [("authorization", bob.authorization.as_str())];
+    let subsonic = |name: &str, secret: &str| format!("u={name}&p={secret}&v=1.16.1&c=two&f=json");
+    let jellyfin = |secret: &str| format!("MediaBrowser Client=\"Two\", Token=\"{secret}\"");
+    let ada_secret = rig.app_password(&ada.authorization).await;
+    let bob_secret = rig.app_password(&bob.authorization).await;
+    let ada_subsonic = subsonic("ada", &ada_secret);
+    let bob_subsonic = subsonic("bob", &bob_secret);
+    let ada_jellyfin = jellyfin(&ada_secret);
+    let bob_jellyfin = jellyfin(&bob_secret);
+
+    // Each holds a song whose album has a cover, so a cover made from it
+    // differs from the placeholder an unreadable playlist answers.
+    for (name, public) in [("AdaPublic", true), ("AdaPrivate", false)] {
+        let (status, made) = app
+            .call_through_busy(
+                "GET",
+                &rest(
+                    &format!("createPlaylist?name={name}&songId={song}"),
+                    &ada_subsonic,
+                ),
+                &[],
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{made}");
+        let id = made["subsonic-response"]["playlist"]["id"]
+            .as_str()
+            .expect("playlist id");
+        let (status, body) = app
+            .call_through_busy(
+                "GET",
+                &rest(
+                    &format!("updatePlaylist?playlistId={id}&public={public}"),
+                    &ada_subsonic,
+                ),
+                &[],
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let (status, made) = app
+        .call_through_busy(
+            "POST",
+            "/api/v3/playlists",
+            &bob_headers,
+            Some(json!({"name": "BobOwn"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{made}");
+    rig.jellyfin_ids_caught_up().await;
+
+    let ada_sub = subsonic_playlists(&rig, &ada_subsonic).await;
+    let ada_jf = jellyfin_playlists(&rig, &ada_jellyfin).await;
+    assert_eq!(names(&ada_sub), ["AdaPrivate", "AdaPublic"]);
+    assert_eq!(names(&ada_jf), ["AdaPrivate", "AdaPublic"]);
+
+    // Both states of the switch read the same by id.
+    let check_by_id = async |state: &str| {
+        for (name, opens) in [("AdaPublic", true), ("AdaPrivate", false)] {
+            assert_eq!(
+                opens_by_id(
+                    &rig,
+                    (&bob_subsonic, id_named(&ada_sub, name)),
+                    (&bob_jellyfin, id_named(&ada_jf, name)),
+                )
+                .await,
+                (opens, opens),
+                "{name} by id, switch {state}"
+            );
+        }
+        // A made cover is the same on every ask, so a read that failed on a
+        // loaded host (it answers the placeholder) is asked again.
+        let public_id = id_named(&ada_sub, "AdaPublic");
+        app.until("the public playlist's cover is made for bob", || async {
+            (cover_type(&rig, public_id, &bob_subsonic).await != "image/webp").then_some(())
+        })
+        .await;
+        assert_eq!(
+            cover_type(&rig, id_named(&ada_sub, "AdaPrivate"), &bob_subsonic).await,
+            "image/webp",
+            "a private playlist's cover stays the placeholder, switch {state}"
+        );
+    };
+
+    // Off for an account that never saved it.
+    let (status, mine) = app
+        .call_through_busy("GET", "/api/v3/me/connect-apps", &bob_headers, None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{mine}");
+    assert_eq!(mine, json!({"include_public_playlists": false}));
+    assert_eq!(
+        names(&subsonic_playlists(&rig, &bob_subsonic).await),
+        ["BobOwn"]
+    );
+    assert_eq!(
+        names(&jellyfin_playlists(&rig, &bob_jellyfin).await),
+        ["BobOwn"]
+    );
+    check_by_id("off").await;
+
+    // On: the public one joins bob's lists, and nobody else's list changes.
+    let (status, saved) = app
+        .call_through_busy(
+            "PUT",
+            "/api/v3/me/connect-apps",
+            &bob_headers,
+            Some(json!({"include_public_playlists": true})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    assert_eq!(saved, json!({"include_public_playlists": true}));
+    assert_eq!(
+        names(&subsonic_playlists(&rig, &bob_subsonic).await),
+        ["AdaPublic", "BobOwn"]
+    );
+    assert_eq!(
+        names(&jellyfin_playlists(&rig, &bob_jellyfin).await),
+        ["AdaPublic", "BobOwn"]
+    );
+    check_by_id("on").await;
+    let (_, ada_mine) = app
+        .call_through_busy("GET", "/api/v3/me/connect-apps", &ada_headers, None)
+        .await;
+    assert_eq!(ada_mine, json!({"include_public_playlists": false}));
+    assert_eq!(
+        names(&subsonic_playlists(&rig, &ada_subsonic).await),
+        ["AdaPrivate", "AdaPublic"]
     );
     rig.stop().await;
 }
@@ -1951,7 +2246,7 @@ async fn plant_artist_picture(rig: &CompatApp, mbid: &str) {
     image::RgbImage::from_pixel(4, 4, image::Rgb([10, 200, 10]))
         .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
         .expect("picture encodes");
-    droppedneedle_catalog::reads::platform::artwork::cache::ArtworkCache::new(
+    droppedneedle_catalog::artwork::cache::ArtworkCache::new(
         rig.app.config.cache_dir.join("covers"),
         64 * 1024 * 1024,
         std::sync::Arc::new(droppedneedle_kernel::clock::SystemClock),
@@ -2233,6 +2528,7 @@ async fn jellyfin_album_id(rig: &CompatApp, name: &str) -> String {
 /// The Jellyfin id a signed-in app is handed for the album artist of the
 /// track `track`.
 async fn jellyfin_artist_id(rig: &CompatApp, track: &str) -> String {
+    rig.jellyfin_ids_caught_up().await;
     let token = rig.jellyfin_auth();
     let (status, item) = rig
         .app
@@ -2671,17 +2967,6 @@ async fn a_continued_track_opens_by_its_old_id() {
 
     let admin = rig.app.login_admin().await;
     let admin = [("authorization", admin.as_str())];
-    let (status, track) = rig
-        .app
-        .call(
-            "GET",
-            &format!("/api/v3/library/tracks/{old}"),
-            &admin,
-            None,
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK, "{track}");
-    assert_eq!(track["id"], json!(copy), "{track}");
     let (status, _, body) = rig
         .app
         .raw("GET", &format!("/api/v3/stream/local/{old}"), &admin, None)
@@ -2839,7 +3124,7 @@ async fn subsonic_ratings_are_per_user_and_follow_a_merge() {
         .app
         .db()
         .query_row(
-            "SELECT COUNT(*) FROM library_user_ratings WHERE item_id = ?1",
+            "SELECT COUNT(*) FROM catalog_user_ratings WHERE item_id = ?1",
             [&kept[3..]],
             |row| row.get(0),
         )
@@ -2889,8 +3174,8 @@ async fn subsonic_ratings_are_per_user_and_follow_a_merge() {
     assert_eq!(highest["albumList2"]["album"][0]["id"], json!(kept));
     rig.app
         .seed_with(
-            "INSERT INTO library_user_ratings (user_id, item_kind, item_id, rating, rated_at) \
-             SELECT user_id, 'album', 'album-gone', 5, rated_at FROM library_user_ratings \
+            "INSERT INTO catalog_user_ratings (user_id, item_kind, item_id, rating, rated_at) \
+             SELECT user_id, 'album', 'album-gone', 5, rated_at FROM catalog_user_ratings \
              WHERE item_id = ?1 AND rating = 2",
             [local(&kept)],
         )
@@ -2905,7 +3190,7 @@ async fn subsonic_ratings_are_per_user_and_follow_a_merge() {
         .app
         .db()
         .query_row(
-            "SELECT COUNT(*) FROM library_user_ratings WHERE item_id = ?1",
+            "SELECT COUNT(*) FROM catalog_user_ratings WHERE item_id = ?1",
             [local(&merged)],
             |row| row.get(0),
         )
@@ -3034,7 +3319,7 @@ async fn web_and_subsonic_apps_share_one_rating() {
         .app
         .db()
         .query_row(
-            "SELECT COUNT(*) FROM library_user_ratings WHERE item_id = 'no-such-track'",
+            "SELECT COUNT(*) FROM catalog_user_ratings WHERE item_id = 'no-such-track'",
             [],
             |row| row.get(0),
         )
@@ -3110,7 +3395,7 @@ async fn web_and_subsonic_apps_share_one_favorite() {
         .app
         .db()
         .query_row(
-            "SELECT COUNT(*) FROM library_user_favorites WHERE item_id = 'no-such-item'",
+            "SELECT COUNT(*) FROM catalog_user_favorites WHERE item_id = 'no-such-item'",
             [],
             |row| row.get(0),
         )
@@ -3491,7 +3776,7 @@ async fn jellyfin_played_marks_are_the_callers_and_leave_plays_alone() {
     // A stop after the mark counts again. A mark and a play both read the
     // clock, a play in whole seconds, so the mark moves back a minute.
     rig.app
-        .seed("UPDATE library_user_play_marks SET marked_unplayed_at = marked_unplayed_at - 60000")
+        .seed("UPDATE catalog_user_play_marks SET marked_unplayed_at = marked_unplayed_at - 60000")
         .await;
     let (status, _) = rig
         .app

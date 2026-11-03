@@ -1,53 +1,39 @@
 <script lang="ts">
-	import { CircleCheck, HardDrive, Layers, Sparkles } from 'lucide-svelte';
-	import type { AlbumIdentityState, ArtistIdentityState, NativePickBasis } from '$lib/types';
+	import { CircleCheck, HardDrive, Layers } from 'lucide-svelte';
 
 	interface Props {
-		state: AlbumIdentityState | ArtistIdentityState;
+		/** The view's `identity_state`. */
+		state: string;
+		/** An album's exact edition; without one a linked album is only its release group. */
+		releaseMbid?: string | null;
 		subject: 'album' | 'artist';
 		compact?: boolean;
 		showDescription?: boolean;
 		className?: string;
-		pickBasis?: NativePickBasis | null;
 	}
 
 	let {
 		state,
+		releaseMbid = null,
 		subject,
 		compact = false,
 		showDescription = false,
-		className = '',
-		pickBasis = null
+		className = ''
 	}: Props = $props();
 
-	const pickBasisNote: Record<NativePickBasis, string> = {
-		pin: 'This pressing was pinned and is shown as the best fit.',
-		owned: 'This pressing matches your identified edition and is shown.',
-		embedded_tags: 'Your files agree on this pressing, shown as the best fit until verified.'
-	};
+	const kind = $derived(
+		state !== 'linked' ? 'local' : subject === 'album' && !releaseMbid ? 'edition' : 'linked'
+	);
 
 	const content = $derived.by(() => {
-		if (state === 'release_group_linked') {
-			if (subject === 'album' && pickBasis && pickBasisNote[pickBasis]) {
-				return {
-					label: 'Best-fit edition',
-					description: `This album is linked to a MusicBrainz release group. ${pickBasisNote[pickBasis]}`
-				};
-			}
+		if (kind === 'edition') {
 			return {
 				label: 'Local edition',
 				description:
 					'This album is linked to a MusicBrainz release group, but this exact edition is not.'
 			};
 		}
-		if (state === 'custom_edition') {
-			return {
-				label: 'Custom edition',
-				description:
-					'File organization uses this administrator-sealed local track list as the edition.'
-			};
-		}
-		if (state === 'release_linked' || state === 'musicbrainz_linked') {
+		if (kind === 'linked') {
 			return {
 				label: 'MusicBrainz linked',
 				description:
@@ -74,12 +60,10 @@
 		aria-label={`${content.label}. ${content.description}`}
 		title={content.description}
 	>
-		{#if state === 'local_only'}
+		{#if kind === 'local'}
 			<HardDrive class={compact ? 'h-3 w-3' : 'h-3.5 w-3.5'} />
-		{:else if state === 'release_group_linked'}
+		{:else if kind === 'edition'}
 			<Layers class={compact ? 'h-3 w-3' : 'h-3.5 w-3.5'} />
-		{:else if state === 'custom_edition'}
-			<Sparkles class={compact ? 'h-3 w-3' : 'h-3.5 w-3.5'} />
 		{:else}
 			<CircleCheck class={compact ? 'h-3 w-3' : 'h-3.5 w-3.5'} />
 		{/if}

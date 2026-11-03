@@ -17,20 +17,20 @@
 	import { SvelteURLSearchParams } from 'svelte/reactivity';
 
 	import {
-		applyArtistMerge,
-		previewArtistMerge
+		createApplyArtistMergeMutation,
+		createPreviewArtistMergeMutation
 	} from '$lib/queries/library/LibraryCatalogMutations.svelte';
 	import type { ArtistMergePreviewResponse } from '$lib/queries/library/LibraryOperationsTypes';
-	import { dismissArtistDuplicateGroup } from '$lib/queries/artist-reconciliation/ArtistReconciliationMutations.svelte';
+	import { createDismissArtistDuplicateGroupMutation } from '$lib/queries/artist-reconciliation.svelte';
 	import {
 		getArtistDuplicateGroupQuery,
 		getArtistDuplicateGroupsQuery,
 		getArtistReconciliationProgressQuery
-	} from '$lib/queries/artist-reconciliation/ArtistReconciliationQueries.svelte';
+	} from '$lib/queries/artist-reconciliation.svelte';
 	import type {
 		ArtistDuplicateGroupSummary,
 		ArtistReconciliationGroupState
-	} from '$lib/queries/artist-reconciliation/ArtistReconciliationTypes';
+	} from '$lib/queries/artist-reconciliation.svelte';
 	import { authStore } from '$lib/stores/authStore.svelte';
 	import { withBasePath } from '$lib/utils/basePath';
 	import Button from '$lib/ui/Button.svelte';
@@ -47,6 +47,7 @@
 		{ value: 'ambiguous_credit_structure', label: 'Ambiguous credit structure' },
 		{ value: 'same_name_only', label: 'Same name only' },
 		{ value: 'credits_moved', label: 'Songs moved' },
+		{ value: 'shared_provider_identity', label: 'Same MusicBrainz artist' },
 		{ value: 'resolved_automatically', label: 'Resolved automatically' }
 	];
 
@@ -135,7 +136,8 @@
 
 	const basisLabels: Record<NonNullable<ArtistDuplicateGroupSummary['merge_basis']>, string> = {
 		musicbrainz_proof: 'MusicBrainz proof',
-		same_name: 'Same name'
+		same_name: 'Same name',
+		v2_placeholder: 'v2 upgrade'
 	};
 
 	function stateClass(state: ArtistReconciliationGroupState): string {
@@ -274,9 +276,9 @@
 		}
 	}
 
-	const previewArtist = previewArtistMerge();
-	const applyArtist = applyArtistMerge();
-	const dismissMutation = dismissArtistDuplicateGroup();
+	const previewArtist = createPreviewArtistMergeMutation();
+	const applyArtist = createApplyArtistMergeMutation();
+	const dismissMutation = createDismissArtistDuplicateGroupMutation();
 </script>
 
 <section class="space-y-5" aria-labelledby="artist-identity-desk-title">

@@ -3,14 +3,14 @@
 	import { authStore } from '$lib/stores/authStore.svelte';
 	import { withBasePath } from '$lib/utils/basePath';
 	import { logout } from '$lib/utils/logout';
-	import { getProfileQuery } from '$lib/queries/profile/ProfileQuery.svelte';
+	import { getProfileQuery } from '$lib/queries/profile.svelte';
 	import {
 		getRemoteConnectionQuery,
 		getRemoteStatsQuery
 	} from '$lib/queries/remotes/RemoteQueries.svelte';
 	import { getLibraryStatsQuery } from '$lib/queries/library/LibraryQueries.svelte';
 	import { formatBytes } from '$lib/utils/formatting';
-	import type { ProfileLibraryStats, ProfileServiceConnection } from '$lib/queries/profile/types';
+	import type { ProfileLibraryStats, ProfileServiceConnection } from '$lib/queries/profile.svelte';
 	import AccountCard from '$lib/components/profile/AccountCard.svelte';
 	import ConnectedServicesGrid from '$lib/components/profile/ConnectedServicesGrid.svelte';
 	import LibraryStatsList from '$lib/components/profile/LibraryStatsList.svelte';
@@ -56,19 +56,19 @@
 				name: 'Navidrome',
 				enabled: navidromeConnection.data?.connected ?? false,
 				username: navidromeConnection.data?.account_label ?? '',
-				url: null
+				url: navidromeConnection.data?.server_url ?? null
 			},
 			{
 				name: 'Jellyfin',
 				enabled: jellyfinConnection.data?.connected ?? false,
 				username: jellyfinConnection.data?.account_label ?? '',
-				url: null
+				url: jellyfinConnection.data?.server_url ?? null
 			},
 			{
 				name: 'Plex',
 				enabled: plexConnection.data?.connected ?? false,
 				username: plexConnection.data?.account_label ?? '',
-				url: null
+				url: plexConnection.data?.server_url ?? null
 			}
 		];
 	});

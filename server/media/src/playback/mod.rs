@@ -1,50 +1,46 @@
 //! Playback reporting: session lifecycle, native scrobbles, live
 //! presence, and each user's listening settings.
 //!
-//! The native player reports `start`/`progress`/`stop` for each play; the
-//! services resolve the track, keep the bounded session, write presence,
-//! attribute the play to its remote server (Jellyfin/Navidrome/Plex), and
-//! count a scrobble past threshold. Direct submits and now-playing forwards
+//! The native player reports `start`/`progress`/`stop` for each play. For
+//! a library track the services resolve it, keep the bounded session,
+//! write presence and count a scrobble past threshold; a Jellyfin,
+//! Navidrome or Plex track is only reported on to that server
+//! ([`reports`]). Direct submits and now-playing forwards
 //! carry the by-name native path to Last.fm/ListenBrainz. Presence writes
 //! and the live snapshot live here too, backed by the in-memory registry.
 //! A counted play is written with one scrobble job per service it goes
 //! to, so a scrobble survives a restart and a service outage.
 //!
-//! ## V2 rule map
+//! ## Rules
 //!
-//! Every behavior is a v2 port; the citations sit beside the code:
+//! Quirks kept from v2 are marked `Quirk (v2)` where they sit.
 //!
 //! - Session lifecycle (start resets, rewind restarts, stop thresholds,
-//!   once-only submits): v2's compat playback report service
+//!   once-only submits)
 //! - Session-driven scrobbles (client normalization, 5s mixed-report
-//!   dedup, presence writes, played-at backdating):
-//!   v2's compat scrobble adapter
-//! - Native submit/forward (hour dedup, always-record history, 30s gate,
-//!   Navidrome delegation, accepted quirks):
-//!   v2's scrobble service
+//!   dedup, presence writes, played-at backdating)
+//! - Native submit and forward (hour dedup, always-record history, 30s gate,
+//!   Navidrome delegation, accepted quirks)
 //! - Native threshold (omitted position counts, past 90%, within the last
-//!   second): v2's Jellyfin router `_should_scrobble`
+//!   second)
 //! - Presence (45s TTL, owner-keyed visibility with fail-closed redaction,
-//!   silent idle reconciles, publish-if-removed sweeps):
-//!   v2's now-playing service and poller
-//! - Outbound attribution (per-source session reports, logged and
-//!   swallowed; per-user fail-closed): the three
-//!   v2 per-source playback services
+//!   silent idle reconciles, publish-if-removed sweeps)
+//! - Media-server session reports (per-source calls, logged and dropped,
+//!   own linked account only)
 //!
 //! ## Wiring
 //!
 //! [`routes`] puts every route in the user group, inside the session gate.
 //! `GET /now-playing` serves the live presence registry here, not the
-//! static snapshot in `reads::discover`. [`listening_routes`] serves each
+//! static snapshot in `discover`. [`listening_routes`] serves each
 //! user's scrobble preferences and ListenBrainz link, kept by
 //! [`listening::ListeningStore`].
 //!
-//! The 4s presence poll loop (v2 `run_now_playing_presence_loop`) lives in
-//! `jobs::presence`; `remotes::presence_feed` feeds it this registry and the
+//! The 4s presence poll loop lives in `jobs::presence`;
+//! `remotes::presence_feed` feeds it this registry and the
 //! Jellyfin/Navidrome/Plex session pollers. Scrobble jobs and now-playing
-//! reports to Last.fm and ListenBrainz are sent by `forwarding`. Not built
-//! yet: the SSE
-//! fan-out that would consume the registry's generation.
+//! reports to Last.fm and ListenBrainz are sent by `forwarding`. No SSE
+//! fan-out consumes the registry's generation yet.
 
 pub mod error;
 pub mod forwarding;
@@ -79,7 +75,8 @@ use sqlite::PlaybackStore;
 /// Everything the reporting services need, built once and cloned into
 /// handlers. The database side is the one concrete store; only what lies
 /// outside the process sits behind a trait. The session, presence, and
-/// dedup state is process-local by design (v2 single-process invariant).
+/// dedup state is process-local by design: a data directory runs one server
+/// process.
 #[derive(Clone)]
 pub struct PlaybackDeps {
     /// Tracks, play history, listening preferences and display names.
@@ -88,7 +85,7 @@ pub struct PlaybackDeps {
     pub sinks: Arc<dyn ScrobbleSinks>,
     /// The admin's Last.fm switch: plays go to Last.fm only while it is on.
     pub lastfm_switch: LastFmSwitch,
-    /// Outbound remote attribution (Jellyfin / Navidrome / Plex).
+    /// Session reports to the media server a track plays from.
     pub remotes: Arc<dyn RemoteReporters>,
     /// Bounded playback sessions.
     pub sessions: SessionStore,

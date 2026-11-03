@@ -43,15 +43,15 @@ vi.mock('$lib/queries/playlists/PlaylistV3Queries.svelte', () => ({
 }));
 
 vi.mock('$lib/queries/playlists/PlaylistV3Mutations.svelte', () => ({
-	setPlaylistVisibilityV3: () => ({ mutateAsync: mockShareMutate, isPending: false }),
-	deletePlaylistV3: () => ({ mutateAsync: mockDeleteMutate, isPending: false }),
-	updatePlaylistV3: () => ({ mutateAsync: mockRenameMutate, isPending: false }),
-	uploadPlaylistCoverV3: () => ({ mutateAsync: vi.fn(), isPending: false }),
-	deletePlaylistCoverV3: () => ({ mutateAsync: vi.fn(), isPending: false }),
-	removePlaylistTrackV3: () => ({ mutateAsync: vi.fn(), isPending: false }),
-	removePlaylistTracksV3: () => ({ mutateAsync: vi.fn(), isPending: false }),
-	updatePlaylistTrackV3: () => ({ mutateAsync: vi.fn(), isPending: false }),
-	reorderPlaylistTrackV3: () => ({ mutateAsync: vi.fn(), isPending: false }),
+	createSetPlaylistVisibilityV3Mutation: () => ({ mutateAsync: mockShareMutate, isPending: false }),
+	createDeletePlaylistV3Mutation: () => ({ mutateAsync: mockDeleteMutate, isPending: false }),
+	createUpdatePlaylistV3Mutation: () => ({ mutateAsync: mockRenameMutate, isPending: false }),
+	createUploadPlaylistCoverV3Mutation: () => ({ mutateAsync: vi.fn(), isPending: false }),
+	createDeletePlaylistCoverV3Mutation: () => ({ mutateAsync: vi.fn(), isPending: false }),
+	createRemovePlaylistTrackV3Mutation: () => ({ mutateAsync: vi.fn(), isPending: false }),
+	createRemovePlaylistTracksV3Mutation: () => ({ mutateAsync: vi.fn(), isPending: false }),
+	createUpdatePlaylistTrackV3Mutation: () => ({ mutateAsync: vi.fn(), isPending: false }),
+	createReorderPlaylistTrackV3Mutation: () => ({ mutateAsync: vi.fn(), isPending: false }),
 	refreshPlaylist: vi.fn().mockResolvedValue(undefined),
 	forgetPlaylistSources: mockForgetSources
 }));
@@ -64,7 +64,6 @@ vi.mock('$lib/queries/QueryClient', async () => {
 		queryClient,
 		invalidateQueriesWithPersister: vi.fn(),
 		setQueryDataWithPersister: async (key: readonly unknown[], data: unknown): Promise<void> => {
-			// eslint-disable-next-line no-restricted-syntax -- this stands in for the helper itself
 			queryClient.setQueryData(key, data);
 		}
 	};
@@ -147,6 +146,7 @@ function makePlaylist(overrides: Record<string, unknown> = {}): PlaylistDetailV3
 		updated_at: 1767312000,
 		is_public: false,
 		is_owner: true,
+		can_delete: true,
 		owner_name: null,
 		is_redacted: false,
 		tracks: [

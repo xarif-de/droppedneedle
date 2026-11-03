@@ -6,8 +6,8 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use super::reasons::ItemReason;
+use crate::jobs::OperationJob;
 use crate::jobs::{ManagementPhase, WorkState};
-use crate::operations::models::OperationJob;
 use crate::publish::planner::PlanItem;
 use droppedneedle_kernel::runtime_config::sections::{
     LibraryManagementProfile, LibraryManagementRootOverrides, NamingScript, TaggingScript,
@@ -145,6 +145,49 @@ pub enum TagEditMode {
     ResetCanonical,
 }
 
+/// Where a tag applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+#[schema(as = ManagementTagScope)]
+pub enum TagScope {
+    /// Every file of the album.
+    Album,
+    /// One file.
+    Track,
+}
+
+crate::scan::models::spelled!(TagScope {
+    Album => "album",
+    Track => "track",
+});
+
+/// The shape of a tag's value in the editor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+#[schema(as = ManagementTagCardinality)]
+pub enum TagCardinality {
+    String,
+    Integer,
+    Boolean,
+    OrderedStrings,
+}
+
+/// What a saved override does to its tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+#[schema(as = ManagementOverrideMode)]
+pub enum OverrideMode {
+    Replace,
+    Preserve,
+    Clear,
+}
+
+crate::scan::models::spelled!(OverrideMode {
+    Replace => "replace",
+    Preserve => "preserve",
+    Clear => "clear",
+});
+
 /// One edited field, with the override it replaces.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TagEditField {
@@ -186,12 +229,25 @@ pub enum DuplicateAction {
     RecycleIncomingKeepExisting,
 }
 
+/// What kind of collision a duplicate resolution settles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+#[schema(as = ManagementCollisionKind)]
+pub enum CollisionKind {
+    SamePathSameContent,
+    SamePathDifferentContent,
+    SameReleasePositionDifferentContent,
+    NormalizedPathCollision,
+    SidecarCollision,
+    DestinationCreatedAfterPreview,
+}
+
 /// A duplicate resolution: the blocked file and what to do with it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DuplicateIntent {
     pub source_job_id: String,
     pub source_plan_item_ordinal: i64,
-    pub collision_kind: String,
+    pub collision_kind: CollisionKind,
     pub existing_root_id: String,
     pub existing_relative_path: String,
     pub existing_local_track_id: Option<String>,
@@ -236,25 +292,14 @@ pub enum Eligibility {
     Stale,
 }
 
+crate::scan::models::spelled!(Eligibility {
+    Eligible => "eligible",
+    Warning => "warning",
+    Blocked => "blocked",
+    Stale => "stale",
+});
+
 impl Eligibility {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Eligible => "eligible",
-            Self::Warning => "warning",
-            Self::Blocked => "blocked",
-            Self::Stale => "stale",
-        }
-    }
-
-    pub fn parse(raw: &str) -> Self {
-        match raw {
-            "eligible" => Self::Eligible,
-            "warning" => Self::Warning,
-            "stale" => Self::Stale,
-            _ => Self::Blocked,
-        }
-    }
-
     pub fn writes(self) -> bool {
         matches!(self, Self::Eligible | Self::Warning)
     }
@@ -390,7 +435,7 @@ pub struct DesiredDocument {
     pub artwork: Vec<ArtworkChoice>,
 }
 
-/// One piece of cover art a plan writes (v2's artwork choice).
+/// One piece of cover art a plan writes.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ArtworkChoice {
@@ -574,7 +619,6 @@ pub struct JobDetail {
     pub profile_name: String,
     pub profile_revision: String,
     pub settings_revision: String,
-    pub policy_revision: String,
     pub catalog_revision: i64,
     pub target_root_id: Option<String>,
     pub linked_job_id: Option<String>,
@@ -718,24 +762,27 @@ pub enum ManagementError {
     Forbidden(&'static str),
     /// A request that cannot be acted on as sent, with its own code (400).
     #[error("{}", .0.message)]
-    Refused(crate::operations::reasons::Reason),
+    Refused(crate::reasons::Reason),
     #[error("store: {0}")]
     Store(String),
     /// The database was too busy to answer, or is shutting down.
     #[error("busy: {0}")]
     Busy(String),
-    /// No recycle bin is known while a setting cannot be read: the work
-    /// waits, as on a busy database. The bins' source logs this once per
-    /// change, so a wait on it is not logged again.
-    #[error("{}", crate::mutations::RECYCLE_BIN_UNKNOWN.message)]
-    BinsUnknown,
+    /// No recycle bin is known while a setting cannot be read or the
+    /// configured bin cannot be reached: the work waits, as on a busy
+    /// database. The bins' source logs this once per cause, so a wait on
+    /// it is not logged again. The reason says why.
+    #[error("{}", .0.message)]
+    BinsUnknown(crate::reasons::Reason),
 }
 
 impl From<droppedneedle_kernel::db::DbError> for ManagementError {
     fn from(error: droppedneedle_kernel::db::DbError) -> Self {
         use droppedneedle_kernel::db::DbError;
         match error {
-            DbError::Busy { .. } | DbError::LaneClosed => Self::Busy(error.to_string()),
+            DbError::Busy { .. } | DbError::TxTimeout { .. } | DbError::LaneClosed => {
+                Self::Busy(error.to_string())
+            }
             other => Self::Store(other.to_string()),
         }
     }

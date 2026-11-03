@@ -9,13 +9,13 @@ import type {
 	LocalAlbumMatch,
 	LocalTrackInfo,
 	LibraryAlbumStatus,
-	LibraryFileMeta,
+	LibraryStatusTrack,
 	DownloadTask,
 	HeldFileInEntry
 } from '$lib/types';
 import type { RemoteTrack } from '$lib/queries/remotes/types';
 import { libraryStore } from '$lib/stores/library';
-import { useIntegrationStatus } from '$lib/queries/HomeIntegrationStatusQuery.svelte';
+import { useIntegrationStatus } from '$lib/queries/home.svelte';
 import { ApiError } from '$lib/api/errors';
 import { compareDiscTrack, getDiscTrackKey } from '$lib/player/queueHelpers';
 import type { QueueItem } from '$lib/player/types';
@@ -43,10 +43,12 @@ import { getAlbumDownloadsQuery } from '$lib/queries/downloads/DownloadQueries.s
 import { getHeldEntriesQuery } from '$lib/queries/downloads/HeldQueries.svelte';
 import { isActiveDownloadStatus } from '$lib/queries/downloads/downloadStatus';
 import { authStore } from '$lib/stores/authStore.svelte';
-import { removeLibraryTrack } from '$lib/queries/library/LibraryMutations.svelte';
+import { getDownloadAccessQuery } from '$lib/queries/local/DownloadAccessQuery.svelte';
+import { createRemoveLibraryTrackMutation } from '$lib/queries/library/LibraryMutations.svelte';
 import { toastStore } from '$lib/stores/toast';
+import { isStaleRevision } from '$lib/api/errors';
 import { getActiveRequestsQuery } from '$lib/queries/requests/RequestQueries.svelte';
-import { switchRequestedEdition } from '$lib/queries/albums/EditionQueries.svelte';
+import { createSwitchRequestedEditionMutation } from '$lib/queries/albums/EditionQueries.svelte';
 import type { EditionRequestPick } from '$lib/components/library/edition/editionSheetState.svelte';
 import {
 	getAlbumBasicQuery,
@@ -58,9 +60,9 @@ import {
 	getSimilarAlbumsQuery
 } from '$lib/queries/catalog/AlbumQueries.svelte';
 import { AlbumQueryKeyFactory } from '$lib/queries/catalog/AlbumQueryKeyFactory';
-import { refreshAlbum } from '$lib/queries/catalog/AlbumMutations.svelte';
-import { getLocalAlbumMatchQuery, getRemoteAlbumMatchQuery } from '$lib/queries/albumMatch';
-import { AlbumMatchKeyFactory } from '$lib/queries/AlbumMatchQueryKeyFactory';
+import { createRefreshAlbumMutation } from '$lib/queries/catalog/AlbumMutations.svelte';
+import { getLocalAlbumMatchQuery, getRemoteAlbumMatchQuery } from '$lib/queries/albumMatch.svelte';
+import { AlbumMatchKeyFactory } from '$lib/queries/featureKeys';
 import { albumCopiesChanged, albumCopiesStale, applyEffectsIn } from '$lib/queries/effects';
 import { setQueryDataWithPersister } from '$lib/queries/QueryClient';
 
@@ -154,11 +156,14 @@ export function createAlbumPageState(albumIdGetter: () => string) {
 		enabled: integrations.plex && !!album
 	}));
 	const localMatch = $derived<LocalAlbumMatch | null>(localMatchQuery.data ?? null);
+	// The download buttons follow the admin's "Library downloads" setting.
+	const downloadAccessQuery = getDownloadAccessQuery(userId);
+	const downloadAllowed = $derived(downloadAccessQuery.data?.allowed !== false);
 	const jellyfinMatch = $derived(jellyfinMatchQuery.data ?? null);
 	const navidromeMatch = $derived(navidromeMatchQuery.data ?? null);
 	const plexMatch = $derived(plexMatchQuery.data ?? null);
 
-	const refresh = refreshAlbum();
+	const refresh = createRefreshAlbumMutation();
 
 	// shared TanStack query so tag-edit/rescan mutations that invalidate album(mbid) refresh this overlay in place
 	const libraryStatusQuery = getLibraryAlbumStatusQuery(albumIdGetter);
@@ -238,15 +243,15 @@ export function createAlbumPageState(albumIdGetter: () => string) {
 		!!(album && !inLibrary && (album.requested || libraryStore.isRequested(album.musicbrainz_id)))
 	);
 	const libraryTracksByRecording = $derived.by(() => {
-		const m = new SvelteMap<string, LibraryFileMeta>();
+		const m = new SvelteMap<string, LibraryStatusTrack>();
 		for (const t of libraryStatus?.tracks ?? []) {
-			if (t.musicbrainz_recording_id) m.set(t.musicbrainz_recording_id, t);
+			if (t.recording_mbid) m.set(t.recording_mbid, t);
 		}
 		return m;
 	});
 	// positional fallback (disc:track): downloaded files often lack a recording MBID, and the same song has different recording MBIDs across releases, so MBID-only matching misses in-library tracks
 	const libraryTracksByPosition = $derived.by(() => {
-		const m = new SvelteMap<string, LibraryFileMeta>();
+		const m = new SvelteMap<string, LibraryStatusTrack>();
 		for (const t of libraryStatus?.tracks ?? []) {
 			m.set(getDiscTrackKey({ disc_number: t.disc_number, track_number: t.track_number }), t);
 		}
@@ -308,11 +313,6 @@ export function createAlbumPageState(albumIdGetter: () => string) {
 	const libraryTrackCount = $derived(libraryStatus?.track_count ?? 0);
 	// any held track below the quality cutoff -> the header's curator "Upgrade quality" affordance
 	const libraryBelowCutoff = $derived((libraryStatus?.tracks ?? []).some((t) => t.below_cutoff));
-	// Coverage: what the held files actually COVER of the release's tracklist.
-	// expectedTracks === 0 -> tracklist unavailable, badge/Play All fall back to the
-	// presence-only reading (never block playback on a MusicBrainz hiccup).
-	const coverageExpected = $derived(libraryStatus?.expected_tracks ?? 0);
-	const matchedFileIds = $derived(new SvelteSet(libraryStatus?.matched_file_ids ?? []));
 
 	// The local album that holds this release group, and its current edition's
 	// plan: the same reads, under the same keys, as the edition plate, so the
@@ -453,7 +453,7 @@ export function createAlbumPageState(albumIdGetter: () => string) {
 				item.request_kind === 'album' && item.musicbrainz_id === album?.musicbrainz_id.toLowerCase()
 		) ?? null
 	);
-	const switchEdition = switchRequestedEdition();
+	const switchEdition = createSwitchRequestedEditionMutation();
 	const editionPick = $derived.by((): EditionRequestPick | null => {
 		if (!album || inLibrary || libraryInLibrary || !authStore.isTrusted) return null;
 		if (isRequested && !liveRequest) return null;
@@ -521,15 +521,17 @@ export function createAlbumPageState(albumIdGetter: () => string) {
 		void tracksQuery.refetch();
 	}
 
-	// Playback sees only files that COVER an expected track: an orphan
-	// ("doesn't match this album") never enters the album queue - it plays
-	// individually from the review section. Falls back to the raw match when
-	// the tracklist was unavailable (expected_tracks === 0).
+	// Playback follows the edition plan: a file it does not keep (a duplicate,
+	// another version, an extra) plays individually from its own section. With
+	// no plan, or a plan that keeps nothing, every held file plays.
 	const localMatchForPlayback = $derived.by(() => {
-		if (!localMatch || coverageExpected === 0) return localMatch;
+		const kept = new SvelteSet(
+			editionPlan?.files.filter((file) => file.fate === 'keep').map((file) => file.local_track_id)
+		);
+		if (!localMatch || kept.size === 0) return localMatch;
 		return {
 			...localMatch,
-			tracks: localMatch.tracks.filter((t) => matchedFileIds.has(String(t.track_file_id)))
+			tracks: localMatch.tracks.filter((t) => kept.has(String(t.track_file_id)))
 		};
 	});
 	const localTracksForPlayback = $derived(localMatchForPlayback?.tracks ?? []);
@@ -580,16 +582,17 @@ export function createAlbumPageState(albumIdGetter: () => string) {
 			resolvedNavidrome,
 			resolvedPlex,
 			playlistModalRef,
-			localMatch?.download_allowed !== false,
+			downloadAllowed,
 			authStore.isTrusted
 				? (fileId: string) => openRemoveFileDialog(fileId, track.title)
 				: undefined
 		);
 	}
 
-	const removeTrack = removeLibraryTrack();
+	const removeTrack = createRemoveLibraryTrackMutation();
 	let removeFileTarget = $state<{
 		fileId: string;
+		revision: number;
 		albumMbid: string;
 		albumCacheId: string;
 		title: string;
@@ -608,9 +611,10 @@ export function createAlbumPageState(albumIdGetter: () => string) {
 	function openRemoveFileDialog(fileId: string, title: string): void {
 		const albumMbid = album?.musicbrainz_id ?? '';
 		const albumCacheId = albumIdGetter();
-		if (!albumMbid || !fileId || !albumCacheId) return;
+		const revision = localMatch?.tracks.find((t) => t.track_file_id === fileId)?.row_revision;
+		if (!albumMbid || !fileId || !albumCacheId || revision === undefined) return;
 		removeFileError = null;
-		removeFileTarget = { fileId, albumMbid, albumCacheId, title };
+		removeFileTarget = { fileId, revision, albumMbid, albumCacheId, title };
 	}
 
 	function closeRemoveFileDialog(): void {
@@ -623,14 +627,25 @@ export function createAlbumPageState(albumIdGetter: () => string) {
 		const target = removeFileTarget;
 		if (!target || removeTrack.isPending) return;
 		removeTrack.mutate(
-			{ fileId: target.fileId, albumMbid: target.albumMbid },
+			{
+				fileId: target.fileId,
+				expectedRevision: target.revision,
+				albumMbid: target.albumMbid
+			},
 			{
 				onSuccess: () => {
 					removeFileTarget = null;
 					removeFileError = null;
 					toastStore.show({ message: 'File removed', type: 'success' });
 				},
-				onError: () => {
+				onError: (error) => {
+					if (isStaleRevision(error)) {
+						// The list refreshes; removing again reads the new revision.
+						removeFileTarget = null;
+						removeFileError = null;
+						toastStore.show({ message: error.message, type: 'error' });
+						return;
+					}
 					removeFileError = "Couldn't remove this file";
 					toastStore.show({ message: "Couldn't remove this file", type: 'error' });
 				}
@@ -639,10 +654,7 @@ export function createAlbumPageState(albumIdGetter: () => string) {
 	}
 
 	const localDownloadCallback = $derived<{ callback: (() => void) | undefined }>({
-		callback: buildLocalAlbumDownloadCallback(
-			localMatch?.musicbrainz_id,
-			localMatch?.download_allowed !== false
-		)
+		callback: buildLocalAlbumDownloadCallback(localMatch?.musicbrainz_id, downloadAllowed)
 	});
 
 	const jellyfinCallbacks: SourceCallbacks = buildSourceCallbacks(
@@ -832,6 +844,9 @@ export function createAlbumPageState(albumIdGetter: () => string) {
 		},
 		get libraryTrackCount() {
 			return libraryTrackCount;
+		},
+		get downloadAllowed() {
+			return downloadAllowed;
 		},
 		get libraryBelowCutoff() {
 			return libraryBelowCutoff;

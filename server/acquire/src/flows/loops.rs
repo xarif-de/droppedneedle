@@ -29,14 +29,14 @@ use crate::downloads::state::TaskStatus;
 use crate::follows::Follows;
 use crate::follows::cursors::{FeedRelease, FollowCursor, Follower, PendingRelease};
 use crate::requests::error::RequestsError;
-use crate::requests::ledger::{RequestStatus, WantedWatch, WatchState};
+use crate::requests::ledger::{RequestStatus, WantedWatch, WatchKind, WatchState};
 use crate::requests::models::RequestKind;
 use crate::requests::service::{FollowIntake, FollowRelease, RequestsService};
 use crate::requests::settle::announce_fulfilled;
 use crate::requests::sqlite::{RequestStore, WantedStore, WatchCheck};
 use crate::search_jobs::store::JobStore;
 use crate::target::Targets;
-use droppedneedle_catalog::reads::catalog::mapping::{should_include_release, type_set};
+use droppedneedle_catalog::metadata::mapping::{should_include_release, type_set};
 use droppedneedle_kernel::events::{AutoDownloadEnqueued, UserNotice, WantedNotice};
 use droppedneedle_kernel::runtime_config::Live;
 use droppedneedle_kernel::runtime_config::secret_sections::AdvancedSettings;
@@ -329,7 +329,7 @@ async fn check_watch(
                         .link_task(RequestKind::Album, &watch.key, &task_id, generation)
                         .await?;
                     if !linked && outcome.started() && cancelled_meanwhile(deps, watch).await? {
-                        // The request was cancelled after the check above:
+                        // The request was cancelled or rejected after the check above:
                         // the download it never asked for stops too.
                         if let Err(cause) = deps.downloads.cancel(&task_id).await {
                             tracing::warn!(%task_id, %cause, "wanted dispatch cancel failed");
@@ -387,7 +387,7 @@ async fn check_watch(
     Ok(())
 }
 
-/// Whether the watch's request reads cancelled or mid-cancel now.
+/// Whether the watch's request reads cancelled, mid-cancel or rejected now.
 async fn cancelled_meanwhile(
     deps: &WantedDeps,
     watch: &WantedWatch,
@@ -399,7 +399,7 @@ async fn cancelled_meanwhile(
         .is_some_and(|row| {
             matches!(
                 row.status,
-                RequestStatus::Cancelled | RequestStatus::Cancelling
+                RequestStatus::Cancelled | RequestStatus::Cancelling | RequestStatus::Rejected
             )
         }))
 }
@@ -449,16 +449,16 @@ fn notify_wanted(
 
 /// Enrol availability-dead album requests as watches: `failed` rows, plus
 /// `incomplete` rows when the partial toggle is on. Never auto-revives a
-/// stopped watch, skips rows with no requester, and skips rows whose
+/// stopped or removed watch, skips rows with no requester, and skips rows whose
 /// linked task is still active.
 async fn enrol_watches(now: i64, settings: &WantedSettings, deps: &WantedDeps) -> usize {
-    let mut statuses = vec![(RequestStatus::Failed, "missing")];
+    let mut statuses = vec![(RequestStatus::Failed, WatchKind::Missing)];
     if settings.watch_partial_albums {
-        statuses.push((RequestStatus::Incomplete, "partial"));
+        statuses.push((RequestStatus::Incomplete, WatchKind::Partial));
     }
     let mut enrolled = 0;
     for (status, kind) in statuses {
-        let rows = match deps.ledger.with_status(RequestKind::Album, status).await {
+        let rows = match deps.ledger.to_watch(status).await {
             Ok(rows) => rows,
             Err(error) => {
                 tracing::warn!(%status, ?error, "wanted enrolment could not read requests");
@@ -503,7 +503,7 @@ async fn enrol_watches(now: i64, settings: &WantedSettings, deps: &WantedDeps) -
                 artist_mbid: row.artist_mbid.clone(),
                 year: row.year,
                 cover_url: None,
-                kind: kind.to_owned(),
+                kind,
                 state: WatchState::Watching,
                 created_at: epoch(now),
                 first_release_date: date.found,
@@ -665,8 +665,9 @@ pub struct FollowDeps {
 pub async fn follow_tick(now: i64, deps: &FollowDeps) -> FollowSummary {
     let mut summary = FollowSummary::default();
     let today = (deps.today)();
-    // Unreadable release-type preferences skip the pass: cursors stay due
-    // and no release is recorded or marked known.
+    // Unreadable release-type preferences skip the pass: cursors stay due,
+    // no release is recorded or marked known, and waiting rows keep
+    // waiting until the preferences read again.
     let Some(preferences) = deps.preferences.read() else {
         return summary;
     };

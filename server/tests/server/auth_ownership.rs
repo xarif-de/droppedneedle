@@ -30,7 +30,7 @@ use droppedneedle_acquire::held::store::{
     EntryOrigin, GroupKey, HeldRoot, HeldRows, NewEntry, NewFile,
 };
 use droppedneedle_acquire::reason::Reason;
-use droppedneedle_acquire::requests::ledger::{RequestStatus, WantedWatch, WatchState};
+use droppedneedle_acquire::requests::ledger::{RequestStatus, WantedWatch, WatchKind, WatchState};
 use droppedneedle_acquire::requests::models::RequestKind;
 use droppedneedle_acquire::search_jobs::store::{COMPLETED, JobPayload, JobStore, NewJob};
 use serde_json::{Value, json};
@@ -101,9 +101,6 @@ enum Owned {
     Task,
     Held,
     SearchJob,
-    SpotifyJob,
-    /// Drop-import jobs and items, owned by one of two trusted users.
-    Drop,
     /// An edition's tag write, a management job one of two trusted users
     /// asked for.
     TagWrite,
@@ -123,14 +120,14 @@ const ADMITTED: u16 = 0;
 /// resource, destructive operations come last, since the owner pass runs
 /// them in order on one resource.
 const PATH_ID_ROWS: &[(Owned, &str, &str, u16, u16)] = &[
-    // Playlists: a private one is invisible to everyone else, admins
-    // included: admins never see another user's private playlist.
+    // Playlists: opening a private one answers its stub to everyone else,
+    // admins included, and every other route treats it as not there.
     (
         Owned::Playlist,
         "GET",
         "/api/v3/playlists/{playlist_id}",
-        404,
-        404,
+        403,
+        403,
     ),
     (
         Owned::Playlist,
@@ -348,9 +345,9 @@ const PATH_ID_ROWS: &[(Owned, &str, &str, u16, u16)] = &[
         403,
         ADMITTED,
     ),
-    // Requests (A's has failed): a requester or an admin. Retry and
-    // cancel answer another user as for an unknown id whatever the status,
-    // so they are tried on a failed and on a waiting request.
+    // Requests (A's has failed): a requester or an admin. Each answers
+    // another user as for an unknown id; retry and cancel whatever the
+    // status, so they are tried on a failed and on a waiting request.
     (
         Owned::Request,
         "POST",
@@ -369,14 +366,14 @@ const PATH_ID_ROWS: &[(Owned, &str, &str, u16, u16)] = &[
         Owned::Request,
         "DELETE",
         "/api/v3/requests/history/{musicbrainz_id}",
-        403,
+        404,
         ADMITTED,
     ),
     (
         Owned::TrackRequest,
         "POST",
         "/api/v3/requests/tracks/{musicbrainz_id}/from-album",
-        403,
+        404,
         ADMITTED,
     ),
     (
@@ -414,21 +411,14 @@ const PATH_ID_ROWS: &[(Owned, &str, &str, u16, u16)] = &[
         404,
         ADMITTED,
     ),
+    (
+        Owned::Wanted,
+        "DELETE",
+        "/api/v3/requests/wanted/{musicbrainz_id}",
+        404,
+        ADMITTED,
+    ),
     // Download tasks: owner or admin.
-    (
-        Owned::Task,
-        "GET",
-        "/api/v3/downloads/tasks/{task_id}",
-        403,
-        ADMITTED,
-    ),
-    (
-        Owned::Task,
-        "GET",
-        "/api/v3/downloads/tasks/{task_id}/files",
-        403,
-        ADMITTED,
-    ),
     (
         Owned::Task,
         "POST",
@@ -451,7 +441,6 @@ const PATH_ID_ROWS: &[(Owned, &str, &str, u16, u16)] = &[
         ADMITTED,
     ),
     // Held entries: owner or admin.
-    (Owned::Held, "GET", "/api/v3/held/{entry_id}", 404, ADMITTED),
     (
         Owned::Held,
         "GET",
@@ -517,22 +506,6 @@ const PATH_ID_ROWS: &[(Owned, &str, &str, u16, u16)] = &[
         403,
         403,
     ),
-    // Spotify import jobs are keyed by their user: nobody else finds one.
-    (
-        Owned::SpotifyJob,
-        "GET",
-        "/api/v3/acquire/spotify/jobs/{id}",
-        404,
-        404,
-    ),
-    // Drop imports, between two trusted users: owner or admin.
-    (
-        Owned::Drop,
-        "GET",
-        "/api/v3/import/jobs/{job_id}",
-        404,
-        ADMITTED,
-    ),
     // An edition's tag write, between two trusted users: writer or admin.
     (
         Owned::TagWrite,
@@ -567,6 +540,10 @@ const CALLER_KEYED_OPERATIONS: &[(&str, &str)] = &[
     ("GET", "/api/v3/remotes/{source}/connection"),
     ("PUT", "/api/v3/remotes/{source}/connection"),
     ("DELETE", "/api/v3/remotes/{source}/connection"),
+    (
+        "DELETE",
+        "/api/v3/discover/queue/ignored/{release_group_mbid}",
+    ),
 ];
 
 /// Operations that take a user-owned id in the body, each driven by
@@ -598,7 +575,6 @@ const EXEMPT_READS: &[(&str, &str)] = &[
         "/api/v3/library/contributions/",
         "contributions, shared by curators",
     ),
-    ("/api/v3/library/genres/", "shared library genres"),
     (
         "/api/v3/library/reviews/",
         "library reviews, shared by curators",
@@ -647,6 +623,16 @@ const EXACT_EXEMPTIONS: &[(&str, &str, &str)] = &[
         "POST",
         "/api/v3/discover/queue/preview/{release_group_mbid}",
         "looks up a preview for a catalog release group",
+    ),
+    (
+        "PUT",
+        "/api/v3/library/artists/{id}/musicbrainz-link",
+        "a shared library artist's MusicBrainz link, set by curators",
+    ),
+    (
+        "DELETE",
+        "/api/v3/library/artists/{id}/musicbrainz-link",
+        "a shared library artist's MusicBrainz link, set by curators",
     ),
     (
         "PUT",
@@ -803,11 +789,6 @@ const EXACT_EXEMPTIONS: &[(&str, &str, &str)] = &[
     ),
     ("PUT", "/api/v3/youtube/link/{album_id}", SHARED_LINK),
     ("DELETE", "/api/v3/youtube/link/{album_id}", SHARED_LINK),
-    (
-        "DELETE",
-        "/api/v3/youtube/track-link/{album_id}/{disc_number}/{track_number}",
-        SHARED_LINK,
-    ),
 ];
 
 /// The document's user and curator operations, as (method, path).
@@ -914,6 +895,9 @@ fn fill(template: &str, ids: &Ids) -> String {
 }
 
 const PNG: &str = "iVBORw0KGgo=";
+/// Bytes that differ from the seeded cover, so a cover write that got through
+/// shows in the owner's read.
+const OTHER_PNG: &str = "AQIDBA==";
 
 fn track() -> Value {
     json!({"track_name": "One", "artist_name": "Someone", "album_name": "Something"})
@@ -926,11 +910,11 @@ fn body(method: &str, template: &str, ids: &Ids) -> Option<Value> {
     match (method, template) {
         ("PUT", "/api/v3/playlists/{playlist_id}") => Some(json!({"name": "Renamed"})),
         ("POST", "/api/v3/playlists/{playlist_id}/cover") => {
-            Some(json!({"content_type": "image/png", "image_base64": PNG}))
+            Some(json!({"content_type": "image/png", "image_base64": OTHER_PNG}))
         }
         ("POST", "/api/v3/playlists/{playlist_id}/tracks") => Some(json!({"tracks": [track()]})),
         ("PATCH", "/api/v3/playlists/{playlist_id}/tracks/reorder") => {
-            Some(json!({"track_id": id("track_id"), "new_position": 0}))
+            Some(json!({"track_id": id("track_id"), "new_position": 1}))
         }
         ("PATCH", "/api/v3/playlists/{playlist_id}/tracks/{track_id}") => {
             Some(json!({"source_type": "local"}))
@@ -1170,7 +1154,7 @@ async fn seed(app: &TestApp, kind: Owned, owner: &Who, n: u32) -> Ids {
                     artist_mbid: None,
                     year: None,
                     cover_url: None,
-                    kind: "missing".to_owned(),
+                    kind: WatchKind::Missing,
                     state: WatchState::Stopped,
                     created_at: 1_700_000_000,
                     first_release_date: None,
@@ -1275,38 +1259,12 @@ async fn seed(app: &TestApp, kind: Owned, owner: &Who, n: u32) -> Ids {
             );
             ids.insert("job_id", job_id);
         }
-        Owned::SpotifyJob => {
-            let spotify_id = format!("spotify-list-{n}");
-            let imports = &app.state().acquire.imports;
-            let playlist_id = imports
-                .spotify_playlists
-                .create(&owner.id, "Imported", &format!("spotify:{spotify_id}"))
-                .await
-                .expect("playlist seeds");
-            imports
-                .spotify_imports
-                .seed_done(&owner.id, &spotify_id, &playlist_id)
-                .await
-                .expect("import seeds");
-            ids.insert("id", spotify_id);
-        }
         Owned::TagWrite => {
             let album = format!("tag-write-album-{n}");
             let job = format!("tag-write-job-{n}");
             seed_tag_write(app, owner, &album, &job).await;
             ids.insert("album_id", album);
             ids.insert("job_id", job);
-        }
-        Owned::Drop => {
-            let job = drop_upload(app, owner).await;
-            ids.insert("job_id", job["id"].as_str().expect("job id").to_owned());
-            ids.insert(
-                "item_id",
-                job["items"][0]["id"]
-                    .to_string()
-                    .trim_matches('"')
-                    .to_owned(),
-            );
         }
     }
     ids
@@ -1365,53 +1323,6 @@ async fn seed_tag_write(app: &TestApp, owner: &Who, album: &str, job: &str) {
     .await;
 }
 
-/// Upload one audio file to the drop import as `owner` and wait for the
-/// job to settle with its item.
-async fn drop_upload(app: &TestApp, owner: &Who) -> Value {
-    let audio = std::fs::read(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/library/flac_full_01.flac"
-    ))
-    .expect("fixture reads");
-    let boundary = "ownership-boundary";
-    let mut form = format!(
-        "--{boundary}\r\nContent-Disposition: form-data; name=\"files\"; filename=\"01 One.flac\"\r\n\
-         Content-Type: audio/flac\r\n\r\n"
-    )
-    .into_bytes();
-    form.extend_from_slice(&audio);
-    form.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
-    app.state().auth.limits.reset();
-    let content_type = format!("multipart/form-data; boundary={boundary}");
-    let (status, _, bytes) = app
-        .raw_bytes(
-            "POST",
-            "/api/v3/import/uploads",
-            &[
-                ("authorization", owner.auth.as_str()),
-                ("content-type", content_type.as_str()),
-            ],
-            form,
-        )
-        .await;
-    let job: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-    assert!(status.is_success(), "upload: {status} {job}");
-    let job_id = job["id"].as_str().expect("job id").to_owned();
-    app.until("the drop job settles with its item", || async {
-        let (_, job) = call(
-            app,
-            owner,
-            "GET",
-            &format!("/api/v3/import/jobs/{job_id}"),
-            None,
-        )
-        .await;
-        (job["status"] != json!("processing") && job["items"][0]["id"] != Value::Null)
-            .then_some(job)
-    })
-    .await
-}
-
 /// What `owner` sees of the resource: the fields another user's call
 /// could change.
 async fn look(app: &TestApp, kind: Owned, owner: &Who, ids: &Ids) -> Value {
@@ -1423,10 +1334,19 @@ async fn look(app: &TestApp, kind: Owned, owner: &Who, ids: &Ids) -> Value {
     match kind {
         Owned::Playlist | Owned::PublicPlaylist => {
             let playlist = read(fill("/api/v3/playlists/{playlist_id}", ids)).await;
+            let (status, _, cover) = app
+                .raw_bytes(
+                    "GET",
+                    &fill("/api/v3/playlists/{playlist_id}/cover", ids),
+                    &[("authorization", owner.auth.as_str())],
+                    Vec::new(),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "the owner reads the cover");
             json!([
                 playlist["name"],
                 playlist["is_public"],
-                playlist["custom_cover_url"],
+                cover,
                 playlist["tracks"]
             ])
         }
@@ -1449,14 +1369,18 @@ async fn look(app: &TestApp, kind: Owned, owner: &Who, ids: &Ids) -> Value {
             read("/api/v3/requests/history".to_owned()).await,
         ]),
         Owned::Wanted => read("/api/v3/requests/wanted".to_owned()).await,
-        Owned::Task => read(fill("/api/v3/downloads/tasks/{task_id}", ids)).await,
+        Owned::Task => task_row(
+            ids["task_id"].as_str(),
+            read("/api/v3/downloads/tasks?page_size=100".to_owned()).await,
+        ),
         Owned::Held | Owned::HeldMatch => json!([
             read("/api/v3/held".to_owned()).await,
-            read(format!("/api/v3/downloads/tasks/{}", ids["source_task_id"])).await,
+            task_row(
+                ids["source_task_id"].as_str(),
+                read("/api/v3/downloads/tasks?page_size=100".to_owned()).await
+            ),
         ]),
         Owned::SearchJob => read(fill("/api/v3/downloads/search/{job_id}", ids)).await,
-        Owned::SpotifyJob => read(fill("/api/v3/acquire/spotify/jobs/{id}", ids)).await,
-        Owned::Drop => read(fill("/api/v3/import/jobs/{job_id}", ids)).await,
         Owned::TagWrite => {
             read(fill(
                 "/api/v3/library/albums/{album_id}/edition/tags/{job_id}",
@@ -1465,6 +1389,89 @@ async fn look(app: &TestApp, kind: Owned, owner: &Who, ids: &Ids) -> Value {
             .await
         }
     }
+}
+
+/// Upload one file as `owner` and wait for its job to settle.
+async fn drop_upload(app: &TestApp, owner: &Who) -> String {
+    let audio = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/library/flac_full_01.flac"
+    ))
+    .expect("fixture reads");
+    let boundary = "ownership-boundary";
+    let mut form = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"files\"; filename=\"01.flac\"\r\n\
+         Content-Type: audio/flac\r\n\r\n"
+    )
+    .into_bytes();
+    form.extend_from_slice(&audio);
+    form.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    app.state().auth.limits.reset();
+    let content_type = format!("multipart/form-data; boundary={boundary}");
+    let (status, _, bytes) = app
+        .raw_bytes(
+            "POST",
+            "/api/v3/import/uploads",
+            &[
+                ("authorization", owner.auth.as_str()),
+                ("content-type", content_type.as_str()),
+            ],
+            form,
+        )
+        .await;
+    let job: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    assert!(status.is_success(), "upload: {status} {job}");
+    job["id"].as_str().expect("job id").to_owned()
+}
+
+/// A person's uploads stay theirs: another trusted user does not see them,
+/// asking for everyone's does not help, and an admin who asks does see them.
+#[tokio::test]
+async fn drop_import_jobs_stay_with_their_owner() {
+    let app = TestApp::start("auth-drop-jobs").await;
+    let admin = Who {
+        id: String::new(),
+        username: "admin".to_owned(),
+        auth: app.login_admin().await,
+    };
+    let tia = trusted(&app, &admin, "tia").await;
+    let tom = trusted(&app, &admin, "tom").await;
+    // An upload needs a library folder to import into.
+    let music = app.config.root_app_dir.join("music");
+    std::fs::create_dir_all(&music).expect("music folder");
+    app.add_library_folder("music", &music).await;
+    let job = drop_upload(&app, &tia).await;
+    let lists = async |who: &Who, uri: &str| {
+        let (status, body) = call(&app, who, "GET", uri, None).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        body["jobs"]
+            .as_array()
+            .expect("jobs")
+            .iter()
+            .any(|row| row["id"] == json!(job))
+    };
+    assert!(lists(&tia, "/api/v3/import/jobs").await, "the owner's list");
+    assert!(
+        !lists(&tom, "/api/v3/import/jobs").await,
+        "another trusted user's list"
+    );
+    assert!(
+        !lists(&tom, "/api/v3/import/jobs?all=true").await,
+        "all=true is for admins"
+    );
+    assert!(
+        lists(&admin, "/api/v3/import/jobs?all=true").await,
+        "an admin's full list"
+    );
+}
+
+/// One task out of the owner's download list.
+fn task_row(task_id: &str, list: Value) -> Value {
+    list["items"]
+        .as_array()
+        .and_then(|items| items.iter().find(|task| task["id"] == json!(task_id)))
+        .cloned()
+        .unwrap_or(Value::Null)
 }
 
 fn answered(status: StatusCode, expected: u16) -> bool {
@@ -1507,13 +1514,11 @@ async fn another_users_resources_stay_out_of_reach() {
         Owned::Held,
         Owned::HeldMatch,
         Owned::SearchJob,
-        Owned::SpotifyJob,
-        Owned::Drop,
         Owned::TagWrite,
     ];
     let mut wrong = Vec::new();
     for (n, kind) in (0u32..).step_by(2).zip(families) {
-        let (owner, other) = if matches!(kind, Owned::Drop | Owned::TagWrite | Owned::HeldMatch) {
+        let (owner, other) = if matches!(kind, Owned::TagWrite | Owned::HeldMatch) {
             (&tia, &tom)
         } else {
             (&ada, &bob)
@@ -1567,6 +1572,26 @@ async fn another_users_resources_stay_out_of_reach() {
     app.stop().await;
 }
 
+/// Connect Apps holds no secret: any signed-in user reads it, only an admin
+/// saves it.
+#[tokio::test]
+async fn a_plain_user_reads_connect_apps_and_cannot_save_it() {
+    let app = TestApp::start("auth-connect-apps").await;
+    let ada = user(&app, "ada").await;
+    let (status, section) = call(&app, &ada, "GET", "/api/v3/settings/connect-apps", None).await;
+    assert_eq!(status, StatusCode::OK, "{section}");
+    let (status, body) = call(
+        &app,
+        &ada,
+        "PUT",
+        "/api/v3/settings/connect-apps",
+        Some(section),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    app.stop().await;
+}
+
 /// Favourites, ratings, follows, play marks, remote-server links and
 /// Navidrome folder choices belong to their caller: A's never show in B's
 /// reads, and B's writes never touch A's.
@@ -1604,12 +1629,6 @@ async fn caller_keyed_state_stays_with_its_caller() {
     )
     .await;
     ok(status, &body, "A favourites");
-    let (status, body) = call(&app, &bob, "GET", "/api/v3/favorites", None).await;
-    ok(status, &body, "B lists favourites");
-    assert!(
-        !body.to_string().contains(album),
-        "B sees A's favourite: {body}"
-    );
     let (status, body) = call(&app, &bob, "GET", hearted, None).await;
     ok(status, &body, "B lists favourite albums");
     assert_eq!(body["items"], json!([]), "B sees A's favourite album");
@@ -1677,8 +1696,10 @@ async fn caller_keyed_state_stays_with_its_caller() {
         !body.to_string().contains(artist),
         "B lists A's follow: {body}"
     );
-    call(&app, &bob, "PUT", &auto, Some(json!({"enabled": false}))).await;
-    call(&app, &bob, "PUT", &follow, Some(json!({"followed": false}))).await;
+    let (status, body) = call(&app, &bob, "PUT", &auto, Some(json!({"enabled": false}))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "B follows nothing: {body}");
+    let (status, body) = call(&app, &bob, "PUT", &follow, Some(json!({"followed": false}))).await;
+    ok(status, &body, "B unfollows");
     let (_, body) = call(&app, &ada, "GET", &status_uri, None).await;
     assert_eq!(body, adas, "B's writes changed A's follow");
 
@@ -1696,10 +1717,38 @@ async fn caller_keyed_state_stays_with_its_caller() {
     let (status, body) = call(&app, &bob, "DELETE", "/api/v3/now-playing?device=web", None).await;
     ok(status, &body, "B stops");
     let (_, body) = call(&app, &ada, "GET", "/api/v3/now-playing", None).await;
+    let playing = body["sessions"].as_array().expect("sessions");
     assert!(
-        body.to_string().contains("ada"),
+        playing.iter().any(|row| row["user_name"] == json!("ada")),
         "B's stop ended A's play: {body}"
     );
+
+    // Hidden albums: both hid the same one, and B's un-hide takes only B's.
+    let hidden_album = "6c5a1c8e-2f0b-4d8a-9b7e-3f1d2c4a5b60";
+    for who in [&ada, &bob] {
+        app.seed(&format!(
+            "INSERT INTO catalog_ignored_releases (user_id, release_group_mbid_lower, \
+             release_group_mbid, artist_mbid, release_name, artist_name, ignored_at) \
+             VALUES ('{}', '{hidden_album}', '{hidden_album}', '', 'Album', 'Artist', 1000)",
+            who.id
+        ))
+        .await;
+    }
+    let ledger = "/api/v3/discover/queue/ignored";
+    let unhide = format!("{ledger}/{hidden_album}");
+    let (status, body) = call(&app, &bob, "DELETE", &unhide, None).await;
+    ok(status, &body, "B un-hides");
+    let (_, body) = call(&app, &bob, "GET", ledger, None).await;
+    assert_eq!(body["items"], json!([]), "B's album stays hidden: {body}");
+    let (_, body) = call(&app, &ada, "GET", ledger, None).await;
+    assert_eq!(
+        body["items"][0]["release_group_mbid"], hidden_album,
+        "B's un-hide took A's: {body}"
+    );
+    let (status, body) = call(&app, &bob, "DELETE", &unhide, None).await;
+    ok(status, &body, "B un-hides again, with nothing left to take");
+    let (_, body) = call(&app, &ada, "GET", ledger, None).await;
+    assert_eq!(body["items"].as_array().map(Vec::len), Some(1), "{body}");
 
     // Remote-server links and folder choices, against the mock Navidrome.
     let navidrome = droppedneedle_testkit::remotes::serve_navidrome()
@@ -1729,6 +1778,10 @@ async fn caller_keyed_state_stays_with_its_caller() {
     let (status, body) = call(&app, &bob, "GET", connection, None).await;
     ok(status, &body, "B reads the link");
     assert_eq!(body["connected"], json!(false), "B sees A's link: {body}");
+    assert!(
+        body["server_url"].is_null(),
+        "B sees the server address: {body}"
+    );
     let (status, body) = call(&app, &bob, "DELETE", connection, None).await;
     ok(status, &body, "B unlinks");
     let (_, body) = call(&app, &ada, "GET", connection, None).await;
@@ -1736,6 +1789,11 @@ async fn caller_keyed_state_stays_with_its_caller() {
         body["connected"],
         json!(true),
         "B's unlink ended A's: {body}"
+    );
+    assert_eq!(
+        body["server_url"],
+        json!(navidrome.base_url),
+        "A's linked tile lost the server address: {body}"
     );
 
     let folders = "/api/v3/remotes/navidrome/folders";
@@ -1771,6 +1829,52 @@ async fn caller_keyed_state_stays_with_its_caller() {
         body["mode"],
         json!("selected"),
         "B's choice changed A's: {body}"
+    );
+
+    // With a shared Navidrome account, B is still not linked: no address.
+    let (status, mut settings) =
+        call(&app, &admin, "GET", "/api/v3/settings/navidrome", None).await;
+    ok(status, &settings, "admin reads Navidrome settings");
+    settings["username"] = json!(droppedneedle_testkit::remotes::NAVIDROME_USER);
+    settings["password"] = json!("pw");
+    let (status, body) = call(
+        &app,
+        &admin,
+        "PUT",
+        "/api/v3/settings/navidrome",
+        Some(settings),
+    )
+    .await;
+    ok(status, &body, "admin shares the Navidrome account");
+    let (status, body) = call(&app, &bob, "DELETE", connection, None).await;
+    ok(status, &body, "B drops its own link");
+    let (status, body) = call(&app, &bob, "GET", connection, None).await;
+    ok(status, &body, "B reads the shared account");
+    assert_eq!(
+        body["account_mode"],
+        json!("shared"),
+        "B is not on the shared account: {body}"
+    );
+    assert!(
+        body["server_url"].is_null(),
+        "B sees the server address on the shared account: {body}"
+    );
+
+    // Clearing finished watches: B's reaches only B's, an admin's everyone's.
+    let ids = seed(&app, Owned::Wanted, &ada, 900).await;
+    let stop = fill("/api/v3/requests/wanted/{musicbrainz_id}/stop", &ids);
+    let (status, body) = call(&app, &ada, "POST", &stop, None).await;
+    ok(status, &body, "A stops its watch");
+    let clear = "/api/v3/requests/wanted/clear-finished";
+    let (status, body) = call(&app, &bob, "POST", clear, None).await;
+    ok(status, &body, "B clears its finished watches");
+    assert_eq!(body["removed"], json!(0), "B reached A's watch: {body}");
+    let (status, body) = call(&app, &admin, "POST", clear, None).await;
+    ok(status, &body, "admin clears every finished watch");
+    assert_eq!(
+        body["removed"],
+        json!(1),
+        "admin's clear missed A's: {body}"
     );
     app.stop().await;
 }
@@ -1845,4 +1949,172 @@ async fn body_ids_never_reach_another_users_resources() {
     let (status, body) = call(&app, &ada, "POST", uri, suggest).await;
     assert!(answered(status, ADMITTED), "owner: {status} {body}");
     app.stop().await;
+}
+
+/// Opening another user's private playlist answers exactly the stub the
+/// caller's list shows, admins included, and an unknown id stays 404.
+#[tokio::test]
+async fn a_private_playlist_opens_to_its_stub_and_nothing_more() {
+    let app = TestApp::start("auth-playlist-locked").await;
+    let admin = Who {
+        id: String::new(),
+        username: "admin".to_owned(),
+        auth: app.login_admin().await,
+    };
+    let ada = user(&app, "ada").await;
+    let bob = user(&app, "bob").await;
+    let ids = seed(&app, Owned::Playlist, &ada, 0).await;
+    let uri = fill("/api/v3/playlists/{playlist_id}", &ids);
+
+    for who in [&bob, &admin] {
+        let (status, body) = call(&app, who, "GET", &uri, None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["error"]["code"], "PLAYLIST_PRIVATE");
+        let (_, list) = call(&app, who, "GET", "/api/v3/playlists", None).await;
+        let listed = list["playlists"]
+            .as_array()
+            .expect("playlists")
+            .iter()
+            .find(|row| row["id"] == ids["playlist_id"].as_str())
+            .expect("the list shows the stub");
+        assert_eq!(&body["error"]["details"], listed);
+        assert_eq!(body["error"]["details"]["track_count"], 2);
+        let text = body.to_string();
+        assert!(
+            !text.contains("Mine") && !text.contains("Someone"),
+            "{text}"
+        );
+
+        let (status, _) = call(&app, who, "GET", "/api/v3/playlists/no-such-id", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+    app.stop().await;
+}
+
+/// An ownerless playlist from v2, with one entry and a cover.
+async fn seed_stray(app: &TestApp, id: &str, public: bool) {
+    app.seed(format!(
+        "INSERT INTO catalog_playlists (id, name, created_at, updated_at, is_public) \
+             VALUES ('{id}', 'Stray {id}', 0, 0, {public}); \
+             INSERT INTO catalog_playlist_tracks (id, playlist_id, position, track_name, \
+             artist_name, album_name, source_type, created_at) \
+             VALUES ('{id}-entry', '{id}', 0, 'T', 'A', 'B', 'local', 0); \
+             INSERT INTO catalog_playlist_covers (playlist_id, content_type, image, updated_at) \
+             VALUES ('{id}', 'image/png', x'00', 0);",
+        public = i64::from(public),
+    ))
+    .await;
+}
+
+/// Rows left of a playlist: itself, its entries, its cover.
+fn rows_of(app: &TestApp, id: &str) -> [i64; 3] {
+    let db = app.db();
+    let count = |sql: &str| -> i64 {
+        db.query_row(sql, [id], |row| row.get(0))
+            .expect("rows count")
+    };
+    [
+        count("SELECT COUNT(*) FROM catalog_playlists WHERE id = ?1"),
+        count("SELECT COUNT(*) FROM catalog_playlist_tracks WHERE playlist_id = ?1"),
+        count("SELECT COUNT(*) FROM catalog_playlist_covers WHERE playlist_id = ?1"),
+    ]
+}
+
+/// Who may delete an ownerless playlist: only an admin. Everyone else gets
+/// what `require_owner` answers: 403 for a public one, 404 for a private one.
+/// An admin may read a private one no better than before, or change either.
+#[tokio::test]
+async fn only_an_admin_deletes_an_ownerless_playlist() {
+    let app = TestApp::start("auth-playlist-strays").await;
+    let admin = Who {
+        id: String::new(),
+        username: "admin".to_owned(),
+        auth: app.login_admin().await,
+    };
+    let ada = user(&app, "ada").await;
+    let tia = trusted(&app, &admin, "tia").await;
+    seed_stray(&app, "public", true).await;
+    seed_stray(&app, "private", false).await;
+
+    for who in [&ada, &tia] {
+        for (id, want) in [("public", 403), ("private", 404)] {
+            let uri = format!("/api/v3/playlists/{id}");
+            let (status, body) = call(&app, who, "DELETE", &uri, None).await;
+            assert_eq!(
+                status.as_u16(),
+                want,
+                "{} deleting {id}: {body}",
+                who.username
+            );
+            assert_eq!(rows_of(&app, id), [1, 1, 1], "{id} stays");
+        }
+        let (status, body) = call(&app, who, "GET", "/api/v3/playlists/private", None).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "not listed, not opened: {body}"
+        );
+        let (status, list) = call(&app, who, "GET", "/api/v3/playlists", None).await;
+        assert_eq!(status, StatusCode::OK, "{list}");
+        let rows = list["playlists"].as_array().expect("playlists");
+        assert_eq!(rows.len(), 1, "a private stray is not listed: {list}");
+        assert_eq!(rows[0]["id"], "public");
+        assert_eq!(rows[0]["can_delete"], false);
+    }
+
+    let (_, list) = call(&app, &admin, "GET", "/api/v3/playlists", None).await;
+    let rows = list["playlists"].as_array().expect("playlists");
+    let row = |id: &str| {
+        rows.iter()
+            .find(|row| row["id"] == id)
+            .unwrap_or_else(|| panic!("{id} listed: {list}"))
+    };
+    assert_eq!(row("public")["can_delete"], true);
+    assert_eq!(row("public")["name"], "Stray public");
+    assert_eq!(row("private")["can_delete"], true);
+    assert_eq!(row("private")["is_redacted"], true);
+    assert!(row("private").get("name").is_none(), "{list}");
+
+    let (status, detail) = call(&app, &admin, "GET", "/api/v3/playlists/public", None).await;
+    assert_eq!(status, StatusCode::OK, "{detail}");
+    assert_eq!(detail["can_delete"], true);
+    let (status, locked) = call(&app, &admin, "GET", "/api/v3/playlists/private", None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{locked}");
+    assert_eq!(&locked["error"]["details"], row("private"));
+    let rename = || Some(json!({"name": "Mine now"}));
+    let (status, _) = call(&app, &admin, "PUT", "/api/v3/playlists/public", rename()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = call(&app, &admin, "PUT", "/api/v3/playlists/private", rename()).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    for id in ["public", "private"] {
+        let uri = format!("/api/v3/playlists/{id}");
+        let (status, body) = call(&app, &admin, "DELETE", &uri, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(rows_of(&app, id), [0, 0, 0], "{id} went with its rows");
+    }
+}
+
+/// Deleting a user through the real admin route takes their playlists,
+/// entries and covers, and leaves another user's alone.
+#[tokio::test]
+async fn deleting_a_user_deletes_their_playlists() {
+    let app = TestApp::start("auth-playlist-cascade").await;
+    let admin = Who {
+        id: String::new(),
+        username: "admin".to_owned(),
+        auth: app.login_admin().await,
+    };
+    let ada = user(&app, "ada").await;
+    let bob = user(&app, "bob").await;
+    let adas = seed(&app, Owned::Playlist, &ada, 0).await["playlist_id"].clone();
+    let bobs = seed(&app, Owned::Playlist, &bob, 1).await["playlist_id"].clone();
+    assert_eq!(rows_of(&app, &adas), [1, 2, 1]);
+
+    let uri = format!("/api/v3/admin/users/{}", ada.id);
+    let (status, body) = call(&app, &admin, "DELETE", &uri, None).await;
+    assert!(status.is_success(), "{status}: {body}");
+
+    assert_eq!(rows_of(&app, &adas), [0, 0, 0]);
+    assert_eq!(rows_of(&app, &bobs), [1, 2, 1]);
 }

@@ -22,7 +22,7 @@ vi.mock('$lib/queries/library-management/LibraryManagementQueries.svelte', () =>
 	getLibraryManagementOperationResultsQuery: () => h.results
 }));
 vi.mock('$lib/queries/library-management/LibraryManagementMutations.svelte', () => ({
-	controlLibraryManagementOperationMutation: (action: string) => ({
+	createControlLibraryManagementOperationMutation: (action: string) => ({
 		mutateAsync: action === 'pause' ? h.pause : action === 'resume' ? h.resume : h.stop,
 		isPending: false
 	}),
@@ -42,7 +42,6 @@ function operation(overrides: Record<string, unknown> = {}): Record<string, unkn
 		profile_name: 'Picard-style Organizer',
 		profile_revision: 'profile-revision-1',
 		settings_revision: 'settings-1',
-		policy_revision: 'policy-1',
 		catalog_revision: 1,
 		proposed_settings_revision: null,
 		target_root_id: null,
@@ -133,7 +132,7 @@ describe('LibraryManagementOperationPage', () => {
 			.toBeVisible();
 		await expect
 			.element(page.getByRole('link', { name: 'Open baseline restore...' }))
-			.toHaveAttribute('href', '/library/management?runner=baseline_restore');
+			.toHaveAttribute('href', '/library/management?tab=organize&runner=baseline_restore');
 		await page.getByRole('button', { name: 'Preview Undo...' }).click();
 		await expect
 			.element(page.getByRole('heading', { name: 'Generate an Undo preview?' }))

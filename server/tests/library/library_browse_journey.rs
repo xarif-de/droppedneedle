@@ -100,13 +100,13 @@ async fn fixture() -> Fixture {
          (local_track_id, provider, recording_mbid, decision_source, selected_at) VALUES \
          ('t1', 'musicbrainz', 'rec-opener', 'manual', 1000)",
         "INSERT INTO library_identify_reviews (id, local_album_id, reason_code, candidates_json, \
-         state, created_ms, updated_ms) VALUES \
+         state, created_at, updated_at) VALUES \
          ('rv1', 'al2', 'low_confidence', '[]', 'pending', 1, 1), \
          ('rv2', 'al1', 'low_confidence', '[]', 'approved', 1, 1)",
         "INSERT INTO library_scan_runs (id, kind, trigger, state, phase, aggregate_scope, \
          queued_at, updated_at, terminal_at) VALUES \
-         ('run1', 'incremental', 'manual', 'completed', 'reconciling', '{}', 10, 20, 2000.5), \
-         ('run2', 'incremental', 'manual', 'failed', 'reconciling', '{}', 30, 40, 9000000000.0)",
+         ('run1', 'incremental', 'manual', 'completed', 'reconciling', '{}', 10, 20, 2000500), \
+         ('run2', 'incremental', 'manual', 'failed', 'reconciling', '{}', 30, 40, 9000000000000)",
         "INSERT INTO request_history (musicbrainz_id_lower, musicbrainz_id, artist_name, album_title, \
          requested_at, status) VALUES ('rg-req', 'RG-REQ', 'Someone', 'Wanted', 1704067200000, 'pending')",
     ]
@@ -190,53 +190,6 @@ async fn browse_gaps_journey() {
         )
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    // The unfiltered form: every held release group and open request.
-    let (status, body) = fixture
-        .json(&fixture.user, "GET", "/library/mbids", None)
-        .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(
-        body,
-        json!({"mbids": ["rg1"], "requested_mbids": ["rg-req"]})
-    );
-
-    // Tags straight from the file: admins only, with v2's answers for a
-    // file that is gone or unreadable.
-    let (status, body) = fixture
-        .json(&fixture.admin, "GET", "/library/tracks/t1/tags", None)
-        .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["title"], "Airbag");
-    assert_eq!(
-        body["musicbrainz_release_group_id"],
-        "b1392450-e666-3926-a536-22c65f834433"
-    );
-    let (status, body) = fixture
-        .json(&fixture.admin, "GET", "/library/tracks/t2/tags", None)
-        .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert_eq!(body["error"]["message"], "Could not read the audio file.");
-    let (status, body) = fixture
-        .json(&fixture.admin, "GET", "/library/tracks/t3/tags", None)
-        .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert_eq!(
-        body["error"]["message"],
-        "The audio file is no longer present on disk."
-    );
-    let (status, _) = fixture
-        .json(&fixture.admin, "GET", "/library/tracks/t4/tags", None)
-        .await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
-    let (status, _) = fixture
-        .json(&fixture.admin, "GET", "/library/tracks/nope/tags", None)
-        .await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
-    let (status, _) = fixture
-        .json(&fixture.user, "GET", "/library/tracks/t1/tags", None)
-        .await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
-
     // Album status by MusicBrainz id: tiers judged against the cutoff.
     let (status, body) = fixture
         .json(&fixture.user, "GET", "/library/albums/rg1/status", None)
@@ -300,7 +253,7 @@ async fn browse_gaps_journey() {
         .app
         .db()
         .query_row(
-            "SELECT MAX(terminal_at) FROM library_scan_runs WHERE state = 'completed'",
+            "SELECT MAX(terminal_at) / 1000.0 FROM library_scan_runs WHERE state = 'completed'",
             [],
             |row| row.get(0),
         )
@@ -312,9 +265,13 @@ async fn browse_gaps_journey() {
     assert_eq!(body["last_scan_at"], as_sent);
 
     // Track identity and quality fields.
-    let (_, body) = fixture
-        .json(&fixture.user, "GET", "/library/tracks/t1", None)
+    let (_, tracks) = fixture
+        .json(&fixture.user, "GET", "/library/tracks", None)
         .await;
+    let body = tracks["items"]
+        .as_array()
+        .and_then(|items| items.iter().find(|track| track["id"] == "t1"))
+        .expect("track listed");
     assert_eq!(body["recording_mbid"], "rec-opener");
     assert_eq!(body["release_group_mbid"], "RG1");
     assert_eq!(body["artist_mbid"], "mb-aurora");

@@ -2,6 +2,7 @@
 
 use droppedneedle_kernel::error::ApiError;
 
+pub mod artist_link;
 pub mod contrib;
 pub mod corrections;
 pub mod edition;
@@ -11,10 +12,10 @@ pub mod history;
 pub mod management;
 pub mod management_tools;
 pub mod models;
-pub mod mutations;
 pub mod operations;
 pub mod reconcile;
 pub mod recycle_bin;
+pub mod removal;
 pub mod repairs;
 pub mod reviews;
 pub mod routes;

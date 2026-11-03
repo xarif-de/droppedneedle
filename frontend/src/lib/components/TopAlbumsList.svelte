@@ -5,7 +5,7 @@
 	import CoverPlaceholder from '$lib/ui/CoverPlaceholder.svelte';
 	import type { AlbumRef } from '$lib/queries/discover/types';
 	import { libraryStore } from '$lib/stores/library';
-	import { requestAlbum } from '$lib/queries/downloads/DownloadMutations.svelte';
+	import { createRequestAlbumMutation } from '$lib/queries/downloads/DownloadMutations.svelte';
 	import { withBasePath } from '$lib/utils/basePath';
 	import Button from '$lib/ui/Button.svelte';
 	import Card from '$lib/ui/Card.svelte';
@@ -25,24 +25,21 @@
 
 	let requestingIds = new SvelteSet<string>();
 
-	const topAlbumRequest = requestAlbum();
+	const topAlbumRequest = createRequestAlbumMutation();
 
 	let libraryMbids = new SvelteSet<string>();
 	let requestedMbids = new SvelteSet<string>();
-	let storeInitialized = $state(false);
 
 	onMount(() => {
 		const unsubscribe = libraryStore.subscribe((state) => {
 			libraryMbids = new SvelteSet(state.mbidSet);
 			requestedMbids = new SvelteSet(state.requestedSet);
-			storeInitialized = state.initialized;
 		});
 		return unsubscribe;
 	});
 
 	function isInLibrary(album: AlbumRef): boolean {
 		const mbid = album.musicbrainz_id?.toLowerCase();
-		if (storeInitialized) return mbid ? libraryMbids.has(mbid) : false;
 		return album.in_library || (mbid ? libraryMbids.has(mbid) : false);
 	}
 

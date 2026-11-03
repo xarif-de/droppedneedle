@@ -12,24 +12,46 @@ const gitignorePath = fileURLToPath(new URL('./.gitignore', import.meta.url));
 
 // Writes to the query cache must go through the persister helpers.
 const queryClientRules = [
-	// Ensure not to call queryClient.setQueriesData or queryClient.setQueryData directly, as this will bypass the persister and lead to data loss on page refresh.
+	// Ensure not to call setQueriesData or setQueryData on any client directly, whatever the variable is called, as this will bypass the persister and lead to data loss on page refresh.
 	{
-		selector:
-			"CallExpression[callee.object.name='queryClient'][callee.property.name='setQueriesData']",
+		selector: "CallExpression[callee.property.name='setQueriesData']",
 		message:
-			"Direct use of 'queryClient.setQueriesData' is forbidden. Please use 'setQueryDataWithPersister' per matching query key instead (no plural helper exists)."
+			"Direct use of 'setQueriesData' is forbidden. Please use 'setQueryDataWithPersister' per matching query key instead (no plural helper exists)."
 	},
 	{
-		selector:
-			"CallExpression[callee.object.name='queryClient'][callee.property.name='setQueryData']",
+		selector: "CallExpression[callee.property.name='setQueryData']",
 		message:
-			"Direct use of 'queryClient.setQueryData' is forbidden. Please use the 'setQueryDataWithPersister' function instead."
+			"Direct use of 'setQueryData' is forbidden. Please use the 'setQueryDataWithPersister' function instead."
 	},
 	{
-		selector:
-			"CallExpression[callee.object.name='queryClient'][callee.property.name='invalidateQueries']",
+		selector: "CallExpression[callee.property.name='invalidateQueries']",
 		message:
-			"Direct use of 'queryClient.invalidateQueries' is forbidden. Please use the custom 'invalidateQueriesWithPersister' hook instead."
+			"Direct use of 'invalidateQueries' is forbidden. Please use the custom 'invalidateQueriesWithPersister' hook instead."
+	}
+];
+
+// A mutation hook exported from lib/queries is create<Action>Mutation. Matches
+// an exported function that returns a call to any *Mutation builder, and one
+// taken from a settings section's save.
+const MUTATION_HOOK_NAME = '/^create[A-Z]\\w*Mutation$/';
+const MUTATION_BUILDER = '/Mutation$/';
+const mutationNameMessage = 'A mutation hook is named create<Action>Mutation.';
+const mutationNameRules = [
+	{
+		selector: `ExportNamedDeclaration VariableDeclarator[id.name!=${MUTATION_HOOK_NAME}] > ArrowFunctionExpression > CallExpression[callee.name=${MUTATION_BUILDER}]`,
+		message: mutationNameMessage
+	},
+	{
+		selector: `ExportNamedDeclaration VariableDeclarator[id.name!=${MUTATION_HOOK_NAME}] > ArrowFunctionExpression > BlockStatement > ReturnStatement > CallExpression[callee.name=${MUTATION_BUILDER}]`,
+		message: mutationNameMessage
+	},
+	{
+		selector: `ExportNamedDeclaration > FunctionDeclaration[id.name!=${MUTATION_HOOK_NAME}] > BlockStatement > ReturnStatement > CallExpression[callee.name=${MUTATION_BUILDER}]`,
+		message: mutationNameMessage
+	},
+	{
+		selector: `ExportNamedDeclaration VariableDeclarator[id.name!=${MUTATION_HOOK_NAME}] > MemberExpression[property.name='save']`,
+		message: mutationNameMessage
 	}
 ];
 
@@ -142,6 +164,35 @@ const kitRules = [
 	}
 ];
 
+// In-app links and goto take their path through withBasePath
+// (lib/utils/basePath.ts), so a deployment base path is kept. A root path
+// written as a literal skips it: an href (static, in {...} or a template
+// literal) or the first argument of goto.
+const ROOT_PATH = '/^\\/(?!\\/)/';
+const LINK_MESSAGE = 'Wrap an in-app path in withBasePath from $lib/utils/basePath.';
+const linkRules = [
+	{
+		selector: `SvelteAttribute[key.name='href'] > SvelteLiteral[value=${ROOT_PATH}]`,
+		message: LINK_MESSAGE
+	},
+	{
+		selector: `SvelteAttribute[key.name='href'] > SvelteMustacheTag > Literal[value=${ROOT_PATH}]`,
+		message: LINK_MESSAGE
+	},
+	{
+		selector: `SvelteAttribute[key.name='href'] > SvelteMustacheTag > TemplateLiteral[quasis.0.value.raw=${ROOT_PATH}]`,
+		message: LINK_MESSAGE
+	},
+	{
+		selector: `CallExpression[callee.name='goto'] > Literal.arguments:first-child[value=${ROOT_PATH}]`,
+		message: LINK_MESSAGE
+	},
+	{
+		selector: `CallExpression[callee.name='goto'] > TemplateLiteral.arguments:first-child[quasis.0.value.raw=${ROOT_PATH}]`,
+		message: LINK_MESSAGE
+	}
+];
+
 // The transport itself: the api client and the page-scoped fetch it wraps.
 const TRANSPORT = ['src/lib/api/**', 'src/lib/utils/navigationAbort.ts'];
 
@@ -160,6 +211,8 @@ export default defineConfig(
 			// typescript-eslint strongly recommend that you do not use the no-undef lint rule on TypeScript projects.
 			// see: https://typescript-eslint.io/troubleshooting/faqs/eslint/#i-get-errors-from-the-no-undef-rule-about-global-variables-not-being-defined-even-though-there-are-no-typescript-errors
 			'no-undef': 'off',
+			// In-app paths go through withBasePath, which linkRules checks.
+			'svelte/no-navigation-without-resolve': 'off',
 			'@typescript-eslint/no-explicit-any': 'error',
 			'@typescript-eslint/no-unused-vars': [
 				'error',
@@ -176,14 +229,18 @@ export default defineConfig(
 				parser: ts.parser,
 				svelteConfig
 			}
-		},
-		rules: {
-			'svelte/no-navigation-without-resolve': 'off'
 		}
 	},
 	{
 		rules: {
 			'no-restricted-syntax': ['error', ...queryClientRules, ...markupRules]
+		}
+	},
+	{
+		// A spec's fake client may call these.
+		files: ['src/**/*.spec.ts'],
+		rules: {
+			'no-restricted-syntax': ['error', ...markupRules]
 		}
 	},
 	{
@@ -198,7 +255,27 @@ export default defineConfig(
 		files: ['src/**/*.ts', 'src/**/*.js', 'src/**/*.svelte'],
 		ignores: [...TRANSPORT, 'src/**/*.spec.ts', 'src/**/*.test.ts', 'src/**/*.d.ts'],
 		rules: {
-			'no-restricted-syntax': ['error', ...queryClientRules, ...transportRules, ...markupRules]
+			'no-restricted-syntax': [
+				'error',
+				...queryClientRules,
+				...transportRules,
+				...markupRules,
+				...linkRules
+			]
+		}
+	},
+	{
+		files: ['src/lib/queries/**/*.ts'],
+		ignores: ['src/**/*.spec.ts'],
+		rules: {
+			'no-restricted-syntax': [
+				'error',
+				...queryClientRules,
+				...transportRules,
+				...markupRules,
+				...linkRules,
+				...mutationNameRules
+			]
 		}
 	},
 	{
@@ -210,7 +287,8 @@ export default defineConfig(
 				...queryClientRules,
 				...transportRules,
 				...markupRules,
-				...kitRules
+				...kitRules,
+				...linkRules
 			]
 		}
 	},

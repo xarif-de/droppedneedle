@@ -39,11 +39,14 @@ pub const SOURCE: &str = "acoustid";
 const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 /// AcoustID on the wire. A 4xx whose body names error code 4 is a bad key
-/// ([`ProviderError::Unauthorized`]); any other 4xx stays a rejection. A
-/// 200 whose `status` is not `ok` is [`ProviderError::Unavailable`]. A 429
-/// that names no wait rests a minute ("the
-/// historical 60s window"). The error body was seen on 2026-10-15 per
-/// `server/tests/fixtures/acoustid/README.md`.
+/// ([`ProviderError::Unauthorized`], and the only way to get one). Code 14,
+/// too many requests, is a 429 and rests the client the same way. Any
+/// other 4xx that names an AcoustID error code passes through, so the
+/// batch request can read the code; one that names none is
+/// [`ProviderError::BadRequest`], a bare 401 included. A 200 whose
+/// `status` is not `ok` is [`ProviderError::Unavailable`]. A 429 that
+/// names no wait rests a minute ("the historical 60s window"). The error
+/// body was seen on 2026-10-15 per `server/tests/fixtures/acoustid/README.md`.
 pub static SPEC: Spec = Spec {
     source: SOURCE,
     health_key: SOURCE,
@@ -54,15 +57,31 @@ pub static SPEC: Spec = Spec {
     classify,
 };
 
+/// AcoustID's error code for a client over its request rate.
+const TOO_MANY_REQUESTS: i64 = 14;
+/// AcoustID's error code for a print it cannot read. Probed on 2026-11-01
+/// against api.acoustid.org: a batch whose only print is garbage answers 400
+/// with this code; with a readable print beside it, the garbage one is left
+/// out of a 200 and the other keeps its own index.
+const INVALID_FINGERPRINT: i64 = 3;
+
 /// The AcoustID hook over the standard rules.
 pub fn classify(answer: &Answer<'_>) -> Result<(), ProviderError> {
     let status = answer.reply.status();
     let decoded = || answer.reply.json::<Envelope>().ok();
-    if (400..500).contains(&status)
-        && status != 429
-        && decoded().and_then(|envelope| envelope.error?.code) == Some(4)
-    {
-        return Err(ProviderError::Unauthorized { provider: SOURCE });
+    if (400..500).contains(&status) && status != 429 {
+        return match decoded().and_then(|envelope| envelope.error?.code) {
+            Some(4) => Err(ProviderError::Unauthorized { provider: SOURCE }),
+            Some(TOO_MANY_REQUESTS) => Err(ProviderError::RateLimited {
+                provider: SOURCE,
+                retry_after: answer.retry_after(),
+            }),
+            Some(_) => Ok(()),
+            None => Err(ProviderError::BadRequest {
+                provider: SOURCE,
+                status,
+            }),
+        };
     }
     if status == 200
         && let Some(said) = decoded().and_then(|envelope| envelope.status)
@@ -146,9 +165,13 @@ impl AcoustIdClient {
             .executor
             .send(self.lookup_request(form)?, priority)
             .await?;
-        let answer: LookupAnswer = reply.json().inspect_err(|error| {
-            note_shape(&error.to_string());
-        })?;
+        if !(200..300).contains(&reply.status()) {
+            return Err(ProviderError::BadRequest {
+                provider: SOURCE,
+                status: reply.status(),
+            });
+        }
+        let answer: LookupAnswer = reply.json().inspect_err(|_| note_shape())?;
         parse_lookup(answer)
     }
 
@@ -158,25 +181,33 @@ impl AcoustIdClient {
     /// it, keyed by the query's index. One fingerprint often maps to
     /// several duplicate MusicBrainz recordings (single and album
     /// versions), so keeping only the best would read as "unsupported"
-    /// for the others (Lidarr keeps them all the same way). A request
-    /// that fails contributes nothing; the other requests still count.
-    /// An empty key never touches the wire.
+    /// for the others (Lidarr keeps them all the same way).
+    ///
+    /// All or nothing: a request that went unanswered fails the lookup, so
+    /// nothing is worked out from part of the files. A print AcoustID cannot
+    /// read is steady, not an outage: it is absent, like a file that could
+    /// not be printed. An empty or refused key answers nothing heard, and an
+    /// empty key never touches the wire.
+    ///
+    /// # Errors
+    ///
+    /// Why a request went unanswered.
     pub async fn lookup_batch(
         &self,
         api_key: &str,
         queries: &[BatchQuery<'_>],
         priority: RequestPriority,
-    ) -> std::collections::HashMap<usize, BatchMatch> {
+    ) -> Result<std::collections::HashMap<usize, BatchMatch>, Unanswered> {
         let mut found = std::collections::HashMap::new();
-        if api_key.is_empty() {
-            return found;
-        }
         for (chunk_index, chunk) in queries.chunks(MAX_BATCH).enumerate() {
             let offset = chunk_index * MAX_BATCH;
-            let BatchOutcome::Answered(entries) =
-                self.lookup_batch_request(api_key, chunk, priority).await
-            else {
-                continue;
+            let entries = match self.lookup_batch_request(api_key, chunk, priority).await {
+                BatchOutcome::Answered(entries) => entries,
+                BatchOutcome::NoKey | BatchOutcome::KeyRefused => {
+                    return Ok(std::collections::HashMap::new());
+                }
+                BatchOutcome::Unavailable(Unanswered::Code(INVALID_FINGERPRINT)) => continue,
+                BatchOutcome::Unavailable(why) => return Err(why),
             };
             for (index, results) in entries {
                 if index < chunk.len() {
@@ -184,11 +215,18 @@ impl AcoustIdClient {
                 }
             }
         }
-        found
+        Ok(found)
+    }
+
+    /// Whether AcoustID is resting after a run of failed calls: a lookup
+    /// now would not be sent.
+    #[must_use]
+    pub fn resting_after_failures(&self) -> bool {
+        self.executor.resting_after_failures()
     }
 
     /// One batch request of at most [`MAX_BATCH`] prints (any past that
-    /// are left out). An empty key is rejected without touching the wire.
+    /// are left out). An empty key never touches the wire.
     pub async fn lookup_batch_request(
         &self,
         api_key: &str,
@@ -196,9 +234,7 @@ impl AcoustIdClient {
         priority: RequestPriority,
     ) -> BatchOutcome {
         if api_key.is_empty() {
-            return BatchOutcome::Rejected {
-                message: "no AcoustID key".to_owned(),
-            };
+            return BatchOutcome::NoKey;
         }
         let queries = &queries[..queries.len().min(MAX_BATCH)];
         let mut form: Vec<(String, String)> = vec![
@@ -210,16 +246,30 @@ impl AcoustIdClient {
             form.push((format!("duration.{index}"), query.duration_secs.to_string()));
             form.push((format!("fingerprint.{index}"), query.fingerprint.to_owned()));
         }
-        let answer = match self.lookup_request(form) {
+        let reply = match self.lookup_request(form) {
             Ok(request) => self.executor.send(request, priority).await,
             Err(error) => Err(error),
         };
-        let answer = answer.and_then(|reply| {
-            reply
-                .json::<BatchAnswer>()
-                .inspect_err(|error| note_shape(&error.to_string()))
-        });
-        match answer {
+        let reply = match reply {
+            Ok(reply) => reply,
+            Err(error) => return BatchOutcome::from_error(&error),
+        };
+        // A 4xx naming an AcoustID error code other than a refused key:
+        // the request was not served, and asking later may be.
+        if !(200..300).contains(&reply.status()) {
+            let code = reply
+                .json::<Envelope>()
+                .ok()
+                .and_then(|envelope| envelope.error?.code);
+            tracing::info!(
+                provider = SOURCE,
+                status = reply.status(),
+                code,
+                "AcoustID did not serve the lookup"
+            );
+            return BatchOutcome::Unavailable(code.map_or(Unanswered::Failed, Unanswered::Code));
+        }
+        match reply.json::<BatchAnswer>().inspect_err(|_| note_shape()) {
             Ok(answer) => BatchOutcome::Answered(
                 answer
                     .fingerprints
@@ -247,19 +297,16 @@ impl AcoustIdClient {
 }
 
 /// An answer without the expected shape: the service answered, so it is
-/// noted for the request but never counted as an outage.
-fn note_shape(cause: &str) {
-    tracing::debug!(
-        provider = SOURCE,
-        cause,
-        "AcoustID answer had no usable shape"
-    );
+/// noted for the request but never counted as an outage. The decoder's
+/// account is not logged: it can quote the body.
+fn note_shape() {
+    tracing::debug!(provider = SOURCE, "AcoustID answer had no usable shape");
     record_current(SOURCE, IntegrationStatus::Error, true);
 }
 
 /// A lookup answer that breaks its documented shape.
 fn malformed() -> ProviderError {
-    note_shape("malformed AcoustID answer");
+    note_shape();
     ProviderError::Payload {
         provider: SOURCE,
         kind: PayloadKind::Decode,
@@ -351,37 +398,50 @@ pub struct BatchMatch {
 #[derive(Debug, Clone, PartialEq)]
 pub enum BatchOutcome {
     /// AcoustID answered: each query index of the request with its
-    /// results, in AcoustID's order.
+    /// results, in AcoustID's order. An index it left out is not a "no
+    /// match".
     Answered(Vec<(usize, Vec<BatchResult>)>),
-    /// A 4xx other than 429, such as a bad key: asking again gets the
-    /// same answer.
-    Rejected { message: String },
-    /// Transport failure, 429 (with its `Retry-After`), 5xx, or a body
-    /// that did not decode.
-    Unavailable {
-        retry_after_secs: Option<f64>,
-        message: String,
-    },
+    /// No key was given, so nothing was sent.
+    NoKey,
+    /// AcoustID refused the key (its error code 4).
+    KeyRefused,
+    /// No usable answer now; asking later may get one.
+    Unavailable(Unanswered),
+}
+
+/// Why a batch request got no usable answer. The executor already rests
+/// AcoustID for any wait it asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unanswered {
+    /// A 429, or the rate limiter held the request back.
+    Paused,
+    /// AcoustID named an error code other than a refused key.
+    Code(i64),
+    /// Anything else: no answer, a redirect, a 4xx without a code, a 5xx,
+    /// or an answer that did not decode.
+    Failed,
 }
 
 impl BatchOutcome {
-    /// What a failed request means for the batch: a rejection asking
-    /// again cannot change, or an outage worth asking again later.
+    /// What a failed request means: only a refused key is final; anything
+    /// else waits. Logged by HTTP status alone, never the error's text.
     fn from_error(error: &ProviderError) -> Self {
-        let message = error.to_string();
-        match error {
-            ProviderError::Unauthorized { .. }
-            | ProviderError::Forbidden { .. }
-            | ProviderError::NotFound { .. }
-            | ProviderError::BadRequest { .. }
-            | ProviderError::Redirect { .. }
-            | ProviderError::NotConfigured { .. }
-            | ProviderError::Invalid { .. } => Self::Rejected { message },
-            _ => Self::Unavailable {
-                retry_after_secs: error.retry_after().map(|wait| wait.as_secs_f64()),
-                message,
-            },
-        }
+        let status = match error {
+            ProviderError::Forbidden { .. } => Some(403),
+            ProviderError::NotFound { .. } => Some(404),
+            ProviderError::RateLimited { .. } => Some(429),
+            ProviderError::BadRequest { status, .. }
+            | ProviderError::Redirect { status, .. }
+            | ProviderError::Server { status, .. } => Some(*status),
+            _ => None,
+        };
+        let outcome = match error {
+            ProviderError::Unauthorized { .. } => return Self::KeyRefused,
+            ProviderError::RateLimited { .. } => Self::Unavailable(Unanswered::Paused),
+            _ => Self::Unavailable(Unanswered::Failed),
+        };
+        tracing::info!(provider = SOURCE, status, "AcoustID lookup not answered");
+        outcome
     }
 }
 

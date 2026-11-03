@@ -9,8 +9,8 @@
 //!
 //! Probes reuse the production clients (media adapters, slskd and
 //! Usenet clients, the provider clients for MusicBrainz, ListenBrainz,
-//! YouTube, Ticketmaster and Skiddle), so a passing verify means the same
-//! code path the app uses can reach the upstream. The
+//! Last.fm, YouTube, Ticketmaster and Skiddle), so a passing verify means
+//! the same code path the app uses can reach the upstream. The
 //! [`VerifyProbes`] port keeps tests hermetic: HTTP tests run against
 //! scripted fakes while the live probes prove themselves against
 //! loopback stubs with explicit base URLs.
@@ -20,22 +20,23 @@ use std::time::Duration;
 use futures_util::future::BoxFuture;
 
 use droppedneedle_auth::federated::settings::InstallIds;
-use droppedneedle_kernel::http_client::read_capped;
 use droppedneedle_kernel::runtime_config::settings_error::SettingsError;
-use droppedneedle_media::remotes::adapter::RemoteHandle;
 use droppedneedle_media::remotes::connections::{ConnectionResolver, ResolvedConnection};
 use droppedneedle_media::remotes::models::SourceName;
+use droppedneedle_media::remotes::source::RemoteHandle;
+use droppedneedle_providers::lastfm::{self, LastFmClient, LastFmCredentials};
 use droppedneedle_providers::listenbrainz::ListenBrainzClient;
 use droppedneedle_providers::musicbrainz::{MbSource, MusicBrainzClient};
+use droppedneedle_providers::oidc::OidcClient;
 use droppedneedle_providers::skiddle::SkiddleClient;
 use droppedneedle_providers::ticketmaster::TicketmasterClient;
 use droppedneedle_providers::youtube::YouTubeApi;
 use droppedneedle_providers::{ProviderError, Providers, RequestPriority, TransportKind};
 
-/// Per-probe HTTP budget, matching the v2 repositories.
+/// Per-probe HTTP budget, matching the v2 repositories. A provider whose
+/// own deadline is longer (Ticketmaster's full event pages) is held to it
+/// here too: an admin is waiting on the button.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
-/// Largest probe answer read.
-const MAX_PROBE_BODY_BYTES: usize = 4 * 1024 * 1024;
 
 /// Plain connection-test verdict.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -213,6 +214,9 @@ pub trait VerifyProbes: Send + Sync {
         username: &'a str,
         token: &'a str,
     ) -> BoxFuture<'a, ListenBrainzVerdict>;
+    /// Last.fm app key check, then the shared secret through a signed
+    /// `auth.getToken`.
+    fn lastfm<'a>(&'a self, key: &'a str, secret: &'a str) -> BoxFuture<'a, ProbeVerdict>;
     /// YouTube Data API key check.
     fn youtube<'a>(&'a self, key: &'a str) -> BoxFuture<'a, ProbeVerdict>;
     /// Ticketmaster Discovery key check.
@@ -250,12 +254,18 @@ pub struct LiveProbes {
     pub musicbrainz: MusicBrainzClient,
     /// The one ListenBrainz client, which checks ListenBrainz credentials.
     pub listenbrainz: ListenBrainzClient,
+    /// The Last.fm client.
+    pub lastfm: LastFmClient,
     /// The YouTube Data API client.
     pub youtube: YouTubeApi,
     /// The Ticketmaster client.
     pub ticketmaster: TicketmasterClient,
+    /// The Newznab indexers' clients.
+    pub newznab: droppedneedle_providers::newznab::NewznabIndexers,
     /// The Skiddle client.
     pub skiddle: SkiddleClient,
+    /// The OIDC client, which reads the issuer's discovery document.
+    pub oidc: OidcClient,
     /// The install ids presented to Plex. Without them the Plex checks
     /// present no client id.
     install: Option<InstallIds>,
@@ -268,9 +278,12 @@ impl LiveProbes {
             http,
             musicbrainz: providers.musicbrainz.clone(),
             listenbrainz: providers.listenbrainz.clone(),
+            lastfm: providers.lastfm.clone(),
             youtube: providers.youtube.clone(),
             ticketmaster: providers.ticketmaster.clone(),
+            newznab: providers.newznab.clone(),
             skiddle: providers.skiddle.clone(),
+            oidc: providers.oidc.clone(),
             install: None,
         }
     }
@@ -326,7 +339,7 @@ pub fn require_service_url(url: &str, label: &str) -> Result<String, SettingsErr
 /// The HTTP status behind a failed provider call, when it had one.
 fn status_of(error: &ProviderError) -> Option<u16> {
     match error {
-        ProviderError::Unauthorized { .. } => Some(401),
+        ProviderError::Unauthorized { .. } | ProviderError::Rejected { .. } => Some(401),
         ProviderError::Forbidden { .. } => Some(403),
         ProviderError::NotFound { .. } => Some(404),
         ProviderError::RateLimited { .. } => Some(429),
@@ -389,14 +402,38 @@ fn youtube_failure(error: &ProviderError) -> String {
     }
 }
 
+/// The Last.fm verdict for a failed check, by Last.fm's error code where
+/// it sent one. Nothing Last.fm wrote is echoed.
+fn lastfm_failure(error: &ProviderError) -> String {
+    if let Some(wait) = asked_to_wait("Last.fm", error) {
+        return wait;
+    }
+    match error {
+        ProviderError::Rejected { code, .. } => match *code {
+            lastfm::ERROR_INVALID_KEY => "Last.fm says the API key is invalid.",
+            lastfm::ERROR_INVALID_SIGNATURE => "The shared secret does not match the key.",
+            lastfm::ERROR_SUSPENDED_KEY => "Last.fm has suspended this API key.",
+            _ => "Last.fm refused the key.",
+        }
+        .to_owned(),
+        ProviderError::Unauthorized { .. } | ProviderError::Forbidden { .. } => {
+            "Last.fm refused the key.".to_owned()
+        }
+        ProviderError::Transport { .. }
+        | ProviderError::Unavailable { .. }
+        | ProviderError::Server { .. } => "Could not reach Last.fm.".to_owned(),
+        _ => "Last.fm answered in a way the check did not expect.".to_owned(),
+    }
+}
+
 /// Map a media-adapter failure to a v2-shaped verdict message. The URL
 /// is never echoed.
 fn adapter_message(
-    error: &droppedneedle_media::remotes::adapter::AdapterError,
+    error: &droppedneedle_media::remotes::source::AdapterError,
     unconfigured: &str,
     auth: &str,
 ) -> String {
-    use droppedneedle_media::remotes::adapter::AdapterError as Source;
+    use droppedneedle_media::remotes::source::AdapterError as Source;
     match error {
         Source::NotConfigured => unconfigured.to_owned(),
         Source::Auth => auth.to_owned(),
@@ -550,6 +587,33 @@ impl VerifyProbes for LiveProbes {
         })
     }
 
+    fn lastfm<'a>(&'a self, key: &'a str, secret: &'a str) -> BoxFuture<'a, ProbeVerdict> {
+        Box::pin(async move {
+            let creds = LastFmCredentials {
+                api_key: key.trim().to_owned(),
+                shared_secret: secret.trim().to_owned(),
+                ..LastFmCredentials::default()
+            };
+            if creds.api_key.is_empty() {
+                return ProbeVerdict::failed("An API key is required.");
+            }
+            // An admin waits on the Test button. The unsigned chart read
+            // checks the key alone; the signed token request, the call
+            // Connect starts with, checks the secret against it.
+            let priority = RequestPriority::UserInitiated;
+            if let Err(error) = self.lastfm.chart_top_artists(&creds, 1, priority).await {
+                return ProbeVerdict::provider_failed(lastfm_failure(&error), error);
+            }
+            if creds.shared_secret.is_empty() {
+                return ProbeVerdict::failed("The API key works. Add the shared secret.");
+            }
+            match self.lastfm.request_token(&creds, priority).await {
+                Ok(_) => ProbeVerdict::ok("Connected to Last.fm."),
+                Err(error) => ProbeVerdict::provider_failed(lastfm_failure(&error), error),
+            }
+        })
+    }
+
     fn youtube<'a>(&'a self, key: &'a str) -> BoxFuture<'a, ProbeVerdict> {
         Box::pin(async move {
             if key.trim().is_empty() {
@@ -572,13 +636,16 @@ impl VerifyProbes for LiveProbes {
             if key.trim().is_empty() {
                 return ProbeVerdict::failed("An API key is required.");
             }
-            let checked = self
-                .ticketmaster
-                .check_key(key.trim(), RequestPriority::UserInitiated)
-                .await;
+            let checked = tokio::time::timeout(
+                PROBE_TIMEOUT,
+                self.ticketmaster
+                    .check_key(key.trim(), RequestPriority::UserInitiated),
+            )
+            .await;
             match checked {
-                Ok(()) => ProbeVerdict::ok("Connected to Ticketmaster."),
-                Err(error) => {
+                Ok(Ok(())) => ProbeVerdict::ok("Connected to Ticketmaster."),
+                Err(_) => ProbeVerdict::failed("Ticketmaster did not answer in time."),
+                Ok(Err(error)) => {
                     ProbeVerdict::failed(asked_to_wait("Ticketmaster", &error).unwrap_or_else(
                         || "Ticketmaster rejected the key or is unreachable.".to_owned(),
                     ))
@@ -592,13 +659,16 @@ impl VerifyProbes for LiveProbes {
             if key.trim().is_empty() {
                 return ProbeVerdict::failed("An API key is required.");
             }
-            let checked = self
-                .skiddle
-                .check_key(key.trim(), RequestPriority::UserInitiated)
-                .await;
+            let checked = tokio::time::timeout(
+                PROBE_TIMEOUT,
+                self.skiddle
+                    .check_key(key.trim(), RequestPriority::UserInitiated),
+            )
+            .await;
             match checked {
-                Ok(()) => ProbeVerdict::ok("Connected to Skiddle."),
-                Err(error) => {
+                Ok(Ok(())) => ProbeVerdict::ok("Connected to Skiddle."),
+                Err(_) => ProbeVerdict::failed("Skiddle did not answer in time."),
+                Ok(Err(error)) => {
                     ProbeVerdict::failed(asked_to_wait("Skiddle", &error).unwrap_or_else(|| {
                         "Skiddle rejected the key or is unreachable.".to_owned()
                     }))
@@ -773,7 +843,6 @@ impl VerifyProbes for LiveProbes {
 
     fn newznab<'a>(&'a self, url: &'a str, key: &'a str) -> BoxFuture<'a, NewznabVerdict> {
         Box::pin(async move {
-            use droppedneedle_acquire::usenet::newznab::NewznabClient;
             if url.trim().is_empty() {
                 return NewznabVerdict {
                     valid: false,
@@ -785,11 +854,13 @@ impl VerifyProbes for LiveProbes {
                 };
             }
             let url = url.trim().trim_end_matches('/').to_owned();
-            let client = NewznabClient::new(self.http.clone(), &url, key, "", "");
-            let caps = match client.caps(PROBE_TIMEOUT).await {
+            // An admin waits on the Test Connection button.
+            let client = self.newznab.client("", "", &url, key);
+            let caps = match client.caps(RequestPriority::UserInitiated).await {
                 Ok(caps) => caps,
                 Err(error) => {
-                    return newznab_failure(&self.http, &url, key, &error.to_string()).await;
+                    return newznab_failure(&self.newznab, &url, key, newznab_message(&error))
+                        .await;
                 }
             };
             // Well-formed but empty caps mean the URL answered something
@@ -797,7 +868,7 @@ impl VerifyProbes for LiveProbes {
             // not an endpoint.
             if caps_are_empty(&caps) {
                 return newznab_failure(
-                    &self.http,
+                    &self.newznab,
                     &url,
                     key,
                     "The URL did not answer as a Newznab endpoint.",
@@ -858,26 +929,32 @@ impl VerifyProbes for LiveProbes {
             {
                 return ProbeVerdict::failed(reason);
             }
-            let url = format!(
-                "{}{}",
-                issuer.trim_end_matches('/'),
-                droppedneedle_auth::federated::oidc::DISCOVERY_SUFFIX
-            );
-            let response = self.http.get(&url).timeout(PROBE_TIMEOUT).send().await;
-            match response {
-                Ok(response) if response.status().is_success() => {
-                    let name = decode_body(response)
-                        .await
-                        .and_then(|doc| {
-                            doc.get("issuer")
-                                .and_then(|value| value.as_str())
-                                .map(str::to_owned)
-                        })
-                        .unwrap_or_else(|| issuer.to_owned());
+            let Some(base) =
+                droppedneedle_providers::web_address::web_address(issuer.trim_end_matches('/'))
+            else {
+                return ProbeVerdict::failed("Issuer URL is not a web address.");
+            };
+            let segments: Vec<&str> = droppedneedle_auth::federated::oidc::DISCOVERY_SUFFIX
+                .split('/')
+                .collect();
+            let url = droppedneedle_auth::federated::endpoint(&base, &segments);
+            // An admin waits on the Test button.
+            let fetched = self
+                .oidc
+                .get_json::<serde_json::Value>(url.as_str(), None, RequestPriority::UserInitiated)
+                .await;
+            match fetched {
+                Ok(doc) => {
+                    let name = doc
+                        .get("issuer")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or(issuer);
                     ProbeVerdict::ok(format!("Connected to {name}."))
                 }
-                Ok(_) => ProbeVerdict::failed("Failed to fetch OIDC discovery document."),
-                Err(_) => ProbeVerdict::failed("Failed to fetch OIDC discovery document."),
+                Err(error) => ProbeVerdict::failed(
+                    asked_to_wait("The identity provider", &error)
+                        .unwrap_or_else(|| "Failed to fetch OIDC discovery document.".to_owned()),
+                ),
             }
         })
     }
@@ -887,13 +964,13 @@ impl VerifyProbes for LiveProbes {
 /// endpoint: offer `<url>/api` when it answers as a real endpoint.
 /// The URL is never echoed.
 async fn newznab_failure(
-    http: &reqwest::Client,
+    indexers: &droppedneedle_providers::newznab::NewznabIndexers,
     url: &str,
     key: &str,
     message: &str,
 ) -> NewznabVerdict {
     if let Some(suggestion) = api_path_suggestion(url)
-        && reaches_newznab(http, &suggestion, key).await
+        && reaches_newznab(indexers, &suggestion, key).await
     {
         return NewznabVerdict {
             valid: false,
@@ -936,13 +1013,6 @@ fn prowlarr_failure(error: &droppedneedle_acquire::client_error::ClientError) ->
     }
 }
 
-/// Decode a JSON body read under the probe cap; anything unreadable or
-/// too large is `None`.
-async fn decode_body(response: reqwest::Response) -> Option<serde_json::Value> {
-    let bytes = read_capped(response, MAX_PROBE_BODY_BYTES).await.ok()?;
-    serde_json::from_slice(&bytes).ok()
-}
-
 /// A bare site URL (no path) is almost never the Newznab endpoint: the
 /// API lives at `/api`. Offer `<url>/api` only then.
 fn api_path_suggestion(url: &str) -> Option<String> {
@@ -960,22 +1030,45 @@ fn api_path_suggestion(url: &str) -> Option<String> {
 /// Did `url` answer as a real Newznab endpoint? Non-empty caps, an
 /// auth error, or a rate limit all mean the API was reached; anything
 /// else means the suggestion is wrong too.
-async fn reaches_newznab(http: &reqwest::Client, url: &str, key: &str) -> bool {
-    use droppedneedle_acquire::client_error::ClientError;
-    use droppedneedle_acquire::usenet::newznab::{NewznabClient, NewznabError};
-    let client = NewznabClient::new(http.clone(), url, key, "", "");
-    match client.caps(PROBE_TIMEOUT).await {
+async fn reaches_newznab(
+    indexers: &droppedneedle_providers::newznab::NewznabIndexers,
+    url: &str,
+    key: &str,
+) -> bool {
+    use droppedneedle_providers::newznab::NewznabError;
+    let client = indexers.client("", "", url, key);
+    match client.caps(RequestPriority::UserInitiated).await {
         Ok(caps) => !caps_are_empty(&caps),
-        Err(NewznabError::Client(ClientError::Auth { .. } | ClientError::RateLimited { .. })) => {
-            true
-        }
+        Err(NewznabError::Provider(
+            ProviderError::Unauthorized { .. }
+            | ProviderError::Forbidden { .. }
+            | ProviderError::RateLimited { .. },
+        )) => true,
         Err(_) => false,
+    }
+}
+
+/// What a failed indexer test tells the admin. The indexer's own text and
+/// the URL are never echoed.
+fn newznab_message(error: &droppedneedle_providers::newznab::NewznabError) -> &'static str {
+    use droppedneedle_providers::newznab::NewznabError;
+    match error {
+        NewznabError::Provider(
+            ProviderError::Unauthorized { .. } | ProviderError::Forbidden { .. },
+        ) => "The indexer rejected the API key.",
+        NewznabError::Provider(ProviderError::RateLimited { .. }) => {
+            "The indexer is limiting requests. Try again later."
+        }
+        NewznabError::Provider(ProviderError::Transport { .. }) => {
+            "Couldn't reach the indexer. Check the URL."
+        }
+        _ => "The URL did not answer as a Newznab endpoint.",
     }
 }
 
 /// Empty caps (no server, no searching, no categories) mean the URL
 /// answered something other than a caps document.
-fn caps_are_empty(caps: &droppedneedle_acquire::usenet::newznab::NewznabCaps) -> bool {
+fn caps_are_empty(caps: &droppedneedle_providers::newznab::NewznabCaps) -> bool {
     caps.server_title.is_none()
         && caps.server_version.is_none()
         && !caps.supports_audio_search

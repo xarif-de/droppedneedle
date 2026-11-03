@@ -1,10 +1,9 @@
+import { v3 } from '$lib/api/v3/endpoint';
 import { api } from '$lib/api/client';
 import { toastStore } from '$lib/stores/toast';
 import { authStore } from '$lib/stores/authStore.svelte';
 import { createUuid } from '$lib/utils/uuid';
 import { albumEditionChanged } from '$lib/queries/albums/EditionQueries.svelte';
-import { LibraryV3Api } from './LibraryV3Api';
-import { toOperationResponse } from './libraryOperationAdapters';
 import {
 	anyLibraryActivityChanged,
 	catalogChanged,
@@ -21,15 +20,13 @@ function identityPreparation(userId: string | undefined, catalog = false): Effec
 	];
 }
 
-export function createLibraryIdentityPreparation(getUserId: () => string | undefined) {
+export function createLibraryIdentityPreparationMutation(getUserId: () => string | undefined) {
 	return createAppMutation(() => ({
 		mutationFn: async (rootIds: string[]) =>
-			toOperationResponse(
-				await api.v3.POST(LibraryV3Api.identityPreparations(), {
-					idempotency_key: createUuid(),
-					root_ids: rootIds
-				})
-			),
+			await api.v3.POST(v3('/api/v3/library/management/identity-preparations'), {
+				idempotency_key: createUuid(),
+				root_ids: rootIds
+			}),
 		effects: () => identityPreparation(getUserId()),
 		onSuccess: () => {
 			toastStore.show({ message: 'Identity preparation started', type: 'success' });
@@ -39,14 +36,17 @@ export function createLibraryIdentityPreparation(getUserId: () => string | undef
 	}));
 }
 
-export function applyLibraryIdentityPreparation(getUserId: () => string | undefined) {
+export function createApplyLibraryIdentityPreparationMutation(getUserId: () => string | undefined) {
 	return createAppMutation(() => ({
 		mutationFn: async (input: { jobId: string; expectedRevision: number }) =>
-			toOperationResponse(
-				await api.v3.POST(LibraryV3Api.applyIdentityPreparation(input.jobId), {
+			await api.v3.POST(
+				v3('/api/v3/library/management/identity-preparations/{job_id}/apply', {
+					path: { job_id: input.jobId }
+				}),
+				{
 					expected_row_revision: input.expectedRevision,
 					confirmation: true
-				})
+				}
 			),
 		effects: () => identityPreparation(getUserId(), true),
 		onSuccess: () => {
@@ -57,13 +57,18 @@ export function applyLibraryIdentityPreparation(getUserId: () => string | undefi
 	}));
 }
 
-export function discardLibraryIdentityPreparation(getUserId: () => string | undefined) {
+export function createDiscardLibraryIdentityPreparationMutation(
+	getUserId: () => string | undefined
+) {
 	return createAppMutation(() => ({
 		mutationFn: async (input: { jobId: string; expectedRevision: number }) =>
-			toOperationResponse(
-				await api.v3.POST(LibraryV3Api.discardIdentityPreparation(input.jobId), {
+			await api.v3.POST(
+				v3('/api/v3/library/management/identity-preparations/{job_id}/discard', {
+					path: { job_id: input.jobId }
+				}),
+				{
 					expected_row_revision: input.expectedRevision
-				})
+				}
 			),
 		effects: () => identityPreparation(getUserId()),
 		onSuccess: () => {
@@ -74,17 +79,22 @@ export function discardLibraryIdentityPreparation(getUserId: () => string | unde
 	}));
 }
 
-export function undoLibraryAutomaticEdition(getUserId: () => string | undefined) {
+export function createUndoLibraryAutomaticEditionMutation(getUserId: () => string | undefined) {
 	return createAppMutation(() => ({
 		mutationFn: (input: {
 			albumId: string;
 			expectedAlbumRevision: number;
 			expectedIdentityRevision: number;
 		}) =>
-			api.v3.POST(LibraryV3Api.undoAutomaticEdition(input.albumId), {
-				expected_album_revision: input.expectedAlbumRevision,
-				expected_identity_revision: input.expectedIdentityRevision
-			}),
+			api.v3.POST(
+				v3('/api/v3/library/albums/{album_id}/undo-automatic-edition', {
+					path: { album_id: input.albumId }
+				}),
+				{
+					expected_album_revision: input.expectedAlbumRevision,
+					expected_identity_revision: input.expectedIdentityRevision
+				}
+			),
 		effects: (_data, input) => [
 			...albumEditionChanged(getUserId(), input.albumId),
 			...identityPreparation(getUserId(), true)

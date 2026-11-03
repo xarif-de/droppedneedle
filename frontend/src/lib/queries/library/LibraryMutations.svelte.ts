@@ -1,23 +1,20 @@
+import { v3 } from '$lib/api/v3/endpoint';
 import { useQueryClient } from '@tanstack/svelte-query';
 import { api } from '$lib/api/client';
+import { isStaleRevision } from '$lib/api/errors';
 import { authStore } from '$lib/stores/authStore.svelte';
 import { libraryStore } from '$lib/stores/library';
 import { playerStore } from '$lib/stores/player.svelte';
 import { setQueryDataWithPersister } from '../QueryClient';
 import { LibraryQueryKeyFactory } from './LibraryQueryKeyFactory';
-import { LibraryV3Api } from './LibraryV3Api';
-import type {
-	AlbumRemoveResponse,
-	TargetCatalogRemovalResponse,
-	LibraryAlbumStatus,
-	LibraryScanSchedule
-} from '$lib/types';
+import type { LibraryAlbumStatus, LibraryScanSchedule } from '$lib/types';
 import {
 	albumLocalCopyChanged,
 	albumRemovalsChanged,
 	albumStatusChanged,
 	anyWantedChanged,
 	applyEffects,
+	applyEffectsIn,
 	catalogChanged,
 	createAppMutation,
 	editionPlansChanged,
@@ -26,16 +23,35 @@ import {
 	scanScheduleChanged
 } from '$lib/queries/effects';
 
-export function removeLibraryAlbum() {
+export function createRemoveLibraryAlbumMutation() {
 	return createAppMutation(() => ({
-		mutationFn: ({ mbid, stopWanted }: { mbid: string; stopWanted: boolean }) =>
-			api.v3.DELETE(LibraryV3Api.removeAlbum(mbid, stopWanted)) as Promise<
-				AlbumRemoveResponse | TargetCatalogRemovalResponse
-			>,
+		// `mbid` is the address the caller knows the album by; the rest comes
+		// from the album's detail.
+		mutationFn: ({
+			albumId,
+			expectedRevision,
+			expectedTrackCount,
+			stopWanted
+		}: {
+			mbid: string;
+			albumId: string;
+			expectedRevision: number;
+			expectedTrackCount: number;
+			stopWanted: boolean;
+		}) =>
+			api.v3.DELETE(
+				v3('/api/v3/library/albums/{id}', {
+					path: { id: albumId },
+					query: {
+						expected_revision: expectedRevision,
+						expected_track_count: expectedTrackCount,
+						delete_files: true,
+						stop_wanted: stopWanted
+					}
+				})
+			),
 		onSuccess: async (result, { mbid: requestedMbid }) => {
-			const responseMbids =
-				'album_mbid' in result ? [result.album_mbid, ...result.removed_mbids] : [result.id];
-			const removedMbids = [requestedMbid, ...responseMbids].filter(
+			const removedMbids = [requestedMbid, result.id].filter(
 				(mbid, index, all) => all.indexOf(mbid) === index
 			);
 			for (const mbid of removedMbids) {
@@ -51,10 +67,7 @@ export function removeLibraryAlbum() {
 									...previous,
 									in_library: false,
 									track_count: 0,
-									tracks: [],
-									covered_tracks: 0,
-									matched_file_ids: [],
-									orphans: []
+									tracks: []
 								}
 							: previous
 				);
@@ -77,9 +90,10 @@ function removedTrackIds(result: object): string[] {
 // so a single immediate invalidation would only re-read the pre-rescan rows.
 const RESCAN_REFRESH_DELAYS_MS = [2500, 6000];
 
-export function rescanAlbum() {
+export function createRescanAlbumMutation() {
 	return createAppMutation(() => ({
-		mutationFn: (mbid: string) => api.v3.POST(LibraryV3Api.rescanAlbum(mbid)),
+		mutationFn: (mbid: string) =>
+			api.v3.POST(v3('/api/v3/library/albums/{album_id}/rescan', { path: { album_id: mbid } })),
 		onSuccess: (_data, mbid) => {
 			const status = albumStatusChanged(authStore.user?.id, mbid);
 			for (const delay of RESCAN_REFRESH_DELAYS_MS) {
@@ -90,10 +104,10 @@ export function rescanAlbum() {
 	}));
 }
 
-export function saveLibraryScanSchedule() {
+export function createSaveLibraryScanScheduleMutation() {
 	return createAppMutation(() => ({
 		mutationFn: (schedule: LibraryScanSchedule) =>
-			api.v3.PUT(LibraryV3Api.schedule(), {
+			api.v3.PUT(v3('/api/v3/settings/library/schedule'), {
 				scan_frequency: schedule.scan_frequency,
 				daily_scan_time: schedule.daily_scan_time
 			}),
@@ -105,25 +119,46 @@ export function saveLibraryScanSchedule() {
 // track page's per-row action. Admin/trusted only (the route enforces it).
 // Invalidates the album's coverage/status, its local copy on the album page
 // AND the local-library lists, in the cache of the page that removed it.
-export function removeLibraryTrack() {
+export function createRemoveLibraryTrackMutation() {
 	const client = useQueryClient();
+	const changed = (albumMbid: string, albumId?: string) => {
+		const userId = authStore.user?.id;
+		return [
+			albumStatusChanged(userId, albumMbid),
+			albumLocalCopyChanged(userId, albumMbid),
+			libraryCountsChanged(userId),
+			albumRemovalsChanged(userId),
+			localChanged(),
+			...(albumId ? [editionPlansChanged(userId, albumId)] : [])
+		];
+	};
 	return createAppMutation(
 		() => ({
 			// `albumId`, the library album's own id, also refreshes its edition plans.
-			mutationFn: ({ fileId }: { fileId: string; albumMbid: string; albumId?: string }) =>
-				api.v3.DELETE(LibraryV3Api.removeTrack(fileId)),
+			mutationFn: ({
+				fileId,
+				expectedRevision
+			}: {
+				fileId: string;
+				expectedRevision: number;
+				albumMbid: string;
+				albumId?: string;
+			}) =>
+				api.v3.DELETE(
+					v3('/api/v3/library/tracks/{id}', {
+						path: { id: fileId },
+						query: { expected_revision: expectedRevision }
+					})
+				),
 			onSuccess: (result) => playerStore.dropTracks(removedTrackIds(result)),
-			effects: (_data, { albumMbid, albumId }) => {
-				const userId = authStore.user?.id;
-				return [
-					albumStatusChanged(userId, albumMbid),
-					albumLocalCopyChanged(userId, albumMbid),
-					libraryCountsChanged(userId),
-					albumRemovalsChanged(userId),
-					localChanged(),
-					...(albumId ? [editionPlansChanged(userId, albumId)] : [])
-				];
-			}
+			// A refusal for a moved revision means the page is old: read it again.
+			onError: (error, { albumMbid, albumId }) => {
+				if (!isStaleRevision(error)) return;
+				void applyEffectsIn(client, changed(albumMbid, albumId)).catch((failure: unknown) =>
+					console.error('Refreshing after a refused removal failed', failure)
+				);
+			},
+			effects: (_data, { albumMbid, albumId }) => changed(albumMbid, albumId)
 		}),
 		client
 	);

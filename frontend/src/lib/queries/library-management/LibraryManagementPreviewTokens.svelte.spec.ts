@@ -20,6 +20,8 @@ const session: LibraryManagementActivationSession = {
 		tagging_scripts: [],
 		undo_retention_days: 90,
 		preview_retention_hours: 24,
+		recycle_bin_path: '',
+		recycle_retention_days: 30,
 		external_refresh: {
 			enabled: false,
 			plex_enabled: false,
@@ -37,6 +39,8 @@ const session: LibraryManagementActivationSession = {
 		tagging_scripts: [],
 		undo_retention_days: 90,
 		preview_retention_hours: 24,
+		recycle_bin_path: '',
+		recycle_retention_days: 30,
 		external_refresh: {
 			enabled: false,
 			plex_enabled: false,

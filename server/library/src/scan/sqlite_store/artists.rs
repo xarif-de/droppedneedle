@@ -1,6 +1,6 @@
 //! Which artist row a file's credits land on.
 //!
-//! An artist row is keyed by the tag's name and sort name, as in v2. A
+//! Quirk (v2): an artist row is keyed by the tag's name and sort name. A
 //! credit whose file lists its artists with their MusicBrainz ids one for
 //! one (`ARTISTS` with `MUSICBRAINZ_ARTISTID`, `ALBUMARTISTS` with
 //! `MUSICBRAINZ_ALBUMARTISTID`) carries its id, and that id picks the row
@@ -22,10 +22,9 @@ use std::collections::{HashMap, HashSet};
 
 use rusqlite::{Connection, OptionalExtension as _, params};
 
-use super::commit::{TRACK_GONE, UNKNOWN_ARTIST, UNKNOWN_ARTIST_ID};
+use super::commit::{UNKNOWN_ARTIST, UNKNOWN_ARTIST_ID};
 use crate::identify::artist_links::placeholder;
 use crate::identify::merged_ids;
-use crate::identity::sql::PERSONS;
 use crate::scan::naming::{VARIOUS_ARTISTS_ID, artist_key, artist_mbid_key};
 use crate::tags::AudioArtistCredit;
 use droppedneedle_kernel::db::fold_text;
@@ -129,31 +128,23 @@ pub(super) fn credits(
 /// Insert the row `id` with the credit's names unless it exists.
 fn insert_artist(tx: &Connection, id: &str, credit: &Credit, now: f64) -> rusqlite::Result<()> {
     let folded = fold_text(&credit.name);
-    tx.prepare_cached(
-        "INSERT INTO local_artists (id, display_name, sort_name, folded_name, normalized_name, \
-         kind, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?4, 'group', ?5, ?5) \
-         ON CONFLICT (id) DO NOTHING",
-    )?
-    .execute(params![id, credit.name, credit.sort_name, folded, now])?;
+    tx.prepare_cached(crate::scan::sql::INSERT_ARTIST.text())?
+        .execute(params![
+            id,
+            credit.name,
+            credit.sort_name,
+            folded,
+            crate::clock::ms(now)
+        ])?;
     Ok(())
 }
 
 /// The live row `id` names: itself, else the row its alias names, else
 /// the row it was retired into (the order artist reads use).
 fn live_artist(tx: &Connection, id: &str) -> rusqlite::Result<Option<String>> {
-    tx.prepare_cached(
-        "SELECT id FROM ( \
-         SELECT id, 0 AS rank FROM local_artists WHERE id = ?1 AND retired_into_artist_id IS NULL \
-         UNION ALL SELECT r.id, 1 FROM local_artist_aliases x \
-          JOIN local_artists r ON r.id = x.local_artist_id \
-          WHERE x.alias = ?1 AND r.retired_into_artist_id IS NULL \
-         UNION ALL SELECT r.id, 2 FROM local_artists a \
-          JOIN local_artists r ON r.id = a.retired_into_artist_id \
-          WHERE a.id = ?1 AND r.retired_into_artist_id IS NULL) \
-         ORDER BY rank LIMIT 1",
-    )?
-    .query_row(params![id], |row| row.get(0))
-    .optional()
+    tx.prepare_cached(crate::scan::sql::LIVE_ARTIST.text())?
+        .query_row(params![id], |row| row.get(0))
+        .optional()
 }
 
 /// The row a credit's name keys to, and the live row that is now: the
@@ -195,17 +186,7 @@ pub(crate) struct Proven {
 /// proven. Every test is a bounded index probe.
 pub(crate) fn proven_rows(tx: &Connection, mbid: &str) -> rusqlite::Result<Vec<Proven>> {
     let mut out: Vec<Proven> = tx
-        .prepare_cached(&format!(
-            "SELECT a.id, i.decision_source IN {PERSONS} AS chosen \
-             FROM local_artist_external_identities i \
-             JOIN local_artists a ON a.id = i.local_artist_id \
-             WHERE lower(i.provider_artist_id) = ?2 AND i.provider = 'musicbrainz' \
-             AND a.retired_into_artist_id IS NULL AND a.kind <> 'various_artists' \
-             AND a.id NOT IN (?5, ?6) \
-             AND (i.decision_source IN {PERSONS} OR NOT {}) \
-             ORDER BY chosen DESC, a.created_at, a.id",
-            holds_other_id("a.id")
-        ))?
+        .prepare_cached(crate::scan::sql::ROWS_PROVEN_AS_MBID.text())?
         .query_map(
             params![
                 mbid,
@@ -216,11 +197,11 @@ pub(crate) fn proven_rows(tx: &Connection, mbid: &str) -> rusqlite::Result<Vec<P
                 UNKNOWN_ARTIST_ID
             ],
             |row| {
-                let chosen: bool = row.get(1)?;
+                let row = crate::scan::sql::ProvenRow::read(row)?;
                 Ok(Proven {
-                    id: row.get(0)?,
+                    id: row.id,
                     linked: true,
-                    automatic: !chosen,
+                    automatic: !row.chosen,
                 })
             },
         )?
@@ -231,13 +212,7 @@ pub(crate) fn proven_rows(tx: &Connection, mbid: &str) -> rusqlite::Result<Vec<P
             continue;
         }
         let created: Option<f64> = tx
-            .prepare_cached(&format!(
-                "SELECT created_at FROM local_artists WHERE id = ?1 \
-                 AND retired_into_artist_id IS NULL AND kind <> 'various_artists' \
-                 AND id NOT IN (?5, ?6) AND NOT EXISTS (SELECT 1 FROM \
-                 local_artist_external_identities WHERE local_artist_id = ?1) \
-                 AND NOT {HOLDS_OTHER_ID}"
-            ))?
+            .prepare_cached(crate::scan::sql::PROVEN_ROWS.text())?
             .query_row(
                 params![
                     holder,
@@ -270,15 +245,7 @@ fn holders(tx: &Connection, mbid: &str) -> rusqlite::Result<Vec<String>> {
     let mut after = String::new();
     loop {
         let next: Option<String> = tx
-            .prepare_cached(
-                "SELECT min(id) FROM ( \
-                 SELECT (SELECT local_artist_id FROM local_track_artists \
-                  WHERE artist_mbid = ?1 AND local_artist_id > ?2 \
-                  ORDER BY local_artist_id LIMIT 1) AS id \
-                 UNION ALL SELECT (SELECT local_artist_id FROM local_album_artists \
-                  WHERE artist_mbid = ?1 AND local_artist_id > ?2 \
-                  ORDER BY local_artist_id LIMIT 1))",
-            )?
+            .prepare_cached(crate::scan::sql::HOLDERS.text())?
             .query_row(params![mbid, after], |row| row.get(0))?;
         let Some(next) = next else { break };
         out.push(next.clone());
@@ -297,25 +264,6 @@ pub(super) struct Own<'a> {
     pub track_id: Option<&'a str>,
     pub album_id: &'a str,
 }
-
-/// [`HOLDS_OTHER_ID`] for the artist row `artist` names (a column)
-/// instead of `?1`.
-fn holds_other_id(artist: &str) -> String {
-    HOLDS_OTHER_ID.replace("?1", artist)
-}
-
-/// SQL that is true when a credit of artist `?1` holds an id other than
-/// `?2`, leaving out the credits of track `?3` and album `?4` (NULL leaves
-/// out none). Each probe is a range on an (artist, id) index and stops at
-/// the first row found.
-const HOLDS_OTHER_ID: &str = "(EXISTS(SELECT 1 FROM local_track_artists \
-     WHERE local_artist_id = ?1 AND artist_mbid < ?2 AND local_track_id IS NOT ?3) \
-     OR EXISTS(SELECT 1 FROM local_track_artists \
-     WHERE local_artist_id = ?1 AND artist_mbid > ?2 AND local_track_id IS NOT ?3) \
-     OR EXISTS(SELECT 1 FROM local_album_artists \
-     WHERE local_artist_id = ?1 AND artist_mbid < ?2 AND local_album_id IS NOT ?4) \
-     OR EXISTS(SELECT 1 FROM local_album_artists \
-     WHERE local_artist_id = ?1 AND artist_mbid > ?2 AND local_album_id IS NOT ?4))";
 
 /// Picks the rows for one file's credits.
 struct Resolver<'a> {
@@ -359,7 +307,7 @@ impl Resolver<'_> {
                 // and its merge by name only as a name row would.
                 let converged: Option<String> = self
                     .tx
-                    .prepare_cached("SELECT converged_mbid FROM local_artists WHERE id = ?1")?
+                    .prepare_cached(crate::scan::sql::CONVERGED_MBID_OF_ARTIST.text())?
                     .query_row(params![base.keyed], |row| row.get(0))
                     .optional()?
                     .flatten();
@@ -399,14 +347,7 @@ impl Resolver<'_> {
             return Ok(true);
         }
         self.tx
-            .prepare_cached(&format!(
-                "SELECT EXISTS(SELECT 1 FROM local_artists WHERE id = ?1 \
-                 AND (kind = 'various_artists' OR id IN (?5, ?6))) \
-                 OR EXISTS(SELECT 1 FROM local_artist_external_identities \
-                 WHERE local_artist_id = ?1 AND provider = 'musicbrainz' \
-                 AND lower(provider_artist_id) <> ?2) \
-                 OR {HOLDS_OTHER_ID}"
-            ))?
+            .prepare_cached(crate::scan::sql::SAYS_OTHER.text())?
             .query_row(
                 params![
                     artist,
@@ -427,8 +368,11 @@ impl Resolver<'_> {
     fn follow_names(&self, artist: &str, credit: &Credit) -> rusqlite::Result<()> {
         let (display, sort): (String, Option<String>) = self
             .tx
-            .prepare_cached("SELECT display_name, sort_name FROM local_artists WHERE id = ?1")?
-            .query_row(params![artist], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            .prepare_cached(crate::scan::sql::ARTIST_NAMES.text())?
+            .query_row(params![artist], |row| {
+                let row = crate::scan::sql::ArtistNames::read(row)?;
+                Ok((row.display_name, row.sort_name))
+            })?;
         let renamed = display != credit.name && !self.still_named(artist, &display)?;
         let name = if renamed { &credit.name } else { &display };
         let new_sort = match &credit.sort_name {
@@ -440,12 +384,14 @@ impl Resolver<'_> {
         }
         let folded = fold_text(name);
         self.tx
-            .prepare_cached(
-                "UPDATE local_artists SET display_name = ?2, folded_name = ?3, \
-                 normalized_name = ?3, sort_name = COALESCE(?4, sort_name), updated_at = ?5, \
-                 row_revision = row_revision + 1 WHERE id = ?1",
-            )?
-            .execute(params![artist, name, folded, new_sort, self.now])?;
+            .prepare_cached(crate::scan::sql::WRITE_ARTIST_NAMES.text())?
+            .execute(params![
+                artist,
+                name,
+                folded,
+                new_sort,
+                crate::clock::ms(self.now)
+            ])?;
         Ok(())
     }
 
@@ -456,19 +402,7 @@ impl Resolver<'_> {
     /// other than this one is indexed on it.
     fn still_named(&self, artist: &str, display: &str) -> rusqlite::Result<bool> {
         self.tx
-            .prepare_cached(&format!(
-                "SELECT EXISTS(SELECT 1 FROM local_track_artists c \
-                 JOIN local_tracks t ON t.id = c.local_track_id \
-                 WHERE c.local_artist_id = ?2 AND c.credited_name = ?3 \
-                 AND c.local_track_id IS NOT ?4 AND t.availability = 'indexed' \
-                 AND NOT {TRACK_GONE}) \
-                 OR EXISTS(SELECT 1 FROM local_album_artists c \
-                 JOIN local_albums a ON a.id = c.local_album_id \
-                 WHERE c.local_artist_id = ?2 AND c.credited_name = ?3 \
-                 AND c.local_album_id <> ?5 AND a.retired_into_album_id IS NULL \
-                 AND EXISTS(SELECT 1 FROM local_tracks t WHERE t.local_album_id = a.id \
-                 AND t.availability = 'indexed' AND t.id IS NOT ?4 AND NOT {TRACK_GONE}))"
-            ))?
+            .prepare_cached(crate::scan::sql::STILL_NAMED.text())?
             .query_row(
                 params![
                     self.own.run_id,

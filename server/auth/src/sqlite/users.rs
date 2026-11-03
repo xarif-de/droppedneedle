@@ -46,16 +46,12 @@ fn map_user(row: &rusqlite::Row<'_>) -> rusqlite::Result<UserRecord> {
 
 /// Tables that keep a user's name on library history with
 /// `ON DELETE RESTRICT`, as (statement, readable name).
-const RESTRICTING_HISTORY: [(Statement, &str); 3] = [
+const RESTRICTING_HISTORY: [(Statement, &str); 2] = [
     (
         sql::HELD_BY_RECONCILIATION_DISMISSALS,
         "artist reconciliation dismissals",
     ),
     (sql::HELD_BY_EDITION_MANIFESTS, "custom edition manifests"),
-    (
-        sql::HELD_BY_MANAGEMENT_EXCLUSIONS,
-        "library management exclusions",
-    ),
 ];
 
 /// A constraint conflict is the caller's `Conflict`; the rest as
@@ -716,6 +712,34 @@ impl Users {
                 binding.provider,
                 binding.provider_uid,
                 provider_data,
+                secs_to_ms(created_at),
+            ],
+        )
+        .map_err(op_error)?;
+        Ok(())
+    }
+
+    /// Insert one sign-in row holding a password, its uid given as it is,
+    /// inside the caller's transaction. The importer's form for a local row
+    /// whose uid need not be today's username, on an account that may have
+    /// none. A taken `(provider, provider_uid)` pair is
+    /// [`WriteError::Conflict`].
+    pub fn insert_password_binding_in(
+        tx: &Transaction<'_>,
+        binding: &ProviderBinding,
+        hash: &str,
+        scheme: &str,
+        created_at: i64,
+    ) -> Result<(), WriteError> {
+        tx.execute(
+            sql::INSERT_PASSWORD_BINDING.text(),
+            rusqlite::params![
+                binding.id,
+                binding.user_id,
+                binding.provider,
+                binding.provider_uid,
+                hash,
+                scheme,
                 secs_to_ms(created_at),
             ],
         )

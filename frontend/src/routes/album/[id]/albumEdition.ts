@@ -2,7 +2,7 @@
 // the album pages' track rows and their "Unmatched files" section.
 import type { EditionPlan } from '$lib/queries/albums/EditionQueries.svelte';
 import { getDiscTrackKey } from '$lib/player/queueHelpers';
-import type { LibraryFileMeta } from '$lib/types';
+import type { LibraryStatusTrack } from '$lib/types';
 
 type EditionPlanFile = EditionPlan['files'][number];
 
@@ -11,7 +11,7 @@ export interface EditionTrackRow {
 	/** No file sits on the track. */
 	missing: boolean;
 	/** The library's facts about the file that sits on the track. */
-	file: LibraryFileMeta | null;
+	file: LibraryStatusTrack | null;
 	/** The file's length when one sits on the track, else the edition's. */
 	lengthMs: number | null;
 	/** The length of a file that is another version of this missing track. */
@@ -22,6 +22,8 @@ export interface EditionTrackRow {
 /** A file under the album that sits on none of its edition's tracks. */
 export interface UnmatchedFile {
 	id: string;
+	/** The revision on the album's status, which removal sends. Null: no status row, no removal. */
+	rowRevision: number | null;
 	title: string;
 	artistName: string | null;
 	format: string | null;
@@ -54,7 +56,7 @@ export function notesByFile(plan: EditionPlan): Map<string, string> {
 /** Each edition track by disc and position, as the plan lines the files up on it. */
 export function editionTrackRows(
 	plan: EditionPlan,
-	filesById: Map<string, LibraryFileMeta>
+	filesById: Map<string, LibraryStatusTrack>
 ): Map<string, EditionTrackRow> {
 	const planFiles = new Map(plan.files.map((file) => [file.local_track_id, file]));
 	const versions = new Map<string, EditionPlanFile>();
@@ -99,7 +101,7 @@ function unmatchedLabel(file: EditionPlanFile): string {
 /** The album's files the edition has no track for, each labelled with why. */
 export function unmatchedFiles(
 	plan: EditionPlan,
-	filesById: Map<string, LibraryFileMeta>
+	filesById: Map<string, LibraryStatusTrack>
 ): UnmatchedFile[] {
 	return plan.files
 		.filter((file) => file.fate !== 'keep')
@@ -107,6 +109,7 @@ export function unmatchedFiles(
 			const meta = filesById.get(file.local_track_id);
 			return {
 				id: file.local_track_id,
+				rowRevision: meta?.row_revision ?? null,
 				title: file.title,
 				artistName: meta?.artist_name ?? null,
 				format: meta?.format ?? null,

@@ -13,6 +13,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::common::bundles::quiet_ticks;
+use droppedneedle_providers::newznab::NewznabIndexers;
+use droppedneedle_providers::{ProviderEndpoints, ProviderError, Providers, RequestPriority};
 use droppedneedle_testkit::usenet::{
     NewznabMock, NewznabScenario, ProwlarrMock, ProwlarrScenario, SabnzbdMock, serve_loopback,
 };
@@ -28,6 +30,8 @@ use usenet::sabnzbd::{
 };
 
 const TIMEOUT: Duration = Duration::from_secs(10);
+/// Newznab calls in these tests are a person's: never queued for long.
+const USER: RequestPriority = RequestPriority::UserInitiated;
 
 fn http() -> reqwest::Client {
     reqwest::Client::builder().build().expect("test client")
@@ -154,6 +158,33 @@ async fn sab_addfile_multipart_shape() {
     assert!(body.contains("<nzb"), "{body}");
 
     std::fs::remove_dir_all(&mount).ok();
+}
+
+/// A proxy in front of SABnzbd that answers the POST with a 308 costs nothing:
+/// the upload is sent again, whole, and the job is added once.
+#[tokio::test]
+async fn sab_addfile_survives_a_308_redirect() {
+    let mock = SabnzbdMock::new();
+    mock.state().addfile_redirect_308 = 1;
+    let (base, _server) = serve_loopback(mock.router()).await.expect("mock serves");
+    let mount = temp_dir("addfile-308");
+    let queue = queue_for(&mock, &base, mount.to_path_buf());
+
+    let handle = queue
+        .enqueue_album(
+            "t1",
+            Some(&format!("{base}/nzb/good")),
+            Some("audio"),
+            None,
+            None,
+        )
+        .await
+        .expect("enqueue");
+    assert_eq!(handle.nzo_id, "nzo-test-1");
+
+    let calls = mock.state().add_file_requests.clone();
+    assert_eq!(calls.len(), 1);
+    assert!(String::from_utf8_lossy(&calls[0].body).contains("<nzb"));
 }
 
 /// A no-response transport failure falls back to `addurl`: SABnzbd
@@ -767,8 +798,9 @@ async fn sab_addurl_redaction() {
 }
 
 /// A key echoed in a URL path, percent-encoded inside another URL's query,
-/// or as a JSON member is scrubbed like a plain `apikey=`, and a key
-/// written into a URL's last segment (DrunkenSlug's enclosure) still is.
+/// as a JSON member (escaped or under a longer name) or as a URL's
+/// password is scrubbed like a plain `apikey=`, and a key written into a
+/// URL's last segment (DrunkenSlug's enclosure) still is.
 #[test]
 fn redaction_covers_path_encoded_and_json_keys() {
     let cases = [
@@ -791,6 +823,31 @@ fn redaction_covers_path_encoded_and_json_keys() {
         ("https://x/api;apikey=SECRET", "https://x/api;apikey=***"),
         ("x%3Fi%3D1%26r%3DPERUSERKEY%26y", "x%3Fi%3D1%26r%3D***%26y"),
         ("x%26link%3DTOKEN", "x%26link%3D***"),
+        (
+            "https://x/api?nzbkey=K1&nzb_key=K2",
+            "https://x/api?nzbkey=***&nzb_key=***",
+        ),
+        (
+            "login?user=a&password=P1&pass=P2",
+            "login?user=a&password=***&pass=***",
+        ),
+        ("bypass=kept", "bypass=kept"),
+        (
+            r#"{"error": "{\"apikey\": \"SECRET\", \"x\": 1}"}"#,
+            r#"{"error": "{\"apikey\": \"***\", \"x\": 1}"}"#,
+        ),
+        (
+            r#"{"url": "https:\/\/x\/fetch\/0123456789abcdef0123456789abcdef\/a"}"#,
+            r#"{"url": "https:\/\/x\/fetch\/***\/a"}"#,
+        ),
+        (
+            r#"{"sabnzbd_apikey": "SECRET", "error": "x"}"#,
+            r#"{"sabnzbd_apikey": "***", "error": "x"}"#,
+        ),
+        (
+            "fetch failed for https://user:SECRET@x/getnzb",
+            "fetch failed for https://user:***@x/getnzb",
+        ),
     ];
     let leaks: Vec<String> = cases
         .iter()
@@ -806,18 +863,22 @@ fn redaction_covers_path_encoded_and_json_keys() {
 // Newznab: caps gating, 202 fallback, ladder, fan-out.
 // ---------------------------------------------------------------------------
 
+/// The providers' Newznab indexers over real HTTP to loopback, unpaced.
+fn newznab_indexers() -> NewznabIndexers {
+    let http = droppedneedle_kernel::http_client::HttpClientFactory::new().expect("http");
+    Providers::unpaced_at(
+        std::sync::Arc::new(droppedneedle_providers::ReqwestWire::new(&http)),
+        ProviderEndpoints::closed(),
+    )
+    .newznab
+}
+
 fn newznab_client(base: &str, id: &str, name: &str) -> NewznabClient {
-    NewznabClient::new(http(), &format!("{base}/api"), "NZKEY", id, name)
+    newznab_indexers().client(id, name, &format!("{base}/api"), "NZKEY")
 }
 
 fn newznab_indexer(entries: Vec<NewznabIndexerEntry>) -> NewznabIndexer {
-    NewznabIndexer::new(
-        entries,
-        Duration::from_secs(300),
-        Duration::from_secs(60),
-        Duration::from_secs(300),
-        TIMEOUT,
-    )
+    NewznabIndexer::new(entries, Duration::from_secs(300), Duration::from_secs(60))
 }
 
 fn entry_for(client: NewznabClient, id: &str, name: &str, priority: u32) -> NewznabIndexerEntry {
@@ -847,7 +908,7 @@ async fn newznab_music_202_fallback() {
         1,
     )]);
     let hits = indexer
-        .search_album("Radiohead", "In Rainbows", None, TIMEOUT)
+        .search_album("Radiohead", "In Rainbows", None, USER)
         .await;
     assert_eq!(hits.len(), 3, "fell back to the search feed");
     let recorded = log.calls();
@@ -857,7 +918,7 @@ async fn newznab_music_202_fallback() {
     // The raw client surfaces the 202 with its code intact.
     let client = newznab_client(&base, "bm", "BM");
     let err = client
-        .music_search("Radiohead", "In Rainbows", &[], None, 0, 100, TIMEOUT)
+        .music_search("Radiohead", "In Rainbows", &[], None, 0, 100, USER)
         .await
         .expect_err("202");
     assert_eq!(err.code(), Some(202));
@@ -873,10 +934,7 @@ async fn newznab_item_parsing() {
         .await
         .expect("mock serves");
     let client = newznab_client(&base, "ds", "DrunkenSlug");
-    let (releases, limits) = client
-        .search("x", &[], 0, 100, TIMEOUT)
-        .await
-        .expect("feed");
+    let (releases, limits) = client.search("x", &[], 0, 100, USER).await.expect("feed");
     assert_eq!(releases.len(), 3);
     let first = &releases[0];
     assert!(
@@ -915,10 +973,7 @@ async fn newznab_item_parsing() {
         .await
         .expect("mock serves");
     let client = newznab_client(&base, "tor", "Tor");
-    let (releases, _) = client
-        .search("x", &[], 0, 100, TIMEOUT)
-        .await
-        .expect("feed");
+    let (releases, _) = client.search("x", &[], 0, 100, USER).await.expect("feed");
     assert!(releases.is_empty());
 
     // Bare ampersands, &nbsp;, and control chars still parse.
@@ -927,10 +982,7 @@ async fn newznab_item_parsing() {
         .await
         .expect("mock serves");
     let client = newznab_client(&base, "mal", "Mal");
-    let (releases, _) = client
-        .search("x", &[], 0, 100, TIMEOUT)
-        .await
-        .expect("feed");
+    let (releases, _) = client.search("x", &[], 0, 100, USER).await.expect("feed");
     assert_eq!(releases.len(), 1);
     assert!(
         releases[0].title.contains("Fish & Chips"),
@@ -971,7 +1023,7 @@ async fn newznab_query_ladder() {
         1,
     )]);
     let hits = indexer
-        .search_album("Drake", "Honestly, Nevermind", None, TIMEOUT)
+        .search_album("Drake", "Honestly, Nevermind", None, USER)
         .await;
     assert_eq!(hits.len(), 1);
     assert!(hits[0].usenet.title.contains("Honestly_Nevermind"));
@@ -982,9 +1034,7 @@ async fn newznab_query_ladder() {
     );
 
     // A genuinely empty (but punctuated) query runs both rungs, then gives up.
-    let hits = indexer
-        .search_album("x,", "xyzzynomatch", None, TIMEOUT)
-        .await;
+    let hits = indexer.search_album("x,", "xyzzynomatch", None, USER).await;
     assert!(hits.is_empty());
     assert_eq!(log.calls().len(), 4);
 
@@ -1000,7 +1050,7 @@ async fn newznab_query_ladder() {
         1,
     )]);
     let hits = indexer
-        .search_album("Drake", "Honestly, Nevermind", None, TIMEOUT)
+        .search_album("Drake", "Honestly, Nevermind", None, USER)
         .await;
     assert!(hits.is_empty());
     assert_eq!(log.calls().len(), 1);
@@ -1017,7 +1067,7 @@ async fn newznab_query_ladder() {
         1,
     )]);
     let hits = indexer
-        .search_album("Drake", "Honestly, Nevermind", None, TIMEOUT)
+        .search_album("Drake", "Honestly, Nevermind", None, USER)
         .await;
     assert_eq!(hits.len(), 1);
     let recorded = log.calls();
@@ -1049,7 +1099,7 @@ async fn newznab_fanout() {
         entry_for(newznab_client(&ax_base, "ax", "AX"), "ax", "AX", 0),
     ]);
     let hits = indexer
-        .search_album("Radiohead", "In Rainbows", None, TIMEOUT)
+        .search_album("Radiohead", "In Rainbows", None, USER)
         .await;
     let flac: Vec<_> = hits
         .iter()
@@ -1069,7 +1119,7 @@ async fn newznab_fanout() {
         entry_for(newznab_client(&ds_base, "ds", "DS"), "ds", "DS", 1),
     ]);
     let hits = indexer
-        .search_album("Radiohead", "In Rainbows", None, TIMEOUT)
+        .search_album("Radiohead", "In Rainbows", None, USER)
         .await;
     assert_eq!(hits.len(), 3);
 
@@ -1085,7 +1135,7 @@ async fn newznab_fanout() {
         1,
     )]);
     let hits = indexer
-        .search_album("Radiohead", "In Rainbows", None, TIMEOUT)
+        .search_album("Radiohead", "In Rainbows", None, USER)
         .await;
     assert_eq!(hits.len(), 3);
     assert_eq!(dead_log.calls()[0].kind, "search");
@@ -1101,23 +1151,13 @@ async fn newznab_fanout() {
         "L",
         1,
     )]);
-    assert!(
-        indexer
-            .search_album("a", "b", None, TIMEOUT)
-            .await
-            .is_empty()
-    );
-    assert!(
-        indexer
-            .search_album("a", "b", None, TIMEOUT)
-            .await
-            .is_empty()
-    );
+    assert!(indexer.search_album("a", "b", None, USER).await.is_empty());
+    assert!(indexer.search_album("a", "b", None, USER).await.is_empty());
     assert_eq!(lim_log.calls().len(), 1);
 
     // Cache: a repeat query never re-hits the indexer.
     let hits = indexer
-        .search_album("Radiohead", "In Rainbows", None, TIMEOUT)
+        .search_album("Radiohead", "In Rainbows", None, USER)
         .await;
     assert!(hits.is_empty());
     let before = ds_log.calls().len();
@@ -1129,14 +1169,14 @@ async fn newznab_fanout() {
     )]);
     assert_eq!(
         indexer
-            .search_album("Radiohead", "In Rainbows", None, TIMEOUT)
+            .search_album("Radiohead", "In Rainbows", None, USER)
             .await
             .len(),
         3
     );
     assert_eq!(
         indexer
-            .search_album("Radiohead", "In Rainbows", None, TIMEOUT)
+            .search_album("Radiohead", "In Rainbows", None, USER)
             .await
             .len(),
         3
@@ -1144,12 +1184,47 @@ async fn newznab_fanout() {
     assert_eq!(ds_log.calls().len(), before + 1);
 
     // Health counts reachable members; an empty roster errors.
-    let health = indexer.health_check().await;
+    let health = indexer.health_check(USER).await;
     assert_eq!(health.status, "ok");
     assert!(health.message.contains("1/1"));
     assert!(indexer.is_configured());
+    // The next probe reuses that answer: it spends no daily API call.
+    let asked = ds_log.statuses().requests();
+    assert_eq!(indexer.health_check(USER).await.status, "ok");
+    assert_eq!(ds_log.statuses().requests(), asked);
     let empty = newznab_indexer(vec![]);
-    assert_eq!(empty.health_check().await.status, "error");
+    assert_eq!(empty.health_check(USER).await.status, "error");
+}
+
+/// A search the indexer refuses or fails ends the health probe's reuse of its
+/// last answer, so the next probe finds out.
+#[tokio::test]
+async fn a_failed_search_makes_the_next_health_probe_ask() {
+    let log = NewznabMock::new();
+    let (base, _server) = serve_loopback(log.router(NewznabScenario::DrunkenSlug))
+        .await
+        .expect("mock serves");
+    let indexer = newznab_indexer(vec![entry_for(
+        newznab_client(&base, "ds", "DS"),
+        "ds",
+        "DS",
+        1,
+    )]);
+    assert_eq!(indexer.health_check(USER).await.status, "ok");
+    assert_eq!(indexer.health_check(USER).await.status, "ok");
+    let asked = log.statuses().requests();
+
+    log.statuses().answer_next(401, None);
+    indexer
+        .search_album("Radiohead", "In Rainbows", None, USER)
+        .await;
+    let searched = log.statuses().requests();
+    assert!(searched > asked);
+    indexer.health_check(USER).await;
+    assert!(
+        log.statuses().requests() > searched,
+        "the probe asked again"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1295,11 +1370,11 @@ async fn newznab_deeply_nested_document_is_refused() {
     let body = format!("{}{}", "<a>".repeat(depth), "</a>".repeat(depth));
     let (base, _server) = serve_streamed(body.into_bytes()).await;
     let err = newznab_client(&base, "deep", "Deep")
-        .caps(TIMEOUT)
+        .caps(USER)
         .await
         .expect_err("too deep");
     assert!(
-        matches!(err, NewznabError::Client(ClientError::Decode { .. })),
+        matches!(err, NewznabError::Provider(ProviderError::Payload { .. })),
         "{err:?}"
     );
 }
@@ -1312,11 +1387,11 @@ async fn oversized_indexer_bodies_are_refused() {
     let feed = format!("<rss><channel><!-- {padding} --></channel></rss>");
     let (base, _server) = serve_streamed(feed.into_bytes()).await;
     let err = newznab_client(&base, "big", "Big")
-        .search("x", &[], 0, 100, TIMEOUT)
+        .search("x", &[], 0, 100, USER)
         .await
         .expect_err("too large");
     assert!(
-        matches!(err, NewznabError::Client(ClientError::Decode { .. })),
+        matches!(err, NewznabError::Provider(ProviderError::Payload { .. })),
         "{err:?}"
     );
 
@@ -1474,16 +1549,17 @@ async fn sab_transport_errors_never_carry_the_url() {
 async fn newznab_transport_errors_never_carry_the_url() {
     let (logs, _guard) = capture_logs();
     let base = refused_url("/api").await;
-    let client = || NewznabClient::new(http(), &base, MARKER, "dead", "Dead");
+    let indexers = newznab_indexers();
+    let client = || indexers.client("dead", "Dead", &base, MARKER);
 
-    let err = client().caps(TIMEOUT).await.expect_err("refused");
+    let err = client().caps(USER).await.expect_err("refused");
     assert!(!shown(&err).contains(MARKER), "{}", shown(&err));
 
     let indexer = newznab_indexer(vec![entry_for(client(), "dead", "Dead", 0)]);
-    assert_eq!(indexer.health_check().await.status, "error");
+    assert_eq!(indexer.health_check(USER).await.status, "error");
     assert!(
         indexer
-            .search_album("Radiohead", "In Rainbows", None, TIMEOUT)
+            .search_album("Radiohead", "In Rainbows", None, USER)
             .await
             .is_empty()
     );
@@ -1627,8 +1703,6 @@ async fn usenet_enqueue_reattaches_to_existing_job() {
             Vec::new(),
             Duration::from_secs(5),
             Duration::from_secs(5),
-            Duration::from_secs(5),
-            Duration::from_secs(5),
         ))],
         policy,
         journal,
@@ -1726,12 +1800,26 @@ async fn statuses_map_to_distinct_client_errors() {
     let mut errors = Vec::new();
     for (status, wait) in REFUSALS {
         newznab.statuses().answer_next(status, wait);
-        match client.caps(TIMEOUT).await.expect_err("scripted") {
-            NewznabError::Client(error) => errors.push(error),
-            other => panic!("not a client error: {other:?}"),
+        match client.caps(USER).await.expect_err("scripted") {
+            NewznabError::Provider(error) => errors.push(error),
+            other => panic!("not a provider error: {other:?}"),
         }
     }
-    assert_distinct(&errors);
+    assert!(
+        matches!(
+            errors.as_slice(),
+            [
+                ProviderError::Unauthorized { .. },
+                ProviderError::NotFound { .. },
+                ProviderError::BadRequest { status: 400, .. },
+                ProviderError::RateLimited {
+                    retry_after: Some(wait),
+                    ..
+                },
+            ] if *wait == Duration::from_secs(5)
+        ),
+        "{errors:?}"
+    );
 
     let prowlarr = ProwlarrMock::new();
     let (base, _prowlarr) = serve_loopback(prowlarr.router(ProwlarrScenario::default()))

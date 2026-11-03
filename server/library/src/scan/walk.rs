@@ -1,6 +1,6 @@
 //! One-walk, bounded-queue discovery.
 //!
-//! Port of v2's library inventory scanner. A
+//! Library inventory scanner. A
 //! blocking producer walks each scope and streams file stats through a
 //! bounded channel; the async consumer dedups, classifies, and persists
 //! inventory in batches. Skip-and-report runs through everything: one bad
@@ -33,21 +33,20 @@ use super::stop::RunStop;
 use super::store::{ClassifyInput, ScanStoreError};
 use crate::clock::LibraryClock as _;
 
-/// Bounded discovery queue (v2 `INVENTORY_QUEUE_SIZE`).
+/// Bounded discovery queue.
 pub const INVENTORY_QUEUE_SIZE: usize = 256;
-/// Inventory rows persisted per batch (v2 `INVENTORY_BATCH_SIZE`).
+/// Inventory rows persisted per batch.
 pub const INVENTORY_BATCH_SIZE: usize = 256;
 /// Reap horizon for wedged detached walkers as a multiple of the walk
-/// deadline (v2 `DETACHED_WALKER_REAP_MULTIPLIER`).
+/// deadline.
 pub const DETACHED_WALKER_REAP_MULTIPLIER: f64 = 3.0;
-/// Default walk deadline (v2 `walk_deadline_seconds`).
+/// Default walk deadline.
 pub const DEFAULT_WALK_DEADLINE_SECS: f64 = 30.0;
-/// Default cap on in-flight detached walkers (v2 `max_detached_walkers`).
+/// Default cap on in-flight detached walkers.
 pub const DEFAULT_MAX_DETACHED_WALKERS: usize = 4;
 
-/// Audio suffixes, lowercase with dot (v2 `AUDIO_EXTENSIONS` in
-/// `local_files_service.py`). Matching is case-insensitive ASCII, which
-/// equals v2's `casefold` for these suffixes.
+/// Audio suffixes, lowercase with dot. Matching is case-insensitive ASCII,
+/// which equals `casefold` for these suffixes.
 pub const AUDIO_EXTENSIONS: &[&str] = &[".flac", ".mp3", ".ogg", ".m4a", ".aac", ".wav", ".opus"];
 
 pub fn is_audio_file(path: &Path) -> bool {
@@ -62,8 +61,8 @@ pub fn is_audio_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// POSIX text for a path that is always bindable as stored TEXT (v2
-/// `_text_safe_posix`): names that are not valid UTF-8 are
+/// POSIX text for a path that is always bindable as stored TEXT: names that
+/// are not valid UTF-8 are
 /// losslessly percent-encoded from their raw bytes instead.
 pub fn text_safe_posix(path: &Path) -> String {
     #[cfg(unix)]
@@ -107,7 +106,7 @@ fn percent_encode_bytes(bytes: &[u8]) -> String {
     out
 }
 
-/// Relativize for failure and heartbeat paths (v2 `_relativize`).
+/// Relativize for failure and heartbeat paths.
 pub fn relativize(path: &Path, root: &Path) -> String {
     match path.strip_prefix(root) {
         Ok(relative) => text_safe_posix(relative),
@@ -115,8 +114,8 @@ pub fn relativize(path: &Path, root: &Path) -> String {
     }
 }
 
-/// NFC-normalized inventory key for one in-root path (v2 `_inventory_key`,
-/// step 4.13). macOS writes NFD bytes, so an NFC<->NFD rename of an
+/// NFC-normalized inventory key for one in-root path. macOS writes NFD bytes,
+/// so an NFC<->NFD rename of an
 /// unchanged file must classify as a move (same key) instead of a
 /// delete+new pair. Only the key is normalized; display strings keep their
 /// on-disk form, and case-only variants are unaffected.
@@ -130,8 +129,7 @@ pub fn inventory_key(path: &Path, root: &Path) -> String {
     }
 }
 
-/// Class-name-plus-errno detail, never the message or filesystem paths
-/// (v2 `_walk_failure_detail`).
+/// Class-name-plus-errno detail, never the message or filesystem paths.
 fn walk_failure_detail(error: &std::io::Error) -> String {
     match error.raw_os_error() {
         Some(errno) => format!("IoError (errno={}) while walking.", errno_name(errno)),
@@ -178,8 +176,8 @@ fn walk_error_code(error: &std::io::Error) -> FailureCode {
     }
 }
 
-/// Thread-safe liveness signal written by the walk producer (v2
-/// `_WalkHeartbeat`): `WALK_TIMEOUT` fires only when no progress
+/// Thread-safe liveness signal written by the walk producer: `WALK_TIMEOUT`
+/// fires only when no progress
 /// signal arrived for the whole deadline.
 #[derive(Debug)]
 struct WalkHeartbeat {
@@ -254,6 +252,9 @@ enum WalkMessage {
     /// A folder on another filesystem than the folder above it, as its
     /// inventory key.
     Mount(String),
+    /// Links met in one folder, as inventory keys. A link to a folder is never
+    /// followed; one with rows under it keeps them.
+    Links(Vec<String>),
     Done,
 }
 
@@ -278,7 +279,7 @@ fn send_with_stop(
     }
 }
 
-/// One-walk bounded-queue inventory scanner (v2 `LibraryInventoryScanner`).
+/// One-walk bounded-queue inventory scanner.
 pub struct InventoryScanner {
     store: Arc<SqliteScanStore>,
     pool: BlockingPool,
@@ -423,7 +424,11 @@ impl InventoryScanner {
 
     /// Probe one scope path on the pool with the walk deadline. Returns
     /// the probe outcome: directory or not.
-    async fn probe_selected(&self, selected: &Path) -> Result<bool, ProbeOutcome> {
+    async fn probe_selected(
+        &self,
+        root: &Path,
+        selected: &Path,
+    ) -> Result<ScopeFolder, ProbeOutcome> {
         // One probe slot by default. When occupied, give
         // the wedged stat one bounded deadline to finish before failing
         // the run.
@@ -436,17 +441,18 @@ impl InventoryScanner {
         let pending = Arc::clone(&self.pending_probes);
         let released = Arc::new(AtomicBool::new(false));
         let job_released = Arc::clone(&released);
+        let root = root.to_owned();
         let selected = selected.to_owned();
         let pool = self.pool.clone();
         let job = tokio::spawn(async move {
-            let result = pool.run(move || selected.is_dir()).await;
+            let result = pool.run(move || scope_folder(&root, &selected)).await;
             if !job_released.swap(true, Ordering::SeqCst) {
                 pending.fetch_sub(1, Ordering::SeqCst);
             }
             result
         });
         match tokio::time::timeout(self.walk_deadline, job).await {
-            Ok(Ok(Ok(exists))) => Ok(exists),
+            Ok(Ok(Ok(found))) => Ok(found),
             Ok(Ok(Err(_)) | Err(_)) => Err(ProbeOutcome::Wedged),
             Err(_) => {
                 // Tombstone the slot so it is recovered instead of
@@ -477,7 +483,7 @@ impl InventoryScanner {
         }
     }
 
-    /// Discover every scope of a run (v2 `discover`).
+    /// Discover every scope of a run.
     pub async fn discover<C: Checkpoint>(
         &self,
         run: &ScanRun,
@@ -492,6 +498,7 @@ impl InventoryScanner {
         // The run fails wholesale only when nothing was discoverable.
         let mut current = run.clone();
         let mut unavailable_scopes = 0usize;
+        let mut linked_scopes = 0usize;
         for scope in scopes {
             if self.store.scope_discovery_state(
                 stop,
@@ -534,7 +541,7 @@ impl InventoryScanner {
             } else {
                 root.join(&scope.relative_path)
             };
-            match self.probe_selected(&selected).await {
+            match self.probe_selected(&root, &selected).await {
                 Err(ProbeOutcome::Unavailable) => {
                     self.record_failure(
                         stop,
@@ -581,14 +588,57 @@ impl InventoryScanner {
                     )?;
                     return self.fail_run(&run.id, current.row_revision, FailureCode::WalkTimeout);
                 }
-                Ok(false) => {
+                Ok(ScopeFolder::Renamed) => {
+                    self.store.begin_scope_walk(
+                        stop,
+                        &run.id,
+                        &scope.root_id,
+                        &scope.relative_path,
+                    )?;
+                    self.store.complete_scope_discovery(
+                        stop,
+                        &run.id,
+                        &scope.root_id,
+                        &scope.relative_path,
+                        ScopeDiscoveryState::Completed,
+                        Some(FailureCode::ScopeRenamed),
+                    )?;
+                    continue;
+                }
+                Ok(ScopeFolder::Linked) => {
+                    self.record_failure(
+                        stop,
+                        &run.id,
+                        scope,
+                        scope.relative_path.clone(),
+                        FailureCode::ScopeThroughLink,
+                        format!(
+                            "This folder is a link, or inside one, and is not read: {}",
+                            scope.relative_path
+                        ),
+                    )?;
+                    self.store.complete_scope_discovery(
+                        stop,
+                        &run.id,
+                        &scope.root_id,
+                        &scope.relative_path,
+                        ScopeDiscoveryState::Unavailable,
+                        Some(FailureCode::ScopeThroughLink),
+                    )?;
+                    unavailable_scopes += 1;
+                    linked_scopes += 1;
+                    continue;
+                }
+                Ok(ScopeFolder::Missing) => {
+                    let detail =
+                        format!("The library root path is missing: {}", scope.relative_path);
                     self.record_failure(
                         stop,
                         &run.id,
                         scope,
                         scope.relative_path.clone(),
                         FailureCode::RootUnavailable,
-                        format!("The library root path is missing: {}", scope.relative_path),
+                        detail,
                     )?;
                     self.store.complete_scope_discovery(
                         stop,
@@ -601,7 +651,7 @@ impl InventoryScanner {
                     unavailable_scopes += 1;
                     continue;
                 }
-                Ok(true) => {}
+                Ok(ScopeFolder::Walkable) => {}
             }
             let mut restarts = 0u32;
             let (completed, walk_failure_code) = loop {
@@ -682,12 +732,17 @@ impl InventoryScanner {
             // GH-296: every scope proved unreachable, so the run fails
             // instead of completing silently green.
             tracing::warn!(run_id = %run.id, count = unavailable_scopes, "library_scan event=all_scopes_unavailable");
-            return self.fail_run(&run.id, current.row_revision, FailureCode::RootUnavailable);
+            let code = if linked_scopes == unavailable_scopes {
+                FailureCode::ScopeThroughLink
+            } else {
+                FailureCode::RootUnavailable
+            };
+            return self.fail_run(&run.id, current.row_revision, code);
         }
         Ok(current)
     }
 
-    /// Walk one scope and persist its inventory (v2 `_walk_scope`).
+    /// Walk one scope and persist its inventory.
     #[allow(clippy::too_many_arguments)]
     async fn walk_scope<C: Checkpoint>(
         &self,
@@ -838,6 +893,23 @@ impl InventoryScanner {
                         .record_mount(stop, &scope.root_id, &relative_path)?;
                 }
                 _ if discard_remaining => continue,
+                WalkMessage::Links(links) => {
+                    for relative_path in links {
+                        if self
+                            .store
+                            .refuse_link(stop, &run.id, scope, &relative_path)?
+                        {
+                            self.record_failure(
+                                stop,
+                                &run.id,
+                                scope,
+                                relative_path.clone(),
+                                FailureCode::ScopeThroughLink,
+                                format!("This folder is a link and is not read: {relative_path}"),
+                            )?;
+                        }
+                    }
+                }
                 WalkMessage::Skips(skips) => {
                     for (relative_path, failure_code) in skips {
                         let failure_detail = match failure_code {
@@ -1002,7 +1074,7 @@ impl InventoryScanner {
         }
     }
 
-    /// Classify and persist one inventory page (v2 `_persist_batch`).
+    /// Classify and persist one inventory page.
     /// Returns the revision plus whether the batch landed: a skipped
     /// batch degrades the scope (its files are invisible to reconcile),
     /// so the outcome must reach the caller, not just the log.
@@ -1112,6 +1184,47 @@ impl InventoryScanner {
 enum ProbeOutcome {
     Unavailable,
     Wedged,
+}
+
+/// What a scope's path turned out to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScopeFolder {
+    Walkable,
+    Missing,
+    /// It or a folder on the way to it, below the root, is a link. The
+    /// root's own path is the admin's and may go through links.
+    Linked,
+    /// The exact path is not on the disk, and a folder differing only in case
+    /// is, at full depth, holding files. The scope completes empty; a row here
+    /// is judged gone only as the mass-missing guard allows, and a row whose
+    /// file the twin holds at the same place does not count against it.
+    Renamed,
+}
+
+fn scope_folder(root: &Path, selected: &Path) -> ScopeFolder {
+    let mut at = root.to_path_buf();
+    let below = selected.strip_prefix(root).unwrap_or(Path::new(""));
+    for part in below.components() {
+        at.push(part);
+        match at.symlink_metadata() {
+            Ok(meta) if meta.file_type().is_symlink() => return ScopeFolder::Linked,
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(_) => return ScopeFolder::Missing,
+        }
+    }
+    if let Some(relative) = below.to_str().filter(|relative| !relative.is_empty()) {
+        match super::roots::renamed_to_a_twin(root, relative) {
+            Ok(false) => {}
+            Ok(true) => return ScopeFolder::Renamed,
+            Err(_) => return ScopeFolder::Missing,
+        }
+    }
+    if selected.is_dir() {
+        ScopeFolder::Walkable
+    } else {
+        ScopeFolder::Missing
+    }
 }
 
 struct StopGuard(Arc<AtomicBool>);
@@ -1283,7 +1396,7 @@ pub fn folder_digests(
     Ok(digests)
 }
 
-/// Blocking walk producing inventory messages (v2 `producer`). Runs on the
+/// Blocking walk producing inventory messages. Runs on the
 /// pool: stat-only, symlink-cautious, skip-and-report. `device` reads the
 /// filesystem of each folder the walk descends into, once, to report mounts.
 /// `yielded` holds the real folders of other roots that index the files
@@ -1359,6 +1472,7 @@ fn produce_inventory(
             }
         };
         let mut skips: Vec<(String, FailureCode)> = Vec::new();
+        let mut links: Vec<String> = Vec::new();
         let mut inspected: Vec<Result<DiscoveredFile, WalkErrorInfo>> = Vec::new();
         for entry in entries {
             let entry = match entry {
@@ -1394,6 +1508,13 @@ fn produce_inventory(
                 }
                 continue;
             }
+            if file_type.is_symlink() {
+                links.push(
+                    path.strip_prefix(root)
+                        .map(text_safe_posix)
+                        .unwrap_or_else(|_| text_safe_posix(&path)),
+                );
+            }
             if !is_audio_file(&path) || is_management_artifact(&path) {
                 continue;
             }
@@ -1412,6 +1533,11 @@ fn produce_inventory(
             // followed into the library).
             let resolved = if file_type.is_symlink() {
                 match std::fs::canonicalize(&path) {
+                    // Its file is indexed under the root that won the
+                    // shared folder.
+                    Ok(target) if yielded.iter().any(|other| target.starts_with(other)) => {
+                        continue;
+                    }
                     Ok(target) => match target.strip_prefix(&canonical_root) {
                         // Re-expressed under the configured root, so its
                         // inventory key matches a plain file's.
@@ -1474,6 +1600,9 @@ fn produce_inventory(
                 mtime_secs: mtime_ns as f64 / 1_000_000_000.0,
                 revision: exact_stat_revision(meta.len(), mtime_ns),
             }));
+        }
+        if !links.is_empty() && !send_with_stop(sender, stopped, WalkMessage::Links(links)) {
+            break;
         }
         if !skips.is_empty() && !send_with_stop(sender, stopped, WalkMessage::Skips(skips)) {
             break;

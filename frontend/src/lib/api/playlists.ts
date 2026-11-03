@@ -1,58 +1,30 @@
+import { v3 } from '$lib/api/v3/endpoint';
 import { api } from '$lib/api/client';
 import type { QueueItem } from '$lib/player/types';
-import { PlaylistV3Api } from '$lib/queries/playlists/PlaylistV3Api';
-import { REQUESTS_ENDPOINTS } from '$lib/queries/requests/endpoints';
+import type { components } from '$lib/api/v3/openapi';
 import { toPageDetail } from '$lib/queries/playlists/playlistV3Adapter';
 
-export interface PlaylistTrack {
-	id: string;
-	position: number;
-	track_name: string;
-	artist_name: string;
-	album_name: string;
-	album_id: string | null;
-	artist_id: string | null;
-	track_source_id: string | null;
-	cover_url: string | null;
-	source_type: string;
-	available_sources: string[] | null;
-	format: string | null;
-	track_number: number | null;
-	disc_number: number | null;
-	duration: number | null;
-	created_at: string;
-	plex_rating_key: string | null;
-	library_file_id: string | null;
-}
+type Schemas = components['schemas'];
 
-export interface PlaylistSummary {
-	id: string;
-	name: string;
-	track_count: number;
-	total_duration: number | null;
-	cover_urls: string[];
-	custom_cover_url: string | null;
-	source_ref: string | null;
+// The contract's rows with dates as ISO strings and every optional field filled.
+export type PlaylistTrack = Required<Omit<Schemas['PlaylistTrack'], 'created_at'>> & {
+	created_at: string;
+};
+
+export type PlaylistSummary = Required<
+	Omit<Schemas['PlaylistSummary'], 'created_at' | 'updated_at' | 'is_redacted'>
+> & {
 	created_at: string;
 	updated_at: string;
-	// Ownership and visibility.
-	is_public: boolean;
-	is_owner: boolean;
-	owner_name: string | null;
 	is_redacted: false;
-}
+};
 
-export interface PlaylistDetail extends PlaylistSummary {
-	tracks: PlaylistTrack[];
-}
+export type PlaylistDetail = PlaylistSummary & { tracks: PlaylistTrack[] };
 
-/** Admin's view of another user's PRIVATE playlist: count + owner only. */
-export interface RedactedPlaylist {
-	id: string;
-	track_count: number;
-	owner_name: string | null;
+/** A private playlist the caller may not read: count + owner only. */
+export type RedactedPlaylist = Required<Omit<Schemas['RedactedPlaylist'], 'is_redacted'>> & {
 	is_redacted: true;
-}
+};
 
 export type PlaylistListItem = PlaylistSummary | RedactedPlaylist;
 export type PlaylistDetailItem = PlaylistDetail | RedactedPlaylist;
@@ -63,22 +35,7 @@ export function isRedactedPlaylist(
 	return item.is_redacted === true;
 }
 
-export interface TrackData {
-	track_name: string;
-	artist_name: string;
-	album_name: string;
-	album_id?: string | null;
-	artist_id?: string | null;
-	track_source_id?: string | null;
-	cover_url?: string | null;
-	source_type: string;
-	available_sources?: string[] | null;
-	format?: string | null;
-	track_number?: number | null;
-	disc_number?: number | null;
-	duration?: number | null;
-	plex_rating_key?: string | null;
-}
+export type TrackData = Schemas['TrackInput'] & { source_type: string };
 
 export function queueItemToTrackData(item: QueueItem): TrackData {
 	return {
@@ -95,7 +52,8 @@ export function queueItemToTrackData(item: QueueItem): TrackData {
 		track_number: item.trackNumber ?? null,
 		disc_number: item.discNumber ?? null,
 		duration: item.duration ?? null,
-		plex_rating_key: item.plexRatingKey ?? null
+		plex_rating_key: item.plexRatingKey ?? null,
+		recording_mbid: item.recordingIds?.[item.sourceType] ?? null
 	};
 }
 
@@ -106,7 +64,10 @@ export async function fetchPlaylist(
 	id: string,
 	options?: { signal?: AbortSignal }
 ): Promise<PlaylistDetailItem> {
-	const data = await api.v3.GET(PlaylistV3Api.detail(id), { signal: options?.signal });
+	const data = await api.v3.GET(
+		v3('/api/v3/playlists/{playlist_id}', { path: { playlist_id: id } }),
+		{ signal: options?.signal }
+	);
 	return toPageDetail(data);
 }
 
@@ -144,7 +105,7 @@ export async function requestMissingTracks(tracks: PlaylistTrack[]): Promise<Bat
 			skipped: 0
 		};
 	}
-	const data = await api.v3.POST(REQUESTS_ENDPOINTS.requestBatch(), { items });
+	const data = await api.v3.POST(v3('/api/v3/requests/batches'), { items });
 	return {
 		success: data.success,
 		message: data.message,

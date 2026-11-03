@@ -11,10 +11,11 @@
 		createOidcAuthorizeMutation
 	} from '$lib/queries/auth/AuthMutations.svelte';
 	import { withBasePath } from '$lib/utils/basePath';
+	import { providerUnavailableMessage } from '$lib/utils/serviceError';
 	import { takeSignInReturn } from '$lib/utils/signInReturn';
 	import { outsideLink } from '$lib/components/outsideLink';
-	import { createPlexStartMutation } from '$lib/queries/plex/PlexAuthMutations.svelte';
-	import { pollPlexFlow } from '$lib/queries/plex/PlexFlowApi';
+	import { createPlexStartMutation } from '$lib/queries/plex.svelte';
+	import { pollPlexFlow } from '$lib/queries/plex.svelte';
 	import { toAuthUser, type AuthProviders, type SessionUserLike } from '$lib/queries/auth/types';
 	import { onDestroy } from 'svelte';
 	import { Eye, EyeOff } from 'lucide-svelte';
@@ -107,13 +108,27 @@
 		}
 	}
 
+	/** What to say when the server or a provider asked this sign-in to wait. */
+	function waitMessage(error: unknown): string | null {
+		if (error instanceof ApiError && error.status === 429) {
+			return 'Too many attempts. Wait a moment and try again.';
+		}
+		return providerUnavailableMessage(error);
+	}
+
 	async function handlePlexLogin() {
 		plexError = null;
 		plexLoading = true;
 		if (plexPollInterval) clearInterval(plexPollInterval);
 		try {
 			const { pin_id, authorize_url } = await plexPin.mutateAsync({ purpose: 'login' });
-			window.open(authorize_url, '_blank', 'width=800,height=600');
+			const authorizeLink = outsideLink(authorize_url);
+			if (!authorizeLink) {
+				plexError = 'Sign-in provider address refused';
+				plexLoading = false;
+				return;
+			}
+			window.open(authorizeLink, '_blank', 'width=800,height=600');
 
 			plexPollInterval = setInterval(async () => {
 				try {
@@ -127,11 +142,13 @@
 				} catch (e) {
 					clearInterval(plexPollInterval!);
 					plexLoading = false;
-					plexError = e instanceof ApiError ? 'Plex access denied' : 'Plex login failed';
+					plexError =
+						providerUnavailableMessage(e) ??
+						(e instanceof ApiError ? 'Plex access denied' : 'Plex login failed');
 				}
 			}, 2000);
-		} catch {
-			plexError = 'Plex login unavailable';
+		} catch (e) {
+			plexError = waitMessage(e) ?? 'Plex login unavailable';
 			plexLoading = false;
 		}
 	}
@@ -145,13 +162,13 @@
 			// document names, and assigning a script address here would run it.
 			const authorizeLink = outsideLink(authorize_url);
 			if (!authorizeLink) {
-				oidcError = 'SSO is not configured';
+				oidcError = 'Sign-in provider address refused';
 				oidcLoading = false;
 				return;
 			}
 			window.location.href = authorizeLink;
-		} catch {
-			oidcError = 'SSO is not configured';
+		} catch (e) {
+			oidcError = waitMessage(e) ?? 'SSO is not configured';
 			oidcLoading = false;
 		}
 	}

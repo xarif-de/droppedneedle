@@ -1,6 +1,6 @@
 //! The library activity feed: what the library is doing right now.
 //!
-//! A port of v2's `GET /library/activity` assembly. `items` drive the
+//! Assembly of the `GET /library/activity` feed. `items` drive the
 //! activity strip (one scan card, one identification card); `work_items`
 //! drive the work stack, sorted most urgent first. Building the feed is
 //! pure: the service reads the runs and queue counts, this decides what
@@ -12,6 +12,7 @@ use serde::Serialize;
 use utoipa::ToSchema;
 
 use super::store::{DeferredJob, IdentificationSnapshot, OperationWork};
+use crate::jobs::{OperationKind, OperationState};
 use crate::scan::models::{Counter, Counters, ScanPhase, ScanRun, ScanState};
 
 /// A failed scan stays on the strip this long after it ended.
@@ -104,13 +105,64 @@ impl From<&DeferredJob> for DeferredJobView {
     }
 }
 
+/// What a card's work is doing: a scan run's state, or identification's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivityState {
+    Queued,
+    Discovering,
+    Indexing,
+    Reconciling,
+    Running,
+    Pausing,
+    Paused,
+    Stopping,
+    Idle,
+    Completed,
+    Cancelled,
+    SupersededPolicyChanged,
+    Failed,
+}
+
+crate::scan::models::spelled!(ActivityState {
+    Queued => "queued",
+    Discovering => "discovering",
+    Indexing => "indexing",
+    Reconciling => "reconciling",
+    Running => "running",
+    Pausing => "pausing",
+    Paused => "paused",
+    Stopping => "stopping",
+    Idle => "idle",
+    Completed => "completed",
+    Cancelled => "cancelled",
+    SupersededPolicyChanged => "superseded_policy_changed",
+    Failed => "failed",
+});
+
+impl From<ScanState> for ActivityState {
+    fn from(state: ScanState) -> Self {
+        match state {
+            ScanState::Queued => Self::Queued,
+            ScanState::Discovering => Self::Discovering,
+            ScanState::Indexing => Self::Indexing,
+            ScanState::Reconciling => Self::Reconciling,
+            ScanState::Pausing => Self::Pausing,
+            ScanState::Paused => Self::Paused,
+            ScanState::Stopping => Self::Stopping,
+            ScanState::Completed => Self::Completed,
+            ScanState::Cancelled => Self::Cancelled,
+            ScanState::SupersededPolicyChanged => Self::SupersededPolicyChanged,
+            ScanState::Failed => Self::Failed,
+        }
+    }
+}
+
 /// One activity strip card.
 #[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
 pub struct ActivityItem {
     pub kind: ActivityKind,
-    /// A scan run state, or `running`, `pausing`, `paused`, `idle` or
-    /// `failed` for identification.
-    pub state: String,
+    pub state: ActivityState,
     pub label: String,
     pub processed: u64,
     #[schema(required = true)]
@@ -147,10 +199,10 @@ pub struct ActivityItem {
 }
 
 impl ActivityItem {
-    fn new(kind: ActivityKind, state: &str, label: &str) -> Self {
+    fn new(kind: ActivityKind, state: ActivityState, label: &str) -> Self {
         Self {
             kind,
-            state: state.to_owned(),
+            state,
             label: label.to_owned(),
             processed: 0,
             total: None,
@@ -183,7 +235,7 @@ pub struct WorkItem {
     /// Run id, or a fixed id for queue-wide entries.
     pub id: String,
     pub kind: WorkKind,
-    pub state: String,
+    pub state: ActivityState,
     #[schema(required = true)]
     pub phase: Option<String>,
     #[schema(required = true)]
@@ -231,11 +283,11 @@ pub struct WorkItem {
 }
 
 impl WorkItem {
-    fn new(id: &str, kind: WorkKind, state: &str, unit: WorkUnit) -> Self {
+    fn new(id: &str, kind: WorkKind, state: ActivityState, unit: WorkUnit) -> Self {
         Self {
             id: id.to_owned(),
             kind,
-            state: state.to_owned(),
+            state,
             phase: None,
             mode: None,
             effect: WorkEffect::CatalogOnly,
@@ -298,7 +350,7 @@ fn counter(counters: &Counters, counter: Counter) -> Option<u64> {
     Some(counters.get(counter).max(0) as u64)
 }
 
-/// v2's `total_count or discovered_count`: a zero total falls through.
+/// `total_count`, or `discovered_count` when the total is zero.
 fn run_total(counters: &Counters) -> Option<u64> {
     counter(counters, Counter::Total)
         .filter(|total| *total != 0)
@@ -321,7 +373,7 @@ fn failed_scan(run: &ScanRun, counters: &Counters) -> (ActivityItem, WorkItem) {
     let total = run_total(counters);
     let inspected = counter(counters, Counter::Inspected).unwrap_or(0);
     let failure_at = run.terminal_at.unwrap_or(run.updated_at);
-    let mut item = ActivityItem::new(ActivityKind::Scan, "failed", SCAN_LABEL);
+    let mut item = ActivityItem::new(ActivityKind::Scan, ActivityState::Failed, SCAN_LABEL);
     item.processed = inspected;
     item.total = total;
     item.indeterminate = total.unwrap_or(0) == 0;
@@ -329,7 +381,12 @@ fn failed_scan(run: &ScanRun, counters: &Counters) -> (ActivityItem, WorkItem) {
     item.started_at = run.started_at;
     item.failure_event_id = Some(run.id.clone());
     item.failure_at = Some(failure_at);
-    let mut work = WorkItem::new(&run.id, WorkKind::Scan, "failed", WorkUnit::Files);
+    let mut work = WorkItem::new(
+        &run.id,
+        WorkKind::Scan,
+        ActivityState::Failed,
+        WorkUnit::Files,
+    );
     work.phase = Some(run.state.phase().as_str().to_owned());
     work.effect = WorkEffect::Attention;
     work.processed = inspected;
@@ -345,36 +402,47 @@ fn failed_scan(run: &ScanRun, counters: &Counters) -> (ActivityItem, WorkItem) {
 }
 
 /// Identification state as the cards spell it.
-fn identification_state(snapshot: &IdentificationSnapshot, failed_counts: bool) -> &'static str {
+fn identification_state(snapshot: &IdentificationSnapshot, failed_counts: bool) -> ActivityState {
     if snapshot.paused && snapshot.running > 0 {
-        "pausing"
+        ActivityState::Pausing
     } else if snapshot.paused {
-        "paused"
+        ActivityState::Paused
     } else if snapshot.running > 0 || snapshot.claimable > 0 {
-        "running"
+        ActivityState::Running
     } else if failed_counts && snapshot.failure.is_some() {
-        "failed"
+        ActivityState::Failed
     } else {
-        "idle"
+        ActivityState::Idle
     }
 }
 
-/// One operation job on the work stack (v2's administrative work items):
+/// One operation job on the work stack (administrative work items):
 /// re-identifications, identity repairs and preparations, and cleanup.
 fn operation_item(job: &OperationWork) -> WorkItem {
-    let kind = match (job.kind.as_str(), job.purpose.as_deref()) {
-        ("explicit_reidentification", _) => WorkKind::Reidentification,
-        ("repair", Some("management_readiness")) => WorkKind::IdentityPreparation,
-        ("library_management", _) => WorkKind::LibraryManagement,
-        ("bulk_review_apply", _) => WorkKind::IdentityReview,
-        _ => WorkKind::Maintenance,
+    let kind = match (job.kind, job.purpose.as_deref()) {
+        (OperationKind::ExplicitReidentification, _) => WorkKind::Reidentification,
+        (OperationKind::Repair, Some("management_readiness")) => WorkKind::IdentityPreparation,
+        (OperationKind::LibraryManagement, _) => WorkKind::LibraryManagement,
+        (OperationKind::BulkReviewApply, _) => WorkKind::IdentityReview,
+        (OperationKind::Repair, _) => WorkKind::Maintenance,
     };
     // Play filing counts play rows; every other job here counts albums.
     let unit = match job.purpose.as_deref() {
         Some("play_history_filing") => WorkUnit::Items,
         _ => WorkUnit::Albums,
     };
-    let mut work = WorkItem::new(&job.id, kind, &job.state, unit);
+    // The list holds queued, running and paused jobs; the rest are spelled
+    // out so a new state cannot pass unnoticed.
+    let state = match job.state {
+        OperationState::Queued => ActivityState::Queued,
+        OperationState::Running => ActivityState::Running,
+        OperationState::Paused => ActivityState::Paused,
+        OperationState::Ready => ActivityState::Idle,
+        OperationState::Succeeded => ActivityState::Completed,
+        OperationState::Failed => ActivityState::Failed,
+        OperationState::Cancelled | OperationState::Stopped => ActivityState::Cancelled,
+    };
+    let mut work = WorkItem::new(&job.id, kind, state, unit);
     work.phase = job.phase.as_deref().map(|phase| {
         if phase == "apply" {
             "applying".to_owned()
@@ -393,11 +461,15 @@ fn operation_item(job: &OperationWork) -> WorkItem {
     work.succeeded_count = job.succeeded;
     work.failed_count = job.failed;
     work.skipped_count = job.skipped;
-    work.priority = if job.state == "running" { 60 } else { 80 };
+    work.priority = if job.state == OperationState::Running {
+        60
+    } else {
+        80
+    };
     work
 }
 
-/// Assemble the feed (v2 `library_activity`).
+/// Assemble the feed.
 pub fn build(inputs: FeedInputs<'_>) -> LibraryActivity {
     let mut items: Vec<ActivityItem> = Vec::new();
     let mut work_items: Vec<WorkItem> = Vec::new();
@@ -428,7 +500,7 @@ pub fn build(inputs: FeedInputs<'_>) -> LibraryActivity {
         if index == 0 {
             let mut item = ActivityItem::new(
                 ActivityKind::Scan,
-                run.state.scan_state().as_str(),
+                run.state.scan_state().into(),
                 SCAN_LABEL,
             );
             item.processed = processed;
@@ -445,7 +517,7 @@ pub fn build(inputs: FeedInputs<'_>) -> LibraryActivity {
         let mut work = WorkItem::new(
             &run.id,
             WorkKind::Scan,
-            run.state.scan_state().as_str(),
+            run.state.scan_state().into(),
             WorkUnit::Files,
         );
         work.phase = Some(run.state.phase().as_str().to_owned());
@@ -521,7 +593,7 @@ pub fn build(inputs: FeedInputs<'_>) -> LibraryActivity {
         items.push(item);
 
         if waiting > 0 || failure_id.is_some() {
-            let settled_failure = state == "failed" && waiting == 0;
+            let settled_failure = state == ActivityState::Failed && waiting == 0;
             let mut work = WorkItem::new(
                 "identification",
                 WorkKind::Identification,
@@ -551,7 +623,7 @@ pub fn build(inputs: FeedInputs<'_>) -> LibraryActivity {
                 let mut failed = WorkItem::new(
                     &format!("identification-failure:{id}"),
                     WorkKind::Identification,
-                    "failed",
+                    ActivityState::Failed,
                     WorkUnit::Albums,
                 );
                 failed.phase = Some("identifying_albums".to_owned());

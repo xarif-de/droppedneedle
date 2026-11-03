@@ -1,5 +1,6 @@
 import { page } from 'vitest/browser';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { toastStore } from '$lib/stores/toast';
 import { apiError, fakeApi, type FakeApi, type RouteData } from '$lib/test/api';
 import { renderWithQuery } from '$lib/test/render';
 
@@ -23,7 +24,7 @@ vi.mock('$lib/stores/player.svelte', () => ({
 import AlbumPage from './ProviderAlbumPage.svelte';
 import AlbumRoute from './+page.svelte';
 import { authStore } from '$lib/stores/authStore.svelte';
-import { HomeQueryKeyFactory } from '$lib/queries/HomeQueryKeyFactory';
+import { HomeQueryKeyFactory } from '$lib/queries/featureKeys';
 import { setQueryDataWithPersister } from '$lib/queries/QueryClient';
 import { libraryStore } from '$lib/stores/library';
 import { toAuthUser } from '$lib/queries/auth/types';
@@ -64,6 +65,7 @@ function localTrack(i: number, albumIdOfFile: string): LocalTrack {
 	const [disc, position, title, length] = songs[i];
 	return {
 		id: `file-${i}`,
+		row_revision: 4,
 		title,
 		album_id: albumIdOfFile,
 		album_title: 'Daylight Hours',
@@ -75,6 +77,7 @@ function localTrack(i: number, albumIdOfFile: string): LocalTrack {
 		file_size_bytes: 1,
 		format: 'flac',
 		cover_available: false,
+		art_missing: false,
 		favorite: false
 	};
 }
@@ -92,12 +95,14 @@ function localAlbum(): RouteData<'GET /api/v3/library/albums/{id}'> {
 		artist_name: 'Lumen',
 		release_group_mbid: albumId,
 		cover_available: false,
+		art_missing: false,
 		favorite: false,
 		identity_state: 'matched',
 		is_compilation: false,
 		total_duration_seconds: 736,
 		total_size_bytes: 4,
-		track_count: 4
+		track_count: 4,
+		row_revision: 1
 	};
 }
 
@@ -109,6 +114,7 @@ let status: (id: string) => Status;
 let plan: Plan | null;
 let history: History;
 let editionFetch: Fetch;
+let downloadAllowed: boolean;
 let api: FakeApi;
 
 function routes(): FakeApi {
@@ -165,6 +171,7 @@ function routes(): FakeApi {
 						}))
 					: []
 		}),
+		'GET /api/v3/download/access': () => ({ allowed: downloadAllowed }),
 		'GET /api/v3/library/albums/{id}/status': ({ params }) => status(params.id),
 		'GET /api/v3/library/albums/{id}': ({ params }) =>
 			params.id === localAlbumId ? localAlbum() : apiError(404, 'NOT_FOUND', 'Unknown album'),
@@ -203,7 +210,7 @@ function routes(): FakeApi {
 		'GET /api/v3/youtube/track-links/{album_id}': [],
 		'GET /api/v3/covers/release-group/{release_group_id}': undefined,
 		'POST /api/v3/ratings/lookup': { albums: {}, artists: {}, tracks: {} },
-		'GET /api/v3/library/retag-pairs': { pairs: [], total: 0 },
+		'GET /api/v3/library/retag-pairs': { items: [], next_cursor: null, total: 0 },
 		'DELETE /api/v3/library/tracks/{id}': ({ params }) => removed(params.id)
 	});
 }
@@ -239,6 +246,7 @@ beforeEach(async () => {
 	plan = null;
 	history = { items: [] };
 	editionFetch = null;
+	downloadAllowed = true;
 	await setQueryDataWithPersister(HomeQueryKeyFactory.integrationStatus('user-1'), {
 		download_client: false,
 		jellyfin: false,
@@ -269,6 +277,20 @@ describe('album detail page remote match', () => {
 	});
 });
 
+describe('album download', () => {
+	it('offers a restricted user no Download', async () => {
+		downloadAllowed = false;
+		status = (id) => ({ album_id: id, in_library: true, track_count: 4, tracks: [] });
+		signIn('user');
+		await renderPage();
+
+		await expect.element(page.getByText('In Library').first()).toBeVisible();
+		await expect
+			.element(page.getByRole('button', { name: /Download album/ }))
+			.not.toBeInTheDocument();
+	});
+});
+
 describe('album detail page track removal', () => {
 	const removeRoute = 'DELETE /api/v3/library/tracks/{id}' as const;
 	const matchRoute = 'GET /api/v3/library/albums/match/{mbid}' as const;
@@ -288,6 +310,7 @@ describe('album detail page track removal', () => {
 
 		await expect.element(page.getByRole('dialog')).not.toBeInTheDocument();
 		expect(api.calls(removeRoute).map((call) => call.params.id)).toEqual(['file-0']);
+		expect(api.calls(removeRoute)[0].query.get('expected_revision')).toBe('4');
 		expect(h.dropTracks).toHaveBeenCalledWith(['file-0']);
 		await vi.waitFor(() => expect(api.calls(matchRoute).length).toBe(before + 1));
 		expect(api.calls(matchRoute).every((call) => call.params.mbid === albumId)).toBe(true);
@@ -314,6 +337,25 @@ describe('album detail page track removal', () => {
 		await expect.element(page.getByRole('alert')).toHaveTextContent("Couldn't remove this file");
 		await expect.element(page.getByRole('dialog')).toBeVisible();
 		expect(api.calls(matchRoute)).toHaveLength(before);
+	});
+
+	it('a refused stale removal says so, closes and rereads the album', async () => {
+		await renderPage();
+		await openRemoveFileDialog();
+		const before = api.calls(matchRoute).length;
+		const shown = vi.spyOn(toastStore, 'show');
+		api.use({
+			[removeRoute]: apiError(409, 'STALE_REVISION', 'This track changed after you opened it.')
+		});
+
+		await page.getByRole('dialog').getByRole('button', { name: 'Remove', exact: true }).click();
+
+		await expect.element(page.getByRole('dialog')).not.toBeInTheDocument();
+		expect(shown).toHaveBeenCalledWith({
+			message: 'This track changed after you opened it.',
+			type: 'error'
+		});
+		await vi.waitFor(() => expect(api.calls(matchRoute).length).toBe(before + 1));
 	});
 
 	it('drops the dialog on navigation and never refetches the old album', async () => {
@@ -547,7 +589,7 @@ describe('the page agrees with the edition', () => {
 			await expect.element(missing.getByText('3:43')).toBeVisible();
 			await expect.element(missing.getByText('Your version 3:30')).toBeVisible();
 			await expect.element(trackRow('Ambrosia').getByText('3:20')).toBeVisible();
-			await expect.element(page.getByText('3/4', { exact: true })).toBeVisible();
+			await expect.element(page.getByText('3/4', { exact: true }).first()).toBeVisible();
 			await expect.element(page.getByText('Edition complete')).not.toBeInTheDocument();
 			await expect
 				.element(page.getByText('Another version of track 5', { exact: true }))

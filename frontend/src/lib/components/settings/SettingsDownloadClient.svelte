@@ -4,8 +4,8 @@
 	import {
 		getDownloadClientConfigQuery,
 		getDownloadClientStatusQuery,
-		saveDownloadClientConfig,
-		testDownloadClient
+		createSaveDownloadClientConfigMutation,
+		createTestDownloadClientMutation
 	} from '$lib/queries/downloads/DownloadClientQueries.svelte';
 	import type { DownloadClientConfig } from '$lib/queries/downloads/DownloadClientQueries.svelte';
 	import { toastStore } from '$lib/stores/toast';
@@ -22,11 +22,11 @@
 	import DownloadClientCard from './DownloadClientCard.svelte';
 
 	const statusQuery = getDownloadClientStatusQuery();
-	const test = testDownloadClient();
+	const test = createTestDownloadClientMutation();
 
 	const section = createSettingsSection(
 		getDownloadClientConfigQuery(),
-		saveDownloadClientConfig(),
+		createSaveDownloadClientConfigMutation(),
 		{
 			test: async (draft) => {
 				if (!draft.url.trim()) return { passed: false, message: 'Add the URL first.' };
@@ -116,12 +116,19 @@
 			enableAriaLabel="Enable slskd download client"
 		>
 			<section class="space-y-3">
-				<TextField label="slskd URL" mono bind:value={draft.url} placeholder="http://slskd:5030" />
+				<TextField
+					label="slskd URL"
+					mono
+					bind:value={draft.url}
+					placeholder="http://slskd:5030"
+					error={section.fieldError('url', 'slskd URL')}
+				/>
 				<SecretField
 					label="API key"
 					mask={SECRET_MASK}
 					bind:value={draft.api_key}
 					placeholder="slskd API key"
+					error={section.fieldError('api_key', 'API key')}
 				/>
 			</section>
 

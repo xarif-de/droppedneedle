@@ -1,8 +1,8 @@
-//! Compat bundle: the adapters both protocols call plus the mounted
+//! Compat bundle: what both protocols call plus the mounted
 //! routers.
 //!
 //! [`CompatSetup`] is the one `AppState` field compat adds. It binds auth
-//! to the app-password store ([`ProdCompatPasswords`]), the library to the
+//! to the app-password store ([`CompatPasswords`]), the library to the
 //! v3 catalog and the shared collections ([`CompatLibrary`]), queues and
 //! bookmarks to SQLite, playback to the reporting services and streaming to
 //! the stream engine. Settings (kill switches, names, transcode policy)
@@ -18,21 +18,22 @@ use std::sync::Arc;
 use axum::Router;
 use axum::middleware::from_fn_with_state;
 
-use crate::adapters::audio::GatewayAudio;
-use crate::adapters::jellyfin_ids::{JellyfinIds, RESOLVE_WAIT};
-use crate::adapters::jellyfin_library::{CatalogIds, JellyfinLibrary};
-use crate::adapters::library::CompatLibrary;
-use crate::adapters::playback::CompatPlayback;
-use crate::adapters::principal::SubsonicVerifier;
-use crate::adapters::queues::CompatQueues;
-use crate::adapters::subsonic_store::SubsonicStore;
+use crate::audio::GatewayAudio;
 use crate::http::{CompatLimits, SubsonicState, cors_layer, limits_layer, subsonic_routes};
+use crate::jellyfin::ids::{JellyfinIds, RESOLVE_WAIT};
+use crate::jellyfin::library::{CatalogIds, JellyfinLibrary};
 use crate::jellyfin::{JellyfinState, routes as jellyfin_routes};
+use crate::library::CompatLibrary;
+use crate::playback::CompatPlayback;
+use crate::queues::CompatQueues;
 use crate::settings::LiveSettings;
 use crate::shared::address::ListenerConfig;
-use droppedneedle_auth::compat_auth::prod::ProdCompatPasswords;
+use crate::subsonic::principal::SubsonicVerifier;
+use crate::subsonic::store::SubsonicStore;
+use crate::user_settings::UserSettings;
+use droppedneedle_auth::compat_auth::prod::CompatPasswords;
 use droppedneedle_auth::users::UsersDeps;
-use droppedneedle_catalog::reads::ReadsSetup;
+use droppedneedle_catalog::wiring::CatalogSetup;
 use droppedneedle_kernel::db::Db;
 use droppedneedle_kernel::jobs::{AlreadyRunning, Supervisor};
 use droppedneedle_kernel::platform::Platform;
@@ -69,7 +70,7 @@ pub struct CompatDeps {
 }
 
 impl CompatDeps {
-    /// Deps over the native reads bundle, so compat shares its catalog and
+    /// Deps over the native catalog bundle, so compat shares its catalog and
     /// collections; the data key, the live settings and this server's port
     /// and proxies come from `platform`.
     pub fn over_reads(
@@ -78,7 +79,7 @@ impl CompatDeps {
         playback: PlaybackDeps,
         engine: Arc<MediaEngine>,
         scan: Scans,
-        reads: &ReadsSetup,
+        catalog_setup: &CatalogSetup,
     ) -> Self {
         let config = &platform.config;
         let settings = LiveSettings::from_config(&platform.settings, engine.can_transcode());
@@ -89,8 +90,8 @@ impl CompatDeps {
             playback,
             engine,
             scan,
-            library: CompatLibrary::from_reads(reads),
-            queues: CompatQueues::new(reads.collections.db.clone()),
+            library: CompatLibrary::from_catalog(catalog_setup, platform.db.clone()),
+            queues: CompatQueues::new(catalog_setup.collections.db.clone()),
             settings,
             listener: ListenerConfig {
                 port: config.port,
@@ -106,14 +107,16 @@ impl CompatDeps {
 pub struct CompatSetup {
     ids: JellyfinIds,
     settings: LiveSettings,
+    user_settings: UserSettings,
     router: Router,
     templates: Arc<[&'static str]>,
 }
 
 impl CompatSetup {
-    /// Build the adapters and mount both routers.
+    /// Build what both protocols call and mount both routers.
     pub fn build(deps: CompatDeps) -> Self {
-        let passwords = ProdCompatPasswords::new(deps.users.clone(), Arc::clone(&deps.crypto));
+        let user_settings = deps.library.user_settings.clone();
+        let passwords = CompatPasswords::new(deps.users.clone(), Arc::clone(&deps.crypto));
         let playback = CompatPlayback::new(deps.playback);
         let store = SubsonicStore::new(
             deps.library.clone(),
@@ -151,6 +154,7 @@ impl CompatSetup {
         Self {
             ids,
             settings: deps.settings,
+            user_settings,
             router,
             templates,
         }
@@ -160,6 +164,11 @@ impl CompatSetup {
     /// the stored Jellyfin ids.
     pub fn start_loops(&self, supervisor: &Supervisor) -> Result<(), AlreadyRunning> {
         self.ids.start(supervisor)
+    }
+
+    /// Each person's choices for their apps, for the route that saves them.
+    pub fn user_settings(&self) -> UserSettings {
+        self.user_settings.clone()
     }
 
     /// The stored Jellyfin ids, for a caller that waits for the fill.
@@ -215,8 +224,7 @@ impl CompatSetup {
             store.clone(),
             audio.clone(),
             settings.clone(),
-            limits.limits.clone(),
-            limits.started.clone(),
+            limits,
             listener.clone(),
             store.clock().clone(),
         ))

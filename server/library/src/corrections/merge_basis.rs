@@ -12,6 +12,8 @@
 //!   proof there still names the artist;
 //! - [`MergeBasis::emptied_by_name`]: a row a retag emptied follows its
 //!   credits by name, the one merge names alone decide;
+//! - [`MergeBasis::v2_placeholder`]: the upgrade folds a v2 row named
+//!   exactly "Unknown Artist" into the built-in one;
 //! - [`MergeBasis::person`]: an administrator chose the merge.
 //!
 //! MusicBrainz's special-purpose artist ids (`[unknown]` and the like)
@@ -37,8 +39,13 @@ use serde_json::{Value, json};
 use unicode_normalization::UnicodeNormalization as _;
 
 use super::artists::{MOVED_BY_NAME, MOVED_WITH_ID};
-use crate::identify::artist_links::{CURRENT_PROOF, placeholder};
+use crate::corrections::sql::{
+    EVERY_CREDIT_HOLDS, FILE_ID_COUNT, FILE_IDS, HELD_BACK, PROOF_ROWS, RELEASE_PROOF_COUNT,
+    RELEASE_PROOFS, STILL_CREDITED, UNLINKED_MEMBER,
+};
+use crate::identify::artist_links::placeholder;
 use crate::identity::DecisionSource;
+use crate::scan::naming::{UNKNOWN_ARTIST, UNKNOWN_ARTIST_ID};
 use crate::scan::sqlite_store::artists::{NAME_MERGE_MARK, SENTINEL_ARTIST_IDS, proven_rows};
 use droppedneedle_auth::Admin;
 
@@ -72,6 +79,8 @@ enum Kind {
     /// A retag moved every credit of the retiree by name to the survivor;
     /// the recorded moves' ids.
     EmptiedByName { moves: Vec<String> },
+    /// The upgrade folded v2's placeholder row of this name.
+    V2Placeholder { name: String },
     /// An administrator chose the merge.
     PersonChose { user_id: String },
 }
@@ -101,6 +110,84 @@ enum Subject {
     Album(String),
 }
 
+/// Why a v2 "Unknown Artist" row stays apart from the built-in one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum V2PlaceholderKept {
+    /// It is not a live ordinary row of that name, or the built-in row is
+    /// not live.
+    NotPlaceholder,
+    Linked,
+    SourceLink,
+    NamesRealId,
+    MixedCredit,
+    MarkedDistinct,
+    /// The store failed on the merge.
+    MergeFailed,
+    /// The store failed moving on what landed after the merge.
+    LateRowsFailed,
+}
+
+impl V2PlaceholderKept {
+    /// The reason as the upgrade report words it.
+    #[must_use]
+    pub fn sentence(self) -> &'static str {
+        match self {
+            Self::NotPlaceholder => "it is not a live artist of exactly that name",
+            Self::Linked => "it is linked to a real artist",
+            Self::SourceLink => "it has a link to a page on another service",
+            Self::NamesRealId => "a credit or proof on it names a real MusicBrainz artist",
+            Self::MixedCredit => "some of its credits are under another name",
+            Self::MarkedDistinct => "an admin marked the two as different artists",
+            Self::MergeFailed => {
+                "the merge failed. Its songs, plays and favorites stay on it and nothing is \
+                 lost. To try again, run droppedneedle-tool upgrade --undo --yes and then the \
+                 upgrade again, before you start using v3"
+            }
+            Self::LateRowsFailed => {
+                "the merge happened, but rows that landed on it later could not move and stay \
+                 on it. Nothing is lost"
+            }
+        }
+    }
+}
+
+/// What the fold of a v2 "Unknown Artist" row looks at, read from the
+/// database for a real fold and from the export bundle for a dry run.
+#[derive(Debug, Default)]
+pub struct V2PlaceholderFacts {
+    /// The ids its links name.
+    pub linked_ids: Vec<String>,
+    /// It has a link to a page on another service.
+    pub source_link: bool,
+    /// The MusicBrainz ids its credits and proofs name.
+    pub named_ids: Vec<String>,
+    /// A credit or album stands under another name.
+    pub other_credit: bool,
+    /// An administrator marked it and the built-in row as distinct.
+    pub marked_distinct: bool,
+}
+
+impl V2PlaceholderFacts {
+    /// Ok when the row folds. A special-purpose MusicBrainz id is not a
+    /// real one, so it never keeps a row apart.
+    pub fn judge(&self) -> Result<(), V2PlaceholderKept> {
+        let real = |id: &String| !placeholder(&id.trim().to_lowercase());
+        if self.linked_ids.iter().any(real) {
+            Err(V2PlaceholderKept::Linked)
+        } else if self.source_link {
+            Err(V2PlaceholderKept::SourceLink)
+        } else if self.named_ids.iter().any(real) {
+            Err(V2PlaceholderKept::NamesRealId)
+        } else if self.other_credit {
+            Err(V2PlaceholderKept::MixedCredit)
+        } else if self.marked_distinct {
+            Err(V2PlaceholderKept::MarkedDistinct)
+        } else {
+            Ok(())
+        }
+    }
+}
+
 /// Where a row that could follow its credits stands.
 pub(crate) enum Follow<'tx> {
     /// It merges on this basis.
@@ -125,7 +212,7 @@ impl MergeBasis<'_> {
     pub(super) fn converged_mark(&self) -> Option<&str> {
         match &self.kind {
             Kind::Proven { mbid, .. } => Some(mbid),
-            Kind::EmptiedByName { .. } => Some(NAME_MERGE_MARK),
+            Kind::EmptiedByName { .. } | Kind::V2Placeholder { .. } => Some(NAME_MERGE_MARK),
             Kind::PersonChose { .. } => None,
         }
     }
@@ -191,6 +278,7 @@ impl MergeBasis<'_> {
                     .collect();
                 json!({ "kind": "same_name", "moves": moves })
             }
+            Kind::V2Placeholder { name } => json!({ "kind": "v2_placeholder", "name": name }),
             Kind::PersonChose { user_id } => json!({ "kind": "person", "user_id": user_id }),
         }
     }
@@ -205,6 +293,7 @@ impl MergeBasis<'_> {
         match (&self.kind, &other.kind) {
             (Kind::Proven { mbid: a, .. }, Kind::Proven { mbid: b, .. }) => a == b,
             (Kind::EmptiedByName { .. }, Kind::EmptiedByName { .. }) => true,
+            (Kind::V2Placeholder { .. }, Kind::V2Placeholder { .. }) => true,
             (Kind::PersonChose { user_id: a }, Kind::PersonChose { user_id: b }) => a == b,
             _ => false,
         }
@@ -365,7 +454,7 @@ impl<'tx> MergeBasis<'tx> {
             return Ok(Follow::Stays);
         }
         let credited: bool = tx
-            .prepare_cached(STILL_CREDITED)?
+            .prepare_cached(STILL_CREDITED.text())?
             .query_row(params![from], |row| row.get(0))?;
         if credited {
             return Ok(Follow::Waiting(survivor));
@@ -397,17 +486,13 @@ impl<'tx> MergeBasis<'tx> {
         from: &str,
     ) -> rusqlite::Result<Follow<'tx>> {
         let credited: bool = tx
-            .prepare_cached(STILL_CREDITED)?
+            .prepare_cached(STILL_CREDITED.text())?
             .query_row(params![from], |row| row.get(0))?;
         if credited {
             return Ok(Follow::Stays);
         }
         let moves: Vec<(String, String, String)> = tx
-            .prepare_cached(
-                "SELECT id, right_artist_id, reason_code FROM local_artist_merge_candidates \
-                 WHERE left_artist_id = ?1 AND reason_code IN (?2, ?3) AND state = 'open' \
-                 ORDER BY id",
-            )?
+            .prepare_cached(crate::corrections::sql::EMPTIED_BY_NAME.text())?
             .query_map(params![from, MOVED_BY_NAME, MOVED_WITH_ID], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))
             })?
@@ -448,6 +533,28 @@ impl<'tx> MergeBasis<'tx> {
         )))
     }
 
+    /// The fold of v2's placeholder row `retiree` into the built-in Unknown
+    /// Artist: both live, `retiree` an ordinary row whose trimmed name is
+    /// exactly that one (a scan keys the name exactly, so a folded match
+    /// would move back at the first scan), and [`V2PlaceholderFacts::judge`]
+    /// holds.
+    pub(crate) fn v2_placeholder(
+        tx: &'tx Transaction<'_>,
+        retiree: &str,
+    ) -> rusqlite::Result<Result<Self, V2PlaceholderKept>> {
+        let live: i64 = tx
+            .prepare_cached(crate::corrections::sql::LIVE_ARTISTS_OF_PAIR.text())?
+            .query_row(params![UNKNOWN_ARTIST_ID, retiree], |row| row.get(0))?;
+        let name = ordinary_name(tx, retiree)?;
+        let Some(name) = name.filter(|name| live == 2 && name.trim() == UNKNOWN_ARTIST) else {
+            return Ok(Err(V2PlaceholderKept::NotPlaceholder));
+        };
+        let facts = v2_placeholder_facts(tx, retiree)?;
+        Ok(facts
+            .judge()
+            .map(|()| Self::new(UNKNOWN_ARTIST_ID, retiree, Kind::V2Placeholder { name })))
+    }
+
     /// An administrator's merge of live row `retiree` into live row
     /// `survivor`; none when either is not live or they are one row.
     pub(crate) fn person(
@@ -460,10 +567,7 @@ impl<'tx> MergeBasis<'tx> {
             return Ok(None);
         }
         let live: i64 = tx
-            .prepare_cached(
-                "SELECT COUNT(*) FROM local_artists WHERE id IN (?1, ?2) \
-                 AND retired_into_artist_id IS NULL",
-            )?
+            .prepare_cached(crate::corrections::sql::LIVE_ARTISTS_OF_PAIR.text())?
             .query_row(params![survivor, retiree], |row| row.get(0))?;
         Ok((live == 2).then(|| {
             Self::new(
@@ -477,97 +581,26 @@ impl<'tx> MergeBasis<'tx> {
     }
 }
 
-/// SQL that is true when artist `?1` is proven to be an artist other
-/// than `?2`: a credit's file holds another id, or a current proof names
-/// another. Each probe is a range on an (artist, id) index.
-const OTHER_ID: &str = "(EXISTS(SELECT 1 FROM local_track_artists \
-     WHERE local_artist_id = ?1 AND artist_mbid < ?2) \
-     OR EXISTS(SELECT 1 FROM local_track_artists \
-     WHERE local_artist_id = ?1 AND artist_mbid > ?2) \
-     OR EXISTS(SELECT 1 FROM local_album_artists \
-     WHERE local_artist_id = ?1 AND artist_mbid < ?2) \
-     OR EXISTS(SELECT 1 FROM local_album_artists \
-     WHERE local_artist_id = ?1 AND artist_mbid > ?2) \
-     OR EXISTS(SELECT 1 FROM library_artist_credit_proofs p \
-     WHERE p.source_local_artist_id = ?1 AND p.artist_mbid < ?2 AND (CURRENT_PROOF)) \
-     OR EXISTS(SELECT 1 FROM library_artist_credit_proofs p \
-     WHERE p.source_local_artist_id = ?1 AND p.artist_mbid > ?2 AND (CURRENT_PROOF)))";
-
-/// The rows a current proof says are `?1`.
-const PROOF_ROWS: &str = "SELECT DISTINCT p.source_local_artist_id \
-     FROM library_artist_credit_proofs p WHERE p.artist_mbid = ?1 \
-     AND p.source_local_artist_id IS NOT NULL AND (CURRENT_PROOF)";
-
-/// The `created_at` of row `?1`, proven to be `?2` without a link, when it
-/// belongs in that group: live, neither sentinel (`?3`, `?4`) nor a
-/// Various Artists row, no link, and nothing proving it another artist.
-const UNLINKED_MEMBER: &str = "SELECT created_at FROM local_artists WHERE id = ?1 \
-     AND retired_into_artist_id IS NULL AND kind <> 'various_artists' AND id NOT IN (?3, ?4) \
-     AND NOT EXISTS (SELECT 1 FROM local_artist_external_identities WHERE local_artist_id = ?1) \
-     AND NOT OTHER_ID";
-
-/// True when every track and album credit of artist `?1` holds `?2`: by
-/// its file's id, or by a current proof of `?2` at that very credit.
-const EVERY_CREDIT_HOLDS: &str = "SELECT NOT EXISTS (SELECT 1 FROM local_track_artists credit \
-     WHERE credit.local_artist_id = ?1 AND credit.artist_mbid IS NOT ?2 \
-     AND NOT EXISTS (SELECT 1 FROM library_artist_credit_proofs p \
-      WHERE p.subject_kind = 'track' AND p.subject_id = credit.local_track_id \
-      AND p.credit_position = credit.position AND p.source_local_artist_id = ?1 \
-      AND p.artist_mbid = ?2 AND (CURRENT_PROOF))) \
-     AND NOT EXISTS (SELECT 1 FROM local_album_artists credit \
-     WHERE credit.local_artist_id = ?1 AND credit.artist_mbid IS NOT ?2 \
-     AND NOT EXISTS (SELECT 1 FROM library_artist_credit_proofs p \
-      WHERE p.subject_kind = 'album' AND p.subject_id = credit.local_album_id \
-      AND p.credit_position = credit.position AND p.source_local_artist_id = ?1 \
-      AND p.artist_mbid = ?2 AND (CURRENT_PROOF)))";
-
-/// Up to `?3` of artist `?1`'s credits whose file holds `?2`.
-const FILE_IDS: &str = "SELECT 'track', local_track_id, position FROM local_track_artists \
-     WHERE local_artist_id = ?1 AND artist_mbid = ?2 \
-     UNION ALL SELECT 'album', local_album_id, position FROM local_album_artists \
-     WHERE local_artist_id = ?1 AND artist_mbid = ?2 LIMIT ?3";
-
-/// How many of artist `?1`'s credits have a file holding `?2`.
-const FILE_ID_COUNT: &str = "SELECT \
-     (SELECT COUNT(*) FROM local_track_artists WHERE local_artist_id = ?1 AND artist_mbid = ?2) \
-     + (SELECT COUNT(*) FROM local_album_artists WHERE local_artist_id = ?1 AND artist_mbid = ?2)";
-
-/// Up to `?3` current proofs that artist `?1` is `?2`.
-const RELEASE_PROOFS: &str = "SELECT p.evidence_hash, p.release_mbid \
-     FROM library_artist_credit_proofs p WHERE p.source_local_artist_id = ?1 \
-     AND p.artist_mbid = ?2 AND (CURRENT_PROOF) \
-     ORDER BY p.subject_kind, p.subject_id, p.credit_position LIMIT ?3";
-
-/// How many current proofs say artist `?1` is `?2`.
-const RELEASE_PROOF_COUNT: &str = "SELECT COUNT(*) FROM library_artist_credit_proofs p \
-     WHERE p.source_local_artist_id = ?1 AND p.artist_mbid = ?2 AND (CURRENT_PROOF)";
-
-/// True when something other than credits still on it keeps row `?1`,
-/// whose proven credits for `?3` moved to the row that is now `?2`, from
-/// following them: it is not live, is a sentinel (`?4`, `?5`) or a Various
-/// Artists row, has a link, has a proof naming another id, or has a play
-/// of a track now credited to neither row (a play goes with its row, and
-/// must not land on another artist's).
-const HELD_BACK: &str = "SELECT NOT EXISTS (SELECT 1 FROM local_artists WHERE id = ?1 \
-     AND retired_into_artist_id IS NULL AND kind <> 'various_artists' AND id NOT IN (?4, ?5)) \
-     OR EXISTS (SELECT 1 FROM local_artist_external_identities WHERE local_artist_id = ?1) \
-     OR EXISTS (SELECT 1 FROM library_artist_credit_proofs \
-      WHERE (source_local_artist_id = ?1 OR local_artist_id = ?1) AND artist_mbid <> ?3) \
-     OR EXISTS (SELECT 1 FROM library_play_history h WHERE h.local_artist_id = ?1 \
-      AND EXISTS (SELECT 1 FROM local_track_artists c WHERE c.local_track_id = h.local_track_id) \
-      AND NOT EXISTS (SELECT 1 FROM local_track_artists c \
-       WHERE c.local_track_id = h.local_track_id AND c.local_artist_id IN (?1, ?2)))";
-
-/// True when row `?1` still has a credit, or an album names it as album
-/// artist: it follows its credits once the rest of them have moved.
-const STILL_CREDITED: &str = "SELECT EXISTS (SELECT 1 FROM local_album_artists \
-     WHERE local_artist_id = ?1) \
-     OR EXISTS (SELECT 1 FROM local_track_artists WHERE local_artist_id = ?1) \
-     OR EXISTS (SELECT 1 FROM local_albums WHERE album_artist_id = ?1)";
-
-fn with_current(sql: &str) -> String {
-    sql.replace("OTHER_ID", OTHER_ID)
-        .replace("CURRENT_PROOF", CURRENT_PROOF)
+fn v2_placeholder_facts(
+    tx: &Transaction<'_>,
+    retiree: &str,
+) -> rusqlite::Result<V2PlaceholderFacts> {
+    let ids = |statement: droppedneedle_kernel::db::statement::Statement| {
+        tx.prepare_cached(statement.text())?
+            .query_map(params![retiree], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()
+    };
+    Ok(V2PlaceholderFacts {
+        linked_ids: ids(crate::corrections::sql::LINKED_IDS)?,
+        source_link: tx
+            .prepare_cached(crate::corrections::sql::HAS_SOURCE_LINK.text())?
+            .query_row(params![retiree], |row| row.get(0))?,
+        named_ids: ids(crate::corrections::sql::NAMED_IDS)?,
+        other_credit: tx
+            .prepare_cached(crate::corrections::sql::CREDITED_UNDER_ANOTHER_NAME.text())?
+            .query_row(params![retiree, UNKNOWN_ARTIST], |row| row.get(0))?,
+        marked_distinct: marked_distinct(tx, &[retiree, UNKNOWN_ARTIST_ID])?,
+    })
 }
 
 /// One row of a group proven to be one artist.
@@ -602,7 +635,7 @@ fn group(tx: &Transaction<'_>, mbid: &str) -> rusqlite::Result<Vec<Member>> {
         }
     }
     let by_proofs: Vec<String> = tx
-        .prepare_cached(&with_current(PROOF_ROWS))?
+        .prepare_cached(PROOF_ROWS.text())?
         .query_map(params![mbid], |row| row.get(0))?
         .collect::<rusqlite::Result<_>>()?;
     for row in by_proofs {
@@ -612,11 +645,11 @@ fn group(tx: &Transaction<'_>, mbid: &str) -> rusqlite::Result<Vec<Member>> {
             unlinked.push((row, true));
         }
     }
-    let member_sql = with_current(UNLINKED_MEMBER);
+    let member_sql = UNLINKED_MEMBER.text();
     let mut dated: Vec<(f64, String, bool)> = Vec::new();
     for (row, proof_only) in unlinked {
         let created: Option<f64> = tx
-            .prepare_cached(&member_sql)?
+            .prepare_cached(member_sql)?
             .query_row(
                 params![row, mbid, SENTINEL_ARTIST_IDS[0], SENTINEL_ARTIST_IDS[1]],
                 |found| found.get(0),
@@ -671,11 +704,7 @@ fn link_proofs(
     mbid: &str,
 ) -> rusqlite::Result<(Vec<ArtistProof>, usize)> {
     let source: Option<DecisionSource> = tx
-        .prepare_cached(
-            "SELECT decision_source FROM local_artist_external_identities \
-             WHERE local_artist_id = ?1 AND provider = 'musicbrainz' \
-             AND lower(provider_artist_id) = ?2",
-        )?
+        .prepare_cached(crate::corrections::sql::LINK_DECISION_SOURCE.text())?
         .query_row(params![artist, mbid], |row| row.get(0))
         .optional()?;
     let Some(source) = source else {
@@ -686,14 +715,7 @@ fn link_proofs(
         artist: artist.to_owned(),
     }];
     let followed: Option<String> = tx
-        .prepare_cached(
-            "SELECT json_extract(before_json, '$.provider_artist_id') \
-             FROM library_catalog_actions WHERE local_artist_id = ?1 \
-             AND reason_code = 'MUSICBRAINZ_MERGED_ARTIST_ID' \
-             AND json_valid(after_json) AND json_valid(before_json) \
-             AND json_extract(after_json, '$.provider_artist_id') = ?2 \
-             ORDER BY created_at DESC LIMIT 1",
-        )?
+        .prepare_cached(crate::corrections::sql::MBIDS_FROM_MERGE_ACTIONS.text())?
         .query_row(params![artist, mbid], |row| row.get(0))
         .optional()?
         .flatten();
@@ -716,7 +738,7 @@ fn credit_proofs(
     limit: usize,
 ) -> rusqlite::Result<(Vec<ArtistProof>, usize)> {
     let mut proofs: Vec<ArtistProof> = tx
-        .prepare_cached(FILE_IDS)?
+        .prepare_cached(FILE_IDS.text())?
         .query_map(params![artist, mbid, limit as i64], |row| {
             let kind: String = row.get(0)?;
             let id: String = row.get(1)?;
@@ -735,7 +757,7 @@ fn credit_proofs(
         })?
         .collect::<rusqlite::Result<_>>()?;
     let files: i64 = tx
-        .prepare_cached(FILE_ID_COUNT)?
+        .prepare_cached(FILE_ID_COUNT.text())?
         .query_row(params![artist, mbid], |row| row.get(0))?;
     let room = limit.saturating_sub(proofs.len());
     let (mut releases, current) = release_proofs(tx, artist, mbid, room)?;
@@ -752,7 +774,7 @@ fn release_proofs(
     limit: usize,
 ) -> rusqlite::Result<(Vec<ArtistProof>, usize)> {
     let proofs: Vec<ArtistProof> = tx
-        .prepare_cached(&with_current(RELEASE_PROOFS))?
+        .prepare_cached(RELEASE_PROOFS.text())?
         .query_map(params![artist, mbid, limit as i64], |row| {
             Ok(ArtistProof {
                 kind: ProofKind::ReleaseCredit {
@@ -764,7 +786,7 @@ fn release_proofs(
         })?
         .collect::<rusqlite::Result<_>>()?;
     let count: i64 = tx
-        .prepare_cached(&with_current(RELEASE_PROOF_COUNT))?
+        .prepare_cached(RELEASE_PROOF_COUNT.text())?
         .query_row(params![artist, mbid], |row| row.get(0))?;
     Ok((proofs, count as usize))
 }
@@ -772,7 +794,7 @@ fn release_proofs(
 /// Whether every track and album credit of `artist` holds `mbid`, by its
 /// file's id or by a current proof at that credit.
 fn every_credit_holds(tx: &Transaction<'_>, artist: &str, mbid: &str) -> rusqlite::Result<bool> {
-    tx.prepare_cached(&with_current(EVERY_CREDIT_HOLDS))?
+    tx.prepare_cached(EVERY_CREDIT_HOLDS.text())?
         .query_row(params![artist, mbid], |row| row.get(0))
 }
 
@@ -781,17 +803,14 @@ fn every_credit_holds(tx: &Transaction<'_>, artist: &str, mbid: &str) -> rusqlit
 /// needs before it takes in other rows.
 fn fully_proven(tx: &Transaction<'_>, artist: &str, mbid: &str) -> rusqlite::Result<bool> {
     let credited: bool = tx
-        .prepare_cached(
-            "SELECT EXISTS (SELECT 1 FROM local_track_artists WHERE local_artist_id = ?1) \
-             OR EXISTS (SELECT 1 FROM local_album_artists WHERE local_artist_id = ?1)",
-        )?
+        .prepare_cached(crate::corrections::sql::FULLY_PROVEN.text())?
         .query_row(params![artist], |row| row.get(0))?;
     Ok(credited && every_credit_holds(tx, artist, mbid)? && !other_id(tx, artist, mbid)?)
 }
 
 /// Whether anything proves `artist` to be an artist other than `mbid`.
 fn other_id(tx: &Transaction<'_>, artist: &str, mbid: &str) -> rusqlite::Result<bool> {
-    tx.prepare_cached(&with_current("SELECT OTHER_ID"))?
+    tx.prepare_cached(crate::corrections::sql::OTHER_ID.text())?
         .query_row(params![artist, mbid], |row| row.get(0))
 }
 
@@ -800,12 +819,7 @@ fn other_id(tx: &Transaction<'_>, artist: &str, mbid: &str) -> rusqlite::Result<
 /// others while a credit of its own is not proven.
 fn files_prove(tx: &Transaction<'_>, artist: &str, mbid: &str) -> rusqlite::Result<bool> {
     let held: bool = tx
-        .prepare_cached(
-            "SELECT EXISTS (SELECT 1 FROM local_track_artists \
-             WHERE local_artist_id = ?1 AND artist_mbid = ?2) \
-             OR EXISTS (SELECT 1 FROM local_album_artists \
-             WHERE local_artist_id = ?1 AND artist_mbid = ?2)",
-        )?
+        .prepare_cached(crate::corrections::sql::FILES_PROVE.text())?
         .query_row(params![artist, mbid], |row| row.get(0))?;
     Ok(held && !other_id(tx, artist, mbid)?)
 }
@@ -818,7 +832,7 @@ fn held_back(
     survivor: &str,
     mbid: &str,
 ) -> rusqlite::Result<bool> {
-    tx.prepare_cached(HELD_BACK)?.query_row(
+    tx.prepare_cached(HELD_BACK.text())?.query_row(
         params![
             from,
             survivor,
@@ -833,15 +847,9 @@ fn held_back(
 /// The live row `artist` is now: itself, or the row a chain of merges
 /// retired it into.
 fn live_row(tx: &Transaction<'_>, artist: &str) -> rusqlite::Result<Option<String>> {
-    tx.prepare_cached(
-        "WITH RECURSIVE chain(id, next, depth) AS ( \
-         SELECT id, retired_into_artist_id, 0 FROM local_artists WHERE id = ?1 \
-         UNION ALL SELECT a.id, a.retired_into_artist_id, chain.depth + 1 \
-          FROM local_artists a JOIN chain ON a.id = chain.next WHERE chain.depth < 16) \
-         SELECT id FROM chain WHERE next IS NULL LIMIT 1",
-    )?
-    .query_row(params![artist], |row| row.get(0))
-    .optional()
+    tx.prepare_cached(crate::corrections::sql::LIVE_ROW.text())?
+        .query_row(params![artist], |row| row.get(0))
+        .optional()
 }
 
 /// Whether `artist` is proven to be an artist other than `mbid`: a link
@@ -849,10 +857,7 @@ fn live_row(tx: &Transaction<'_>, artist: &str) -> rusqlite::Result<Option<Strin
 /// another.
 fn contradicted(tx: &Transaction<'_>, artist: &str, mbid: &str) -> rusqlite::Result<bool> {
     let link: Option<String> = tx
-        .prepare_cached(
-            "SELECT lower(provider_artist_id) FROM local_artist_external_identities \
-             WHERE local_artist_id = ?1 AND provider = 'musicbrainz'",
-        )?
+        .prepare_cached(crate::corrections::sql::CONTRADICTED.text())?
         .query_row(params![artist], |row| row.get(0))
         .optional()?;
     Ok(link.is_some_and(|link| link != mbid) || other_id(tx, artist, mbid)?)
@@ -862,18 +867,8 @@ fn contradicted(tx: &Transaction<'_>, artist: &str, mbid: &str) -> rusqlite::Res
 /// artists, at any revision, either row possibly merged since.
 fn marked_distinct(tx: &Transaction<'_>, ids: &[&str]) -> rusqlite::Result<bool> {
     let ids = serde_json::to_string(ids).unwrap_or_default();
-    tx.prepare_cached(
-        "WITH members(id) AS (SELECT value FROM json_each(?1)), \
-         pairs AS (SELECT \
-          COALESCE((SELECT local_artist_id FROM local_artist_aliases \
-           WHERE alias = d.left_artist_id), d.left_artist_id) AS left_id, \
-          COALESCE((SELECT local_artist_id FROM local_artist_aliases \
-           WHERE alias = d.right_artist_id), d.right_artist_id) AS right_id \
-          FROM library_artist_reconciliation_dismissals d) \
-         SELECT EXISTS(SELECT 1 FROM pairs WHERE left_id <> right_id \
-          AND left_id IN (SELECT id FROM members) AND right_id IN (SELECT id FROM members))",
-    )?
-    .query_row(params![ids], |row| row.get(0))
+    tx.prepare_cached(crate::corrections::sql::MARKED_DISTINCT.text())?
+        .query_row(params![ids], |row| row.get(0))
 }
 
 /// A name as [`MergeBasis::emptied_by_name`] compares it: composed,
@@ -890,15 +885,12 @@ fn name_key(name: &str) -> String {
 /// The display name of live row `artist` when it is an ordinary row:
 /// neither a sentinel nor a Various Artists row.
 fn ordinary_name(tx: &Transaction<'_>, artist: &str) -> rusqlite::Result<Option<String>> {
-    tx.prepare_cached(
-        "SELECT display_name FROM local_artists WHERE id = ?1 \
-         AND retired_into_artist_id IS NULL AND kind <> 'various_artists' AND id NOT IN (?2, ?3)",
-    )?
-    .query_row(
-        params![artist, SENTINEL_ARTIST_IDS[0], SENTINEL_ARTIST_IDS[1]],
-        |row| row.get(0),
-    )
-    .optional()
+    tx.prepare_cached(crate::corrections::sql::ORDINARY_NAME.text())?
+        .query_row(
+            params![artist, SENTINEL_ARTIST_IDS[0], SENTINEL_ARTIST_IDS[1]],
+            |row| row.get(0),
+        )
+        .optional()
 }
 
 #[cfg(test)]

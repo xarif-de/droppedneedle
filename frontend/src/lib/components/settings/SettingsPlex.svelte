@@ -1,8 +1,8 @@
 <script lang="ts">
 	import { SECRET_MASK } from '$lib/ui/secretMask';
 	import { onDestroy } from 'svelte';
-	import { fetchPlexLibraries } from '$lib/queries/plex/PlexLibraryQueries';
-	import { pollPlexFlow, startPlexFlow } from '$lib/queries/plex/PlexFlowApi';
+	import { fetchPlexLibraries } from '$lib/queries/plex.svelte';
+	import { pollPlexFlow, startPlexFlow } from '$lib/queries/plex.svelte';
 	import {
 		createSavePlexSettingsMutation,
 		createVerifyPlexMutation,
@@ -131,6 +131,7 @@
 					type="url"
 					placeholder="http://plex-server:32400"
 					bind:value={draft.plex_url}
+					error={section.fieldError('plex_url', 'Plex URL')}
 				/>
 
 				<SecretField
@@ -139,6 +140,7 @@
 					placeholder="Paste your Plex token"
 					help="Sign in with Plex below, or paste a token here."
 					bind:value={draft.plex_token}
+					error={section.fieldError('plex_token', 'Plex Token')}
 				/>
 
 				<div class="flex items-center gap-3">

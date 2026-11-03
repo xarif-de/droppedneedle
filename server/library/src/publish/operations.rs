@@ -10,26 +10,24 @@ use std::collections::HashMap;
 
 use rusqlite::{Connection, OptionalExtension};
 
+use super::sql::{BundleOutput, TrackOutput};
+
 use super::PublishError;
 use super::planner::{GeneratedOutput, OutputKind, PlanBundle};
 
-/// Record one sealed bundle, made at `now_ms` (unix milliseconds) on
-/// `today_day`, with the account that applied it when a person did.
+/// Record one sealed bundle, made at `now_ms` (unix milliseconds), with the account that applied it when a person did.
 /// Overwriting an existing row is refused: bundle ids are unique per
 /// operation.
 pub fn record_operation(
     conn: &Connection,
     bundle: &PlanBundle,
-    today_day: i64,
     now_ms: i64,
     applied_by: Option<&str>,
 ) -> Result<(), PublishError> {
     let json = serde_json::to_string(bundle).map_err(PublishError::from)?;
     let changed = conn
         .prepare_cached(super::sql::OPERATION_INSERT.text())?
-        .execute(rusqlite::params![
-            bundle.id, json, today_day, now_ms, applied_by
-        ])?;
+        .execute(rusqlite::params![bundle.id, json, now_ms, applied_by])?;
     if changed == 0 {
         return Err(PublishError::Journal(
             format!("operation {} already recorded", bundle.id).into(),
@@ -47,7 +45,10 @@ pub fn generated_for_track(
 ) -> Result<Vec<GeneratedOutput>, PublishError> {
     let rows = conn
         .prepare_cached(super::sql::OUTPUTS_FOR_TRACK.text())?
-        .query_map(rusqlite::params![track_id], |row| read_output(row, 0))?
+        .query_map(rusqlite::params![track_id], |row| {
+            let row = TrackOutput::read(row)?;
+            output_of(row.dest_root, row.dest_rel, row.sha256, row.size, row.kind)
+        })?
         .collect::<Result<Vec<_>, _>>()?;
     let mut out: Vec<GeneratedOutput> = Vec::new();
     for output in rows {
@@ -69,7 +70,9 @@ pub fn outputs_of(
     let rows = conn
         .prepare_cached(super::sql::OUTPUTS_OF_BUNDLE.text())?
         .query_map(rusqlite::params![bundle_id], |row| {
-            Ok((row.get::<_, String>(0)?, read_output(row, 1)?))
+            let row = BundleOutput::read(row)?;
+            let output = output_of(row.dest_root, row.dest_rel, row.sha256, row.size, row.kind)?;
+            Ok((row.track_id, output))
         })?
         .collect::<Result<Vec<_>, _>>()?;
     for (track_id, output) in rows {
@@ -78,22 +81,28 @@ pub fn outputs_of(
     Ok(out)
 }
 
-/// One output row from column `at` on: root, path, hash, size and kind.
-fn read_output(row: &rusqlite::Row<'_>, at: usize) -> Result<GeneratedOutput, rusqlite::Error> {
-    let kind: String = row.get(at + 4)?;
+/// One output row. A kind no release wrote fails the read.
+fn output_of(
+    dest_root: String,
+    dest_rel: String,
+    sha256: String,
+    size: u64,
+    kind: String,
+) -> Result<GeneratedOutput, rusqlite::Error> {
     let kind = OutputKind::parse(&kind).ok_or_else(|| {
         rusqlite::Error::FromSqlConversionFailure(
-            at + 4,
+            4,
             rusqlite::types::Type::Text,
             format!("unknown output kind {kind}").into(),
         )
     })?;
     Ok(GeneratedOutput {
-        dest_root: row.get(at)?,
-        dest_rel: row.get(at + 1)?,
-        sha256: row.get(at + 2)?,
-        size: row.get(at + 3)?,
+        dest_root,
+        dest_rel,
+        sha256,
+        size,
         kind,
+        replaces: None,
     })
 }
 
@@ -114,7 +123,7 @@ pub fn load_operation(
 ) -> Result<Option<PlanBundle>, PublishError> {
     let row: Option<String> = conn
         .query_row(
-            "SELECT bundle_json FROM library_publish_operations WHERE bundle_id = ?1",
+            crate::publish::sql::LOAD_OPERATION.text(),
             rusqlite::params![bundle_id],
             |row| row.get(0),
         )
@@ -131,7 +140,7 @@ pub fn applied_by(
     bundle_id: &str,
 ) -> Result<Option<Option<String>>, PublishError> {
     conn.query_row(
-        "SELECT applied_by_user_id FROM library_publish_operations WHERE bundle_id = ?1",
+        crate::publish::sql::APPLIED_BY.text(),
         rusqlite::params![bundle_id],
         |row| row.get(0),
     )

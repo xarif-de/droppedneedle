@@ -1,7 +1,7 @@
 //! Artist reconciliation routes: progress, duplicate artist groups, one
 //! group's evidence, and marking a group as distinct people.
 //!
-//! Admin-only, as in v2. Store work runs on a blocking thread.
+//! Admin-only. Store work runs on a blocking thread.
 
 use std::collections::BTreeMap;
 
@@ -67,6 +67,8 @@ pub enum ArtistGroupState {
     SameNameOnly,
     /// A tag edit moved a record's songs to records of another name.
     CreditsMoved,
+    /// A link set by hand names the MusicBrainz artist another record is.
+    SharedProviderIdentity,
     /// Merged automatically already.
     ResolvedAutomatically,
 }
@@ -79,6 +81,7 @@ impl From<GroupState> for ArtistGroupState {
             GroupState::AmbiguousCreditStructure => Self::AmbiguousCreditStructure,
             GroupState::SameNameOnly => Self::SameNameOnly,
             GroupState::CreditsMoved => Self::CreditsMoved,
+            GroupState::SharedProviderIdentity => Self::SharedProviderIdentity,
             GroupState::ResolvedAutomatically => Self::ResolvedAutomatically,
         }
     }
@@ -92,6 +95,7 @@ impl From<ArtistGroupState> for GroupState {
             ArtistGroupState::AmbiguousCreditStructure => Self::AmbiguousCreditStructure,
             ArtistGroupState::SameNameOnly => Self::SameNameOnly,
             ArtistGroupState::CreditsMoved => Self::CreditsMoved,
+            ArtistGroupState::SharedProviderIdentity => Self::SharedProviderIdentity,
             ArtistGroupState::ResolvedAutomatically => Self::ResolvedAutomatically,
         }
     }
@@ -106,6 +110,8 @@ pub enum ArtistMergeBasis {
     /// A tag edit moved every song to a record of the same name, with only
     /// its sort name, capitals or spacing changed.
     SameName,
+    /// The upgrade folded v2's Unknown Artist into the built-in one.
+    V2Placeholder,
 }
 
 impl From<MergeBasisLabel> for ArtistMergeBasis {
@@ -113,6 +119,7 @@ impl From<MergeBasisLabel> for ArtistMergeBasis {
         match label {
             MergeBasisLabel::MusicbrainzProof => Self::MusicbrainzProof,
             MergeBasisLabel::SameName => Self::SameName,
+            MergeBasisLabel::V2Placeholder => Self::V2Placeholder,
         }
     }
 }

@@ -15,8 +15,8 @@ use utoipa::ToSchema;
 use droppedneedle_kernel::runtime_config::Masked;
 use droppedneedle_kernel::runtime_config::secret_sections::TypedLibrary;
 use droppedneedle_kernel::runtime_config::sections::{
-    DownloadPolicy, LibraryManagement, LibraryManagementProfile, LibraryScanSchedule, MbSourceMode,
-    MusicBrainzSettings, UsenetBackend,
+    DownloadPolicy, LibraryManagement, LibraryScanSchedule, MbSourceMode, MusicBrainzSettings,
+    UsenetBackend,
 };
 use droppedneedle_library::settings_models::LibraryRestorableRoot;
 
@@ -57,6 +57,18 @@ pub struct UsenetSearchBackend {
     pub backend: UsenetBackend,
 }
 
+/// How the stored quality settings read: a v1 tier range, a v2 recipe, a
+/// policy with codecs a recipe cannot express, or a recipe that does not
+/// validate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum QualityRecipeStatus {
+    V1,
+    V2,
+    NonConvertible,
+    Invalid,
+}
+
 /// GET view of the acquisition policy: the stored policy plus the
 /// read-only recipe verdict, recomputed on every read and never saved.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
@@ -64,14 +76,10 @@ pub struct DownloadPolicyView {
     /// The stored policy.
     #[serde(flatten)]
     pub policy: DownloadPolicy,
-    /// Read-only recipe verdict: `v1`, `v2`, `non_convertible`, `invalid`.
-    pub quality_recipe_status: String,
+    /// Read-only recipe verdict.
+    pub quality_recipe_status: QualityRecipeStatus,
     /// Recipe verdict detail, when any.
     pub quality_recipe_error: Option<String>,
-    /// Why the recycle bin path is not used, when it is not: each library
-    /// folder's `.recycle` takes its place. Read-only.
-    #[serde(default)]
-    pub recycle_bin_warning: Option<String>,
 }
 
 /// GET view of the MusicBrainz connection: the settled settings plus the
@@ -209,20 +217,6 @@ pub struct IndexerTestResponse {
 
 // --- download policy and indexers ------------------------------------------------
 
-/// Safe, signed-in-user projection of the acquisition policy: the quality
-/// summary sentence and the recipe verdict only, no admin internals.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct PolicySummaryResponse {
-    /// Backend-composed contract sentence.
-    pub summary: String,
-    /// Whether a down-level image reproduces acquisition behavior.
-    pub legacy_rollback_compatible: bool,
-    /// Read-only recipe verdict: `v1`, `v2`, `non_convertible`, `invalid`.
-    pub quality_recipe_status: String,
-    /// Recipe verdict detail, when any.
-    pub quality_recipe_error: Option<String>,
-}
-
 /// Indexer save acknowledgement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct IndexerSavedResponse {
@@ -344,20 +338,6 @@ pub struct LibrarySettingsSaveRequest {
     pub expected_policy_revision: String,
 }
 
-/// Add-one-library-path body.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct LibraryPathRequest {
-    /// Directory to add as a library root.
-    pub path: String,
-}
-
-/// Remove-one-library-path query.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct LibraryPathQuery {
-    /// Directory to remove.
-    pub path: String,
-}
-
 /// Impact preview request.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct LibraryPolicyImpactRequest {
@@ -397,25 +377,6 @@ pub struct LibraryRestoreRootsRequest {
     pub paths: Option<BTreeMap<String, String>>,
 }
 
-// --- advanced settings ------------------------------------------------------------
-
-/// The advanced settings the web app reads at start. The browser's cache
-/// lifetimes and the queue's polling interval are fixed in the web app.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(default)]
-pub struct FrontendCacheTTLs {
-    /// Discover-queue auto-generate switch.
-    pub discover_queue_auto_generate: bool,
-}
-
-impl Default for FrontendCacheTTLs {
-    fn default() -> Self {
-        Self {
-            discover_queue_auto_generate: true,
-        }
-    }
-}
-
 // --- library management -----------------------------------------------------------
 
 /// PUT body: full settings plus the required CAS token.
@@ -436,32 +397,11 @@ pub struct LibraryManagementSettingsImpactRequest {
     pub expected_settings_revision: Option<String>,
 }
 
-/// Create-profile request (clones the default profile).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct LibraryManagementProfileCreateRequest {
-    /// Name for the new profile.
-    pub name: String,
-    /// Compare-and-swap token from the last GET.
-    pub expected_settings_revision: String,
-    /// Description for the new profile.
-    #[serde(default)]
-    pub description: String,
-}
-
 /// Copy-profile request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct LibraryManagementProfileCopyRequest {
     /// Name for the copy.
     pub name: String,
-    /// Compare-and-swap token from the last GET.
-    pub expected_settings_revision: String,
-}
-
-/// Update-profile request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct LibraryManagementProfileUpdateRequest {
-    /// Full replacement profile (id must match the path).
-    pub profile: LibraryManagementProfile,
     /// Compare-and-swap token from the last GET.
     pub expected_settings_revision: String,
 }

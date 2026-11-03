@@ -1,7 +1,7 @@
-import { YOUTUBE_ENDPOINTS } from '$lib/queries/youtube/endpoints';
+import { v3 } from '$lib/api/v3/endpoint';
 import { api } from '$lib/api/client';
 import { playerStore } from '$lib/stores/player.svelte';
-import { playbackToast } from '$lib/stores/playbackToast.svelte';
+import { toastStore } from '$lib/stores/toast';
 import { buildQueueItemsFromYouTube, type TrackMeta } from '$lib/player/queueHelpers';
 import { openGlobalPlaylistModal } from '$lib/stores/playlistModal.svelte';
 import { getCoverUrl } from '$lib/utils/errorHandling';
@@ -21,7 +21,9 @@ function buildMeta(link: YouTubeLink): TrackMeta {
 
 async function fetchTrackItems(link: YouTubeLink): Promise<FetchResult> {
 	try {
-		const tracks = await api.v3.GET(YOUTUBE_ENDPOINTS.trackLinks(link.album_id));
+		const tracks = await api.v3.GET(
+			v3('/api/v3/youtube/track-links/{album_id}', { path: { album_id: link.album_id } })
+		);
 		if (tracks.length === 0) return { items: [], error: false };
 		return { items: buildQueueItemsFromYouTube(tracks, buildMeta(link)), error: false };
 	} catch {
@@ -32,11 +34,11 @@ async function fetchTrackItems(link: YouTubeLink): Promise<FetchResult> {
 export async function ytCardQuickPlay(link: YouTubeLink): Promise<boolean> {
 	const { items, error } = await fetchTrackItems(link);
 	if (error) {
-		playbackToast.show("Couldn't load the track list", 'error');
+		toastStore.notify("Couldn't load the track list", 'error');
 		return false;
 	}
 	if (items.length === 0) {
-		playbackToast.show('No tracks linked yet', 'info');
+		toastStore.notify('No tracks linked yet', 'info');
 		return false;
 	}
 	playerStore.playQueue(items, 0, false);
@@ -46,11 +48,11 @@ export async function ytCardQuickPlay(link: YouTubeLink): Promise<boolean> {
 export async function ytCardQuickShuffle(link: YouTubeLink): Promise<boolean> {
 	const { items, error } = await fetchTrackItems(link);
 	if (error) {
-		playbackToast.show("Couldn't load the track list", 'error');
+		toastStore.notify("Couldn't load the track list", 'error');
 		return false;
 	}
 	if (items.length === 0) {
-		playbackToast.show('No tracks linked yet', 'info');
+		toastStore.notify('No tracks linked yet', 'info');
 		return false;
 	}
 	playerStore.playQueue(items, 0, true);
@@ -60,11 +62,11 @@ export async function ytCardQuickShuffle(link: YouTubeLink): Promise<boolean> {
 export async function ytCardAddToQueue(link: YouTubeLink): Promise<boolean> {
 	const { items, error } = await fetchTrackItems(link);
 	if (error) {
-		playbackToast.show("Couldn't load the track list", 'error');
+		toastStore.notify("Couldn't load the track list", 'error');
 		return false;
 	}
 	if (items.length === 0) {
-		playbackToast.show('No tracks linked yet', 'info');
+		toastStore.notify('No tracks linked yet', 'info');
 		return false;
 	}
 	playerStore.addMultipleToQueue(items);
@@ -74,11 +76,11 @@ export async function ytCardAddToQueue(link: YouTubeLink): Promise<boolean> {
 export async function ytCardPlayNext(link: YouTubeLink): Promise<boolean> {
 	const { items, error } = await fetchTrackItems(link);
 	if (error) {
-		playbackToast.show("Couldn't load the track list", 'error');
+		toastStore.notify("Couldn't load the track list", 'error');
 		return false;
 	}
 	if (items.length === 0) {
-		playbackToast.show('No tracks linked yet', 'info');
+		toastStore.notify('No tracks linked yet', 'info');
 		return false;
 	}
 	playerStore.playMultipleNext(items);
@@ -88,11 +90,11 @@ export async function ytCardPlayNext(link: YouTubeLink): Promise<boolean> {
 export async function ytCardAddToPlaylist(link: YouTubeLink): Promise<void> {
 	const { items, error } = await fetchTrackItems(link);
 	if (error) {
-		playbackToast.show("Couldn't load the track list", 'error');
+		toastStore.notify("Couldn't load the track list", 'error');
 		return;
 	}
 	if (items.length === 0) {
-		playbackToast.show('No tracks linked yet', 'info');
+		toastStore.notify('No tracks linked yet', 'info');
 		return;
 	}
 	openGlobalPlaylistModal(items);

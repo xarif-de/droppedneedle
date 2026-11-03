@@ -3,7 +3,7 @@
 //! Everything here reads or writes the application database through a
 //! borrowed connection: a pooled read, or the pause switch's foreground
 //! write. The pause switch is the `library_work_control`
-//! row v2 used; the queue counts read the identification jobs and
+//! row; the queue counts read the identification jobs and
 //! reviews tables; the change revisions read the library event streams.
 
 use std::collections::BTreeMap;
@@ -11,11 +11,30 @@ use std::collections::BTreeMap;
 use droppedneedle_kernel::db::DbError;
 use rusqlite::{Connection, OptionalExtension as _, params};
 
-/// Deferred jobs the activity card lists by name (v2 limit).
+use super::sql::{
+    ControlRow, FailedJob, FailureCount, JobTotals, OperationRow, StateCount, WaitingJob,
+};
+use crate::clock::at_secs;
+use crate::identify::models::JobState;
+use crate::jobs::{OperationKind, OperationState};
+
+/// Deferred jobs the activity card lists by name, at most this many.
 const DEFERRED_JOB_LIMIT: i64 = 20;
 
 /// Stream rows the activity revisions always carry.
 const STREAMS: [&str; 3] = ["scan", "identification", "operation"];
+
+/// What the identification pause switch says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum QueueSwitch {
+    Running,
+    Paused,
+}
+
+crate::scan::models::spelled!(QueueSwitch {
+    Running => "running",
+    Paused => "paused",
+});
 
 /// The identification pause switch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,10 +136,6 @@ impl IdentificationSnapshot {
     }
 }
 
-fn seconds(ms: i64) -> f64 {
-    ms as f64 / 1000.0
-}
-
 fn count(conn: &Connection, sql: &str) -> rusqlite::Result<u64> {
     conn.query_row(sql, [], |row| row.get::<_, i64>(0))
         .map(|value| value.max(0) as u64)
@@ -130,16 +145,15 @@ fn count(conn: &Connection, sql: &str) -> rusqlite::Result<u64> {
 pub fn identification_control(conn: &Connection) -> rusqlite::Result<IdentificationControl> {
     let row = conn
         .query_row(
-            "SELECT state, row_revision FROM library_work_control \
-             WHERE queue_kind = 'identification'",
+            crate::activity::sql::IDENTIFICATION_CONTROL.text(),
             [],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            ControlRow::read,
         )
         .optional()?;
     Ok(match row {
-        Some((state, revision)) => IdentificationControl {
-            paused: state == "paused",
-            row_revision: revision.max(0) as u64,
+        Some(row) => IdentificationControl {
+            paused: row.state == QueueSwitch::Paused,
+            row_revision: row.row_revision.max(0) as u64,
         },
         None => IdentificationControl {
             paused: false,
@@ -148,8 +162,7 @@ pub fn identification_control(conn: &Connection) -> rusqlite::Result<Identificat
     })
 }
 
-/// Pause or resume identification (v2 `pause_identification_queue` and
-/// `resume_identification_queue`). With `expected` set, the switch must
+/// Pause or resume identification. With `expected` set, the switch must
 /// still be at that revision. Returns the new revision. Runs inside the
 /// caller's write.
 pub fn set_identification_paused(
@@ -160,28 +173,20 @@ pub fn set_identification_paused(
     expected: Option<u64>,
 ) -> Result<u64, ControlError> {
     tx.execute(
-        "INSERT OR IGNORE INTO library_work_control (queue_kind, state) \
-         VALUES ('identification', 'running')",
+        crate::activity::sql::ENSURE_IDENTIFICATION_CONTROL.text(),
         [],
     )?;
     let expected = expected.map(|revision| revision as i64);
     let revision: Option<i64> = if paused {
         tx.query_row(
-            "UPDATE library_work_control SET state = 'paused', requested_at = ?1, \
-             requested_by_user_id = ?2, row_revision = row_revision + 1 \
-             WHERE queue_kind = 'identification' AND (?3 IS NULL OR row_revision = ?3) \
-             RETURNING row_revision",
-            params![now, requested_by_user_id, expected],
+            crate::activity::sql::PAUSE_IDENTIFICATION.text(),
+            params![crate::clock::ms(now), requested_by_user_id, expected],
             |row| row.get(0),
         )
         .optional()?
     } else {
         tx.query_row(
-            "UPDATE library_work_control SET state = 'running', requested_at = NULL, \
-             requested_by_user_id = NULL, high_priority_claim_count = 0, \
-             row_revision = row_revision + 1 \
-             WHERE queue_kind = 'identification' AND (?1 IS NULL OR row_revision = ?1) \
-             RETURNING row_revision",
+            crate::activity::sql::RESUME_IDENTIFICATION.text(),
             params![expected],
             |row| row.get(0),
         )
@@ -190,16 +195,11 @@ pub fn set_identification_paused(
     let Some(revision) = revision else {
         return Err(ControlError::Stale);
     };
-    tx.execute(
-        "UPDATE library_event_stream_revisions SET value = value + 1 \
-         WHERE stream_kind = 'identification'",
-        [],
-    )?;
+    tx.execute(crate::activity::sql::BUMP_IDENTIFICATION_STREAM.text(), [])?;
     Ok(revision.max(0) as u64)
 }
 
-/// Aggregate identification state for the activity feed (v2
-/// `get_identification_activity_snapshot`). `now` is unix seconds.
+/// Aggregate identification state for the activity feed. `now` is unix seconds.
 pub fn identification_snapshot(
     conn: &Connection,
     now: f64,
@@ -218,162 +218,94 @@ pub fn identification_snapshot(
         // same rule as the latest failure below. Neither is a job that
         // ended because its album changed (files moved mid-attempt, the
         // album gone): nothing failed, and a newer job takes the album.
-        let mut stmt = conn.prepare(
-            "SELECT CASE WHEN j.state = 'running' AND NOT (j.lease_expires_ms > ?1) \
-             THEN 'queued' ELSE j.state END AS live_state, COUNT(*) \
-             FROM library_identify_jobs j \
-             WHERE NOT (j.state = 'failed' \
-                 AND COALESCE(j.failure_code, '') IN ('INPUT_MOVED','ALBUM_GONE')) \
-             AND NOT (j.state IN ('failed','attention') \
-                 AND EXISTS (SELECT 1 FROM library_identify_jobs later \
-                     WHERE later.local_album_id = j.local_album_id \
-                     AND later.state = 'succeeded' AND later.updated_ms > j.updated_ms)) \
-             GROUP BY live_state",
-        )?;
-        let rows = stmt.query_map(params![now_ms], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        })?;
-        for row in rows {
-            let (state, total) = row?;
-            let total = total.max(0) as u64;
-            match state.as_str() {
-                "queued" => snapshot.queued = total,
-                "running" => snapshot.running = total,
-                "deferred" => snapshot.backing_off = total,
-                "succeeded" => snapshot.succeeded = total,
-                "failed" => snapshot.failed = total,
-                "attention" => snapshot.attention = total,
-                _ => {}
+        let mut stmt = conn.prepare(crate::activity::sql::JOB_COUNTS_BY_LIVE_STATE.text())?;
+        for row in stmt.query_map(params![now_ms], StateCount::read)? {
+            let row = row?;
+            let total = row.total.max(0) as u64;
+            match row.live_state {
+                JobState::Queued => snapshot.queued = total,
+                JobState::Running => snapshot.running = total,
+                JobState::Deferred => snapshot.backing_off = total,
+                JobState::Succeeded => snapshot.succeeded = total,
+                JobState::Failed => snapshot.failed = total,
+                JobState::Attention => snapshot.attention = total,
             }
         }
     }
-    let (started, updated, deferred, claimable) = conn.query_row(
-        "SELECT MIN(created_ms), MAX(updated_ms), \
-         SUM(CASE WHEN failure_code IS NOT NULL THEN 1 ELSE 0 END), \
-         SUM(CASE WHEN (state IN ('queued','deferred') AND not_before_ms <= ?1) \
-             OR (state = 'running' AND NOT (lease_expires_ms > ?1)) THEN 1 ELSE 0 END) \
-         FROM library_identify_jobs WHERE state IN ('queued','running','deferred')",
+    let totals = conn.query_row(
+        crate::activity::sql::JOB_TOTALS.text(),
         params![now_ms],
-        |row| {
-            Ok((
-                row.get::<_, Option<i64>>(0)?,
-                row.get::<_, Option<i64>>(1)?,
-                row.get::<_, Option<i64>>(2)?,
-                row.get::<_, Option<i64>>(3)?,
-            ))
-        },
+        JobTotals::read,
     )?;
-    snapshot.started_at = started.map(seconds);
-    snapshot.updated_at = updated.map(seconds);
-    snapshot.deferred_count = deferred.unwrap_or(0).max(0) as u64;
-    snapshot.claimable = claimable.unwrap_or(0).max(0) as u64;
+    snapshot.started_at = totals.started_at.map(at_secs);
+    snapshot.updated_at = totals.updated_at.map(at_secs);
+    snapshot.deferred_count = totals.deferred.unwrap_or(0).max(0) as u64;
+    snapshot.claimable = totals.claimable.unwrap_or(0).max(0) as u64;
     snapshot.active_priority = conn
         .query_row(
-            "SELECT priority FROM library_identify_jobs \
-             WHERE state IN ('queued','running','deferred') \
-             ORDER BY (state = 'running' AND lease_expires_ms > ?1) DESC, \
-             priority, created_ms, rowid LIMIT 1",
+            crate::activity::sql::NEXT_JOB_PRIORITY.text(),
             params![now_ms],
             |row| row.get::<_, i64>(0),
         )
         .optional()?;
-    snapshot.needs_review = count(
-        conn,
-        "SELECT COUNT(*) FROM library_identify_reviews WHERE state = 'pending'",
-    )?;
-    snapshot.kept_local = count(
-        conn,
-        "SELECT COUNT(*) FROM library_identify_reviews WHERE state = 'rejected'",
-    )?;
-    snapshot.identified = count(
-        conn,
-        "SELECT COUNT(*) FROM library_identify_jobs j WHERE j.state = 'succeeded' \
-         AND NOT EXISTS (SELECT 1 FROM library_identify_reviews r \
-             WHERE r.local_album_id = j.local_album_id AND r.state = 'pending')",
-    )?;
+    snapshot.needs_review = count(conn, crate::activity::sql::PENDING_REVIEW_COUNT.text())?;
+    snapshot.kept_local = count(conn, crate::activity::sql::REJECTED_REVIEW_COUNT.text())?;
+    snapshot.identified = count(conn, crate::activity::sql::MATCHED_JOB_COUNT.text())?;
     // A failure the album's own later success settled needs nobody's
     // attention, and a job that ended because its album changed is no
     // failure at all.
     snapshot.failure = conn
         .query_row(
-            "SELECT j.id, j.updated_ms FROM library_identify_jobs j \
-             WHERE j.state IN ('failed','attention') \
-             AND NOT (j.state = 'failed' \
-                 AND COALESCE(j.failure_code, '') IN ('INPUT_MOVED','ALBUM_GONE')) \
-             AND NOT EXISTS (SELECT 1 FROM library_identify_jobs later \
-                 WHERE later.local_album_id = j.local_album_id \
-                 AND later.state = 'succeeded' AND later.updated_ms > j.updated_ms) \
-             ORDER BY j.updated_ms DESC, j.id DESC LIMIT 1",
+            crate::activity::sql::FAILED_JOBS.text(),
             [],
-            |row| Ok((row.get::<_, String>(0)?, seconds(row.get::<_, i64>(1)?))),
+            FailedJob::read,
         )
+        .map(|job| (job.id, at_secs(job.updated_at)))
         .optional()?;
-    snapshot.foreground_operations = count(
-        conn,
-        "SELECT COUNT(*) FROM library_operation_jobs \
-         WHERE state IN ('queued','running','paused')",
-    )?;
+    snapshot.foreground_operations =
+        count(conn, crate::activity::sql::ACTIVE_OPERATION_COUNT.text())?;
     {
-        let mut stmt = conn.prepare(
-            "SELECT failure_code, COUNT(*) FROM library_identify_jobs \
-             WHERE state IN ('queued','running','deferred') AND failure_code IS NOT NULL \
-             GROUP BY failure_code",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        })?;
-        for row in rows {
-            let (code, total) = row?;
+        let mut stmt = conn.prepare(crate::activity::sql::WAITING_FAILURE_COUNTS.text())?;
+        for row in stmt.query_map([], FailureCount::read)? {
+            let row = row?;
             snapshot
                 .deferred_reason_counts
-                .insert(code, total.max(0) as u64);
+                .insert(row.failure_code, row.total.max(0) as u64);
         }
     }
     {
-        let mut stmt = conn.prepare(
-            "SELECT j.id, j.local_album_id, a.title, ar.display_name, j.failure_code, \
-             j.attempts, j.not_before_ms, j.updated_ms \
-             FROM library_identify_jobs j \
-             LEFT JOIN local_albums a ON a.id = j.local_album_id \
-             LEFT JOIN local_artists ar ON ar.id = a.album_artist_id \
-             WHERE j.state IN ('queued','running','deferred') AND j.failure_code IS NOT NULL \
-             ORDER BY j.priority, j.created_ms, j.rowid LIMIT ?1",
-        )?;
-        let rows = stmt.query_map(params![DEFERRED_JOB_LIMIT], |row| {
-            let not_before: i64 = row.get(6)?;
-            Ok(DeferredJob {
-                job_id: row.get(0)?,
-                local_album_id: row.get(1)?,
-                album_title: row.get(2)?,
-                artist_name: row.get(3)?,
-                last_failure_code: row.get(4)?,
-                attempt_count: row.get::<_, i64>(5)?.max(0) as u64,
-                not_before: (not_before > 0).then(|| seconds(not_before)),
-                updated_at: seconds(row.get(7)?),
-            })
-        })?;
-        for row in rows {
-            snapshot.deferred_jobs.push(row?);
+        let mut stmt = conn.prepare(crate::activity::sql::WAITING_JOBS_WITH_FAILURE.text())?;
+        for row in stmt.query_map(params![DEFERRED_JOB_LIMIT], WaitingJob::read)? {
+            let job = row?;
+            snapshot.deferred_jobs.push(DeferredJob {
+                job_id: job.id,
+                local_album_id: job.local_album_id,
+                album_title: job.title,
+                artist_name: job.display_name,
+                last_failure_code: job.failure_code,
+                attempt_count: job.attempts.max(0) as u64,
+                not_before: (job.not_before_at.0 > 0).then(|| at_secs(job.not_before_at)),
+                updated_at: at_secs(job.updated_at),
+            });
         }
     }
     Ok(snapshot)
 }
 
-/// Change revisions for every library activity stream (v2
-/// `get_library_revisions`): `scan`, `identification`, `operation`, and
+/// Change revisions for every library activity stream: `scan`, `identification`, `operation`, and
 /// `catalog`. A client compares them to know what to refetch.
 /// One library operation job still in flight: a re-identification, an
 /// identity repair or preparation, or catalog cleanup.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OperationWork {
     pub id: String,
-    pub kind: String,
+    pub kind: OperationKind,
     /// A repair's purpose (`existing_matches`, `management_readiness`,
     /// `catalog_identity_hygiene`).
     pub purpose: Option<String>,
     /// A repair's phase: `dry_run` (checking) or `apply`.
     pub phase: Option<String>,
-    pub state: String,
+    pub state: OperationState,
     pub expected: u64,
     pub completed: u64,
     pub succeeded: u64,
@@ -385,32 +317,26 @@ pub struct OperationWork {
 
 /// Operation jobs queued, running or paused, newest first (at most 20).
 pub fn operation_work(conn: &Connection) -> rusqlite::Result<Vec<OperationWork>> {
-    let mut stmt = conn.prepare(
-        "SELECT j.id, j.kind, s.purpose, s.phase, \
-         j.state, j.expected_work_count, j.completed_count, j.succeeded_count, \
-         j.failed_count, j.skipped_count, j.started_at, j.updated_at \
-         FROM library_operation_jobs j LEFT JOIN library_repair_snapshots s ON s.job_id = j.id \
-         WHERE j.state IN ('queued','running','paused') \
-         ORDER BY j.updated_at DESC, j.id DESC LIMIT 20",
-    )?;
+    let mut stmt = conn.prepare(crate::activity::sql::OPERATION_WORK.text())?;
     let count = |value: i64| value.max(0) as u64;
-    stmt.query_map([], |row| {
-        Ok(OperationWork {
-            id: row.get(0)?,
-            kind: row.get(1)?,
-            purpose: row.get(2)?,
-            phase: row.get(3)?,
-            state: row.get(4)?,
-            expected: count(row.get(5)?),
-            completed: count(row.get(6)?),
-            succeeded: count(row.get(7)?),
-            failed: count(row.get(8)?),
-            skipped: count(row.get(9)?),
-            started_at: row.get(10)?,
-            updated_at: row.get(11)?,
+    stmt.query_map([], OperationRow::read)?
+        .map(|row| {
+            row.map(|job| OperationWork {
+                id: job.id,
+                kind: job.kind,
+                purpose: job.purpose,
+                phase: job.phase,
+                state: job.state,
+                expected: count(job.expected_work_count),
+                completed: count(job.completed_count),
+                succeeded: count(job.succeeded_count),
+                failed: count(job.failed_count),
+                skipped: count(job.skipped_count),
+                started_at: job.started_at.map(at_secs),
+                updated_at: at_secs(job.updated_at),
+            })
         })
-    })?
-    .collect()
+        .collect()
 }
 
 pub fn library_revisions(conn: &Connection) -> rusqlite::Result<BTreeMap<String, u64>> {
@@ -418,7 +344,7 @@ pub fn library_revisions(conn: &Connection) -> rusqlite::Result<BTreeMap<String,
     for kind in STREAMS {
         let value = conn
             .query_row(
-                "SELECT value FROM library_event_stream_revisions WHERE stream_kind = ?1",
+                crate::activity::sql::STREAM_REVISION.text(),
                 params![kind],
                 |row| row.get::<_, i64>(0),
             )
@@ -428,11 +354,7 @@ pub fn library_revisions(conn: &Connection) -> rusqlite::Result<BTreeMap<String,
     }
     revisions.insert(
         "catalog".to_owned(),
-        count(
-            conn,
-            "SELECT COALESCE((SELECT value FROM library_catalog_revision \
-             WHERE singleton = 1), 0)",
-        )?,
+        count(conn, crate::activity::sql::CATALOG_REVISION.text())?,
     );
     Ok(revisions)
 }

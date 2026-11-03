@@ -16,6 +16,7 @@ function track(id: string, title: string, artist: string): TrackPage['items'][nu
 		id,
 		title,
 		album_id: `album-${id}`,
+		row_revision: 1,
 		album_title: `Album ${id}`,
 		artist_id: null,
 		artist_name: artist,
@@ -34,6 +35,7 @@ function track(id: string, title: string, artist: string): TrackPage['items'][nu
 		file_size_bytes: 1024,
 		date_added: 1,
 		cover_available: false,
+		art_missing: false,
 		favorite: false
 	};
 }

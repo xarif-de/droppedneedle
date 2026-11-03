@@ -30,7 +30,7 @@
 	let exportHeading: HTMLHeadingElement;
 	let exportOpener: HTMLElement | null = null;
 
-	function formatTime(value: number | null): string {
+	function formatTime(value: number | null | undefined): string {
 		return value ? new Date(value * 1000).toLocaleString() : '-';
 	}
 
@@ -253,7 +253,7 @@
 					{/each}
 				</ul>
 			{/if}
-			{#if detailRun.state === 'failed' || (detailRun.counters['errored_count'] ?? 0) > 0}
+			{#if detailRun.state === 'failed' || (detailRun.counters['errored_count'] ?? 0) > 0 || failureItems.length > 0}
 				<h3 class="mt-4 text-sm font-semibold">Failed paths</h3>
 				{#if failuresQuery.isLoading}
 					<p class="mt-2 text-sm text-base-content/55">Loading failed paths…</p>
@@ -287,16 +287,14 @@
 				{/if}
 			{/if}
 			<div class="modal-action">
-				{#if detailRun.diagnostics_available !== false}
-					<Button
-						variant="outline"
-						size="sm"
-						icon={Download}
-						class="mr-auto"
-						onclick={openDetailExport}
-						aria-label={`Export diagnostics for run ${detailRun.id}`}>Export diagnostics</Button
-					>
-				{/if}
+				<Button
+					variant="outline"
+					size="sm"
+					icon={Download}
+					class="mr-auto"
+					onclick={openDetailExport}
+					aria-label={`Export diagnostics for run ${detailRun.id}`}>Export diagnostics</Button
+				>
 				<Button variant="ghost" onclick={closeDetails}>Close</Button>
 			</div>
 		</div>

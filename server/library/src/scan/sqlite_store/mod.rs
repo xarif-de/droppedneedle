@@ -1,14 +1,14 @@
 //! SQLite-backed scan store: durable runs, scopes, inventory, failures,
 //! and the track catalog over the 0001 baseline tables.
 //!
-//! [`SqliteScanStore`] keeps the v2 disposition,
-//! transition, and verdict semantics: the cover rule, union
+//! [`SqliteScanStore`] keeps the disposition, transition, and
+//! verdict semantics: the cover rule, union
 //! normalization, idempotent control answers, the legacy-mtime band with
 //! promotion, and the deferred re-offer. `runs` holds the run lifecycle,
 //! `inventory` the discovery inventory, `catalog` the track catalog.
 //! The catalog lives in `local_tracks` (keyed by `root_id, relative_path`),
 //! so [`commit_window`](SqliteScanStore::commit_window) also writes the
-//! `local_*` rows the reads layer shows (`availability = 'indexed'`).
+//! `local_*` rows the catalog shows (`availability = 'indexed'`).
 //!
 //! The store holds the shared [`Db`] and no connection. The request path
 //! reads through the request pool and writes in the foreground class; the
@@ -28,19 +28,22 @@ use rusqlite::{Connection, OptionalExtension as _, Transaction, params, params_f
 use sha2::{Digest as _, Sha256};
 
 use super::models::{
-    Counter, Counters, Disposition, EffectivePolicy, Event, FailureCode, PhaseTimings,
-    RequestedControl, RunState, ScanFailureRecord, ScanInventoryItem, ScanKind, ScanPhase,
-    ScanRequest, ScanRequestResult, ScanRun, ScanScope, ScanState, ScanTrigger,
-    ScopeDiscoveryState, Verdict, scope_covers_path,
+    Counter, Counters, Disposition, EffectivePolicy, Event, FailureCode, PhaseTimings, RunState,
+    ScanFailureRecord, ScanInventoryItem, ScanKind, ScanPhase, ScanRequest, ScanRequestResult,
+    ScanRun, ScanScope, ScanState, ScopeDiscoveryState, Verdict, scope_covers_path,
 };
 use super::revision::{exact_stat_revision, legacy_mtime_eps_seconds};
 use super::stop::{Backoff, RunStop, retry_busy};
 use super::store::{
     CatalogEntry, ClassifyInput, CommitIndexedItem, IndexWindow, InventoryPage, RevisionKind,
-    ScanStoreError, WindowOutcome,
+    ScanStoreError, UnreadRows, WindowOutcome,
 };
+use crate::scan::sql::{FailureRow, InventoryRow, RunRow, ScopeRow};
+pub use artwork::ArtworkSweep;
 use droppedneedle_kernel::db::writer::Lane;
 use droppedneedle_kernel::db::{ChunkedError, Db, fold_text};
+pub(crate) use held_scopes::{holds_new_files, judge_remembered, remembered};
+pub use lyrics::LyricsSweep;
 
 /// Terminal runs kept past cleanup before history pruning.
 const HISTORY_KEPT: usize = 50;
@@ -254,153 +257,115 @@ fn unknown(column: &str, value: &str) -> rusqlite::Error {
     )
 }
 
-/// Column `column` read through `parse`.
-fn spelled<T>(
-    row: &rusqlite::Row<'_>,
-    column: &str,
-    parse: fn(&str) -> Option<T>,
-) -> rusqlite::Result<T> {
-    let text: String = row.get(column)?;
-    parse(&text).ok_or_else(|| unknown(column, &text))
-}
-
-/// Nullable column `column` read through `parse`.
-fn spelled_opt<T>(
-    row: &rusqlite::Row<'_>,
-    column: &str,
-    parse: fn(&str) -> Option<T>,
-) -> rusqlite::Result<Option<T>> {
-    let text: Option<String> = row.get(column)?;
-    text.map(|text| parse(&text).ok_or_else(|| unknown(column, &text)))
-        .transpose()
-}
-
-pub(in crate::scan) const RUN_COLUMNS: &str = "id, kind, trigger, requested_by_user_id, state, phase, \
-    resume_phase, requested_control, aggregate_scope, total_count, discovered_count, \
-    inspected_count, new_count, changed_count, indexed_count, unchanged_count, \
-    excluded_count, missing_count, errored_count, identification_enqueued_count, \
-    coalesced_request_count, queued_at, started_at, updated_at, terminal_at, \
-    terminal_code, phase_timings_json, row_revision, event_revision";
-
 fn map_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScanRun> {
-    let state: String = row.get("state")?;
-    let phase: String = row.get("phase")?;
-    let run_state = RunState::from_columns(&state, &phase)
-        .ok_or_else(|| unknown("state", &format!("{state} in phase {phase}")))?;
-    // Both follow from the state; they are read only so a word no release
-    // wrote fails the read.
-    spelled_opt(row, "resume_phase", ScanPhase::parse)?;
-    spelled(row, "requested_control", RequestedControl::parse)?;
-    let mut counters = Counters::default();
-    for counter in Counter::ALL {
-        *counters.slot(counter) = row.get(counter.column())?;
-    }
-    let timings: String = row.get("phase_timings_json")?;
-    let phase_timings: PhaseTimings =
-        serde_json::from_str(&timings).map_err(|_| unknown("phase_timings_json", &timings))?;
+    let row = RunRow::read(row)?;
+    let run_state = RunState::from_columns(&row.state, &row.phase)
+        .ok_or_else(|| unknown("state", &format!("{} in phase {}", row.state, row.phase)))?;
+    // Both follow from the state; reading the row fails on a word no release
+    // wrote, and nothing else looks at them.
+    let (_resume_phase, _requested_control) = (row.resume_phase, row.requested_control);
+    let phase_timings: PhaseTimings = serde_json::from_str(&row.phase_timings_json)
+        .map_err(|_| unknown("phase_timings_json", &row.phase_timings_json))?;
     Ok(ScanRun {
-        id: row.get("id")?,
-        kind: spelled(row, "kind", ScanKind::parse)?,
-        trigger: spelled(row, "trigger", ScanTrigger::parse)?,
+        id: row.id,
+        kind: row.kind,
+        trigger: row.trigger,
         state: run_state,
-        requested_by_user_id: row.get("requested_by_user_id")?,
-        aggregate_scope: row.get("aggregate_scope")?,
-        queued_at: row.get("queued_at")?,
-        started_at: row.get("started_at")?,
-        updated_at: row.get("updated_at")?,
-        terminal_at: row.get("terminal_at")?,
-        terminal_code: spelled_opt(row, "terminal_code", FailureCode::parse)?,
-        coalesced_request_count: row.get("coalesced_request_count")?,
-        row_revision: row.get::<_, i64>("row_revision")? as u64,
-        event_revision: row.get::<_, i64>("event_revision")? as u64,
-        counters,
+        requested_by_user_id: row.requested_by_user_id,
+        aggregate_scope: row.aggregate_scope,
+        queued_at: crate::clock::at_secs(row.queued_at),
+        started_at: row.started_at.map(crate::clock::at_secs),
+        updated_at: crate::clock::at_secs(row.updated_at),
+        terminal_at: row.terminal_at.map(crate::clock::at_secs),
+        terminal_code: row.terminal_code,
+        coalesced_request_count: row.coalesced_request_count,
+        row_revision: row.row_revision as u64,
+        event_revision: row.event_revision as u64,
+        counters: Counters {
+            total_count: row.total_count,
+            discovered_count: row.discovered_count,
+            inspected_count: row.inspected_count,
+            new_count: row.new_count,
+            changed_count: row.changed_count,
+            indexed_count: row.indexed_count,
+            unchanged_count: row.unchanged_count,
+            excluded_count: row.excluded_count,
+            missing_count: row.missing_count,
+            errored_count: row.errored_count,
+            identification_enqueued_count: row.identification_enqueued_count,
+        },
         phase_timings,
     })
 }
 
 fn map_scope(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScanScope> {
+    let row = ScopeRow::read(row)?;
     Ok(ScanScope {
-        root_id: row.get("root_id")?,
-        scope_id: row.get("scope_id")?,
-        relative_path: row.get("relative_path")?,
-        root_path: row.get("root_path")?,
-        effective_policy: spelled(row, "effective_policy", EffectivePolicy::parse)?,
-        policy_revision: row.get("policy_revision")?,
-        estimated_count: row.get("estimated_count")?,
+        root_id: row.root_id,
+        scope_id: row.scope_id,
+        relative_path: row.relative_path,
+        root_path: row.root_path,
+        effective_policy: row.effective_policy,
+        policy_revision: row.policy_revision,
+        estimated_count: row.estimated_count,
     })
 }
 
 fn map_inventory(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScanInventoryItem> {
+    let row = InventoryRow::read(row)?;
     Ok(ScanInventoryItem {
-        root_id: row.get("root_id")?,
-        relative_path: row.get("relative_path")?,
-        absolute_path: row.get("absolute_path")?,
-        file_size_bytes: row.get::<_, i64>("file_size_bytes")? as u64,
-        file_mtime_ns: row.get("file_mtime_ns")?,
-        stat_revision: row.get("stat_revision")?,
-        effective_policy: spelled(row, "effective_policy", EffectivePolicy::parse)?,
-        comparison_result: spelled(row, "comparison_result", Verdict::parse)?,
-        policy_revision: row.get("policy_revision")?,
-        local_track_id: row.get("local_track_id")?,
-        scope_relative_path: row.get("scope_relative_path")?,
+        root_id: row.root_id,
+        relative_path: row.relative_path,
+        absolute_path: row.absolute_path,
+        file_size_bytes: row.file_size_bytes as u64,
+        file_mtime_ns: row.file_mtime_ns,
+        stat_revision: row.stat_revision,
+        effective_policy: row.effective_policy,
+        comparison_result: row.comparison_result,
+        policy_revision: row.policy_revision,
+        local_track_id: row.local_track_id,
+        scope_relative_path: row.scope_relative_path,
     })
 }
 
 fn map_failure(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScanFailureRecord> {
+    let row = FailureRow::read(row)?;
     Ok(ScanFailureRecord {
-        root_id: row.get("root_id")?,
-        relative_path: row.get("relative_path")?,
-        failure_code: spelled(row, "failure_code", FailureCode::parse)?,
-        recorded_at: row.get("recorded_at")?,
-        failure_detail: row.get("failure_detail")?,
-        phase: spelled(row, "phase", ScanPhase::parse)?,
+        root_id: row.root_id,
+        relative_path: row.relative_path,
+        failure_code: row.failure_code,
+        recorded_at: crate::clock::at_secs(row.recorded_at),
+        failure_detail: row.failure_detail,
+        phase: row.phase,
     })
 }
 
 fn load_scopes(conn: &Connection, run_id: &str) -> rusqlite::Result<Vec<ScanScope>> {
-    let mut stmt = conn.prepare(
-        "SELECT root_id, scope_id, relative_path, root_path, effective_policy, \
-         policy_revision, estimated_count FROM library_scan_run_scopes \
-         WHERE run_id = ?1 ORDER BY scope_sequence",
-    )?;
+    let mut stmt = conn.prepare(crate::scan::sql::LOAD_SCOPES.text())?;
     stmt.query_map(params![run_id], map_scope)?.collect()
 }
 
 fn load_run(conn: &Connection, run_id: &str) -> rusqlite::Result<Option<ScanRun>> {
-    conn.query_row(
-        &format!("SELECT {RUN_COLUMNS} FROM library_scan_runs WHERE id = ?1"),
-        params![run_id],
-        map_run,
-    )
-    .optional()
+    conn.query_row(crate::scan::sql::LOAD_RUN.text(), params![run_id], map_run)
+        .optional()
 }
 
 fn bump_scan_stream(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute(
-        "INSERT INTO library_event_stream_revisions (stream_kind, value) \
-         VALUES ('scan', 0) ON CONFLICT (stream_kind) DO NOTHING",
-        [],
-    )?;
-    conn.execute(
-        "UPDATE library_event_stream_revisions SET value = value + 1 \
-         WHERE stream_kind = 'scan'",
-        [],
-    )?;
+    conn.execute(crate::scan::sql::ENSURE_SCAN_STREAM.text(), [])?;
+    conn.execute(crate::scan::sql::BUMP_SCAN_STREAM.text(), [])?;
     Ok(())
 }
 
 fn read_scan_stream(conn: &Connection) -> rusqlite::Result<u64> {
-    conn.query_row(
-        "SELECT value FROM library_event_stream_revisions WHERE stream_kind = 'scan'",
-        [],
-        |row| row.get::<_, i64>(0),
-    )
+    conn.query_row(crate::scan::sql::READ_SCAN_STREAM.text(), [], |row| {
+        row.get::<_, i64>(0)
+    })
     .optional()
     .map(|value| value.unwrap_or(0).max(0) as u64)
 }
 
 /// True when a stored scope covers a requested one: same root, same policy
-/// revision, stored path is the requested path or an ancestor (memory port).
+/// revision, stored path is the requested path or an ancestor.
 fn scope_covers(existing: &ScanScope, requested_root: &str, requested: &ScanScope) -> bool {
     existing.root_id == requested_root
         && existing.policy_revision == requested.policy_revision
@@ -409,7 +374,6 @@ fn scope_covers(existing: &ScanScope, requested_root: &str, requested: &ScanScop
 
 pub(crate) mod artists;
 mod artwork;
-pub use artwork::ArtworkSweep;
 mod catalog;
 mod commit;
 mod folder_digests;
@@ -417,13 +381,12 @@ mod hands_off;
 mod held_scopes;
 mod inventory;
 mod lyrics;
-pub use lyrics::LyricsSweep;
 mod mounts;
 pub mod retag_pairs;
 mod runs;
+pub(crate) mod sql;
 
 pub(crate) use commit::{
-    Adopted, RetagPair, adopt_file, adoptable_track_id, automatic_album_for, awaits_retag, holds,
-    tried, waits_for_the_rest,
+    Adopted, RetagPair, adopt_file, adoptable_track_id, automatic_album_for, awaits_retag, tried,
+    waits_for_the_rest,
 };
-pub(crate) use held_scopes::{holds_new_files, judge_remembered, remembered};

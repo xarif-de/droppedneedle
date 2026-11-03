@@ -1,10 +1,10 @@
 //! Library policy: normalize-and-validate, content revisions, and the
 //! pure logic behind the policy routes (tree, impact, apply preview,
-//! restorable roots, path mapping).
+//! restorable roots).
 //!
-//! Ports v2's `LibraryPolicyResolver` (root/rule normalization, warnings,
-//! SHA-256 content revision) plus the pure parts of v2's library policy
-//! services. Catalog rows come in through the [`LibraryPolicyCatalog`]
+//! Root and rule normalization, warnings, the SHA-256 content revision,
+//! and the pure parts of the library policy services. Catalog rows come in
+//! through the [`LibraryPolicyCatalog`]
 //! read port; the SQLite adapter is `settings::library_catalog` and the
 //! orchestration (blocking hops, revision checks, saves) is
 //! `settings::library_policy_service`.
@@ -25,10 +25,8 @@ use futures_util::future::BoxFuture;
 use sha2::{Digest, Sha256};
 
 use crate::settings_models::{
-    LibraryPathMappingItem, LibraryPathMappingReport, LibraryPolicyApplyPreviewResponse,
-    LibraryPolicyImpactResponse, LibraryPolicyTreeNode, LibraryPolicyTreeResponse,
-    LibraryRestorableRoot, LibrarySettingsResponse, PathMappingError, PathMappingSource,
-    PolicyNodeKind,
+    LibraryPolicyApplyPreviewResponse, LibraryPolicyImpactResponse, LibraryPolicyTreeNode,
+    LibraryPolicyTreeResponse, LibraryRestorableRoot, LibrarySettingsResponse, PolicyNodeKind,
 };
 use droppedneedle_kernel::runtime_config::Masked;
 use droppedneedle_kernel::runtime_config::secret_sections::{
@@ -197,7 +195,7 @@ pub struct ResolvedLibraryPolicy {
 }
 
 /// Normalize-and-validate library settings, then hash the revision and
-/// warn about paths that are not there now. Mirrors v2's resolver: unique
+/// warn about paths that are not there now. The checks are unique
 /// root ids, unique casefolded labels, no root inside another root or
 /// inside staging, unique rule ids per root, rules ordered by depth,
 /// warnings for unavailable paths.
@@ -267,7 +265,7 @@ pub fn normalize(settings: &TypedLibrary) -> Result<TypedLibrary, SettingsError>
         canonical_paths.push((root_id.clone(), canonical.clone()));
 
         let mut rule_ids = BTreeSet::new();
-        let mut rule_paths = BTreeSet::new();
+        let mut rule_paths = BTreeMap::new();
         let mut rules: Vec<LibraryPathRule> = Vec::new();
         for rule in &root.rules {
             let rule_id = rule.id.trim().to_owned();
@@ -282,9 +280,21 @@ pub fn normalize(settings: &TypedLibrary) -> Result<TypedLibrary, SettingsError>
                 });
             }
             let relative = normalise_rule_path(&rule.relative_path)?;
-            if !rule_paths.insert(relative.clone()) {
+            // Rules match folded names, so two that fold together would
+            // both cover the same folders.
+            if let Some(other) = rule_paths.insert(
+                crate::publish::collision_key("", &relative),
+                relative.clone(),
+            ) {
                 return Err(SettingsError::InvalidInput {
-                    message: format!("Library root {label} has more than one rule for {relative}."),
+                    message: if other == relative {
+                        format!("Library root {label} has more than one rule for {relative}.")
+                    } else {
+                        format!(
+                            "Library root {label} has rules for {other} and {relative}, \
+                             which cover the same folders."
+                        )
+                    },
                 });
             }
             rules.push(LibraryPathRule {
@@ -385,11 +395,16 @@ fn overlap_warnings(normalized: &TypedLibrary) -> Vec<String> {
     warnings
 }
 
+/// The stored settings' policy revision, as [`resolve_stored`] gives it,
+/// without its availability warnings: it touches no file.
+pub fn stored_revision(stored: &TypedLibrary) -> String {
+    normalize(stored).map_or_else(|_| revision(stored), |normal| revision(&normal))
+}
+
 /// 409 unless `expected` is the stored settings' revision. Touches no
 /// file, so it may run inside a settings write.
 pub fn check_revision(stored: &TypedLibrary, expected: &str) -> Result<(), SettingsError> {
-    let current = normalize(stored).map_or_else(|_| revision(stored), |normal| revision(&normal));
-    if expected != current {
+    if expected != stored_revision(stored) {
         return Err(SettingsError::StaleRevision {
             message: "Library settings changed since this page loaded. Refresh and retry."
                 .to_owned(),
@@ -425,6 +440,7 @@ pub fn resolve_stored(settings: &TypedLibrary) -> ResolvedLibraryPolicy {
         Err(error) => {
             let message = match error {
                 SettingsError::InvalidInput { message } => message,
+                refused @ SettingsError::InvalidField { .. } => refused.to_string(),
                 other => format!("{other:?}"),
             };
             ResolvedLibraryPolicy {
@@ -437,7 +453,7 @@ pub fn resolve_stored(settings: &TypedLibrary) -> ResolvedLibraryPolicy {
 }
 
 /// Content revision over roots plus rules (enabled, staging, naming,
-/// and keys are excluded, exactly like v2).
+/// and keys are excluded).
 pub fn revision(settings: &TypedLibrary) -> String {
     let payload = serde_json::json!({
         "roots": settings.library_roots.iter().map(|root| {
@@ -506,18 +522,13 @@ pub fn resolve_path(
             _ => None,
         })
         .collect();
-    let mut selected: Option<&LibraryPathRule> = None;
-    for rule in &root.rules {
-        let parts: Vec<&str> = rule.relative_path.split('/').collect();
-        if relative_parts.len() >= parts.len()
-            && relative_parts[..parts.len()]
-                .iter()
-                .zip(parts.iter())
-                .all(|(a, b)| a == b)
-        {
-            selected = Some(rule);
-        }
-    }
+    let selected = crate::scan::roots::deepest_rule(
+        root.rules
+            .iter()
+            .map(|rule| (rule.relative_path.as_str(), rule)),
+        &relative_parts,
+        |rule| crate::settings::policy(rule.policy),
+    );
     let relative_path = if relative_parts.is_empty() {
         ".".to_owned()
     } else {
@@ -654,7 +665,7 @@ pub fn collapse_scopes(scopes: Vec<TransitionScope>) -> Vec<TransitionScope> {
 }
 
 /// Scope counts: (indexed, on-disk) catalog files per (root, relative
-/// path). On-disk counts indexed plus excluded files, like v2.
+/// path). On-disk counts indexed plus excluded files.
 pub type ScopeCounts = HashMap<(String, String), (i64, i64)>;
 
 /// Catalog files under a set of scopes, each file counted once however
@@ -685,15 +696,6 @@ pub struct CatalogRoot {
     pub any_on_disk: bool,
 }
 
-/// One catalog track path, for the path-mapping dry run.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CatalogPath {
-    /// Track id.
-    pub track_id: String,
-    /// Absolute file path.
-    pub file_path: String,
-}
-
 /// Read port over the library catalog. Settings reads catalog rows only
 /// through this; the production adapter is `settings::library_catalog`.
 pub trait LibraryPolicyCatalog: Send + Sync {
@@ -711,8 +713,6 @@ pub trait LibraryPolicyCatalog: Send + Sync {
     fn has_tracks<'a>(&'a self) -> BoxFuture<'a, Result<bool, String>>;
     /// Every root id the catalog holds rows for, sorted by id.
     fn catalog_roots<'a>(&'a self) -> BoxFuture<'a, Result<Vec<CatalogRoot>, String>>;
-    /// Every track path, ordered by track id.
-    fn track_paths<'a>(&'a self) -> BoxFuture<'a, Result<Vec<CatalogPath>, String>>;
 }
 
 /// Build the policy tree: one node per root plus one per rule, counts
@@ -1041,69 +1041,6 @@ pub fn with_restored_roots(
         });
     }
     Ok(settings)
-}
-
-/// Dry run: map every catalog path to a saved root. Paths are cleaned
-/// lexically, not resolved on disk, so the run stays one pass over the
-/// rows.
-pub fn path_mapping(
-    resolved: &ResolvedLibraryPolicy,
-    sources: Vec<CatalogPath>,
-) -> LibraryPathMappingReport {
-    let roots: Vec<PathBuf> = resolved
-        .settings
-        .library_roots
-        .iter()
-        .map(|root| PathBuf::from(&root.path))
-        .collect();
-    let (mut mapped, mut ambiguous, mut out_of_root) = (0_i64, 0_i64, 0_i64);
-    let source_count = i64::try_from(sources.len()).unwrap_or(i64::MAX);
-    let items = sources
-        .into_iter()
-        .map(|source| {
-            let candidate = clean_absolute(&source.file_path);
-            let matches = candidate.as_ref().map_or(0, |path| {
-                roots.iter().filter(|root| path.starts_with(root)).count()
-            });
-            let mapping = match (&candidate, matches) {
-                (Some(path), 1) => resolve_path(&resolved.settings, path),
-                _ => None,
-            };
-            let mut item = LibraryPathMappingItem {
-                source_kind: PathMappingSource::LibraryFile,
-                source_id: source.track_id,
-                absolute_path: source.file_path,
-                root_id: None,
-                relative_path: None,
-                error: None,
-            };
-            match mapping {
-                Some((root_id, relative_path, _)) => {
-                    mapped += 1;
-                    item.root_id = Some(root_id);
-                    item.relative_path = Some(relative_path);
-                }
-                None if matches > 1 => {
-                    ambiguous += 1;
-                    item.error = Some(PathMappingError::Ambiguous);
-                }
-                None => {
-                    out_of_root += 1;
-                    item.error = Some(PathMappingError::OutOfRoot);
-                }
-            }
-            item
-        })
-        .collect();
-    LibraryPathMappingReport {
-        policy_revision: resolved.policy_revision.clone(),
-        source_count,
-        mapped_count: mapped,
-        ambiguous_count: ambiguous,
-        out_of_root_count: out_of_root,
-        blocking: ambiguous > 0 || out_of_root > 0,
-        items,
-    }
 }
 
 /// Build the GET view: normalized settings plus revision, the applied

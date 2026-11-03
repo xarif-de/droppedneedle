@@ -1,6 +1,6 @@
 //! Stable scan supervisor: recovery, dirty scopes, schedule, worker.
 //!
-//! Port of v2's library scan supervisor. One loop owns every trigger:
+//! Library scan supervisor. One loop owns every trigger:
 //! Hook A (one-shot startup reconciliation),
 //! Hook B (dirty scope marks from settings saves), the rolling schedule
 //! tick, and the single scan worker. Iterations never fail the loop: a
@@ -31,15 +31,11 @@ pub struct SupervisorInputs {
     pub now_unix: Arc<dyn Fn() -> f64 + Send + Sync>,
 }
 
-/// Resolve Hook B dirty scope ids against current settings (v2
-/// `_scopes_for_dirty_ids`). Ids that no longer resolve are dropped:
+/// Resolve Hook B dirty scope ids against current settings. Ids that no
+/// longer resolve are dropped:
 /// dirty marks are hints only, and removals converge through
 /// policy reconciliation instead.
-pub fn scopes_for_dirty_ids(
-    registry: &RootRegistry,
-    rules: &[InclusionRule],
-    scope_ids: &[String],
-) -> Vec<ScanScope> {
+pub fn scopes_for_dirty_ids(registry: &RootRegistry, scope_ids: &[String]) -> Vec<ScanScope> {
     let wanted: std::collections::HashSet<&str> = scope_ids.iter().map(String::as_str).collect();
     let mut scopes = Vec::new();
     for root in registry.roots() {
@@ -47,34 +43,17 @@ pub fn scopes_for_dirty_ids(
             let mut scope = ScanScope::root(
                 &root.id,
                 &root.path.to_string_lossy(),
-                registry.policy_revision(),
+                registry.fingerprint(),
             );
             scope.effective_policy = root.policy;
             scopes.push(scope);
         }
     }
-    for rule in rules {
-        if !wanted.contains(rule.rule_id.as_str()) {
-            continue;
-        }
-        let Some(root) = registry.resolve(&rule.root_id) else {
-            continue;
-        };
-        scopes.push(ScanScope {
-            root_id: rule.root_id.clone(),
-            scope_id: Some(rule.rule_id.clone()),
-            relative_path: rule.relative_path.clone(),
-            root_path: Some(root.path.to_string_lossy().into_owned()),
-            effective_policy: root.policy,
-            policy_revision: registry.policy_revision().to_owned(),
-            estimated_count: None,
-        });
-    }
     scopes
 }
 
-/// Hook B consumer: ask for a scan of the scopes marked dirty (new or
-/// changed roots and rules), whatever the schedule, while the library is
+/// Hook B consumer: ask for a scan of the roots marked dirty (new or
+/// changed, their rules included), whatever the schedule, while the library is
 /// on. Marks clear only on a non-conflict request; ids that no longer
 /// resolve clear at once as hints. Callers take turns, so two never ask
 /// for the same marks. Blocking.
@@ -91,8 +70,7 @@ where
     if dirty_ids.is_empty() {
         return;
     }
-    let rules = (inputs.inclusion_rules)();
-    let dirty_scopes = scopes_for_dirty_ids(&registry, &rules, &dirty_ids);
+    let dirty_scopes = scopes_for_dirty_ids(&registry, &dirty_ids);
     if dirty_scopes.is_empty() {
         inputs.dirty.clear(&dirty_ids);
         return;
@@ -101,7 +79,7 @@ where
         kind: ScanKind::Incremental,
         trigger: ScanTrigger::PolicyApply,
         requested_by_user_id: None,
-        policy_revision: registry.policy_revision().to_owned(),
+        policy_revision: registry.fingerprint().to_owned(),
         scopes: dirty_scopes,
     }) {
         Ok(result) if result.disposition != Disposition::Conflict => {
@@ -114,8 +92,8 @@ where
     }
 }
 
-/// Startup recovery plus the Hook A one-shot reconciliation scan (v2
-/// supervisor preamble, every boot). Guards mirror the loop gates:
+/// Startup recovery plus the Hook A one-shot reconciliation scan, run on
+/// every boot. Guards mirror the loop gates:
 /// enabled, not manual, nothing resumable or current, non-empty scopes.
 /// Every request disposition is acceptable; failures log and the loop
 /// below still runs.
@@ -149,7 +127,7 @@ where
                 trigger: ScanTrigger::StartupResume,
                 scopes,
                 requested_by_user_id: None,
-                policy_revision: registry.policy_revision().to_owned(),
+                policy_revision: registry.fingerprint().to_owned(),
             });
             if let Err(error) = result {
                 tracing::warn!(error = %error, "target scan startup reconciliation request failed");

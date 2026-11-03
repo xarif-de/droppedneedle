@@ -9,26 +9,54 @@ droppedneedle_kernel::sql! {
     /// Which of several artists one user follows.
     family FOLLOWED_AMONG = followed_among;
     /// Whether user `?1` follows artist `?2`.
-    pub(crate) IS_FOLLOWED = "SELECT 1 FROM user_followed_artists \
+    pub(crate) IS_FOLLOWED = "SELECT 1 FROM acquire_followed_artists \
          WHERE user_id = ?1 AND artist_mbid_lower = ?2";
     /// The followed artist `?2` of user `?1`: `(mbid, name)`.
-    pub(crate) FOLLOWED_ARTIST = "SELECT artist_mbid, artist_name FROM user_followed_artists \
+    pub(crate) FOLLOWED_ARTIST = "SELECT artist_mbid, artist_name FROM acquire_followed_artists \
+         WHERE user_id = ?1 AND artist_mbid_lower = ?2";
+    /// Add a follow as it stands, with its own times.
+    pub(crate) INSERT_FOLLOW_ROW = "INSERT INTO acquire_followed_artists (user_id, artist_mbid, \
+         artist_mbid_lower, artist_name, auto_download, followed_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)";
+    /// Write a follow's merged values.
+    pub(crate) MERGE_FOLLOW_ROW = "UPDATE acquire_followed_artists SET auto_download = ?3, \
+         followed_at = ?4, updated_at = ?5 WHERE user_id = ?1 AND artist_mbid_lower = ?2";
+    /// Add an approval as it stands.
+    pub(crate) INSERT_APPROVAL_ROW = "INSERT INTO auto_download_approvals (user_id, artist_mbid, \
+         artist_mbid_lower, artist_name, state, requested_at, reviewed_by_id, reviewed_by_name, \
+         reviewed_at, batch_id, source) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)";
+    /// Write an approval's merged values.
+    pub(crate) MERGE_APPROVAL_ROW = "UPDATE auto_download_approvals SET state = ?3, requested_at = ?4, \
+         reviewed_by_id = ?5, reviewed_by_name = ?6, reviewed_at = ?7, batch_id = ?8, source = ?9 \
          WHERE user_id = ?1 AND artist_mbid_lower = ?2";
     /// Unfollow one artist.
-    pub(crate) UNFOLLOW = "DELETE FROM user_followed_artists \
+    pub(crate) UNFOLLOW = "DELETE FROM acquire_followed_artists \
          WHERE user_id = ?1 AND artist_mbid_lower = ?2";
     /// Follow one artist; a conflict keeps the intent and start date and
     /// refreshes the name when one is given.
-    pub(crate) UPSERT_FOLLOW = "INSERT INTO user_followed_artists (user_id, artist_mbid, \
+    pub(crate) UPSERT_FOLLOW = "INSERT INTO acquire_followed_artists (user_id, artist_mbid, \
          artist_mbid_lower, artist_name, auto_download, followed_at, updated_at) \
          VALUES (?1, ?2, ?3, COALESCE(?4, ?5), 0, ?6, ?6) \
          ON CONFLICT (user_id, artist_mbid_lower) DO UPDATE SET \
          artist_name = COALESCE(?4, artist_name), updated_at = ?6";
+    /// End user `?1`'s follow rows for artist `?2` that have not started
+    /// (waiting, or left pending with no task by a busy database), as
+    /// cancelled at `?3`. A row someone else joined keeps waiting for them;
+    /// one the owner asked for by hand is a person's ask and stays.
+    pub(crate) END_WAITING_FOLLOWS = "UPDATE request_history SET status = 'cancelled', \
+         completed_at = ?3, dispatch_authorized = 0, generation = generation + 1 \
+         WHERE user_id = ?1 AND lower(artist_mbid) = ?2 AND origin = 'follow' \
+           AND request_kind = 'album' AND status IN ('queued', 'pending') \
+           AND download_task_id IS NULL \
+           AND NOT EXISTS (SELECT 1 FROM request_history_requesters r \
+             WHERE r.musicbrainz_id_lower = request_history.musicbrainz_id_lower \
+               AND r.user_id <> ?1) \
+         RETURNING musicbrainz_id_lower";
     /// Set the auto-download intent `?1` on one followed row.
-    pub(crate) SET_INTENT = "UPDATE user_followed_artists SET auto_download = ?1, \
+    pub(crate) SET_INTENT = "UPDATE acquire_followed_artists SET auto_download = ?1, \
          updated_at = ?2 WHERE user_id = ?3 AND artist_mbid_lower = ?4";
     /// Follow with auto-download on, or turn it on for an existing follow.
-    pub(crate) FOLLOW_ARMED = "INSERT INTO user_followed_artists (user_id, artist_mbid, \
+    pub(crate) FOLLOW_ARMED = "INSERT INTO acquire_followed_artists (user_id, artist_mbid, \
          artist_mbid_lower, artist_name, auto_download, followed_at, updated_at) \
          VALUES (?1, ?2, ?3, ?4, 1, ?5, ?5) \
          ON CONFLICT (user_id, artist_mbid_lower) DO UPDATE SET \
@@ -86,13 +114,20 @@ droppedneedle_kernel::sql! {
          WHERE a.state = 'pending' AND (a.batch_id IS NOT NULL) = ?1 \
          ORDER BY a.requested_at ASC, a.artist_name ASC";
 
+    /// Granted rows of plain users, by artist name.
+    pub(crate) APPROVED_APPROVALS = "SELECT a.user_id, u.display_name, a.artist_mbid, \
+         a.artist_name, a.requested_at, a.batch_id FROM auto_download_approvals a \
+         LEFT JOIN auth_users u ON u.id = a.user_id \
+         WHERE a.state = 'approved' AND COALESCE(u.role, 'user') NOT IN ('admin', 'trusted') \
+         ORDER BY a.artist_name ASC, a.user_id ASC";
+
     // The follow poll.
 
     /// Followed artists due at `?1`, never-polled first, at most `?2`.
     pub(crate) CURSORS_DUE = "SELECT f.artist_mbid_lower, MIN(f.artist_mbid), \
          MIN(f.artist_name), MAX(c.baselined), MAX(c.cursor_date), MAX(c.next_poll_at), \
          MAX(c.pending) \
-         FROM user_followed_artists f \
+         FROM acquire_followed_artists f \
          LEFT JOIN acquire_follow_cursors c ON c.artist_mbid_lower = f.artist_mbid_lower \
          GROUP BY f.artist_mbid_lower \
          HAVING MAX(c.next_poll_at) IS NULL OR MAX(c.next_poll_at) <= ?1 \
@@ -105,9 +140,11 @@ droppedneedle_kernel::sql! {
     pub(crate) KNOWN_RELEASES = "SELECT rg_mbid_lower FROM artist_known_releases \
          WHERE artist_mbid_lower = ?1";
     /// Followers of artist `?1` with auto-download on:
-    /// `(user id, role, verdict, name)`.
-    pub(crate) AUTO_FOLLOWERS = "SELECT f.user_id, u.role, a.state, u.display_name \
-         FROM user_followed_artists f \
+    /// `(user id, role, verdict, name)`. The name is the login a person's
+    /// own asks show.
+    pub(crate) AUTO_FOLLOWERS = "SELECT f.user_id, u.role, a.state, \
+         COALESCE(u.username_display, u.username) \
+         FROM acquire_followed_artists f \
          JOIN auth_users u ON u.id = f.user_id \
          LEFT JOIN auto_download_approvals a \
            ON a.user_id = f.user_id AND a.artist_mbid_lower = f.artist_mbid_lower \
@@ -121,7 +158,7 @@ droppedneedle_kernel::sql! {
     pub(crate) ADD_KNOWN_RELEASE = "INSERT OR IGNORE INTO artist_known_releases \
          (artist_mbid_lower, rg_mbid_lower) VALUES (?1, ?2)";
     /// Add one release to the followers' feed; a known one keeps its time.
-    pub(crate) ADD_FEED_RELEASE = "INSERT OR IGNORE INTO new_release_feed \
+    pub(crate) ADD_FEED_RELEASE = "INSERT OR IGNORE INTO acquire_new_release_feed \
          (release_group_mbid_lower, release_group_mbid, artist_mbid_lower, artist_name, title, \
          primary_type, secondary_types, first_release_date, discovered_at) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)";
@@ -130,7 +167,7 @@ droppedneedle_kernel::sql! {
 /// Which of `artists` artists one user (the first value) follows.
 pub(crate) fn followed_among(artists: ListLen) -> String {
     format!(
-        "SELECT artist_mbid_lower FROM user_followed_artists \
+        "SELECT artist_mbid_lower FROM acquire_followed_artists \
          WHERE user_id = ? AND artist_mbid_lower IN ({})",
         vec!["?"; artists.get()].join(", ")
     )

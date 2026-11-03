@@ -22,7 +22,7 @@ use droppedneedle_kernel::jobs::{AlreadyRunning, FnTick, Next, Schedule, Supervi
 use droppedneedle_providers::RequestPriority;
 
 use super::HeldFolders;
-use super::store::{Entry, EntryOrigin, FileState, HeldFile, HeldRows, Pairing};
+use super::store::{Entry, EntryOrigin, FileState, HeldFile, HeldRoot, HeldRows, Pairing};
 use crate::db::AcquireDb;
 use crate::downloads::journal::Journal;
 use crate::downloads::plan::PlannedAlbum;
@@ -114,6 +114,7 @@ impl From<DropError> for HeldError {
             DropError::NotFound => Self::NotFound(GONE),
             DropError::Conflict(message) => Self::Refused(message),
             DropError::Unavailable(cause) => Self::Unavailable(cause),
+            DropError::Busy(operation) => Self::Busy(operation),
         }
     }
 }
@@ -131,6 +132,9 @@ pub struct Acted {
     pub discarded: usize,
     /// Files still held, with why.
     pub held: Vec<Reason>,
+    /// What went wrong with the files still held, when it was not their
+    /// hold reason (a copy Discard could not delete).
+    pub message: Option<String>,
 }
 
 /// One file of a bulk re-check.
@@ -384,8 +388,7 @@ impl HeldService {
                     .map(|matched| Acted {
                         imported: matched.imported,
                         owned: matched.owned,
-                        discarded: 0,
-                        held: Vec::new(),
+                        ..Acted::default()
                     })
                     .map_err(HeldError::from),
                 EntryOrigin::Download => self.match_download(&entry, files, &group, actor).await,
@@ -513,7 +516,7 @@ impl HeldService {
         &self,
         entry: &Entry,
         files: Vec<HeldFile>,
-    ) -> Vec<(HeldFile, Result<bool, String>)> {
+    ) -> Vec<(HeldFile, Result<Checked, String>)> {
         let library = match self.library() {
             Ok(library) => library,
             Err(error) => {
@@ -525,6 +528,10 @@ impl HeldService {
         };
         let mut out = Vec::with_capacity(files.len());
         for file in files {
+            if settles_as_automatic(&file) {
+                out.push((file, Ok(Checked::AsAutomatic)));
+                continue;
+            }
             let path = match self.on_disk(entry, &file).await {
                 Ok(Some(path)) => path,
                 Ok(None) => {
@@ -536,17 +543,41 @@ impl HeldService {
                     continue;
                 }
             };
-            let heard = library.fingerprints(vec![(String::new(), path)]).await;
+            // Only a length read from the file's frame count may outrank
+            // its fingerprint; an MP3 with none has only an estimate.
+            let measured = probe_held(&path).await.and_then(|read| {
+                read.header
+                    .duration_seconds
+                    .filter(|_| read.header.duration_measured)
+            });
+            let heard = library
+                .fingerprints(vec![(String::new(), path)], RequestPriority::UserInitiated)
+                .await;
+            // An outage says nothing about the file: it stays held as it is.
+            let heard = match heard {
+                Ok(heard) => heard,
+                Err(unavailable) => {
+                    out.push((file, Err(format!("{unavailable}."))));
+                    continue;
+                }
+            };
             let heard = heard.get("").map(Vec::as_slice).unwrap_or(&[]);
             // No AcoustID answer is no confirmation: the file stays held.
             let confirmed = !heard.is_empty()
                 && !specs::fingerprint_disagrees(
                     heard,
                     file.pairing.recording_mbid.as_deref().unwrap_or(""),
-                    file.duration_seconds,
+                    measured,
                     file.pairing.expected_duration_seconds,
                 );
-            out.push((file, Ok(confirmed)));
+            out.push((
+                file,
+                Ok(if confirmed {
+                    Checked::Confirmed
+                } else {
+                    Checked::NotConfirmed
+                }),
+            ));
         }
         out
     }
@@ -555,22 +586,39 @@ impl HeldService {
     async fn import_confirmed(
         &self,
         entry: &Entry,
-        checked: Vec<(HeldFile, Result<bool, String>)>,
+        checked: Vec<(HeldFile, Result<Checked, String>)>,
         actor: &str,
     ) -> Vec<(i64, Result<bool, String>)> {
         let mut confirmed = Vec::new();
+        let mut automatic = Vec::new();
         let mut results = Vec::new();
         for (file, outcome) in checked {
             match outcome {
-                Ok(true) => confirmed.push(file),
-                other => results.push((file.id, other)),
+                Ok(Checked::Confirmed) => confirmed.push(file),
+                Ok(Checked::AsAutomatic) => automatic.push(file),
+                Ok(Checked::NotConfirmed) => results.push((file.id, Ok(false))),
+                Err(message) => results.push((file.id, Err(message))),
             }
         }
-        if confirmed.is_empty() {
-            return results;
+        for (files, asker) in [(confirmed, Asker::Person), (automatic, Asker::Loop)] {
+            if !files.is_empty() {
+                results.extend(self.place_checked(entry, files, actor, asker).await);
+            }
         }
-        let ids: Vec<i64> = confirmed.iter().map(|file| file.id).collect();
-        match self.place(entry, confirmed, actor, Asker::Person).await {
+        results
+    }
+
+    /// Place files a Re-check settled; answers each file's outcome.
+    async fn place_checked(
+        &self,
+        entry: &Entry,
+        files: Vec<HeldFile>,
+        actor: &str,
+        asker: Asker,
+    ) -> Vec<(i64, Result<bool, String>)> {
+        let mut results = Vec::new();
+        let ids: Vec<i64> = files.iter().map(|file| file.id).collect();
+        match self.place(entry, files, actor, asker).await {
             Ok(_) => {
                 let still: HashSet<i64> = self
                     .read("held.recheck_left", {
@@ -615,7 +663,18 @@ impl HeldService {
                 return Err(error);
             }
         };
-        let ids: Vec<i64> = files.iter().map(|file| file.id).collect();
+        // The entry is claimed, so nothing else acts on it while its copies
+        // go. A copy that could not be removed keeps its row, still listed.
+        let mut ids: Vec<i64> = Vec::with_capacity(files.len());
+        let mut kept: Vec<Reason> = Vec::new();
+        for file in &files {
+            if self.remove(file).await {
+                ids.push(file.id);
+            } else {
+                kept.push(file.reason);
+            }
+        }
+        let deleted = ids.len();
         let tasks: Vec<String> = files
             .iter()
             .filter_map(|file| file.source_task_id.clone())
@@ -642,15 +701,29 @@ impl HeldService {
                 return Err(error);
             }
         };
-        for file in &files {
-            self.remove(file).await;
-        }
         if let Some(item) = entry.drop_item_id {
             self.drops.tidy_item(item).await;
         }
         self.worker.wake();
+        if kept.is_empty() {
+            return Ok(Acted {
+                discarded,
+                ..Acted::default()
+            });
+        }
+        let message = if kept.len() == 1 {
+            "A held file could not be deleted, so it is still listed. Check that the server can write to its folder, then try again."
+        } else {
+            "Some held files could not be deleted, so they are still listed. Check that the server can write to its folder, then try again."
+        };
+        if deleted == 0 {
+            return Err(HeldError::Refused(message.to_owned()));
+        }
+        // Some copies went: say what was done, and why the rest stay.
         Ok(Acted {
             discarded,
+            held: kept,
+            message: Some(message.to_owned()),
             ..Acted::default()
         })
     }
@@ -716,8 +789,9 @@ impl HeldService {
         Ok(None)
     }
 
-    async fn remove(&self, file: &HeldFile) {
-        super::remove_copy(self.folders.dir(file.root), &file.path).await;
+    /// Remove a held file's copy; true once it is gone.
+    async fn remove(&self, file: &HeldFile) -> bool {
+        super::remove_copy(self.folders.dir(file.root), &file.path).await
     }
 
     /// Place held files as a person's choice: one batch per download they
@@ -825,8 +899,11 @@ impl HeldService {
                     code = deferred.reason.code(),
                     "held import refused"
                 );
+                if deferred.reason == Reason::JournalUnreadable {
+                    return Err(HeldError::Busy("held import".to_owned()));
+                }
                 if deferred.reason != Reason::LibraryChanged {
-                    return Err(refused_for(&deferred));
+                    return Err(refused(deferred.reason));
                 }
                 // The library changed under the import twice: the files
                 // stay held with the publisher's words, to try again.
@@ -852,16 +929,13 @@ impl HeldService {
                 Outcome::Imported { .. } => imported.push(file.id),
                 Outcome::Held { reason, detail, .. } => {
                     // A file the person chose to replace yours stays chosen
-                    // when the recycle bin refused your copy: once the bin
-                    // works, the same button tries again.
+                    // when your copy could not be taken away: once it can,
+                    // the same button tries again.
                     let (reason, detail) = match (file.reason, reason) {
                         (
                             chosen @ (Reason::NoBetterThanYours | Reason::VersionLowerQuality),
                             Reason::UpgradeBlocked,
-                        ) => (
-                            chosen,
-                            format!("Your copy could not go to the recycle bin: {detail}"),
-                        ),
+                        ) => (chosen, detail.clone()),
                         _ => (*reason, detail.clone()),
                     };
                     tracing::info!(
@@ -1074,9 +1148,15 @@ impl HeldService {
             let summary = match identify::assigned(library.as_ref(), &landing, group).await {
                 identify::Outcome::Matched(summary) => summary,
                 identify::Outcome::Review { reason, .. } => return Err(refused(reason)),
+                identify::Outcome::Busy | identify::Outcome::Closed => {
+                    return Err(HeldError::Busy("held match edition read".to_owned()));
+                }
                 identify::Outcome::Unavailable(detail) => {
                     tracing::warn!(entry_id = entry.id, %detail, "held match: MusicBrainz unavailable");
                     return Err(refused(Reason::MusicbrainzUnavailable));
+                }
+                identify::Outcome::AcoustidUnavailable => {
+                    return Err(refused(Reason::AcoustidUnavailable));
                 }
             };
             let Some((found, _, pairing)) =
@@ -1109,7 +1189,10 @@ impl HeldService {
                 .await
                 .map_err(|deferred| {
                     tracing::warn!(entry_id = entry.id, detail = %deferred.detail, "held match refused");
-                    refused_for(&deferred)
+                    if deferred.reason == Reason::JournalUnreadable {
+                        return HeldError::Busy("held match import".to_owned());
+                    }
+                    refused(deferred.reason)
                 })?;
             let by_path = |path: &Path| {
                 files.iter().find(|file| {
@@ -1424,10 +1507,24 @@ impl HeldService {
                 }
             };
             let mut committed = Vec::new();
+            let mut absent = Vec::new();
             for file in &entry.files {
                 let Some(path) = self.folders.locate(file.root, &file.path) else {
                     continue;
                 };
+                // A discard cut off after it removed the copy: the row goes
+                // too. A folder that is not there says nothing about a file.
+                if tokio::fs::try_exists(self.folders.dir(file.root))
+                    .await
+                    .unwrap_or(false)
+                    && matches!(
+                        tokio::fs::symlink_metadata(&path).await,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                    )
+                {
+                    absent.push(file.id);
+                    continue;
+                }
                 let hashed = tokio::task::spawn_blocking(move || {
                     droppedneedle_kernel::db::backup::file_sha256(&path)
                 })
@@ -1446,6 +1543,7 @@ impl HeldService {
                         rows.add_item_imports(item, ids.len())?;
                     }
                     rows.resolve(entry_id, &ids, FileState::Imported, now)?;
+                    rows.resolve(entry_id, &absent, FileState::Discarded, now)?;
                     rows.release(entry_id, now)?;
                     Ok(())
                 })
@@ -1474,9 +1572,10 @@ impl HeldService {
     }
 
     /// Expire every entry past its expiry: each is claimed first (`held`
-    /// to `expired`, so one being acted on is skipped), and only once the
-    /// claim is written are its held copies removed. Nothing else is
-    /// deleted.
+    /// to `placing`, so one being acted on is skipped), then its held
+    /// copies are removed, and only the files whose copies are gone are
+    /// discarded. An entry with a copy that could not be removed stays
+    /// listed and the next prune tries again. Nothing else is deleted.
     async fn expire_due(&self) -> usize {
         let now = self.now();
         let due = match self
@@ -1492,9 +1591,11 @@ impl HeldService {
         let mut expired = 0;
         for entry_id in due {
             let claimed = self
-                .write("held.expire", move |rows, _| {
+                .write("held.expire_claim", move |rows, _| {
                     let item = rows.entry(entry_id)?.and_then(|entry| entry.drop_item_id);
-                    Ok(rows.expire(entry_id, now)?.map(|copies| (copies, item)))
+                    Ok(rows
+                        .claim_expired(entry_id, now)?
+                        .map(|copies| (copies, item)))
                 })
                 .await;
             let (copies, item) = match claimed {
@@ -1505,18 +1606,34 @@ impl HeldService {
                     continue;
                 }
             };
-            for (root, path) in &copies {
-                super::remove_copy(self.folders.dir(*root), path).await;
+            let mut gone = Vec::with_capacity(copies.len());
+            for (file_id, root, path) in &copies {
+                if super::remove_copy(self.folders.dir(*root), path).await {
+                    gone.push(*file_id);
+                }
             }
-            if let Some(item) = item {
-                self.drops.tidy_item(item).await;
+            let files = copies.len();
+            let finished = self
+                .write("held.expire", move |rows, _| {
+                    Ok(rows.expire(entry_id, &gone, now)?)
+                })
+                .await;
+            match finished {
+                Ok(true) => {
+                    if let Some(item) = item {
+                        self.drops.tidy_item(item).await;
+                    }
+                    tracing::info!(entry_id, files, "held entry expired after 90 days");
+                    expired += 1;
+                }
+                Ok(false) => {
+                    tracing::warn!(entry_id, "expired held entry kept: a copy was not removed");
+                }
+                Err(error) => {
+                    tracing::warn!(entry_id, %error, "expired held entry not finished; the prune finishes it");
+                    self.remember_cut_off(entry_id);
+                }
             }
-            tracing::info!(
-                entry_id,
-                files = copies.len(),
-                "held entry expired after 90 days"
-            );
-            expired += 1;
         }
         expired
     }
@@ -1588,25 +1705,26 @@ async fn read_release(
 }
 
 /// Whether a file's hold is one AcoustID can settle on a second ask.
-fn rechecks(file: &HeldFile) -> bool {
-    matches!(
-        file.reason,
-        Reason::FingerprintMismatch | Reason::FingerprintUnconfirmed
-    )
+pub fn rechecks(file: &HeldFile) -> bool {
+    match file.reason {
+        Reason::FingerprintMismatch | Reason::FingerprintUnconfirmed => true,
+        // With no track to check against, only Match can settle it.
+        Reason::AcoustidUnavailable => file.is_paired(),
+        _ => false,
+    }
+}
+
+/// What a Re-check found out about one file.
+enum Checked {
+    Confirmed,
+    NotConfirmed,
+    /// Placed as an automatic import is, which asks AcoustID itself.
+    AsAutomatic,
 }
 
 /// The answer for a file that stays held.
 fn refused(reason: Reason) -> HeldError {
     HeldError::Refused(format!("{} {}", reason.message(), reason.action()))
-}
-
-/// A deferred import as a person reads it: while the library is switched
-/// off, that is what they are told.
-fn refused_for(deferred: &intake::Deferred) -> HeldError {
-    if deferred.detail == crate::landing::ports::LIBRARY_OFF_DETAIL {
-        return HeldError::Refused(droppedneedle_library::mutations::LIBRARY_OFF_TEXT.to_owned());
-    }
-    refused(deferred.reason)
 }
 
 /// Read files off the async workers, never entering the library.
@@ -1658,10 +1776,17 @@ pub fn is_retry(reason: Reason) -> bool {
     reason.kind() == ReasonKind::Library
 }
 
-/// Whether a held file offers Retry, and so is retried by itself: held
-/// for a library reason and paired with a track.
+/// An upload waiting for AcoustID with a track to go to: it settles as an
+/// automatic import does, through [`Gate::HeldRetry`], which never replaces a
+/// library copy.
+fn settles_as_automatic(file: &HeldFile) -> bool {
+    file.reason == Reason::AcoustidUnavailable && file.root == HeldRoot::Drop && file.is_paired()
+}
+
+/// Whether a held file is retried by itself: paired with a track, and held
+/// for a library reason or waiting for AcoustID as an upload.
 pub fn retries_by_itself(file: &HeldFile) -> bool {
-    is_retry(file.reason) && file.is_paired()
+    file.is_paired() && (is_retry(file.reason) || settles_as_automatic(file))
 }
 
 /// The held list's loop runs every five minutes, the first pass a minute

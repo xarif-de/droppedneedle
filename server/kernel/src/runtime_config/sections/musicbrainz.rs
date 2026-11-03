@@ -16,10 +16,14 @@ use crate::runtime_config::error::ConfigError;
 pub const OFFICIAL_MB_API_BASE: &str = "https://musicbrainz.org/ws/2";
 /// Server-owned BrainzMash endpoint. Never accepted from a client.
 pub const BRAINZMASH_ENDPOINT: &str = "https://api.brainzmash.cc/ws/2";
-/// Forced BrainzMash throughput (v2 `_BRAINZMASH_RATE_LIMIT`).
-pub const BRAINZMASH_RATE_LIMIT: f64 = 10.0;
+/// Forced BrainzMash throughput (v2 `_BRAINZMASH_RATE_LIMIT`). The kernel
+/// cannot read the providers' rate table; a gate test holds this and
+/// [`OFFICIAL_MB_RATE_LIMIT`] equal to its rows.
+/// xarif build: 4, as the providers' rate table holds it.
+pub const BRAINZMASH_RATE_LIMIT: f64 = 4.0;
 /// Official-host ceilings (never raised).
-pub const OFFICIAL_MB_RATE_LIMIT: f64 = 1.0;
+/// xarif build: 0.5, as the providers' rate table holds it.
+pub const OFFICIAL_MB_RATE_LIMIT: f64 = 0.5;
 /// Widest allowed off-official throughput (0 = Unlimited sentinel).
 pub const MAX_MB_RATE_LIMIT: f64 = 500.0;
 
@@ -227,7 +231,7 @@ impl Section for MusicBrainzSettings {
             return Err(validation(
                 key,
                 "rate_limit",
-                "rate_limit must be finite".to_owned(),
+                "must be a finite number".to_owned(),
             ));
         }
         match self.source_mode {
@@ -240,8 +244,7 @@ impl Section for MusicBrainzSettings {
                     return Err(validation(
                         key,
                         "api_url",
-                        "api_url must be an absolute HTTP(S) URL for non-official sources"
-                            .to_owned(),
+                        "must start with http:// or https:// for this source".to_owned(),
                     ));
                 }
             }
@@ -254,7 +257,7 @@ impl Section for MusicBrainzSettings {
             return Err(validation(
                 key,
                 "rate_limit",
-                format!("rate_limit must be 0 (unlimited) or between 0.1 and {MAX_MB_RATE_LIMIT}"),
+                format!("must be 0 (unlimited) or between 0.1 and {MAX_MB_RATE_LIMIT}"),
             ));
         }
         Ok(())

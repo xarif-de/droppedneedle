@@ -1,4 +1,5 @@
 import type { LibraryWorkItem } from '$lib/queries/library/LibraryOperationsTypes';
+import { withBasePath } from '$lib/utils/basePath';
 
 const phaseLabels: Record<string, string> = {
 	discovering: 'Counting local files',
@@ -99,17 +100,17 @@ export function libraryWorkPercentage(item: LibraryWorkItem): number | null {
 
 export function libraryWorkHref(item: LibraryWorkItem): string {
 	if (item.kind === 'library_management') {
-		return `/library/management/operations/${encodeURIComponent(item.id)}`;
+		return withBasePath(`/library/management/operations/${encodeURIComponent(item.id)}`);
 	}
 	if (
 		item.kind === 'identity_preparation' ||
 		item.kind === 'reidentification' ||
 		item.kind === 'identity_review'
 	) {
-		return '/library/management?tab=organize';
+		return withBasePath('/library/management?tab=organize');
 	}
-	if (item.kind === 'recovery') return '/library/management?tab=organize';
-	return '/library/management?tab=scanning';
+	if (item.kind === 'recovery') return withBasePath('/library/management?tab=organize');
+	return withBasePath('/library/management?tab=scanning');
 }
 
 export function libraryWorkContext(item: LibraryWorkItem): string | null {
@@ -141,7 +142,7 @@ export function libraryWorkFacts(item: LibraryWorkItem): string[] {
 	].filter((value): value is string => value !== null);
 }
 
-export const STALE_INPUT_TERMINAL_CODE = 'STALE_INPUT';
+const STALE_INPUT_TERMINAL_CODE = 'STALE_INPUT';
 
 export const STALE_INPUT_HINT =
 	'Inputs moved since planning. Retry or refresh to rebuild this preview. No files were changed.';
@@ -165,7 +166,7 @@ export interface FailedGroupSource {
  * Group key collapsing duplicate failed cards for the same album.
  * Only single-kind album selections group; anything else stays individual (null).
  */
-export function selectionAlbumGroupKey(selection: unknown): string | null {
+function selectionAlbumGroupKey(selection: unknown): string | null {
 	if (typeof selection !== 'object' || selection === null || Array.isArray(selection)) {
 		return null;
 	}

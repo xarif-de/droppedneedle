@@ -5,15 +5,18 @@
 	import LibraryFormatBadge from './LibraryFormatBadge.svelte';
 	import LocalIdentityBadge from './LocalIdentityBadge.svelte';
 	import NoFilesBadge from './NoFilesBadge.svelte';
-	import type { LibraryAlbumSummary } from '$lib/types';
+	import type { AlbumView } from '$lib/types';
 	import { albumHref } from '$lib/utils/entityRoutes';
+	import { trackCountLabel } from '$lib/utils/trackCount';
 
 	interface Props {
-		album: LibraryAlbumSummary;
+		album: AlbumView;
+		/** What kind of release it is ("Single", "Live"), shown after the track count. */
+		kind?: string;
 	}
 
-	let { album }: Props = $props();
-	let href = $derived(albumHref(album.musicbrainz_release_group_id ?? album.id));
+	let { album, kind }: Props = $props();
+	let href = $derived(albumHref(album.release_group_mbid ?? album.id));
 </script>
 
 <Card
@@ -26,8 +29,9 @@
 	<figure class="aspect-square overflow-hidden relative">
 		<AlbumImage
 			albumId={album.id}
-			mbid={album.musicbrainz_release_group_id ?? ''}
+			mbid={album.release_group_mbid ?? ''}
 			available={album.cover_available}
+			artMissing={album.art_missing}
 			alt={album.title}
 			size="full"
 			requestSize={250}
@@ -41,9 +45,10 @@
 				<LibraryFormatBadge format={album.format} />
 			{/if}
 		</div>
-		{#if album.album_identity_state === 'local_only'}
+		{#if album.identity_state === 'local_only'}
 			<LocalIdentityBadge
-				state={album.album_identity_state}
+				state={album.identity_state}
+				releaseMbid={album.release_mbid}
 				subject="album"
 				compact
 				className="absolute left-2 top-2 z-10"
@@ -51,17 +56,23 @@
 		{/if}
 	</figure>
 
-	<div class="space-y-2 px-3 pb-3">
+	<!-- One line for year and artist, cut letter by letter at the cover's
+	     width; count and kind share a line and wrap only when short of room. -->
+	<div class="space-y-1 px-3 pb-3">
 		<CardTitle class="text-sm line-clamp-2 min-h-[2.5rem]">{album.title}</CardTitle>
-		<p class="text-xs opacity-70 line-clamp-1">
+		<p class="truncate text-xs leading-tight opacity-70">
 			{#if album.year}{album.year}{:else}Unknown{/if}
 			{#if album.artist_name}
 				<span class="opacity-50 mx-1">•</span>{album.artist_name}
 			{/if}
 		</p>
-		<p class="text-[11px] opacity-50">
-			{album.track_count}
-			{album.track_count === 1 ? 'track' : 'tracks'}
+		<p class="flex flex-wrap gap-x-1 text-[11px] leading-tight opacity-50">
+			<span class="whitespace-nowrap">
+				{trackCountLabel(album.track_count, album.expected_track_count)}
+			</span>
+			{#if kind}
+				<span class="whitespace-nowrap"><span aria-hidden="true" class="mr-1">•</span>{kind}</span>
+			{/if}
 		</p>
 	</div>
 </Card>

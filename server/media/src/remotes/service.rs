@@ -10,10 +10,6 @@ use std::sync::Arc;
 
 use droppedneedle_kernel::clock::Clock;
 
-use super::adapter::{
-    AdapterError, AlbumBrowse, ArtistBrowse, ImportSink, RemoteHandle, TrackBrowse, album_page,
-    artist_page, track_page, unsupported,
-};
 use super::connections::{
     ConnectionResolver, LinkSummary, Reads, ResolveError, ResolvedConnection, SaveError, UserLink,
 };
@@ -22,14 +18,22 @@ use super::folders::{
 };
 use super::jellyfin::{JellyfinAdapter, MixSeed};
 use super::models::{
-    AlbumPage, AlbumView, AnalyticsView, ArtistIndexEntry, ArtistPage, ArtistView,
-    ConnectionStatus, DiscoveryView, FavoritesView, FilterFacetsView, FolderResolutionView,
-    HistoryPage, HubView, ImportResult, InfoView, LyricsView, MatchQuery, MatchView,
-    MusicFolderView, PlaylistCollection, PlaylistDetail, SearchResults, SessionsView, SourceName,
-    StatsView, TrackPage, TrackView,
+    AlbumPage, AlbumView, AnalyticsView, ArtistIndexEntry, ArtistPage, ConnectionStatus,
+    DiscoveryView, FavoritesView, FilterFacetsView, FolderResolutionView, HistoryPage, HubView,
+    ImportResult, InfoView, LyricsView, MatchQuery, MatchView, MusicFolderView, PlaylistCollection,
+    PlaylistDetail, SearchResults, SourceName, StatsView, TrackPage, TrackView,
+};
+use super::source::{
+    AdapterError, AlbumBrowse, ArtistBrowse, ImportSink, RemoteHandle, TrackBrowse, album_page,
+    artist_page, track_page, unsupported,
 };
 use super::warmup::MbidIndex;
 use droppedneedle_kernel::db::fold::fold_text;
+use droppedneedle_providers::RequestPriority;
+
+/// Every call here answers a person's request, images included, so a
+/// plex.tv token lookup it leads to is asked at user priority.
+const PERSON_WAITING: RequestPriority = RequestPriority::UserInitiated;
 
 /// Every way a remotes call can fail. Detail strings are log-only unless
 /// the variant says otherwise.
@@ -124,7 +128,7 @@ pub struct AccountLogin {
     pub password: String,
 }
 
-/// Albums one name search reads, as in v2.
+/// Albums one name search reads.
 const NAME_SEARCH_LIMIT: i64 = 50;
 /// The folded compilation credit the name step never matches on: a title
 /// like "Greatest Hits" under it names no one album.
@@ -147,7 +151,7 @@ async fn playable(
 /// Plex listening analytics over the history feed.
 pub const ANALYTICS_MAX_ENTRIES: i64 = 5_000;
 const ANALYTICS_BATCH: i64 = 500;
-/// Most genres one genre-songs read merges, as in v2.
+/// Most genres one genre-songs read merges.
 const MAX_GENRES: usize = 10;
 
 /// The remotes service. Cheap to clone.
@@ -246,7 +250,7 @@ impl RemotesService {
     ) -> RemotesResult<RemoteHandle> {
         let resolved = self
             .resolver
-            .resolve(user_id, source)
+            .resolve(user_id, source, PERSON_WAITING)
             .await
             .map_err(|error| resolve_failure(source, error))?;
         Ok(self.resolver.client(&self.http, resolved, reads))
@@ -338,20 +342,6 @@ impl RemotesService {
         Ok(album_page(page, offset, limit))
     }
 
-    /// One album.
-    pub async fn album(
-        &self,
-        user_id: &str,
-        source: SourceName,
-        id: String,
-    ) -> RemotesResult<AlbumView> {
-        self.call_by_id(user_id, source, Reads::User, move |handle| async move {
-            handle.album_detail(&id).await
-        })
-        .await?
-        .ok_or(RemotesFailure::NotFound)
-    }
-
     /// Tracks of one album.
     pub async fn album_tracks(
         &self,
@@ -393,20 +383,6 @@ impl RemotesService {
             handle.artist_index().await
         })
         .await
-    }
-
-    /// One artist.
-    pub async fn artist(
-        &self,
-        user_id: &str,
-        source: SourceName,
-        id: String,
-    ) -> RemotesResult<ArtistView> {
-        self.call(user_id, source, move |handle| async move {
-            handle.artist_detail(&id).await
-        })
-        .await?
-        .ok_or(RemotesFailure::NotFound)
     }
 
     /// One page of tracks.
@@ -453,19 +429,6 @@ impl RemotesService {
     ) -> RemotesResult<Vec<AlbumView>> {
         self.call(user_id, source, move |handle| async move {
             handle.recent(limit).await
-        })
-        .await
-    }
-
-    /// Recently added albums.
-    pub async fn recently_added(
-        &self,
-        user_id: &str,
-        source: SourceName,
-        limit: i64,
-    ) -> RemotesResult<Vec<AlbumView>> {
-        self.call(user_id, source, move |handle| async move {
-            handle.recently_added(limit).await
         })
         .await
     }
@@ -550,42 +513,6 @@ impl RemotesService {
             SourceName::Jellyfin,
             what,
             |handle| async move { handle.jellyfin(what)?.filter_facets().await },
-        )
-        .await
-    }
-
-    /// Most-played albums (Jellyfin play counts).
-    pub async fn most_played_albums(
-        &self,
-        user_id: &str,
-        source: SourceName,
-        limit: i64,
-    ) -> RemotesResult<Vec<AlbumView>> {
-        let what = "play counts";
-        self.call_only(
-            user_id,
-            source,
-            SourceName::Jellyfin,
-            what,
-            |handle| async move { handle.jellyfin(what)?.most_played_albums(limit).await },
-        )
-        .await
-    }
-
-    /// Most-played artists (Jellyfin play counts).
-    pub async fn most_played_artists(
-        &self,
-        user_id: &str,
-        source: SourceName,
-        limit: i64,
-    ) -> RemotesResult<Vec<ArtistView>> {
-        let what = "play counts";
-        self.call_only(
-            user_id,
-            source,
-            SourceName::Jellyfin,
-            what,
-            |handle| async move { handle.jellyfin(what)?.most_played_artists(limit).await },
         )
         .await
     }
@@ -786,16 +713,6 @@ impl RemotesService {
         Ok(capped_page(items, limit))
     }
 
-    /// Active audio sessions.
-    pub async fn sessions(&self, user_id: &str, source: SourceName) -> RemotesResult<SessionsView> {
-        self.call(
-            user_id,
-            source,
-            |handle| async move { handle.sessions().await },
-        )
-        .await
-    }
-
     /// Listening history, newest first.
     pub async fn history(
         &self,
@@ -811,7 +728,7 @@ impl RemotesService {
     }
 
     /// Plex listening analytics: top artists, albums, and tracks over the
-    /// most recent history (v2 reads up to 5,000 entries, 500 per call).
+    /// most recent history (up to 5,000 entries, 500 per call).
     pub async fn analytics(
         &self,
         user_id: &str,
@@ -1001,12 +918,14 @@ impl RemotesService {
     ) -> RemotesResult<ConnectionStatus> {
         // Browsing falls back to the shared account past a stale link, but
         // the status still asks the user to relink their own.
-        let mut resolved = self.resolver.resolve(user_id, source).await;
+        let mut resolved = self.resolver.resolve(user_id, source, PERSON_WAITING).await;
         if let Ok(shared) = &resolved
             && shared.account_mode == "shared"
             && let Ok(Some(server)) = self.resolver.server(source)
             && matches!(
-                self.resolver.usable_link(user_id, &server, source).await,
+                self.resolver
+                    .usable_link(user_id, &server, source, PERSON_WAITING)
+                    .await,
                 Err(ResolveError::Stale)
             )
         {
@@ -1016,6 +935,7 @@ impl RemotesService {
             Ok(resolved) => ConnectionStatus {
                 source,
                 connected: true,
+                server_url: (resolved.account_mode == "linked").then(|| resolved.base_url.clone()),
                 account_mode: resolved.account_mode,
                 account_label: resolved.account_label,
             },
@@ -1024,12 +944,14 @@ impl RemotesService {
                 connected: false,
                 account_mode: "linked".to_owned(),
                 account_label: "Reconnect required".to_owned(),
+                server_url: None,
             },
             Err(ResolveError::NotConfigured) => ConnectionStatus {
                 source,
                 connected: false,
                 account_mode: "linked".to_owned(),
                 account_label: String::new(),
+                server_url: None,
             },
             Err(ResolveError::Store(cause)) => return Err(RemotesFailure::Internal(cause)),
         })

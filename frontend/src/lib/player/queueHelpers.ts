@@ -1,6 +1,6 @@
 import type {
 	LocalTrackInfo,
-	NativeTrackListItem,
+	TrackView,
 	QueueItem,
 	SourceType,
 	YouTubeTrackLink
@@ -104,7 +104,7 @@ export function recordingFor(
 	return recordingMbid ? { [source]: recordingMbid } : undefined;
 }
 
-export function getAvailableSources(data: TrackSourceData): SourceType[] {
+function getAvailableSources(data: TrackSourceData): SourceType[] {
 	const sources: SourceType[] = [];
 	if (data.localTrack) sources.push('local');
 	if (data.navidromeTrack) sources.push('navidrome');
@@ -212,7 +212,8 @@ export function buildQueueItemFromYouTube(track: YouTubeTrackLink, meta: TrackMe
 		coverUrl: normalizedCoverUrl,
 		sourceType: 'youtube' as const,
 		artistId: meta.artistId,
-		availableSources: ['youtube'] as SourceType[]
+		availableSources: ['youtube'] as SourceType[],
+		recordingIds: recordingFor('youtube', track.recording_mbid)
 	};
 }
 
@@ -255,13 +256,14 @@ export function playlistTrackToQueueItem(track: PlaylistTrack): QueueItem | null
 		format: track.format ?? undefined,
 		availableSources,
 		sourceIds,
+		recordingIds: recordingFor(track.source_type as SourceType, track.recording_mbid),
 		duration: track.duration ?? undefined,
 		playlistTrackId: track.id,
 		plexRatingKey: track.source_type === 'plex' ? (track.plex_rating_key ?? undefined) : undefined
 	};
 }
 
-export function buildDiscoveryQueueFromLocal(tracks: NativeTrackListItem[]): QueueItem[] {
+export function buildDiscoveryQueueFromLocal(tracks: TrackView[]): QueueItem[] {
 	return tracks.map((t) => ({
 		trackSourceId: t.id,
 		trackName: t.title,
@@ -273,7 +275,7 @@ export function buildDiscoveryQueueFromLocal(tracks: NativeTrackListItem[]): Que
 		coverUrl: getCoverUrl(null, t.album_id),
 		coverRemoteUrl: null,
 		sourceType: 'local' as const,
-		artistId: t.artist_id,
+		artistId: t.artist_id ?? undefined,
 		format: (t.format ?? '').toLowerCase(),
 		availableSources: ['local'] as SourceType[],
 		duration: t.duration_seconds ?? undefined

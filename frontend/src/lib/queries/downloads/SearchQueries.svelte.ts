@@ -1,3 +1,4 @@
+import { v3 } from '$lib/api/v3/endpoint';
 import { createQuery, queryOptions } from '@tanstack/svelte-query';
 
 import { api } from '$lib/api/client';
@@ -7,7 +8,6 @@ import { authStore } from '$lib/stores/authStore.svelte';
 import { toastStore } from '$lib/stores/toast';
 
 import { DownloadQueryKeyFactory } from './DownloadQueryKeyFactory';
-import { DOWNLOAD_SEARCH_ENDPOINTS } from './endpoints';
 import { STALE_LIVE } from '$lib/queries/staleTime';
 import {
 	createAppMutation,
@@ -34,12 +34,13 @@ function errorMessage(err: unknown, fallback: string): string {
 	return err instanceof Error && err.message ? err.message : fallback;
 }
 
-export const getSearchJobQueryOptions = (jobId: string) =>
+const getSearchJobQueryOptions = (jobId: string) =>
 	queryOptions({
 		staleTime: STALE_LIVE,
 		enabled: jobId !== '',
 		queryKey: DownloadQueryKeyFactory.searchJob(authStore.user?.id, jobId),
-		queryFn: ({ signal }) => api.v3.GET(DOWNLOAD_SEARCH_ENDPOINTS.job(jobId), { signal }),
+		queryFn: ({ signal }) =>
+			api.v3.GET(v3('/api/v3/downloads/search/{job_id}', { path: { job_id: jobId } }), { signal }),
 		refetchInterval: (query: { state: { data?: SearchJob } }) =>
 			query.state.data?.status === 'searching' ? SEARCHING_POLL_MS : false
 	});
@@ -47,11 +48,11 @@ export const getSearchJobQueryOptions = (jobId: string) =>
 export const getSearchJobQuery = (jobId: () => string) =>
 	createQuery(() => getSearchJobQueryOptions(jobId()));
 
-export function startAlbumSearch() {
+export function createStartAlbumSearchMutation() {
 	return createAppMutation(() => ({
 		effects: () => [],
 		mutationFn: (input: SearchAlbumRequest) =>
-			api.v3.POST(DOWNLOAD_SEARCH_ENDPOINTS.start(), input),
+			api.v3.POST(v3('/api/v3/downloads/search/album'), input),
 		onSuccess: (data: SearchAlbumResponse) => {
 			if (data.status === 'already_in_library') {
 				toastStore.show({ message: 'This album is already in your library.', type: 'info' });
@@ -72,10 +73,10 @@ export function policyBreak(err: unknown): CandidateRefusal | null {
 	return details?.refusal ?? null;
 }
 
-export function pickSearchCandidate() {
+export function createPickSearchCandidateMutation() {
 	return createAppMutation(() => ({
 		mutationFn: ({ jobId, ...body }: PickInput) =>
-			api.v3.POST(DOWNLOAD_SEARCH_ENDPOINTS.pick(jobId), body),
+			api.v3.POST(v3('/api/v3/downloads/search/{job_id}/pick', { path: { job_id: jobId } }), body),
 		onSuccess: () => {
 			toastStore.show({ message: 'Download started from your pick.', type: 'success' });
 		},
@@ -96,9 +97,10 @@ export function pickSearchCandidate() {
 
 // "None of these - keep watching": closes the search, remembers every
 // candidate as turned down, and puts the album on the wanted watchlist.
-export function dismissSearch() {
+export function createDismissSearchMutation() {
 	return createAppMutation(() => ({
-		mutationFn: (jobId: string) => api.v3.POST(DOWNLOAD_SEARCH_ENDPOINTS.dismiss(jobId)),
+		mutationFn: (jobId: string) =>
+			api.v3.POST(v3('/api/v3/downloads/search/{job_id}/dismiss', { path: { job_id: jobId } })),
 		onSuccess: () => {
 			toastStore.show({
 				message: 'On the watchlist - DroppedNeedle will keep checking for it.',
@@ -117,9 +119,10 @@ export function dismissSearch() {
 	}));
 }
 
-export function cancelSearch() {
+export function createCancelSearchMutation() {
 	return createAppMutation(() => ({
-		mutationFn: (jobId: string) => api.v3.POST(DOWNLOAD_SEARCH_ENDPOINTS.cancel(jobId)),
+		mutationFn: (jobId: string) =>
+			api.v3.POST(v3('/api/v3/downloads/search/{job_id}/cancel', { path: { job_id: jobId } })),
 		effects: (_data: ActionResponse, jobId: string) => [
 			searchJobChanged(authStore.user?.id, jobId)
 		],

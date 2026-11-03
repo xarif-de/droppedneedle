@@ -6,6 +6,7 @@
 //! that moved underneath. An album is all or nothing: when one file is
 //! blocked, the others wait with a reason saying so.
 
+use crate::identity::ReleaseIdentity;
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
@@ -20,11 +21,12 @@ use super::profile::{self, CompiledScripts, NamingFacts};
 use super::reasons::{self, ItemReason};
 use super::script;
 use super::selection::{AlbumScope, CatalogTrack};
+use super::service::ManagementParts;
 use super::{automatic, takeover};
 use crate::matching::model::Release;
 use crate::publish::planner::{
     Capability, CollisionGate, DiskPreflight, FileFingerprint, OutputKind, PlanBundle, PlanItem,
-    PlanKind, ReleaseIdentity, STAGED_HEADROOM_BYTES,
+    PlanKind, STAGED_HEADROOM_BYTES,
 };
 use crate::publish::snapshots::sha256_hex;
 use crate::publish::{MAX_PLAN_SUBJECTS, PublishError, Sandbox, collision_key};
@@ -32,7 +34,6 @@ use crate::scan::models::EffectivePolicy;
 use crate::scan::roots::RootRegistry;
 use crate::scan::sqlite_store::holds_new_files;
 use crate::tags::{self, TagField};
-use crate::wiring::LibrarySetup;
 use droppedneedle_kernel::db::Lane;
 
 /// Why an album's match keeps its files from being managed, if it does.
@@ -48,14 +49,15 @@ pub(crate) fn match_gate(
     }
     let state = conn
         .query_row(
-            "SELECT state, reason_code FROM library_album_match_state WHERE local_album_id = ?1",
+            crate::management::sql::MATCH_GATE.text(),
             params![album_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            crate::management::sql::MatchGate::read,
         )
-        .optional()?;
+        .optional()?
+        .map(|row| (row.state, row.reason_code));
     Ok(match state {
         Some((_, code)) if code.starts_with("CHOSEN_") => {
-            Some(crate::operations::reasons::match_reason(&code).into())
+            Some(crate::reasons::match_reason(&code).into())
         }
         Some((state, _)) if state == "unconfirmed" => Some(reasons::unconfirmed_match()),
         Some((state, _)) if state == "unmatched" => Some(reasons::unmatched_album()),
@@ -73,7 +75,7 @@ pub(crate) fn remap_gate(
 ) -> rusqlite::Result<Option<ItemReason>> {
     let attempts: Option<i64> = conn
         .query_row(
-            "SELECT attempts FROM library_edition_remap_queue WHERE local_album_id = ?1",
+            crate::management::sql::EDITION_REMAP_ATTEMPTS.text(),
             params![album_id],
             |row| row.get(0),
         )
@@ -98,8 +100,8 @@ fn album_keeps_own_tags(ctx: &PlanContext<'_>, tracks: &[CatalogTrack]) -> bool 
 }
 
 /// Whether management may touch unconfirmed matches, read per call.
-pub(crate) fn manage_unconfirmed(setup: &LibrarySetup) -> bool {
-    setup.settings.editions.manage_unconfirmed()
+pub(crate) fn manage_unconfirmed(parts: &ManagementParts) -> bool {
+    parts.settings.editions.manage_unconfirmed()
 }
 
 /// Per-file tag overrides an administrator saved (album-wide and for the
@@ -127,27 +129,18 @@ fn override_values(json: &str) -> Vec<String> {
 
 /// Saved overrides for one file.
 pub fn overrides(conn: &Connection, album_id: &str, track_id: &str) -> rusqlite::Result<Overrides> {
-    let mut statement = conn.prepare_cached(
-        "SELECT id, row_revision, field_name, mode, value_json FROM library_management_overrides \
-         WHERE local_album_id = ?1 OR local_track_id = ?2 \
-         ORDER BY subject_kind, field_name, id",
+    let mut statement = conn.prepare_cached(crate::management::sql::OVERRIDES.text())?;
+    let rows = statement.query_map(
+        params![album_id, track_id],
+        crate::management::sql::OverrideRow::read,
     )?;
-    let rows = statement.query_map(params![album_id, track_id], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, i64>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, String>(4)?,
-        ))
-    })?;
     let mut fields = Vec::new();
     let mut fingerprint = String::new();
     for row in rows {
-        let (id, revision, name, mode, value) = row?;
-        fingerprint.push_str(&format!("{id}:{revision};"));
-        if let Some(field) = profile::tag_field(&name) {
-            fields.push((field, mode, override_values(&value)));
+        let row = row?;
+        fingerprint.push_str(&format!("{}:{};", row.id, row.row_revision));
+        if let Some(field) = profile::tag_field(&row.field_name) {
+            fields.push((field, row.mode, override_values(&row.value_json)));
         }
     }
     Ok(Overrides {
@@ -162,7 +155,7 @@ pub fn overrides(conn: &Connection, album_id: &str, track_id: &str) -> rusqlite:
 
 /// Everything planning needs that is the same for every album.
 pub struct PlanContext<'a> {
-    pub setup: &'a LibrarySetup,
+    pub(crate) parts: &'a ManagementParts,
     pub pinned: &'a PinnedProfile,
     pub scripts: &'a CompiledScripts,
     pub sandbox: &'a Sandbox,
@@ -261,7 +254,7 @@ fn edition_held() -> ItemReason {
 fn left_unmanaged(conn: &Connection, album_id: &str) -> rusqlite::Result<bool> {
     let excluded = conn
         .query_row(
-            "SELECT 1 FROM library_management_exclusions WHERE local_album_id = ?1",
+            crate::management::sql::AUTOMATIC_GATE.text(),
             params![album_id],
             |_| Ok(()),
         )
@@ -276,8 +269,8 @@ fn album_state(
     person: bool,
     edition: Option<&EditionPin>,
 ) -> Result<AlbumState, ManagementError> {
-    let store = &ctx.setup.identify_store;
-    let db = &ctx.setup.db;
+    let store = &ctx.parts.identify_store;
+    let db = &ctx.parts.db;
     if person
         && let Some(reason) = db
             .read_blocking("management.remap_gate", |conn| {
@@ -506,7 +499,7 @@ fn plan_file(
     overrides: &Overrides,
     extras: &super::enrich::AlbumExtras,
 ) -> Result<(), ItemReason> {
-    let store = &ctx.setup.identify_store;
+    let store = &ctx.parts.identify_store;
     let (recording_mbid, release_track_mbid, mapping_revision, release_track) =
         if super::custom::is_custom(release) {
             // A custom edition's tracks are the album's own files.
@@ -554,11 +547,10 @@ fn plan_file(
         .map_err(|_| reasons::format_unsupported(&track.file_format))?;
     let format_name = format.as_str().to_owned();
     item.facts.audio_format = format_name.clone();
-    if ctx
-        .registry
-        .resolve(&track.root_id)
-        .is_none_or(|root| root.policy == EffectivePolicy::Excluded)
-    {
+    if ctx.registry.resolve(&track.root_id).is_none_or(|root| {
+        root.policy == EffectivePolicy::Excluded
+            || root.policy_for(&root.path.join(&track.relative_path)) == EffectivePolicy::Excluded
+    }) {
         return Err(reasons::root_unavailable());
     }
     let unreadable = |error: PublishError| {
@@ -584,7 +576,7 @@ fn plan_file(
         reasons::file_unreadable()
     })?;
     let lyrics = super::enrich::lyrics(
-        ctx.setup.enrichment.as_deref(),
+        ctx.parts.enrichment.as_deref(),
         &ctx.pinned.profile.enrichment.lyrics,
         release,
         release_track,
@@ -660,25 +652,31 @@ fn plan_file(
     item.diff.field_mutations = tag_plan.mutations;
     item.diff.tags_changed = !tag_plan.updates.is_empty();
     if item.diff.tags_changed {
-        // A tag write that also changes the file's ID3 version says so.
-        let notes = tags::save::id3_upgrade_notes(&path).map_err(|error| {
-            tracing::info!(%error, track = track.id, "tags unreadable at preview");
-            reasons::file_unreadable()
-        })?;
-        item.facts.warnings.extend(notes);
-        let kept = tags::save::tags_kept(&path).map_err(|error| {
+        let pictures = if tag_plan.updates.pictures().is_some() {
+            tags::save::PicturesPlan::Written
+        } else {
+            tags::save::PicturesPlan::Untouched
+        };
+        let kept = tags::save::tags_kept(&path, pictures).map_err(|error| {
             tracing::info!(%error, track = track.id, "tags unreadable at preview");
             reasons::file_unreadable()
         })?;
         if let Some(message) = kept.refusal {
             return Err(reasons::tags_not_kept(&message));
         }
-        // A scrub leaves these alone; the preview says so.
+        // A tag write that also changes the file's ID3 version says so.
+        item.facts.warnings.extend(kept.upgrade_notes);
+        // A scrub leaves these alone; the preview says so, for the ones
+        // it would otherwise have removed.
         let metadata = &ctx.pinned.profile.metadata;
         if metadata.enabled && metadata.scrub_unmanaged_tags {
-            item.facts
-                .warnings
-                .extend(left_alone_note(&kept.left_alone));
+            let preserved = profile::scrub_preserved(&ctx.pinned.profile);
+            let spared: Vec<_> = kept
+                .left_alone
+                .into_iter()
+                .filter(|(key, _)| profile::scrub_removes(&preserved, key))
+                .collect();
+            item.facts.warnings.extend(left_alone_note(&spared));
         }
     }
     item.diff.path_changed = moves;
@@ -823,6 +821,7 @@ fn generated_output(
         sha256,
         size: bytes.len() as u64,
         kind,
+        replaces: None,
     })
 }
 
@@ -842,11 +841,11 @@ fn keep_bytes(
     bytes: &[u8],
 ) -> Result<String, ManagementError> {
     use crate::publish::snapshots::SnapshotStore;
-    ctx.setup
+    ctx.parts
         .core
         .blobs
         .keep(
-            &ctx.setup.db,
+            &ctx.parts.db,
             Lane::Background,
             name,
             &[bytes],
@@ -883,6 +882,7 @@ fn left_alone_note(left_alone: &[(String, tags::save::LeftAlone)]) -> Option<Str
     }
     let groups: Vec<String> = [
         (LeftAlone::NotText, "not text"),
+        (LeftAlone::Empty, "empty"),
         (LeftAlone::HeldTwice, "held twice"),
         (LeftAlone::OverSizeLimit, "over 1 MB"),
     ]
@@ -891,7 +891,7 @@ fn left_alone_note(left_alone: &[(String, tags::save::LeftAlone)]) -> Option<Str
         let mut names: Vec<&str> = left_alone
             .iter()
             .filter(|(_, why)| *why == kind)
-            .map(|(name, _)| name.as_str())
+            .map(|(key, _)| key.split_once(':').map_or(key.as_str(), |(_, name)| name))
             .collect();
         names.sort_unstable();
         names.dedup();
@@ -910,8 +910,8 @@ fn left_alone_note(left_alone: &[(String, tags::save::LeftAlone)]) -> Option<Str
     ))
 }
 
-/// Plan the file's embedded pictures (v2's embedded artwork and its
-/// picture scrub) as one list:
+/// Plan the file's embedded pictures (embedded artwork and the picture
+/// scrub) as one list:
 /// - the front cover: with embedding on, the album's cover, unless the
 ///   file's front already holds these bytes or, under "never replace with
 ///   smaller", a larger image (then the file's own front stays);
@@ -1058,9 +1058,15 @@ fn plan_pictures(
     Ok(())
 }
 
-/// The album's cover file next to its tracks (v2's external artwork):
-/// written only where no cover file the profile recognises already sits,
-/// in the folder the album ends up in or the one it comes from.
+/// The album's cover file next to its tracks (external artwork): the
+/// archive's cover for the edition, never one that came with the files.
+/// Where the album stays in its folder, a `cover.*` already there is
+/// replaced when it differs (in its own format, so one cover file stays;
+/// it goes to the recycle bin), unless the profile keeps a larger one, and
+/// a folder without one gets `cover.<ext>` even beside other images, which
+/// the pages read after it. An album that moves keeps the old rule: written
+/// only where no cover file the profile recognises sits, in the folder it
+/// ends up in or the one it comes from; the next run replaces it in place.
 fn cover_file(
     ctx: &PlanContext<'_>,
     item: &mut PlannedItem,
@@ -1069,6 +1075,8 @@ fn cover_file(
     dest_rel: &str,
     track: &CatalogTrack,
 ) -> Result<Option<crate::publish::GeneratedOutput>, ItemReason> {
+    use droppedneedle_kernel::runtime_config::sections::ArtworkOutputFormat;
+
     let art = &ctx.pinned.profile.artwork;
     if !art.external_enabled {
         return Ok(None);
@@ -1076,59 +1084,153 @@ fn cover_file(
     let Some(cover) = &extras.cover else {
         return Ok(None);
     };
-    let Some(rendered) =
-        super::enrich::render_cover(&cover.bytes, art.external_maximum_size, art.external_format)
-    else {
-        return Ok(None);
-    };
-    let patterns: Vec<Vec<char>> = art
-        .local_file_patterns
-        .iter()
-        .map(|pattern| pattern.to_lowercase().chars().collect())
-        .collect();
     let folder_of = |rel: &str| {
         Path::new(rel)
             .parent()
             .map(|parent| parent.to_string_lossy().replace('\\', "/"))
             .unwrap_or_default()
     };
-    let has_cover = |root: &str, folder: &str| {
+    let dest_folder = folder_of(dest_rel);
+    let in_place = dest_root == track.root_id && dest_folder == folder_of(&track.relative_path);
+    let listed = |root: &str, folder: &str| -> Vec<String> {
         ctx.sandbox
             .resolve_no_symlink(root, if folder.is_empty() { "." } else { folder })
             .ok()
             .and_then(|dir| std::fs::read_dir(dir).ok())
-            .is_some_and(|entries| {
-                entries.flatten().any(|entry| {
-                    let name: Vec<char> = entry
-                        .file_name()
-                        .to_string_lossy()
-                        .to_lowercase()
-                        .chars()
-                        .collect();
-                    // A `cover.*` file counts even when the profile lists
-                    // no patterns: it is where this one would go.
-                    name.starts_with(&['c', 'o', 'v', 'e', 'r', '.'])
-                        || patterns.iter().any(|pattern| glob(pattern, &name))
-                })
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .collect()
             })
+            .unwrap_or_default()
     };
-    let dest_folder = folder_of(dest_rel);
-    if has_cover(dest_root, &dest_folder)
-        || has_cover(&track.root_id, &folder_of(&track.relative_path))
+    let in_folder = |folder: &str, name: &str| {
+        if folder.is_empty() {
+            name.to_owned()
+        } else {
+            format!("{folder}/{name}")
+        }
+    };
+    let format_of = |name: &str| match Path::new(name)
+        .extension()
+        .map(|ext| ext.to_string_lossy().to_lowercase())
+        .as_deref()
     {
-        return Ok(None);
-    }
-    let extension = match rendered.mime.as_str() {
-        "image/png" => "png",
-        "image/webp" => "webp",
-        _ => "jpg",
+        Some("jpg" | "jpeg") => Some(ArtworkOutputFormat::Jpeg),
+        Some("png") => Some(ArtworkOutputFormat::Png),
+        Some("webp") => Some(ArtworkOutputFormat::Webp),
+        _ => None,
     };
-    let rel = if dest_folder.is_empty() {
-        format!("cover.{extension}")
+    let is_cover = |name: &str| name.to_lowercase().starts_with("cover.");
+    let mut replaces = None;
+    let (rendered, rel) = if in_place {
+        let names = listed(dest_root, &dest_folder);
+        let own = names
+            .iter()
+            .find(|name| is_cover(name) && format_of(name).is_some());
+        match own {
+            Some(name) => {
+                let rel = in_folder(&dest_folder, name);
+                let held = ctx
+                    .sandbox
+                    .resolve_no_symlink(dest_root, &rel)
+                    .ok()
+                    .and_then(|path| std::fs::read(path).ok());
+                let (Some(held), Some(format)) = (held, format_of(name)) else {
+                    return Ok(None);
+                };
+                // The profile's own encoding when it gives the file's
+                // format, so a cover written before reads as the same;
+                // else re-encoded into the file's format.
+                let Some(rendered) = super::enrich::render_cover(
+                    &cover.bytes,
+                    art.external_maximum_size,
+                    art.external_format,
+                )
+                .filter(|rendered| {
+                    format_of(&format!("x.{}", extension_of(&rendered.mime))) == Some(format)
+                })
+                .or_else(|| {
+                    super::enrich::render_cover(&cover.bytes, art.external_maximum_size, format)
+                }) else {
+                    return Ok(None);
+                };
+                let held_sha = sha256_hex(&held);
+                if sha256_hex(&rendered.bytes) == held_sha {
+                    return Ok(None);
+                }
+                let larger = art.never_replace_with_smaller
+                    && image_size(&held).is_some_and(|(width, height)| {
+                        u64::from(width) * u64::from(height)
+                            > u64::from(rendered.width) * u64::from(rendered.height)
+                    });
+                if larger {
+                    item.facts.warnings.push(format!(
+                        "{rel} is larger than the archive's cover, so it is kept."
+                    ));
+                    return Ok(None);
+                }
+                replaces = Some(crate::publish::Replacement {
+                    sha256: held_sha,
+                    track_id: None,
+                    recycle_to: String::new(),
+                });
+                (rendered, rel)
+            }
+            None => {
+                let Some(rendered) = super::enrich::render_cover(
+                    &cover.bytes,
+                    art.external_maximum_size,
+                    art.external_format,
+                ) else {
+                    return Ok(None);
+                };
+                let name = format!("cover.{}", extension_of(&rendered.mime));
+                // A cover.* in a format no cover is written in keeps its
+                // name; nothing is written beside it under the same one.
+                if names
+                    .iter()
+                    .any(|existing| existing.eq_ignore_ascii_case(&name))
+                {
+                    return Ok(None);
+                }
+                (rendered, in_folder(&dest_folder, &name))
+            }
+        }
     } else {
-        format!("{dest_folder}/cover.{extension}")
+        let Some(rendered) = super::enrich::render_cover(
+            &cover.bytes,
+            art.external_maximum_size,
+            art.external_format,
+        ) else {
+            return Ok(None);
+        };
+        let patterns: Vec<Vec<char>> = art
+            .local_file_patterns
+            .iter()
+            .map(|pattern| pattern.to_lowercase().chars().collect())
+            .collect();
+        let has_cover = |root: &str, folder: &str| {
+            listed(root, folder).iter().any(|name| {
+                let name: Vec<char> = name.to_lowercase().chars().collect();
+                // A `cover.*` file counts even when the profile lists
+                // no patterns: it is where this one would go.
+                name.starts_with(&['c', 'o', 'v', 'e', 'r', '.'])
+                    || patterns.iter().any(|pattern| glob(pattern, &name))
+            })
+        };
+        if has_cover(dest_root, &dest_folder)
+            || has_cover(&track.root_id, &folder_of(&track.relative_path))
+        {
+            return Ok(None);
+        }
+        let name = format!("cover.{}", extension_of(&rendered.mime));
+        (rendered, in_folder(&dest_folder, &name))
     };
-    let output = generated_output(ctx, dest_root, &rel, OutputKind::Artwork, &rendered.bytes)?;
+    let mut output = generated_output(ctx, dest_root, &rel, OutputKind::Artwork, &rendered.bytes)?;
+    output.replaces = replaces;
     item.desired.artwork.push(ArtworkChoice {
         output_kind: "external_art".to_owned(),
         image_type: "front".to_owned(),
@@ -1141,6 +1243,15 @@ fn cover_file(
         destination_relative_path: Some(rel),
     });
     Ok(Some(output))
+}
+
+/// The file extension a cover is written with.
+fn extension_of(mime: &str) -> &'static str {
+    match mime {
+        "image/png" => "png",
+        "image/webp" => "webp",
+        _ => "jpg",
+    }
 }
 
 /// Drop generated files that would land where a sidecar moving with the
@@ -1177,7 +1288,7 @@ fn drop_shadowed_outputs(items: &mut [PlannedItem]) {
     }
 }
 
-/// Most files one album's ReplayGain analysis covers (as v2).
+/// Most files one album's ReplayGain analysis covers.
 const MAX_REPLAYGAIN_TRACKS: usize = 500;
 
 /// Measure the album's ReplayGain when the profile writes it and some file
@@ -1309,12 +1420,23 @@ pub(crate) struct AcoustIdSubject<'a> {
     pub overrides: &'a Overrides,
 }
 
+/// An automatic run's file whose AcoustID id could not be looked up: it
+/// is written once AcoustID answers.
+fn acoustid_unavailable() -> ItemReason {
+    ItemReason {
+        code: "METADATA_UNAVAILABLE".to_owned(),
+        message: "AcoustID could not be asked for this file's ID, so it was not written."
+            .to_owned(),
+        action: "Automatic management looks again by itself.".to_owned(),
+    }
+}
+
 /// How an album's AcoustID lookup went.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AcoustIdLookup {
     /// No file needed one, or no outside sources are attached.
     NotAsked,
-    /// No key, or AcoustID refused it.
+    /// No key, or AcoustID refused it: the work goes ahead without ids.
     NoKey,
     Answered,
     /// AcoustID could not be reached for at least one request.
@@ -1383,21 +1505,25 @@ fn acoustid_id_for(
 /// the run's analysis budget (`until`). Ids come from one AcoustID lookup
 /// per album, in requests of at most twenty prints; a print of zero
 /// seconds is never looked up (AcoustID answers it with nothing, which
-/// would read as "no match"). With `ids_only` only the files that would
-/// get an id are looked at, and no print is put in `extras`.
+/// would read as "no match"). A print taken from the audio is kept before
+/// it is looked up, so a lookup that waits does not decode it again. With
+/// `ids_only` only the files that would get an id are looked at, and no
+/// print is put in `extras`. `background` looks up at background priority.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn acoustid_values(
-    setup: &LibrarySetup,
+    parts: &ManagementParts,
     sandbox: &Sandbox,
     profile: &droppedneedle_kernel::runtime_config::sections::LibraryManagementProfile,
     subjects: &[AcoustIdSubject<'_>],
     until: std::time::Instant,
     ids_only: bool,
+    background: bool,
     extras: &mut super::enrich::AlbumExtras,
 ) -> AcoustIdLookup {
     use super::enrich::{AcoustIdAnswer, AcoustIdPrint};
-    use droppedneedle_providers::acoustid::MAX_BATCH;
+    use droppedneedle_providers::acoustid::{MAX_BATCH, Unanswered};
 
-    let port = setup.enrichment.as_deref();
+    let port = parts.enrichment.as_deref();
     // Without a key no id is looked up, so a file that wants only an id
     // is not decoded.
     let mut keyed: Option<bool> = None;
@@ -1408,6 +1534,19 @@ pub(crate) fn acoustid_values(
     // (track, stat revision, print, recording)
     let mut lookups: Vec<(&str, String, AcoustIdPrint, String)> = Vec::new();
     for subject in subjects {
+        // A file the profile writes neither field into is not read.
+        let may_print = !ids_only
+            && acoustid_wanted(
+                profile,
+                subject.overrides,
+                TagField::AcoustIdFingerprint,
+                false,
+            );
+        let may_id = port.is_some()
+            && acoustid_wanted(profile, subject.overrides, TagField::AcoustIdId, false);
+        if !may_print && !may_id {
+            continue;
+        }
         let Ok(path) = sandbox.resolve_no_symlink(subject.root_id, subject.relative_path) else {
             continue;
         };
@@ -1429,7 +1568,7 @@ pub(crate) fn acoustid_values(
                 TagField::AcoustIdFingerprint,
                 held(TagField::AcoustIdFingerprint),
             );
-        let recording = match setup.identify_store.track_identity(subject.track_id) {
+        let recording = match parts.identify_store.track_identity(subject.track_id) {
             Ok(mapping) => mapping
                 .and_then(|mapping| mapping.recording_mbid)
                 .filter(|recording| !recording.trim().is_empty()),
@@ -1455,7 +1594,7 @@ pub(crate) fn acoustid_values(
             let has_key = *keyed.get_or_insert_with(|| {
                 port.is_some_and(|port| {
                     super::enrich::wait(Box::pin(async {
-                        Ok::<_, String>(port.acoustid_lookup(&[]).await)
+                        Ok::<_, String>(port.acoustid_lookup(&[], background).await)
                     })) != Some(AcoustIdAnswer::NoKey)
                 })
             });
@@ -1476,7 +1615,7 @@ pub(crate) fn acoustid_values(
         );
         // A stored print that cannot be read is logged and taken from the
         // audio again: that gives the same print.
-        let stored = setup
+        let stored = parts
             .identify_store
             .fingerprint(subject.track_id, &revision)
             .unwrap_or_else(|error| {
@@ -1493,10 +1632,20 @@ pub(crate) fn acoustid_values(
                 continue;
             }
             None => match tags::generate_fingerprint(&path) {
-                Ok(found) if !found.fingerprint.is_empty() => AcoustIdPrint {
-                    print: found.fingerprint,
-                    duration_seconds: found.duration_seconds,
-                },
+                Ok(found) if !found.fingerprint.is_empty() => {
+                    if let Err(error) = parts.identify_store.keep_fingerprint(
+                        subject.track_id,
+                        &revision,
+                        &found.fingerprint,
+                        found.duration_seconds,
+                    ) {
+                        tracing::warn!(%error, track = subject.track_id, "fingerprint not kept");
+                    }
+                    AcoustIdPrint {
+                        print: found.fingerprint,
+                        duration_seconds: found.duration_seconds,
+                    }
+                }
                 Ok(_) => continue,
                 Err(error) => {
                     tracing::info!(%error, track = subject.track_id, "AcoustID print failed");
@@ -1526,22 +1675,41 @@ pub(crate) fn acoustid_values(
                 .to_owned(),
         ));
     }
+    let mut unanswered: Option<Unanswered> = None;
+    let mut refused = false;
+    let mut settings_unreadable = false;
     if let Some(port) = port {
-        for chunk in lookups.chunks(MAX_BATCH) {
+        for (index, chunk) in lookups.chunks(MAX_BATCH).enumerate() {
             let prints: Vec<AcoustIdPrint> =
                 chunk.iter().map(|(_, _, print, _)| print.clone()).collect();
             let answer = super::enrich::wait(Box::pin(async {
-                Ok::<_, String>(port.acoustid_lookup(&prints).await)
+                Ok::<_, String>(port.acoustid_lookup(&prints, background).await)
             }))
-            .unwrap_or(AcoustIdAnswer::Unavailable);
+            .unwrap_or(AcoustIdAnswer::Unavailable(Unanswered::Failed));
             let results = match answer {
                 AcoustIdAnswer::Answered(results) => results,
                 AcoustIdAnswer::NoKey => {
                     outcome = AcoustIdLookup::NoKey;
                     break;
                 }
-                AcoustIdAnswer::Unavailable => {
+                AcoustIdAnswer::KeyRefused => {
+                    refused = true;
+                    outcome = AcoustIdLookup::NoKey;
+                    break;
+                }
+                answer @ (AcoustIdAnswer::Unavailable(_) | AcoustIdAnswer::SettingsUnreadable) => {
+                    match answer {
+                        AcoustIdAnswer::Unavailable(why) => unanswered = Some(why),
+                        _ => settings_unreadable = true,
+                    }
                     outcome = AcoustIdLookup::Unavailable;
+                    // The files whose ids wait, this chunk's and every
+                    // later one's.
+                    extras.acoustid_waiting.extend(
+                        lookups[index * MAX_BATCH..]
+                            .iter()
+                            .map(|(track, ..)| (*track).to_owned()),
+                    );
                     break;
                 }
             };
@@ -1551,7 +1719,7 @@ pub(crate) fn acoustid_values(
                     result.score() > droppedneedle_providers::acoustid::BATCH_MIN_SCORE
                         && !result.recordings().is_empty()
                 });
-                if let Err(error) = setup.identify_store.save_fingerprint(
+                if let Err(error) = parts.identify_store.save_fingerprint(
                     track,
                     revision,
                     &print.print,
@@ -1570,25 +1738,37 @@ pub(crate) fn acoustid_values(
             }
         }
     }
-    let note = match outcome {
-        AcoustIdLookup::NoKey => {
-            Some("AcoustID IDs need an AcoustID key in Settings > Library; the files keep theirs.")
+    let note = match (outcome, unanswered) {
+        (AcoustIdLookup::Unavailable, _) if settings_unreadable => Some(
+            "The library settings could not be read; the files keep their AcoustID IDs.".to_owned(),
+        ),
+        (AcoustIdLookup::NoKey, _) if refused => Some(
+            "AcoustID refused the key in Settings > Library; the files keep their AcoustID IDs."
+                .to_owned(),
+        ),
+        (AcoustIdLookup::NoKey, _) => Some(
+            "AcoustID IDs need an AcoustID key in Settings > Library; the files keep theirs."
+                .to_owned(),
+        ),
+        (AcoustIdLookup::Unavailable, Some(Unanswered::Paused)) => {
+            Some("AcoustID asked for a pause; the files keep their AcoustID IDs.".to_owned())
         }
-        AcoustIdLookup::Unavailable => {
-            Some("AcoustID could not be reached; the files keep their AcoustID IDs.")
+        (AcoustIdLookup::Unavailable, Some(Unanswered::Code(code))) => Some(format!(
+            "AcoustID answered with error {code}; the files keep their AcoustID IDs."
+        )),
+        (AcoustIdLookup::Unavailable, _) => {
+            Some("AcoustID could not be reached; the files keep their AcoustID IDs.".to_owned())
         }
         _ => None,
     };
     if let (Some(note), Some(track)) = (note, first_wanting_id) {
-        extras
-            .acoustid_notes
-            .push((track.to_owned(), note.to_owned()));
+        extras.acoustid_notes.push((track.to_owned(), note));
     }
     outcome
 }
 
 /// Most sidecar files one album may carry, and most directory entries
-/// looked at to find them (as in v2).
+/// looked at to find them.
 const MAX_SIDECARS: usize = 1_000;
 const MAX_SIDECAR_ENTRIES: usize = 10_000;
 
@@ -1674,7 +1854,7 @@ pub(crate) fn sidecar_candidates(
 }
 
 /// Sidecars (cover art, cue sheets, logs) travel with the album when its
-/// folder moves, as v2 did: the files in the first moving file's folder
+/// folder moves: the files in the first moving file's folder
 /// that match the profile's patterns go to its new folder. A sidecar
 /// that would land on an existing file blocks the album instead.
 fn plan_sidecars(ctx: &PlanContext<'_>, items: &mut [PlannedItem]) {
@@ -1833,8 +2013,8 @@ fn folded_sibling_exists(path: &Path) -> bool {
     })
 }
 
-/// Block files whose destination is taken: by another file of this run
-/// or by a file on disk that is not the file itself.
+/// Block files whose destination is taken (by another file of this run
+/// or by a file on disk that is not the file itself) or excluded.
 fn check_collisions(ctx: &PlanContext<'_>, items: &mut [PlannedItem]) {
     let mut seen = HashSet::new();
     for item in items.iter_mut() {
@@ -1849,6 +2029,14 @@ fn check_collisions(ctx: &PlanContext<'_>, items: &mut [PlannedItem]) {
             continue;
         }
         if plan.kind == PlanKind::SamePath {
+            continue;
+        }
+        // Nothing is placed where a folder or path rule leaves files out.
+        let excluded = ctx.registry.resolve(&plan.dest_root).is_none_or(|root| {
+            root.policy_for(&root.path.join(&plan.dest_rel)) == EffectivePolicy::Excluded
+        });
+        if excluded {
+            item.block(reasons::root_read_only());
             continue;
         }
         let single = PlanBundle {
@@ -1931,8 +2119,8 @@ pub fn plan_album(
         };
     // Only a person's own preview asks MusicBrainz at their priority.
     let mut extras = super::enrich::gather(
-        ctx.setup.enrichment.as_deref(),
-        &ctx.setup.identify_store,
+        ctx.parts.enrichment.as_deref(),
+        &ctx.parts.identify_store,
         &ctx.pinned.profile,
         &mut release,
         !person,
@@ -1941,7 +2129,7 @@ pub fn plan_album(
     // just stored, so a run that writes their ids and new names keeps
     // them. No merge here: it would move the album's revision under the
     // plan.
-    if let Err(error) = ctx.setup.identify_store.link_album_artists(&scope.album_id) {
+    if let Err(error) = ctx.parts.identify_store.link_album_artists(&scope.album_id) {
         tracing::warn!(
             %error,
             album_id = scope.album_id,
@@ -1953,7 +2141,7 @@ pub fn plan_album(
     measure_replaygain(ctx, tracks, scope.track_ids.is_none(), &mut extras);
     let mut saved = Vec::with_capacity(tracks.len());
     for track in tracks {
-        let mut overrides = ctx.setup.db.read_blocking("management.overrides", |conn| {
+        let mut overrides = ctx.parts.db.read_blocking("management.overrides", |conn| {
             Ok::<_, ManagementError>(overrides(conn, &scope.album_id, &track.id)?)
         })?;
         if let Some(edit) = ctx.tag_edit {
@@ -1972,15 +2160,22 @@ pub fn plan_album(
         })
         .collect();
     acoustid_values(
-        ctx.setup,
+        ctx.parts,
         ctx.sandbox,
         &ctx.pinned.profile,
         &subjects,
         ctx.analysis_until,
         false,
+        !person,
         &mut extras,
     );
     for ((item, track), overrides) in items.iter_mut().zip(tracks).zip(&saved) {
+        // An automatic run never writes a file without the AcoustID id it
+        // would have had: it waits for AcoustID.
+        if extras.automatic && extras.acoustid_waiting.contains(&track.id) {
+            item.block(acoustid_unavailable());
+            continue;
+        }
         if let Err(reason) = plan_file(
             ctx,
             item,
@@ -2001,7 +2196,7 @@ pub fn plan_album(
     // A person's preview of the album itself still plans, and says what
     // applying it does.
     if ctx.tag_edit.is_none()
-        && ctx.setup.db.read_blocking("management.is_marked", |conn| {
+        && ctx.parts.db.read_blocking("management.is_marked", |conn| {
             Ok::<_, ManagementError>(takeover::is_marked(conn, &scope.album_id)?)
         })?
     {
@@ -2029,7 +2224,7 @@ pub fn plan_album(
             added: None,
             removal: None,
         };
-        let probe = crate::adapters::FsSpaceProbe::new(ctx.setup.root_dirs.clone());
+        let probe = crate::adapters::FsSpaceProbe::new(ctx.parts.root_dirs.clone());
         if DiskPreflight::check(&bundle, &probe).is_err() {
             for item in items.iter_mut().filter(|item| item.desired.plan.is_some()) {
                 item.block(reasons::insufficient_space());
@@ -2073,19 +2268,19 @@ pub fn plan_one(
             release_group_mbid,
             album_identity_revision,
         } => {
-            let overrides = ctx.setup.db.read_blocking("management.overrides", |conn| {
+            let overrides = ctx.parts.db.read_blocking("management.overrides", |conn| {
                 Ok::<_, ManagementError>(overrides(conn, &scope.album_id, &track.id)?)
             })?;
             let mut extras = super::enrich::gather(
-                ctx.setup.enrichment.as_deref(),
-                &ctx.setup.identify_store,
+                ctx.parts.enrichment.as_deref(),
+                &ctx.parts.identify_store,
                 &ctx.pinned.profile,
                 &mut release,
                 false,
             );
             measure_replaygain(ctx, std::slice::from_ref(track), false, &mut extras);
             acoustid_values(
-                ctx.setup,
+                ctx.parts,
                 ctx.sandbox,
                 &ctx.pinned.profile,
                 &[AcoustIdSubject {
@@ -2095,6 +2290,9 @@ pub fn plan_one(
                     overrides: &overrides,
                 }],
                 ctx.analysis_until,
+                false,
+                // Duplicate resolution is a person's: their priority, as
+                // the gather above.
                 false,
                 &mut extras,
             );

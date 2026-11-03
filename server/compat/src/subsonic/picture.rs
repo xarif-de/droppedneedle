@@ -2,8 +2,8 @@
 //! no sign-in, `/subsonic/img?id=<id>&sig=<signature>&size=<px>`.
 //!
 //! Apps hand the image links of `getArtists`, `getArtistInfo2` and
-//! `getAlbumInfo2` to a picture loader that sends no credentials, as
-//! Navidrome's own links allow. Each link names one album or artist by its
+//! `getAlbumInfo2` to a picture loader that sends no credentials.
+//! Each link names one album or artist by its
 //! Subsonic id and carries a signature made with the data key under a
 //! purpose of its own, so nothing else the key signs or seals (a transcode
 //! parameter, a correction token, a stored secret) is ever a valid
@@ -34,8 +34,8 @@ use super::media::library_picture;
 use super::stream::cover_bucket;
 use super::value::Rendered;
 use super::{Outcome, Settings};
-use crate::adapters::subsonic_store::SubsonicStore;
-use droppedneedle_auth::session::tokens::constant_time_eq;
+use crate::subsonic::store::SubsonicStore;
+use droppedneedle_auth::session::tokens::secret_eq;
 use droppedneedle_kernel::runtime_config::Crypto;
 
 /// The route, as registered.
@@ -114,7 +114,7 @@ impl PictureSigner {
     /// Whether `sig` is the whole signature of `kind` and `internal_id`,
     /// compared in constant time.
     pub fn verifies(&self, kind: PictureKind, internal_id: &str, sig: &str) -> bool {
-        constant_time_eq(&self.sign(kind, internal_id), sig)
+        secret_eq(&self.sign(kind, internal_id), sig)
     }
 }
 

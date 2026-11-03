@@ -1,9 +1,9 @@
+import { v3 } from '$lib/api/v3/endpoint';
 import { api } from '$lib/api/client';
 import { ApiError } from '$lib/api/errors';
 import type { components } from '$lib/api/v3/openapi';
 import { toastStore } from '$lib/stores/toast';
 
-import { PLUGIN_ENDPOINTS } from './endpoints';
 import { createAppMutation, pluginsChanged } from '$lib/queries/effects';
 
 export type PluginInstallPreview = components['schemas']['PluginInstallPreview'];
@@ -29,11 +29,11 @@ export function githubWaitMessage(error: unknown): string | null {
 }
 
 /** Download and check a repository without installing it. */
-export const previewPluginInstallMutation = () =>
+export const createPreviewPluginInstallMutation = () =>
 	createAppMutation(() => ({
 		effects: () => [],
 		mutationFn: (request: PluginInstallRequest) =>
-			api.v3.POST(PLUGIN_ENDPOINTS.installPreview(), request),
+			api.v3.POST(v3('/api/v3/plugins/install/preview'), request),
 		onError: (error: Error) => {
 			// The install screen shows the wait itself.
 			if (githubWaitMessage(error)) return;
@@ -45,12 +45,14 @@ export const previewPluginInstallMutation = () =>
 	}));
 
 /** Install exactly the commit the admin previewed. */
-export const installPreviewedPluginMutation = () =>
+export const createInstallPreviewedPluginMutation = () =>
 	createAppMutation(() => ({
 		mutationFn: (preview: PluginInstallPreview & { repository_url: string }) =>
-			api.v3.POST(PLUGIN_ENDPOINTS.install(), {
+			api.v3.POST(v3('/api/v3/plugins/install'), {
 				repository_url: preview.repository_url,
-				commit: preview.commit
+				commit: preview.commit,
+				reference: preview.reference,
+				ref_kind: preview.ref_kind
 			}),
 		onSuccess: (plugin) => {
 			toastStore.show({
@@ -66,9 +68,10 @@ export const installPreviewedPluginMutation = () =>
 	}));
 
 /** Move an installed plugin to its newest release (or the same ref). */
-export const updatePluginFromSourceMutation = () =>
+export const createUpdatePluginFromSourceMutation = () =>
 	createAppMutation(() => ({
-		mutationFn: (name: string) => api.v3.POST(PLUGIN_ENDPOINTS.update(name), {}),
+		mutationFn: (name: string) =>
+			api.v3.POST(v3('/api/v3/plugins/{name}/update', { path: { name } }), {}),
 		onSuccess: (result) => {
 			toastStore.show({
 				message: result.updated

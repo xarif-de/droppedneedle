@@ -5,9 +5,8 @@
 //! publisher moves bytes through prepare, publish, catalog commit, and
 //! cleanup. Nothing else writes managed files.
 //!
-//! The port keeps the behavior of v2's library management publisher and
-//! its recovery, undo and baseline services; nothing working there is
-//! removed.
+//! Recovery, undo and baselines keep the behavior of v2's library
+//! management publisher.
 //!
 //! # Crash semantics
 //!
@@ -113,6 +112,7 @@ pub mod put_back;
 pub mod record;
 pub mod recovery;
 pub mod remove;
+pub mod session;
 pub mod snapshots;
 pub(crate) mod sql;
 pub mod staging;
@@ -130,8 +130,7 @@ pub use paths::{CollisionKey, Sandbox, collision_key};
 pub use place::{PlaceError, Placed, PlacementMode, place_from_hidden};
 pub use planner::{
     Capability, CapabilityGate, DiskPreflight, FileFingerprint, GeneratedOutput, OutputKind,
-    PlanBundle, PlanItem, PlanKind, ReleaseIdentity, Replacement, SealError, SealedPreview,
-    SpaceProbe,
+    PlanBundle, PlanItem, PlanKind, Replacement, SealError, SealedPreview, SpaceProbe,
 };
 pub use publisher::{CrashPoint, PublishOutcome, Publisher};
 pub use recovery::{BundleRecovery, RecoveryAction, reconcile, startup_gate};
@@ -217,6 +216,10 @@ pub enum PublishError {
     /// policy no longer match the sealed preview.
     #[error("validation: {0}")]
     Validation(Detail),
+    /// The album a file joins no longer sits where its placement read it.
+    /// Nothing landed; the import can plan again.
+    #[error("join changed: {0}")]
+    JoinChanged(Detail),
     /// Catalog-commit gate: the bundle's own rows moved since its seal,
     /// or the commit transaction refused a row.
     #[error("catalog commit: {0}")]
@@ -265,6 +268,11 @@ pub enum PublishError {
     /// and leaves the bundle to recovery.
     #[error("store: {0}")]
     Interrupted(String),
+    /// No recycle bin is known (a setting it comes from cannot be read,
+    /// or the configured bin cannot be reached), so a publish that would
+    /// send a file to a bin waits before anything moves.
+    #[error("no recycle bin is known while {0}")]
+    BinsUnknown(bin::BinsUnknown),
     /// A write ran past its time budget and was rolled back: nothing it
     /// would have written landed.
     #[error("store: {0}")]
@@ -312,6 +320,7 @@ impl PublishError {
             | Self::Snapshot(detail)
             | Self::Journal(detail)
             | Self::Validation(detail)
+            | Self::JoinChanged(detail)
             | Self::Catalog(detail)
             | Self::Cleanup(detail)
             | Self::UnsafePath(detail)
@@ -324,6 +333,7 @@ impl PublishError {
             | Self::InjectedCrash(_)
             | Self::Store(_)
             | Self::Interrupted(_)
+            | Self::BinsUnknown(_)
             | Self::TimedOut(_) => None,
         }
     }
@@ -335,6 +345,7 @@ impl PublishError {
             | Self::Snapshot(detail)
             | Self::Journal(detail)
             | Self::Validation(detail)
+            | Self::JoinChanged(detail)
             | Self::Catalog(detail)
             | Self::Cleanup(detail)
             | Self::UnsafePath(detail)
@@ -347,6 +358,7 @@ impl PublishError {
             | Self::InjectedCrash(_)
             | Self::Store(_)
             | Self::Interrupted(_)
+            | Self::BinsUnknown(_)
             | Self::TimedOut(_) => None,
         }
     }

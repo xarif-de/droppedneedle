@@ -15,7 +15,7 @@ use super::models::{
 use super::service::{ApplyRequest, JobSpec, Management, PAGE_MAX};
 use super::store::Snapshot;
 use super::{profile, reasons, takeover};
-use crate::operations::reasons::Reason;
+use crate::reasons::Reason;
 
 /// Why an edition's tags were not queued or reached.
 #[derive(Debug)]
@@ -121,12 +121,10 @@ struct Album {
 }
 
 fn album(conn: &Connection, album_id: &str, release_mbid: &str) -> rusqlite::Result<Option<Album>> {
-    let mut statement = conn.prepare(
-        "SELECT root_id, relative_path FROM local_tracks \
-         WHERE local_album_id = ?1 AND availability = 'indexed' ORDER BY root_id",
-    )?;
+    let mut statement = conn.prepare(crate::management::sql::ALBUM_TRACK_PATHS.text())?;
     let files = statement
-        .query_map(params![album_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .query_map(params![album_id], super::sql::TrackPath::read)?
+        .map(|row| row.map(|row| (row.root_id, row.relative_path)))
         .collect::<rusqlite::Result<Vec<(String, String)>>>()?;
     if files.is_empty() {
         return Ok(None);
@@ -135,7 +133,7 @@ fn album(conn: &Connection, album_id: &str, release_mbid: &str) -> rusqlite::Res
     roots.dedup();
     let custom = conn
         .query_row(
-            "SELECT 1 FROM library_custom_edition_active WHERE local_album_id = ?1",
+            crate::management::sql::ALBUM_HAS_CUSTOM_EDITION.text(),
             params![album_id],
             |_| Ok(()),
         )
@@ -143,7 +141,7 @@ fn album(conn: &Connection, album_id: &str, release_mbid: &str) -> rusqlite::Res
         .is_some();
     let excluded = conn
         .query_row(
-            "SELECT 1 FROM library_management_exclusions WHERE local_album_id = ?1",
+            crate::management::sql::AUTOMATIC_GATE.text(),
             params![album_id],
             |_| Ok(()),
         )
@@ -151,7 +149,7 @@ fn album(conn: &Connection, album_id: &str, release_mbid: &str) -> rusqlite::Res
         .is_some();
     let placing = conn
         .query_row(
-            "SELECT attempts FROM library_edition_remap_queue WHERE local_album_id = ?1",
+            crate::management::sql::EDITION_REMAP_ATTEMPTS.text(),
             params![album_id],
             |row| row.get(0),
         )
@@ -163,7 +161,7 @@ fn album(conn: &Connection, album_id: &str, release_mbid: &str) -> rusqlite::Res
         custom,
         held: excluded || takeover::is_marked(conn, album_id)?,
         placing,
-        mapped: crate::operations::choice::mapped_track_ids(conn, album_id, release_mbid)?,
+        mapped: crate::edition::choice::mapped_track_ids(conn, album_id, release_mbid)?,
     }))
 }
 
@@ -181,7 +179,7 @@ impl Management {
         caller: &Principal,
     ) -> Result<PreviewHandle, EditionTagsError> {
         let found = self
-            .setup
+            .parts
             .db
             .read_blocking("management.edition_tags_album", |conn| {
                 Ok::<_, ManagementError>(album(conn, album_id, release_mbid)?)
@@ -216,7 +214,7 @@ impl Management {
         let [root] = found.roots.as_slice() else {
             return refused(TWO_FOLDERS);
         };
-        let registry = self.setup.core.live_registry();
+        let registry = self.parts.core.live_registry();
         if found
             .files
             .iter()
@@ -247,7 +245,7 @@ impl Management {
             origin: Origin::Manual,
             actor: Some(caller.user_id()),
             idempotency_key: None,
-            revisions: profile::revisions(&stored, &pinned, registry.policy_revision()),
+            revisions: profile::revisions(&stored, &pinned, registry.fingerprint()),
             selection_json: serde_json::to_string(&selection).map_err(ManagementError::from)?,
             pinned: &pinned,
             target_root_id: None,

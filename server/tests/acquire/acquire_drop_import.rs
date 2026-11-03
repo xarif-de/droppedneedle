@@ -17,7 +17,7 @@ use std::time::Duration;
 use droppedneedle_acquire::db::AcquireDb;
 use droppedneedle_acquire::downloads::queue_rows::Viewer as HeldViewer;
 use droppedneedle_acquire::drop_import::Viewer;
-use droppedneedle_acquire::drop_import::store::JobRecord;
+use droppedneedle_acquire::drop_import::store::{DropItemStatus, DropJobStatus, JobRecord};
 use droppedneedle_acquire::held::store::Entry;
 use droppedneedle_acquire::landing::library::LibraryLanding;
 use droppedneedle_acquire::landing::ports::LandingLibrary;
@@ -296,7 +296,7 @@ async fn dropped_album_lands_and_the_unknown_folder_waits_for_review() {
         .iter()
         .find(|item| item.folder_name == "Dummy")
         .expect("album item");
-    assert_eq!(album.status, "imported", "{:?}", album.detail);
+    assert_eq!(album.status, DropItemStatus::Imported, "{:?}", album.detail);
     assert_eq!(album.files_imported, 3, "{:?}", album.detail);
     assert_eq!(album.release_group_mbid.as_deref(), Some(GROUP));
     let shelf = music.join("Portishead/Dummy");
@@ -330,7 +330,7 @@ async fn dropped_album_lands_and_the_unknown_folder_waits_for_review() {
         .iter()
         .find(|item| item.folder_name == "Odds")
         .expect("review item");
-    assert_eq!(odd.status, "needs_review");
+    assert_eq!(odd.status, DropItemStatus::NeedsReview);
     assert_eq!(odd.reason_code, Some(Reason::NoAlbumMatch));
     assert!(odd.detail.is_some());
     let (entry, staged) = entry_of(&acquire, &curator.user_id, odd.id).await;
@@ -350,13 +350,13 @@ async fn dropped_album_lands_and_the_unknown_folder_waits_for_review() {
         .discard(&held_viewer, entry.id, None)
         .await
         .expect("discard");
-    let now = acquire.drops.get_job(&curator, &job.id).await.expect("job");
+    let now = job_now(&acquire.drops, &curator, &job.id).await;
     let odd = now
         .items
         .iter()
         .find(|item| item.id == odd.id)
         .expect("review item");
-    assert_eq!(odd.status, "discarded");
+    assert_eq!(odd.status, DropItemStatus::Discarded);
     assert!(staged.iter().all(|path| !path.exists()));
     acquire.drops.sweep_stale().await.unwrap();
     assert!(!job_dir.exists(), "the job folder goes once nothing waits");
@@ -370,7 +370,9 @@ async fn dropped_album_lands_and_the_unknown_folder_waits_for_review() {
     )
     .await;
     assert!(
-        job.items.iter().all(|item| item.status != "imported"),
+        job.items
+            .iter()
+            .all(|item| item.status != DropItemStatus::Imported),
         "{:?}",
         job.items
     );
@@ -389,7 +391,12 @@ async fn dropped_album_lands_and_the_unknown_folder_waits_for_review() {
     )
     .await;
     let upgrade = &job.items[0];
-    assert_eq!(upgrade.status, "imported", "{:?}", upgrade.detail);
+    assert_eq!(
+        upgrade.status,
+        DropItemStatus::Imported,
+        "{:?}",
+        upgrade.detail
+    );
     assert!(
         upgrade
             .detail
@@ -432,7 +439,7 @@ async fn same_named_files_on_two_discs_both_wait() {
     )
     .await;
     assert_eq!(job.items.len(), 1, "{:?}", job.items);
-    assert_eq!(job.items[0].status, "needs_review");
+    assert_eq!(job.items[0].status, DropItemStatus::NeedsReview);
     let (entry, staged) = entry_of(&acquire, &curator.user_id, job.items[0].id).await;
     assert_eq!(entry.files.len(), 2, "{:?}", entry.files);
     assert!(staged.iter().all(|path| path.is_file()));
@@ -497,7 +504,12 @@ async fn an_upgrade_the_bin_cannot_take_keeps_the_upload() {
         .iter()
         .find(|item| item.reason_code == Some(Reason::UpgradeBlocked))
         .unwrap_or_else(|| panic!("a review item keeps the upload: {:?}", job.items));
-    assert_eq!(kept.status, "needs_review", "{:?}", kept.detail);
+    assert_eq!(
+        kept.status,
+        DropItemStatus::NeedsReview,
+        "{:?}",
+        kept.detail
+    );
     let (entry, staged) = entry_of(&acquire, &curator.user_id, kept.id).await;
     assert_eq!(entry.files[0].reason, Reason::UpgradeBlocked);
     assert_eq!(staged.len(), 1);
@@ -642,7 +654,8 @@ async fn a_hand_match_finds_the_edition_in_a_large_group() {
         let job = drop_zip(&acquire, &curator, &format!("upload-{case}"), &entries).await;
         let item = &job.items[0];
         assert_eq!(
-            item.status, "needs_review",
+            item.status,
+            DropItemStatus::NeedsReview,
             "case {case}: {:?}",
             item.detail
         );
@@ -658,9 +671,10 @@ async fn a_hand_match_finds_the_edition_in_a_large_group() {
             .await
             .expect("matched by hand");
         assert_eq!(matched.imported, 3, "case {case}: {matched:?}");
-        let now = acquire.drops.get_job(&curator, &job.id).await.expect("job");
+        let now = job_now(&acquire.drops, &curator, &job.id).await;
         assert_eq!(
-            now.items[0].status, "imported",
+            now.items[0].status,
+            DropItemStatus::Imported,
             "case {case}: {:?}",
             now.items[0].detail
         );
@@ -709,7 +723,12 @@ async fn a_deferred_upload_match_leaves_its_files_as_they_were() {
     let bytes = tagged(&work, "flac_full_01.flac", "Odds", "Numb", 1);
     let job = drop_zip(&acquire, &curator, "odds", &[("Odds/01 Numb.flac", &bytes)]).await;
     let item = &job.items[0];
-    assert_eq!(item.status, "needs_review", "{:?}", item.detail);
+    assert_eq!(
+        item.status,
+        DropItemStatus::NeedsReview,
+        "{:?}",
+        item.detail
+    );
     let (entry, _) = entry_of(&acquire, &curator.user_id, item.id).await;
     let file_id = entry.files[0].id;
     // AcoustID heard another recording; the app's guess was another album.
@@ -758,8 +777,8 @@ async fn a_deferred_upload_match_leaves_its_files_as_they_were() {
         Some(GUESS.to_owned()),
     );
     assert_eq!(held().await, as_it_was);
-    let now = acquire.drops.get_job(&curator, &job.id).await.expect("job");
-    assert_eq!(now.items[0].status, "needs_review");
+    let now = job_now(&acquire.drops, &curator, &job.id).await;
+    assert_eq!(now.items[0].status, DropItemStatus::NeedsReview);
 
     std::fs::create_dir_all(&music).expect("library folder back");
     acquire.held.tend().await;
@@ -768,6 +787,120 @@ async fn a_deferred_upload_match_leaves_its_files_as_they_were() {
         files_under(&music).is_empty(),
         "nothing reached the library"
     );
+}
+
+/// An automatic upload the library could not take is held paired with its
+/// track, so the held loop places it by itself once the library is on.
+#[tokio::test]
+async fn an_upload_deferred_with_the_library_off_is_retried_by_itself() {
+    use droppedneedle_kernel::runtime_config::secret_sections::TypedLibrary;
+
+    let (_db, library, dir, auth) = bundles().await;
+    let work = dir.join("work");
+    std::fs::create_dir_all(&work).expect("work dir");
+    let bytes = tagged(&work, "flac_full_01.flac", "Dummy", "Mysterons", 1);
+    let lengths = [length_ms(&bytes, &work)];
+    let acquire = acquire_over(
+        &auth,
+        &library,
+        Arc::new(LibraryLanding::new(
+            &library,
+            every_priority(Arc::new(OneRelease(release(&["Mysterons"], &lengths)))),
+        )),
+    );
+    let switch = |on: bool| {
+        library
+            .settings
+            .store()
+            .update_secret_blocking::<TypedLibrary, String, _>(move |stored| {
+                let mut settings = stored.into_inner();
+                settings.enabled = on;
+                Ok(settings)
+            })
+            .expect("library switch saved");
+        library.core.refresh_registry();
+    };
+    let curator = Viewer {
+        user_id: "u-curator".to_owned(),
+        admin: false,
+    };
+    switch(false);
+    let job = drop_zip(
+        &acquire,
+        &curator,
+        "library-off",
+        &[("Dummy/01 - Mysterons.flac", &bytes)],
+    )
+    .await;
+    assert_eq!(job.items[0].status, DropItemStatus::NeedsReview);
+    let music = dir.join("music");
+    assert!(files_under(&music).is_empty(), "nothing lands while off");
+
+    switch(true);
+    acquire.held.tend().await;
+    assert_eq!(files_under(&music).len(), 1, "the held loop placed it");
+}
+
+/// An upload matched by itself during an AcoustID outage stays held while
+/// it lasts, and the held loop places it once AcoustID answers.
+#[tokio::test]
+async fn an_upload_held_in_an_acoustid_outage_is_retried_by_itself() {
+    use droppedneedle_library::identify::sources::AcoustIdUnavailable;
+
+    let (_db, mut library, dir, auth) = bundles().await;
+    let outage = crate::acquire_landing::Outage::new(AcoustIdUnavailable::Unreachable);
+    library.imports.fingerprints = outage.clone();
+    let work = dir.join("work");
+    std::fs::create_dir_all(&work).expect("work dir");
+    let bytes = tagged(&work, "flac_full_01.flac", "Dummy", "Mysterons", 1);
+    let lengths = [length_ms(&bytes, &work)];
+    let acquire = acquire_over(
+        &auth,
+        &library,
+        Arc::new(LibraryLanding::new(
+            &library,
+            every_priority(Arc::new(OneRelease(release(&["Mysterons"], &lengths)))),
+        )),
+    );
+    let curator = Viewer {
+        user_id: "u-curator".to_owned(),
+        admin: false,
+    };
+    let job = drop_zip(
+        &acquire,
+        &curator,
+        "acoustid-down",
+        &[("Dummy/01 - Mysterons.flac", &bytes)],
+    )
+    .await;
+    assert_eq!(job.items[0].status, DropItemStatus::NeedsReview);
+    let music = dir.join("music");
+    let reason = || async {
+        sqlx::query_scalar::<_, String>("SELECT reason FROM acquire_held_files")
+            .fetch_one(acquire.db.db().sqlx())
+            .await
+            .expect("held file")
+    };
+    let due_now = || async {
+        acquire
+            .db
+            .write("test.due", |tx| {
+                tx.execute("UPDATE acquire_held_entries SET retry_at = NULL", [])?;
+                Ok(())
+            })
+            .await
+            .expect("due now");
+    };
+    assert_eq!(reason().await, "acoustid_unavailable");
+
+    acquire.held.tend().await;
+    assert_eq!(reason().await, "acoustid_unavailable", "still waiting");
+    assert!(files_under(&music).is_empty(), "nothing lands while down");
+
+    outage.end();
+    due_now().await;
+    acquire.held.tend().await;
+    assert_eq!(files_under(&music).len(), 1, "the held loop placed it");
 }
 
 /// A bonus track of an upload a curator matched, which the library could
@@ -815,7 +948,12 @@ async fn a_matched_uploads_bonus_track_is_not_retried_onto_the_old_guess() {
     )
     .await;
     let item = &job.items[0];
-    assert_eq!(item.status, "needs_review", "{:?}", item.detail);
+    assert_eq!(
+        item.status,
+        DropItemStatus::NeedsReview,
+        "{:?}",
+        item.detail
+    );
     let (entry, _) = entry_of(&acquire, &curator.user_id, item.id).await;
     let file_id = entry
         .files
@@ -916,7 +1054,7 @@ async fn drop_zip(
         zip.finish().expect("zip finish");
     }
     let job = upload_and_settle(acquire, curator, upload).await;
-    assert_eq!(job.status, "completed", "{:?}", job.error);
+    assert_eq!(job.status, DropJobStatus::Completed, "{:?}", job.error);
     job
 }
 
@@ -946,45 +1084,71 @@ async fn upload_and_settle(
         if frame.name() != "drop_import_updated" {
             continue;
         }
-        let now = acquire.drops.get_job(curator, &job.id).await.expect("job");
-        if now.status != "processing" {
+        let now = job_now(&acquire.drops, curator, &job.id).await;
+        if now.status != DropJobStatus::Processing {
             return now;
         }
     }
 }
 
-/// An entry whose header understates its size is refused whole: no part
-/// of it stays in staging and nothing from it reaches the library.
+/// An archive whose third entry is damaged (its header understates its
+/// size) is refused whole: the two good entries unpacked before it are
+/// discarded with it, nothing stays in staging, nothing reaches the
+/// library, and the job fails naming the bad entry.
 #[tokio::test]
-async fn an_entry_longer_than_its_header_leaves_nothing_behind() {
-    let (_db, library, _dir, auth) = bundles().await;
+async fn a_damaged_entry_discards_the_whole_archive() {
+    let (_db, library, dir, auth) = bundles().await;
+    let work = dir.join("work");
+    std::fs::create_dir_all(&work).expect("work dir");
     let acquire = acquire_over(
         &auth,
         &library,
         Arc::new(LibraryLanding::new(
             &library,
-            every_priority(Arc::new(OneRelease(release(&["Big"], &[None])))),
+            every_priority(Arc::new(OneRelease(release(
+                &["Mysterons", "Sour Times", "Big"],
+                &[None, None, None],
+            )))),
         )),
     );
     let curator = Viewer {
         user_id: "u-curator".to_owned(),
         admin: false,
     };
+    let good = [
+        tagged(&work, "flac_full_01.flac", "Dummy", "Mysterons", 1),
+        tagged(&work, "flac_full_01.flac", "Dummy", "Sour Times", 2),
+    ];
     let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
     let stored =
         zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    for (name, bytes) in [
+        ("Dummy/01 - Mysterons.flac", &good[0]),
+        ("Dummy/02 - Sour Times.flac", &good[1]),
+    ] {
+        writer.start_file(name, stored).expect("zip entry");
+        writer.write_all(bytes).expect("zip bytes");
+    }
     writer
-        .start_file("Album/01 - Big.flac", stored)
+        .start_file("Dummy/03 - Big.flac", stored)
         .expect("zip entry");
     writer.write_all(&vec![7u8; 3 << 20]).expect("zip bytes");
     let mut bytes = writer.finish().expect("zip finish").into_inner();
-    // Claim 1 KiB unpacked in the local header (offset 22) and the central
-    // directory entry (offset 24); the stored data stays 3 MiB.
-    let central = bytes
-        .windows(4)
-        .position(|window| window == [0x50, 0x4b, 0x01, 0x02])
-        .expect("central directory");
-    for at in [22, central + 24] {
+    // Claim 1 KiB unpacked in the third entry's local header (offset 22)
+    // and its central directory entry (offset 24); the stored data stays
+    // 3 MiB.
+    let nth_header = |signature: [u8; 4]| {
+        bytes
+            .windows(4)
+            .enumerate()
+            .filter(|(_, window)| *window == signature)
+            .map(|(at, _)| at)
+            .nth(2)
+            .expect("third entry header")
+    };
+    let local = nth_header([0x50, 0x4b, 0x03, 0x04]);
+    let central = nth_header([0x50, 0x4b, 0x01, 0x02]);
+    for at in [local + 22, central + 24] {
         bytes[at..at + 4].copy_from_slice(&1024u32.to_le_bytes());
     }
     let incoming = acquire.drops.incoming_dir();
@@ -993,7 +1157,19 @@ async fn an_entry_longer_than_its_header_leaves_nothing_behind() {
     std::fs::write(&upload, &bytes).expect("upload");
 
     let job = upload_and_settle(&acquire, &curator, upload).await;
-    assert_eq!(job.status, "failed", "{:?}", job.error);
+    let indexed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM local_tracks")
+        .fetch_one(acquire.db.db().sqlx())
+        .await
+        .expect("catalog");
+    assert_eq!(indexed, 0, "files of the damaged archive were imported");
+    assert_eq!(job.status, DropJobStatus::Failed, "{:?}", job.items);
+    assert!(
+        job.error
+            .as_deref()
+            .is_some_and(|error| error.contains("Dummy/03 - Big.flac")),
+        "{:?}",
+        job.error
+    );
     assert!(job.items.is_empty(), "{:?}", job.items);
     let mut left = Vec::new();
     let mut pending = vec![PathBuf::from(&job.staging_dir)];
@@ -1011,11 +1187,6 @@ async fn an_entry_longer_than_its_header_leaves_nothing_behind() {
         }
     }
     assert!(left.is_empty(), "staging still holds {left:?}");
-    let indexed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM local_tracks")
-        .fetch_one(acquire.db.db().sqlx())
-        .await
-        .expect("catalog");
-    assert_eq!(indexed, 0);
 }
 
 /// An upload a restart cut off before it became items keeps its files when
@@ -1096,7 +1267,7 @@ async fn a_cut_off_upload_survives_a_sweep_that_cannot_read_its_jobs() {
     holder.await.expect("join").expect("hold");
     assert!(track.exists(), "the cut-off upload was swept");
     let job = store.get_job("job-cut").await.expect("read").expect("job");
-    assert_eq!(job.status, "processing", "{:?}", job.error);
+    assert_eq!(job.status, DropJobStatus::Processing, "{:?}", job.error);
     assert!(job.items.is_empty(), "{:?}", job.items);
 
     acquire.drops.sweep_stale().await.unwrap();
@@ -1174,6 +1345,65 @@ async fn a_cut_off_upload_is_grouped_whole_or_not_at_all() {
     assert_eq!(folders, ["Album A", "Album B"]);
 }
 
+/// A stop while an upload unpacks leaves no half archive behind: an
+/// unpacking folder whose archive is still there is thrown away and the
+/// archive unpacks again whole, and one whose archive is gone had finished
+/// and takes its name. Each gives one item.
+#[tokio::test]
+async fn an_archive_cut_off_while_unpacking_unpacks_again_whole() {
+    let (_db, library, dir, auth) = bundles().await;
+    let acquire = acquire_over(
+        &auth,
+        &library,
+        Arc::new(LibraryLanding::new(
+            &library,
+            every_priority(Arc::new(OneRelease(release(&["Mysterons"], &[None])))),
+        )),
+    );
+    let staging = dir.join("cut-unpack");
+    std::fs::create_dir_all(&staging).expect("staging");
+    let mut zip = zip::ZipWriter::new(
+        std::fs::File::create(staging.join("001_Dummy.zip")).expect("zip file"),
+    );
+    let stored =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    for entry in ["01 Mysterons.flac", "02 Sour Times.flac"] {
+        zip.start_file(entry, stored).expect("zip entry");
+        zip.write_all(b"audio").expect("zip bytes");
+    }
+    zip.finish().expect("zip finish");
+    let partial = staging.join(".001_Dummy.zip.unpacking");
+    std::fs::create_dir_all(&partial).expect("partial folder");
+    std::fs::write(partial.join("01 Mysterons.flac"), b"aud").expect("partial file");
+    let finished = staging.join(".002_Third.zip.unpacking");
+    std::fs::create_dir_all(&finished).expect("finished folder");
+    std::fs::write(finished.join("01 Roads.flac"), b"audio").expect("finished file");
+    let store = droppedneedle_acquire::drop_import::store::DropStore::new(acquire.db.clone());
+    store
+        .create_job(
+            "job-cut",
+            "u-curator",
+            "Cora",
+            "albums.zip",
+            &staging.to_string_lossy(),
+        )
+        .await
+        .expect("job");
+
+    acquire.drops.sweep_stale().await.unwrap();
+    let job = store.get_job("job-cut").await.expect("read").expect("job");
+    let mut units: Vec<(&str, usize)> = job
+        .items
+        .iter()
+        .map(|item| (item.folder_name.as_str(), item.staging_paths.len()))
+        .collect();
+    units.sort_unstable();
+    assert_eq!(units, [("Dummy", 2), ("Third", 1)]);
+    let whole = std::fs::read(staging.join("Dummy").join("01 Mysterons.flac")).expect("file");
+    assert_eq!(whole, b"audio", "the archive unpacked again whole");
+    assert!(!partial.exists() && !finished.exists());
+}
+
 /// An upload whose declared length is over the 8 GB limit is refused with
 /// 413 before any of it is written, so a person learns the cap at once
 /// instead of after sending gigabytes.
@@ -1207,4 +1437,19 @@ async fn an_upload_declared_over_the_limit_is_refused_before_writing() {
     let incoming = app.state().acquire.drops.incoming_dir();
     let written = std::fs::read_dir(&incoming).map_or(0, |dir| dir.count());
     assert_eq!(written, 0, "nothing lands in {}", incoming.display());
+}
+
+/// One job as its owner's list shows it.
+async fn job_now(
+    drops: &droppedneedle_acquire::drop_import::DropImports,
+    viewer: &Viewer,
+    id: &str,
+) -> JobRecord {
+    drops
+        .list_jobs(viewer, false)
+        .await
+        .expect("jobs read")
+        .into_iter()
+        .find(|job| job.id == id)
+        .expect("job")
 }

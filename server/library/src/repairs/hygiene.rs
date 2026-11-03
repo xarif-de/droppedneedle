@@ -27,16 +27,25 @@ use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension as _, Transaction, params, params_from_iter};
 
+use crate::catalog_actions::CatalogAction;
+use crate::catalog_actions::record_action;
 use crate::catalog_revision::bump_catalog;
 use crate::corrections::membership::retire;
 use crate::identify::artist_links::mark_stale;
 use crate::identify::queue::offer_again;
 use crate::identify::sqlite::offer_album;
 use crate::identity::{self, DecisionSource, Rows};
-use crate::operations::decisions::{CatalogAction, record_action};
+use crate::repairs::sql::ALBUM_CREDITS;
+use crate::repairs::sql::INSERT_ALBUM_CREDIT;
+use crate::repairs::sql::TRACK_CREDITS;
+use crate::repairs::sql::{
+    AlbumArtistAndSort, ArtistRepairAction, CreditColumns, HygieneAlbum as Album, HygieneIdentity,
+    HygieneTrack, LiveAlbumArtist, NamedTrack,
+};
 use crate::scan::naming::{UNKNOWN_ARTIST, UNKNOWN_ARTIST_ID};
 use crate::scan::sqlite_store::awaits_retag;
 use droppedneedle_kernel::db::fold::fold_text;
+use droppedneedle_kernel::db::statement::ListLen;
 
 const PROVIDER: &str = "musicbrainz";
 
@@ -63,35 +72,11 @@ pub fn clean_album(
     Ok(changed)
 }
 
-#[derive(Debug, Clone)]
-struct Album {
-    id: String,
-    root_id: String,
-    title_folded: String,
-    artist_name: String,
-    artist_folded: String,
-    grouping_source: String,
-    grouping_locked: bool,
-}
-
 fn album(conn: &Connection, album_id: &str) -> rusqlite::Result<Option<Album>> {
     conn.query_row(
-        "SELECT id, root_id, title_folded, COALESCE(album_artist_name, ''), \
-         COALESCE(album_artist_name_folded, ''), grouping_source, grouping_locked \
-         FROM local_albums \
-         WHERE id = ?1 AND retired_into_album_id IS NULL",
+        crate::repairs::sql::ALBUM.text(),
         params![album_id],
-        |row| {
-            Ok(Album {
-                id: row.get(0)?,
-                root_id: row.get(1)?,
-                title_folded: row.get(2)?,
-                artist_name: row.get(3)?,
-                artist_folded: row.get(4)?,
-                grouping_source: row.get(5)?,
-                grouping_locked: row.get(6)?,
-            })
-        },
+        Album::read,
     )
     .optional()
 }
@@ -101,36 +86,30 @@ type Identity = (String, Option<String>, DecisionSource);
 
 fn identity(conn: &Connection, album_id: &str) -> rusqlite::Result<Option<Identity>> {
     conn.query_row(
-        "SELECT release_group_mbid, release_mbid, decision_source \
-         FROM local_album_external_identities WHERE local_album_id = ?1 AND provider = ?2",
+        crate::repairs::sql::IDENTITY.text(),
         params![album_id, PROVIDER],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        |row| {
+            let row = HygieneIdentity::read(row)?;
+            Ok((
+                row.release_group_mbid,
+                row.release_mbid,
+                row.decision_source,
+            ))
+        },
     )
     .optional()
 }
 
 /// Work a person or a job is doing on these albums: leave them alone.
 fn busy(conn: &Connection, albums: &[&str], now: f64) -> rusqlite::Result<bool> {
-    let marks = (1..=albums.len())
-        .map(|number| format!("?{number}"))
-        .collect::<Vec<_>>()
-        .join(",");
-    let live = crate::management::store::live_job_sql(&format!("?{}", albums.len() + 1));
     conn.query_row(
-        &format!(
-            "SELECT EXISTS(SELECT 1 FROM library_contribution_drafts WHERE local_album_id IN \
-             ({marks}) AND state IN ('draft','ready','seeded','verifying','needs_review')) \
-             OR EXISTS(SELECT 1 FROM library_management_plan_items item \
-             JOIN library_operation_jobs job ON job.id = item.job_id \
-             WHERE item.local_album_id IN ({marks}) AND {live}) \
-             OR EXISTS(SELECT 1 FROM library_management_overrides \
-             WHERE local_album_id IN ({marks}))"
-        ),
+        &crate::repairs::sql::albums_have_live_work(ListLen::new(albums.len())),
         params_from_iter(
-            albums
-                .iter()
-                .map(|album| rusqlite::types::Value::Text((*album).to_owned()))
-                .chain([rusqlite::types::Value::Real(now)]),
+            std::iter::once(rusqlite::types::Value::Integer(crate::clock::ms(now))).chain(
+                albums
+                    .iter()
+                    .map(|album| rusqlite::types::Value::Text((*album).to_owned())),
+            ),
         ),
         |row| row.get(0),
     )
@@ -171,20 +150,14 @@ fn retire_empty_shell(
         return Ok(None);
     }
     let has_tracks: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM local_tracks WHERE local_album_id = ?1)",
+        crate::repairs::sql::ALBUM_HAS_TRACKS.text(),
         params![album.id],
         |row| row.get(0),
     )?;
     if has_tracks {
         return Ok(None);
     }
-    let mut stmt = tx.prepare(
-        "SELECT target.id FROM local_albums target WHERE target.id <> ?1 \
-         AND target.retired_into_album_id IS NULL AND target.root_id = ?2 \
-         AND target.title_folded = ?3 AND COALESCE(target.album_artist_name_folded, '') = ?4 \
-         AND EXISTS (SELECT 1 FROM local_tracks t WHERE t.local_album_id = target.id \
-         AND t.availability = 'indexed') ORDER BY target.id LIMIT 2",
-    )?;
+    let mut stmt = tx.prepare(crate::repairs::sql::SHELL_TARGET.text())?;
     let targets = stmt
         .query_map(
             params![
@@ -243,46 +216,10 @@ fn retire_empty_shell(
     Ok(Some(after))
 }
 
-#[derive(Debug, Clone)]
-struct HygieneTrack {
-    id: String,
-    relative_path: String,
-    disc: i64,
-    number: i64,
-    tag_title: Option<String>,
-    tag_artist: Option<String>,
-    embedded_group: Option<String>,
-    release_track: Option<String>,
-    identity_release: Option<String>,
-    identity_source: Option<String>,
-    indexed: bool,
-}
-
 fn tracks(conn: &Connection, album_id: &str) -> rusqlite::Result<Vec<HygieneTrack>> {
-    let mut stmt = conn.prepare(
-        "SELECT t.id, t.relative_path, COALESCE(t.disc_number, 0), COALESCE(t.track_number, 0), \
-         t.tag_album_title, t.tag_album_artist_name, t.embedded_release_group_mbid, \
-         ti.release_track_mbid, ti.release_mbid, ti.decision_source, \
-         t.availability = 'indexed' FROM local_tracks t \
-         LEFT JOIN local_track_external_identities ti ON ti.local_track_id = t.id \
-         AND ti.provider = ?2 WHERE t.local_album_id = ?1 ORDER BY t.id",
-    )?;
-    stmt.query_map(params![album_id, PROVIDER], |row| {
-        Ok(HygieneTrack {
-            id: row.get(0)?,
-            relative_path: row.get(1)?,
-            disc: row.get(2)?,
-            number: row.get(3)?,
-            tag_title: row.get(4)?,
-            tag_artist: row.get(5)?,
-            embedded_group: row.get(6)?,
-            release_track: row.get(7)?,
-            identity_release: row.get(8)?,
-            identity_source: row.get(9)?,
-            indexed: row.get(10)?,
-        })
-    })?
-    .collect()
+    let mut stmt = conn.prepare(crate::repairs::sql::TRACKS.text())?;
+    stmt.query_map(params![album_id, PROVIDER], HygieneTrack::read)?
+        .collect()
 }
 
 /// The one value every track agrees on, folded; `None` when any track
@@ -319,8 +256,7 @@ fn fold_split_legacy_album(
     let later_decision = source.iter().any(|track| {
         track
             .identity_source
-            .as_deref()
-            .is_some_and(|source| source != "legacy_import")
+            .is_some_and(|source| source != DecisionSource::LegacyImport)
     });
     let incomplete_map = source.iter().any(|track| {
         track.release_track.is_none() || track.identity_release.as_deref() != Some(&release)
@@ -340,16 +276,7 @@ fn fold_split_legacy_album(
     {
         return Ok(None);
     }
-    let mut stmt = tx.prepare(
-        "SELECT target.id FROM local_albums target JOIN local_album_external_identities ti \
-         ON ti.local_album_id = target.id AND ti.provider = 'musicbrainz' \
-         WHERE target.id <> ?1 AND target.retired_into_album_id IS NULL \
-         AND target.root_id = ?2 AND target.title_folded = ?3 \
-         AND COALESCE(target.album_artist_name_folded, '') = ?4 \
-         AND ti.release_group_mbid = ?5 AND EXISTS (SELECT 1 FROM local_tracks t \
-         WHERE t.local_album_id = target.id AND t.availability = 'indexed') \
-         ORDER BY target.id LIMIT 2",
-    )?;
+    let mut stmt = tx.prepare(crate::repairs::sql::LEGACY_SPLIT_TARGET.text())?;
     let targets = stmt
         .query_map(
             params![album.id, album.root_id, tag_title, tag_artist, embedded],
@@ -388,20 +315,16 @@ fn fold_split_legacy_album(
         return Ok(None);
     }
     let moved: Vec<String> = source.iter().map(|track| track.id.clone()).collect();
-    let marks = vec!["?"; moved.len()].join(",");
     // The v2 choice is kept in the audit row, so the fold can be undone.
     let folded = identity::fold_legacy(tx, &album.id, &moved)?;
     tx.execute(
-        &format!(
-            "UPDATE local_tracks SET local_album_id = ?, row_revision = row_revision + 1 \
-             WHERE id IN ({marks})"
-        ),
+        &crate::repairs::sql::move_tracks_to_album(ListLen::new(moved.len())),
         params_from_iter(std::iter::once(target).chain(&moved)),
     )?;
     retire(tx, &album.id, target, now)?;
     tx.execute(
-        "UPDATE local_albums SET updated_at = ?2, row_revision = row_revision + 1 WHERE id = ?1",
-        params![target, now],
+        crate::repairs::sql::BUMP_ALBUM_REVISION.text(),
+        params![target, crate::clock::ms(now)],
     )?;
     offer_album(tx, target, crate::clock::ms(now))?;
     let after = serde_json::json!({
@@ -435,12 +358,12 @@ fn write_album_credits(
     credits: &[CreditRow],
 ) -> rusqlite::Result<()> {
     tx.execute(
-        "DELETE FROM local_album_artists WHERE local_album_id = ?1",
+        crate::repairs::sql::WRITE_ALBUM_CREDITS.text(),
         params![album_id],
     )?;
     for (position, credit) in credits.iter().enumerate() {
         tx.execute(
-            INSERT_ALBUM_CREDIT,
+            INSERT_ALBUM_CREDIT.text(),
             params![
                 album_id,
                 position as i64,
@@ -454,10 +377,6 @@ fn write_album_credits(
     }
     mark_stale(tx, album_id)
 }
-
-const INSERT_ALBUM_CREDIT: &str = "INSERT INTO local_album_artists (local_album_id, position, \
-     local_artist_id, role, credited_name, join_phrase, artist_mbid) \
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)";
 
 /// One artist credit as `local_track_artists` and `local_album_artists`
 /// hold it, in position order. A track credit reads as role `main`, the
@@ -477,33 +396,19 @@ fn main_role() -> String {
     "main".to_owned()
 }
 
-const TRACK_CREDITS: &str = "SELECT local_artist_id, credited_name, join_phrase, artist_mbid, \
-     'main' FROM local_track_artists WHERE local_track_id = ?1 ORDER BY position";
-
-const ALBUM_CREDITS: &str = "SELECT local_artist_id, credited_name, join_phrase, artist_mbid, \
-     role FROM local_album_artists WHERE local_album_id = ?1 ORDER BY position";
-
 fn credit_rows(conn: &Connection, sql: &str, subject: &str) -> rusqlite::Result<Vec<CreditRow>> {
     conn.prepare_cached(sql)?
         .query_map(params![subject], |row| {
+            let row = CreditColumns::read(row)?;
             Ok(CreditRow {
-                artist_id: row.get(0)?,
-                credited_name: row.get(1)?,
-                join_phrase: row.get(2)?,
-                artist_mbid: row.get(3)?,
-                role: row.get(4)?,
+                artist_id: row.artist_id,
+                credited_name: row.credited_name,
+                join_phrase: row.join_phrase,
+                artist_mbid: row.artist_mbid,
+                role: row.role,
             })
         })?
         .collect()
-}
-
-/// An indexed track as [`artist_from_tracks`] reads it.
-struct NamedTrack {
-    id: String,
-    album_artist: String,
-    album_artist_from_tag: bool,
-    album_artist_sort: Option<String>,
-    artist: String,
 }
 
 /// Give an album row that names the "Unknown Artist" placeholder the
@@ -526,21 +431,8 @@ fn artist_from_tracks(
         return Ok(None);
     }
     let tracks = tx
-        .prepare(
-            "SELECT id, COALESCE(album_artist_name, ''), album_artist_provenance = 'tag', \
-             album_artist_sort, COALESCE(artist_name, '') FROM local_tracks \
-             WHERE local_album_id = ?1 AND availability = 'indexed' \
-             ORDER BY disc_number, track_number, id",
-        )?
-        .query_map(params![album.id], |row| {
-            Ok(NamedTrack {
-                id: row.get(0)?,
-                album_artist: row.get(1)?,
-                album_artist_from_tag: row.get(2)?,
-                album_artist_sort: row.get(3)?,
-                artist: row.get(4)?,
-            })
-        })?
+        .prepare(crate::repairs::sql::TRACK_ARTIST_TAGS.text())?
+        .query_map(params![album.id], NamedTrack::read)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     if tracks.iter().any(|track| !track.album_artist_from_tag) {
         return Ok(None);
@@ -556,7 +448,7 @@ fn artist_from_tracks(
         .iter()
         .filter(|track| fold_text(&track.artist) == name)
     {
-        let credits = credit_rows(tx, TRACK_CREDITS, &track.id)?;
+        let credits = credit_rows(tx, TRACK_CREDITS.text(), &track.id)?;
         match &found {
             None => found = Some((track, credits)),
             Some((_, seen)) if *seen == credits => {}
@@ -580,52 +472,49 @@ fn artist_from_tracks(
     // read the old artist and would land on it; the album stays a
     // candidate and the cleanup after that identification comes back.
     let held: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM library_catalog_actions \
-         WHERE local_album_id = ?1 AND actor_user_id IS NOT NULL) \
-         OR EXISTS(SELECT 1 FROM library_identify_jobs \
-         WHERE local_album_id = ?1 AND state = 'running')",
+        crate::repairs::sql::ALBUM_HAS_PERSON_CHOICE.text(),
         params![album.id],
         |row| row.get(0),
     )?;
     if held || artist_repair_undone(tx, &album.id)? {
         return Ok(None);
     }
-    let (previous_artist, previous_sort): (String, Option<String>) = tx.query_row(
-        "SELECT album_artist_id, album_artist_sort_name FROM local_albums WHERE id = ?1",
+    let previous = tx.query_row(
+        crate::repairs::sql::ALBUM_ARTIST_ID_AND_SORT.text(),
         params![album.id],
-        |row| Ok((row.get(0)?, row.get(1)?)),
+        AlbumArtistAndSort::read,
     )?;
     let before = serde_json::json!({
-        "album_artist_id": previous_artist,
+        "album_artist_id": previous.album_artist_id,
         "album_artist_name": album.artist_name,
         "album_artist_name_folded": album.artist_folded,
-        "album_artist_sort_name": previous_sort,
-        "credits": credit_rows(tx, ALBUM_CREDITS, &album.id)?,
+        "album_artist_sort_name": previous.album_artist_sort_name,
+        "credits": credit_rows(tx, ALBUM_CREDITS.text(), &album.id)?,
     });
     tx.execute(
-        "UPDATE local_albums SET album_artist_name = ?2, album_artist_name_folded = ?3, \
-         album_artist_id = ?4, album_artist_sort_name = ?5, updated_at = ?6, \
-         row_revision = row_revision + 1 WHERE id = ?1",
+        crate::repairs::sql::WRITE_ALBUM_ARTIST.text(),
         params![
             album.id,
             source.album_artist,
             name,
             primary.artist_id,
             source.album_artist_sort,
-            now
+            crate::clock::ms(now)
         ],
     )?;
     write_album_credits(tx, &album.id, &credits)?;
     // An album the placeholder kept unmatched is looked up again under
-    // its artist's name.
-    if identity(tx, &album.id)?.is_none() {
-        offer_again(tx, &album.id, (now * 1000.0) as i64)?;
-    }
+    // its artist's name. The undo takes that look back while it waits.
+    let offered_at_ms = (now * 1000.0) as i64;
+    let offered = identity(tx, &album.id)?.is_none() && offer_again(tx, &album.id, offered_at_ms)?;
     let after = serde_json::json!({
         "kind": "album_artist_from_tracks",
         "album_artist_id": primary.artist_id,
         "album_artist_name": source.album_artist,
+        "album_artist_name_folded": name,
+        "album_artist_sort_name": source.album_artist_sort,
         "credits": credits,
+        "identification_offered_at_ms": offered.then_some(offered_at_ms),
         "filesystem_writes": 0,
     });
     record_action(
@@ -653,11 +542,8 @@ pub const ARTIST_REPAIR_UNDONE: &str = "album_artist_undone";
 
 /// Whether a placeholder-artist repair of the album was undone.
 fn artist_repair_undone(conn: &Connection, album_id: &str) -> rusqlite::Result<bool> {
-    conn.prepare_cached(
-        "SELECT EXISTS(SELECT 1 FROM library_catalog_actions \
-         WHERE local_album_id = ?1 AND action_kind = ?2)",
-    )?
-    .query_row(params![album_id, ARTIST_REPAIR_UNDONE], |row| row.get(0))
+    conn.prepare_cached(crate::repairs::sql::ARTIST_REPAIR_UNDONE.text())?
+        .query_row(params![album_id, ARTIST_REPAIR_UNDONE], |row| row.get(0))
 }
 
 /// The album's artist fields and credits before the repair, as its audit
@@ -678,7 +564,13 @@ struct ArtistBefore {
 struct ArtistAfter {
     album_artist_id: String,
     album_artist_name: String,
+    /// The folded and sort names, absent from audit rows written before
+    /// they were kept.
+    album_artist_name_folded: Option<String>,
+    album_artist_sort_name: Option<String>,
     credits: Vec<CreditRow>,
+    /// When the repair queued a fresh identification of the album.
+    identification_offered_at_ms: Option<i64>,
 }
 
 /// How [`undo_artist_from_tracks`] ended.
@@ -695,43 +587,45 @@ pub enum ArtistRepairUndo {
     Unknown,
 }
 
-/// The repair recorded as `action_id`, its album and what it replaced, or
-/// why [`undo_artist_from_tracks`] would refuse it.
+/// The repair recorded as `action_id`, its album, what it replaced and
+/// what it gave, or why [`undo_artist_from_tracks`] would refuse it.
 fn artist_standing(
     conn: &Connection,
     action_id: &str,
-) -> rusqlite::Result<Result<(String, ArtistBefore), ArtistRepairUndo>> {
-    let action: Option<(Option<String>, String, String)> = conn
-        .prepare_cached(
-            "SELECT local_album_id, before_json, after_json FROM library_catalog_actions \
-             WHERE id = ?1 AND action_kind = 'album_artist' AND reason_code = ?2",
-        )?
-        .query_row(params![action_id, ARTIST_REPAIR_REASON], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })
+) -> rusqlite::Result<Result<(String, ArtistBefore, ArtistAfter), ArtistRepairUndo>> {
+    let action = conn
+        .prepare_cached(crate::repairs::sql::ARTIST_REPAIR_ACTION.text())?
+        .query_row(
+            params![action_id, ARTIST_REPAIR_REASON],
+            ArtistRepairAction::read,
+        )
         .optional()?;
-    let Some((Some(album_id), before, after)) = action else {
+    let Some(ArtistRepairAction {
+        local_album_id: Some(album_id),
+        before_json,
+        after_json,
+    }) = action
+    else {
         return Ok(Err(ArtistRepairUndo::Unknown));
     };
     let (Ok(before), Ok(after)) = (
-        serde_json::from_str::<ArtistBefore>(&before),
-        serde_json::from_str::<ArtistAfter>(&after),
+        serde_json::from_str::<ArtistBefore>(&before_json),
+        serde_json::from_str::<ArtistAfter>(&after_json),
     ) else {
         return Ok(Err(ArtistRepairUndo::Unknown));
     };
-    let current: Option<(Option<String>, Option<String>)> = conn
-        .prepare_cached(
-            "SELECT album_artist_id, album_artist_name FROM local_albums \
-             WHERE id = ?1 AND retired_into_album_id IS NULL",
-        )?
-        .query_row(params![album_id], |row| Ok((row.get(0)?, row.get(1)?)))
+    let current = conn
+        .prepare_cached(crate::repairs::sql::LIVE_ALBUM_ARTIST.text())?
+        .query_row(params![album_id], LiveAlbumArtist::read)
         .optional()?;
-    let unchanged = current
-        == Some((
-            Some(after.album_artist_id.clone()),
-            Some(after.album_artist_name.clone()),
-        ))
-        && credit_rows(conn, ALBUM_CREDITS, &album_id)? == after.credits;
+    let unchanged = current.is_some_and(|now| {
+        now.album_artist_id.as_deref() == Some(after.album_artist_id.as_str())
+            && now.album_artist_name.as_deref() == Some(after.album_artist_name.as_str())
+            && after.album_artist_name_folded.as_ref().is_none_or(|kept| {
+                now.album_artist_name_folded.as_ref() == Some(kept)
+                    && now.album_artist_sort_name == after.album_artist_sort_name
+            })
+    }) && credit_rows(conn, ALBUM_CREDITS.text(), &album_id)? == after.credits;
     if !unchanged || artist_repair_undone(conn, &album_id)? {
         return Ok(Err(ArtistRepairUndo::Stale));
     }
@@ -739,16 +633,13 @@ fn artist_standing(
         .chain(before.credits.iter().map(|credit| &credit.artist_id));
     for artist_id in named {
         let live: bool = conn
-            .prepare_cached(
-                "SELECT EXISTS(SELECT 1 FROM local_artists \
-                 WHERE id = ?1 AND retired_into_artist_id IS NULL)",
-            )?
+            .prepare_cached(crate::repairs::sql::ARTIST_IS_LIVE.text())?
             .query_row(params![artist_id], |row| row.get(0))?;
         if !live {
             return Ok(Err(ArtistRepairUndo::Stale));
         }
     }
-    Ok(Ok((album_id, before)))
+    Ok(Ok((album_id, before, after)))
 }
 
 /// Whether [`undo_artist_from_tracks`] would undo the repair recorded as
@@ -761,15 +652,16 @@ pub fn artist_repair_undoable(conn: &Connection, action_id: &str) -> rusqlite::R
 /// for `actor`: the album's artist id, name, folded name and sort name and
 /// its credits are what they were before it, an audit row
 /// ([`ARTIST_REPAIR_UNDONE`]) keeps the repair from running on the album
-/// again, and the catalog revision moves once. Only while the album still
-/// holds what the repair gave it. No artist row is made or deleted.
+/// again, and the catalog revision moves once. An identification the
+/// repair queued is taken back while it still waits. Only while the album
+/// still holds what the repair gave it. No artist row is made or deleted.
 pub fn undo_artist_from_tracks(
     tx: &Transaction<'_>,
     action_id: &str,
     actor: &str,
     now: f64,
 ) -> rusqlite::Result<ArtistRepairUndo> {
-    let (album_id, before) = match artist_standing(tx, action_id)? {
+    let (album_id, before, after) = match artist_standing(tx, action_id)? {
         Ok(repair) => repair,
         Err(outcome) => return Ok(outcome),
     };
@@ -778,19 +670,27 @@ pub fn undo_artist_from_tracks(
         .clone()
         .unwrap_or_else(|| fold_text(&before.album_artist_name));
     tx.execute(
-        "UPDATE local_albums SET album_artist_name = ?2, album_artist_name_folded = ?3, \
-         album_artist_id = ?4, album_artist_sort_name = ?5, updated_at = ?6, \
-         row_revision = row_revision + 1 WHERE id = ?1",
+        crate::repairs::sql::WRITE_ALBUM_ARTIST.text(),
         params![
             album_id,
             before.album_artist_name,
             folded,
             before.album_artist_id,
             before.album_artist_sort_name,
-            now
+            crate::clock::ms(now)
         ],
     )?;
     write_album_credits(tx, &album_id, &before.credits)?;
+    // The identification the repair queued goes too while it still waits:
+    // it would look the album up under the name just taken back.
+    if let Some(offered_ms) = after.identification_offered_at_ms {
+        let dropped = tx
+            .prepare_cached(crate::repairs::sql::DROP_REPAIR_IDENTIFY_JOB.text())?
+            .execute(params![album_id, offered_ms])?;
+        if dropped > 0 {
+            crate::identify::queue::bump_identification_stream(tx)?;
+        }
+    }
     record_action(
         tx,
         CatalogAction {

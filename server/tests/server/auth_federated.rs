@@ -13,7 +13,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use droppedneedle_auth::federated::jellyfin_login::emby_auth_header;
 use droppedneedle_auth::federated::oidc::{
-    AuthorizeParams, OidcConfig, RawClaims, authorize_url, form_encode, normalise_claims,
+    AuthorizeParams, OidcConfig, RawClaims, authorize_url, form_query, normalise_claims,
     pkce_challenge,
 };
 use droppedneedle_auth::federated::password_import::SESSIONS_SURVIVE_IMPORT;
@@ -24,7 +24,6 @@ use droppedneedle_auth::federated::users::{
 use droppedneedle_auth::prod::{StoredPassword, Verdict};
 use droppedneedle_auth::session::tokens;
 use droppedneedle_auth::users::roles::Role;
-use droppedneedle_auth::wiring::Upstreams;
 use droppedneedle_kernel::runtime_config::Secret;
 use droppedneedle_kernel::runtime_config::secret_sections::{
     JellyfinConnection, LastFmSettings, OidcConnection, PlexConnection,
@@ -35,7 +34,7 @@ use ring::rand::SystemRandom;
 use ring::signature::{RSA_PKCS1_SHA256, RsaKeyPair, RsaPublicKeyComponents};
 use serde_json::{Value, json};
 
-use crate::auth_e2e::{E2e, call};
+use crate::auth_e2e::{E2e, call, call_once};
 use crate::common::auth::AuthRig;
 
 // ---------------------------------------------------------------------------
@@ -310,8 +309,8 @@ async fn land(
         app.clone(),
         "GET",
         &format!(
-            "{path}?code={OIDC_CODE}&state={}",
-            form_encode(&login.state)
+            "{path}?{}",
+            form_query(&[("code", OIDC_CODE), ("state", &login.state)])
         ),
         headers,
         None,
@@ -356,7 +355,7 @@ async fn oidc_sign_in_verifies_the_id_token_and_creates_the_first_admin() {
     assert_eq!(providers(e2e.router()).await["oidc"], true);
 
     // One app throughout: the one-time exchange codes live in its memory.
-    let app = e2e.router();
+    let app = e2e.router_with_fresh_buckets();
     let login = start_oidc(&app, &mock).await;
     // Unmarked: the plain name, then a marked clear of the `__Secure-` one.
     let sent = &login.set_cookies;
@@ -368,7 +367,7 @@ async fn oidc_sign_in_verifies_the_id_token_and_creates_the_first_admin() {
     assert!(
         sent[1].starts_with("__Secure-droppedneedle_oidc_state=; ")
             && sent[1].contains("Max-Age=0")
-            && sent[1].ends_with("; Secure"),
+            && sent[1].contains("; Secure; "),
         "{sent:?}"
     );
     // A callback in a browser that did not start the login is refused.
@@ -469,7 +468,7 @@ async fn oidc_sign_in_verifies_the_id_token_and_creates_the_first_admin() {
         marked
             .cookie
             .starts_with("__Secure-droppedneedle_oidc_state=")
-            && marked.set_cookies[0].ends_with("; Secure"),
+            && marked.set_cookies[0].contains("; Secure; "),
         "{:?}",
         marked.set_cookies
     );
@@ -489,9 +488,179 @@ async fn oidc_sign_in_verifies_the_id_token_and_creates_the_first_admin() {
         cleared.iter().any(
             |value| value.starts_with("__Secure-droppedneedle_oidc_state=; ")
                 && value.contains("Max-Age=0")
-                && value.ends_with("; Secure")
+                && value.contains("; Secure; ")
         ),
         "{cleared:?}"
+    );
+}
+
+/// A callback the `oidc` row cannot cover answers "try again" before it
+/// spends the login state, so reloading it still finishes the sign-in.
+#[tokio::test]
+async fn a_paced_oidc_callback_keeps_its_login_state() {
+    use droppedneedle_auth::federated::FederatedError;
+    use droppedneedle_auth::federated::oidc::{OidcConfig, OidcLogin};
+    use droppedneedle_auth::federated::oidc_http::OidcHttp;
+    use droppedneedle_providers::executor::ScriptedWire;
+    use droppedneedle_providers::{ProviderEndpoints, Providers, oidc};
+
+    let e2e = E2e::open("oidc-paced").await;
+    let auth = e2e.bundle();
+    let providers = Providers::over_wire(
+        Arc::new(ScriptedWire::new()),
+        Arc::new(droppedneedle_kernel::clock::SystemClock),
+        ProviderEndpoints::closed(),
+    );
+    let login = OidcLogin::new(
+        auth.federated.clone(),
+        OidcHttp::new(providers.oidc.clone()),
+        auth.oidc_states.clone(),
+        auth.sessions.clone(),
+        Arc::new(droppedneedle_kernel::clock::SystemClock),
+    );
+    auth.oidc_states
+        .store_state("state-1", "verifier-1")
+        .await
+        .expect("state stores");
+    providers
+        .limiter(oidc::SOURCE)
+        .expect("oidc has a rate row")
+        .cool_down(std::time::Duration::from_secs(60));
+
+    let refused = login
+        .handle_callback(
+            &OidcConfig {
+                enabled: true,
+                issuer: "https://idp.test".to_owned(),
+                client_id: "client".to_owned(),
+                client_secret: None,
+                redirect_uri: "https://app.test/callback".to_owned(),
+                scopes: "openid".to_owned(),
+            },
+            "code",
+            "state-1",
+            None,
+        )
+        .await;
+    assert!(
+        matches!(refused, Err(FederatedError::Paced { .. })),
+        "{refused:?}"
+    );
+    assert_eq!(
+        auth.oidc_states.consume_state("state-1").await.unwrap(),
+        Some("verifier-1".to_owned()),
+        "the state was not spent"
+    );
+}
+
+/// plex.tv turning a PIN start down answers the wait, not a bare 503.
+#[tokio::test]
+async fn a_declined_plex_start_says_how_long_to_wait() {
+    let mock = serve(|_| {
+        Router::new().route(
+            "/pins",
+            post(|| async {
+                let mut wait = HeaderMap::new();
+                wait.insert("retry-after", "7".parse().unwrap());
+                (StatusCode::TOO_MANY_REQUESTS, wait)
+            }),
+        )
+    })
+    .await;
+    let e2e = E2e::open("plex-paced").await.with_plex_tv(mock.clone());
+    e2e.store
+        .save_secret_blocking(PlexConnection {
+            plex_url: mock,
+            plex_token: Secret::new(PLEX_ADMIN_TOKEN),
+            enabled: true,
+            login_enabled: true,
+            music_library_ids: Vec::new(),
+        })
+        .expect("plex settings save");
+
+    // Once only: `call` would obey the answer's wait and ask again until the
+    // tests' patience ran out.
+    let (status, body, headers) =
+        call_once(e2e.router(), "POST", "/api/v3/auth/plex/start", &[], None).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["error"]["code"], "PROVIDER_UNAVAILABLE");
+    assert_eq!(body["error"]["details"]["provider"], "plextv");
+    assert_eq!(headers["retry-after"], "7");
+}
+
+/// OIDC discovery goes out on the `oidc` rate row at user priority. While
+/// the row is resting it sends nothing and answers "try again", and a
+/// callback is held before it spends its login state.
+#[tokio::test]
+async fn oidc_calls_are_paced_by_their_rate_row() {
+    use droppedneedle_auth::federated::FederatedError;
+    use droppedneedle_auth::federated::oidc_http::OidcHttp;
+    use droppedneedle_providers::executor::ScriptedWire;
+    use droppedneedle_providers::{
+        CallOutcome, ProviderEndpoints, Providers, RequestPriority, oidc,
+    };
+
+    let wire = Arc::new(ScriptedWire::new());
+    wire.answer(
+        "https://idp.test/.well-known/openid-configuration",
+        200,
+        &[],
+        json!({
+            "issuer": "https://idp.test",
+            "authorization_endpoint": "https://idp.test/authorize",
+            "token_endpoint": "https://idp.test/token",
+            "jwks_uri": "https://idp.test/keys",
+        })
+        .to_string(),
+    );
+    let providers = Providers::over_wire(
+        wire.clone(),
+        Arc::new(droppedneedle_kernel::clock::SystemClock),
+        ProviderEndpoints::closed(),
+    );
+    let row = providers
+        .limiter(oidc::SOURCE)
+        .expect("oidc has a rate row");
+    let idp = OidcHttp::new(providers.oidc.clone());
+
+    row.cool_down(std::time::Duration::from_secs(60));
+    for refused in [
+        idp.room_for_callback().err(),
+        idp.discover("https://idp.test").await.err(),
+    ] {
+        assert!(
+            matches!(
+                refused,
+                Some(FederatedError::Paced {
+                    provider: "oidc",
+                    retry_after: Some(wait),
+                }) if (1..=61).contains(&wait)
+            ),
+            "{refused:?}"
+        );
+    }
+    assert!(wire.sent().is_empty(), "a resting row sends nothing");
+
+    let fresh = Providers::over_wire(
+        wire.clone(),
+        Arc::new(droppedneedle_kernel::clock::SystemClock),
+        ProviderEndpoints::closed(),
+    );
+    let idp = OidcHttp::new(fresh.oidc.clone());
+    assert!(idp.room_for_callback().is_ok());
+    let doc = idp.discover("https://idp.test/").await.expect("discovery");
+    assert_eq!(doc.token_endpoint, "https://idp.test/token");
+    let calls: Vec<_> = fresh
+        .limiter(oidc::SOURCE)
+        .expect("oidc has a rate row")
+        .calls()
+        .into_iter()
+        .map(|count| (count.priority, count.outcome, count.calls))
+        .collect();
+    assert_eq!(
+        calls,
+        vec![(RequestPriority::UserInitiated, CallOutcome::Ok, 1)],
+        "discovery went through the oidc row"
     );
 }
 
@@ -642,6 +811,10 @@ fn plex_token(headers: &HeaderMap) -> &str {
 /// PIN ids count up from 42 like plex.tv's, so a test can guess them.
 static NEXT_PIN: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(42);
 
+/// `/user` reads of the paced account so far; plex.tv turns the first
+/// two down for pace.
+static PACED_READS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 fn plex_router(_base: String) -> Router {
     async fn create_pin(headers: HeaderMap) -> (StatusCode, Json<Value>) {
         assert!(headers.contains_key("x-plex-client-identifier"));
@@ -649,26 +822,34 @@ fn plex_router(_base: String) -> Router {
         (StatusCode::CREATED, Json(json!({"id": id, "code": "ABCD"})))
     }
     async fn poll_pin(Path(id): Path<i64>) -> Json<Value> {
-        // 43 is an outsider, 44 still pending, every other PIN the member.
+        // 43 is an outsider, 44 still pending, 45 an account plex.tv paces,
+        // every other PIN the member.
         Json(match id {
             43 => json!({"id": 43, "authToken": "acct-outsider"}),
             44 => json!({"id": 44, "authToken": null}),
+            45 => json!({"id": 45, "authToken": "acct-paced"}),
             _ => json!({"id": id, "authToken": "acct-member"}),
         })
     }
-    async fn user(headers: HeaderMap) -> Result<Json<Value>, StatusCode> {
+    async fn user(headers: HeaderMap) -> Result<Json<Value>, (StatusCode, HeaderMap)> {
         match plex_token(&headers) {
+            "acct-paced" if PACED_READS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2 => {
+                let mut wait = HeaderMap::new();
+                wait.insert("retry-after", "0".parse().unwrap());
+                Err((StatusCode::TOO_MANY_REQUESTS, wait))
+            }
+            "acct-paced" => Ok(Json(json!({"uuid": "plex-uuid-5", "username": "paced"}))),
             "acct-member" => Ok(Json(json!({
                 "uuid": "plex-uuid-1", "email": "jane@example.com",
                 "friendlyName": "Jane P", "thumb": "https://plex.test/jane.png",
             }))),
             "acct-outsider" => Ok(Json(json!({"uuid": "plex-uuid-9", "username": "stranger"}))),
-            _ => Err(StatusCode::UNAUTHORIZED),
+            _ => Err((StatusCode::UNAUTHORIZED, HeaderMap::new())),
         }
     }
     async fn resources(headers: HeaderMap) -> Json<Value> {
         Json(match plex_token(&headers) {
-            "acct-member" => json!([
+            "acct-member" | "acct-paced" => json!([
                 {"clientIdentifier": "phone-1", "provides": "player"},
                 {"clientIdentifier": PLEX_MACHINE, "provides": "server", "accessToken": "srv-token-1"},
             ]),
@@ -713,10 +894,7 @@ fn plex_router(_base: String) -> Router {
 #[tokio::test]
 async fn plex_pins_are_bound_to_their_starter_and_gate_membership() {
     let mock = serve(plex_router).await;
-    let e2e = E2e::open("plex").await.with_upstreams(Upstreams {
-        plex_tv: mock.clone(),
-        ..crate::common::closed_outbound().sign_in()
-    });
+    let e2e = E2e::open("plex").await.with_plex_tv(mock.clone());
     let mut settings = PlexConnection {
         plex_url: mock,
         plex_token: Secret::new(PLEX_ADMIN_TOKEN),
@@ -729,7 +907,7 @@ async fn plex_pins_are_bound_to_their_starter_and_gate_membership() {
         .expect("plex settings save");
     assert_eq!(providers(e2e.router()).await["plex"], true);
     // One app throughout: started PINs live in its memory.
-    let app = e2e.router();
+    let app = e2e.router_with_fresh_buckets();
     let start = |path: &'static str, auth: Option<String>| {
         let app = app.clone();
         async move {
@@ -794,6 +972,45 @@ async fn plex_pins_are_bound_to_their_starter_and_gate_membership() {
     assert_eq!(status, StatusCode::FORBIDDEN);
     let links = linked_accounts(app.clone(), &token).await;
     assert_eq!(links.get("plex").map(String::as_str), Some("Jane P"));
+
+    // plex.tv turns the account read down for pace after the approval: the
+    // poll stays pending and keeps the PIN, and the next one signs in. A
+    // fresh app, so this server's own limit on sign-in calls has room.
+    let paced_app = e2e.router();
+    let (status, body, _) = call(
+        paced_app.clone(),
+        "POST",
+        "/api/v3/auth/plex/start",
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["pin_id"], 45);
+    let claim = json!({"pin_id": 45, "pin_secret": body["pin_secret"], "transport": "bearer"});
+    let (status, body, _) = call(
+        paced_app.clone(),
+        "POST",
+        "/api/v3/auth/plex/poll/login",
+        &[],
+        Some(claim.clone()),
+    )
+    .await;
+    assert_eq!(
+        (status, body["completed"].clone()),
+        (StatusCode::OK, json!(false)),
+        "{body}"
+    );
+    let (status, body, _) = call(
+        paced_app,
+        "POST",
+        "/api/v3/auth/plex/poll/login",
+        &[],
+        Some(claim),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["completed"], true);
 
     // Linking needs a session and stores the account server-side; the
     // answer carries only the name.
@@ -1195,6 +1412,9 @@ async fn old_sessions_die_on_import_while_new_logins_work() {
     let live = issuer.issue_session(&user.id, None).await.unwrap();
     assert!(is_live(live.clone()).await);
 
+    // A v2 export carries no sessions and the import writes none, so a
+    // session from before it cannot be there afterwards. Revoking them here
+    // puts the database in that state.
     rig.auth
         .sessions
         .revoke_all_for_user(&user.id)
@@ -1236,7 +1456,7 @@ async fn imported_app_passwords_verify_on_both_compat_paths() {
     let principal = subsonic::authenticate(&passwords, &params).await.unwrap();
     assert_eq!(principal.user_id, "user-imma");
 
-    let hexed = format!("enc:{}", subsonic::hex_encode(b"imported-secret-1"));
+    let hexed = format!("enc:{}", hex::encode(b"imported-secret-1"));
     let params = subsonic::SubsonicParams::new(vec![("u", "Imma"), ("p", &hexed)]);
     let principal = subsonic::authenticate(&passwords, &params).await.unwrap();
     assert_eq!(principal.user_id, "user-imma");

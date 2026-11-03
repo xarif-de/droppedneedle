@@ -49,20 +49,20 @@ use droppedneedle_auth::{
     prod::ProdAuth,
     wiring::AuthSetup,
 };
-use droppedneedle_catalog::reads::{
-    ReadsInputs, ReadsPorts, ReadsSetup,
-    catalog::{
-        Catalog,
-        library::LocalCatalog,
-        plugin_sources::{PluginDetailsSource, PluginPurchaseLinks},
-        upstream::{LiveCatalogSettings, Upstream},
-    },
+use droppedneedle_catalog::{
+    artwork::ArtworkService,
     collections::{
         CollectionsState, db::CollectionsDb, remote_import::PlaylistImportSink, store::Stores,
     },
     enrichment::{library::LiveEnrichment, live::production_enrichment},
     lyrics::OnlineLyrics,
-    platform::artwork::ArtworkService,
+    metadata::{
+        Catalog,
+        library::LocalCatalog,
+        plugin_sources::{PluginDetailsSource, PluginPurchaseLinks},
+        upstream::{LiveCatalogSettings, Upstream},
+    },
+    wiring::{CatalogInputs, CatalogPorts, CatalogSetup},
 };
 use droppedneedle_compat::{CompatSetup, setup::CompatDeps};
 use droppedneedle_kernel::{
@@ -220,10 +220,8 @@ pub async fn build_with(config: AppConfig, outbound: Outbound) -> Result<Built, 
     // the other loops.
     let queues = jobs::QueueSetup::new(p);
     // Pages queue the background warm of their covers and artist images.
-    let cover_warm = droppedneedle_catalog::reads::platform::artwork::warm::CoverWarm::new(
-        db.clone(),
-        queues.queue().clone(),
-    );
+    let cover_warm =
+        droppedneedle_catalog::artwork::warm::CoverWarm::new(db.clone(), queues.queue().clone());
 
     // The library's write side (the publish cell, its roots and leases):
     // the library and plugin library writes share it, so it is built
@@ -231,7 +229,11 @@ pub async fn build_with(config: AppConfig, outbound: Outbound) -> Result<Built, 
     let library_core = droppedneedle_library::wiring::LibraryCore::build(
         p,
         queues.queue().clone(),
-        droppedneedle_acquire::wiring::recycle_guard(&p.settings, p.config.imports_dir()),
+        droppedneedle_acquire::wiring::recycle_guard(
+            &p.settings,
+            p.config.imports_dir(),
+            p.config.slskd_downloads_path.clone(),
+        ),
     )
     .map_err(stage("library setup"))?;
     // The plugin host exists early so playback, acquisition and streaming
@@ -239,8 +241,9 @@ pub async fn build_with(config: AppConfig, outbound: Outbound) -> Result<Built, 
     let plugin_ticks = droppedneedle_plugins::wiring::tick_store(p);
     let plugin_host =
         droppedneedle_plugins::wiring::new_host(p, &plugin_ticks, library_core.clone());
-    // Shared provider deps first: auth links Last.fm accounts through the
-    // one Last.fm client, and the reads enrichment pair paces through these
+    // Shared provider deps first: auth links Last.fm accounts, signs in
+    // with Plex and OIDC and screens passwords through their one client
+    // each, and the catalog enrichment pair paces through these
     // same limiters, so production holds one limiter set. The answer cache
     // stays shared with the admin stats and clear routes.
     let providers = Arc::new(Providers::build(p, outbound.providers(), cache_db.clone()));
@@ -248,8 +251,7 @@ pub async fn build_with(config: AppConfig, outbound: Outbound) -> Result<Built, 
     let auth = AuthSetup::build(
         p,
         ProdAuth::new(p),
-        &outbound.sign_in(),
-        &providers.lastfm,
+        &providers,
         Arc::new(ConfiguredPlexServer::new(
             http.shared().clone(),
             config_store.live(),
@@ -258,6 +260,9 @@ pub async fn build_with(config: AppConfig, outbound: Outbound) -> Result<Built, 
         sign_in_links(p),
     );
 
+    // The one listening store: discovery, wrapped, the Weekly Mix,
+    // playback reporting and the listening settings all hold it.
+    let listening = ListeningStore::new(db.clone(), crypto.clone(), p.clock.clone());
     // Read live so turning ListenBrainz, Last.fm or lyrics on or off takes effect
     // at once.
     let enrichment = production_enrichment(
@@ -265,11 +270,10 @@ pub async fn build_with(config: AppConfig, outbound: Outbound) -> Result<Built, 
         config_store.live(),
         config_store.live(),
         config_store.live(),
+        listening.clone(),
+        auth.users.clone(),
     );
-    // The one listening store: discovery, wrapped, the Weekly Mix,
-    // playback reporting and the listening settings all hold it.
-    let listening = ListeningStore::new(db.clone(), crypto.clone(), p.clock.clone());
-    let reads_inputs = ReadsInputs {
+    let catalog_inputs = CatalogInputs {
         covers_dir: config.cache_dir.join("covers"),
         cover_cache_max_bytes: config.cover_cache_max_bytes,
         http: http.shared().clone(),
@@ -295,7 +299,7 @@ pub async fn build_with(config: AppConfig, outbound: Outbound) -> Result<Built, 
     .with_purchase_links(Arc::new(PluginPurchaseLinks(plugin_host.clone())))
     .with_details(Arc::new(PluginDetailsSource(plugin_host.clone())))
     .with_cover_warm(cover_warm.clone());
-    let artwork = droppedneedle_catalog::reads::artwork(p, &reads_inputs, catalog.clone());
+    let artwork = droppedneedle_catalog::wiring::artwork(p, &catalog_inputs, catalog.clone());
     let collections_db = CollectionsDb::new(db.clone(), p.clock.clone());
     let collections = Stores::new(&collections_db);
     // Flow outcomes (fulfilled requests among them) go to plugins and the
@@ -347,13 +351,13 @@ pub async fn build_with(config: AppConfig, outbound: Outbound) -> Result<Built, 
     .map_err(stage("acquire setup"))?;
     // The one connection resolver every remote read goes through, so the
     // reads people trigger share one bound per source.
-    let remotes = MediaSetup::remotes(p, outbound.plex_tv.clone());
-    let reads = ReadsSetup::build(
+    let remotes = MediaSetup::remotes(p, providers.plextv.clone());
+    let catalog_setup = CatalogSetup::build(
         p,
         auth.users.clone(),
-        reads_inputs,
+        catalog_inputs,
         Some(enrichment),
-        ReadsPorts {
+        CatalogPorts {
             remotes: remotes.clone(),
             collections: CollectionsState::over(collections_db, collections, local),
             catalog,
@@ -373,13 +377,13 @@ pub async fn build_with(config: AppConfig, outbound: Outbound) -> Result<Built, 
         auth.users.clone(),
         library.core.root_source(),
         // Remote playlist imports land in the user's playlists.
-        Arc::new(PlaylistImportSink::new(reads.collections.clone())),
+        Arc::new(PlaylistImportSink::new(catalog_setup.collections.clone())),
         plugin_host.clone(),
         remotes,
         outbound.ffmpeg.clone(),
         &providers,
         mix_hooks.clone(),
-        listening,
+        listening.clone(),
         queues.queue().clone(),
         queues.clock(),
     )
@@ -411,7 +415,7 @@ pub async fn build_with(config: AppConfig, outbound: Outbound) -> Result<Built, 
         media.playback.clone(),
         media.stream.engine.clone(),
         library.scans.clone(),
-        &reads,
+        &catalog_setup,
     ));
     let admin = AdminSetup::new(
         auth.users.clone(),
@@ -450,23 +454,23 @@ pub async fn build_with(config: AppConfig, outbound: Outbound) -> Result<Built, 
         library.contrib_worker.handler(),
     )
     .with_job(
-        droppedneedle_library::recycle_bin::SPEC,
-        droppedneedle_library::recycle_bin::handler(&library.publishing),
+        droppedneedle_library::removal::recycle_bin::SPEC,
+        droppedneedle_library::removal::recycle_bin::handler(&library.publishing),
     )
     .with_mixer(mix_hooks)
-    .with_precache_sources_from(&reads, config_store)
-    .with_cover_warm_jobs(&reads)
+    .with_precache_sources_from(&catalog_setup, config_store, listening.clone())
+    .with_cover_warm_jobs(&catalog_setup)
     .with_job(
         droppedneedle_acquire::imports::jobs::SPEC,
         acquire.spotify_import_jobs.clone(),
     )
     .with_job(library_removal::SPEC, album_cleanup)
     .with_discovery_demand(Arc::new(
-        droppedneedle_catalog::reads::discover::demand::ContentDemand(
-            reads.discover.content.clone(),
+        droppedneedle_catalog::discover::demand::ContentDemand(
+            catalog_setup.discover.content.clone(),
         ),
     ));
-    let admin = match &reads.artwork {
+    let admin = match &catalog_setup.artwork {
         Some(artwork) => admin.with_covers(artwork.cache().clone()),
         None => admin,
     }
@@ -532,7 +536,7 @@ pub async fn build_with(config: AppConfig, outbound: Outbound) -> Result<Built, 
         p.ids.clone(),
         config.clone(),
         auth,
-        reads,
+        catalog_setup,
         media,
         acquire,
         library_services,
@@ -595,17 +599,17 @@ fn library_ports(
     lyrics: OnlineLyrics,
     core: droppedneedle_library::wiring::LibraryCore,
 ) -> droppedneedle_library::wiring::LibraryPorts {
-    let enrichment = LiveEnrichment {
-        acoustid: providers.acoustid.clone(),
-        library: p.settings.live(),
-        upstream: Upstream::new(
+    let enrichment = LiveEnrichment::new(
+        Upstream::new(
             providers.clone(),
             Arc::new(LiveCatalogSettings::new(&p.settings)),
             auth.users.clone(),
         ),
-        artwork: Some(artwork.clone()),
+        Some(artwork.clone()),
         lyrics,
-    };
+        providers.acoustid.clone(),
+        p.settings.live(),
+    );
     let scans = scans.clone();
     droppedneedle_library::wiring::LibraryPorts {
         enrichment: Some(Arc::new(enrichment)),

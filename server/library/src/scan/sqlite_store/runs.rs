@@ -1,9 +1,11 @@
 //! Scan runs: requests, claims, transitions, control, counters, recovery.
 
 use super::*;
+use crate::clock::LibraryClock as _;
 use crate::scan::models::transition;
 use crate::scan::sql;
 use droppedneedle_kernel::db::statement::Statement;
+use droppedneedle_kernel::db::time::Millis;
 
 /// Scan runs: requests, claims, state transitions, control, failures,
 /// counters, and boot recovery.
@@ -51,7 +53,7 @@ impl SqliteScanStore {
             let mut runs = current_runs(conn)?;
             let owing = conn
                 .prepare(sql::RUNS_OWING_END_PASSES.text())?
-                .query_map(params![FailureCode::RunEndPending], map_run)?
+                .query_map([], map_run)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             runs.extend(owing);
             Ok(runs)
@@ -70,13 +72,16 @@ impl SqliteScanStore {
             None => (None, None),
         };
         self.read("scan_history", |conn| {
-            let mut stmt = conn.prepare(&format!(
-                "SELECT {RUN_COLUMNS} FROM library_scan_runs WHERE terminal_at IS NOT NULL \
-                 AND (?2 IS NULL OR terminal_at < ?2 OR (terminal_at = ?2 AND id < ?3)) \
-                 ORDER BY terminal_at DESC, id DESC LIMIT ?1"
-            ))?;
+            let mut stmt = conn.prepare(crate::scan::sql::LIST_HISTORY.text())?;
             let runs = stmt
-                .query_map(params![limit.max(1) as i64, before_at, before_id], map_run)?
+                .query_map(
+                    params![
+                        limit.max(1) as i64,
+                        before_at.map(crate::clock::ms),
+                        before_id
+                    ],
+                    map_run,
+                )?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(runs)
         })
@@ -84,10 +89,7 @@ impl SqliteScanStore {
 
     pub fn latest_filesystem_terminal(&self) -> Result<Option<ScanRun>, ScanStoreError> {
         let rows = self.read("scan_latest_terminal", |conn| {
-            let mut stmt = conn.prepare(&format!(
-                "SELECT {RUN_COLUMNS} FROM library_scan_runs WHERE terminal_at IS NOT NULL \
-                 ORDER BY terminal_at DESC, id DESC"
-            ))?;
+            let mut stmt = conn.prepare(crate::scan::sql::LATEST_FILESYSTEM_TERMINAL.text())?;
             let runs = stmt
                 .query_map([], map_run)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -109,15 +111,7 @@ impl SqliteScanStore {
     pub fn resumable(&self, stop: &RunStop) -> Result<Option<ScanRun>, ScanStoreError> {
         self.read_long(stop, "scan_resumable", |conn| {
             Ok(conn
-                .query_row(
-                    &format!(
-                        "SELECT {RUN_COLUMNS} FROM library_scan_runs \
-                         WHERE state IN ('discovering','indexing','reconciling','pausing','stopping') \
-                         ORDER BY started_at, id LIMIT 1"
-                    ),
-                    [],
-                    map_run,
-                )
+                .query_row(crate::scan::sql::RESUMABLE.text(), [], map_run)
                 .optional()?)
         })
     }
@@ -189,7 +183,7 @@ impl SqliteScanStore {
                     failure.failure_code,
                     failure.failure_detail,
                     failure.phase.as_str(),
-                    failure.recorded_at,
+                    crate::clock::ms(failure.recorded_at),
                 ])?;
             }
             Ok(())
@@ -200,7 +194,7 @@ impl SqliteScanStore {
         self.read("scan_failures", |conn| {
             let mut stmt = conn.prepare(sql::RUN_FAILURES.text())?;
             let rows = stmt
-                .query_map(params![run_id, FailureCode::RunEndPending], map_failure)?
+                .query_map(params![run_id], map_failure)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
         })
@@ -208,8 +202,7 @@ impl SqliteScanStore {
 
     /// One keyset page of a run's recorded failures, oldest first.
     /// `after` is the cursor the previous page handed back; the answer
-    /// carries the next cursor while more rows remain (v2
-    /// `list_scan_run_failures`).
+    /// carries the next cursor while more rows remain.
     pub fn failures_page(
         &self,
         run_id: &str,
@@ -220,15 +213,20 @@ impl SqliteScanStore {
         let mut rows = self.read("scan_failures_page", |conn| {
             let mut stmt = conn.prepare(sql::RUN_FAILURES_PAGE.text())?;
             let rows = stmt
-                .query_map(
-                    params![
-                        run_id,
-                        after,
-                        (limit + 1) as i64,
-                        FailureCode::RunEndPending
-                    ],
-                    |row| Ok((row.get::<_, i64>("rowid")?, map_failure(row)?)),
-                )?
+                .query_map(params![run_id, after, (limit + 1) as i64], |row| {
+                    let row = sql::FailurePageRow::read(row)?;
+                    Ok((
+                        row.rowid,
+                        ScanFailureRecord {
+                            root_id: row.root_id,
+                            relative_path: row.relative_path,
+                            failure_code: row.failure_code,
+                            recorded_at: crate::clock::at_secs(row.recorded_at),
+                            failure_detail: row.failure_detail,
+                            phase: row.phase,
+                        },
+                    ))
+                })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
         })?;
@@ -246,7 +244,7 @@ impl SqliteScanStore {
         self.read("scan_stream_revision", |conn| {
             Ok(conn
                 .query_row(
-                    "SELECT value FROM library_event_stream_revisions WHERE stream_kind = ?1",
+                    crate::scan::sql::STREAM_REVISION.text(),
                     params![kind],
                     |row| row.get::<_, i64>(0),
                 )
@@ -266,12 +264,8 @@ impl SqliteScanStore {
     /// takes effect, then the runs still to drive are listed.
     pub fn recover(&self, stop: &RunStop, now: f64) -> Result<Vec<ScanRun>, ScanStoreError> {
         self.write(stop, Lane::Background, "scan_recover", |tx| {
-            settle_all(tx, "state IN ('pausing','stopping')", now)?;
-            let mut stmt = tx.prepare(&format!(
-                "SELECT {RUN_COLUMNS} FROM library_scan_runs \
-                 WHERE state IN ('queued','discovering','indexing','reconciling','paused') \
-                 ORDER BY queued_at, id"
-            ))?;
+            settle_all(tx, sql::RUNS_PAUSING_OR_STOPPING, now)?;
+            let mut stmt = tx.prepare(crate::scan::sql::RECOVER.text())?;
             let runs = stmt
                 .query_map([], map_run)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -287,7 +281,7 @@ impl SqliteScanStore {
         now: f64,
     ) -> Result<Vec<ScanRun>, ScanStoreError> {
         self.write(stop, Lane::Background, "scan_recover_stopping", |tx| {
-            settle_all(tx, "state = 'stopping'", now)
+            settle_all(tx, sql::RUNS_STOPPING, now)
         })
     }
 
@@ -295,82 +289,63 @@ impl SqliteScanStore {
     /// own background turn after the run's state changed, so no pass keeps
     /// a run from ending. Each turn moves the run's note on to the next
     /// pass, so a stop or a crash resumes where it left off and no pass
-    /// runs twice. A pass that fails or runs out of time is logged and
+    /// runs twice.
+    ///
+    /// A pass that runs out of time or finds the database busy is tried
+    /// again at once; if that fails too it is put off by the clock
+    /// ([`PUT_OFF_WAITS_SECS`]), and this call answers `false`, leaving it
+    /// and every later run's passes until its wait is over. A pass that
+    /// has used every wait, or that fails any other way, is logged and
     /// passed over: the library-wide passes (`join_replaced`,
-    /// `place_scanned`, `continue_tracks`, `converge_artists`) run again at
-    /// the end of every later run, and the run-keyed ones keep their own
-    /// "next scan tries again" records where they have them.
-    pub fn settle_ended_runs(&self, stop: &RunStop) -> Result<(), ScanStoreError> {
-        use super::commit::{END_PASSES, EndWork};
-        let owed: Vec<(String, String, f64)> = self.read_long(stop, "scan_end_owed", |conn| {
-            let rows = conn
-                .prepare(sql::OWED_END_PASSES.text())?
-                .query_map(params![FailureCode::RunEndPending], |row| {
-                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
-        })?;
-        for (run_id, next, ended_at) in owed {
-            let start = END_PASSES
-                .iter()
-                .position(|pass| pass.name == next)
-                .unwrap_or(0);
+    /// `place_scanned`, `continue_tracks`, `converge_artists`) run again
+    /// at the end of every later run, and the run-keyed ones keep their
+    /// own "next scan tries again" records where they have them.
+    ///
+    /// Answers whether every owed pass is settled.
+    pub fn settle_ended_runs(&self, stop: &RunStop) -> Result<bool, ScanStoreError> {
+        use super::commit::END_PASSES;
+        let owed: Vec<(String, String, f64, i64, Option<f64>)> =
+            self.read_long(stop, "scan_end_owed", |conn| {
+                let rows = conn
+                    .prepare(sql::OWED_END_PASSES.text())?
+                    .query_map([], |row| {
+                        let row = sql::OwedEndPass::read(row)?;
+                        Ok((
+                            row.id,
+                            row.next_end_pass,
+                            crate::clock::at_secs(row.terminal_at),
+                            row.end_pass_waits_used,
+                            row.end_pass_retry_at.map(crate::clock::at_secs),
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })?;
+        for (run_id, next, ended_at, used, retry_at) in owed {
+            if retry_at.is_some_and(|at| still_waiting(self.clock.now_secs(), at)) {
+                return Ok(false);
+            }
+            let mut waits_used = usize::try_from(used).unwrap_or(0);
+            let Some(start) = END_PASSES.iter().position(|pass| pass.name == next) else {
+                tracing::warn!(
+                    run_id,
+                    pass = next,
+                    "a scan owes an end pass this release does not have; skipped"
+                );
+                self.write(stop, Lane::Background, "scan_end_passes_done", |tx| {
+                    advance(tx, &run_id, END_PASSES.len())
+                })?;
+                continue;
+            };
             for (at, pass) in END_PASSES.iter().enumerate().skip(start) {
-                let following = END_PASSES.get(at + 1).map(|pass| pass.name);
-                let advance = |tx: &Transaction<'_>| -> Result<(), ScanStoreError> {
-                    match following {
-                        Some(name) => tx.execute(
-                            sql::NEXT_END_PASS.text(),
-                            params![run_id, name, FailureCode::RunEndPending],
-                        )?,
-                        None => tx.execute(
-                            sql::END_PASSES_DONE.text(),
-                            params![run_id, FailureCode::RunEndPending],
-                        )?,
-                    };
-                    Ok(())
-                };
-                let ran = match &pass.work {
-                    EndWork::Whole(run) => self.write(stop, Lane::Background, pass.name, |tx| {
-                        let enqueued = run(tx, &run_id, ended_at)?;
-                        if enqueued > 0 {
-                            let column = Counter::IdentificationEnqueued.column();
-                            tx.execute(
-                                &format!(
-                                    "UPDATE library_scan_runs SET {column} = {column} + ?1 \
-                                     WHERE id = ?2"
-                                ),
-                                params![enqueued, run_id],
-                            )?;
-                        }
-                        advance(tx)
-                    }),
-                    EndWork::ByAlbum { each, tidy } => self
-                        .read_long(stop, pass.name, |conn| {
-                            Ok(super::commit::albums_left(conn, &run_id)?)
-                        })
-                        .and_then(|albums| {
-                            self.write_chunked_by(
-                                stop,
-                                pass.name,
-                                &albums,
-                                END_PASS_ALBUMS,
-                                |chunk, tx| {
-                                    for album_id in chunk {
-                                        each(tx, &run_id, album_id, ended_at)?;
-                                    }
-                                    Ok(chunk.len())
-                                },
-                            )
-                        })
-                        .and_then(|_| {
-                            self.write(stop, Lane::Background, pass.name, |tx| {
-                                tidy(tx, &run_id, ended_at)?;
-                                advance(tx)
-                            })
-                        }),
-                };
+                let mut ran = self.end_pass(stop, &run_id, ended_at, at, END_PASS_ALBUMS);
+                if let Err(error) = &ran
+                    && tried_again(error)
+                {
+                    tracing::warn!(run_id, pass = pass.name, %error, "a scan's end pass is tried again");
+                    Backoff::new().pause(stop, pass.name)?;
+                    ran = self.end_pass(stop, &run_id, ended_at, at, 1);
+                }
                 match ran {
                     Ok(()) => {}
                     Err(
@@ -378,6 +353,25 @@ impl SqliteScanStore {
                         | ScanStoreError::ReadCancelled { .. }
                         | ScanStoreError::LaneClosed),
                     ) => return Err(error),
+                    Err(error) if tried_again(&error) && waits_used < PUT_OFF_WAITS_SECS.len() => {
+                        let wait = PUT_OFF_WAITS_SECS[waits_used];
+                        tracing::warn!(
+                            run_id,
+                            pass = pass.name,
+                            %error,
+                            wait_secs = wait,
+                            "a scan's end pass is put off; no new scan starts until it settles"
+                        );
+                        let retry_at = crate::clock::ms(self.clock.now_secs() + wait);
+                        self.write(stop, Lane::Background, "scan_end_pass_put_off", |tx| {
+                            tx.execute(
+                                sql::PUT_OFF_END_PASS.text(),
+                                params![run_id, (waits_used + 1) as i64, retry_at],
+                            )?;
+                            Ok(())
+                        })?;
+                        return Ok(false);
+                    }
                     Err(error) => {
                         tracing::error!(
                             run_id,
@@ -386,13 +380,98 @@ impl SqliteScanStore {
                             "a scan's end pass failed and was passed over"
                         );
                         self.write(stop, Lane::Background, "scan_end_pass_over", |tx| {
-                            advance(tx)
+                            advance(tx, &run_id, at + 1)
                         })?;
+                    }
+                }
+                // The waits are the pass's own, and moving on cleared the
+                // run's record of them.
+                waits_used = 0;
+            }
+        }
+        Ok(true)
+    }
+
+    /// Run end pass `at` of `run_id` once, a chunk of `albums` albums a
+    /// turn where it works album by album, and move the note on past it.
+    /// A pass whose albums fail still tidies what the albums done so far
+    /// left, and answers the failure.
+    fn end_pass(
+        &self,
+        stop: &RunStop,
+        run_id: &str,
+        ended_at: f64,
+        at: usize,
+        albums: usize,
+    ) -> Result<(), ScanStoreError> {
+        use super::commit::{END_PASSES, EndWork};
+        let Some(pass) = END_PASSES.get(at) else {
+            return Ok(());
+        };
+        match &pass.work {
+            EndWork::Whole(run) => self.write(stop, Lane::Background, pass.name, |tx| {
+                let enqueued = run(tx, run_id, ended_at)?;
+                if enqueued > 0 {
+                    tx.execute(
+                        &crate::scan::sql::add_to_counter(Counter::IdentificationEnqueued),
+                        params![enqueued, run_id],
+                    )?;
+                }
+                advance(tx, run_id, at + 1)
+            }),
+            EndWork::ByAlbum { each, tidy } => {
+                let kept = self
+                    .read_long(stop, pass.name, |conn| {
+                        Ok(super::commit::albums_left(conn, run_id)?)
+                    })
+                    .and_then(|left| {
+                        self.write_chunked_by(stop, pass.name, &left, albums, |chunk, tx| {
+                            for album_id in chunk {
+                                each(tx, run_id, album_id, ended_at)?;
+                            }
+                            Ok(chunk.len())
+                        })
+                    });
+                match kept {
+                    Ok(_) => self.write(stop, Lane::Background, pass.name, |tx| {
+                        tidy(tx, run_id, ended_at)?;
+                        advance(tx, run_id, at + 1)
+                    }),
+                    Err(
+                        error @ (ScanStoreError::Stopped
+                        | ScanStoreError::ReadCancelled { .. }
+                        | ScanStoreError::LaneClosed),
+                    ) => Err(error),
+                    Err(error) => {
+                        let tidied = self.write(stop, Lane::Background, pass.name, |tx| {
+                            Ok(tidy(tx, run_id, ended_at)?)
+                        });
+                        match tidied {
+                            Ok(()) => Err(error),
+                            // A stop, or a tidy that is worth another try,
+                            // says more than the albums' failure.
+                            Err(tidy_error)
+                                if !tried_again(&error)
+                                    && (tried_again(&tidy_error)
+                                        || matches!(
+                                            tidy_error,
+                                            ScanStoreError::Stopped
+                                                | ScanStoreError::ReadCancelled { .. }
+                                                | ScanStoreError::LaneClosed
+                                        )) =>
+                            {
+                                tracing::error!(run_id, pass = pass.name, %error, "a scan's end pass failed and its tidy did not finish");
+                                Err(tidy_error)
+                            }
+                            Err(tidy_error) => {
+                                tracing::error!(run_id, pass = pass.name, error = %tidy_error, "a scan's end pass could not tidy after a failure");
+                                Err(error)
+                            }
+                        }
                     }
                 }
             }
         }
-        Ok(())
     }
 
     /// Clear finished runs' inventory and album moves, then prune history
@@ -404,11 +483,7 @@ impl SqliteScanStore {
         loop {
             let target: Option<String> = self.read_long(stop, "scan_cleanup_target", |conn| {
                 Ok(conn
-                    .query_row(
-                        sql::CLEANUP_TARGET.text(),
-                        params![FailureCode::RunEndPending],
-                        |row| row.get(0),
-                    )
+                    .query_row(sql::CLEANUP_TARGET.text(), [], |row| row.get(0))
                     .optional()?)
             })?;
             let Some(target) = target else {
@@ -458,8 +533,41 @@ impl SqliteScanStore {
 }
 
 /// Albums an end pass works through in one turn. One album's work reads
-/// every move of the run, so a turn holds far fewer albums than rows.
+/// every move of the run, so a turn holds far fewer albums than rows. A
+/// pass tried again after it ran out of time takes one album a turn.
 const END_PASS_ALBUMS: usize = 50;
+
+/// How long an end pass that keeps failing on time or a busy database
+/// waits before each later try: about half an hour in all. A checkpoint, a
+/// backup or swap pressure can hold the database for minutes, and passing
+/// over a run-keyed pass can lose a hands-off mark, so the tries are spread
+/// well past that. They end because new scans wait meanwhile, and a pass
+/// that can never finish must not hold them for good.
+const PUT_OFF_WAITS_SECS: [f64; 5] = [60.0, 120.0, 240.0, 480.0, 900.0];
+
+/// Whether a pass put off until `retry_at` still waits at `now`. A retry
+/// time further off than the longest wait means the clock moved back, and
+/// the pass is due rather than holding new scans until the clock catches up.
+fn still_waiting(now: f64, retry_at: f64) -> bool {
+    let longest = PUT_OFF_WAITS_SECS.iter().copied().fold(0.0, f64::max);
+    retry_at > now && retry_at - now <= longest
+}
+
+/// An end pass failure worth one more try: the database was busy, or the
+/// turn ran out of time.
+fn tried_again(error: &ScanStoreError) -> bool {
+    matches!(
+        error,
+        ScanStoreError::Busy { .. } | ScanStoreError::TxTimeout { .. }
+    )
+}
+
+/// Move run `run_id` on to the pass at `at`, or to none once none is left.
+fn advance(tx: &Transaction<'_>, run_id: &str, at: usize) -> Result<(), ScanStoreError> {
+    let next = super::commit::END_PASSES.get(at).map(|pass| pass.name);
+    tx.execute(sql::NEXT_END_PASS.text(), params![run_id, next])?;
+    Ok(())
+}
 
 /// Delete one chunk of a run's rows by rowid.
 pub(super) fn delete_rowids(
@@ -478,11 +586,7 @@ pub(super) fn delete_rowids(
 
 /// The active and queued runs, the active one first.
 fn current_runs(conn: &Connection) -> Result<Vec<ScanRun>, ScanStoreError> {
-    let mut stmt = conn.prepare(&format!(
-        "SELECT {RUN_COLUMNS} FROM library_scan_runs \
-         WHERE state NOT IN ('completed','cancelled','superseded_policy_changed','failed') \
-         ORDER BY CASE WHEN state = 'queued' THEN 1 ELSE 0 END, queued_at, id"
-    ))?;
+    let mut stmt = conn.prepare(crate::scan::sql::CURRENT_RUNS.text())?;
     let runs = stmt
         .query_map([], map_run)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -508,39 +612,25 @@ fn run_with_scopes(
 /// queue keeps its order, and its current entry moves to the next track
 /// still there. Runs inside the caller's write.
 fn prune_compat_orphans(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
-    let gone = |table: &str| {
-        format!("NOT EXISTS (SELECT 1 FROM local_tracks t WHERE t.id = {table}.file_id)")
-    };
-    let bookmarks = conn.execute(
-        &format!(
-            "DELETE FROM compat_bookmarks WHERE {}",
-            gone("compat_bookmarks")
-        ),
-        [],
-    )?;
-    let queue_gone = gone("compat_play_queue_items");
+    let bookmarks = conn.execute(crate::scan::sql::DROP_ORPHAN_BOOKMARKS.text(), [])?;
     let users: Vec<String> = conn
-        .prepare(&format!(
-            "SELECT DISTINCT user_id FROM compat_play_queue_items WHERE {queue_gone}"
-        ))?
+        .prepare(crate::scan::sql::USERS_WITH_ORPHAN_QUEUE_ITEMS.text())?
         .query_map([], |row| row.get(0))?
         .collect::<rusqlite::Result<_>>()?;
     for user in &users {
         let current: Option<i64> = conn
             .query_row(
-                "SELECT current_index FROM compat_play_queues WHERE user_id = ?1",
+                crate::scan::sql::QUEUE_CURRENT_INDEX.text(),
                 params![user],
                 |row| row.get(0),
             )
             .optional()?
             .flatten();
         let items: Vec<(i64, String, bool)> = conn
-            .prepare(&format!(
-                "SELECT item_index, file_id, {queue_gone} FROM compat_play_queue_items \
-                 WHERE user_id = ?1 ORDER BY item_index"
-            ))?
+            .prepare(crate::scan::sql::QUEUE_ITEMS_OF_USER.text())?
             .query_map(params![user], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                let row = crate::scan::sql::QueueItem::read(row)?;
+                Ok((row.item_index, row.file_id, row.gone))
             })?
             .collect::<rusqlite::Result<_>>()?;
         let kept: Vec<(i64, String)> = items
@@ -551,19 +641,15 @@ fn prune_compat_orphans(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
         let new_current = current
             .and_then(|old| kept.iter().position(|(index, _)| *index >= old))
             .and_then(|position| i64::try_from(position).ok());
-        conn.execute(
-            "DELETE FROM compat_play_queue_items WHERE user_id = ?1",
-            params![user],
-        )?;
+        conn.execute(crate::scan::sql::CLEAR_QUEUE_ITEMS.text(), params![user])?;
         for (position, (_, file_id)) in (0_i64..).zip(&kept) {
             conn.execute(
-                "INSERT INTO compat_play_queue_items (user_id, item_index, file_id) \
-                 VALUES (?1, ?2, ?3)",
+                crate::scan::sql::ADD_QUEUE_ITEM.text(),
                 params![user, position, file_id],
             )?;
         }
         conn.execute(
-            "UPDATE compat_play_queues SET current_index = ?2 WHERE user_id = ?1",
+            crate::scan::sql::SET_QUEUE_CURRENT_INDEX.text(),
             params![user, new_current],
         )?;
     }
@@ -602,17 +688,15 @@ fn already_done(state: RunState, event: Event) -> bool {
     }
 }
 
-/// Settle every run `filter` selects, each by its own transition. Returns
+/// Settle every run the statement `runs` lists, each by its own transition. Returns
 /// the settled runs.
 fn settle_all(
     tx: &Transaction<'_>,
-    filter: &str,
+    runs: Statement,
     now: f64,
 ) -> Result<Vec<ScanRun>, ScanStoreError> {
     let ids: Vec<String> = tx
-        .prepare(&format!(
-            "SELECT id FROM library_scan_runs WHERE {filter} ORDER BY queued_at, id"
-        ))?
+        .prepare(runs.text())?
         .query_map([], |row| row.get(0))?
         .collect::<rusqlite::Result<_>>()?;
     ids.iter()
@@ -651,7 +735,7 @@ fn apply_event(
     let mut timings = run.phase_timings.clone();
     let mut phase_started_at: Option<f64> =
         tx.query_row(sql::PHASE_STARTED_AT.text(), params![run_id], |row| {
-            row.get(0)
+            Ok(row.get::<_, Option<Millis>>(0)?.map(crate::clock::at_secs))
         })?;
     if run.state.timed() != next.timed() {
         if let (Some(phase), Some(started)) = (run.state.timed(), phase_started_at) {
@@ -671,16 +755,16 @@ fn apply_event(
             next.phase().as_str(),
             next.resume_phase().map(ScanPhase::as_str),
             next.requested_control().as_str(),
-            (event == Event::Claim).then_some(now),
-            ended.then_some(now),
+            (event == Event::Claim).then_some(crate::clock::ms(now)),
+            ended.then_some(crate::clock::ms(now)),
             terminal_code.filter(|_| ended).map(FailureCode::as_str),
-            phase_started_at,
+            phase_started_at.map(crate::clock::ms),
             timings,
-            now,
+            crate::clock::ms(now),
         ],
     )?;
     if ended {
-        super::commit::owe_end_passes(tx, run_id, now)?;
+        super::commit::owe_end_passes(tx, run_id)?;
     }
     bump_scan_stream(tx)?;
     load_run(tx, run_id)?.ok_or_else(|| not_found(run_id))
@@ -692,11 +776,7 @@ fn request_run_inner(
     run_id: &str,
     requested_at: f64,
 ) -> rusqlite::Result<ScanRequestResult> {
-    let mut stmt = conn.prepare(&format!(
-        "SELECT {RUN_COLUMNS} FROM library_scan_runs \
-         WHERE state NOT IN ('completed','cancelled','superseded_policy_changed','failed') \
-         ORDER BY CASE WHEN state = 'queued' THEN 1 ELSE 0 END, rowid"
-    ))?;
+    let mut stmt = conn.prepare(crate::scan::sql::OPEN_RUN_TO_JOIN.text())?;
     let current: Vec<ScanRun> = stmt
         .query_map([], map_run)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -729,14 +809,12 @@ fn request_run_inner(
     });
     if let Some(covering) = covering {
         conn.execute(
-            "UPDATE library_scan_runs SET coalesced_request_count = coalesced_request_count + 1, \
-             updated_at = ?1, row_revision = row_revision + 1, event_revision = event_revision + 1 \
-             WHERE id = ?2",
-            params![requested_at, covering.id],
+            crate::scan::sql::COALESCE_RUN_REQUEST.text(),
+            params![crate::clock::ms(requested_at), covering.id],
         )?;
         bump_scan_stream(conn)?;
         let revision: i64 = conn.query_row(
-            "SELECT row_revision FROM library_scan_runs WHERE id = ?1",
+            crate::scan::sql::RUN_REVISION.text(),
             params![covering.id],
             |row| row.get(0),
         )?;
@@ -785,7 +863,7 @@ fn request_run_inner(
             .cloned()
             .collect();
         let mut sequence: i64 = conn.query_row(
-            "SELECT COALESCE(MAX(scope_sequence), -1) FROM library_scan_run_scopes WHERE run_id = ?1",
+            crate::scan::sql::LAST_SCOPE_SEQUENCE.text(),
             params![queued_id],
             |row| row.get(0),
         )?;
@@ -797,17 +875,14 @@ fn request_run_inner(
             })
         }) {
             conn.execute(
-                "DELETE FROM library_scan_run_scopes \
-                 WHERE run_id = ?1 AND root_id = ?2 AND relative_path = ?3",
+                crate::scan::sql::DROP_RUN_SCOPE.text(),
                 params![queued_id, existing.root_id, existing.relative_path],
             )?;
         }
         for scope in &additions {
             sequence += 1;
             conn.execute(
-                "INSERT INTO library_scan_run_scopes (run_id, scope_sequence, root_id, scope_id, \
-                 relative_path, root_path, effective_policy, policy_revision, estimated_count) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                crate::scan::sql::ADD_RUN_SCOPE.text(),
                 params![
                     queued_id,
                     sequence,
@@ -821,7 +896,7 @@ fn request_run_inner(
                 ],
             )?;
         }
-        // Quirk port: aggregate_scope derives from the request alone.
+        // Quirk (v2): aggregate_scope derives from the request alone.
         let aggregate = if request
             .scopes
             .iter()
@@ -832,13 +907,12 @@ fn request_run_inner(
             "selected"
         };
         conn.execute(
-            "UPDATE library_scan_runs SET aggregate_scope = ?1, updated_at = ?2, \
-             row_revision = row_revision + 1, event_revision = event_revision + 1 WHERE id = ?3",
-            params![aggregate, requested_at, queued_id],
+            crate::scan::sql::SET_RUN_AGGREGATE_SCOPE.text(),
+            params![aggregate, crate::clock::ms(requested_at), queued_id],
         )?;
         bump_scan_stream(conn)?;
         let revision: i64 = conn.query_row(
-            "SELECT row_revision FROM library_scan_runs WHERE id = ?1",
+            crate::scan::sql::RUN_REVISION.text(),
             params![queued_id],
             |row| row.get(0),
         )?;
@@ -872,24 +946,19 @@ fn fresh_run(
         "selected"
     };
     conn.execute(
-        "INSERT INTO library_scan_runs (id, kind, trigger, requested_by_user_id, state, phase, \
-         aggregate_scope, queued_at, updated_at, inventory_cleanup_pending, \
-         row_revision, event_revision) \
-         VALUES (?1, ?2, ?3, ?4, 'queued', 'queued', ?5, ?6, ?6, 1, 1, 0)",
+        crate::scan::sql::ADD_RUN.text(),
         params![
             run_id,
             request.kind.as_str(),
             request.trigger.as_str(),
             request.requested_by_user_id,
             aggregate,
-            requested_at,
+            crate::clock::ms(requested_at),
         ],
     )?;
     for (sequence, scope) in request.scopes.iter().enumerate() {
         conn.execute(
-            "INSERT INTO library_scan_run_scopes (run_id, scope_sequence, root_id, scope_id, \
-             relative_path, root_path, effective_policy, policy_revision, estimated_count) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            crate::scan::sql::ADD_RUN_SCOPE.text(),
             params![
                 run_id,
                 sequence as i64,
@@ -923,21 +992,16 @@ fn fresh_run(
 }
 
 fn claim_next_inner(tx: &Transaction<'_>, now: f64) -> Result<Option<ScanRun>, ScanStoreError> {
-    let blocked: i64 = tx.query_row(
-        "SELECT COUNT(*) FROM library_scan_runs \
-         WHERE state IN ('discovering','indexing','reconciling','pausing','paused','stopping')",
-        [],
-        |row| row.get(0),
-    )?;
+    let blocked: i64 = tx.query_row(crate::scan::sql::ACTIVE_RUN_COUNT.text(), [], |row| {
+        row.get(0)
+    })?;
     if blocked > 0 {
         return Ok(None);
     }
     let candidate: Option<String> = tx
-        .query_row(
-            "SELECT id FROM library_scan_runs WHERE state = 'queued' ORDER BY rowid LIMIT 1",
-            [],
-            |row| row.get(0),
-        )
+        .query_row(crate::scan::sql::NEXT_QUEUED_RUN.text(), [], |row| {
+            row.get(0)
+        })
         .optional()?;
     candidate
         .map(|candidate| apply_event(tx, &candidate, None, Event::Claim, now, None))
@@ -945,74 +1009,4 @@ fn claim_next_inner(tx: &Transaction<'_>, now: f64) -> Result<Option<ScanRun>, S
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn column<T: rusqlite::types::FromSql>(conn: &rusqlite::Connection, sql: &str) -> Vec<T> {
-        conn.prepare(sql)
-            .unwrap()
-            .query_map([], |row| row.get(0))
-            .unwrap()
-            .collect::<rusqlite::Result<_>>()
-            .unwrap()
-    }
-
-    #[test]
-    fn compat_orphans_go_and_the_queue_keeps_its_place() {
-        let (_dir, store) = scratch_store();
-        let check = |conn: &Connection| -> Result<(), ScanStoreError> {
-            conn.execute_batch(
-                "INSERT INTO auth_users (id, display_name, created_at) VALUES
-                 ('u', 'U', 0), ('v', 'V', 0);
-             INSERT INTO local_artists (id, display_name, folded_name, kind, created_at,
-                 updated_at) VALUES ('ar', 'Artist', 'artist', 'person', 1000, 1000);
-             INSERT INTO local_albums (id, root_id, grouping_key, title, title_folded,
-                 album_artist_name, album_artist_name_folded, album_artist_id, grouping_source,
-                 created_at, updated_at) VALUES
-                 ('al', 'r1', 'g1', 'Album', 'album', 'Artist', 'artist', 'ar', 'automatic',
-                  1000, 1000);
-             INSERT INTO local_tracks (id, local_album_id, root_id, file_path, relative_path,
-                 path_hash, file_size_bytes, file_mtime_ns, stat_revision, title, title_folded,
-                 album_title, album_title_folded, disc_number, track_number, duration_seconds,
-                 file_format, availability, ingest_source, imported_at, membership_source) VALUES
-                 ('a', 'al', 'r1', '/m/a', 'a', 'ha', 1, 1, 'sa', 'A', 'a', 'Album', 'album',
-                  1, 1, 1.0, 'flac', 'indexed', 'scan', 1000.0, 'automatic'),
-                 ('c', 'al', 'r1', '/m/c', 'c', 'hc', 1, 1, 'sc', 'C', 'c', 'Album', 'album',
-                  1, 2, 1.0, 'flac', 'indexed', 'scan', 1000.0, 'automatic'),
-                 ('d', 'al', 'r1', '/m/d', 'd', 'hd', 1, 1, 'sd', 'D', 'd', 'Album', 'album',
-                  1, 3, 1.0, 'flac', 'indexed', 'scan', 1000.0, 'automatic');
-             INSERT INTO compat_bookmarks (user_id, file_id, position_ms, created_at, changed_at)
-                 VALUES ('u', 'a', 1, 0, 0), ('u', 'gone', 2, 0, 0);
-             INSERT INTO compat_play_queues (user_id, current_index, updated_at)
-                 VALUES ('u', 1, 0), ('v', 0, 0);
-             INSERT INTO compat_play_queue_items (user_id, item_index, file_id) VALUES
-                 ('u', 0, 'a'), ('u', 1, 'gone'), ('u', 2, 'c'), ('u', 3, 'd'),
-                 ('v', 0, 'a');",
-            )
-            .unwrap();
-            prune_compat_orphans(conn).unwrap();
-            let bookmarks: Vec<String> = column(conn, "SELECT file_id FROM compat_bookmarks");
-            assert_eq!(bookmarks, ["a"]);
-            let queue: Vec<String> = column(
-                conn,
-                "SELECT file_id FROM compat_play_queue_items WHERE user_id = 'u' ORDER BY item_index",
-            );
-            assert_eq!(queue, ["a", "c", "d"]);
-            let indexes: Vec<i64> = column(
-                conn,
-                "SELECT item_index FROM compat_play_queue_items WHERE user_id = 'u' ORDER BY item_index",
-            );
-            assert_eq!(indexes, [0, 1, 2]);
-            let current: Vec<Option<i64>> = column(
-                conn,
-                "SELECT current_index FROM compat_play_queues ORDER BY user_id",
-            );
-            // The next surviving track becomes current; other queues are untouched.
-            assert_eq!(current, [Some(1), Some(0)]);
-            Ok(())
-        };
-        store
-            .write_once(Lane::Foreground, "test", |tx| check(tx))
-            .unwrap();
-    }
-}
+mod tests;

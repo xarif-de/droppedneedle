@@ -27,6 +27,7 @@
 //! a reference to a user v2 no longer has is emptied, as v2's own
 //! `ON DELETE SET NULL` would have done.
 
+use super::requests::millis;
 use super::{Column, Parent, Source, TableSection, Target, col};
 
 /// The value of a user column, or NULL when v2 no longer has that user.
@@ -69,8 +70,8 @@ pub const ARTISTS: TableSection = TableSection {
         col("normalized_name"),
         col("kind"),
         col("retired_into_artist_id"),
-        col("created_at"),
-        col("updated_at"),
+        Column::new("created_at").from_sql(concat!("COALESCE(", millis!("created_at"), ", 0)")),
+        Column::new("updated_at").from_sql(concat!("COALESCE(", millis!("updated_at"), ", 0)")),
         col("row_revision"),
     ],
     key: &["id"],
@@ -104,8 +105,8 @@ pub const ALBUMS: TableSection = TableSection {
         col("grouping_source"),
         col("grouping_locked"),
         col("retired_into_album_id"),
-        col("created_at"),
-        col("updated_at"),
+        Column::new("created_at").from_sql(concat!("COALESCE(", millis!("created_at"), ", 0)")),
+        Column::new("updated_at").from_sql(concat!("COALESCE(", millis!("updated_at"), ", 0)")),
         col("row_revision"),
     ],
     key: &["id"],
@@ -157,7 +158,7 @@ pub const TRACKS: TableSection = TableSection {
         col("stat_revision"),
         col("stat_revision_kind"),
         col("tag_revision"),
-        col("tags_read_at"),
+        Column::new("tags_read_at").from_sql(millis!("tags_read_at")),
         col("metadata_incomplete"),
         col("title"),
         col("title_folded"),
@@ -198,12 +199,12 @@ pub const TRACKS: TableSection = TableSection {
         col("replaygain_track_peak"),
         col("replaygain_album_peak"),
         col("availability"),
-        col("missing_since"),
-        col("excluded_at"),
+        Column::new("missing_at").from_sql(millis!("missing_since")),
+        Column::new("excluded_at").from_sql(millis!("excluded_at")),
         col("ingest_source"),
         col("download_task_id"),
         col("source_path"),
-        col("imported_at"),
+        Column::new("imported_at").from_sql(concat!("COALESCE(", millis!("imported_at"), ", 0)")),
         Column::new("membership_source").from_sql(
             "CASE s.membership_source WHEN 'automatic' THEN 'legacy_import' \
              ELSE s.membership_source END",
@@ -268,30 +269,6 @@ pub const TRACK_GENRES: TableSection = TableSection {
     left_behind: "",
 };
 
-/// Stand-ins v2 keeps for playlist entries whose track left the library.
-pub const TOMBSTONES: TableSection = TableSection {
-    name: "library_tombstone",
-    source: table("library_reference_tombstones"),
-    target: Target::Table("library_reference_tombstones"),
-    columns: &[
-        col("id"),
-        col("source_kind"),
-        col("source_key"),
-        col("legacy_file_id"),
-        col("title"),
-        col("artist_name"),
-        col("album_name"),
-        col("source_type"),
-        col("created_at"),
-        col("row_revision"),
-    ],
-    key: &["id"],
-    unique: &[&["source_kind", "source_key"]],
-    parents: &[],
-    user_column: None,
-    left_behind: "",
-};
-
 /// Links from artists, albums and tracks to pages on other services.
 pub const SOURCE_LINKS: TableSection = TableSection {
     name: "library_source_link",
@@ -308,9 +285,9 @@ pub const SOURCE_LINKS: TableSection = TableSection {
         col("canonical_url"),
         col("decision_source"),
         Column::new("selected_by_user_id").from_sql(live_user!("selected_by_user_id")),
-        col("verified_at"),
-        col("created_at"),
-        col("updated_at"),
+        Column::new("verified_at").from_sql(concat!("COALESCE(", millis!("verified_at"), ", 0)")),
+        Column::new("created_at").from_sql(concat!("COALESCE(", millis!("created_at"), ", 0)")),
+        Column::new("updated_at").from_sql(concat!("COALESCE(", millis!("updated_at"), ", 0)")),
         col("row_revision"),
     ],
     key: &["id"],
@@ -333,7 +310,7 @@ pub const ARTIST_ALIASES: TableSection = TableSection {
         col("alias"),
         col("local_artist_id"),
         col("kind"),
-        col("created_at"),
+        Column::new("created_at").from_sql(concat!("COALESCE(", millis!("created_at"), ", 0)")),
     ],
     key: &["alias"],
     unique: &[],
@@ -351,7 +328,7 @@ pub const ALBUM_ALIASES: TableSection = TableSection {
         col("alias"),
         col("local_album_id"),
         col("kind"),
-        col("created_at"),
+        Column::new("created_at").from_sql(concat!("COALESCE(", millis!("created_at"), ", 0)")),
     ],
     key: &["alias"],
     unique: &[],
@@ -371,7 +348,7 @@ pub const ARTIST_IDENTITIES: TableSection = TableSection {
         col("provider_artist_id"),
         col("decision_source"),
         Column::new("selected_by_user_id").from_sql(live_user!("selected_by_user_id")),
-        col("selected_at"),
+        Column::new("selected_at").from_sql(concat!("COALESCE(", millis!("selected_at"), ", 0)")),
         col("row_revision"),
         col("provider_source_mode"),
         col("provider_source_id"),
@@ -397,7 +374,7 @@ pub const ALBUM_IDENTITIES: TableSection = TableSection {
         col("decision_source"),
         col("matcher_version"),
         Column::new("selected_by_user_id").from_sql(live_user!("selected_by_user_id")),
-        col("selected_at"),
+        Column::new("selected_at").from_sql(concat!("COALESCE(", millis!("selected_at"), ", 0)")),
         col("row_revision"),
         col("provider_source_mode"),
         col("provider_source_id"),
@@ -425,7 +402,7 @@ pub const TRACK_IDENTITIES: TableSection = TableSection {
         col("medium_position"),
         col("release_track_position"),
         col("decision_source"),
-        col("selected_at"),
+        Column::new("selected_at").from_sql(concat!("COALESCE(", millis!("selected_at"), ", 0)")),
         col("row_revision"),
         col("provider_source_mode"),
         col("provider_source_id"),
@@ -460,9 +437,14 @@ pub const KEPT_TAGGED: TableSection = TableSection {
         Column::new("state")
             .from_sql("CASE s.state WHEN 'excluded' THEN 'excluded' ELSE 'rejected' END"),
         Column::new("resolved_by_user_id").from_sql(live_user!("decided_by_user_id")),
-        Column::new("created_ms").from_sql("CAST(s.created_at * 1000 AS INTEGER)"),
-        Column::new("updated_ms")
-            .from_sql("CAST(COALESCE(s.decided_at, s.updated_at) * 1000 AS INTEGER)"),
+        Column::new("created_at").from_sql(concat!("COALESCE(", millis!("created_at"), ", 0)")),
+        Column::new("updated_at").from_sql(concat!(
+            "COALESCE(",
+            millis!("decided_at"),
+            ", ",
+            millis!("updated_at"),
+            ", 0)"
+        )),
     ],
     key: &["id"],
     unique: &[],
@@ -492,11 +474,11 @@ pub const REQUEUED_REVIEWS: TableSection = TableSection {
         Column::new("priority").from_sql("40"),
         Column::new("state").from_sql("'queued'"),
         Column::new("attempts").from_sql("0"),
-        Column::new("not_before_ms").from_sql("0"),
+        Column::new("not_before_at").from_sql("0"),
         Column::new("input_revision").from_sql("'v2-review'"),
         Column::new("idempotency_key").from_sql("s.local_album_id || ':v2-review'"),
-        Column::new("created_ms").from_sql("CAST(s.created_at * 1000 AS INTEGER)"),
-        Column::new("updated_ms").from_sql("CAST(s.updated_at * 1000 AS INTEGER)"),
+        Column::new("created_at").from_sql(concat!("COALESCE(", millis!("created_at"), ", 0)")),
+        Column::new("updated_at").from_sql(concat!("COALESCE(", millis!("updated_at"), ", 0)")),
     ],
     key: &["id"],
     unique: &[&["idempotency_key"]],
@@ -509,7 +491,7 @@ pub const REQUEUED_REVIEWS: TableSection = TableSection {
 pub const ALBUM_PINS: TableSection = TableSection {
     name: "album_pin",
     source: table("library_album_release_pins"),
-    target: Target::Table("library_album_release_pins"),
+    target: Target::BundleOnly,
     columns: &[
         col("local_album_id"),
         col("release_group_mbid"),
@@ -535,8 +517,8 @@ pub const MERGE_CANDIDATES: TableSection = TableSection {
         col("right_artist_id"),
         col("reason_code"),
         col("state"),
-        col("created_at"),
-        col("updated_at"),
+        Column::new("created_at").from_sql(concat!("COALESCE(", millis!("created_at"), ", 0)")),
+        Column::new("updated_at").from_sql(concat!("COALESCE(", millis!("updated_at"), ", 0)")),
         col("row_revision"),
     ],
     key: &["id"],
@@ -561,8 +543,8 @@ pub const ARTIST_DISMISSALS: TableSection = TableSection {
         col("right_artist_revision"),
         col("dismissed_by_user_id"),
         col("reason_code"),
-        col("created_at"),
-        col("updated_at"),
+        Column::new("created_at").from_sql(concat!("COALESCE(", millis!("created_at"), ", 0)")),
+        Column::new("updated_at").from_sql(concat!("COALESCE(", millis!("updated_at"), ", 0)")),
         col("row_revision"),
     ],
     key: &["left_artist_id", "right_artist_id"],

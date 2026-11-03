@@ -1,14 +1,15 @@
 //! Scope selection for scans someone asks for by hand.
 //!
 //! A caller names roots and path rules by id; this turns those ids into
-//! the scopes a run walks (v2 `_selected_scopes`). No ids means every
+//! the scopes a run walks. No ids means every
 //! root. A rule whose root is also selected, or a rule inside another
 //! selected rule, adds nothing: the wider scope already walks it.
 
 use std::collections::BTreeSet;
+use std::path::Path;
 
-use super::models::{ScanScope, scope_covers_path};
-use super::roots::RootRegistry;
+use super::models::ScanScope;
+use super::roots::{RootRegistry, on_disk_rule_paths, scope_covers};
 
 /// Some selected ids name no root or rule the scan engine knows. Holds
 /// those ids, sorted.
@@ -29,7 +30,7 @@ pub fn select_scopes(
         let root_path = root.path.to_string_lossy();
         if selected.is_empty() || selected.contains(root.id.as_str()) {
             matched.insert(root.id.as_str());
-            let mut scope = ScanScope::root(&root.id, &root_path, registry.policy_revision());
+            let mut scope = ScanScope::root(&root.id, &root_path, registry.fingerprint());
             scope.effective_policy = root.policy;
             candidates.push(scope);
         }
@@ -44,7 +45,7 @@ pub fn select_scopes(
                 relative_path: rule.relative_path.clone(),
                 root_path: Some(root_path.clone().into_owned()),
                 effective_policy: rule.policy,
-                policy_revision: registry.policy_revision().to_owned(),
+                policy_revision: registry.fingerprint().to_owned(),
                 estimated_count: None,
             });
         }
@@ -73,13 +74,29 @@ pub fn select_scopes(
     for candidate in candidates {
         let covered = scopes.iter().any(|kept| {
             kept.root_id == candidate.root_id
-                && scope_covers_path(&kept.relative_path, &candidate.relative_path)
+                && scope_covers(&kept.relative_path, &candidate.relative_path)
         });
         if !covered {
             scopes.push(candidate);
         }
     }
-    Ok(scopes)
+    Ok(scopes.into_iter().flat_map(on_disk_scopes).collect())
+}
+
+/// One scope for each folder a rule's scope matches on the disk. A root's
+/// scope stays as it is.
+fn on_disk_scopes(scope: ScanScope) -> Vec<ScanScope> {
+    let root = match scope.root_path.as_deref() {
+        Some(root) if scope.relative_path != "." => root,
+        _ => return vec![scope],
+    };
+    on_disk_rule_paths(Path::new(root), &scope.relative_path)
+        .into_iter()
+        .map(|relative_path| ScanScope {
+            relative_path,
+            ..scope.clone()
+        })
+        .collect()
 }
 
 /// Path depth in components; the root scope `.` sorts first.

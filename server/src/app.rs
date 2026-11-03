@@ -14,10 +14,10 @@
 //!    case) a preflight answers 204 with compat CORS before auth, a
 //!    case-variant path is rewritten to the casing its compat route
 //!    recorded (Feishin posts lower-case Jellyfin paths), and every answer
-//!    carries compat CORS, so a native 404 or 405 there looks like a
-//!    disabled protocol's 404 and the enabled protocols cannot be
-//!    enumerated. Any other path goes through the debug-only CORS layer
-//!    when the constructor enables it.
+//!    carries compat CORS and no 404 carries `Allow`, so a native 404 or
+//!    405 there looks like a disabled protocol's 404 and the enabled
+//!    protocols and their routes cannot be enumerated. Any other path goes
+//!    through the debug-only CORS layer when the constructor enables it.
 //! 5. The router: the routes, a plain 404 fallback that serves the web UI
 //!    for a GET outside the API and compat paths, and a plain 405.
 //!
@@ -26,9 +26,11 @@
 //! fallback, layered ones included, so no layer on an inner router sees an
 //! OPTIONS or wrong-method request on an existing path: it goes straight to
 //! the 405. A layer also runs after its route matched, so a path it
-//! rewrote would never match again. Subsonic keeps its own 405 envelope
-//! because it sets its fallback before its layers, and a fallback that is
-//! not the default is never replaced.
+//! rewrote would never match again. Subsonic and Jellyfin keep their own
+//! wrong-method answers (Subsonic's envelope, Jellyfin's empty 404 while
+//! its API is off) because each sets its own fallback, and a fallback that
+//! is not the default is never replaced. Axum still adds `Allow` to such an
+//! answer outside the route's layers, so step 4 takes it off a 404.
 //!
 //! Inside the router, matching does not follow registration order (an
 //! overlap panics at build). Every route is registered through the kernel's
@@ -55,7 +57,13 @@
 //!   the session gate too: they carry their own app-password auth plus the
 //!   compat layers (CORS, limits), and never inherit `/api` session auth.
 
-use axum::{Router, extract::Request, middleware, response::IntoResponse};
+use axum::{
+    Router,
+    extract::Request,
+    http::{StatusCode, header},
+    middleware,
+    response::IntoResponse,
+};
 use tower::{Layer as _, ServiceExt as _};
 use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate};
 
@@ -71,7 +79,9 @@ use crate::{
 use droppedneedle_auth::session::{
     event_stream, middleware::require_session, rate_limit::rate_limit,
 };
-use droppedneedle_catalog::reads;
+use droppedneedle_catalog::{
+    artwork, collections, discover, local, metadata, search, version, wrapped, youtube,
+};
 use droppedneedle_compat::{
     http::{canonicalize_case, preflight, stamp_cors},
     shared::path_case::is_compat_path,
@@ -160,6 +170,9 @@ fn pre_routing(state: &AppState, routes: Router) -> Router {
         canonicalize_case(&templates, &mut request);
         let mut response = answer(routes.oneshot(request).await);
         stamp_cors(&mut response);
+        if response.status() == StatusCode::NOT_FOUND {
+            response.headers_mut().remove(header::ALLOW);
+        }
         response
     })
 }
@@ -198,6 +211,9 @@ fn mount(m: Mount<'_>) -> Mount<'_> {
             )
         })
         .area(droppedneedle_media::routes(), |state| state.media.clone())
+        .area(droppedneedle_compat::user_settings::routes(), |state| {
+            state.compat.user_settings()
+        })
         .area(
             droppedneedle_media::remotes::playlist_sync::routes(),
             |state| state.jobs.playlist_sync(),
@@ -205,31 +221,19 @@ fn mount(m: Mount<'_>) -> Mount<'_> {
         .area(droppedneedle_library::wiring::routes(), |state| {
             state.library_services.clone()
         })
-        .area(reads::library::routes(), |state| {
-            state.reads.library.clone()
+        .area(local::routes(), |state| state.catalog.local.clone())
+        .area(discover::routes(), |state| state.catalog.discover.clone())
+        .area(collections::routes(), |state| {
+            state.catalog.collections.clone()
         })
-        .area(reads::discover::routes(), |state| {
-            state.reads.discover.clone()
+        .area(artwork::covers::routes(), |state| {
+            state.catalog.covers.clone()
         })
-        .area(reads::collections::routes(), |state| {
-            state.reads.collections.clone()
-        })
-        .area(reads::platform::covers::routes(), |state| {
-            state.reads.platform.covers.clone()
-        })
-        .area(reads::platform::version::routes(), |state| {
-            state.reads.platform.version.clone()
-        })
-        .area(reads::platform::wrapped::routes(), |state| {
-            state.reads.platform.wrapped.clone()
-        })
-        .area(reads::youtube::routes(), |state| {
-            state.reads.youtube.clone()
-        })
-        .area(reads::search::routes(), |state| state.reads.search.clone())
-        .optional_area(reads::catalog::routes(), |state| {
-            state.reads.catalog.clone()
-        })
+        .area(version::routes(), |state| state.catalog.version.clone())
+        .area(wrapped::routes(), |state| state.catalog.wrapped.clone())
+        .area(youtube::routes(), |state| state.catalog.youtube.clone())
+        .area(search::routes(), |state| state.catalog.search.clone())
+        .optional_area(metadata::routes(), |state| state.catalog.metadata.clone())
         .area(
             droppedneedle_catalog::concerts::handlers::routes(),
             |state| state.concerts.service(),
@@ -390,14 +394,11 @@ fn routes(state: &AppState, web: Option<WebUi>) -> Router {
     // compiles this mount out of release binaries entirely, so no
     // production process can serve tooling however it was configured.
     #[cfg(debug_assertions)]
-    let app = if droppedneedle_catalog::reads::platform::covers_debug::tooling_routes_enabled(
-        &state.config,
-    ) {
-        app.merge(
-            droppedneedle_catalog::reads::platform::covers_debug::router(
-                state.reads.platform.covers.clone(),
-            ),
-        )
+    let app = if droppedneedle_catalog::artwork::covers_debug::tooling_routes_enabled(&state.config)
+    {
+        app.merge(droppedneedle_catalog::artwork::covers_debug::router(
+            state.catalog.covers.clone(),
+        ))
     } else {
         app
     };

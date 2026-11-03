@@ -28,18 +28,6 @@ use rusqlite::{Connection, OptionalExtension as _, params};
 
 use super::snapshots::sha256_hex;
 
-/// True for a state row (alias `s`) that came from v2 with its record.
-/// Every v3 writer of `managed_path_revision` sets the job too, and the
-/// upgrade leaves v2's job behind.
-pub(crate) const V2_ROW_SQL: &str = "s.written_sha256 IS NULL AND s.managed_path_revision IS NOT NULL \
-     AND s.last_operation_job_id IS NULL AND s.last_outcome IN ('succeeded', 'undone')";
-
-/// SQL condition on a `library_track_management_state` row (alias `s`):
-/// the app has a record of the file's bytes.
-pub fn record_sql() -> String {
-    format!("(s.written_sha256 IS NOT NULL OR ({V2_ROW_SQL}))")
-}
-
 /// What the app recorded about one file.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Record {
@@ -84,11 +72,11 @@ pub fn v2_path_revision(root_id: &str, relative_path: &str, file_sha256: &str) -
 /// The app's record of one track's file.
 pub fn record(conn: &Connection, track_id: &str) -> rusqlite::Result<Record> {
     let row: Option<(Option<String>, Option<String>)> = conn
-        .prepare_cached(&format!(
-            "SELECT s.written_sha256, CASE WHEN {V2_ROW_SQL} THEN s.managed_path_revision END \
-             FROM library_track_management_state s WHERE s.local_track_id = ?1"
-        ))?
-        .query_row(params![track_id], |row| Ok((row.get(0)?, row.get(1)?)))
+        .prepare_cached(crate::publish::sql::TRACK_WRITTEN_STATE.text())?
+        .query_row(params![track_id], |row| {
+            let row = crate::publish::sql::WrittenState::read(row)?;
+            Ok((row.written_sha256, row.v2_path_revision))
+        })
         .optional()?;
     Ok(
         row.map_or_else(Record::default, |(written_sha256, v2_path_revision)| {
@@ -107,13 +95,7 @@ pub fn record(conn: &Connection, track_id: &str) -> rusqlite::Result<Record> {
 /// whether it wrote.
 pub(crate) fn forget(conn: &Connection, track_id: &str) -> rusqlite::Result<bool> {
     let written = conn
-        .prepare_cached(&format!(
-            "UPDATE library_track_management_state AS s SET written_sha256 = NULL, \
-             managed_path_revision = CASE WHEN s.last_operation_job_id IS NULL THEN NULL \
-             ELSE s.managed_path_revision END, row_revision = s.row_revision + 1 \
-             WHERE s.local_track_id = ?1 AND {}",
-            record_sql()
-        ))?
+        .prepare_cached(crate::publish::sql::FORGET_RECORD.text())?
         .execute(params![track_id])?;
     Ok(written > 0)
 }
@@ -124,14 +106,7 @@ pub(crate) fn forget(conn: &Connection, track_id: &str) -> rusqlite::Result<bool
 /// row a replacement retired (its record is cleared when it is retired).
 fn stands_in(conn: &Connection, track_id: &str) -> rusqlite::Result<bool> {
     Ok(conn
-        .prepare_cached(&format!(
-            "SELECT 1 FROM local_tracks t \
-             JOIN local_tracks o ON o.local_album_id = t.local_album_id AND o.id <> t.id \
-             AND o.availability = 'missing' \
-             JOIN library_track_management_state s ON s.local_track_id = o.id \
-             WHERE t.id = ?1 AND {} LIMIT 1",
-            record_sql()
-        ))?
+        .prepare_cached(crate::publish::sql::MISSING_ROW_STANDS_IN.text())?
         .query_row(params![track_id], |_| Ok(()))
         .optional()?
         .is_some())

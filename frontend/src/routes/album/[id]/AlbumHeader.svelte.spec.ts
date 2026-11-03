@@ -6,8 +6,8 @@ import type {
 	AlbumBasicInfo,
 	AlbumEditionsResponse,
 	AlbumTracksInfo,
-	LibraryAlbumDetail,
-	LibraryAlbumSummary
+	AlbumDetailView,
+	AlbumView
 } from '$lib/types';
 
 const h = vi.hoisted(() => ({
@@ -24,74 +24,70 @@ vi.mock('$lib/queries/albums/EditionQueries.svelte', () => ({
 			return h.editions;
 		}
 	}),
-	acquireEdition: () => ({ mutateAsync: h.acquire, isPending: false }),
+	createAcquireEditionMutation: () => ({ mutateAsync: h.acquire, isPending: false }),
 	getEditionFetchQuery: () => ({ data: { latest: null } }),
 	editionFetchLive: () => false,
 	getAlbumEditionStatusQuery: () => ({ data: undefined, isLoading: false, isError: false }),
 	getEditionTracksQuery: () => ({ data: undefined, isLoading: false, isError: false }),
-	chooseAlbumEdition: () => ({ mutateAsync: vi.fn(), isPending: false }),
-	handBackAlbumEdition: () => ({ mutateAsync: vi.fn(), isPending: false }),
-	confirmAlbumEdition: () => ({ mutateAsync: vi.fn(), isPending: false }),
-	undoAlbumEdition: () => ({ mutateAsync: vi.fn(), isPending: false }),
-	sealCustomEdition: () => ({ mutateAsync: vi.fn(), isPending: false }),
-	leaveAlbumUnmanaged: () => ({ mutateAsync: vi.fn(), isPending: false }),
-	previewEditionTags: () => ({ mutateAsync: vi.fn(), isPending: false }),
+	createChooseAlbumEditionMutation: () => ({ mutateAsync: vi.fn(), isPending: false }),
+	createHandBackAlbumEditionMutation: () => ({ mutateAsync: vi.fn(), isPending: false }),
+	createConfirmAlbumEditionMutation: () => ({ mutateAsync: vi.fn(), isPending: false }),
+	createUndoAlbumEditionMutation: () => ({ mutateAsync: vi.fn(), isPending: false }),
+	createSealCustomEditionMutation: () => ({ mutateAsync: vi.fn(), isPending: false }),
+	createLeaveAlbumUnmanagedMutation: () => ({ mutateAsync: vi.fn(), isPending: false }),
+	createPreviewEditionTagsMutation: () => ({ mutateAsync: vi.fn(), isPending: false }),
 	getTagWriteQuery: () => ({ data: undefined, refetch: vi.fn() }),
-	tagWriteFinished: vi.fn(),
-	writeEditionTags: () => ({ mutateAsync: vi.fn(), isPending: false }),
-	undoTagWrite: () => ({ mutateAsync: vi.fn(), isPending: false }),
+	createWriteEditionTagsMutation: () => ({ mutateAsync: vi.fn(), isPending: false }),
+	createUndoTagWriteMutation: () => ({ mutateAsync: vi.fn(), isPending: false }),
 	editionsKey: (id: string) => ['editions', id],
 	getEditionPlanQuery: () => ({ data: undefined, isLoading: false, isError: false }),
-	removeEditionExtras: () => ({ mutateAsync: vi.fn(), mutate: vi.fn(), isPending: false }),
-	matchEditionFile: () => ({ mutateAsync: vi.fn(), isPending: false }),
-	unmatchEditionFile: () => ({ mutateAsync: vi.fn(), isPending: false }),
+	createRemoveEditionExtrasMutation: () => ({
+		mutateAsync: vi.fn(),
+		mutate: vi.fn(),
+		isPending: false
+	}),
+	createMatchEditionFileMutation: () => ({ mutateAsync: vi.fn(), isPending: false }),
+	createUnmatchEditionFileMutation: () => ({ mutateAsync: vi.fn(), isPending: false }),
 	getWaitingAlbumsQuery: () => ({ data: undefined, isLoading: false, isError: false })
 }));
 
 vi.mock('$lib/queries/library/LibraryMutations.svelte', () => ({
-	rescanAlbum: () => ({ mutateAsync: vi.fn(), isPending: false }),
-	removeLibraryAlbum: () => ({ mutateAsync: vi.fn(), mutate: vi.fn(), isPending: false }),
-	removeLibraryTrack: () => ({ mutateAsync: vi.fn(), mutate: vi.fn(), isPending: false })
+	createRescanAlbumMutation: () => ({ mutateAsync: vi.fn(), isPending: false }),
+	createRemoveLibraryAlbumMutation: () => ({
+		mutateAsync: vi.fn(),
+		mutate: vi.fn(),
+		isPending: false
+	}),
+	createRemoveLibraryTrackMutation: () => ({
+		mutateAsync: vi.fn(),
+		mutate: vi.fn(),
+		isPending: false
+	})
 }));
 
-const localAlbum: LibraryAlbumDetail = {
+const localAlbum: AlbumDetailView = {
 	id: 'local-album-1',
 	title: 'Glass Harbor',
 	artist_name: 'Northern Static',
 	artist_id: 'local-artist-1',
-	musicbrainz_release_group_id: '4b6276da-e7c7-36df-8771-34b92f774d3b',
-	musicbrainz_release_id: '0687c8a5-40a2-4a0c-bdc9-c1d80d94bef5',
-	musicbrainz_artist_id: 'eba4c290-2ce6-42c9-affd-5b1ffab84a8f',
-	album_identity_state: 'release_linked',
+	release_group_mbid: '4b6276da-e7c7-36df-8771-34b92f774d3b',
+	release_mbid: '0687c8a5-40a2-4a0c-bdc9-c1d80d94bef5',
+	artist_mbid: 'eba4c290-2ce6-42c9-affd-5b1ffab84a8f',
+	identity_state: 'linked',
 	track_count: 20,
 	total_duration_seconds: 3900,
 	total_size_bytes: 1,
 	format: 'flac',
 	year: 2008,
 	is_compilation: false,
-	release_type: 'album',
 	cover_available: true,
+	art_missing: false,
+	favorite: false,
 	date_added: 1,
-	sort_name: null,
-	original_release_date: '2008-08-04',
 	contribution_id: null,
 	contribution_state: null,
 	row_revision: 4,
-	input_revision: 'input-4',
-	identification_status: 'identified',
-	review_id: null,
-	review_revision: null,
-	management_identity_readiness: 'ready',
-	mapped_track_count: 20,
-	management_identity_kind: 'exact_release',
-	custom_manifest_id: null,
-	custom_manifest_version: null,
-	custom_manifest_track_count: 0,
-	custom_manifest_recognized_track_count: 0,
-	custom_manifest_stale: false,
-	active_edition_conversion: null,
-	display_release_mbid: null,
-	pick_basis: null
+	pending_review_id: null
 };
 
 vi.mock('$lib/queries/library/LibraryQueries.svelte', () => ({
@@ -136,22 +132,38 @@ vi.mock('$lib/queries/library/LibraryEditionQueries.svelte', () => ({
 }));
 
 vi.mock('$lib/queries/library/LibraryCatalogMutations.svelte', () => ({
-	reenableAlbumManagement: () => ({ mutateAsync: vi.fn(), isPending: false, isError: false })
+	createReenableAlbumManagementMutation: () => ({
+		mutateAsync: vi.fn(),
+		isPending: false,
+		isError: false
+	})
 }));
 
 vi.mock('$lib/queries/library/LibraryOperationMutations.svelte', () => ({
-	controlLibraryOperation: () => ({ mutateAsync: vi.fn() }),
-	controlLibraryRun: () => ({ mutateAsync: vi.fn(), mutate: vi.fn(), isPending: false }),
-	controlIdentification: () => ({ mutateAsync: vi.fn(), mutate: vi.fn(), isPending: false })
+	createControlLibraryOperationMutation: () => ({ mutateAsync: vi.fn() }),
+	createControlLibraryRunMutation: () => ({
+		mutateAsync: vi.fn(),
+		mutate: vi.fn(),
+		isPending: false
+	}),
+	createControlIdentificationMutation: () => ({
+		mutateAsync: vi.fn(),
+		mutate: vi.fn(),
+		isPending: false
+	})
 }));
 
 vi.mock('$lib/queries/library-management/LibraryManagementMutations.svelte', () => ({
-	handBackLibraryAlbumMutation: () => ({ mutateAsync: vi.fn(), isPending: false, error: null }),
+	createHandBackLibraryAlbumMutation: () => ({
+		mutateAsync: vi.fn(),
+		isPending: false,
+		error: null
+	}),
 	handBackRefusalMessage: () => null
 }));
 
 vi.mock('$lib/queries/downloads/UpgradeQueries.svelte', () => ({
-	requestUpgradeAlbum: () => ({ mutateAsync: vi.fn(), isPending: false }),
+	createRequestUpgradeAlbumMutation: () => ({ mutateAsync: vi.fn(), isPending: false }),
 	getCutoffUnmetQuery: () => ({ data: undefined, isLoading: false, isError: false })
 }));
 
@@ -211,7 +223,7 @@ async function renderHeader({
 	onrefresh?: () => void;
 	libraryTrackCount?: number;
 	libraryBelowCutoff?: boolean;
-	localCopies?: LibraryAlbumSummary[];
+	localCopies?: AlbumView[];
 	trackData?: AlbumTracksInfo;
 	loadingTracks?: boolean;
 	downloadAllowed?: boolean;

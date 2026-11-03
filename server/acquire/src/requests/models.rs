@@ -6,6 +6,8 @@
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 
+use super::ledger::RequestStatus;
+
 /// What kind of thing a request asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -118,6 +120,7 @@ pub struct BatchCancelBody {
     /// MBIDs to cancel.
     pub musicbrainz_ids: Vec<String>,
     /// Request kind; defaults to album.
+    #[schema(value_type = Option<RequestKind>)]
     pub kind: Option<String>,
 }
 
@@ -161,7 +164,7 @@ pub struct IntakeResponse {
     /// Canonical MBID.
     pub musicbrainz_id: String,
     /// Row status after this call.
-    pub status: String,
+    pub status: RequestStatus,
     /// Linked download task, when dispatched.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
@@ -170,8 +173,8 @@ pub struct IntakeResponse {
 /// Exact-track intake response.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct TrackIntakeResponse {
-    /// `queued`, `awaiting_approval`, or `already_in_library`.
-    pub status: String,
+    /// `queued` or `awaiting_approval`.
+    pub status: RequestStatus,
     /// Linked download task, when dispatched.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
@@ -190,9 +193,22 @@ pub struct BatchIntakeResponse {
     pub skipped: u32,
     /// Rows over the batch cap; always zero (cap rejects the batch instead).
     pub overflow: u32,
-    /// Batch decision: `pending`, `awaiting_approval`, `already_requested`,
-    /// or `failed`.
-    pub status: String,
+    /// Batch decision.
+    pub status: BatchIntakeStatus,
+}
+
+/// What a batch ask did as a whole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BatchIntakeStatus {
+    /// Downloads started.
+    Pending,
+    /// The rows wait for an admin.
+    AwaitingApproval,
+    /// Every row was already asked for.
+    AlreadyRequested,
+    /// Nothing was recorded or started.
+    Failed,
 }
 
 /// Batch-cancel response.
@@ -244,7 +260,7 @@ pub struct RequestItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<u64>,
     /// Row status.
-    pub status: String,
+    pub status: RequestStatus,
     /// Download progress percent (0-100) from the linked task, when linked.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub progress: Option<f64>,
@@ -265,6 +281,11 @@ pub struct RequestItem {
     /// Why a live request has not started, when it waits.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub waiting_reason: Option<WaitingReason>,
+    /// The linked download's own state while it is in flight or held for
+    /// review, whoever started it: a request joined to another person's
+    /// download reads it here. None when no download is live.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_state: Option<RequestTaskState>,
     /// Last failure text from the linked task, when failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
@@ -305,9 +326,9 @@ pub struct RequestItem {
     pub album_version_only: Option<bool>,
     /// Whole album or one track.
     pub request_kind: RequestKind,
-    /// What made the request: a person's ask (`user`) or a followed
-    /// artist's new release (`follow`).
-    pub origin: crate::dispatch::DispatchOrigin,
+    /// What made the request: a person's ask or a followed artist's new
+    /// release.
+    pub origin: RequestOrigin,
     /// Track title for exact-track rows.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub track_title: Option<String>,
@@ -324,6 +345,44 @@ pub struct RequestItem {
     pub requester_count: u32,
 }
 
+/// A live download's state as a request card shows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestTaskState {
+    /// No search has run for it yet.
+    Searching,
+    /// A person picks the copy, or decides on held files.
+    AwaitingReview,
+    /// A copy is picked and waits to start.
+    Queued,
+    /// The files are transferring.
+    Downloading,
+    /// The files arrived and are going into the library.
+    Importing,
+}
+
+impl RequestTaskState {
+    /// The state a task's row and held files give, `None` once it has
+    /// settled with nothing held.
+    pub fn of(task: &crate::dispatch::TaskView) -> Option<Self> {
+        use crate::downloads::state::TaskStatus;
+        if task.held_for_review {
+            return Some(Self::AwaitingReview);
+        }
+        match task.status {
+            TaskStatus::Queued if task.search_job_id.is_none() => Some(Self::Searching),
+            TaskStatus::Queued if task.candidate_index.is_none() => Some(Self::AwaitingReview),
+            TaskStatus::Queued => Some(Self::Queued),
+            TaskStatus::Downloading => Some(Self::Downloading),
+            TaskStatus::Processing => Some(Self::Importing),
+            TaskStatus::Completed
+            | TaskStatus::Partial
+            | TaskStatus::Failed
+            | TaskStatus::Cancelled => None,
+        }
+    }
+}
+
 /// Why a live request waits. It starts by itself once the cause clears.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -335,6 +394,34 @@ pub enum WaitingReason {
     RequestQuotaFull,
     /// The owner's storage budget or the library's size cap is reached.
     StorageFull,
+    /// Nothing holds it back now: a busy database kept its download from
+    /// being queued, and the next pass of waiting requests starts it.
+    WaitingToStart,
+}
+
+/// What made a request row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestOrigin {
+    /// A person's ask.
+    User,
+    /// A followed artist's new release.
+    Follow,
+}
+
+impl From<crate::dispatch::DispatchOrigin> for RequestOrigin {
+    fn from(origin: crate::dispatch::DispatchOrigin) -> Self {
+        use crate::dispatch::DispatchOrigin;
+        match origin {
+            DispatchOrigin::Follow => Self::Follow,
+            DispatchOrigin::User
+            | DispatchOrigin::Approval
+            | DispatchOrigin::Retry
+            | DispatchOrigin::Wanted
+            | DispatchOrigin::Upgrade
+            | DispatchOrigin::Edition => Self::User,
+        }
+    }
 }
 
 /// Active-requests list.
@@ -393,8 +480,8 @@ pub struct WantedItem {
     pub artist_name: String,
     /// Album title.
     pub album_title: String,
-    /// `missing` (whole album) or `partial` (filling gaps).
-    pub kind: String,
+    /// The whole album or the gaps of a short one.
+    pub kind: super::ledger::WatchKind,
     /// Watch state.
     pub state: super::ledger::WatchState,
     /// Passed checks so far.
@@ -475,7 +562,14 @@ pub struct WantedActionResponse {
     /// Whether the action applied.
     pub success: bool,
     /// Watch state after this call.
-    pub state: String,
+    pub state: super::ledger::WatchState,
+}
+
+/// How many wanted watches a removal took off the list.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct WantedRemovalResponse {
+    /// Watches removed.
+    pub removed: u64,
 }
 
 /// One pending personal-mix auto-request approval.
@@ -494,8 +588,10 @@ pub struct PersonalMixApprovalItem {
 pub struct PersonalMixApprovalsResponse {
     /// Pending rows.
     pub items: Vec<PersonalMixApprovalItem>,
-    /// Row count.
+    /// Pending row count.
     pub count: u32,
+    /// Approvals already granted, which an admin may revoke.
+    pub granted: Vec<PersonalMixApprovalItem>,
 }
 
 /// Personal-mix refresh outcome. The schema renames to avoid discover's
@@ -503,15 +599,23 @@ pub struct PersonalMixApprovalsResponse {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 #[schema(as = RequestsRefreshResponse)]
 pub struct RefreshResponse {
-    /// `started` or `already_running`.
-    pub status: String,
+    pub status: MixRefreshStatus,
+}
+
+/// Whether a personal-mix refresh started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MixRefreshStatus {
+    /// A build started.
+    Started,
+    /// A build for this user is already running.
+    AlreadyRunning,
 }
 
 /// Edition-acquire outcome.
 #[derive(Debug, Clone, Default, Serialize, ToSchema)]
 pub struct EditionAcquireResponse {
-    /// `started`, `already_in_progress`, or `already_complete`.
-    pub status: String,
+    pub status: EditionAcquireStatus,
     /// Human outcome.
     pub message: String,
     /// Linked download task, when dispatched.
@@ -537,6 +641,19 @@ pub struct EditionAcquireResponse {
     /// when it is as good or better.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub versions: Option<u32>,
+}
+
+/// What an edition acquire did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EditionAcquireStatus {
+    /// A download for the edition's tracks started, or waits for a source.
+    #[default]
+    Started,
+    /// Another download of the album is still working.
+    AlreadyInProgress,
+    /// The library already holds every track asked for.
+    AlreadyComplete,
 }
 
 /// Which library copy "get missing tracks" works on.

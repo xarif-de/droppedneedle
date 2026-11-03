@@ -7,7 +7,7 @@ use sha2::{Digest as _, Sha256};
 use super::models::{Candidate, Dismissal, Group, GroupInputs, GroupPage, GroupState, Member};
 use super::reasons;
 
-/// Largest page of groups, as in v2.
+/// Largest page of groups.
 pub const PAGE_MAX: usize = 100;
 
 /// Every group, open ones from same-name records and resolved ones from
@@ -48,6 +48,23 @@ pub fn build(inputs: &GroupInputs) -> Vec<Group> {
         groups.push(open_group(&members, &ambiguous));
     }
     groups.extend(inputs.moved.iter().filter_map(|rows| moved_group(rows)));
+    // A pair a same-name or moved group already lists is not listed again.
+    let listed: Vec<BTreeSet<String>> = groups
+        .iter()
+        .map(|group| group.members.iter().map(|m| m.id.clone()).collect())
+        .collect();
+    for rows in &inputs.shared {
+        let members: Vec<&Candidate> = rows.iter().collect();
+        let covered = listed.iter().any(|ids| {
+            members
+                .iter()
+                .all(|candidate| ids.contains(&candidate.member.id))
+        });
+        if covered || all_pairs_dismissed(&members, &dismissed) {
+            continue;
+        }
+        groups.push(shared_group(&members));
+    }
     groups.extend(inputs.merges.iter().filter_map(|merge| {
         let ids = std::iter::once(&merge.survivor_id).chain(&merge.retired_ids);
         let members: Vec<Member> = ids
@@ -215,6 +232,41 @@ fn moved_group(rows: &[Candidate]) -> Option<Group> {
     })
 }
 
+/// The group of two records a person's link named as one MusicBrainz
+/// artist. The record holding the link is the recommended survivor when
+/// only one does.
+fn shared_group(members: &[&Candidate]) -> Group {
+    let provider_mbids: BTreeSet<String> = members
+        .iter()
+        .flat_map(|c| c.member.provider_mbid.iter().chain(&c.proof_mbids))
+        .filter(|mbid| !mbid.is_empty())
+        .cloned()
+        .collect();
+    let linked: Vec<&&Candidate> = members
+        .iter()
+        .filter(|c| c.member.provider_mbid.is_some())
+        .collect();
+    let survivor = match linked.as_slice() {
+        [only] => Some(only.member.id.clone()),
+        _ => None,
+    };
+    let reason = reasons::SHARED_PROVIDER_IDENTITY;
+    let members: Vec<Member> = members.iter().map(|c| c.member.clone()).collect();
+    Group {
+        id: group_id(&members),
+        display_name: members[0].name.clone(),
+        state: GroupState::SharedProviderIdentity,
+        affected_reference_count: members.iter().map(|m| m.counts.affected()).sum(),
+        provider_mbids: provider_mbids.into_iter().collect(),
+        recommended_survivor_id: survivor,
+        members,
+        reason_code: reason.code.to_owned(),
+        reason,
+        resolved_at: None,
+        merge_basis: None,
+    }
+}
+
 /// A stable id from the member ids, so the same records give the same
 /// group across reads.
 fn group_id(members: &[Member]) -> String {
@@ -231,8 +283,7 @@ fn sort_key(group: &Group) -> (String, &str) {
 
 /// One page of groups after `after`, the sort key the last page ended
 /// on, so a page boundary survives groups disappearing between reads. The
-/// state counts cover every group, before the state and search filters,
-/// as in v2.
+/// state counts cover every group, before the state and search filters.
 pub fn page(
     groups: Vec<Group>,
     limit: usize,

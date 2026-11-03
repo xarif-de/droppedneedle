@@ -164,53 +164,6 @@ pub struct SpotifyImportResponse {
     pub playlist_id: String,
 }
 
-/// Terminal-or-live state of one `spotify:import` job.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
-pub struct SpotifyJobStatus {
-    /// `running`, `done`, or `error`.
-    pub state: String,
-    /// Internal playlist id the job populates.
-    pub playlist_id: String,
-    /// Tracks written on success.
-    pub track_count: Option<i64>,
-    /// User-safe failure summary, else null.
-    pub message: Option<String>,
-}
-
-/// Per-source release gate verdict. Each source gates independently: one
-/// red gate never flips another.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
-pub struct SourceGate {
-    /// `slskd`, `sabnzbd`, `newznab`, or `lidarr_import`.
-    pub source: String,
-    /// Admin master switch for this source.
-    pub enabled: bool,
-    /// Credentials/URL present.
-    pub configured: bool,
-    /// Live probe answered.
-    pub reachable: bool,
-    /// True when releases may flow from this source.
-    pub open: bool,
-    /// User-safe summary.
-    pub message: String,
-}
-
-/// Acquisition health smoke. `ready`
-/// says whether a download source is on; the gates unpack per source.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
-pub struct AcquireHealth {
-    /// Overall verdict: `ok`, `degraded`, or `error`.
-    pub status: String,
-    /// True when a download source is on: slskd, SABnzbd or a plugin
-    /// download client. Requests are taken while it is false, and wait.
-    pub ready: bool,
-    /// The sources that are on and answered the last probe: `soulseek`,
-    /// `usenet` or `plugin:<name>`.
-    pub ready_via: Vec<String>,
-    /// Independent per-source release gates.
-    pub gates: Vec<SourceGate>,
-}
-
 /// Live slskd client status. The mount check belongs to the downloads
 /// module.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
@@ -244,9 +197,7 @@ pub struct DownloadsMountView {
     /// Imports can move files into a library root in one step. When false
     /// they copy and then delete, which is slower but still works.
     pub move_supported: bool,
-    /// `ok`, `not_set`, `missing`, `not_writable`, `different_mount`,
-    /// `different_filesystem`, or `stat_error`.
-    pub reason: String,
+    pub reason: super::mount::MountReason,
     /// The mount path inside DroppedNeedle's container.
     pub path: String,
 }

@@ -49,6 +49,7 @@ pub enum Reason {
     LibraryUnavailable,
     NamingScriptFailed,
     LibraryFolderMissing,
+    LibraryOff,
     LocalFault,
     // Source: this download is skipped and another tried.
     FilesMissing,
@@ -84,6 +85,7 @@ pub enum Reason {
     SettingsUnreadable,
     JournalUnreadable,
     MusicbrainzUnavailable,
+    AcoustidUnavailable,
     HeldForReview,
     TracksMissing,
     // Settled: a final word that needs nothing.
@@ -110,7 +112,7 @@ pub enum ReasonKind {
 
 impl Reason {
     /// Every reason, in declaration order.
-    pub const ALL: [Reason; 66] = [
+    pub const ALL: [Reason; 68] = [
         Self::WeakMatch,
         Self::NoArtistEvidence,
         Self::MostlyUnmatched,
@@ -139,6 +141,7 @@ impl Reason {
         Self::LibraryUnavailable,
         Self::NamingScriptFailed,
         Self::LibraryFolderMissing,
+        Self::LibraryOff,
         Self::LocalFault,
         Self::FilesMissing,
         Self::FilesUnlisted,
@@ -172,6 +175,7 @@ impl Reason {
         Self::SettingsUnreadable,
         Self::JournalUnreadable,
         Self::MusicbrainzUnavailable,
+        Self::AcoustidUnavailable,
         Self::HeldForReview,
         Self::TracksMissing,
         Self::AlreadyOwned,
@@ -210,6 +214,7 @@ impl Reason {
             Self::LibraryUnavailable => "library_unavailable",
             Self::NamingScriptFailed => "naming_script_failed",
             Self::LibraryFolderMissing => "library_folder_missing",
+            Self::LibraryOff => "library_off",
             Self::LocalFault => "local_fault",
             Self::FilesMissing => "files_missing",
             Self::FilesUnlisted => "files_unlisted",
@@ -243,6 +248,7 @@ impl Reason {
             Self::SettingsUnreadable => "settings_unreadable",
             Self::JournalUnreadable => "journal_unreadable",
             Self::MusicbrainzUnavailable => "musicbrainz_unavailable",
+            Self::AcoustidUnavailable => "acoustid_unavailable",
             Self::HeldForReview => "held_for_review",
             Self::TracksMissing => "tracks_missing",
             Self::AlreadyOwned => "already_owned",
@@ -319,7 +325,7 @@ impl Reason {
                 "Another file already sits where this would go in your library."
             }
             Self::UpgradeBlocked => {
-                "Your copy could not be moved to the recycle bin, so the better file was not added. Both are kept."
+                "Your copy could not be taken away, so the better file was not added. Both are kept."
             }
             Self::LibraryChanged => {
                 "Something in the library changed while these files were going in, so nothing was changed."
@@ -330,6 +336,9 @@ impl Reason {
             }
             Self::LibraryFolderMissing => {
                 "The library folder isn't there, so the files wait where they are."
+            }
+            Self::LibraryOff => {
+                "The local library is switched off, so the files wait where they are."
             }
             Self::LocalFault => {
                 "Something on this server stopped the import (for example a full disk or a folder it cannot write)."
@@ -396,6 +405,7 @@ impl Reason {
                 "The download's records could not be read just now, so the files wait where they are."
             }
             Self::MusicbrainzUnavailable => "MusicBrainz could not be reached to check the files.",
+            Self::AcoustidUnavailable => "AcoustID could not be reached to check the files.",
             Self::HeldForReview => {
                 "Some files of this download are held for you to check before they reach the library."
             }
@@ -465,17 +475,20 @@ impl Reason {
                 "Compare it with the one in your library: discard it if it is the same, otherwise move yours and try again."
             }
             Self::UpgradeBlocked => {
-                "Check that the recycle bin folder exists and can be written, then try again."
+                "Nothing to do: DroppedNeedle tries again by itself. If it keeps happening, check the recycle bin folder in Settings, Library."
             }
             Self::LibraryChanged => "Nothing to do: DroppedNeedle tries again by itself.",
             Self::LibraryUnavailable => {
                 "Check that a library folder is set up and has free space, then try again."
             }
             Self::NamingScriptFailed => {
-                "Fix the import naming script in Settings, Library, then try again."
+                "Fix the import naming script, or the Excluded folder or path rule its path falls under, in Settings, Library, then try again."
             }
             Self::LibraryFolderMissing => {
                 "Check the library folder in Settings, Library, and that the server can write to it. Downloads go ahead by themselves once it is back."
+            }
+            Self::LibraryOff => {
+                "Turn it on under Settings > Library. Downloads go ahead by themselves once it is on."
             }
             Self::LocalFault => "Check free space and folder permissions, then retry import.",
             Self::FilesMissing => {
@@ -542,6 +555,9 @@ impl Reason {
             Self::MusicbrainzUnavailable => {
                 "Downloads try again by themselves. For an upload, try Match again in a few minutes."
             }
+            Self::AcoustidUnavailable => {
+                "DroppedNeedle tries again by itself. An upload with no album yet needs Match, and a file that would replace your copy needs Re-check."
+            }
             Self::HeldForReview => "Open the held list and import or discard them.",
             Self::TracksMissing => {
                 "DroppedNeedle looks for the missing tracks again later. You can also search for them yourself."
@@ -584,6 +600,7 @@ impl Reason {
             | Self::LibraryUnavailable
             | Self::NamingScriptFailed
             | Self::LibraryFolderMissing
+            | Self::LibraryOff
             | Self::LocalFault => ReasonKind::Library,
             Self::FilesMissing
             | Self::FilesUnlisted
@@ -617,6 +634,7 @@ impl Reason {
             | Self::SettingsUnreadable
             | Self::JournalUnreadable
             | Self::MusicbrainzUnavailable
+            | Self::AcoustidUnavailable
             | Self::HeldForReview
             | Self::TracksMissing => ReasonKind::Wait,
             Self::AlreadyOwned | Self::Cancelled | Self::MovedOn => ReasonKind::Settled,
@@ -674,6 +692,7 @@ impl Reason {
             | Self::LibraryUnavailable
             | Self::NamingScriptFailed
             | Self::LibraryFolderMissing
+            | Self::LibraryOff
             | Self::LocalFault
             | Self::FilesMissing
             | Self::FilesUnlisted
@@ -692,6 +711,7 @@ impl Reason {
             | Self::SettingsUnreadable
             | Self::JournalUnreadable
             | Self::MusicbrainzUnavailable
+            | Self::AcoustidUnavailable
             | Self::HeldForReview
             | Self::AlreadyOwned
             | Self::Cancelled
@@ -849,11 +869,13 @@ mod tests {
             (Reason::NotAnUpgrade, Rejected(Permanent)),
             (Reason::WrongTrack, Rejected(Permanent)),
             (Reason::MusicbrainzUnavailable, Rejected(Temporary)),
+            (Reason::AcoustidUnavailable, Rejected(Temporary)),
             (Reason::JournalUnreadable, Rejected(Temporary)),
             (Reason::SettingsUnreadable, Rejected(Temporary)),
             (Reason::LibraryChanged, Rejected(Temporary)),
             (Reason::NamingScriptFailed, Rejected(LocalFault)),
             (Reason::LibraryFolderMissing, Rejected(LocalFault)),
+            (Reason::LibraryOff, Rejected(LocalFault)),
             (Reason::LocalFault, Rejected(LocalFault)),
             (Reason::OutsideDownloadsFolder, Rejected(LocalFault)),
             (Reason::Stalled, FailedOver { blocklisted: true }),

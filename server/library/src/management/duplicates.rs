@@ -17,8 +17,8 @@ use super::reasons::ItemReason;
 use super::selection;
 use super::service::{JobSpec, Management, Refused, stale};
 use super::store::{self, Snapshot};
-use crate::mutations::{MutationError, NO_RECYCLE_BIN, RECYCLE_BIN_UNKNOWN, REMOVAL_CHANGED};
 use crate::publish::planner::PlanKind;
+use crate::removal::{MutationError, NO_RECYCLE_BIN, RECYCLE_BIN_UNKNOWN, REMOVAL_CHANGED};
 use rusqlite::OptionalExtension as _;
 
 /// A request to settle one blocked file.
@@ -167,7 +167,7 @@ impl Management {
             origin: Origin::Manual,
             actor: Some(actor),
             idempotency_key: Some(&request.idempotency_key),
-            revisions: profile::revisions(&stored, &pinned, registry.policy_revision()),
+            revisions: profile::revisions(&stored, &pinned, registry.fingerprint()),
             selection_json: serde_json::to_string(&selection)?,
             pinned: &pinned,
             target_root_id: source.target_root_id.as_deref(),
@@ -198,7 +198,7 @@ impl Management {
             .requested_by_user_id
             .clone()
             .unwrap_or_default();
-        let mutations = crate::mutations::Mutations::new(&self.setup);
+        let mutations = &self.parts.mutations;
         let changed = || {
             ManagementError::Conflict(format!(
                 "{} {}",
@@ -229,14 +229,15 @@ impl Management {
     /// Give the publisher the file a duplicate resolution replaces: it
     /// is set aside under the publish journal, recycled to a fresh bin
     /// entry after commit, and put back if the publish unwinds.
-    /// While the download settings cannot be read no bin is known, and
+    /// While no bin is known (Library Management's settings or a download
+    /// folder's cannot be read, or the configured bin cannot be reached)
     /// the job waits as it does for a busy database.
     pub(super) fn plan_replacements(
         &self,
         items: &[super::models::PlannedItem],
         plans: &mut [crate::publish::PlanItem],
     ) -> Result<(), Refused> {
-        let mutations = crate::mutations::Mutations::new(&self.setup);
+        let mutations = &self.parts.mutations;
         for item in items {
             let Some(first) = &item.desired.recycle_first else {
                 continue;
@@ -244,50 +245,25 @@ impl Management {
             let Some(track_id) = item.track_id.as_deref() else {
                 continue;
             };
-            let name = Path::new(&first.relative_path)
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            // While no bin is known the job waits; a folder with no usable
-            // bin refuses only its own album, and the job moves on.
-            let recycle_to = match mutations.recycle_entry(&first.root_id, &name) {
-                Ok(entry) => entry,
-                Err(MutationError::Conflict(reason)) if reason.code == NO_RECYCLE_BIN.code => {
-                    return Err(Refused::Reason(ItemReason {
-                        code: "RECYCLE_FAILED".to_owned(),
-                        message: format!(
-                            "{}'s library folder has no usable recycle bin, so it cannot be replaced.",
-                            first.relative_path
-                        ),
-                        action: "Make the folder's .recycle a plain folder, or keep both files."
-                            .to_owned(),
-                    }));
-                }
-                Err(MutationError::Conflict(reason)) if reason.code == RECYCLE_BIN_UNKNOWN.code => {
-                    return Err(Refused::Busy(ManagementError::BinsUnknown));
-                }
-                Err(MutationError::Conflict(reason)) => {
-                    return Err(Refused::Busy(ManagementError::Busy(
-                        reason.message.to_owned(),
-                    )));
-                }
-                Err(error) => return Err(Refused::Busy(ManagementError::Busy(error.to_string()))),
-            }
-            .ok_or_else(|| ItemReason {
-                    code: "RECYCLE_FAILED".to_owned(),
-                    message: format!(
-                        "No recycle bin is available for {}, so it cannot be replaced.",
-                        first.relative_path
-                    ),
-                    action: "Set a recycle bin in the download settings, or keep both files."
-                        .to_owned(),
-                })?;
+            let recycle_to = bin_entry(mutations, &first.root_id, &first.relative_path)?;
             for plan in plans.iter_mut().filter(|plan| plan.track_id == track_id) {
                 plan.replaces = Some(crate::publish::Replacement {
                     sha256: first.sha256.clone(),
                     track_id: first.local_track_id.clone(),
                     recycle_to: recycle_to.display().to_string(),
                 });
+            }
+        }
+        // A cover the archive's replaces (planner `cover_file`) gets its
+        // bin entry the same way; it carries no track.
+        for plan in plans.iter_mut() {
+            for output in &mut plan.outputs {
+                let Some(replaced) = output.replaces.as_mut() else {
+                    continue;
+                };
+                replaced.recycle_to = bin_entry(mutations, &output.dest_root, &output.dest_rel)?
+                    .display()
+                    .to_string();
             }
         }
         Ok(())
@@ -299,7 +275,7 @@ impl Management {
         ordinal: i64,
     ) -> Result<super::models::PlannedItem, ManagementError> {
         let page = self
-            .setup
+            .parts
             .db
             .read_blocking("management.source_item", |conn| {
                 Ok::<_, ManagementError>(store::items_page(
@@ -332,25 +308,25 @@ impl Management {
         let selection: Selection = serde_json::from_str(&snapshot.selection_json)?;
         let pinned = Self::pinned(snapshot)?;
         let scripts = CompiledScripts::new(&pinned);
-        let sandbox = self.setup.publishing.publish_sandbox().map_err(|error| {
+        let sandbox = self.parts.publishing.publish_sandbox().map_err(|error| {
             ManagementError::Conflict(format!("No library folder can be written: {error}"))
         })?;
-        let registry = self.setup.core.live_registry();
+        let registry = self.parts.core.live_registry();
         let ctx = PlanContext {
-            setup: &self.setup,
+            parts: &self.parts,
             pinned: &pinned,
             scripts: &scripts,
             sandbox: &sandbox,
             registry: &registry,
             target_root: snapshot.target_root_id.as_deref(),
-            manage_unconfirmed: planner::manage_unconfirmed(&self.setup),
+            manage_unconfirmed: planner::manage_unconfirmed(&self.parts),
             tag_edit: None,
             job_id: &snapshot.job.id,
             analysis_until: std::time::Instant::now() + planner::RUN_ANALYSIS_BUDGET,
             wide: false,
         };
         let albums = self
-            .setup
+            .parts
             .db
             .read_blocking("management.duplicate_albums", |conn| {
                 selection::albums(conn, &selection)
@@ -359,7 +335,7 @@ impl Management {
             return Ok(Some(Summary::default()));
         };
         let tracks = self
-            .setup
+            .parts
             .db
             .read_blocking("management.duplicate_tracks", |conn| {
                 selection::tracks(conn, scope)
@@ -393,7 +369,7 @@ impl Management {
             let source = self.snapshot(&intent.source_job_id)?;
             let blocked_one = self.source_item(&source, intent.source_plan_item_ordinal)?;
             let siblings =
-                self.setup
+                self.parts
                     .db
                     .read_blocking("management.duplicate_siblings", |conn| {
                         Ok::<_, ManagementError>(store::bundle_items(
@@ -481,13 +457,12 @@ impl Management {
                         .and_then(|path| crate::publish::paths::hash_regular_file(&path).ok())
                         .map(|hashed| hashed.sha256);
                     let tracked: Option<String> =
-                        self.setup
+                        self.parts
                             .db
                             .read_blocking("management.duplicate_tracked", |conn| {
                                 Ok::<_, ManagementError>(
                                     conn.query_row(
-                                        "SELECT id FROM local_tracks WHERE root_id = ?1 \
-                                 AND relative_path = ?2 AND availability = 'indexed'",
+                                        crate::management::sql::PLAN_DUPLICATE.text(),
                                         rusqlite::params![
                                             intent.existing_root_id,
                                             intent.existing_relative_path
@@ -506,7 +481,9 @@ impl Management {
                     // is two files, settled by hand.
                     let same_name =
                         item.dest_rel.as_deref() == Some(intent.existing_relative_path.as_str());
-                    let bin = crate::mutations::Mutations::new(&self.setup)
+                    let bin = self
+                        .parts
+                        .mutations
                         .bin_for(&intent.existing_root_id)
                         .map(|bin| bin.display().to_string())
                         .unwrap_or_else(|| "the recycle bin".to_owned());
@@ -543,4 +520,46 @@ impl Management {
         }
         Ok(Some(summary))
     }
+}
+
+/// A fresh recycle-bin entry for the file at `rel` in library folder
+/// `root_id`. While no bin is known the job waits; a folder with no usable
+/// bin refuses only its own album, and the job moves on.
+fn bin_entry(
+    mutations: &crate::removal::Mutations,
+    root_id: &str,
+    rel: &str,
+) -> Result<std::path::PathBuf, Refused> {
+    let name = Path::new(rel)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    match mutations.recycle_entry(root_id, &name) {
+        Ok(entry) => entry,
+        Err(MutationError::Conflict(reason)) if reason.code == NO_RECYCLE_BIN.code => {
+            return Err(Refused::Reason(ItemReason {
+                code: "RECYCLE_FAILED".to_owned(),
+                message: format!(
+                    "{rel}'s library folder has no usable recycle bin, so it cannot be replaced."
+                ),
+                action: "Make the folder's .recycle a plain folder, or keep both files.".to_owned(),
+            }));
+        }
+        Err(MutationError::Conflict(reason)) if reason.code == RECYCLE_BIN_UNKNOWN => {
+            return Err(Refused::Busy(ManagementError::BinsUnknown(reason)));
+        }
+        Err(MutationError::Conflict(reason)) => {
+            return Err(Refused::Busy(ManagementError::Busy(
+                reason.message.to_owned(),
+            )));
+        }
+        Err(error) => return Err(Refused::Busy(ManagementError::Busy(error.to_string()))),
+    }
+    .ok_or_else(|| {
+        Refused::Reason(ItemReason {
+            code: "RECYCLE_FAILED".to_owned(),
+            message: format!("No recycle bin is available for {rel}, so it cannot be replaced."),
+            action: "Set a recycle bin in Library Management, or keep both files.".to_owned(),
+        })
+    })
 }

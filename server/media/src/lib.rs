@@ -31,7 +31,6 @@ use crate::playback::report::{MixedDedup, ScrobbleDedup};
 use crate::playback::reports::{ReportQueue, run_report_worker};
 use crate::playback::sessions::SessionStore;
 use crate::playback::sqlite::PlaybackStore;
-use crate::remotes::adapter::ImportSink;
 use crate::remotes::connections::ConnectionResolver;
 use crate::remotes::folders::SqliteFolderStore;
 use crate::remotes::handlers::RemotesDeps;
@@ -39,6 +38,7 @@ use crate::remotes::plex::PlexTokenProbe;
 use crate::remotes::presence_feed::MediaJobs;
 use crate::remotes::reader::RemotesRemoteReader;
 use crate::remotes::service::RemotesService;
+use crate::remotes::source::ImportSink;
 use crate::remotes::warmup::{self, MbidIndex};
 use crate::stream::download::DownloadState;
 use crate::stream::gateway::Gateway;
@@ -120,13 +120,18 @@ impl MediaWorkers {
 
 impl MediaSetup {
     /// The app's one connection resolver, over `platform`, looking up
-    /// missing Plex server tokens on the plex.tv root `plex_tv`. Every
-    /// remote read shares it, so they share its per-source read bound.
-    pub fn remotes(platform: &Platform, plex_tv: String) -> Arc<ConnectionResolver> {
+    /// missing Plex server tokens through the one plex.tv client
+    /// `plextv`. Every remote read shares it, so they share its per-source
+    /// read bound.
+    pub fn remotes(
+        platform: &Platform,
+        plextv: droppedneedle_providers::plextv::PlexTvClient,
+    ) -> Arc<ConnectionResolver> {
         Arc::new(
-            ConnectionResolver::over(platform).with_plex_tokens(Arc::new(
-                PlexTokenProbe::with_plex_tv(platform.http.shared().clone(), plex_tv),
-            )),
+            ConnectionResolver::over(platform).with_plex_tokens(Arc::new(PlexTokenProbe::new(
+                platform.http.shared().clone(),
+                plextv,
+            ))),
         )
     }
 
@@ -168,7 +173,7 @@ impl MediaSetup {
         let (db, app_config, config) = (&platform.db, &platform.config, &*platform.settings);
         let (http_factory, ids) = (&platform.http, platform.ids.clone());
         let http = http_factory.shared().clone();
-        crate::stream::plugin_url::sweep_stale_spools();
+        crate::stream::plugin_url::sweep_stale_spools(&app_config.temp_dir);
         let library = LibraryFiles::new(db.clone(), library_roots);
         let download = DownloadState::new(Some(library.clone()), config.live());
         let resolver = remotes;
@@ -199,7 +204,11 @@ impl MediaSetup {
         )
         .with_settings(config.live())
         .with_library(library)
-        .with_plugins(plugins.clone(), http_factory.direct_no_redirect().clone());
+        .with_plugins(
+            plugins.clone(),
+            http_factory.direct_no_redirect().clone(),
+            app_config.temp_dir.clone(),
+        );
         let stream = StreamState {
             engine: Arc::new(gateway),
         };

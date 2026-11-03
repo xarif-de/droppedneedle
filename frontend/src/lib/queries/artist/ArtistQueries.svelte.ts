@@ -1,3 +1,4 @@
+import { v3 } from '$lib/api/v3/endpoint';
 import { STALE_SLOW } from '$lib/queries/staleTime';
 import { createInfiniteQuery, createQuery, queryOptions } from '@tanstack/svelte-query';
 import type { Getter } from 'runed';
@@ -10,30 +11,35 @@ import { setQueryDataWithPersister } from '../QueryClient';
 import { applyEffects, artistChanged } from '../effects';
 import { readNow } from '../readNow';
 import { toArtistInfoBasic, toArtistReleases } from '../catalog/catalogAdapters';
-import { CATALOG_ENDPOINTS } from '../catalog/endpoints';
 import { PERSIST, PERSIST_PROVIDER } from '$lib/queries/persistedCache';
 
-export const getBasicArtistQueryOptions = (artistId: string) =>
+const getBasicArtistQueryOptions = (artistId: string) =>
 	queryOptions({
 		staleTime: STALE_SLOW,
 		meta: PERSIST_PROVIDER,
 		queryKey: ArtistQueryKeyFactory.basic(artistId),
 		queryFn: async ({ signal }) => {
-			return toArtistInfoBasic(await api.v3.GET(CATALOG_ENDPOINTS.artist(artistId), { signal }));
+			return toArtistInfoBasic(
+				await api.v3.GET(v3('/api/v3/artists/{artist_mbid}', { path: { artist_mbid: artistId } }), {
+					signal
+				})
+			);
 		}
 	});
 
 export const getBasicArtistQuery = (getArtistId: Getter<string>) =>
 	createQuery(() => getBasicArtistQueryOptions(getArtistId()));
 
-export const getExtendedArtistQueryOptions = (artistId: string) =>
+const getExtendedArtistQueryOptions = (artistId: string) =>
 	queryOptions({
 		staleTime: STALE_SLOW,
 		meta: PERSIST_PROVIDER,
 		queryKey: ArtistQueryKeyFactory.extended(artistId),
-		// A fast extended query can finish before the provider page observes its lazy fields.
-		notifyOnChangeProps: 'all',
-		queryFn: ({ signal }) => api.v3.GET(CATALOG_ENDPOINTS.artistExtended(artistId), { signal })
+		queryFn: ({ signal }) =>
+			api.v3.GET(
+				v3('/api/v3/artists/{artist_mbid}/extended', { path: { artist_mbid: artistId } }),
+				{ signal }
+			)
 	});
 
 export const getExtendedArtistQuery = (getArtistId: Getter<string>) =>
@@ -50,9 +56,15 @@ export const getSimilarArtistsQuery = (
 			meta: PERSIST_PROVIDER,
 			queryKey: ArtistQueryKeyFactory.similarArtists(authStore.user?.id, artistId, source),
 			queryFn: ({ signal }) =>
-				api.v3.GET(CATALOG_ENDPOINTS.similarArtists(artistId, source), {
-					signal
-				})
+				api.v3.GET(
+					v3('/api/v3/artists/{artist_mbid}/similar', {
+						path: { artist_mbid: artistId },
+						query: { count: 15, source }
+					}),
+					{
+						signal
+					}
+				)
 		};
 	});
 
@@ -67,9 +79,15 @@ export const getArtistTopAlbumsQuery = (
 			meta: PERSIST_PROVIDER,
 			queryKey: ArtistQueryKeyFactory.topAlbums(authStore.user?.id, artistId, source),
 			queryFn: ({ signal }) =>
-				api.v3.GET(CATALOG_ENDPOINTS.topAlbums(artistId, source), {
-					signal
-				})
+				api.v3.GET(
+					v3('/api/v3/artists/{artist_mbid}/top-albums', {
+						path: { artist_mbid: artistId },
+						query: { count: 10, source }
+					}),
+					{
+						signal
+					}
+				)
 		};
 	});
 
@@ -84,9 +102,15 @@ export const getArtistTopSongsQuery = (
 			meta: PERSIST_PROVIDER,
 			queryKey: ArtistQueryKeyFactory.topSongs(authStore.user?.id, artistId, source),
 			queryFn: ({ signal }) =>
-				api.v3.GET(CATALOG_ENDPOINTS.topSongs(artistId, source), {
-					signal
-				})
+				api.v3.GET(
+					v3('/api/v3/artists/{artist_mbid}/top-songs', {
+						path: { artist_mbid: artistId },
+						query: { count: 10, source }
+					}),
+					{
+						signal
+					}
+				)
 		};
 	});
 
@@ -100,10 +124,33 @@ export const getArtistLastFmEnrichmentQuery = (
 			meta: PERSIST,
 			queryKey: ArtistQueryKeyFactory.lastFmEnrichment(artistId, artistName),
 			queryFn: ({ signal }) =>
-				api.v3.GET(CATALOG_ENDPOINTS.artistLastFm(artistId, artistName!), {
-					signal
-				}),
+				api.v3.GET(
+					v3('/api/v3/artists/{artist_mbid}/lastfm', {
+						path: { artist_mbid: artistId },
+						query: { artist_name: artistName! }
+					}),
+					{
+						signal
+					}
+				),
 			enabled: () => !!artistName
+		};
+	});
+
+// Every release group of the discography the library holds, whatever its
+// type: the library part of the page files owned albums by it. Not
+// persisted, so a newly held album gets its type on the next visit.
+export const getArtistOwnedReleasesQuery = (getArtistId: Getter<string>) =>
+	createQuery(() => {
+		const artistId = getArtistId();
+		return {
+			enabled: !!artistId,
+			queryKey: ArtistQueryKeyFactory.ownedReleases(artistId),
+			queryFn: ({ signal }) =>
+				api.v3.GET(
+					v3('/api/v3/artists/{artist_mbid}/owned-releases', { path: { artist_mbid: artistId } }),
+					{ signal }
+				)
 		};
 	});
 
@@ -129,9 +176,15 @@ export const getArtistReleasesInfiniteQuery = (getArtistId: Getter<string>) =>
 			initialPageParam: 0,
 			queryFn: async ({ pageParam = 0, signal }) => {
 				const response = toArtistReleases(
-					await api.v3.GET(CATALOG_ENDPOINTS.artistReleases(getArtistId(), pageParam, BATCH_SIZE), {
-						signal
-					})
+					await api.v3.GET(
+						v3('/api/v3/artists/{artist_mbid}/releases', {
+							path: { artist_mbid: getArtistId() },
+							query: { offset: pageParam, limit: BATCH_SIZE }
+						}),
+						{
+							signal
+						}
+					)
 				);
 				return response;
 			},
@@ -195,6 +248,12 @@ export const updateArtistReleaseInCache = (
 export const fetchArtistDiscography = (artistMbid: string) =>
 	readNow([...ArtistQueryKeyFactory.releases(artistMbid), 'all'], async (signal) =>
 		toArtistReleases(
-			await api.v3.GET(CATALOG_ENDPOINTS.artistReleases(artistMbid, 0, 200), { signal })
+			await api.v3.GET(
+				v3('/api/v3/artists/{artist_mbid}/releases', {
+					path: { artist_mbid: artistMbid },
+					query: { offset: 0, limit: 200 }
+				}),
+				{ signal }
+			)
 		)
 	);

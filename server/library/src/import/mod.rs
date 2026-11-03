@@ -11,9 +11,11 @@
 //!    The scan skips the hidden prefix, and the publisher's rename then
 //!    never crosses a filesystem, whatever disk the download client used.
 //!    A plain download goes to the first root whose policy at every
-//!    file's destination is Automatic, else to the first root that is not
-//!    Excluded; joins, upgrades, drop imports and downloads for an album
-//!    the library already holds always go to the latter.
+//!    file's destination is Automatic, else to the first root where no
+//!    file's destination is Excluded (by the root or a path rule); joins,
+//!    upgrades, drop imports and downloads for an album the library
+//!    already holds always go to the latter. When no root takes them, the
+//!    import fails as a naming script fault and nothing is placed.
 //! 2. One bundle moves every copy to the path the import naming script gives
 //!    and writes the release's full tag set on the way. A file whose
 //!    destination is in a folder that keeps its own tags (the Local
@@ -45,14 +47,16 @@
 //! files join it while it names the release they were fetched for
 //! (placed on its edition) or another release of the same album (not
 //! placed). Otherwise they are filed by their tags. A joined file goes into
-//! the copy's own folder when its files sit in one, and is locked to the
-//! album as the album tools lock a moved track. A row at its destination
+//! the copy's own folder when its files sit in one, in whichever root
+//! holds it (staged in that root too) when that root takes managed writes
+//! and leaves none of the files excluded, and is locked to the album as
+//! the album tools lock a moved track. A row at its destination
 //! keeps its id for the new file only when it is on that album, not
 //! excluded and not a track the file replaces as another version; any
 //! other row there gives up its path and keeps its id and history. The
 //! commit applies the same rule again, and on an album whose match is a
 //! person's it places each file on its release track
-//! ([`crate::operations::choice::place_imported`]); what people
+//! ([`crate::edition::choice::place_imported`]); what people
 //! made on a replaced track moves to the file that replaced it. The join
 //! and each file's place ride in the provenance record, so a commit
 //! resumed after a crash joins and places them the same way.
@@ -62,22 +66,27 @@
 //! state is the one the import wrote.
 
 pub mod naming;
+pub(crate) mod sql;
 
+use crate::identity::ReleaseIdentity;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use droppedneedle_kernel::db::{Db, Lane};
+use droppedneedle_kernel::db::{CancelFlag, Db, Lane};
 
 use super::clock::LibraryClock as _;
+use super::identify::stores::StoreError;
 use super::matching::Release;
-use super::publish::import_staging::{copy_in, remove_staging, staging_rel, staging_settled};
+use super::publish::import_staging::{
+    copy_in, remove_staging, staging_needs_attention, staging_rel, staging_settled,
+};
 use super::publish::paths::{ResolvedRoot, left_out};
 use super::publish::planner::{
-    AlbumJoin, Capability, JoinedTrack, PlanBundle, PlanItem, PlanKind, ReleaseIdentity, Removal,
+    AlbumJoin, Capability, CopySeal, JoinedTrack, PlanBundle, PlanItem, PlanKind, Removal,
     RemoveItem, SealRecheck, SealedPreview,
 };
-use super::publish::publisher::{JoinedAlbum, joined_album};
+use super::publish::publisher::{JoinedAlbum, copy_folder, joined_album};
 use super::publish::remove::{self, Probe, Refusal, Target};
 use super::publish::snapshots::sha256_hex;
 use super::publish::{PublishError, TagUpdates};
@@ -105,7 +114,7 @@ pub struct ImportSource {
 
 /// A file that came with an album but is none of the release's tracks (a
 /// bonus track MusicBrainz lacks). It is filed with the album under its
-/// own title and number, with no track identity (v2 drop import "extra
+/// own title and number, with no track identity ("extra
 /// files kept alongside the album").
 #[derive(Debug, Clone)]
 pub struct ExtraSource {
@@ -191,12 +200,27 @@ pub enum ImportError {
     LocalFault(String),
     /// A file already sits where an imported file would go.
     Occupied(String),
+    /// The album the files join, or the folder its copy sits in, is no
+    /// longer as the import planned. Nothing landed; plan it again.
+    LibraryChanged(String),
     /// The import naming script gave no usable path for a file.
     NamingScript(String),
     /// The library folder the files go to is not there (the folder).
     FolderMissing(String),
     /// The library-wide switch is off. The files wait until it is on.
     LibraryOff,
+    /// The database was busy or shutting down, so no import finished. The
+    /// files wait and the import runs again.
+    Busy(String),
+}
+
+/// A database that refused the call waits as [`ImportError::Busy`]; any
+/// other store failure is a local fault.
+fn store_fault(error: PublishError) -> ImportError {
+    match error {
+        PublishError::Interrupted(cause) => ImportError::Busy(cause),
+        other => ImportError::LocalFault(other.to_string()),
+    }
 }
 
 /// One planned file.
@@ -218,6 +242,9 @@ struct Placement {
     /// The tracks this file replaces, read before the publish lock, or
     /// why one of them cannot be taken away.
     replaces: Result<Vec<Target>, String>,
+    /// The folder of the joined album's copy that the placement went by,
+    /// which the commit checks again.
+    copy_folder: Option<(String, String)>,
 }
 
 /// Finished downloads brought into the library, and the MusicBrainz and
@@ -312,38 +339,61 @@ impl Imports {
                     .map_err(|error| fault(format!("unsupported file: {error}")))?,
             );
         }
+        let name = |root: &LibraryRoot,
+                    track: &super::matching::ReleaseTrack,
+                    format: AudioFormat|
+         -> Result<String, ImportError> {
+            let named = super::matching::ReleaseTrack {
+                disc: track.disc.max(1),
+                ..track.clone()
+            };
+            naming::render(
+                &script,
+                &naming::variables(&import.release, &named, format.as_str()),
+                &root.path.to_string_lossy(),
+            )
+            .map_err(|error| ImportError::NamingScript(error.to_string()))
+        };
         let render = |root: &LibraryRoot| -> Result<Vec<String>, ImportError> {
-            let root_path = root.path.to_string_lossy();
             sources
                 .iter()
                 .zip(&formats)
-                .map(|((_, track, _), format)| {
-                    let named = super::matching::ReleaseTrack {
-                        disc: track.disc.max(1),
-                        ..track.clone()
-                    };
-                    naming::render(
-                        &script,
-                        &naming::variables(&import.release, &named, format.as_str()),
-                        &root_path,
-                    )
-                    .map_err(|error| ImportError::NamingScript(error.to_string()))
-                })
+                .map(|((_, track, _), format)| name(root, track, *format))
                 .collect()
         };
+        // A folder the naming script gives no path in is skipped, and the
+        // skip is logged the same way on every path.
+        let render_logged = |root: &LibraryRoot| {
+            render(root).inspect_err(|error| {
+                tracing::info!(
+                    root = root.id,
+                    ?error,
+                    "an import skips a folder the naming script gives no path in"
+                );
+            })
+        };
         // Joins, upgrades, drop imports and downloads for an album the
-        // library already holds take the first folder that is not
-        // excluded. A plain download takes the first folder whose policy
-        // is automatic tags at every file's destination, else that same
-        // first folder, where it keeps the tags it came with.
+        // library already holds take the first folder where no file's
+        // destination is excluded. A plain download takes the first folder
+        // whose policy is automatic tags at every file's destination, else
+        // that same folder, where it keeps the tags it came with.
         let usable: Vec<&LibraryRoot> = registry
             .roots()
             .iter()
             .filter(|root| root.policy != EffectivePolicy::Excluded)
             .collect();
-        let first = *usable
-            .first()
-            .ok_or_else(|| fault("no library root takes imports".to_owned()))?;
+        if usable.is_empty() {
+            return Err(fault("no library root takes imports".to_owned()));
+        }
+        // A folder reached through a link into another takes no managed
+        // writes.
+        let left_out = left_out(
+            &registry
+                .roots()
+                .iter()
+                .map(|root| ResolvedRoot::of(&root.id, &root.path))
+                .collect::<Vec<_>>(),
+        );
         let plain = join.is_none()
             && import.origin == ImportOrigin::Download
             && import.files.iter().all(|file| file.replaces.is_empty())
@@ -352,30 +402,14 @@ impl Imports {
                 .read_blocking("import.group_held", |conn| {
                     Ok::<_, PublishError>(group_held(conn, &import.release.release_group_id)?)
                 })
-                .map_err(|error| fault(error.to_string()))?;
+                .map_err(store_fault)?;
         let tagged = plain
             .then(|| {
-                // A folder reached through a link into another takes no
-                // managed writes.
-                let resolved: Vec<ResolvedRoot> = registry
-                    .roots()
-                    .iter()
-                    .map(|root| ResolvedRoot::of(&root.id, &root.path))
-                    .collect();
-                let left_out = left_out(&resolved);
                 usable
                     .iter()
                     .filter(|root| !left_out.contains(&root.id))
                     .find_map(|root| {
-                        let dests = render(root)
-                            .inspect_err(|error| {
-                                tracing::info!(
-                                    root = root.id,
-                                    ?error,
-                                    "a download skips a folder the naming script gives no path in"
-                                );
-                            })
-                            .ok()?;
+                        let dests = render_logged(root).ok()?;
                         dests
                             .iter()
                             .all(|dest| {
@@ -385,11 +419,81 @@ impl Imports {
                     })
             })
             .flatten();
+        let replaced = join
+            .as_ref()
+            .map(|join| join.replaced.clone())
+            .unwrap_or_default();
+        let join = join.map(|join| AlbumJoin {
+            album_id: join.album_id,
+            release_mbid: join.release_mbid,
+            release_group_mbid: import.release.release_group_id.clone(),
+        });
+        // A joined file goes beside its copy's files, named as the script
+        // names it.
+        let beside = |root: &LibraryRoot, dest: &str, folder: &Option<(String, String)>| {
+            let (copy_root, folder) = folder.as_ref()?;
+            let file = Path::new(dest).file_name()?;
+            (*copy_root == root.id).then(|| format!("{folder}/{}", file.to_string_lossy()))
+        };
+        // Where a file the script names `dest` lands in `root`: beside its
+        // copy when that is there and not excluded, else at `dest`.
+        let landing = |root: &LibraryRoot, dest: &str, folder: &Option<(String, String)>| {
+            beside(root, dest, folder)
+                .filter(|at| root.policy_for(&root.path.join(at)) != EffectivePolicy::Excluded)
+                .unwrap_or_else(|| dest.to_owned())
+        };
+        // A join's folders are judged by where its files land, beside
+        // their copy; the publish lock reads the copy again and refuses a
+        // plan it no longer holds.
+        let (early_joined, early_folders): (Option<JoinedAlbum>, Vec<Option<(String, String)>>) =
+            match &join {
+                Some(join) => self
+                    .db
+                    .read_blocking("import.join_folders", |conn| {
+                        let joined = joined_album(conn, join)?;
+                        let mut folders = Vec::with_capacity(sources.len());
+                        for (_, track, _) in &sources {
+                            folders.push(match &joined {
+                                Some(joined) => copy_folder(conn, &joined.album_id, track.disc)?,
+                                None => None,
+                            });
+                        }
+                        Ok::<_, PublishError>((joined, folders))
+                    })
+                    .map_err(store_fault)?,
+                None => (None, vec![None; sources.len()]),
+            };
         let (root, dests) = match tagged {
             Some(chosen) => chosen,
-            None => (first, render(first)?),
+            None => {
+                // The first refusal says why when no folder takes the
+                // files: the script's own fault, or an excluded path.
+                let mut refused = None;
+                let chosen = usable.iter().find_map(|root| {
+                    let dests = render_logged(root)
+                        .inspect_err(|error| {
+                            refused.get_or_insert_with(|| error.clone());
+                        })
+                        .ok()?;
+                    let landed: Vec<String> = dests
+                        .iter()
+                        .zip(&early_folders)
+                        .map(|(dest, folder)| landing(root, dest, folder))
+                        .collect();
+                    match excluded_dest(root, &landed) {
+                        Some(dest) => {
+                            refused.get_or_insert_with(|| excluded_refusal(root, dest));
+                            None
+                        }
+                        None => Some((*root, dests)),
+                    }
+                });
+                chosen.ok_or_else(|| {
+                    refused.unwrap_or_else(|| fault("no library root takes imports".to_owned()))
+                })?
+            }
         };
-        let root = root.clone();
+        let mut root = root.clone();
         let mut placements = Vec::with_capacity(sources.len());
         for (ordinal, ((((path, track, _), replaces), format), dest_rel)) in sources
             .into_iter()
@@ -421,6 +525,7 @@ impl Imports {
                 policy: root.policy,
                 track_id: String::new(),
                 replaces,
+                copy_folder: None,
             });
         }
 
@@ -428,7 +533,13 @@ impl Imports {
         // outside call, so it is kept first.
         self.identify_store
             .save_release(&import.release, Lane::Background)
-            .map_err(|error| fault(format!("the release document was not kept: {error}")))?;
+            .map_err(|error| match error {
+                StoreError::Busy(cause) => ImportError::Busy(cause),
+                StoreError::Closed => ImportError::Busy(error.to_string()),
+                StoreError::Failed(_) => {
+                    fault(format!("the release document was not kept: {error}"))
+                }
+            })?;
 
         let mut cell = self
             .core
@@ -437,78 +548,140 @@ impl Imports {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Read under the lock, so an import that waited out another write
         // sees the switch as it is now. It waits like a missing folder.
-        if super::manage::switched_off(&self.core.live_registry()) {
+        if crate::publish::session::switched_off(&self.core.live_registry()) {
             tracing::info!("a landing waits: the library is switched off");
             return Err(ImportError::LibraryOff);
         }
         cell.refresh(&registry, &self.core.root_dirs)
-            .map_err(|error| fault(error.to_string()))?;
-        let open = cell.open().map_err(|error| fault(error.to_string()))?;
-        let staged_dir = open
-            .sandbox
-            .resolve_no_symlink(&root.id, &task_dir)
-            .map_err(|error| {
-                if matches!(error, PublishError::FolderMissing) {
-                    tracing::warn!(
-                        root = root.id,
-                        "a landing stopped: the library folder is not there"
-                    );
-                    return ImportError::FolderMissing(root.path.display().to_string());
-                }
-                fault(error.to_string())
-            })?;
-        let replaced = join
-            .as_ref()
-            .map(|join| join.replaced.clone())
-            .unwrap_or_default();
-        let join = join.map(|join| AlbumJoin {
-            album_id: join.album_id,
-            release_mbid: join.release_mbid,
-            release_group_mbid: import.release.release_group_id.clone(),
-        });
-        // Whether an earlier landing still waits, the album the files
-        // join, and the folder each joined file goes to, in one read.
-        let (settled, joined, folders) = self
+            .map_err(store_fault)?;
+        // An earlier publish from this folder that a busy database stopped
+        // gets its recovery now, not at the next maintenance tick. This pass
+        // waits even when that settles it: recovery may have finished it
+        // forward, so the next pass plans afresh and finds the files owned.
+        let settled = self
+            .db
+            .read_blocking("import.staging_settled", |conn| {
+                Ok::<_, PublishError>(staging_settled(conn, &task_dir)?)
+            })
+            .map_err(store_fault)?;
+        if !settled {
+            cell.retry_held().map_err(store_fault)?;
+            let attention = self
+                .db
+                .read_blocking("import.staging_needs_attention", |conn| {
+                    Ok::<_, PublishError>(staging_needs_attention(conn, &task_dir)?)
+                })
+                .map_err(store_fault)?;
+            if attention {
+                return Err(fault(
+                    "an earlier import of this download needs attention".to_owned(),
+                ));
+            }
+            tracing::warn!(
+                task_dir,
+                "a landing waits: an earlier import of this download was unfinished"
+            );
+            return Err(ImportError::Busy(
+                "an earlier import of this download was unfinished".to_owned(),
+            ));
+        }
+        let open = cell.open().map_err(store_fault)?;
+        // The album the files join and the folder of each joined file's
+        // copy, in one read.
+        let (joined, folders) = self
             .db
             .read_blocking("import.join_state", |conn| {
-                let settled = staging_settled(conn, &task_dir)?;
                 let joined = match &join {
                     Some(join) => joined_album(conn, join)?,
                     None => None,
                 };
                 let mut folders = Vec::with_capacity(placements.len());
-                if let Some(joined) = &joined {
-                    for placement in &placements {
-                        folders.push(copy_folder(
-                            conn,
-                            &joined.album_id,
-                            &root.id,
-                            placement.track.disc,
-                        )?);
-                    }
+                for placement in &placements {
+                    folders.push(match &joined {
+                        Some(joined) => copy_folder(conn, &joined.album_id, placement.track.disc)?,
+                        None => None,
+                    });
                 }
-                Ok::<_, PublishError>((settled, joined, folders))
+                Ok::<_, PublishError>((joined, folders))
             })
-            .map_err(|error| fault(error.to_string()))?;
-        // A publish of an earlier landing that still waits for recovery
-        // reads the provenance record in this folder: leave it as it is.
-        if !settled {
-            return Err(fault(
-                "an earlier import of this download is waiting for recovery".to_owned(),
+            .map_err(store_fault)?;
+        if joined != early_joined || folders != early_folders {
+            tracing::info!(
+                task_dir,
+                "a landing is planned again: the album it joins changed"
+            );
+            return Err(ImportError::LibraryChanged(
+                "the album these files join changed".to_owned(),
             ));
         }
-        // A joined file goes beside the copy's own files.
-        for (placement, folder) in placements.iter_mut().zip(folders) {
-            if let (Some(folder), Some(name)) = (folder, Path::new(&placement.dest_rel).file_name())
-            {
-                placement.dest_rel = format!("{folder}/{}", name.to_string_lossy());
-            }
+        for (placement, folder) in placements.iter_mut().zip(&folders) {
+            placement.copy_folder.clone_from(folder);
         }
+        // When the copy sits in another library folder, the files go
+        // there, staged there too, if that folder is there, takes managed
+        // writes and leaves none of them excluded; else they stay in the
+        // folder chosen above.
+        let copy_roots: std::collections::BTreeSet<&str> = folders
+            .iter()
+            .flatten()
+            .map(|(copy_root, _)| copy_root.as_str())
+            .collect();
+        let moved = match copy_roots.into_iter().collect::<Vec<_>>()[..] {
+            [copy_root] if copy_root != root.id => registry
+                .resolve(copy_root)
+                .filter(|other| !left_out.contains(&other.id))
+                .and_then(|other| {
+                    let dests = placements
+                        .iter()
+                        .zip(&folders)
+                        .map(|(placement, folder)| {
+                            let rendered = name(other, &placement.track, placement.format).ok()?;
+                            Some(beside(other, &rendered, folder).unwrap_or(rendered))
+                        })
+                        .collect::<Option<Vec<String>>>()?;
+                    if excluded_dest(other, &dests).is_some() {
+                        return None;
+                    }
+                    let staged = open.sandbox.resolve_no_symlink(&other.id, &task_dir).ok()?;
+                    Some((other.clone(), dests, staged))
+                }),
+            _ => None,
+        };
+        let staged_dir = match moved {
+            Some((other, dests, staged)) => {
+                root = other;
+                for (placement, dest) in placements.iter_mut().zip(dests) {
+                    placement.dest_rel = dest;
+                }
+                staged
+            }
+            None => {
+                for (placement, folder) in placements.iter_mut().zip(&folders) {
+                    placement.dest_rel = landing(&root, &placement.dest_rel, folder);
+                }
+                open.sandbox
+                    .resolve_no_symlink(&root.id, &task_dir)
+                    .map_err(|error| {
+                        if matches!(error, PublishError::FolderMissing) {
+                            tracing::warn!(
+                                root = root.id,
+                                "a landing stopped: the library folder is not there"
+                            );
+                            return ImportError::FolderMissing(root.path.display().to_string());
+                        }
+                        fault(error.to_string())
+                    })?
+            }
+        };
         // A folder that keeps its own tags takes the file as it came. The
         // policy is read here, at the final destination and under the lock,
-        // so the bytes and the row's policy agree.
+        // so the bytes and the row's policy agree. The copy a join was
+        // judged by may have moved since: nothing lands excluded.
         for placement in &mut placements {
             placement.policy = root.policy_for(&root.path.join(&placement.dest_rel));
+            if placement.policy == EffectivePolicy::Excluded {
+                return Err(excluded_refusal(&root, &placement.dest_rel));
+            }
             if placement.policy == EffectivePolicy::LocalMetadata {
                 placement.tags = TagUpdates::new();
             }
@@ -527,7 +700,7 @@ impl Imports {
             .read_blocking("import.replaced_indexed", |conn| {
                 Ok::<_, PublishError>(indexed_among(conn, &wanted)?)
             })
-            .map_err(|error| fault(error.to_string()))?;
+            .map_err(store_fault)?;
         // Files bound for a taken destination are held on their own (the
         // first of two files bound for one path keeps it); the rest import.
         // A file whose replaced tracks cannot be taken away is held too,
@@ -591,7 +764,7 @@ impl Imports {
                             &freed,
                         )?)
                     })
-                    .map_err(|error| fault(error.to_string()))?
+                    .map_err(store_fault)?
                 {
                     Ok(track_id) => {
                         placement.track_id = track_id;
@@ -629,9 +802,10 @@ impl Imports {
                         error:
                             error @ (PublishError::Store(_)
                             | PublishError::Interrupted(_)
+                            | PublishError::BinsUnknown(_)
                             | PublishError::TimedOut(_)),
                         ..
-                    }) => return Err(fault(error.to_string())),
+                    }) => return Err(store_fault(error)),
                     Err(refusal) => {
                         claimed.remove(&key);
                         blocked.push((placement.index, blocked_reason(&refusal)));
@@ -672,13 +846,14 @@ impl Imports {
         };
         let dest_policy = |policy: EffectivePolicy| super::publish::planner::Adoption {
             policy,
-            policy_revision: registry.policy_revision().to_owned(),
+            policy_revision: registry.fingerprint().to_owned(),
             download_task_id: (import.origin == ImportOrigin::Download)
                 .then(|| import.task_id.clone()),
             source_path: None,
             ingest_source: import.origin.as_str().to_owned(),
             join: join.clone(),
             track: None,
+            copy_seal: None,
         };
         let result = (|| {
             let mut items = Vec::with_capacity(placements.len());
@@ -721,6 +896,10 @@ impl Imports {
                     adopt: Some(super::publish::planner::Adoption {
                         source_path: Some(placement.source.to_string_lossy().into_owned()),
                         track: joined_track(track),
+                        copy_seal: join.is_some().then(|| CopySeal {
+                            disc: track.disc,
+                            folder: placement.copy_folder.clone(),
+                        }),
                         ..dest_policy(placement.policy)
                     }),
                     replaces: None,
@@ -736,7 +915,7 @@ impl Imports {
                 items,
                 profile_revision: PINNED_REVISION,
                 naming_revision: PINNED_REVISION,
-                policy_revision: super::manage::policy_revision_u64(&registry),
+                policy_revision: crate::publish::session::policy_revision_u64(&registry),
                 put_back: None,
                 added: None,
                 removal: (!removals.is_empty()).then(|| Removal {
@@ -782,7 +961,10 @@ impl Imports {
                 .publish(&sealed, &live, &BTreeMap::new())
                 .map_err(|error| match error {
                     PublishError::Collision(detail) => ImportError::Occupied(detail.message),
-                    other => fault(other.to_string()),
+                    PublishError::JoinChanged(detail) => {
+                        ImportError::LibraryChanged(detail.message)
+                    }
+                    other => store_fault(other),
                 })?;
             Ok(sealed.bundle)
         })();
@@ -814,7 +996,7 @@ impl Imports {
             .collect();
         let album_id = self
             .db
-            .read_blocking("import.album", |conn| {
+            .read_long("import.album", &CancelFlag::never(), |conn| {
                 Ok::<_, PublishError>(crate::identity::import_album(conn, &tracks)?)
             })
             .map_err(|error| fault(format!("the catalog could not be read: {error}")))?
@@ -872,8 +1054,7 @@ impl Imports {
         }
         let at_path: Option<(String, String, String)> = conn
             .query_row(
-                "SELECT id, local_album_id, availability FROM local_tracks \
-                 WHERE root_id = ?1 AND relative_path = ?2",
+                crate::import::sql::PLANNED_TRACK_ID.text(),
                 rusqlite::params![root_id, dest_rel],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
@@ -912,10 +1093,7 @@ impl Imports {
         let rows = self
             .db
             .read_blocking("import.replaced_rows", |conn| {
-                let mut statement = conn.prepare_cached(
-                    "SELECT root_id, relative_path FROM local_tracks \
-                     WHERE id = ?1 AND availability = 'indexed'",
-                )?;
+                let mut statement = conn.prepare_cached(crate::import::sql::OLD_COPIES.text())?;
                 let mut rows = Vec::with_capacity(replaces.len());
                 for id in replaces {
                     if let Some((root, rel)) = statement
@@ -929,16 +1107,14 @@ impl Imports {
                 }
                 Ok::<_, PublishError>(rows)
             })
-            .map_err(|error| ImportError::LocalFault(error.to_string()))?;
+            .map_err(store_fault)?;
         let mut targets = Vec::with_capacity(rows.len());
         for (track_id, root_id, relative_path) in rows {
             let path = registry.resolve(&root_id).and_then(|root| {
-                super::mutations::join_inside(&root.path, &relative_path).map(|path| (root, path))
+                crate::removal::join_inside(&root.path, &relative_path).map(|path| (root, path))
             });
             let Some((root, path)) = path else {
-                return Ok(Err(
-                    "the copy it replaces is not in a library folder".to_owned()
-                ));
+                return Ok(Err(OUTSIDE_ROOT.to_owned()));
             };
             match remove::probe(&root.path, &path) {
                 Ok(probe) => targets.push(Target {
@@ -950,9 +1126,7 @@ impl Imports {
                 }),
                 Err(error) => {
                     tracing::warn!(%error, track_id, "the copy an imported file replaces could not be read");
-                    return Ok(Err(format!(
-                        "the copy it replaces could not be read: {error}"
-                    )));
+                    return Ok(Err("Your copy could not be read.".to_owned()));
                 }
             }
         }
@@ -960,13 +1134,15 @@ impl Imports {
     }
 }
 
-/// Whether something other than the files in `leaving` sits at `dest`, or
-/// beside it under a name that folds to the same one (case or Unicode), as
-/// the publisher's collision gate judges it. A path that cannot be read
-/// counts as taken.
+/// Whether something other than the files in `leaving` sits at `dest`, or,
+/// when nothing has that exact name, beside it under a name that folds to
+/// the same one (case or Unicode), as the publisher's collision gate
+/// judges it. An old copy at the exact name leaves for the new file, so a
+/// twin beside it is not looked at. A path that cannot be read counts as
+/// taken.
 fn taken(root_id: &str, dest: &Path, leaving: &[&Path]) -> bool {
-    if std::fs::symlink_metadata(dest).is_ok() && !leaving.contains(&dest) {
-        return true;
+    if std::fs::symlink_metadata(dest).is_ok() {
+        return !leaving.contains(&dest);
     }
     let (Some(parent), Some(wanted)) = (dest.parent(), dest.file_name().and_then(|n| n.to_str()))
     else {
@@ -989,13 +1165,31 @@ fn taken(root_id: &str, dest: &Path, leaving: &[&Path]) -> bool {
     })
 }
 
+/// The first of `dests`, relative to `root`, that the folder or a path
+/// rule in it leaves out.
+fn excluded_dest<'a>(root: &LibraryRoot, dests: &'a [String]) -> Option<&'a str> {
+    dests
+        .iter()
+        .find(|dest| root.policy_for(&root.path.join(dest)) == EffectivePolicy::Excluded)
+        .map(String::as_str)
+}
+
+/// Why an import does not go to `root`: the naming script puts `dest`
+/// where the library leaves files out. It waits like a script fault, for
+/// the script or the rules to change.
+fn excluded_refusal(root: &LibraryRoot, dest: &str) -> ImportError {
+    ImportError::NamingScript(format!(
+        "{dest} is in an excluded folder of {}",
+        root.path.display()
+    ))
+}
+
 /// The tracks among `ids` the catalog lists as indexed.
 fn indexed_among(
     conn: &rusqlite::Connection,
     ids: &[String],
 ) -> rusqlite::Result<std::collections::HashSet<String>> {
-    let mut statement = conn
-        .prepare_cached("SELECT 1 FROM local_tracks WHERE id = ?1 AND availability = 'indexed'")?;
+    let mut statement = conn.prepare_cached(crate::import::sql::INDEXED_AMONG.text())?;
     let mut indexed = std::collections::HashSet::new();
     for id in ids {
         if statement.exists([id])? {
@@ -1005,22 +1199,30 @@ fn indexed_among(
     Ok(indexed)
 }
 
-/// Why a file is held when a track it replaces cannot be taken away.
+/// Why a file is held when a track it replaces cannot be taken away: one
+/// short sentence per cause, for the person to read. A publish failure's
+/// own text is logged, never shown.
 fn blocked_reason(refusal: &Refusal) -> String {
     match refusal {
-        Refusal::Busy => "another write holds the copy it replaces".to_owned(),
-        Refusal::LibraryOff => "the library is switched off".to_owned(),
-        Refusal::Changed => "the copy it replaces changed while it was read".to_owned(),
-        Refusal::OutsideRoot => "the copy it replaces is not in a library folder".to_owned(),
-        Refusal::BinsUnknown(cause) => format!("no recycle bin is known while {cause}"),
-        Refusal::NoBin(_) => {
-            "the library folder of the copy it replaces has no usable recycle bin".to_owned()
+        Refusal::Busy => "Another change to the library was using your copy.".to_owned(),
+        Refusal::LibraryOff => "The library is switched off.".to_owned(),
+        Refusal::Changed => "Your copy changed while it was being checked.".to_owned(),
+        Refusal::OutsideRoot => OUTSIDE_ROOT.to_owned(),
+        Refusal::BinsUnknown(cause) => {
+            crate::removal::bins_unknown(*cause, crate::removal::BinUse::Wait)
+                .message
+                .to_owned()
         }
+        Refusal::NoBin(_) => "Your copy's library folder has no usable recycle bin.".to_owned(),
         Refusal::Publish { error, .. } => {
-            format!("the copy it replaces could not be taken away: {error}")
+            tracing::warn!(%error, "the copy an imported file replaces could not be taken away");
+            "Your copy could not be moved to the recycle bin.".to_owned()
         }
     }
 }
+
+/// A replaced copy outside every library folder, in the person's words.
+const OUTSIDE_ROOT: &str = "Your copy is not in a library folder.";
 
 /// Name of the file in a task's import folder that says where each staged
 /// copy came from, so a commit resumed after a crash keeps provenance.
@@ -1173,54 +1375,8 @@ fn group_held(conn: &rusqlite::Connection, group: &str) -> rusqlite::Result<bool
         return Ok(false);
     }
     conn.query_row(
-        "SELECT EXISTS (SELECT 1 FROM local_tracks t \
-         JOIN local_albums b ON b.id = t.local_album_id AND b.retired_into_album_id IS NULL \
-         LEFT JOIN local_album_external_identities ai ON ai.local_album_id = b.id \
-         WHERE t.availability = 'indexed' \
-         AND (lower(ai.release_group_mbid) = ?1 \
-         OR (ai.local_album_id IS NULL AND lower(t.embedded_release_group_mbid) = ?1)))",
+        crate::import::sql::GROUP_HELD.text(),
         rusqlite::params![group.to_ascii_lowercase()],
         |row| row.get(0),
     )
-}
-
-/// The one folder of `root_id` that holds the album's indexed files on
-/// `disc` (all of its indexed files when none is on that disc). `None`
-/// when they sit in several folders, in another library folder, or at
-/// the top of the root.
-fn copy_folder(
-    conn: &rusqlite::Connection,
-    album_id: &str,
-    root_id: &str,
-    disc: u32,
-) -> rusqlite::Result<Option<String>> {
-    let rows: Vec<(String, String, i64)> = conn
-        .prepare(
-            "SELECT root_id, relative_path, disc_number FROM local_tracks \
-             WHERE local_album_id = ?1 AND availability = 'indexed'",
-        )?
-        .query_map(rusqlite::params![album_id], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })?
-        .collect::<rusqlite::Result<_>>()?;
-    let disc = i64::from(disc.max(1));
-    let on_disc: Vec<&(String, String, i64)> =
-        rows.iter().filter(|row| row.2.max(1) == disc).collect();
-    let files = if on_disc.is_empty() {
-        rows.iter().collect()
-    } else {
-        on_disc
-    };
-    let mut folders = files.iter().map(|(root, rel, _)| {
-        let folder = Path::new(rel)
-            .parent()
-            .map(|parent| parent.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        (root.as_str(), folder)
-    });
-    let Some(first) = folders.next() else {
-        return Ok(None);
-    };
-    let one = folders.all(|folder| folder == first);
-    Ok((one && first.0 == root_id && !first.1.is_empty()).then_some(first.1))
 }

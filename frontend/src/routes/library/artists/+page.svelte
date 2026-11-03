@@ -10,9 +10,10 @@
 	import IconButton from '$lib/ui/IconButton.svelte';
 	import Input from '$lib/ui/Input.svelte';
 	import { getLibraryArtistsInfiniteQuery } from '$lib/queries/library/LibraryQueries.svelte';
-	import type { ArtistSort, LibraryArtistScope, LibraryArtistSummary } from '$lib/types';
+	import type { ArtistSort, LibraryArtistScope, ArtistView } from '$lib/types';
 	import { artistHref } from '$lib/utils/entityRoutes';
 	import { ChevronLeft, Disc3, Heart, Mic, Search, UsersRound, X } from 'lucide-svelte';
+	import LibraryFilterMenu from '$lib/components/library/LibraryFilterMenu.svelte';
 
 	const SEARCH_DEBOUNCE_MS = 300;
 
@@ -37,6 +38,7 @@
 			favorites,
 			defaultSort,
 			q: page.url.searchParams.get('q') ?? '',
+			minTracks: Math.max(1, Number(page.url.searchParams.get('min_tracks')) || 1),
 			sortBy: rawSort && validSorts.includes(rawSort) ? rawSort : defaultSort,
 			sortOrder: page.url.searchParams.get('order') === 'desc' ? 'desc' : 'asc'
 		} as const;
@@ -47,13 +49,14 @@
 		sortOrder: browse.sortOrder,
 		q: browse.q,
 		scope: browse.scope,
+		minTracks: browse.minTracks,
 		favorites: browse.favorites
 	});
 	const artistsQuery = getLibraryArtistsInfiniteQuery(() => params);
 
 	const artists = $derived.by(() => {
 		const seen: Record<string, true> = Object.create(null);
-		const out: LibraryArtistSummary[] = [];
+		const out: ArtistView[] = [];
 		for (const response of artistsQuery.data?.pages ?? []) {
 			for (const item of response.items) {
 				if (seen[item.id]) continue;
@@ -138,41 +141,54 @@
 		</div>
 	</header>
 
-	<nav
-		class="mb-6 grid overflow-hidden rounded-2xl border border-base-content/10 bg-base-200/45 p-1 sm:grid-cols-2"
+	<div
+		class="mb-6 grid gap-1 overflow-hidden rounded-2xl border border-base-content/10 bg-base-200/45 p-1 sm:grid-cols-2"
+		role="tablist"
 		aria-label="Artist library views"
 	>
-		<button
-			class="group flex items-center gap-3 rounded-xl px-4 py-3 text-left transition-colors"
-			class:bg-base-100={browse.view === 'albums'}
-			class:shadow-sm={browse.view === 'albums'}
-			onclick={() => selectView('albums')}
-			aria-current={browse.view === 'albums' ? 'page' : undefined}
-		>
-			<span class="rounded-xl bg-primary/10 p-2 text-primary"><Disc3 class="h-5 w-5" /></span>
-			<span class="min-w-0 flex-1">
-				<span class="block font-bold">Album artists</span>
-				<span class="block truncate text-xs text-base-content/55">Release-level ownership</span>
-			</span>
-			<span class="badge badge-ghost tabular-nums">{albumArtistTotal}</span>
-		</button>
-		<button
-			class="group flex items-center gap-3 rounded-xl px-4 py-3 text-left transition-colors"
-			class:bg-base-100={browse.view === 'contributors'}
-			class:shadow-sm={browse.view === 'contributors'}
-			onclick={() => selectView('contributors')}
-			aria-current={browse.view === 'contributors' ? 'page' : undefined}
-		>
-			<span class="rounded-xl bg-secondary/10 p-2 text-secondary"
-				><UsersRound class="h-5 w-5" /></span
+		{#each [{ view: 'albums', label: 'Album artists', hint: 'Release-level ownership', icon: Disc3, count: albumArtistTotal, tone: 'primary' }, { view: 'contributors', label: 'Contributors', hint: 'Track-level appearances', icon: UsersRound, count: contributorTotal, tone: 'secondary' }] as const as tab (tab.view)}
+			{@const selected = browse.view === tab.view}
+			{@const accent =
+				tab.tone === 'primary'
+					? {
+							border: 'border-primary',
+							icon: 'bg-primary text-primary-content',
+							badge: 'badge-primary'
+						}
+					: {
+							border: 'border-secondary',
+							icon: 'bg-secondary text-secondary-content',
+							badge: 'badge-secondary'
+						}}
+			<button
+				type="button"
+				role="tab"
+				aria-selected={selected}
+				class="group flex cursor-pointer items-center gap-3 rounded-xl border-2 px-4 py-3 text-left transition-colors duration-150 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary {selected
+					? `bg-base-100 shadow-sm ${accent.border}`
+					: 'border-transparent hover:border-base-content/15 hover:bg-base-100/60'}"
+				onclick={() => selectView(tab.view)}
 			>
-			<span class="min-w-0 flex-1">
-				<span class="block font-bold">Contributors</span>
-				<span class="block truncate text-xs text-base-content/55">Track-level appearances</span>
-			</span>
-			<span class="badge badge-ghost tabular-nums">{contributorTotal}</span>
-		</button>
-	</nav>
+				<span
+					class="rounded-xl p-2 transition-colors {selected
+						? accent.icon
+						: 'bg-base-content/5 text-base-content/60 group-hover:text-base-content'}"
+				>
+					<tab.icon class="h-5 w-5" />
+				</span>
+				<span class="min-w-0 flex-1">
+					<span
+						class="block font-bold {selected
+							? ''
+							: 'text-base-content/60 group-hover:text-base-content'}">{tab.label}</span
+					>
+					<span class="block truncate text-xs text-base-content/55">{tab.hint}</span>
+				</span>
+				<span class="badge tabular-nums {selected ? accent.badge : 'badge-ghost'}">{tab.count}</span
+				>
+			</button>
+		{/each}
+	</div>
 
 	<div class="mb-6 flex flex-col gap-3 sm:flex-row">
 		<div class="relative flex-1">
@@ -219,6 +235,10 @@
 			<option value="date_added:desc">Newest first</option>
 			<option value="date_added:asc">Oldest first</option>
 		</select>
+		<LibraryFilterMenu
+			minTracks={browse.minTracks}
+			onMinTracks={(min) => setParams({ min_tracks: min > 1 ? String(min) : null })}
+		/>
 	</div>
 
 	{#if artistsQuery.isError}
@@ -260,22 +280,23 @@
 				<Card
 					variant="raised"
 					padding="none"
-					href={artistHref(artist.musicbrainz_artist_id ?? artist.id)}
+					href={artistHref(artist.artist_mbid ?? artist.id)}
 					class="group overflow-hidden"
 					aria-label={`Open ${artist.name}`}
 				>
 					<figure class="relative aspect-square overflow-hidden p-3">
 						<ArtistImage
-							mbid={artist.musicbrainz_artist_id ?? ''}
+							mbid={artist.artist_mbid ?? ''}
 							localId={artist.id}
+							artMissing={artist.art_missing}
 							alt={artist.name}
 							size="full"
 							requestSize={250}
 							className="h-full w-full transition-transform duration-300 motion-safe:group-hover:scale-105"
 						/>
-						{#if artist.artist_identity_state === 'local_only'}
+						{#if artist.identity_state === 'local_only'}
 							<LocalIdentityBadge
-								state={artist.artist_identity_state}
+								state={artist.identity_state}
 								subject="artist"
 								compact
 								className="absolute left-3 top-3 z-10"
@@ -288,11 +309,11 @@
 							{#if browse.scope === 'album'}
 								{artist.album_count}
 								{artist.album_count === 1 ? 'release' : 'releases'} ·
-								{artist.track_count}
-								{artist.track_count === 1 ? 'track' : 'tracks'}
+								{artist.led_track_count}
+								{artist.led_track_count === 1 ? 'track' : 'tracks'}
 							{:else}
-								{artist.appearance_release_count}
-								{artist.appearance_release_count === 1 ? 'release' : 'releases'} ·
+								{artist.appearance_album_count}
+								{artist.appearance_album_count === 1 ? 'release' : 'releases'} ·
 								{artist.appearance_track_count}
 								{artist.appearance_track_count === 1 ? 'appearance' : 'appearances'}
 							{/if}

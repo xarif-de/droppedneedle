@@ -411,11 +411,13 @@ export function managementCollisions(item: LibraryManagementPlanItem): Managemen
 				existingRootId:
 					stringOrNull(value.existing_root_id) ??
 					stringOrNull(value.destination_root_id) ??
-					item.destination_root_id,
+					item.destination_root_id ??
+					null,
 				existingRelativePath:
 					stringOrNull(value.existing_relative_path) ??
 					stringOrNull(value.destination_relative_path) ??
-					item.destination_relative_path,
+					item.destination_relative_path ??
+					null,
 				existingLocalTrackId:
 					stringOrNull(value.existing_local_track_id) ?? stringOrNull(value.catalog_track_id)
 			}
@@ -449,6 +451,7 @@ export function titleManagementValue(value: string): string {
  */
 export const MANAGEMENT_REASON_LABELS: Record<string, string> = {
 	MANAGEMENT_DISABLED: 'File organization is turned off',
+	SCAN_HELD_BACK: 'Held back after a scan found files gone',
 	UNCONFIRMED_MATCH: 'Edition is a best guess nobody confirmed',
 	UNMATCHED_ALBUM: 'Album is not matched to MusicBrainz',
 	CHOSEN_EDITION_FITS_NO_FILE: 'Chosen edition does not fit these files',
@@ -539,13 +542,13 @@ export function formatManagementBytes(value: number): string {
 }
 
 /** A server time in seconds; no time means the preview never expires. */
-export function formatManagementDate(value: number | null): string {
+export function formatManagementDate(value: number | null | undefined): string {
 	return value ? new Date(value * 1000).toLocaleString() : 'No expiry';
 }
 
 export function managementRootLabel(
 	roots: ReadonlyArray<{ id: string; label: string }>,
-	value: string | null
+	value: string | null | undefined
 ): string {
 	return roots.find((root) => root.id === value)?.label ?? (value ? 'Unavailable root' : 'No root');
 }

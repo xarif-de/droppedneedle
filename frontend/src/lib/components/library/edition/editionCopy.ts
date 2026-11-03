@@ -145,7 +145,7 @@ function chipFor(status: EditionStatus): PlateCopy['chip'] {
 }
 
 /** Line 2 while the edition's files are placed or written, if they are. */
-export function busyLine(status: EditionStatus): string | null {
+function busyLine(status: EditionStatus): string | null {
 	if (status.placing) {
 		return status.placing.attempts > 0 ? 'Waiting for MusicBrainz' : 'Matching your files to it...';
 	}
@@ -265,7 +265,7 @@ export function filesPlacedSentence(kept: number, notKept: number): string {
 	return `${placed} ${rest}`;
 }
 
-export type TagsMode = 'held' | 'writing' | 'written' | 'manual';
+export type TagsMode = 'held' | 'writing' | 'written' | 'manual' | 'kept';
 
 /** The Tags row, except 'written', whose "History" is a link. */
 export function tagsSentence(mode: Exclude<TagsMode, 'written'>): string {
@@ -276,6 +276,8 @@ export function tagsSentence(mode: Exclude<TagsMode, 'written'>): string {
 			return "Writing this edition's tags and file names...";
 		case 'manual':
 			return 'Your files still carry their old tags. Apps like Subsonic and Jellyfin read the tags, so they show the new edition once you write them.';
+		case 'kept':
+			return "This album's folder keeps its own tags, so they aren't written here.";
 	}
 }
 

@@ -8,7 +8,7 @@ use utoipa::{IntoParams, ToSchema};
 
 use droppedneedle_kernel::runtime_config::sections::{AppConnect, AppConnectClient};
 
-use crate::session::tokens::constant_time_eq;
+use crate::session::tokens::secret_eq;
 use crate::users::services::MAX_APP_PASSWORD_NAME_LEN;
 
 /// Longest `state`, in bytes.
@@ -218,7 +218,7 @@ pub fn verifier_matches(verifier: &str, challenge: &str) -> bool {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || b"-._~".contains(&byte));
     let computed = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
-    well_formed & constant_time_eq(&computed, challenge)
+    well_formed & secret_eq(&computed, challenge)
 }
 
 #[cfg(test)]

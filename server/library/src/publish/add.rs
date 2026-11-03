@@ -193,9 +193,14 @@ pub fn plan_take_back(
     }
     let taken: bool = conn
         .prepare_cached(sql::TAKE_BACK_EXISTS.text())?
-        .query_row(rusqlite::params![undoes_marker(bundle_id)], |row| {
-            row.get(0)
-        })?;
+        .query_row(
+            rusqlite::params![
+                undoes_marker(bundle_id),
+                JournalKind::Delete,
+                JournalState::Compensated,
+            ],
+            |row| row.get(0),
+        )?;
     if taken {
         return Ok(Err(TakeBackRefusal::AlreadyTakenBack));
     }
@@ -245,9 +250,29 @@ pub fn plugin_files(
     let (at, id) = before.unwrap_or((i64::MAX, ""));
     let rows: Vec<(String, i64, String, bool)> = conn
         .prepare_cached(sql::PLUGIN_FILES.text())?
-        .query_map(rusqlite::params![plugin, at, id, limit], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-        })?
+        .query_map(
+            rusqlite::params![
+                plugin,
+                at,
+                id,
+                limit,
+                JournalKind::Delete,
+                JournalState::Compensated,
+                JournalKind::Add,
+                JournalState::Committed,
+                JournalState::CleanupPending,
+                JournalState::Cleaned,
+            ],
+            |row| {
+                let row = sql::PluginFileRow::read(row)?;
+                Ok((
+                    row.bundle_id,
+                    row.created_at,
+                    row.bundle_json,
+                    row.taken_back,
+                ))
+            },
+        )?
         .collect::<Result<_, _>>()?;
     rows.into_iter()
         .map(|(bundle_id, added_at, json, taken_back)| {
@@ -263,6 +288,21 @@ pub fn plugin_files(
             })
         })
         .collect()
+}
+
+/// Which of `bundle_ids` still stand in the library: each wrote its
+/// journal row and was not unwound. A write that stopped before its row,
+/// or was put back as it was, changed nothing.
+pub fn standing(
+    conn: &Connection,
+    bundle_ids: &[String],
+) -> Result<std::collections::HashSet<String>, PublishError> {
+    let ids = serde_json::to_string(bundle_ids)?;
+    let standing = conn
+        .prepare_cached(sql::STANDING_BUNDLES.text())?
+        .query_map([ids], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    Ok(standing)
 }
 
 /// The text an undo's recorded bundle holds for the add it undoes.

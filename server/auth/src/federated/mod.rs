@@ -11,13 +11,14 @@
 //! store's username derivation (`_derive_username`, `_slugify`), and the
 //! auth, connection and Plex auth routes.
 //!
-//! Each provider has one concrete client in a `*_http` module that talks
-//! through the shared outbound client: [`oidc_http::OidcHttp`] at the
-//! issuer and endpoints the OIDC settings and discovery name,
-//! [`jellyfin_http::JellyfinHttp`] at the Jellyfin settings' server, and
-//! [`plex_http::PlexTv`] at the plex.tv root the server's outbound
-//! addresses give. Wire shapes live in the matching `*_models` module. The
-//! integration tests point the same clients at local mock servers.
+//! Each provider has one concrete client in a `*_http` module:
+//! [`oidc_http::OidcHttp`] at the issuer and endpoints the OIDC settings
+//! and discovery name, through the providers crate's OIDC client, and
+//! [`jellyfin_http::JellyfinHttp`] at the Jellyfin settings' server,
+//! through the shared outbound client, with their wire shapes in the
+//! matching `*_models` module; [`plex_http::PlexTv`] through the providers
+//! crate's plex.tv client, which holds plex.tv's shapes. The integration tests point the same clients at local mock
+//! servers.
 //!
 //! Contracts with the rest of auth:
 //!
@@ -40,7 +41,6 @@ pub mod oidc_models;
 pub mod password_import;
 pub mod plex;
 pub mod plex_http;
-pub mod plex_models;
 pub mod settings;
 pub mod transport;
 pub mod users;
@@ -54,12 +54,14 @@ use self::jellyfin_login::JellyfinProfile;
 use self::plex::PlexProfile;
 use crate::users::stores::BoxFuture;
 
-pub use droppedneedle_providers::web_address::web_address;
+use droppedneedle_providers::web_address::web_address;
 
 /// Failure of a federated login or import step. HTTP mapping lives in the
 /// handler layer: `Authentication` is 401 on login routes (403 on the Plex
-/// poll, v2 parity), `NotConfigured` and `ProviderUnavailable` are 503,
-/// `StoreUnavailable` and `RngUnavailable` are 500 with a fixed body.
+/// poll, v2 parity), `NotConfigured`, `ProviderUnavailable` and `Paced` are
+/// 503,
+/// `Busy` is the closed-list "server busy" 503, and `StoreUnavailable` and
+/// `RngUnavailable` are 500 with a fixed body.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum FederatedError {
     /// Bad credential, bad/expired state or exchange code, rejected
@@ -70,6 +72,15 @@ pub enum FederatedError {
     /// `ExternalServiceError`).
     #[error("provider unavailable: {0}")]
     ProviderUnavailable(String),
+    /// The provider's rate row cannot cover this call right now. Nothing was
+    /// lost: the same sign-in works once the wait is over.
+    #[error("{provider} is paced")]
+    Paced {
+        /// The rate row's name.
+        provider: &'static str,
+        /// Whole seconds until it has room, when known.
+        retry_after: Option<u64>,
+    },
     /// The provider is disabled or half-configured (v2
     /// `ConfigurationError`).
     #[error("not configured: {0}")]
@@ -77,6 +88,9 @@ pub enum FederatedError {
     /// Local persistence failed.
     #[error("store unavailable: {0}")]
     StoreUnavailable(String),
+    /// The database was too busy to answer in time. Nothing was written.
+    #[error("store busy")]
+    Busy,
     /// A username insert raced a concurrent create; the caller re-derives.
     #[error("username taken")]
     UsernameTaken,
@@ -145,28 +159,7 @@ pub fn endpoint(base: &Url, segments: &[&str]) -> Url {
     url
 }
 
-/// Append `value` as one JSON string literal (quotes included).
+/// `value` as one JSON string literal (quotes included).
 pub fn json_string(value: &str) -> String {
-    let mut out = String::with_capacity(value.len() + 2);
-    out.push('"');
-    json_escape_into(&mut out, value);
-    out.push('"');
-    out
-}
-
-/// Escape `value` for embedding in a JSON string (no surrounding quotes).
-pub fn json_escape_into(out: &mut String, value: &str) {
-    for c in value.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => {
-                out.push_str(&format!("\\u{:04x}", c as u32));
-            }
-            c => out.push(c),
-        }
-    }
+    serde_json::Value::from(value).to_string()
 }
