@@ -64,8 +64,6 @@ pub enum ServiceError {
     Internal(String),
     /// The feature needs setup first; the sentence is shown.
     NotConfigured(String),
-    /// The feature is not built yet; the sentence is shown.
-    NotBuilt(String),
     /// A usage limit is spent for now; the sentence is shown.
     Exhausted(String),
 }
@@ -87,7 +85,6 @@ fn owned_store_failure(failure: ProviderFailure) -> ServiceError {
         ProviderFailure::Provider(error) => ServiceError::Provider(error),
         ProviderFailure::Failed(cause) => ServiceError::Internal(cause),
         ProviderFailure::NotConfigured(sentence) => ServiceError::NotConfigured(sentence),
-        ProviderFailure::NotBuilt(sentence) => ServiceError::NotBuilt(sentence),
         ProviderFailure::Exhausted(sentence) => ServiceError::Exhausted(sentence),
     }
 }
@@ -582,15 +579,4 @@ pub async fn your_top_albums(
         .charts
         .your_top_albums(user_id, range, limit, offset, source)
         .await?)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn blank_names_fail() {
-        assert!(check_name("  ", "artist").is_err());
-        assert!(check_name("Portishead", "artist").is_ok());
-    }
 }

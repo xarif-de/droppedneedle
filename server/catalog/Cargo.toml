@@ -7,6 +7,9 @@ license.workspace = true
 description = "DroppedNeedle read side: catalog, discover, collections and concerts"
 publish = false
 
+[lib]
+doctest = false
+
 [dependencies]
 droppedneedle-auth.workspace = true
 droppedneedle-kernel.workspace = true
@@ -42,5 +45,4 @@ test-support = [
 ]
 
 [dev-dependencies]
-droppedneedle-auth = { workspace = true, features = ["test-support"] }
 droppedneedle-kernel = { workspace = true, features = ["test-support"] }

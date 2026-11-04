@@ -218,6 +218,8 @@ Run from the repo root. `make help` lists every target.
   lock (`DataLock::server`) and a second server on the folder refuses to
   start. A server started on v2 data holds only the server lock
   (`DataLock::server_only`) until Continue takes the shared lock.
+  rusqlite is the only SQLite library (`source_gates.rs` refuses another in
+  the lock).
 - One exception: provider answers are cached in `metadata-cache.db` (in
   `CACHE_DIR`, or beside `library.db` when that folder is refused), a
   throwaway file opened in `kernel/src/db/cache/` under a lock of its own,
@@ -237,6 +239,12 @@ Run from the repo root. `make help` lists every target.
   data lock held, the importer writes on one connection, because it attaches
   the export (which a transaction refuses) and a large section outlasts the
   lane's time limit.
+- Reads go through the `Db`'s read pools. A read closure holds one
+  connection and one snapshot for its whole length: on the request path it
+  runs one statement, and statements share a closure only when they must
+  agree (a library background read, an export), with a comment saying why.
+  A read that may run long uses `read_long`. A read closure calls nothing on
+  `Db` and waits on nothing.
 - A write closure fails with the caller's own error type
   (`E: From<DbError>`); an outcome a caller branches on is a variant of that
   type, never the text of a database error. A chunked write commits chunk by
@@ -247,9 +255,10 @@ Run from the repo root. `make help` lists every target.
   (statements, fragments, and families whose builders take only
   `sql_choice!`, `bool` or `ListLen` values);
   `every_registered_statement_prepares` prepares each against the schema.
-  A crate with a `sql.rs` lists it and has a row in that test. An area
-  that moves its SQL there deletes its line from
-  `server/sql-outside-registry.txt`, and a gate then keeps raw SQL out.
+  A crate with a `sql.rs` lists it and has a row in that test. A gate
+  (`raw_sql_stays_in_sql_files`) keeps raw SQL out of every other file;
+  its one permanent exception is the v2 export's bundle builder, which
+  builds each statement at run time from the columns the v2 database has.
   A `sql!` block whose statements read a v2 database starts with
   `schema = V2;` and is prepared against the v2 fixture.
 - A statement that answers more than one column is read through a `row` in its
@@ -261,11 +270,17 @@ Run from the repo root. `make help` lists every target.
 - SQLite is built with its memory counters off (`SQLITE_DEFAULT_MEMSTATUS=0`), in
   `.cargo/config.toml` and the Dockerfile: on every allocation they take one
   process-wide mutex. `persist_schema` holds it.
-- Migrations are numbered and forward-only. Never edit or renumber a shipped
-  one. Each new one ships an upgrade test. They land on `v3` in number
-  order: the runner skips any migration below the database's version, so a
-  later number landing first loses the earlier one on every database that
-  boots in between.
+- Migrations are numbered and forward-only, starting from the v3 baseline
+  in `server/migrations/`. One runner, keyed on `user_version`, applies each
+  listed file above the stamp in number order, each in one transaction with
+  its own stamp; a file whose first line is `-- no-transaction` runs as
+  written. A stamp the runner does not expect is refused before anything is
+  written, the pre-upgrade backup included. Never edit, renumber or remove a
+  migration once it is on `v3`, the baseline included (a test pins each
+  file's hash): a schema change is a new number. Each new one ships an
+  upgrade test. They land on `v3` in number order: the runner skips any
+  migration below the database's version, so a later number landing first
+  loses the earlier one on every database that boots in between.
 - A migration that rebuilds a table other tables reference starts with
   `-- no-transaction`, turns foreign keys off around one transaction, keeps
   `rowid`, indexes and triggers, refuses to commit when `foreign_key_check`
@@ -644,8 +659,14 @@ Run from the repo root. `make help` lists every target.
 - SPA only: `ssr = false`, adapter-static, thin load functions.
 - Svelte 5 runes only: `$props()`, `$state`, `$derived`, callback props. No
   `export let`, `$:`, `createEventDispatcher` or `any`.
-- Data fetching is TanStack Query only, in per-feature modules under
-  `src/lib/queries/` with `get<Thing>Query` hooks. Calls go through the `api`
+- Code lives by feature in `src/lib/features/<name>/` (`components/`,
+  `queries/`, `state/`). Another feature imports only the modules that
+  feature lists in `src/lib/features/public.json`; eslint refuses any other
+  path into it, and a spec holds the list to the folders and files. Shared
+  pieces live in `lib/ui` (the kit), `lib/media` and `lib/shell`, and the
+  query core (client, keys, effects, events, persister) in `lib/queries`.
+- Data fetching is TanStack Query only, in each feature's `queries/` with
+  `get<Thing>Query` hooks. Calls go through the `api`
   client with URL builders and forward the abort signal. Types come from the
   generated contract. Query parameters and DELETE bodies are typed from the
   contract; the client has no untyped request methods.
@@ -657,7 +678,7 @@ Run from the repo root. `make help` lists every target.
   metadata source carries `meta.provider`, so a source switch drops it.
 - An effect that seeds a form from `query.data` guards itself: any change to
   the query re-runs it.
-- A small feature's queries are one file, `lib/queries/<feature>.svelte.ts`; a
+- A small feature's queries are one file in its `queries/` folder; a
   hook names its route, with no alias file. The keys `effects.ts` sweeps live
   in `lib/queries/featureKeys.ts`, so it imports no hooks.
 - Change the cache only through `setQueryDataWithPersister` and
@@ -680,11 +701,13 @@ Run from the repo root. `make help` lists every target.
   Build on `src/lib/ui` (`Button`, `IconButton`, `Card`, `Input`, `Modal`,
   `CardTitle`, `CardActions`, `ConfirmDialog`, `Field`, `TextField`,
   `NumberField`, `SecretField`, `SelectField`, `TextAreaField`, `ToggleRow`,
+  `RadioCards`,
   `SaveBar`,
   `AsyncButton`, `QueryBoundary`, `RatingStars`, `PageShell`, `Toaster`,
   `CoverPlaceholder`, `UnsavedChangesGuard`):
   do not hand-write a button, a card, a text input, a modal, a confirm, a
-  form row or a query's loading, error and empty branches. Lint refuses a
+  form row, a `<dialog>` or a query's loading, error and empty branches
+  (lint refuses a `<dialog>` outside `src/lib/ui` and any `confirm()`). Lint refuses a
   raw `btn` or `card` class (or their DaisyUI modifiers) and a text-like
   `<input>` outside `src/lib/ui`. A look the kit lacks is added to the kit
   as a variant, not to one screen.
@@ -700,7 +723,7 @@ Run from the repo root. `make help` lists every target.
   path.
 - A library view says `art_missing` when the server knows the cover routes
   would answer 404; the web UI asks for no cover a view marks missing.
-- Navigation destinations live in `lib/components/shell/navItems.ts`; the
+- Navigation destinations live in `lib/shell/navItems.ts`; the
   sidebar, the bottom bar and the More sheet all render from it.
 - A Discover or Home section is one entry in the registry in
   `catalog/src/discover/sections.rs` (its page, zone, settings
@@ -773,6 +796,6 @@ Run from the repo root. `make help` lists every target.
 
 - GitHub URLs point at the `DroppedNeedle/DroppedNeedle` org repo. Never
   create repos under the old names.
-- The two ignored advisories (RUSTSEC-2023-0071 in CI, RUSTSEC-2024-0436 in
-  `deny.toml`) are reviewed. Re-check them when sqlx or lofty move.
-- Gaps in the migration numbering stay as they are.
+- The ignored advisory RUSTSEC-2024-0436 in `deny.toml` is reviewed.
+  Re-check it when lofty moves.
+- Migrations start from the v3 baseline. Never reuse a lower number.

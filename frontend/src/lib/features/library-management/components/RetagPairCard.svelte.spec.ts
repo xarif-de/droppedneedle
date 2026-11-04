@@ -1,0 +1,149 @@
+import { page } from 'vitest/browser';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { render } from 'vitest-browser-svelte';
+
+import type { RetagPair } from '$lib/features/library-management/queries/LibraryRetagPairQueries.svelte';
+
+const h = vi.hoisted(() => {
+	return {
+		join: vi.fn(),
+		dismiss: vi.fn(),
+		goto: vi.fn()
+	};
+});
+
+vi.mock('$app/navigation', () => ({ goto: h.goto }));
+vi.mock('$lib/stores/authStore.svelte', () => ({ authStore: { user: { id: 'admin-1' } } }));
+vi.mock('$lib/features/library/queries/EditionQueries.svelte', () => ({
+	getAlbumEditionsQuery: (_user: () => string, group: () => string) => ({
+		get data() {
+			const release = group() === 'rg-old' ? 'rel-old' : 'rel-new';
+			const country = group() === 'rg-old' ? 'GB' : 'US';
+			return {
+				items: [{ release_mbid: release, date: '2011-03-01', country, media_formats: ['CD'] }]
+			};
+		}
+	})
+}));
+vi.mock('$lib/features/library-management/queries/LibraryRetagPairQueries.svelte', () => ({
+	createJoinRetagPairMutation: () => ({ mutateAsync: h.join, isPending: false }),
+	createDismissRetagPairMutation: () => ({ mutateAsync: h.dismiss, isPending: false })
+}));
+
+import RetagPairCard from './RetagPairCard.svelte';
+
+function side(
+	id: string,
+	title: string,
+	edition: Partial<NonNullable<RetagPair['old_album']['edition']>> | null
+) {
+	return {
+		id,
+		title,
+		album_artist_name: 'Artist',
+		track_count: id === 'old' ? 12 : 11,
+		identity_token: id === 'old' ? '3:a' : '7:b',
+		edition: edition
+			? {
+					chosen: true,
+					custom: false,
+					release_group_mbid: `rg-${id}`,
+					release_mbid: `rel-${id}`,
+					...edition
+				}
+			: null
+	};
+}
+
+function pair(overrides: Partial<RetagPair> = {}): RetagPair {
+	return {
+		old_album: side('old', 'Blue Hour', {}),
+		new_album: side('new', 'Blue Hour (Remaster)', {}),
+		reason: 'chosen_matches_differ',
+		editions_differ: true,
+		recorded_at: 0,
+		...overrides
+	};
+}
+
+beforeEach(() => {
+	h.join.mockReset().mockResolvedValue({ album_id: 'new' });
+	h.dismiss.mockReset().mockResolvedValue({ dismissed: true });
+	h.goto.mockReset();
+});
+
+describe('RetagPairCard', () => {
+	it('asks which edition to keep before a merge of two chosen editions', async () => {
+		render(RetagPairCard, { pair: pair() });
+
+		await expect
+			.element(
+				page.getByText('have different editions chosen, so DroppedNeedle did not join them.', {
+					exact: false
+				})
+			)
+			.toBeVisible();
+		const merge = page.getByRole('button', { name: 'Merge into one album' });
+		await expect.element(merge).toBeDisabled();
+
+		await page.getByRole('radio', { name: 'Keep the 2011 GB CD edition (from Blue Hour)' }).click();
+		await expect.element(merge).toBeEnabled();
+		await expect
+			.element(page.getByText('the album is left unmanaged after the merge', { exact: false }))
+			.toBeVisible();
+		await merge.click();
+
+		await vi.waitFor(() =>
+			expect(h.join).toHaveBeenCalledWith({
+				oldAlbumId: 'old',
+				newAlbumId: 'new',
+				keepEditionOf: 'old',
+				expectedIdentityTokens: { old: '3:a', new: '7:b' }
+			})
+		);
+	});
+
+	it('says a split album gives its edition to the named album only', async () => {
+		render(RetagPairCard, { pair: pair({ reason: 'tracks_elsewhere', editions_differ: false }) });
+
+		await expect
+			.element(
+				page.getByText("Blue Hour's edition goes to Blue Hour (Remaster) only.", { exact: false })
+			)
+			.toBeVisible();
+		await expect.element(page.getByRole('radio')).not.toBeInTheDocument();
+		await page.getByRole('button', { name: 'Merge into one album' }).click();
+		await vi.waitFor(() =>
+			expect(h.join).toHaveBeenCalledWith(expect.objectContaining({ keepEditionOf: null }))
+		);
+	});
+
+	it('warns before the click that a custom edition is dropped for good', async () => {
+		render(RetagPairCard, {
+			pair: pair({
+				reason: 'custom_edition',
+				editions_differ: false,
+				old_album: side('old', 'Blue Hour', { custom: true })
+			})
+		});
+
+		await expect
+			.element(
+				page.getByText("Merging drops it: it does not carry over and can't be put back.", {
+					exact: false
+				})
+			)
+			.toBeVisible();
+	});
+
+	it('keeps them apart with a dismiss', async () => {
+		render(RetagPairCard, { pair: pair() });
+
+		await page.getByRole('button', { name: 'Keep them apart' }).click();
+
+		await vi.waitFor(() =>
+			expect(h.dismiss).toHaveBeenCalledWith({ oldAlbumId: 'old', newAlbumId: 'new' })
+		);
+		expect(h.join).not.toHaveBeenCalled();
+	});
+});

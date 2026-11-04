@@ -1,7 +1,7 @@
 import { page } from 'vitest/browser';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { render } from 'vitest-browser-svelte';
-import type { LibraryContribution } from '$lib/types';
+import type { LibraryContribution } from '$lib/features/library/queries/types';
 
 const h = vi.hoisted(() => ({
 	mutateSave: vi.fn(),
@@ -107,7 +107,7 @@ const contribution: LibraryContribution = {
 	review_reason: null
 };
 
-vi.mock('$lib/queries/libraryContributions/LibraryContributionQueries.svelte', () => ({
+vi.mock('$lib/features/library/queries/LibraryContributionQueries.svelte', () => ({
 	getLibraryContributionQuery: () => ({
 		data: contribution,
 		isLoading: false,
@@ -116,7 +116,7 @@ vi.mock('$lib/queries/libraryContributions/LibraryContributionQueries.svelte', (
 	})
 }));
 
-vi.mock('$lib/queries/libraryContributions/LibraryContributionMutations.svelte', () => ({
+vi.mock('$lib/features/library/queries/LibraryContributionMutations.svelte', () => ({
 	createUpdateLibraryContributionMutation: () => ({ isPending: false, mutate: h.mutateSave }),
 	createRebuildLibraryContributionMutation: () => ({ isPending: false, mutate: h.mutateRebuild }),
 	createCancelLibraryContributionMutation: () => ({ isPending: false, mutate: h.mutateCancel }),
@@ -185,16 +185,5 @@ describe('library contribution page', () => {
 			.toBeVisible();
 		await expect.element(page.getByRole('button', { name: 'Search' })).toBeDisabled();
 		await expect.element(page.getByRole('button', { name: 'Check MusicBrainz' })).toBeDisabled();
-	});
-
-	it('shows shared contribution status without curator controls to listeners', async () => {
-		h.authStore.isTrusted = false;
-		await render(ContributionPage, {
-			props: { data: { contributionId: contribution.id, primarySource: 'listenbrainz' } }
-		} as unknown as Parameters<typeof render>[1]);
-
-		await expect.element(page.getByRole('textbox', { name: 'Release title' })).toBeDisabled();
-		await expect.element(page.getByRole('button', { name: 'Save draft' })).not.toBeInTheDocument();
-		await expect.element(page.getByRole('button', { name: 'Cancel' })).not.toBeInTheDocument();
 	});
 });

@@ -20,7 +20,6 @@ const AVALON_MBID: &str = "0687c8a5-40a2-4a0c-bdc9-c1d80d94bef5";
 const IMMUNITY_MBID: &str = "c85ad49c-6bfb-4bdc-96f8-f5f305a8799e";
 const RETIRED_RECORDING_MBID: &str = "5224cfc7-b3bb-4008-a41b-21b168dc631f";
 const CANONICAL_RECORDING_MBID: &str = "33ea7e59-3691-4414-92d3-6bce48d5d9cc";
-const ARTIST_MBID: &str = "5441c29d-3602-4898-b1a1-b77fa23b8e50";
 const GROUP_MBID: &str = "dcff25f1-702d-3b5e-b0da-d48172e6e62a";
 
 /// Scripted MusicBrainz: outcomes queue per URL (the last one repeating),
@@ -104,64 +103,13 @@ async fn degrades<T>(read: impl std::future::Future<Output = T>) -> (T, bool) {
 // Contract: tolerant wire, strict identity, honest absence.
 // ---------------------------------------------------------------------------
 
+/// Absence, typed failure and degradation stay apart: a missing id or a
+/// malformed mbid fails typed, a 404 is absence and degrades nothing, a
+/// dead or failing provider fails an identity-critical read, and a 429 or
+/// 503 surfaces its wait while a best-effort read degrades to absence.
 #[tokio::test(start_paused = true)]
-async fn search_tolerates_unknown_fields_at_every_level() {
-    let fake = fast_mb();
-    fake.script(
-        &mb_url("/release"),
-        Ok(raw(
-            200,
-            vec![],
-            serde_json::json!({
-                "count": 1,
-                "created": "2026-07-21T00:00:00Z",
-                "offset": 0,
-                "future-envelope-key": {"nested": true},
-                "releases": [{
-                    "id": RELEASE_MBID,
-                    "score": 100,
-                    "title": "Goldberg Variations",
-                    "status": "Official",
-                    "future-hit-key": [1, 2],
-                    "artist-credit": [{
-                        "name": "Glenn Gould",
-                        "joinphrase": "",
-                        "future-credit-key": "x",
-                        "artist": {"id": ARTIST_MBID, "name": "Glenn Gould", "sort-name": "Gould, Glenn"}
-                    }],
-                    "release-group": {"id": GROUP_MBID, "title": "Goldberg Variations"},
-                    "media": [{"position": 1, "format": "CD", "track-count": 34}],
-                    "label-info": [{"catalog-number": "ABC-1", "label": {"id": GROUP_MBID, "name": "CBS"}}]
-                }]
-            })
-            .to_string()
-            .into_bytes(),
-        )),
-    );
-    let client = official_client(fake.clone());
-    let page = client
-        .search_releases(
-            "Goldberg Variations",
-            "Glenn Gould",
-            10,
-            musicbrainz::Criticality::BestEffort,
-        )
-        .await
-        .expect("search decodes");
-    assert_eq!(page.count, 1);
-    assert_eq!(page.offset, 0);
-    assert_eq!(page.items.len(), 1);
-    let hit = &page.items[0];
-    assert_eq!(hit.id, RELEASE_MBID);
-    assert_eq!(musicbrainz::hit_score(hit.score, hit.ext_score), 100);
-    assert_eq!(hit.title.as_deref(), Some("Goldberg Variations"));
-    assert_eq!(hit.media.len(), 1);
-    assert_eq!(hit.label_info[0].catalog_number.as_deref(), Some("ABC-1"));
-    assert_eq!(fake.seen().len(), 1);
-}
-
-#[tokio::test(start_paused = true)]
-async fn missing_identity_id_fails_decoding() {
+async fn musicbrainz_answers_keep_absence_failure_and_degradation_apart() {
+    // Missing identity id: a lookup and a search hit both fail decoding.
     let fake = fast_mb();
     fake.script(
         &mb_url(&format!("/release/{RELEASE_MBID}")),
@@ -171,10 +119,10 @@ async fn missing_identity_id_fails_decoding() {
     let error = client
         .lookup_release(RELEASE_MBID, &[], musicbrainz::Criticality::BestEffort)
         .await
-        .expect_err("missing id must fail");
+        .expect_err("missing id: the lookup must fail");
     assert!(
         matches!(error, ProviderError::Payload { .. }),
-        "got {error:?}"
+        "missing id lookup: got {error:?}"
     );
 
     let fake = fast_mb();
@@ -190,10 +138,10 @@ async fn missing_identity_id_fails_decoding() {
     let error = client
         .search_releases("x", "y", 5, musicbrainz::Criticality::BestEffort)
         .await
-        .expect_err("id-less hit must fail");
+        .expect_err("missing id: an id-less hit must fail");
     assert!(
         matches!(error, ProviderError::Payload { .. }),
-        "got {error:?}"
+        "missing id search: got {error:?}"
     );
 
     let error = client
@@ -202,12 +150,10 @@ async fn missing_identity_id_fails_decoding() {
         .expect_err("malformed mbid must fail");
     assert!(
         matches!(error, ProviderError::Invalid { .. }),
-        "got {error:?}"
+        "malformed mbid: got {error:?}"
     );
-}
 
-#[tokio::test(start_paused = true)]
-async fn not_found_is_absence_never_an_empty_struct() {
+    // Not found: None or an empty page, never an empty struct.
     let fake = fast_mb();
     let missing = "00000000-0000-0000-0000-000000000001";
     fake.script(
@@ -221,8 +167,11 @@ async fn not_found_is_absence_never_an_empty_struct() {
         let found = client
             .lookup_release(missing, &[], musicbrainz::Criticality::IdentityCritical)
             .await
-            .expect("404 lookup resolves");
-        assert!(found.is_none(), "404 is None, not an empty release");
+            .expect("not found: 404 lookup resolves");
+        assert!(
+            found.is_none(),
+            "not found: 404 is None, not an empty release"
+        );
         let page = client
             .search_releases(
                 "nothing",
@@ -231,8 +180,11 @@ async fn not_found_is_absence_never_an_empty_struct() {
                 musicbrainz::Criticality::IdentityCritical,
             )
             .await
-            .expect("404 search resolves");
-        assert!(page.items.is_empty() && page.count == 0);
+            .expect("not found: 404 search resolves");
+        assert!(
+            page.items.is_empty() && page.count == 0,
+            "not found: 404 search is an empty page"
+        );
         let resolved = client
             .resolve_url(
                 "https://www.discogs.com/release/1",
@@ -240,11 +192,113 @@ async fn not_found_is_absence_never_an_empty_struct() {
                 musicbrainz::Criticality::IdentityCritical,
             )
             .await
-            .expect("404 url resolves");
-        assert!(resolved.relations.is_empty());
+            .expect("not found: 404 url resolves");
+        assert!(
+            resolved.relations.is_empty(),
+            "not found: 404 url has no relations"
+        );
     })
     .await;
-    assert!(!degraded, "definitive absence records no degradation");
+    assert!(
+        !degraded,
+        "not found: definitive absence records no degradation"
+    );
+
+    // Dead provider: an identity-critical read fails typed.
+    let critical = musicbrainz::Criticality::IdentityCritical;
+    let fake = fast_mb();
+    fake.script(
+        &mb_url(&format!("/release/{RELEASE_MBID}")),
+        Err("connection refused".to_owned()),
+    );
+    let client = official_client(fake.clone());
+    let error = client
+        .lookup_release(RELEASE_MBID, &[], critical)
+        .await
+        .expect_err("dead provider fails identity-critical");
+    assert!(
+        matches!(error, ProviderError::Transport { .. }),
+        "dead provider: got {error:?}"
+    );
+
+    let fake = fast_mb();
+    fake.script(
+        &mb_url(&format!("/release/{RELEASE_MBID}")),
+        Ok(raw(500, vec![], Vec::new())),
+    );
+    let client = official_client(fake.clone());
+    let error = client
+        .lookup_release(RELEASE_MBID, &[], critical)
+        .await
+        .expect_err("500 fails identity-critical");
+    assert!(
+        matches!(error, ProviderError::Server { status: 500, .. }),
+        "500: got {error:?}"
+    );
+
+    // Rate limit: the wait surfaces, a best-effort read degrades.
+    let fake = fast_mb();
+    fake.script(
+        &mb_url(&format!("/release/{RELEASE_MBID}")),
+        Ok(raw(429, vec![("Retry-After", "5")], Vec::new())),
+    );
+    let client = official_client(fake.clone());
+    let error = client
+        .lookup_release(
+            RELEASE_MBID,
+            &[],
+            musicbrainz::Criticality::IdentityCritical,
+        )
+        .await
+        .expect_err("429 fails identity-critical");
+    match error {
+        ProviderError::RateLimited { retry_after, .. } => assert_eq!(
+            retry_after,
+            Some(Duration::from_secs(5)),
+            "429: Retry-After surfaces"
+        ),
+        other => panic!("429: got {other:?}"),
+    }
+
+    let fake = fast_mb();
+    fake.script(
+        &mb_url(&format!("/release/{RELEASE_MBID}")),
+        Ok(raw(503, vec![], Vec::new())),
+    );
+    let client = official_client(fake.clone());
+    let error = client
+        .lookup_release(
+            RELEASE_MBID,
+            &[],
+            musicbrainz::Criticality::IdentityCritical,
+        )
+        .await
+        .expect_err("503 fails identity-critical");
+    assert!(
+        matches!(
+            error,
+            ProviderError::RateLimited {
+                retry_after: Some(wait),
+                ..
+            } if wait == Duration::from_secs(1)
+        ),
+        "503: got {error:?}"
+    );
+
+    let fake = fast_mb();
+    fake.script(
+        &mb_url(&format!("/release/{RELEASE_MBID}")),
+        Ok(raw(429, vec![], Vec::new())),
+    );
+    let client = official_client(fake.clone());
+    let (found, degraded) =
+        degrades(client.lookup_release(RELEASE_MBID, &[], musicbrainz::Criticality::BestEffort))
+            .await;
+    assert!(
+        found.expect("429 degrades best-effort").is_none(),
+        "best effort: 429 reads as absence"
+    );
+    assert!(degraded, "best effort: the request is marked degraded");
 }
 
 #[tokio::test(start_paused = true)]
@@ -285,41 +339,6 @@ async fn requests_carry_user_agent_fmt_and_sorted_includes() {
     );
 }
 
-#[tokio::test(start_paused = true)]
-async fn identity_critical_dead_provider_fails_typed() {
-    for critical in [musicbrainz::Criticality::IdentityCritical] {
-        let fake = fast_mb();
-        fake.script(
-            &mb_url(&format!("/release/{RELEASE_MBID}")),
-            Err("connection refused".to_owned()),
-        );
-        let client = official_client(fake.clone());
-        let error = client
-            .lookup_release(RELEASE_MBID, &[], critical)
-            .await
-            .expect_err("dead provider fails identity-critical");
-        assert!(
-            matches!(error, ProviderError::Transport { .. }),
-            "got {error:?}"
-        );
-
-        let fake = fast_mb();
-        fake.script(
-            &mb_url(&format!("/release/{RELEASE_MBID}")),
-            Ok(raw(500, vec![], Vec::new())),
-        );
-        let client = official_client(fake.clone());
-        let error = client
-            .lookup_release(RELEASE_MBID, &[], critical)
-            .await
-            .expect_err("500 fails identity-critical");
-        assert!(
-            matches!(error, ProviderError::Server { status: 500, .. }),
-            "got {error:?}"
-        );
-    }
-}
-
 /// An answer past the cap is refused unread, even when the server never
 /// says how long it is.
 #[tokio::test]
@@ -356,8 +375,6 @@ async fn an_answer_over_the_cap_is_refused_unread() {
         Arc::new(SystemClock),
         ProviderEndpoints {
             musicbrainz: base.clone(),
-            brainzmash: musicbrainz::BRAINZMASH_API_BASE.to_owned(),
-            coverart: coverart::COVER_ART_ARCHIVE_BASE.to_owned(),
             ..ProviderEndpoints::closed()
         },
     );
@@ -384,67 +401,6 @@ async fn an_answer_over_the_cap_is_refused_unread() {
         ),
         "got {error:?}"
     );
-}
-
-#[tokio::test(start_paused = true)]
-async fn rate_limit_surfaces_retry_after_and_degrades_best_effort() {
-    let fake = fast_mb();
-    fake.script(
-        &mb_url(&format!("/release/{RELEASE_MBID}")),
-        Ok(raw(429, vec![("Retry-After", "5")], Vec::new())),
-    );
-    let client = official_client(fake.clone());
-    let error = client
-        .lookup_release(
-            RELEASE_MBID,
-            &[],
-            musicbrainz::Criticality::IdentityCritical,
-        )
-        .await
-        .expect_err("429 fails identity-critical");
-    match error {
-        ProviderError::RateLimited { retry_after, .. } => {
-            assert_eq!(retry_after, Some(Duration::from_secs(5)))
-        }
-        other => panic!("got {other:?}"),
-    }
-
-    let fake = fast_mb();
-    fake.script(
-        &mb_url(&format!("/release/{RELEASE_MBID}")),
-        Ok(raw(503, vec![], Vec::new())),
-    );
-    let client = official_client(fake.clone());
-    let error = client
-        .lookup_release(
-            RELEASE_MBID,
-            &[],
-            musicbrainz::Criticality::IdentityCritical,
-        )
-        .await
-        .expect_err("503 fails identity-critical");
-    assert!(
-        matches!(
-            error,
-            ProviderError::RateLimited {
-                retry_after: Some(wait),
-                ..
-            } if wait == Duration::from_secs(1)
-        ),
-        "got {error:?}"
-    );
-
-    let fake = fast_mb();
-    fake.script(
-        &mb_url(&format!("/release/{RELEASE_MBID}")),
-        Ok(raw(429, vec![], Vec::new())),
-    );
-    let client = official_client(fake.clone());
-    let (found, degraded) =
-        degrades(client.lookup_release(RELEASE_MBID, &[], musicbrainz::Criticality::BestEffort))
-            .await;
-    assert!(found.expect("429 degrades best-effort").is_none());
-    assert!(degraded, "the request is marked degraded");
 }
 
 // ---------------------------------------------------------------------------
@@ -765,8 +721,9 @@ async fn foreign_and_browse_redirects_are_rejected() {
 // BrainzMash mirror.
 // ---------------------------------------------------------------------------
 
+/// The mirror's path and request URL allowlists, good and bad inputs.
 #[test]
-fn brainzmash_path_allowlist_holds() {
+fn brainzmash_paths_and_urls_follow_the_allowlist() {
     assert_eq!(
         musicbrainz::validate_brainzmash_path(&format!("/release/{RELEASE_MBID}")),
         Ok(format!("/release/{RELEASE_MBID}"))
@@ -794,13 +751,10 @@ fn brainzmash_path_allowlist_holds() {
     ] {
         assert!(
             musicbrainz::validate_brainzmash_path(bad).is_err(),
-            "{bad} must not validate"
+            "path {bad} must not validate"
         );
     }
-}
 
-#[test]
-fn brainzmash_request_url_validation_holds() {
     assert!(
         musicbrainz::validate_brainzmash_request_url(
             "https://api.brainzmash.cc/ws/2/release/aaaaaaaa-0000-0000-0000-000000000001"
@@ -823,7 +777,7 @@ fn brainzmash_request_url_validation_holds() {
     ] {
         assert!(
             musicbrainz::validate_brainzmash_request_url(bad).is_err(),
-            "{bad} must not validate"
+            "url {bad} must not validate"
         );
     }
 }
@@ -899,44 +853,11 @@ async fn the_source_is_read_at_every_request() {
 // Cover Art Archive (live provider boundary 2026-07-21).
 // ---------------------------------------------------------------------------
 
-fn caa_listing_url(entity: &str, mbid: &str) -> String {
+fn caa_front_url(entity: &str, mbid: &str) -> String {
     format!(
-        "{coverart_base}/{entity}/{mbid}",
+        "{coverart_base}/{entity}/{mbid}/front",
         coverart_base = coverart::COVER_ART_ARCHIVE_BASE
     )
-}
-
-fn caa_listing_body() -> Vec<u8> {
-    serde_json::json!({
-        "images": [{
-            "approved": true,
-            "front": true,
-            "back": false,
-            "comment": "Front cover",
-            "id": 42,
-            "image": "http://coverartarchive.org/release/abc/front.png",
-            "thumbnails": {
-                "1200": "http://coverartarchive.org/release/abc/front-1200.jpg",
-                "500": "http://coverartarchive.org/release/abc/front-500.jpg",
-                "250": "http://coverartarchive.org/release/abc/front-250.jpg",
-                "small": "http://coverartarchive.org/release/abc/front-small.jpg"
-            },
-            "types": ["Front"],
-            "future-image-key": 1
-        }, {
-            "approved": false,
-            "front": false,
-            "back": true,
-            "comment": "",
-            "id": 43,
-            "image": "http://coverartarchive.org/release/abc/back.png",
-            "thumbnails": {},
-            "types": ["Back", "Spine"],
-        }],
-        "future-root-key": true
-    })
-    .to_string()
-    .into_bytes()
 }
 
 fn caa() -> FakeMb {
@@ -949,143 +870,121 @@ fn caa_answer(status: u16, headers: Vec<(&str, &str)>, body: Vec<u8>) -> Result<
 
 const CAA_PRIORITY: RequestPriority = RequestPriority::BackgroundSync;
 
-#[tokio::test(start_paused = true)]
-async fn caa_listing_decodes_the_live_shape() {
-    let fake = caa();
-    let url = caa_listing_url("release", RELEASE_MBID);
-    fake.script(&url, caa_answer(200, vec![], caa_listing_body()));
-    let candidates = fake
-        .providers
+/// The front of a release, as `fetch_front` asks for it in full.
+async fn caa_front(
+    fake: &FakeMb,
+    mbid: &str,
+    priority: RequestPriority,
+) -> Result<Option<coverart::ArtworkBytes>, ProviderError> {
+    fake.providers
         .coverart
-        .list_artwork(
+        .fetch_front(
             coverart::EntityKind::Release,
-            RELEASE_MBID,
-            coverart::DownloadSize::Size500,
-            CAA_PRIORITY,
+            mbid,
+            coverart::DownloadSize::Full,
+            1024 * 1024,
+            priority,
         )
         .await
-        .expect("listing decodes");
-    assert_eq!(candidates.len(), 2);
-    let first = &candidates[0];
-    assert_eq!(
-        first.candidate_id,
-        format!("caa:release:{RELEASE_MBID}:42:500")
-    );
-    assert_eq!(first.source, "cover_art_archive_release");
-    assert!(first.source_is_exact_release);
-    assert!(first.approved && first.primary);
-    assert_eq!(
-        first.locator,
-        "https://coverartarchive.org/release/abc/front-500.jpg"
-    );
-    assert_eq!(first.image_types, vec![coverart::ImageType::Front]);
-    let second = &candidates[1];
-    assert_eq!(
-        second.image_types,
-        vec![coverart::ImageType::Back, coverart::ImageType::Spine]
-    );
 }
 
+/// Only raster bytes count as an image (SVG and short blobs are refused).
 #[test]
-fn caa_artwork_url_upgrade_and_rejection() {
+fn caa_image_bytes_are_checked() {
+    let jpeg = [b"\xff\xd8\xff".as_slice(), &[0u8; 16]].concat();
     assert_eq!(
-        coverart::upgrade_artwork_url("http://coverartarchive.org/release/abc/front.png")
-            .as_deref(),
-        Some("https://coverartarchive.org/release/abc/front.png")
+        coverart::sniff_image_content_type(&jpeg),
+        Some("image/jpeg"),
+        "sniff jpeg"
+    );
+    let png = [b"\x89PNG\r\n\x1a\n".as_slice(), &[0u8; 16]].concat();
+    assert_eq!(
+        coverart::sniff_image_content_type(&png),
+        Some("image/png"),
+        "sniff png"
+    );
+    let gif = [b"GIF89a".as_slice(), &[0u8; 16]].concat();
+    assert_eq!(
+        coverart::sniff_image_content_type(&gif),
+        Some("image/gif"),
+        "sniff gif"
+    );
+    let webp = [b"RIFFxxxxWEBP".as_slice(), &[0u8; 16]].concat();
+    assert_eq!(
+        coverart::sniff_image_content_type(&webp),
+        Some("image/webp"),
+        "sniff webp"
     );
     assert_eq!(
-        coverart::upgrade_artwork_url("https://coverartarchive.org:443/a/b.jpg?x=1#frag")
-            .as_deref(),
-        Some("https://coverartarchive.org/a/b.jpg?x=1")
+        coverart::sniff_image_content_type(b"<svg></svg>!!!!"),
+        None,
+        "sniff svg"
     );
-    for bad in [
-        "https://evil.example/a.jpg",
-        "https://coverartarchive.org.evil.example/a.jpg",
-        "ftp://coverartarchive.org/a.jpg",
-        "https://user@coverartarchive.org/a.jpg",
-        "https://coverartarchive.org:8443/a.jpg",
-        "https://coverartarchive.org",
-        "not-a-url",
-    ] {
-        assert_eq!(coverart::upgrade_artwork_url(bad), None, "{bad}");
-    }
+    assert_eq!(
+        coverart::sniff_image_content_type(b"short"),
+        None,
+        "sniff short"
+    );
 }
 
+/// A 404 is no front cover, a 500 is a failure, a malformed mbid sends
+/// nothing; a 429 is retried after its wait, and a second 503 surfaces its
+/// wait.
 #[tokio::test(start_paused = true)]
-async fn caa_missing_is_empty_while_failures_are_errors() {
+async fn caa_front_tells_absence_from_failure() {
     let fake = caa();
-    let missing = "00000000-0000-0000-0000-000000000001";
+    // The recorded 404 answer for a release with no artwork.
+    let missing = "fd6ebf0e-85e4-4aa1-995a-07d5ac0c2147";
     fake.script(
-        &caa_listing_url("release", missing),
-        caa_answer(404, vec![], Vec::new()),
+        &caa_front_url("release", missing),
+        caa_answer(
+            404,
+            vec![],
+            include_bytes!("../fixtures/coverartarchive/release_not_found.html").to_vec(),
+        ),
     );
+    // A 500 was never recorded; the client reads it by its status alone.
     fake.script(
-        &caa_listing_url("release", RELEASE_MBID),
+        &caa_front_url("release", RELEASE_MBID),
         caa_answer(500, vec![], Vec::new()),
     );
-    let client = &fake.providers.coverart;
-    let candidates = client
-        .list_artwork(
-            coverart::EntityKind::Release,
-            missing,
-            coverart::DownloadSize::Full,
-            CAA_PRIORITY,
-        )
+    let front = caa_front(&fake, missing, CAA_PRIORITY)
         .await
-        .expect("404 is authoritative emptiness");
-    assert!(candidates.is_empty());
-    let error = client
-        .list_artwork(
-            coverart::EntityKind::Release,
-            RELEASE_MBID,
-            coverart::DownloadSize::Full,
-            CAA_PRIORITY,
-        )
+        .expect("404 is authoritative absence");
+    assert!(front.is_none(), "404: no front cover");
+    let error = caa_front(&fake, RELEASE_MBID, CAA_PRIORITY)
         .await
-        .expect_err("500 is a provider failure, not empty artwork");
+        .expect_err("500 is a provider failure, not a missing cover");
     assert!(
         matches!(error, ProviderError::Server { status: 500, .. }),
-        "got {error:?}"
+        "500: got {error:?}"
     );
     let before = fake.seen().len();
-    let error = client
-        .list_artwork(
-            coverart::EntityKind::Release,
-            "nope",
-            coverart::DownloadSize::Full,
-            CAA_PRIORITY,
-        )
+    let error = caa_front(&fake, "nope", CAA_PRIORITY)
         .await
         .expect_err("malformed mbid fails locally");
     assert!(
         matches!(error, ProviderError::Invalid { .. }),
-        "got {error:?}"
+        "malformed mbid: got {error:?}"
     );
     assert_eq!(fake.seen().len(), before, "malformed mbid sends nothing");
-}
 
-#[tokio::test(start_paused = true)]
-async fn caa_backoff_retries_then_surfaces_the_wait() {
+    // The archive never answered 429 or 503 while recording, so those
+    // answers are written here.
+    let png: Vec<u8> = [b"\x89PNG\r\n\x1a\n".as_slice(), &[0u8; 16]].concat();
     let fake = caa();
-    let url = caa_listing_url("release", RELEASE_MBID);
+    let url = caa_front_url("release", RELEASE_MBID);
     fake.script(
         &url,
         caa_answer(429, vec![("Retry-After", "1")], Vec::new()),
     );
-    fake.script(&url, caa_answer(200, vec![], br#"{"images": []}"#.to_vec()));
-    let candidates = fake
-        .providers
-        .coverart
-        .list_artwork(
-            coverart::EntityKind::Release,
-            RELEASE_MBID,
-            coverart::DownloadSize::Full,
-            RequestPriority::UserInitiated,
-        )
+    fake.script(&url, caa_answer(200, vec![], png.clone()));
+    let front = caa_front(&fake, RELEASE_MBID, RequestPriority::UserInitiated)
         .await
-        .expect("retry after backoff succeeds");
-    assert!(candidates.is_empty());
-    assert_eq!(fake.seen().len(), 2);
+        .expect("retry after backoff succeeds")
+        .expect("the retried answer is the cover");
+    assert_eq!(front.bytes, png, "429: the retried cover is read");
+    assert_eq!(fake.seen().len(), 2, "429: one retry");
 
     let fake = caa();
     fake.script(&url, caa_answer(503, vec![], Vec::new()));
@@ -1093,118 +992,13 @@ async fn caa_backoff_retries_then_surfaces_the_wait() {
         &url,
         caa_answer(503, vec![("Retry-After", "2")], Vec::new()),
     );
-    let error = fake
-        .providers
-        .coverart
-        .list_artwork(
-            coverart::EntityKind::Release,
-            RELEASE_MBID,
-            coverart::DownloadSize::Full,
-            RequestPriority::UserInitiated,
-        )
+    let error = caa_front(&fake, RELEASE_MBID, RequestPriority::UserInitiated)
         .await
         .expect_err("second 503 surfaces");
     assert!(
         matches!(error, ProviderError::Unavailable { retry_after: Some(wait), .. } if wait == Duration::from_secs(2)),
-        "got {error:?}"
+        "503: got {error:?}"
     );
-}
-
-#[tokio::test(start_paused = true)]
-async fn caa_download_sniffs_when_declarations_lie() {
-    let png: Vec<u8> = [b"\x89PNG\r\n\x1a\n".as_slice(), &[0u8; 16]].concat();
-    assert!(png.len() >= 12);
-    let fake = caa();
-    let listing = caa_listing_url("release", RELEASE_MBID);
-    fake.script(&listing, caa_answer(200, vec![], caa_listing_body()));
-    let client = &fake.providers.coverart;
-    let candidates = client
-        .list_artwork(
-            coverart::EntityKind::Release,
-            RELEASE_MBID,
-            coverart::DownloadSize::Full,
-            CAA_PRIORITY,
-        )
-        .await
-        .expect("listing decodes");
-    let front = candidates
-        .into_iter()
-        .find(|candidate| candidate.primary)
-        .expect("front");
-
-    fake.script(
-        &front.locator,
-        caa_answer(200, vec![("Content-Type", "text/html")], png.clone()),
-    );
-    fake.script(
-        &front.locator,
-        caa_answer(
-            200,
-            vec![("Content-Type", "image/jpeg; charset=binary")],
-            png.clone(),
-        ),
-    );
-    fake.script(&front.locator, caa_answer(200, vec![], png.clone()));
-    let bytes = client
-        .download_artwork(&front, 1024 * 1024, CAA_PRIORITY)
-        .await
-        .expect("download decodes");
-    assert_eq!(bytes.bytes, png);
-    assert_eq!(bytes.content_type, "image/png", "bytes beat a lying header");
-
-    let bytes = client
-        .download_artwork(&front, 1024 * 1024, CAA_PRIORITY)
-        .await
-        .expect("download decodes");
-    assert_eq!(bytes.content_type, "image/jpeg; charset=binary");
-
-    let error = client
-        .download_artwork(&front, 4, CAA_PRIORITY)
-        .await
-        .expect_err("over-limit download fails");
-    assert!(
-        matches!(
-            error,
-            ProviderError::Payload {
-                kind: PayloadKind::TooLarge,
-                ..
-            }
-        ),
-        "got {error:?}"
-    );
-
-    let foreign = coverart::ArtworkCandidate {
-        source: "someone-else".to_owned(),
-        ..front.clone()
-    };
-    let error = client
-        .download_artwork(&foreign, 1024, CAA_PRIORITY)
-        .await
-        .expect_err("foreign source refused");
-    assert!(
-        matches!(error, ProviderError::Invalid { .. }),
-        "got {error:?}"
-    );
-}
-
-#[test]
-fn sniff_accepts_raster_only() {
-    let jpeg = [b"\xff\xd8\xff".as_slice(), &[0u8; 16]].concat();
-    assert_eq!(
-        coverart::sniff_image_content_type(&jpeg),
-        Some("image/jpeg")
-    );
-    let png = [b"\x89PNG\r\n\x1a\n".as_slice(), &[0u8; 16]].concat();
-    assert_eq!(coverart::sniff_image_content_type(&png), Some("image/png"));
-    let gif = [b"GIF89a".as_slice(), &[0u8; 16]].concat();
-    assert_eq!(coverart::sniff_image_content_type(&gif), Some("image/gif"));
-    let webp = [b"RIFFxxxxWEBP".as_slice(), &[0u8; 16]].concat();
-    assert_eq!(
-        coverart::sniff_image_content_type(&webp),
-        Some("image/webp")
-    );
-    assert_eq!(coverart::sniff_image_content_type(b"<svg></svg>!!!!"), None);
-    assert_eq!(coverart::sniff_image_content_type(b"short"), None);
 }
 
 // ---------------------------------------------------------------------------

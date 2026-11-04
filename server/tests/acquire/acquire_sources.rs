@@ -8,11 +8,12 @@
 //! as a real subprocess. Plus the gates that keep a source's stored text
 //! in the one conversion and the Usenet backend in the wiring.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::common::acquire::no_targets;
 use axum::Router;
 use axum::http::{StatusCode, header};
 use axum::routing::get;
@@ -33,6 +34,7 @@ use droppedneedle_acquire::usenet::prowlarr::{ProwlarrClient, ProwlarrIndexer};
 use droppedneedle_acquire::usenet::sabnzbd::{SabnzbdClient, SabnzbdQueue};
 use droppedneedle_kernel::runtime_config::ConfigStore;
 use droppedneedle_kernel::runtime_config::crypto::Crypto;
+use droppedneedle_kernel::runtime_config::sections::PluginConfig;
 use droppedneedle_plugins::host::PluginHost;
 use droppedneedle_plugins::process::ProcessLauncher;
 use droppedneedle_plugins::runtime::RuntimeState;
@@ -147,7 +149,11 @@ async fn slskd_conforms() {
         },
     );
     let journal = journal_with_task("t-slskd", "Portishead", "Dummy").await;
-    let source = Arc::new(SlskdSource::new(Arc::new(repo), journal));
+    let source = Arc::new(SlskdSource::new(
+        Arc::new(repo),
+        journal.clone(),
+        no_targets(&journal),
+    ));
     conforms(source, SourceTag::Soulseek, "t-slskd", |_| {}).await;
 }
 
@@ -225,8 +231,9 @@ async fn sabnzbd_conforms() {
         Arc::new(queue),
         vec![Arc::new(newznab)],
         policy,
-        journal,
+        journal.clone(),
         None,
+        no_targets(&journal),
     ));
     conforms(source, SourceTag::Usenet, "t-sab", |handle| {
         // SABnzbd finishes the job into its complete folder.
@@ -290,6 +297,7 @@ async fn a_usenet_pick_grabs_through_its_indexer() {
         policy.clone(),
     );
     let client = newznab_indexers().client("dummy", "Dummy", &format!("{indexer}/api"), "NZKEY");
+    let journal = journal_with_task("t-grab", "Portishead", "Dummy").await;
     let source = SabnzbdSource::new(
         Arc::new(queue),
         vec![Arc::new(NewznabIndexer::new(
@@ -306,8 +314,9 @@ async fn a_usenet_pick_grabs_through_its_indexer() {
             WAIT,
         ))],
         policy,
-        journal_with_task("t-grab", "Portishead", "Dummy").await,
+        journal.clone(),
         None,
+        no_targets(&journal),
     );
     source.enqueue("t-grab", 0).await.expect("enqueues");
     assert_eq!(mock.state().add_file_requests.len(), 1);
@@ -320,6 +329,176 @@ async fn a_usenet_pick_grabs_through_its_indexer() {
             ))
         ),
         "the grab counted against the cap: {next:?}"
+    );
+}
+
+/// A copy an upgrade's landing turned down as not better than the
+/// library's is not fetched again by the next automatic look for that
+/// album, which takes another; a manual search still lists it, marked.
+#[tokio::test]
+async fn a_copy_turned_down_as_not_better_is_not_picked_again() {
+    use droppedneedle_acquire::downloads::landing_rows::{ImportDecisionRow, ImportOutcome};
+    use droppedneedle_acquire::downloads::state::{AttemptState, TaskStatus};
+    use droppedneedle_acquire::reason::Reason;
+    use droppedneedle_acquire::search_jobs::candidates::CandidateNoteCode;
+    use droppedneedle_acquire::search_jobs::store::{JobPayload, JobStatus, JobStore, NewJob};
+    use droppedneedle_acquire::usenet::newznab::usenet_identity;
+
+    const SIZE: u64 = 314_572_800;
+    let mock = SabnzbdMock::new();
+    let (sab, _sab_server) = serve_loopback(mock.router()).await.expect("mock serves");
+    let item = |title: &str, guid: &str| {
+        format!(
+            r#"<item><title>{title}</title><guid>{guid}</guid>
+   <enclosure url="{sab}/nzb/good" length="{SIZE}" type="application/x-nzb"/>
+   <newznab:attr name="category" value="3040"/>
+   <newznab:attr name="size" value="{SIZE}"/>
+   <newznab:attr name="files" value="12"/></item>"#
+        )
+    };
+    let body = format!(
+        r#"<rss version="2.0" xmlns:newznab="http://www.newznab.com/DTD/2010/feeds/attributes/">
+ <channel>{}{}</channel>
+</rss>"#,
+        item("Portishead - Dummy (1994) [FLAC]", "seen"),
+        item("Portishead - Dummy (1994) [FLAC] [Remaster]", "fresh"),
+    );
+    let (indexer, _indexer_server) = serve_loopback(Router::new().route(
+        "/api",
+        get(move || {
+            let body = body.clone();
+            async move { body }
+        }),
+    ))
+    .await
+    .expect("feed serves");
+    let dir = ScratchDir::new("source-turned-down");
+    let policy = UsenetPolicy::v2_defaults();
+    let queue = SabnzbdQueue::new(
+        SabnzbdClient::new(
+            reqwest::Client::new(),
+            &sab,
+            "SABKEY",
+            3,
+            Duration::from_millis(1),
+        ),
+        &sab,
+        "SABKEY",
+        dir.join("complete"),
+        policy.clone(),
+    );
+    let seen = usenet_identity("Portishead - Dummy (1994) [FLAC]", SIZE);
+    let fresh = usenet_identity("Portishead - Dummy (1994) [FLAC] [Remaster]", SIZE);
+    let journal = journal_with_task("t-earlier", "Portishead", "Dummy").await;
+    let handle = serde_json::to_string(&SourceHandle {
+        release_identity: seen.clone(),
+        ..SourceHandle::new(SourceTag::Usenet)
+    })
+    .expect("handle encodes");
+    journal
+        .run("test.seed_turned_down", move |store| {
+            store.insert_task(
+                &NewTask {
+                    id: "t-next".to_owned(),
+                    user_id: "u1".to_owned(),
+                    artist_name: "Portishead".to_owned(),
+                    album_title: "Dummy".to_owned(),
+                    release_group_mbid: "rg-1".to_owned(),
+                    origin: "upgrade".to_owned(),
+                    retry_count: 0,
+                },
+                1_700_000_100.0,
+            )?;
+            store.insert_attempt(
+                "a-earlier",
+                "t-earlier",
+                "usenet",
+                0,
+                "droppedneedle-t-earlier-0",
+                &handle,
+                AttemptState::Complete,
+                1_700_000_000.0,
+            )?;
+            store.record_import_decision(&ImportDecisionRow {
+                task_id: "t-earlier".to_owned(),
+                attempt_id: Some("a-earlier".to_owned()),
+                outcome: ImportOutcome::Rejected,
+                reason_code: Some(Reason::NotAnUpgrade),
+                checks_json: "[]".to_owned(),
+                missing_positions: "[]".to_owned(),
+                decided_at: 1_700_000_050.0,
+                ..Default::default()
+            })?;
+            store.transition_task("t-earlier", TaskStatus::Failed, 1_700_000_050.0, None)
+        })
+        .await
+        .expect("seeds");
+    let client = newznab_indexers().client("dummy", "Dummy", &format!("{indexer}/api"), "NZKEY");
+    let source = SabnzbdSource::new(
+        Arc::new(queue),
+        vec![Arc::new(NewznabIndexer::new(
+            vec![NewznabIndexerEntry {
+                client,
+                id: "dummy".to_owned(),
+                name: "Dummy".to_owned(),
+                categories: vec![3040],
+                enabled: true,
+                priority: 1,
+                limit: 100,
+            }],
+            WAIT,
+            WAIT,
+        ))],
+        policy,
+        journal.clone(),
+        None,
+        no_targets(&journal),
+    );
+
+    let picked = source.enqueue("t-next", 0).await.expect("enqueues");
+    assert_eq!(
+        picked.release_identity, fresh,
+        "the next look takes another copy"
+    );
+
+    let listed = source
+        .search(&album("Portishead", "Dummy"))
+        .await
+        .expect("searches");
+    let jobs = JobStore::new(journal.db().clone());
+    jobs.insert(NewJob {
+        id: "job-1".to_owned(),
+        user_id: "u1".to_owned(),
+        artist_name: "Portishead".to_owned(),
+        album_title: "Dummy".to_owned(),
+        year: None,
+        release_group_mbid: Some("rg-1".to_owned()),
+        release_mbid: None,
+    })
+    .await
+    .expect("job inserts");
+    let payload = JobPayload {
+        candidates: listed,
+        ..JobPayload::default()
+    };
+    assert!(
+        jobs.finish("job-1", JobStatus::Completed, payload, None)
+            .await
+            .expect("job finishes")
+    );
+    let stored = jobs.get("job-1").await.expect("job reads").expect("job");
+    let candidates = JobPayload::decode(&stored.blob)
+        .expect("payload")
+        .candidates;
+    let offered = candidates
+        .iter()
+        .find(|candidate| candidate.view.title == "Portishead - Dummy (1994) [FLAC]")
+        .expect("a person is still offered the copy");
+    assert_eq!(
+        offered.view.note.code,
+        CandidateNoteCode::TurnedDownBefore,
+        "{:?}",
+        offered.view.note
     );
 }
 
@@ -349,46 +528,53 @@ fn album(artist: &str, title: &str) -> SearchTarget {
 
 /// An indexer that can answer finds releases, every one tagged Usenet and
 /// carrying an NZB link.
-async fn answers(indexer: &dyn Indexer) {
+async fn answers(who: &str, indexer: &dyn Indexer) {
     let target = album("Radiohead", "In Rainbows");
     let hits = indexer.search(&IndexerQuery::Album(&target), USER).await;
-    assert!(!hits.is_empty(), "the indexer answers");
+    assert!(!hits.is_empty(), "{who}: the indexer answers");
     for hit in &hits {
-        assert_eq!(hit.source, SourceTag::Usenet);
-        assert!(!hit.usenet.nzb_url.is_empty(), "{:?}", hit.usenet);
+        assert_eq!(hit.source, SourceTag::Usenet, "{who}");
+        assert!(!hit.usenet.nzb_url.is_empty(), "{who}: {:?}", hit.usenet);
     }
 }
 
 /// A refused key is no releases, never a failure.
-async fn refused(indexer: &dyn Indexer) {
+async fn refused(who: &str, indexer: &dyn Indexer) {
     let target = album("Radiohead", "In Rainbows");
     assert!(
         indexer
             .search(&IndexerQuery::Album(&target), USER)
             .await
-            .is_empty()
+            .is_empty(),
+        "{who}: a refused key finds nothing"
     );
 }
 
 /// A 429 is no releases, and the indexer sits out for the `Retry-After`
 /// it was given.
-async fn limited(indexer: &dyn Indexer, searches: impl Fn() -> usize) {
+async fn limited(who: &str, indexer: &dyn Indexer, searches: impl Fn() -> usize) {
     let target = album("Radiohead", "In Rainbows");
     assert!(
         indexer
             .search(&IndexerQuery::Album(&target), USER)
             .await
-            .is_empty()
+            .is_empty(),
+        "{who}: a 429 finds nothing"
     );
     let asked = searches();
-    assert!(asked > 0, "the indexer was asked");
+    assert!(asked > 0, "{who}: the indexer was asked");
     assert!(
         indexer
             .search(&IndexerQuery::Album(&target), USER)
             .await
-            .is_empty()
+            .is_empty(),
+        "{who}: a limited indexer finds nothing"
     );
-    assert_eq!(searches(), asked, "Retry-After keeps the indexer out");
+    assert_eq!(
+        searches(),
+        asked,
+        "{who}: Retry-After keeps the indexer out"
+    );
 }
 
 /// An indexer, its mock's call log, and the mock's server task.
@@ -415,16 +601,6 @@ async fn newznab_on(scenario: NewznabScenario) -> Rig<NewznabIndexer, NewznabMoc
     (indexer, mock, server)
 }
 
-#[tokio::test]
-async fn newznab_indexer_conforms() {
-    let (indexer, _, _server) = newznab_on(NewznabScenario::DrunkenSlug).await;
-    answers(&indexer).await;
-    let (indexer, _, _server) = newznab_on(NewznabScenario::AuthError).await;
-    refused(&indexer).await;
-    let (indexer, mock, _server) = newznab_on(NewznabScenario::Http429).await;
-    limited(&indexer, || mock.calls().len()).await;
-}
-
 async fn prowlarr_on(scenario: ProwlarrScenario) -> Rig<ProwlarrIndexer, ProwlarrMock> {
     let mock = ProwlarrMock::new();
     let (base, server) = serve_loopback(mock.router(scenario))
@@ -446,22 +622,31 @@ async fn prowlarr_on(scenario: ProwlarrScenario) -> Rig<ProwlarrIndexer, Prowlar
     (indexer, mock, server)
 }
 
+/// Newznab and Prowlarr each answer, take a refused key as no releases,
+/// and sit out a 429 for its `Retry-After`.
 #[tokio::test]
-async fn prowlarr_indexer_conforms() {
+async fn indexers_conform() {
+    let (indexer, _, _server) = newznab_on(NewznabScenario::DrunkenSlug).await;
+    answers("newznab", &indexer).await;
+    let (indexer, _, _server) = newznab_on(NewznabScenario::AuthError).await;
+    refused("newznab", &indexer).await;
+    let (indexer, mock, _server) = newznab_on(NewznabScenario::Http429).await;
+    limited("newznab", &indexer, || mock.calls().len()).await;
+
     let (indexer, _, _server) = prowlarr_on(ProwlarrScenario::default()).await;
-    answers(&indexer).await;
+    answers("prowlarr", &indexer).await;
     let (indexer, _, _server) = prowlarr_on(ProwlarrScenario {
         auth_fail: true,
         ..ProwlarrScenario::default()
     })
     .await;
-    refused(&indexer).await;
+    refused("prowlarr", &indexer).await;
     let (indexer, mock, _server) = prowlarr_on(ProwlarrScenario {
         search_429: true,
         ..ProwlarrScenario::default()
     })
     .await;
-    limited(&indexer, || mock.calls().len()).await;
+    limited("prowlarr", &indexer, || mock.calls().len()).await;
 }
 
 fn repo() -> PathBuf {
@@ -597,8 +782,8 @@ impl Drop for PluginRig {
     }
 }
 
-async fn plugin_rig(tag: &str) -> PluginRig {
-    let dir = ScratchDir::new(&format!("source-plugin-{tag}"));
+async fn plugin_rig() -> PluginRig {
+    let dir = ScratchDir::new("source-plugin");
     for example in ["local-folder-client", "local-folder-indexer"] {
         copy_dir(
             &repo().join("examples/plugins").join(example),
@@ -630,23 +815,14 @@ async fn plugin_rig(tag: &str) -> PluginRig {
             Arc::new(droppedneedle_kernel::clock::SystemClock),
         ),
     );
-    let host = PluginHost::new(
-        dir.join("plugins"),
-        config,
-        Arc::new(ProcessLauncher::new(
-            repo().join("sdk/python"),
-            platform.supervisor.clone(),
-        )),
-        droppedneedle_plugins::wiring::tick_store(&platform),
-        library,
-    );
-    host.load_all();
     let source_dir = dir.join("music-source");
     std::fs::create_dir_all(&source_dir).expect("source folder");
     std::fs::write(source_dir.join("Test Artist - Fixtures.flac"), b"fLaC").expect("file");
     let downloads = dir.join("downloads");
     let source_text = source_dir.to_string_lossy().into_owned();
     let downloads_text = downloads.to_string_lossy().into_owned();
+    // Every plugin is enabled before the one load, so the four Python
+    // starts overlap instead of running one after another.
     for (name, settings) in [
         (
             "local-folder-indexer",
@@ -666,10 +842,34 @@ async fn plugin_rig(tag: &str) -> PluginRig {
             .into_iter()
             .map(|(key, value)| (key.to_owned(), value))
             .collect();
-        host.update_settings(name, true, settings)
+        config
+            .save_plugin_blocking(
+                name,
+                PluginConfig {
+                    enabled: true,
+                    settings,
+                },
+                &HashSet::new(),
+            )
             .expect("plugin enabled");
-        running(&host, name).await;
     }
+    let host = PluginHost::new(
+        dir.join("plugins"),
+        config,
+        Arc::new(ProcessLauncher::new(
+            repo().join("sdk/python"),
+            platform.supervisor.clone(),
+        )),
+        droppedneedle_plugins::wiring::tick_store(&platform),
+        library,
+    );
+    host.load_all();
+    tokio::join!(
+        running(&host, "local-folder-indexer"),
+        running(&host, "local-folder-client"),
+        running(&host, "usenet-feed"),
+        running(&host, "fault-client"),
+    );
     PluginRig {
         _dir: dir,
         host,
@@ -709,7 +909,7 @@ fn plugin_client(rig: &PluginRig, name: &str, journal: Arc<Journal>) -> PluginDo
     PluginDownloadSource::new(
         rig.host.clone(),
         format!("plugin:{name}"),
-        journal,
+        journal.clone(),
         ReleasePolicy {
             usenet: UsenetPolicy::v2_defaults(),
             ignored_terms: Vec::new(),
@@ -717,12 +917,22 @@ fn plugin_client(rig: &PluginRig, name: &str, journal: Arc<Journal>) -> PluginDo
             auto_accept: 0.70,
             manual_min: 0.50,
         },
+        no_targets(&journal),
     )
 }
 
+/// Plugins on one running host: the example client lands inside its own
+/// folder, and a plugin indexer feeding Usenet keeps only what SABnzbd can
+/// fetch. A plugin client says whose fault a failed download was, and the
+/// worker believes it, never the text (all three say "disk full"): a
+/// local failure moves to the next result with its release unblamed;
+/// the source's, or one that says nothing, blocklists the release.
 #[tokio::test]
 async fn plugins_conform() {
-    let rig = plugin_rig("conform").await;
+    use droppedneedle_acquire::downloads::{AttemptState, TaskStatus};
+    use droppedneedle_acquire::reason::Reason;
+
+    let rig = plugin_rig().await;
     let journal = journal_with_task("t-plugin", "Test Artist", "Fixtures").await;
     let source = Arc::new(plugin_source(&rig, journal));
     conforms(
@@ -741,27 +951,23 @@ async fn plugins_conform() {
     // The plugin indexer feeding Usenet, on the same running host: only
     // the release SABnzbd can fetch comes back.
     let indexers = PluginIndexers::new(rig.host.clone());
-    answers(&indexers).await;
+    answers("plugin indexer", &indexers).await;
     let target = album("Radiohead", "In Rainbows");
     let hits = indexers.search(&IndexerQuery::Album(&target), USER).await;
     assert_eq!(hits.len(), 1, "a release without an NZB link is dropped");
-}
 
-/// A plugin client says whose fault a failed download was, and the
-/// worker believes it, never the text (all three say "disk full"): a
-/// local failure moves to the next result with its release unblamed;
-/// the source's, or one that says nothing, blocklists the release.
-#[tokio::test]
-async fn a_plugin_says_whose_fault_a_failed_download_was() {
-    use droppedneedle_acquire::downloads::worker::{DownloadWorker, WorkerConfig};
-    use droppedneedle_acquire::downloads::{AttemptState, TaskStatus};
-    use droppedneedle_acquire::reason::Reason;
-    use droppedneedle_providers::health::ServiceHealth;
-
-    let rig = plugin_rig("fault").await;
-    let db = AcquireDb::scratch().expect("scratch db");
-    db.add_user("u1", "U", "user").await.expect("user seeds");
-    let journal = Arc::new(Journal::new(db, quiet_ticks()));
+    // A plugin client's own word on whose fault a failure was.
+    let worker_db = AcquireDb::scratch().expect("scratch db");
+    worker_db
+        .add_user("u1", "U", "user")
+        .await
+        .expect("user seeds");
+    let worker_dir = worker_db
+        .path()
+        .parent()
+        .expect("scratch dir")
+        .to_path_buf();
+    let journal = Arc::new(Journal::new(worker_db.clone(), quiet_ticks()));
     for fault in ["local", "source", "unknown"] {
         let task = NewTask {
             id: format!("t-{fault}"),
@@ -794,15 +1000,18 @@ async fn a_plugin_says_whose_fault_a_failed_download_was() {
             .await
             .expect("download seeds");
     }
-    let source: Arc<dyn DownloadSource> =
-        Arc::new(plugin_client(&rig, "fault-client", journal.clone()));
-    let worker = Arc::new(DownloadWorker::fixed(
+    let settings = droppedneedle_acquire::settings::scratch_settings(&worker_dir.join("settings"))
+        .expect("settings open");
+    let (worker, _) = crate::common::acquire::worker_over(
+        &worker_db,
         journal.clone(),
-        vec![source],
-        WorkerConfig::default(),
+        &settings,
+        worker_dir.join("slskd"),
+        Arc::new(crate::common::acquire::FixedAlbums::default()),
+        Some(rig.host.clone()),
         droppedneedle_kernel::events::EventHub::new(),
-        Arc::new(ServiceHealth::new()),
-    ));
+    )
+    .await;
 
     worker.run_once(1).await;
 
@@ -870,9 +1079,12 @@ fn acquire_code() -> Vec<(String, usize, String)> {
 }
 
 /// A source's stored text is written and read only by `SourceTag`: no
-/// other acquire code spells `"soulseek"` or `"usenet"`.
+/// other acquire code spells `"soulseek"` or `"usenet"`. Only the wiring
+/// reads which Usenet backend is chosen, to build the indexer list; every
+/// search goes through the indexer seam.
 #[test]
-fn source_text_lives_in_the_tag() {
+fn acquire_source_gates() {
+    let lines = acquire_code();
     // The one conversion.
     let tag_file = "downloads/source_tag.rs";
     // Allowed lines, with the reason: Prowlarr's `protocol` field is
@@ -881,8 +1093,8 @@ fn source_text_lives_in_the_tag() {
         "usenet/prowlarr.rs",
         "if !release.protocol.eq_ignore_ascii_case(\"usenet\") {",
     )];
-    let found: Vec<String> = acquire_code()
-        .into_iter()
+    let found: Vec<String> = lines
+        .iter()
         .filter(|(file, _, code)| {
             file != tag_file
                 && (code.contains("\"soulseek\"") || code.contains("\"usenet\""))
@@ -895,14 +1107,9 @@ fn source_text_lives_in_the_tag() {
         "source text outside SourceTag:\n{}",
         found.join("\n")
     );
-}
 
-/// Only the wiring reads which Usenet backend is chosen, to build the
-/// indexer list; every search goes through the indexer seam.
-#[test]
-fn usenet_backend_is_matched_only_in_the_wiring() {
-    let found: Vec<String> = acquire_code()
-        .into_iter()
+    let found: Vec<String> = lines
+        .iter()
         .filter(|(file, _, code)| file != "wiring.rs" && code.contains("UsenetBackend::"))
         .map(|(file, number, code)| format!("{file}:{number}: {code}"))
         .collect();

@@ -1,16 +1,19 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
 	import { withBasePath } from '$lib/utils/basePath';
-	import { getLibraryTracksInfiniteQuery } from '$lib/queries/library/LibraryQueries.svelte';
-	import { libraryTrackParams, type LibraryTrackSort } from '$lib/queries/library/libraryTracks';
-	import { createLibraryTrackQueue } from '$lib/queries/library/libraryTrackQueue.svelte';
-	import { buildDiscoveryQueueFromLocal } from '$lib/player/queueHelpers';
-	import { playerStore } from '$lib/stores/player.svelte';
+	import { getLibraryTracksInfiniteQuery } from '$lib/features/library/queries/LibraryQueries.svelte';
+	import {
+		libraryTrackParams,
+		type LibraryTrackSort
+	} from '$lib/features/library/queries/libraryTracks';
+	import { createLibraryTrackQueue } from '$lib/features/library/queries/libraryTrackQueue.svelte';
+	import { buildDiscoveryQueueFromLocal } from '$lib/features/player/playback/queueHelpers';
+	import { playerStore } from '$lib/features/player/state/player.svelte';
 	import { toastStore } from '$lib/stores/toast';
-	import NowPlayingIndicator from '$lib/components/NowPlayingIndicator.svelte';
-	import AlbumImage from '$lib/components/AlbumImage.svelte';
-	import ContextMenu from '$lib/components/ContextMenu.svelte';
-	import type { MenuItem } from '$lib/components/ContextMenu.svelte';
+	import NowPlayingIndicator from '$lib/features/player/components/NowPlayingIndicator.svelte';
+	import AlbumImage from '$lib/media/AlbumImage.svelte';
+	import ContextMenu from '$lib/ui/ContextMenu.svelte';
+	import type { MenuItem } from '$lib/ui/ContextMenu.svelte';
 	import { formatDurationSec } from '$lib/utils/formatting';
 	import { reveal } from '$lib/actions/reveal';
 	import Button from '$lib/ui/Button.svelte';
@@ -29,7 +32,7 @@
 		Search,
 		X
 	} from 'lucide-svelte';
-	import type { TrackView } from '$lib/types';
+	import type { TrackView } from '$lib/features/library/queries/types';
 
 	const PAGE_SIZE = 48;
 	const SEARCH_DEBOUNCE_MS = 300;

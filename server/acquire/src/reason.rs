@@ -91,10 +91,17 @@ pub enum Reason {
     AcoustidUnavailable,
     HeldForReview,
     TracksMissing,
-    // Settled: a final word that needs nothing.
+    // Settled: a final word that needs nothing. `MovedOn` is a wait (see
+    // `kind`): it resumes on the next source.
     AlreadyOwned,
     Cancelled,
     MovedOn,
+    NoBetterCopy,
+    /// A failed download's retries stopped: another download fetches the
+    /// album.
+    AlreadyDownloading,
+    /// A failed download's retries stopped: the library holds the album.
+    AlreadyInLibrary,
 }
 
 /// Where a reason shows and what it offers.
@@ -115,7 +122,7 @@ pub enum ReasonKind {
 
 impl Reason {
     /// Every reason, in declaration order.
-    pub const ALL: [Reason; 71] = [
+    pub const ALL: [Reason; 74] = [
         Self::WeakMatch,
         Self::NoArtistEvidence,
         Self::MostlyUnmatched,
@@ -187,7 +194,61 @@ impl Reason {
         Self::AlreadyOwned,
         Self::Cancelled,
         Self::MovedOn,
+        Self::NoBetterCopy,
+        Self::AlreadyDownloading,
+        Self::AlreadyInLibrary,
     ];
+
+    /// The reasons a held file can carry, in declaration order: every hold
+    /// and library reason, and the two outside lookups a held file waits
+    /// on. `acquire_held_files.reason` lists exactly these, so a reason only
+    /// a download task carries needs no schema change.
+    pub const HELD: [Reason; 34] = [
+        Self::WeakMatch,
+        Self::NoArtistEvidence,
+        Self::MostlyUnmatched,
+        Self::TagMismatch,
+        Self::FingerprintMismatch,
+        Self::FingerprintUnconfirmed,
+        Self::AlbumVersionOnly,
+        Self::NoRelease,
+        Self::NoTracks,
+        Self::VersionLowerQuality,
+        Self::NoBetterThanYours,
+        Self::OwnedElsewhere,
+        Self::OwnedOnAlbum,
+        Self::AlbumNeedsCheck,
+        Self::NoAlbumMatch,
+        Self::AlbumNotFound,
+        Self::TagsDisagree,
+        Self::NotChosenEdition,
+        Self::Samples,
+        Self::TooManyFiles,
+        Self::Interrupted,
+        Self::ImportFailed,
+        Self::HeldByEarlierVersion,
+        Self::FormatNotListed,
+        Self::TargetOccupied,
+        Self::UpgradeBlocked,
+        Self::LibraryChanged,
+        Self::LibraryUnavailable,
+        Self::NamingScriptFailed,
+        Self::LibraryFolderMissing,
+        Self::LibraryOff,
+        Self::LocalFault,
+        Self::MusicbrainzUnavailable,
+        Self::AcoustidUnavailable,
+    ];
+
+    /// This reason as a held file stores it: one a held file cannot carry
+    /// reads as [`Reason::HeldByEarlierVersion`].
+    pub fn held(self) -> Self {
+        if Self::HELD.contains(&self) {
+            self
+        } else {
+            Self::HeldByEarlierVersion
+        }
+    }
 
     /// The stored spelling.
     pub const fn code(self) -> &'static str {
@@ -263,6 +324,9 @@ impl Reason {
             Self::AlreadyOwned => "already_owned",
             Self::Cancelled => "cancelled",
             Self::MovedOn => "moved_on",
+            Self::NoBetterCopy => "no_better_copy",
+            Self::AlreadyDownloading => "already_downloading",
+            Self::AlreadyInLibrary => "already_in_library",
         }
     }
 
@@ -431,6 +495,9 @@ impl Reason {
             Self::AlreadyOwned => "Every track in this folder is already in your library.",
             Self::Cancelled => "This download was stopped, so it will not be retried.",
             Self::MovedOn => "You moved this download on from a slow source.",
+            Self::NoBetterCopy => "No better copy was found, so yours stays.",
+            Self::AlreadyDownloading => "Already downloading.",
+            Self::AlreadyInLibrary => "Already in your library.",
         }
     }
 
@@ -592,7 +659,10 @@ impl Reason {
             Self::AlreadyOwned => "Nothing to do.",
             Self::Cancelled => "Retry it to start again.",
             Self::MovedOn => "Nothing to do: it starts on the next source shortly.",
+            Self::AlreadyDownloading => "Nothing to do: the other download brings it.",
+            Self::AlreadyInLibrary => "Nothing to do.",
             Self::QueueGaveWay => "Nothing to do: the next copy is downloading.",
+            Self::NoBetterCopy => "Nothing to do. To choose a copy yourself, use Pick a source.",
         }
     }
 
@@ -666,8 +736,13 @@ impl Reason {
             | Self::MusicbrainzUnavailable
             | Self::AcoustidUnavailable
             | Self::HeldForReview
-            | Self::TracksMissing => ReasonKind::Wait,
-            Self::AlreadyOwned | Self::Cancelled | Self::MovedOn => ReasonKind::Settled,
+            | Self::TracksMissing
+            | Self::MovedOn => ReasonKind::Wait,
+            Self::AlreadyOwned
+            | Self::Cancelled
+            | Self::NoBetterCopy
+            | Self::AlreadyDownloading
+            | Self::AlreadyInLibrary => ReasonKind::Settled,
         }
     }
 
@@ -748,7 +823,10 @@ impl Reason {
             | Self::HeldForReview
             | Self::AlreadyOwned
             | Self::Cancelled
-            | Self::MovedOn => false,
+            | Self::MovedOn
+            | Self::NoBetterCopy
+            | Self::AlreadyDownloading
+            | Self::AlreadyInLibrary => false,
         }
     }
 }
@@ -799,8 +877,11 @@ mod tests {
     use super::{Reason, ReasonKind};
     use crate::landing::specs::Disposition;
 
+    /// Every reason has words and one stored spelling that survives storage,
+    /// retired codes read as held by an earlier version, and a held file
+    /// carries the hold and library reasons plus the two lookup outages.
     #[test]
-    fn every_reason_has_words_a_spelling_and_survives_storage() {
+    fn every_reason_is_spelled_stored_and_held_once() {
         let mut codes: Vec<&str> = Reason::ALL.iter().map(|reason| reason.code()).collect();
         codes.sort_unstable();
         codes.dedup();
@@ -825,6 +906,24 @@ mod tests {
         }
         assert_eq!(Reason::LocalFault.kind(), ReasonKind::Library);
         assert_eq!(Reason::AlbumVersionOnly.kind(), ReasonKind::Hold);
+
+        let expected: Vec<Reason> = Reason::ALL
+            .into_iter()
+            .filter(|reason| {
+                matches!(reason.kind(), ReasonKind::Hold | ReasonKind::Library)
+                    || matches!(
+                        reason,
+                        Reason::MusicbrainzUnavailable | Reason::AcoustidUnavailable
+                    )
+            })
+            .collect();
+        assert_eq!(Reason::HELD.to_vec(), expected, "held reasons");
+        assert_eq!(
+            Reason::Corrupt.held(),
+            Reason::HeldByEarlierVersion,
+            "held reasons"
+        );
+        assert_eq!(Reason::WeakMatch.held(), Reason::WeakMatch, "held reasons");
     }
 
     /// What the code before typed reasons did with each reason. A held
@@ -922,6 +1021,9 @@ mod tests {
             // blocklisted.
             (Reason::TracksMissing, FailedOver { blocklisted: true }),
             (Reason::MovedOn, FailedOver { blocklisted: false }),
+            // New: a retry that stopped by itself says nothing against a source.
+            (Reason::AlreadyDownloading, NotProduced(false)),
+            (Reason::AlreadyInLibrary, NotProduced(false)),
             (Reason::QueueGaveWay, FailedOver { blocklisted: false }),
             (Reason::FilesUnlisted, Waited),
             (Reason::NoSource, Unserved),
@@ -933,6 +1035,7 @@ mod tests {
             (Reason::AlbumReleasesExhausted, Unserved),
             (Reason::TrackNotFound, Unserved),
             (Reason::NothingAllowed, Unserved),
+            (Reason::NoBetterCopy, Unserved),
             // Uploads have no source; the queue's own states and the
             // reasons no code produces yet say nothing against one.
             (Reason::FingerprintUnconfirmed, PersonHeld),

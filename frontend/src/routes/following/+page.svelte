@@ -1,15 +1,15 @@
 <script lang="ts">
 	import { Heart, ArrowRight, CalendarClock, Check, Disc3, ExternalLink } from 'lucide-svelte';
-	import AlbumImage from '$lib/components/AlbumImage.svelte';
-	import ArtistImage from '$lib/components/ArtistImage.svelte';
-	import EmptyState from '$lib/components/EmptyState.svelte';
-	import { outsideLink } from '$lib/components/outsideLink';
+	import AlbumImage from '$lib/media/AlbumImage.svelte';
+	import ArtistImage from '$lib/media/ArtistImage.svelte';
+	import EmptyState from '$lib/ui/EmptyState.svelte';
+	import { outsideLink } from '$lib/ui/outsideLink';
 	import {
 		getConcertsQuery,
 		getFollowedArtistsQuery,
 		getRecentReleasesQuery
-	} from '$lib/queries/following/FollowQueries.svelte';
-	import type { Concert } from '$lib/queries/following/types';
+	} from '$lib/features/following/queries/FollowQueries.svelte';
+	import type { Concert } from '$lib/features/following/queries/types';
 	import { authStore } from '$lib/stores/authStore.svelte';
 	import { KM_PER_MILE } from '$lib/constants';
 	import { withBasePath } from '$lib/utils/basePath';

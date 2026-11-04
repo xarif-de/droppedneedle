@@ -375,26 +375,9 @@ impl ListenBrainzClient {
             .collect())
     }
 
-    /// The first artist MBID of each recording the user loved, in feedback
-    /// order (`/1/feedback/user/{user}/get-feedback?score=1&metadata=true`).
-    /// Recordings without a mapped artist
-    /// are skipped; repeats stay so the caller decides how to dedupe.
-    ///
-    /// # Errors
-    ///
-    /// The typed failure of the call.
-    pub async fn user_loved_artist_mbids(
-        &self,
-        username: &str,
-        count: u32,
-        priority: RequestPriority,
-    ) -> Result<Vec<String>, ProviderError> {
-        let rows = self.loved_feedback(username, count, priority).await?;
-        Ok(rows.iter().filter_map(loved_artist_mbid).collect())
-    }
-
     /// The user's loved recordings with their names, newest first (the home
-    /// "Your Favorites" shelf). Rows without a track title are skipped.
+    /// "Your Favorites" shelf). Rows without a track title or an artist name
+    /// are skipped.
     ///
     /// # Errors
     ///
@@ -537,7 +520,8 @@ fn feedback_metadata(row: &FeedbackRow) -> Option<&FeedbackMetadata> {
 }
 
 /// One loved recording with its names. The row's own fields stand in for
-/// missing metadata, like v2.
+/// missing metadata, like v2; a row with no track title or no artist name
+/// is skipped.
 fn loved_recording(row: FeedbackRow) -> Option<LovedRecording> {
     let artist_mbid = loved_artist_mbid(&row);
     let metadata = feedback_metadata(&row).cloned().unwrap_or_default();
@@ -550,8 +534,7 @@ fn loved_recording(row: FeedbackRow) -> Option<LovedRecording> {
         artist_name: metadata
             .artist_name
             .or(metadata.artist)
-            .or(row.artist_name)
-            .unwrap_or_else(|| "Unknown".to_owned()),
+            .or(row.artist_name)?,
         release_name: metadata
             .release_name
             .or(metadata.album_name)
@@ -582,4 +565,19 @@ fn loved_artist_mbid(row: &FeedbackRow) -> Option<String> {
     .or_else(|| metadata.artist_mbid.clone())
     .map(|mbid| mbid.trim().to_ascii_lowercase())
     .filter(|mbid| !mbid.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A loved row with no artist name is skipped, not shown as "Unknown".
+    #[test]
+    fn a_loved_row_without_an_artist_is_skipped() {
+        let row = |json: &str| loved_recording(serde_json::from_str(json).expect("row decodes"));
+        assert!(row(r#"{"track_metadata": {"track_name": "Opener"}}"#).is_none());
+        let named = row(r#"{"track_metadata": {"track_name": "Opener", "artist_name": "Aurora"}}"#)
+            .expect("a named row stays");
+        assert_eq!(named.artist_name, "Aurora");
+    }
 }

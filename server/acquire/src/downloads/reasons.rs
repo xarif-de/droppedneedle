@@ -7,7 +7,7 @@
 
 use super::landing_rows::ImportOutcome;
 use super::state::TaskStatus;
-use crate::reason::Reason;
+use crate::reason::{Reason, ReasonKind};
 
 /// What a task that was moved on to its next source by hand logs as its
 /// last outcome.
@@ -22,7 +22,8 @@ pub struct DecisionReason {
 
 /// The one reason to show for a task, if it needs one. Live tasks have
 /// none (their progress speaks), except a task moved on by hand and one
-/// whose queued copy gave way to the next.
+/// whose queued copy gave way to the next. A cancelled task shows a
+/// settled reason it was stopped for, else plain cancelled.
 pub fn task_reason(
     status: TaskStatus,
     outcome: Option<Reason>,
@@ -33,7 +34,10 @@ pub fn task_reason(
         return None;
     }
     if status == TaskStatus::Cancelled {
-        return Some(Reason::Cancelled);
+        // A task the worker stopped on its own keeps the settled reason it
+        // stopped for; one a person stopped reads as cancelled.
+        let settled = outcome.filter(|reason| reason.kind() == ReasonKind::Settled);
+        return Some(settled.unwrap_or(Reason::Cancelled));
     }
     let settled = status.is_terminal();
     if let Some(decision) = decision
@@ -59,29 +63,86 @@ pub fn task_reason(
 mod tests {
     use super::*;
 
+    /// The worker's outcome explains a settled task, a cancelled task shows
+    /// only a settled reason it stopped for, and the import decision wins.
     #[test]
-    fn the_worker_outcome_explains_a_settled_task() {
-        let stalled = task_reason(TaskStatus::Failed, Some(Reason::Stalled), false, None);
-        assert_eq!(stalled, Some(Reason::Stalled));
-        let unknown = task_reason(TaskStatus::Failed, None, false, None);
-        assert_eq!(unknown, Some(Reason::DownloadFailed));
-        assert!(task_reason(TaskStatus::Downloading, Some(Reason::Stalled), false, None).is_none());
-        let moved = task_reason(TaskStatus::Queued, Some(Reason::MovedOn), false, None);
-        assert_eq!(moved, Some(Reason::MovedOn));
-    }
-
-    #[test]
-    fn the_import_decision_wins() {
-        let decision = DecisionReason {
+    fn task_reason_table() {
+        let held = DecisionReason {
             outcome: ImportOutcome::Held,
             code: Some(Reason::WeakMatch),
         };
-        let reason = task_reason(
-            TaskStatus::Failed,
-            Some(Reason::WeakMatch),
-            true,
-            Some(&decision),
-        );
-        assert_eq!(reason, Some(Reason::WeakMatch));
+        let cases = [
+            (
+                "failed with an outcome",
+                TaskStatus::Failed,
+                Some(Reason::Stalled),
+                false,
+                None,
+                Some(Reason::Stalled),
+            ),
+            (
+                "failed without one",
+                TaskStatus::Failed,
+                None,
+                false,
+                None,
+                Some(Reason::DownloadFailed),
+            ),
+            (
+                "still downloading",
+                TaskStatus::Downloading,
+                Some(Reason::Stalled),
+                false,
+                None,
+                None,
+            ),
+            (
+                "moved on by hand",
+                TaskStatus::Queued,
+                Some(Reason::MovedOn),
+                false,
+                None,
+                Some(Reason::MovedOn),
+            ),
+            (
+                "cancelled for a settled reason",
+                TaskStatus::Cancelled,
+                Some(Reason::NoBetterCopy),
+                false,
+                None,
+                Some(Reason::NoBetterCopy),
+            ),
+            (
+                "cancelled after moving on",
+                TaskStatus::Cancelled,
+                Some(Reason::MovedOn),
+                false,
+                None,
+                Some(Reason::Cancelled),
+            ),
+            (
+                "cancelled while stalled",
+                TaskStatus::Cancelled,
+                Some(Reason::Stalled),
+                false,
+                None,
+                Some(Reason::Cancelled),
+            ),
+            (
+                "held by the import",
+                TaskStatus::Failed,
+                Some(Reason::WeakMatch),
+                true,
+                Some(&held),
+                Some(Reason::WeakMatch),
+            ),
+        ];
+        for (label, status, outcome, held_for_review, decision, expected) in cases {
+            assert_eq!(
+                task_reason(status, outcome, held_for_review, decision),
+                expected,
+                "{label}"
+            );
+        }
     }
 }

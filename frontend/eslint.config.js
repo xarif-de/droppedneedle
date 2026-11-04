@@ -1,4 +1,5 @@
 import prettier from 'eslint-config-prettier';
+import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { includeIgnoreFile } from '@eslint/compat';
 import js from '@eslint/js';
@@ -30,7 +31,7 @@ const queryClientRules = [
 	}
 ];
 
-// A mutation hook exported from lib/queries is create<Action>Mutation. Matches
+// A mutation hook exported from a queries folder is create<Action>Mutation. Matches
 // an exported function that returns a call to any *Mutation builder, and one
 // taken from a settings section's save.
 const MUTATION_HOOK_NAME = '/^create[A-Z]\\w*Mutation$/';
@@ -121,6 +122,20 @@ const markupRules = [
 	}
 ];
 
+// Retired ways of doing things the app now does in one place. The browser's
+// confirm() blocks the page and cannot be styled; ConfirmDialog asks instead.
+const retiredRules = [
+	{
+		selector: "Identifier[name='createLocalStorageCache']",
+		message: 'Queries are saved to the browser only through their meta.persist.'
+	},
+	{
+		selector:
+			"CallExpression[callee.name='confirm'], CallExpression[callee.object.name=/^(window|globalThis|self)$/][callee.property.name='confirm']",
+		message: 'Ask with ConfirmDialog from $lib/ui, not the browser confirm().'
+	}
+];
+
 // Buttons, cards and text inputs come from the kit in src/lib/ui, so their
 // look is defined in one place. Outside the kit a DaisyUI btn or card class
 // (bare or with one of its modifiers) is refused wherever a class can come
@@ -144,6 +159,12 @@ const TEXT_INPUT_TYPE = '/^(text|search|url|email|password|number|date|time|tel)
 const TEXT_INPUT_MESSAGE =
 	'Text inputs come from the kit: use Input, or TextField, NumberField or SecretField for a labelled row, from $lib/ui.';
 const INPUT_TAG = "SvelteElement[kind='html'][name.name='input'] > SvelteStartTag";
+// Modal (and ConfirmDialog on top of it) owns showModal, Escape, the backdrop
+// and handing focus back, so a <dialog> element is written only there.
+const dialogRule = {
+	selector: "SvelteElement[kind='html'][name.name='dialog']",
+	message: 'Dialogs come from the kit: use Modal or ConfirmDialog from $lib/ui.'
+};
 const kitRules = [
 	...kitClassRules(
 		BTN_CLASS,
@@ -161,7 +182,8 @@ const kitRules = [
 		// type="text", or type={...} that can evaluate to a text-like type
 		selector: `${INPUT_TAG} > SvelteAttribute[key.name='type'] :matches(SvelteLiteral, Literal)[value=${TEXT_INPUT_TYPE}]`,
 		message: TEXT_INPUT_MESSAGE
-	}
+	},
+	dialogRule
 ];
 
 // In-app links and goto take their path through withBasePath
@@ -192,6 +214,50 @@ const linkRules = [
 		message: LINK_MESSAGE
 	}
 ];
+
+// A feature in src/lib/features/<name> keeps its components, queries and state
+// to itself. Another feature imports only the modules on that feature's public
+// list in src/lib/features/public.json, and the list names every feature. A
+// stylesheet exports nothing, so it is imported where it lives. The rule has
+// its own name, so the no-restricted-imports block for components below still
+// applies.
+const PUBLIC = JSON.parse(
+	readFileSync(new URL('./src/lib/features/public.json', import.meta.url), 'utf8')
+);
+const FEATURES = Object.keys(PUBLIC);
+const BOUNDARY_MESSAGE =
+	'Import another feature only through a $lib path on its public list in src/lib/features/public.json.';
+const escapeRegex = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+// An import names a .ts or .js module without its extension, so both spellings pass.
+const publicSpecifiers = (name) =>
+	FEATURES.filter((other) => other !== name).flatMap((other) =>
+		PUBLIC[other].map((path) => escapeRegex(`${other}/${path}`).replace(/\\\.(ts|js)$/, '(\\.$1)?'))
+	);
+const featureBoundary = (name) => {
+	const open = publicSpecifiers(name);
+	const allowed = open.length ? `(?!(?:${open.join('|')})$)` : '';
+	return {
+		files: [`src/lib/features/${name}/**`],
+		rules: {
+			'@typescript-eslint/no-restricted-imports': [
+				'error',
+				{
+					patterns: [
+						{
+							regex: `^\\$lib/features/(?!${name}/)${allowed}(?!.*\\.css$)`,
+							message: BOUNDARY_MESSAGE
+						},
+						{
+							// a relative path that climbs into another feature
+							regex: `^(\\.\\./)+(features/)?(${FEATURES.filter((other) => other !== name).join('|')})/(?!.*\\.css$)`,
+							message: BOUNDARY_MESSAGE
+						}
+					]
+				}
+			]
+		}
+	};
+};
 
 // The transport itself: the api client and the page-scoped fetch it wraps.
 const TRANSPORT = ['src/lib/api/**', 'src/lib/utils/navigationAbort.ts'];
@@ -233,20 +299,20 @@ export default defineConfig(
 	},
 	{
 		rules: {
-			'no-restricted-syntax': ['error', ...queryClientRules, ...markupRules]
+			'no-restricted-syntax': ['error', ...queryClientRules, ...markupRules, ...retiredRules]
 		}
 	},
 	{
 		// A spec's fake client may call these.
 		files: ['src/**/*.spec.ts'],
 		rules: {
-			'no-restricted-syntax': ['error', ...markupRules]
+			'no-restricted-syntax': ['error', ...markupRules, ...retiredRules]
 		}
 	},
 	{
 		// The one component allowed to render a string as markup: it sanitizes
 		// first. Everywhere else svelte/no-at-html-tags stays an error.
-		files: ['src/lib/components/SafeHtml.svelte'],
+		files: ['src/lib/ui/SafeHtml.svelte'],
 		rules: {
 			'svelte/no-at-html-tags': 'off'
 		}
@@ -260,12 +326,13 @@ export default defineConfig(
 				...queryClientRules,
 				...transportRules,
 				...markupRules,
+				...retiredRules,
 				...linkRules
 			]
 		}
 	},
 	{
-		files: ['src/lib/queries/**/*.ts'],
+		files: ['src/lib/queries/**/*.ts', 'src/lib/features/*/queries/**/*.ts'],
 		ignores: ['src/**/*.spec.ts'],
 		rules: {
 			'no-restricted-syntax': [
@@ -273,6 +340,7 @@ export default defineConfig(
 				...queryClientRules,
 				...transportRules,
 				...markupRules,
+				...retiredRules,
 				...linkRules,
 				...mutationNameRules
 			]
@@ -287,6 +355,7 @@ export default defineConfig(
 				...queryClientRules,
 				...transportRules,
 				...markupRules,
+				...retiredRules,
 				...kitRules,
 				...linkRules
 			]
@@ -312,5 +381,6 @@ export default defineConfig(
 				}
 			]
 		}
-	}
+	},
+	...FEATURES.map(featureBoundary)
 );

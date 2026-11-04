@@ -98,7 +98,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: ./server
@@ -171,6 +171,9 @@ jobs:
       - name: Refuse file changes in the library outside the publisher
         run: ./scripts/library-file-gate.sh
 
+      - name: Refuse public items nothing references
+        run: python3 -I scripts/dead-code-scan.py .
+
   audit:
     name: Audit
     needs: changes
@@ -193,10 +196,7 @@ jobs:
           tool: cargo-audit
 
       - name: Run audit
-        # RUSTSEC-2023-0071 (rsa Marvin, no fixed upgrade) is lockfile-only
-        # via sqlx-mysql, which is not in the build graph (sqlite only);
-        # the code never compiles. Re-check if another sqlx driver lands.
-        run: cargo audit --ignore RUSTSEC-2023-0071
+        run: cargo audit
 
   licenses:
     name: Licenses

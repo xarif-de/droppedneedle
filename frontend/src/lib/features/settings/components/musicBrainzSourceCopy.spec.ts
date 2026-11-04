@@ -1,0 +1,48 @@
+import { describe, expect, it } from 'vitest';
+
+import {
+	BRAINZMASH_PRIVACY_DISCLOSURE,
+	BRAINZMASH_RATE_MAX,
+	MORE_INFO_DISCLOSURES,
+	NON_OFFICIAL_RATE_MAX,
+	OFFICIAL_RATE_MAX,
+	sourceBounds
+} from './musicBrainzSourceCopy';
+
+describe('MusicBrainz source copy', () => {
+	it('keeps each source within its rate bound and its privacy unknowns explicit', () => {
+		{
+			// Keeps Official at 1 and BrainzMash at the fixed local 10 requests per second.
+			expect(sourceBounds('official')).toEqual({
+				rateMax: OFFICIAL_RATE_MAX,
+				allowUnlimitedRate: false
+			});
+			expect(sourceBounds('brainzmash')).toEqual({
+				rateMax: BRAINZMASH_RATE_MAX,
+				allowUnlimitedRate: false
+			});
+			expect(OFFICIAL_RATE_MAX).toBe(1);
+			expect(BRAINZMASH_RATE_MAX).toBe(10);
+		}
+
+		{
+			// Keeps mirror and community bounds separate from the fixed policy.
+			expect(sourceBounds('mirror')).toEqual({
+				rateMax: NON_OFFICIAL_RATE_MAX,
+				allowUnlimitedRate: true
+			});
+			expect(sourceBounds('community')).toEqual(sourceBounds('mirror'));
+			expect(NON_OFFICIAL_RATE_MAX).toBe(500);
+		}
+
+		{
+			// Keeps privacy unknowns explicit and versioned.
+			expect(BRAINZMASH_PRIVACY_DISCLOSURE).toMatch(/query terms/);
+			expect(BRAINZMASH_PRIVACY_DISCLOSURE).toMatch(/connection metadata/);
+			expect(BRAINZMASH_PRIVACY_DISCLOSURE).toMatch(/search terms/);
+			expect(BRAINZMASH_PRIVACY_DISCLOSURE).toMatch(/network or location/);
+			expect(BRAINZMASH_PRIVACY_DISCLOSURE).toMatch(/Retention, redaction/);
+			expect(MORE_INFO_DISCLOSURES.brainzmash.join(' ')).toContain(BRAINZMASH_PRIVACY_DISCLOSURE);
+		}
+	});
+});

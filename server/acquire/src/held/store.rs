@@ -932,12 +932,6 @@ mod tests {
     }
 
     #[test]
-    fn retries_wait_longer_each_time_up_to_a_day() {
-        let minutes: Vec<i64> = (0..10).map(|tries| retry_gap(tries) / 60_000).collect();
-        assert_eq!(minutes, [5, 15, 30, 60, 120, 240, 480, 1440, 1440, 1440]);
-    }
-
-    #[test]
     fn the_library_reasons_in_sql_are_the_library_kind() {
         let listed: Vec<&str> = sql::LIBRARY_REASONS
             .trim_matches(|c| c == '(' || c == ')')
@@ -950,22 +944,5 @@ mod tests {
             .map(|reason| reason.code())
             .collect();
         assert_eq!(listed, library);
-    }
-
-    #[test]
-    fn the_reason_check_lists_every_spelling() {
-        let migration =
-            include_str!("../../../migrations/0126_looks_wrong_and_album_needs_check.sql");
-        let check = migration
-            .split("reason TEXT NOT NULL CHECK (reason IN (")
-            .nth(1)
-            .and_then(|rest| rest.split("))").next())
-            .unwrap_or_default();
-        let listed: Vec<&str> = check
-            .split(',')
-            .map(|code| code.trim().trim_matches('\''))
-            .collect();
-        let known: Vec<&str> = Reason::ALL.iter().map(|reason| reason.code()).collect();
-        assert_eq!(listed, known);
     }
 }

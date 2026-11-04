@@ -5,35 +5,33 @@
 //! the real search service, worker pass and slskd source against the
 //! loopback mock with a fixed MusicBrainz tracklist.
 
+use crate::common::Probe;
 use std::sync::Arc;
-use std::time::Duration;
 
 use droppedneedle_acquire::db::AcquireDb;
 use droppedneedle_acquire::downloads::journal::Journal;
 use droppedneedle_acquire::downloads::sources::SourceHandle;
 use droppedneedle_acquire::downloads::store::{NewTask, TaskDetails};
-use droppedneedle_acquire::downloads::worker::{DownloadWorker, WorkerConfig};
+use droppedneedle_acquire::downloads::worker::DownloadWorker;
+use droppedneedle_acquire::flows::stores::UpgradeWorklist;
+use droppedneedle_acquire::reason::Reason;
 use droppedneedle_acquire::requests::quota::QuotaLedger;
 use droppedneedle_acquire::search_jobs::candidates::{
     CandidateNoteCode, CandidateRefusal, CandidateTier,
 };
-use droppedneedle_acquire::search_jobs::review::ReviewMode;
 use droppedneedle_acquire::search_jobs::store::{
-    JobPayload, JobStatus, JobStore, NewJob, PickRefusal, PickedTask,
+    JobPayload, JobStatus, JobStore, NewJob, PickRefusal, PickedTask, ReviewOutcome,
 };
 use droppedneedle_acquire::search_jobs::{AlbumSearch, SearchJobError, SearchJobs, StartOutcome};
-use droppedneedle_acquire::slskd::{
-    DownloadPolicy, ReqwestSlskdHttp, SlskdClient, SlskdRepository,
-};
-use droppedneedle_acquire::sources::SlskdSource;
-use droppedneedle_acquire::target::Targets;
-use droppedneedle_acquire::target::lookup::{AlbumRelease, AlbumTrack, FixedAlbums};
+use droppedneedle_acquire::target::lookup::{AlbumRelease, AlbumTrack};
 use droppedneedle_auth::session::store::SessionKind;
 use droppedneedle_auth::{Principal, Role};
-use droppedneedle_kernel::events::EventHub;
-use droppedneedle_testkit::slskd::{MOCK_API_KEY, MockSlskd};
+use droppedneedle_kernel::events::model::names;
+use droppedneedle_kernel::events::{EventHub, Subscription};
+use droppedneedle_testkit::slskd::MockSlskd;
 use serde_json::{Value, json};
 
+use crate::common::acquire::{FixedAlbums, review_off_in, save_slskd, worker_over, worker_with};
 use crate::common::auth::test_principal;
 use crate::common::bundles::quiet_ticks;
 
@@ -93,8 +91,8 @@ struct Rig {
 }
 
 /// The search service and a worker over the slskd mock, with a fixed
-/// MusicBrainz tracklist. `review` turns on the look before an automatic
-/// grab.
+/// MusicBrainz tracklist. `review` leaves the look before an automatic
+/// grab on, as saved by default.
 async fn rig(mock: &MockSlskd, review: bool) -> Rig {
     let db = AcquireDb::scratch().expect("scratch db");
     db.add_user("u1", "U", "user").await.expect("user seeds");
@@ -103,33 +101,23 @@ async fn rig(mock: &MockSlskd, review: bool) -> Rig {
     let journal = Arc::new(Journal::new(db.clone(), quiet_ticks()));
     let mut albums = FixedAlbums::default();
     albums.releases.insert(RELEASE.to_owned(), album());
-    let targets = Arc::new(Targets::new(journal.clone(), Some(Arc::new(albums))));
-    let http = ReqwestSlskdHttp::new(reqwest::Client::new(), &mock.base_url(), MOCK_API_KEY);
-    let repo = SlskdRepository::new(
-        SlskdClient::new(http),
-        &mock.base_url(),
-        MOCK_API_KEY,
-        staging.join("unused-mount"),
-        DownloadPolicy {
-            search_timeout: Duration::from_secs(2),
-            completion_grace: Duration::from_secs(2),
-            poll_interval: Duration::from_millis(10),
-            ..DownloadPolicy::default()
-        },
-    );
-    let source = SlskdSource::new(Arc::new(repo), journal.clone()).with_targets(targets.clone());
-    let events = EventHub::new();
-    let mut worker = DownloadWorker::fixed(
-        journal.clone(),
-        vec![crate::as_source(Arc::new(source))],
-        WorkerConfig::default(),
-        events.clone(),
-        Default::default(),
-    );
-    if review {
-        worker = worker.with_targets(targets.clone());
+    let settings = droppedneedle_acquire::settings::scratch_settings(&staging.join("settings"))
+        .expect("settings open");
+    save_slskd(&settings, &mock.base_url());
+    if !review {
+        review_off_in(&settings);
     }
-    let worker = Arc::new(worker);
+    let events = EventHub::new();
+    let (worker, targets) = worker_over(
+        &db,
+        journal.clone(),
+        &settings,
+        staging.join("unused-mount"),
+        Arc::new(albums),
+        None,
+        events.clone(),
+    )
+    .await;
     let jobs = Arc::new(SearchJobs::new(
         JobStore::new(db.clone()),
         worker.clone(),
@@ -148,6 +136,19 @@ async fn rig(mock: &MockSlskd, review: bool) -> Rig {
 
 fn principal(user_id: &str) -> Principal {
     test_principal(user_id, Role::User, "sess-test", SessionKind::Standard)
+}
+
+/// Wait for the look a pass started: it tells the owner once it parks or
+/// takes, and leaves the running set in the same step on this runtime.
+async fn look_finishes(updates: &mut Subscription, worker: &DownloadWorker) {
+    tokio::time::timeout(crate::common::PATIENCE, async {
+        while updates.next().await.expect("the hub stays open").name() != names::SEARCH_JOB_UPDATED
+        {
+        }
+    })
+    .await
+    .expect("the look tells its owner");
+    assert!(!worker.reviews_running(), "the look finished");
 }
 
 #[tokio::test]
@@ -311,15 +312,10 @@ async fn automatic_download_waits_for_a_pick_when_unsure() {
         .await
         .expect("task seeds");
 
+    let mut updates = rig.events.subscribe("u1");
     rig.worker.run_once(1).await;
     // The look runs off the pass.
-    for _ in 0..200 {
-        if !rig.worker.reviews_running() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    assert!(!rig.worker.reviews_running(), "the look finished");
+    look_finishes(&mut updates, &rig.worker).await;
     let searched = mock.search_texts().len();
     assert!(searched > 0, "the worker searched before grabbing");
     rig.worker.run_once(2).await;
@@ -374,6 +370,149 @@ async fn automatic_download_waits_for_a_pick_when_unsure() {
     assert_eq!(handles.len(), 1, "one enqueue: {handles:?}");
     let handle: SourceHandle = serde_json::from_str(&handles[0]).expect("handle decodes");
     assert_eq!(handle.username, "halfway");
+    drop(rig.staging);
+}
+
+async fn seed_album_task(journal: &Journal, task_id: &'static str, origin: &'static str) {
+    journal
+        .run("test.seed", move |store| {
+            store.insert_task(
+                &NewTask {
+                    id: task_id.to_owned(),
+                    user_id: "u1".to_owned(),
+                    artist_name: "Massive Attack".to_owned(),
+                    album_title: "Blue Lines".to_owned(),
+                    release_group_mbid: GROUP.to_owned(),
+                    origin: origin.to_owned(),
+                    retry_count: 0,
+                },
+                1_000.0,
+            )?;
+            store.set_task_details(
+                task_id,
+                &TaskDetails {
+                    release_mbid: Some(RELEASE.to_owned()),
+                    year: Some(1991),
+                    ..TaskDetails::default()
+                },
+                1_000.0,
+            )
+        })
+        .await
+        .expect("task seeds");
+}
+
+/// Park `task_id` on a recorded search `job_id` with nothing picked.
+async fn park_on_search(journal: &Journal, task_id: &'static str, job_id: &str) {
+    let recorded = JobStore::new(journal.db().clone())
+        .record_review(
+            NewJob {
+                id: job_id.to_owned(),
+                user_id: "u1".to_owned(),
+                artist_name: "Massive Attack".to_owned(),
+                album_title: "Blue Lines".to_owned(),
+                year: Some(1991),
+                release_group_mbid: Some(GROUP.to_owned()),
+                release_mbid: Some(RELEASE.to_owned()),
+            },
+            JobPayload {
+                release_mbid: Some(RELEASE.to_owned()),
+                tracks_total: Some(4),
+                candidates: Vec::new(),
+            },
+            task_id,
+            ReviewOutcome::Park,
+        )
+        .await
+        .expect("review records");
+    assert!(recorded, "{task_id} is parked on its search");
+}
+
+/// An upgrade never waits for a pick: when its look finds no recommended
+/// copy it stops with "no better copy", nothing is fetched, and the album
+/// rests under the upgrade back-off. One parked before this rule settles
+/// the same way on the next pass, unless a person's request joined it: that
+/// one waits for their pick, as any request does.
+#[tokio::test]
+async fn an_upgrade_with_no_recommended_copy_settles_instead_of_waiting() {
+    let mock = MockSlskd::start().await.expect("mock starts");
+    mock.script_responses(vec![peer(
+        "halfway",
+        "@@music\\Massive Attack\\Blue Lines",
+        &[0, 1],
+    )]);
+    let rig = rig(&mock, true).await;
+    let looked = "0123456789abcdef0123456789abcdea";
+    seed_album_task(&rig.journal, looked, "upgrade").await;
+    let parked = "0123456789abcdef0123456789abcdeb";
+    let joined = "0123456789abcdef0123456789abcdec";
+    for (task_id, job_id) in [
+        (parked, "fedcba9876543210fedcba9876543210"),
+        (joined, "fedcba9876543210fedcba9876543211"),
+    ] {
+        seed_album_task(&rig.journal, task_id, "upgrade").await;
+        park_on_search(&rig.journal, task_id, job_id).await;
+    }
+    rig.journal
+        .db()
+        .write("test.request", |tx| {
+            tx.execute(
+                "INSERT INTO request_history (musicbrainz_id_lower, musicbrainz_id, artist_name, \
+                 album_title, requested_at, status, user_id, download_task_id, request_kind) \
+                 VALUES (?1, ?1, 'Massive Attack', 'Blue Lines', 1, 'downloading', 'u1', ?2, \
+                 'album')",
+                [GROUP, joined],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("a request joins the upgrade");
+
+    let mut updates = rig.events.subscribe("u1");
+    rig.worker.run_once(1).await;
+    look_finishes(&mut updates, &rig.worker).await;
+    rig.worker.run_once(2).await;
+
+    let waiting = rig
+        .journal
+        .read_task(joined)
+        .await
+        .expect("task reads")
+        .expect("task exists");
+    assert_eq!(
+        waiting.status.as_str(),
+        "queued",
+        "a person's request waits"
+    );
+    let mut finished_at = 0.0_f64;
+    for task_id in [looked, parked] {
+        let task = rig
+            .journal
+            .read_task(task_id)
+            .await
+            .expect("task reads")
+            .expect("task exists");
+        assert_eq!(task.status.as_str(), "cancelled", "{task_id}");
+        assert_eq!(task.outcome_code, Some(Reason::NoBetterCopy), "{task_id}");
+        assert!(
+            rig.journal
+                .read_source_handles(
+                    task_id,
+                    &droppedneedle_acquire::downloads::SourceTag::Soulseek
+                )
+                .await
+                .expect("handles read")
+                .is_empty(),
+            "nothing fetched for {task_id}"
+        );
+        finished_at = finished_at.max(task.completed_at.expect("settled"));
+    }
+    let now = finished_at as i64 + 60;
+    let resting = UpgradeWorklist::new(rig.journal.db().clone())
+        .list_resting(now)
+        .await
+        .expect("worklist reads");
+    assert!(resting.contains(GROUP), "the album rests after the settle");
     drop(rig.staging);
 }
 
@@ -491,8 +630,7 @@ impl KeptFile {
 
 /// The search service and a worker that lands into a real library, over
 /// the slskd mock whose peers share `copies` (each already downloaded
-/// into the mock's folder). [`kept_rig`]'s settings keep lossless only, so
-/// every MP3 copy is outside the band.
+/// into the mock's folder), under the download policy `saved`.
 struct KeptRig {
     jobs: Arc<SearchJobs>,
     worker: Arc<DownloadWorker>,
@@ -504,15 +642,6 @@ struct KeptRig {
     _platform: droppedneedle_kernel::platform::Platform,
 }
 
-async fn kept_rig(copies: &[Copy]) -> KeptRig {
-    kept_rig_with(
-        copies,
-        json!({"quality_min": "lossless", "quality_max": "lossless"}),
-    )
-    .await
-}
-
-/// As [`kept_rig`], with the download policy.
 async fn kept_rig_with(copies: &[Copy], saved: Value) -> KeptRig {
     use crate::acquire_landing::{Releases, land_file, length_ms, release};
     use crate::common::TestPlatform;
@@ -617,50 +746,32 @@ async fn kept_rig_with(copies: &[Copy], saved: Value) -> KeptRig {
     )
     .expect("config.json");
     let settings = droppedneedle_acquire::settings::scratch_settings(&band).expect("settings");
-    let repo_policy = DownloadPolicy {
-        search_timeout: Duration::from_secs(2),
-        completion_grace: Duration::from_secs(2),
-        poll_interval: Duration::from_millis(10),
-        ..DownloadPolicy::from_saved(&settings.live().read().expect("policy reads"))
-    };
 
     let journal = Arc::new(Journal::new(db.clone(), quiet_ticks()));
     let landing = Arc::new(LandingService::new(
         journal.clone(),
-        Some(Arc::new(LibraryLanding::new(
-            &library,
-            every_priority(releases),
-        ))),
+        Arc::new(LibraryLanding::new(&library, every_priority(releases))),
         settings.live(),
         dir.join("held"),
     ));
-    let targets = Arc::new(Targets::new(journal.clone(), Some(Arc::new(albums))));
-    let repo = SlskdRepository::new(
-        SlskdClient::new(ReqwestSlskdHttp::new(
-            reqwest::Client::new(),
-            &mock.base_url(),
-            MOCK_API_KEY,
-        )),
-        &mock.base_url(),
-        MOCK_API_KEY,
-        downloads,
-        repo_policy,
-    );
-    let source = SlskdSource::new(Arc::new(repo), journal.clone()).with_targets(targets.clone());
+    let targets = Arc::new(droppedneedle_acquire::target::Targets::new(
+        journal.clone(),
+        Arc::new(albums),
+    ));
+    save_slskd(&settings, &mock.base_url());
+    // Each pick is the source's own, on the pass that asks for it.
+    review_off_in(&settings);
     let events = EventHub::new();
-    let worker = Arc::new(
-        DownloadWorker::fixed(
-            journal.clone(),
-            vec![crate::as_source(Arc::new(source))],
-            // Each pick is the source's own, on the pass that asks for it.
-            WorkerConfig {
-                review: ReviewMode::Off,
-                ..WorkerConfig::default()
-            },
-            events.clone(),
-            Default::default(),
-        )
-        .with_landing(landing),
+    let worker = worker_with(
+        &platform,
+        crate::common::bundles::idle_host(&platform, library.core.clone()),
+        journal.clone(),
+        &settings,
+        downloads,
+        targets.clone(),
+        landing,
+        Default::default(),
+        events.clone(),
     );
     let jobs = Arc::new(SearchJobs::new(
         JobStore::new(db.clone()),
@@ -767,87 +878,99 @@ impl KeptRig {
     }
 
     /// Each held file's reason and state.
-    async fn held_files(&self) -> Vec<(String, String)> {
-        sqlx::query_as("SELECT reason, state FROM acquire_held_files ORDER BY id")
-            .fetch_all(self.db.db().sqlx())
-            .await
-            .expect("held files")
+    fn held_files(&self) -> Vec<(String, String)> {
+        self.db.db().rows(
+            "SELECT reason, state FROM acquire_held_files ORDER BY id",
+            [],
+        )
     }
 
-    async fn task_count(&self) -> i64 {
-        sqlx::query_scalar("SELECT COUNT(*) FROM download_tasks")
-            .fetch_one(self.db.db().sqlx())
-            .await
-            .expect("task count")
+    fn task_count(&self) -> i64 {
+        self.db.db().one("SELECT COUNT(*) FROM download_tasks", [])
     }
 }
 
-/// A folder outside the quality band is listed with its reason. Picking it
-/// without a confirm answers 409 and starts nothing; with the confirm, the
-/// download fetches it and its files are imported although their quality
-/// is outside the band.
+/// A copy outside the saved settings (an MP3 outside a lossless-only band,
+/// an OGG the default recipe does not list) is listed with its reason.
+/// Picking it without a confirm answers 409 and starts nothing; with the
+/// confirm, the download fetches it and its files are imported.
 #[tokio::test]
-async fn a_folder_outside_the_band_is_kept_once_its_pick_is_confirmed() {
-    let rig = kept_rig(&[Copy {
+async fn a_confirmed_pick_keeps_a_copy_outside_the_settings() {
+    let mp3 = Copy {
         username: "mp3peer",
         folder: "Dummy (MP3)",
         album_tag: "Dummy",
         bitrate: Some(320),
         file: KeptFile::MP3,
-    }])
-    .await;
-    let owner = principal("u1");
-    let (job_id, payload) = rig.search(&owner).await;
-    let listed: Vec<_> = payload
-        .candidates
-        .iter()
-        .map(|c| (c.view.username.clone(), c.view.tier, c.view.refusal.clone()))
-        .collect();
-    assert_eq!(
-        listed,
-        [(
-            Some("mp3peer".to_owned()),
-            CandidateTier::Refused,
-            vec![CandidateRefusal::QualityOutsideRange]
-        )]
-    );
+    };
+    let lossless_only = json!({"quality_min": "lossless", "quality_max": "lossless"});
+    for (case, copy, policy, extension) in [
+        ("an mp3 outside the band", mp3, lossless_only, "mp3"),
+        ("an unlisted ogg", OGG_FOLDER, default_policy(), "ogg"),
+    ] {
+        let username = copy.username;
+        let rig = kept_rig_with(&[copy], policy).await;
+        let owner = principal("u1");
+        let (job_id, payload) = rig.search(&owner).await;
+        let listed: Vec<_> = payload
+            .candidates
+            .iter()
+            .map(|c| (c.view.username.clone(), c.view.tier, c.view.refusal.clone()))
+            .collect();
+        assert_eq!(
+            listed,
+            [(
+                Some(username.to_owned()),
+                CandidateTier::Refused,
+                vec![CandidateRefusal::QualityOutsideRange]
+            )],
+            "{case}"
+        );
 
-    let refused = rig
-        .jobs
-        .pick(&owner, &job_id, 0, false)
-        .await
-        .expect_err("an unconfirmed pick is refused");
-    assert!(matches!(
-        refused,
-        SearchJobError::PolicyBreak(CandidateRefusal::QualityOutsideRange)
-    ));
-    let answer = droppedneedle_kernel::error::ApiError::from(refused);
-    assert_eq!((answer.status().as_u16(), answer.code()), (409, "CONFLICT"));
-    assert_eq!(rig.task_count().await, 0, "no download starts");
-    let view = rig.jobs.get(&owner, &job_id).await.expect("job reads");
-    assert_eq!(
-        view.row.status,
-        JobStatus::Completed,
-        "the search stays open"
-    );
+        let refused = rig
+            .jobs
+            .pick(&owner, &job_id, 0, false)
+            .await
+            .expect_err("an unconfirmed pick is refused");
+        assert!(
+            matches!(
+                refused,
+                SearchJobError::PolicyBreak(CandidateRefusal::QualityOutsideRange)
+            ),
+            "{case}"
+        );
+        let answer = droppedneedle_kernel::error::ApiError::from(refused);
+        assert_eq!(
+            (answer.status().as_u16(), answer.code()),
+            (409, "CONFLICT"),
+            "{case}"
+        );
+        assert_eq!(rig.task_count(), 0, "{case}: no download starts");
+        let view = rig.jobs.get(&owner, &job_id).await.expect("job reads");
+        assert_eq!(
+            view.row.status,
+            JobStatus::Completed,
+            "{case}: the search stays open"
+        );
 
-    let task_id = rig
-        .jobs
-        .pick(&owner, &job_id, 0, true)
-        .await
-        .expect("a confirmed pick starts");
-    let task = rig.settle(&task_id).await;
-    assert_eq!(
-        task.status.as_str(),
-        "completed",
-        "{:?}",
-        task.error_message
-    );
-    assert_eq!(
-        crate::acquire_landing::files_under(&rig.music, "mp3").len(),
-        1,
-        "the picked files are in the library"
-    );
+        let task_id = rig
+            .jobs
+            .pick(&owner, &job_id, 0, true)
+            .await
+            .expect("a confirmed pick starts");
+        let task = rig.settle(&task_id).await;
+        assert_eq!(
+            task.status.as_str(),
+            "completed",
+            "{case}: {:?}",
+            task.error_message
+        );
+        assert_eq!(
+            crate::acquire_landing::files_under(&rig.music, extension).len(),
+            1,
+            "{case}: the picked files are in the library"
+        );
+    }
 }
 
 /// A confirmed pick covers only the attempt that fetched it. When that
@@ -910,14 +1033,11 @@ async fn a_failover_after_a_confirmed_pick_is_held_to_the_recipe() {
         .map(|handle| (handle.username.as_str(), handle.pinned))
         .collect();
     assert_eq!(attempts, [("picked", true), ("fallback", false)]);
-    let reasons: Vec<Option<String>> = sqlx::query_scalar(
+    let reasons: Vec<Option<String>> = rig.db.db().column(
         "SELECT reason_code FROM download_import_decisions WHERE task_id = ?1 \
          ORDER BY decided_at",
-    )
-    .bind(&task_id)
-    .fetch_all(rig.db.db().sqlx())
-    .await
-    .expect("decisions");
+        rusqlite::params![&task_id],
+    );
     assert_eq!(
         reasons.last().cloned().flatten().as_deref(),
         Some("format_not_listed"),
@@ -974,47 +1094,11 @@ async fn an_automatic_download_takes_no_format_the_recipe_does_not_list() {
         task.outcome_code.map(|reason| reason.code()),
         Some("nothing_allowed")
     );
-    let attempts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM download_attempts")
-        .fetch_one(rig.db.db().sqlx())
-        .await
-        .expect("attempt count");
+    let attempts: i64 = rig
+        .db
+        .db()
+        .one("SELECT COUNT(*) FROM download_attempts", []);
     assert_eq!(attempts, 0, "nothing was fetched");
-}
-
-/// A person may take that folder, behind the confirm the server enforces, and
-/// only then is it placed.
-#[tokio::test]
-async fn a_confirmed_pick_keeps_a_format_the_recipe_does_not_list() {
-    let rig = kept_rig_with(&[OGG_FOLDER], default_policy()).await;
-    let owner = principal("u1");
-    let (job_id, payload) = rig.search(&owner).await;
-    assert_eq!(
-        payload.candidates[0].view.refusal,
-        [CandidateRefusal::QualityOutsideRange]
-    );
-    let refused = rig
-        .jobs
-        .pick(&owner, &job_id, 0, false)
-        .await
-        .expect_err("an unconfirmed pick is refused");
-    assert!(matches!(refused, SearchJobError::PolicyBreak(_)));
-
-    let task_id = rig
-        .jobs
-        .pick(&owner, &job_id, 0, true)
-        .await
-        .expect("a confirmed pick starts");
-    let task = rig.settle(&task_id).await;
-    assert_eq!(
-        task.status.as_str(),
-        "completed",
-        "{:?}",
-        task.error_message
-    );
-    assert_eq!(
-        crate::acquire_landing::files_under(&rig.music, "ogg").len(),
-        1
-    );
 }
 
 /// Files that turn out to be a quality the recipe does not list are held,
@@ -1034,14 +1118,11 @@ async fn an_unlisted_landing_is_held_not_placed() {
         crate::acquire_landing::files_under(&rig.music, "mp3").is_empty(),
         "nothing is placed"
     );
-    assert_eq!(
-        rig.held_files().await,
-        [("format_not_listed", "held")].map(owned)
-    );
-    let blocked: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM download_quarantine")
-        .fetch_one(rig.db.db().sqlx())
-        .await
-        .expect("quarantine count");
+    assert_eq!(rig.held_files(), [("format_not_listed", "held")].map(owned));
+    let blocked: i64 = rig
+        .db
+        .db()
+        .one("SELECT COUNT(*) FROM download_quarantine", []);
     assert!(blocked > 0, "the release is not tried again");
 }
 
@@ -1079,13 +1160,11 @@ async fn an_album_holds_one_unlisted_set_until_a_complete_copy_lands() {
         task.error_message
     );
 
-    let decisions: Vec<(Option<String>, i64, Option<String>)> = sqlx::query_as(
+    let decisions: Vec<(Option<String>, i64, Option<String>)> = rig.db.db().rows(
         "SELECT reason_code, files_held, detail FROM download_import_decisions \
          ORDER BY decided_at",
-    )
-    .fetch_all(rig.db.db().sqlx())
-    .await
-    .expect("decisions");
+        [],
+    );
     let held: Vec<_> = decisions
         .iter()
         .map(|(code, held, _)| (code.as_deref(), *held))
@@ -1108,7 +1187,7 @@ async fn an_album_holds_one_unlisted_set_until_a_complete_copy_lands() {
         1
     );
     assert_eq!(
-        rig.held_files().await,
+        rig.held_files(),
         [("format_not_listed", "discarded")].map(owned)
     );
 }

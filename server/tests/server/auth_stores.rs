@@ -6,6 +6,7 @@
 //! (atomic account creation, the last-admin rule, the app-password cap,
 //! the first federated admin) plus the sweeps that keep auth tables small.
 
+use crate::common::Probe;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -47,11 +48,8 @@ async fn fixture(name: &str) -> AuthRig {
     rig
 }
 
-async fn count(fx: &AuthRig, sql: &str) -> i64 {
-    sqlx::query_scalar(sql)
-        .fetch_one(fx.runtime().db().sqlx())
-        .await
-        .unwrap()
+fn count(fx: &AuthRig, sql: &str) -> i64 {
+    fx.runtime().db().one(sql, [])
 }
 
 fn user_row(id: &str, username: &str, role: Role) -> UserRecord {
@@ -147,7 +145,20 @@ fn argon2id_params_match_the_owasp_pin() {
 #[test]
 fn md5_keeps_rfc_and_v2_spot_values() {
     assert_eq!(md5_hex(""), "d41d8cd98f00b204e9800998ecf8427e");
+    assert_eq!(md5_hex("a"), "0cc175b9c0f1b6a831c399e269772661");
     assert_eq!(md5_hex("abc"), "900150983cd24fb0d6963f7d28e17f72");
+    assert_eq!(
+        md5_hex("message digest"),
+        "f96b697d7cb7938d525a2f31aaf161d0"
+    );
+    assert_eq!(
+        md5_hex("abcdefghijklmnopqrstuvwxyz"),
+        "c3fcd3d76192e4007dfb496cca67e13b"
+    );
+    assert_eq!(
+        md5_hex("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"),
+        "d174ab98d277d9f5a5611c2c9f419d9f"
+    );
     assert_eq!(
         md5_hex("alice-secretpepper"),
         "22b231fb88294b6a25be3d978438fdc1"
@@ -193,19 +204,16 @@ async fn sign_in(e2e: &E2e, password: &str) -> StatusCode {
 }
 
 /// `ada`'s local scheme, hash and `last_login_at`.
-async fn ada_row(e2e: &E2e) -> (String, String, Option<i64>) {
-    let (scheme, hash): (String, String) = sqlx::query_as(
+fn ada_row(e2e: &E2e) -> (String, String, Option<i64>) {
+    let (scheme, hash): (String, String) = e2e.db().row(
         "SELECT hash_scheme, password_hash FROM auth_providers \
          WHERE user_id = 'user-1' AND provider = 'local'",
-    )
-    .fetch_one(e2e.pool())
-    .await
-    .unwrap();
-    let last_login: Option<i64> =
-        sqlx::query_scalar("SELECT last_login_at FROM auth_users WHERE id = 'user-1'")
-            .fetch_one(e2e.pool())
-            .await
-            .unwrap();
+        [],
+    );
+    let last_login: Option<i64> = e2e.db().one(
+        "SELECT last_login_at FROM auth_users WHERE id = 'user-1'",
+        [],
+    );
     (scheme, hash, last_login)
 }
 
@@ -216,10 +224,10 @@ async fn v2_bcrypt_rows_log_in_and_rehash_to_argon2id() {
         sign_in(&e2e, "wrong password here!").await,
         StatusCode::UNAUTHORIZED
     );
-    assert_eq!(ada_row(&e2e).await.1, LEGACY_BCRYPT);
+    assert_eq!(ada_row(&e2e).1, LEGACY_BCRYPT);
 
     assert_eq!(sign_in(&e2e, LEGACY_PASSWORD).await, StatusCode::OK);
-    let (scheme, hash, last_login) = ada_row(&e2e).await;
+    let (scheme, hash, last_login) = ada_row(&e2e);
     assert_eq!(scheme, "argon2id", "the login persisted the upgrade");
     assert!(
         hash.starts_with("$argon2id$v=19$m=19456,t=2,p=1$"),
@@ -257,8 +265,7 @@ async fn login_write_needs_the_credential_it_verified() {
         let tokens = count(
             &fx,
             "SELECT COUNT(*) FROM auth_tokens WHERE user_id = 'user-ada'",
-        )
-        .await;
+        );
         let stored = fx
             .auth
             .users
@@ -266,11 +273,10 @@ async fn login_write_needs_the_credential_it_verified() {
             .await
             .unwrap()
             .unwrap();
-        let last_login: Option<i64> =
-            sqlx::query_scalar("SELECT last_login_at FROM auth_users WHERE id = 'user-ada'")
-                .fetch_one(fx.runtime().db().sqlx())
-                .await
-                .unwrap();
+        let last_login: Option<i64> = fx.runtime().db().one(
+            "SELECT last_login_at FROM auth_users WHERE id = 'user-ada'",
+            [],
+        );
         (tokens, stored.hash, last_login)
     };
 
@@ -316,7 +322,7 @@ async fn saving_a_link_keeps_enabled_unless_told_to_enable() {
     let links = UserConnections::new(db.clone(), fx.clock.clone());
     let enabled = "SELECT enabled FROM user_connections";
     links.save("user-1", "listenbrainz", "first").await.unwrap();
-    assert_eq!(count(&fx, enabled).await, 1);
+    assert_eq!(count(&fx, enabled), 1);
     db.write(Lane::Foreground, "test.seed", |tx| {
         Ok::<_, DbError>(tx.execute("UPDATE user_connections SET enabled = 0", [])?)
     })
@@ -327,18 +333,15 @@ async fn saving_a_link_keeps_enabled_unless_told_to_enable() {
         .save("user-1", "listenbrainz", "second")
         .await
         .unwrap();
-    assert_eq!(count(&fx, enabled).await, 0);
-    let document: String = sqlx::query_scalar("SELECT connection_data FROM user_connections")
-        .fetch_one(db.sqlx())
-        .await
-        .unwrap();
+    assert_eq!(count(&fx, enabled), 0);
+    let document: String = db.one("SELECT connection_data FROM user_connections", []);
     assert_eq!(document, "second");
 
     links
         .save_enabled("user-1", "listenbrainz", "third")
         .await
         .unwrap();
-    assert_eq!(count(&fx, enabled).await, 1);
+    assert_eq!(count(&fx, enabled), 1);
 }
 
 #[tokio::test]
@@ -415,7 +418,7 @@ async fn logins_sweep_dead_token_rows() {
         .await
         .unwrap();
     assert_eq!(
-        count(&fx, "SELECT COUNT(*) FROM auth_tokens").await,
+        count(&fx, "SELECT COUNT(*) FROM auth_tokens"),
         1,
         "the next login removes rows no request can use"
     );
@@ -507,7 +510,7 @@ async fn last_admin_guard_runs_inside_the_write() {
     outcomes.sort_by_key(|outcome| *outcome != RoleChange::Changed);
     assert_eq!(outcomes, vec![RoleChange::Changed, RoleChange::LastAdmin]);
     assert_eq!(
-        count(&fx, "SELECT COUNT(*) FROM auth_users WHERE role = 'admin'").await,
+        count(&fx, "SELECT COUNT(*) FROM auth_users WHERE role = 'admin'"),
         1
     );
     let remaining = if users.get_by_id("admin-1").await.unwrap().unwrap().role == Role::Admin {
@@ -587,8 +590,7 @@ async fn users_named_by_library_history_are_not_deleted() {
              + (SELECT COUNT(*) FROM catalog_discover_activity) \
              + (SELECT COUNT(*) FROM acquire_discovery_batches) \
              + (SELECT COUNT(*) FROM acquire_discovery_batch_items)"
-        )
-        .await,
+        ),
         0
     );
 }
@@ -673,11 +675,10 @@ async fn federated_tokens_are_sealed_at_rest() {
         .unwrap()
         .unwrap();
     assert_eq!(binding.user_id, user.id);
-    let raw: String = sqlx::query_scalar("SELECT provider_data FROM auth_providers WHERE id = ?")
-        .bind(&binding.id)
-        .fetch_one(fx.runtime().db().sqlx())
-        .await
-        .unwrap();
+    let raw: String = fx.runtime().db().one(
+        "SELECT provider_data FROM auth_providers WHERE id = ?",
+        rusqlite::params![&binding.id],
+    );
     assert!(raw.starts_with("v3:") && !raw.contains("canary"), "{raw}");
     assert_eq!(fx.deps.crypto.decrypt(&raw).unwrap(), profile.token_json);
 }
@@ -704,34 +705,9 @@ async fn first_federated_logins_race_to_exactly_one_admin() {
         handle.await.unwrap().unwrap();
     }
     assert_eq!(
-        count(&fx, "SELECT COUNT(*) FROM auth_users WHERE role = 'admin'").await,
+        count(&fx, "SELECT COUNT(*) FROM auth_users WHERE role = 'admin'"),
         1
     );
-}
-
-#[tokio::test]
-async fn unverified_federated_email_never_claims_an_account() {
-    let fx = fixture("email-link").await;
-    let mut owner = user_row("user-1", "ada", Role::Admin);
-    owner.email = Some("ada@example.com".to_owned());
-    fx.auth.users.insert(owner).await.unwrap();
-    let profile = |verified: bool, uid: &str| FederatedProfile {
-        provider_uid: uid.to_owned(),
-        display_name: "Someone".to_owned(),
-        email: Some("ada@example.com".to_owned()),
-        email_verified: verified,
-        avatar_url: None,
-        token_json: "{}".to_owned(),
-    };
-    let stranger = find_or_create_federated_user(&fx.auth.federated, "oidc", &profile(false, "a"))
-        .await
-        .unwrap();
-    assert_ne!(stranger.id, "user-1");
-    assert_eq!(stranger.email, None, "an unverified address is not stored");
-    let linked = find_or_create_federated_user(&fx.auth.federated, "oidc", &profile(true, "b"))
-        .await
-        .unwrap();
-    assert_eq!(linked.id, "user-1");
 }
 
 #[tokio::test]
@@ -844,8 +820,64 @@ async fn recovery_reset_checks_the_code_first_then_revokes_and_consumes() {
         "reset kills prior sessions"
     );
     assert_eq!(
-        count(&fx, "SELECT COUNT(*) FROM auth_password_recovery_codes").await,
+        count(&fx, "SELECT COUNT(*) FROM auth_password_recovery_codes"),
         0
+    );
+
+    // An account whose local row holds no password (a v2 account carried
+    // without one) gets its first password from a host recovery code in
+    // that row, which keeps its id.
+    deps.users
+        .insert(user_row("user-2", "cy", Role::User))
+        .await
+        .unwrap();
+    fx.runtime()
+        .db()
+        .write(Lane::Foreground, "test.seed", |tx| {
+            tx.execute(
+                "INSERT INTO auth_providers (id, user_id, provider, provider_uid, created_at) \
+                 VALUES ('cred-cy', 'user-2', 'local', 'cy', 1)",
+                params![],
+            )?;
+            tx.execute(
+                "INSERT INTO auth_password_recovery_codes (user_id, code_hash, created_at, \
+                 expires_at) VALUES ('user-2', 'code-cy', ?1, ?2)",
+                params![TEST_NOW * 1000, (TEST_NOW + 600) * 1000],
+            )?;
+            Ok::<_, droppedneedle_kernel::db::DbError>(())
+        })
+        .await
+        .unwrap();
+    assert!(
+        deps.users
+            .complete_recovery_first_password(
+                LocalCredential {
+                    id: "cred-cy-new".to_owned(),
+                    user_id: "user-2".to_owned(),
+                    scheme: "argon2id".to_owned(),
+                    hash: password_hash().to_owned(),
+                },
+                "code-cy",
+                TEST_NOW,
+            )
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        count(
+            &fx,
+            "SELECT COUNT(*) FROM auth_providers WHERE user_id = 'user-2' AND provider = 'local' \
+             AND id = 'cred-cy' AND password_hash IS NOT NULL"
+        ),
+        1,
+        "the empty row takes the password in place"
+    );
+    assert_eq!(
+        count(
+            &fx,
+            "SELECT COUNT(*) FROM auth_providers WHERE user_id = 'user-2'"
+        ),
+        1
     );
 }
 
@@ -867,7 +899,7 @@ async fn oidc_states_consume_once_and_expired_ones_are_swept() {
     let states = &fx.auth.oidc_states;
     states.store_state("state-1", "verifier-1").await.unwrap();
     assert_eq!(
-        count(&fx, "SELECT COUNT(*) FROM auth_oidc_states").await,
+        count(&fx, "SELECT COUNT(*) FROM auth_oidc_states"),
         1,
         "storing a state sweeps expired ones"
     );

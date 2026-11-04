@@ -34,7 +34,12 @@ async fn open_scratch(name: &str) -> (DbRuntime, ScratchDir) {
     let dir = scratch_dir(name);
     let db = dir.join("library.db");
     copy_to(&db).unwrap();
-    let runtime = open_runtime(&DbConfig::new(&db)).await.unwrap();
+    let runtime = open_runtime(&DbConfig::new(
+        &db,
+        std::sync::Arc::new(crate::clock::SystemClock),
+    ))
+    .await
+    .unwrap();
     (runtime, dir)
 }
 
@@ -50,6 +55,16 @@ impl Hold {
     fn wait(self) {
         let _ = self.entered.send(());
         let _ = self.release.recv();
+    }
+}
+
+/// Captured by a write's closure, so refusing that write panics when it
+/// drops the closure, as a caller's code may.
+struct PanicOnDrop;
+
+impl Drop for PanicOnDrop {
+    fn drop(&mut self) {
+        panic!("brief: dropping this closure panics");
     }
 }
 
@@ -174,10 +189,17 @@ fn current_thread_runtime() -> tokio::runtime::Runtime {
 /// back; a closure that swallows that and writes one more row leaves no row,
 /// and the caller hears the timeout whatever the closure returned. The
 /// timeout reports the rows that transaction changed, not the connection's
-/// running total.
+/// running total. The budget is scaled down from 2 s to 100 ms.
 #[tokio::test]
 async fn runaway_write_aborts_at_hard_budget() {
-    let (lane, _dir) = scratch_lane("abort");
+    let abort = Duration::from_millis(100);
+    let (lane, _dir) = scratch_lane_with(
+        "abort",
+        LaneLimits {
+            foreground: Budget { warn: abort, abort },
+            ..LaneLimits::default()
+        },
+    );
     lane.write(Lane::Foreground, "brief-earlier", |tx| {
         for label in ["a", "b", "c", "d", "e"] {
             insert_label(tx, label)?;
@@ -213,7 +235,7 @@ async fn runaway_write_aborts_at_hard_budget() {
         other => panic!("runaway write must abort, got {other:?}"),
     }
     assert!(
-        started.elapsed() < Duration::from_secs(15),
+        started.elapsed() < Duration::from_secs(5),
         "abort must fire near the budget"
     );
 
@@ -249,7 +271,8 @@ fn burn(tx: &rusqlite::Transaction, span: Duration) -> Result<(), DbError> {
 /// past its own budget is rolled back.
 #[tokio::test]
 async fn background_budget_outlasts_the_foreground_one() {
-    let foreground_abort = Duration::from_millis(100);
+    let foreground_abort = Duration::from_millis(50);
+    let background_abort = Duration::from_millis(600);
     let (lane, _dir) = scratch_lane_with(
         "class-budgets",
         LaneLimits {
@@ -258,8 +281,8 @@ async fn background_budget_outlasts_the_foreground_one() {
                 abort: foreground_abort,
             },
             background: Budget {
-                warn: Duration::from_secs(1),
-                abort: Duration::from_secs(1),
+                warn: background_abort,
+                abort: background_abort,
             },
             ..LaneLimits::default()
         },
@@ -305,11 +328,12 @@ async fn foreground_wait_past_its_limit_is_refused() {
     let dir = scratch_dir("foreground-wait");
     let db = dir.join("library.db");
     copy_to(&db).unwrap();
-    let config = DbConfig::new(&db).with_lane_limits(LaneLimits {
-        foreground_wait: Duration::from_millis(50),
-        watch_tick: Duration::from_millis(10),
-        ..LaneLimits::default()
-    });
+    let config = DbConfig::new(&db, std::sync::Arc::new(crate::clock::SystemClock))
+        .with_lane_limits(LaneLimits {
+            foreground_wait: Duration::from_millis(50),
+            watch_tick: Duration::from_millis(10),
+            ..LaneLimits::default()
+        });
     // The lane comes from the production runtime, so the watch at work here
     // is the one that runtime starts. The pool's timeouts run on a runtime's
     // clock, so it is opened and closed on one whose clock is not paused.
@@ -453,7 +477,9 @@ fn durable_write_syncs_fully_and_the_next_write_does_not() {
 
 /// Shutdown behind a write that does not return gives up at its bound: it
 /// comes back, and the writes still queued, from a thread and from an async
-/// caller, are answered `LaneClosed` and never run.
+/// caller, are answered `LaneClosed` and never run. One whose refusal
+/// panics does not stop the rest being answered. A second shutdown
+/// returns at once.
 #[test]
 fn shutdown_gives_up_on_a_holder_that_does_not_return() {
     let (lane, _dir) = scratch_lane("shutdown-stuck");
@@ -468,6 +494,12 @@ fn shutdown_gives_up_on_a_holder_that_does_not_return() {
     inside.blocking_recv().unwrap();
 
     let mut cx = Context::from_waker(Waker::noop());
+    let bomb = PanicOnDrop;
+    let mut panics = Box::pin(lane.write(Lane::Background, "brief-panics", move |tx| {
+        let _bomb = &bomb;
+        insert_label(tx, "panics")
+    }));
+    assert!(panics.as_mut().poll(&mut cx).is_pending());
     let mut queued = Box::pin(lane.write(Lane::Background, "brief-queued", |tx| {
         insert_label(tx, "queued")
     }));
@@ -478,16 +510,34 @@ fn shutdown_gives_up_on_a_holder_that_does_not_return() {
             insert_label(tx, "parked")
         })
     });
-    wait_queued(&lane, 2);
+    wait_queued(&lane, 3);
 
     let (down_tx, down) = std::sync::mpsc::channel();
     let closing = lane.clone();
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&buffer);
     std::thread::spawn(move || {
-        current_thread_runtime().block_on(closing.shutdown(Duration::from_millis(100)));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || LogSink(Arc::clone(&sink)))
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            current_thread_runtime().block_on(closing.shutdown(Duration::from_millis(100)));
+        });
         let _ = down_tx.send(());
     });
     down.recv_timeout(Duration::from_secs(10))
         .expect("shutdown must give up on a write that does not return");
+    let logged = String::from_utf8_lossy(&buffer.lock().unwrap()).into_owned();
+    assert!(
+        !logged.contains("did not stop cleanly"),
+        "a refusal that panics does not end the shutdown early: {logged}"
+    );
+    let refused = panics.as_mut().poll(&mut cx);
+    assert!(
+        matches!(refused, Poll::Ready(Err(DbError::LaneClosed))),
+        "the write whose refusal panicked hears LaneClosed, got {refused:?}"
+    );
     let refused = queued.as_mut().poll(&mut cx);
     assert!(
         matches!(refused, Poll::Ready(Err(DbError::LaneClosed))),
@@ -497,6 +547,16 @@ fn shutdown_gives_up_on_a_holder_that_does_not_return() {
     assert!(
         matches!(refused, Err(DbError::LaneClosed)),
         "a parked write hears LaneClosed, got {refused:?}"
+    );
+
+    // The write it gave up on ends by itself; a second shutdown does not
+    // wait out its grace for it again.
+    let again = Instant::now();
+    current_thread_runtime().block_on(lane.shutdown(DRAIN));
+    assert!(
+        again.elapsed() < DRAIN / 2,
+        "a second shutdown returns at once, took {:?}",
+        again.elapsed()
     );
 
     let_go.send(()).unwrap();
@@ -1110,7 +1170,7 @@ async fn small_wal_runtime(name: &str) -> (DbRuntime, ScratchDir) {
     let dir = scratch_dir(name);
     let db = dir.join("library.db");
     copy_to(&db).unwrap();
-    let config = DbConfig::new(&db)
+    let config = DbConfig::new(&db, std::sync::Arc::new(crate::clock::SystemClock))
         .with_wal_water(64 * 1024, 16 * 1024)
         .with_lane_limits(LaneLimits {
             watch_tick: Duration::from_millis(20),
@@ -1437,13 +1497,6 @@ fn write_connection_keeps_its_prepared_statements() {
 /// logged before any of it.
 #[test]
 fn a_refusal_that_panics_still_answers_the_rest_of_the_pass() {
-    struct PanicOnDrop;
-    impl Drop for PanicOnDrop {
-        fn drop(&mut self) {
-            panic!("brief: dropping this closure panics");
-        }
-    }
-
     let (lane, _dir) = scratch_lane_with(
         "refusal-panics",
         LaneLimits {

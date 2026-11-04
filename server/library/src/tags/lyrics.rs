@@ -25,11 +25,10 @@ use std::fs::File;
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use droppedneedle_kernel::beneath::{RootLinks, open_file_beneath};
 use lofty::file::TaggedFileExt as _;
 use lofty::tag::{ItemKey, TagType};
 
-use super::{AudioFormat, format_for_path};
+use super::{AudioFormat, TrackFile, format_for_path};
 
 /// Largest lyrics payload read, in bytes.
 pub const MAX_LYRICS_BYTES: usize = 2 * 1024 * 1024;
@@ -210,16 +209,23 @@ fn parse_lrc_stamp(line: &str) -> Option<(i64, &str)> {
 /// no lyrics instead of taking the caller down. Blocking: run it off the
 /// async workers.
 #[must_use]
-pub fn read_file_lyrics(audio: &Path) -> Option<(LyricsSource, Lyrics)> {
-    let sidecars = audio.parent().map(Sidecars::list).unwrap_or_default();
-    read_lyrics_beside(audio, sidecars.for_track(audio))
+pub fn read_file_lyrics(audio: TrackFile<'_>) -> Option<(LyricsSource, Lyrics)> {
+    let sidecars = audio
+        .path()
+        .parent()
+        .map(Sidecars::list)
+        .unwrap_or_default();
+    read_lyrics_beside(audio, sidecars.for_track(audio.path()))
 }
 
 /// [`read_file_lyrics`] with the `.lrc` file already found (from a
 /// [`Sidecars`] listing of the track's folder), so a sweep lists each
-/// folder once.
+/// folder once. The `.lrc` file is read beneath the track's folder.
 #[must_use]
-pub fn read_lyrics_beside(audio: &Path, sidecar: Option<&Path>) -> Option<(LyricsSource, Lyrics)> {
+pub fn read_lyrics_beside(
+    audio: TrackFile<'_>,
+    sidecar: Option<&Path>,
+) -> Option<(LyricsSource, Lyrics)> {
     read_lyrics_checked(audio, sidecar).0
 }
 
@@ -227,13 +233,13 @@ pub fn read_lyrics_beside(audio: &Path, sidecar: Option<&Path>) -> Option<(Lyric
 /// lyrics found is not the same as none there.
 #[must_use]
 pub fn read_lyrics_checked(
-    audio: &Path,
+    audio: TrackFile<'_>,
     sidecar: Option<&Path>,
 ) -> (Option<(LyricsSource, Lyrics)>, bool) {
     let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut unread = false;
         if let Some(path) = sidecar {
-            match read_sidecar(path) {
+            match read_sidecar(audio.beside(path)) {
                 Ok(Some(lyrics)) => return (Some((LyricsSource::Sidecar, lyrics)), false),
                 Ok(None) => {}
                 Err(error) => {
@@ -245,13 +251,13 @@ pub fn read_lyrics_checked(
         match read_tag_lyrics(audio) {
             Ok(lyrics) => (lyrics.map(|lyrics| (LyricsSource::Tag, lyrics)), unread),
             Err(error) => {
-                tracing::debug!(path = %audio.display(), %error, "lyrics tag not read");
+                tracing::debug!(path = %audio.path().display(), %error, "lyrics tag not read");
                 (None, true)
             }
         }
     }));
     read.unwrap_or_else(|_| {
-        tracing::error!(path = %audio.display(), "lyrics read panicked; read as none");
+        tracing::error!(path = %audio.path().display(), "lyrics read panicked; read as none");
         (None, false)
     })
 }
@@ -338,22 +344,13 @@ impl Sidecars {
     }
 }
 
-/// Open a regular file for reading without following a link in the last
-/// component. A FIFO or device fails rather than hanging the open.
-fn open_no_follow(path: &Path) -> std::io::Result<File> {
-    let folder = path
-        .parent()
-        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
-    open_file_beneath(folder, path, RootLinks::Follow)
-}
-
 /// The lyrics of a `.lrc` file. `Err` when it could not be read, `None`
 /// when what it holds does not count.
-fn read_sidecar(path: &Path) -> std::io::Result<Option<Lyrics>> {
+fn read_sidecar(at: TrackFile<'_>) -> std::io::Result<Option<Lyrics>> {
     let skip = |why: &dyn std::fmt::Display| {
-        tracing::debug!(path = %path.display(), reason = %why, "lyrics file skipped");
+        tracing::debug!(path = %at.path().display(), reason = %why, "lyrics file skipped");
     };
-    let file = open_no_follow(path)?;
+    let file = at.open()?;
     let mut bytes = Vec::new();
     // One byte past the cap tells an oversized file from one exactly at it.
     let cap = u64::try_from(MAX_LYRICS_BYTES)
@@ -383,11 +380,12 @@ fn read_sidecar(path: &Path) -> std::io::Result<Option<Lyrics>> {
 
 /// The first lyrics item of the file's tag that gives a line. `Err` when
 /// the file could not be read; a tag that does not parse holds no lyrics.
-fn read_tag_lyrics(audio: &Path) -> std::io::Result<Option<Lyrics>> {
+fn read_tag_lyrics(at: TrackFile<'_>) -> std::io::Result<Option<Lyrics>> {
+    let audio = at.path();
     let Ok(format) = format_for_path(audio) else {
         return Ok(None);
     };
-    let values = match tag_lyrics_values(audio, format) {
+    let values = match tag_lyrics_values(at, format) {
         Ok(values) => values,
         Err(TagValuesError::Read(error)) => return Err(error),
         Err(TagValuesError::Parse(error)) => {
@@ -426,9 +424,12 @@ impl From<std::io::Error> for TagValuesError {
 
 /// Every lyrics value in the file's tags: `Lyrics` items first, then
 /// `UnsyncLyrics`.
-fn tag_lyrics_values(audio: &Path, format: AudioFormat) -> Result<Vec<String>, TagValuesError> {
+fn tag_lyrics_values(
+    audio: TrackFile<'_>,
+    format: AudioFormat,
+) -> Result<Vec<String>, TagValuesError> {
     const KEYS: [ItemKey; 2] = [ItemKey::Lyrics, ItemKey::UnsyncLyrics];
-    let mut file = open_no_follow(audio)?;
+    let mut file = audio.open()?;
     if format == AudioFormat::Aac {
         let bytes = ape_tail(&mut file)?;
         let items = super::read::parse_apev2(&bytes).unwrap_or_default();
@@ -460,6 +461,7 @@ fn tag_lyrics_values(audio: &Path, format: AudioFormat) -> Result<Vec<String>, T
                 }
             }
         })?;
+    super::read::confirm_untagged_mp4(&tagged, &mut opened.try_clone()?)?;
     let mut values = Vec::new();
     for key in KEYS {
         for tag in tagged.tags() {
@@ -505,8 +507,12 @@ fn ape_tail(file: &mut File) -> std::io::Result<Vec<u8>> {
 mod tests {
     use super::*;
 
+    /// LRC stamps parse to milliseconds, plain text drops empty lines,
+    /// the byte cap holds, and a `.lrc` reads as Jellyfin reads it: a line
+    /// stamped twice is sung twice, in time order, and a stamped blank line
+    /// stays, so the line before it stops showing through the gap.
     #[test]
-    fn lrc_stamps_parse_to_milliseconds() {
+    fn lyrics_parse_and_cap() {
         assert_eq!(
             parse_lrc_line("[01:02.34] hello"),
             Some(("hello".to_owned(), vec![62_340]))
@@ -518,10 +524,7 @@ mod tests {
         assert_eq!(parse_lrc_line("[ar:Someone]"), None);
         assert_eq!(parse_lrc_line("[99:99.99] x"), None);
         assert_eq!(parse_lrc_line("no stamp"), None);
-    }
 
-    #[test]
-    fn plain_text_drops_empty_lines_and_caps_hold() {
         let plain = parse_lyrics_text("One\n\n  Two  ").unwrap().unwrap();
         assert!(!plain.synced);
         assert_eq!(
@@ -532,6 +535,27 @@ mod tests {
         assert_eq!(
             parse_lyrics(Some(&"x".repeat(MAX_LYRICS_BYTES + 1)), None),
             Err(LyricsRefused::TooManyBytes)
+        );
+
+        let dir =
+            droppedneedle_kernel::db::scratch::ScratchDir::new("lyrics-lrc").expect("scratch");
+        std::fs::write(
+            dir.path().join("song.lrc"),
+            "[ar:Someone]\n[00:12.00][00:45.00]Chorus\n[00:20.00]\n",
+        )
+        .expect("lrc writes");
+        let song = dir.path().join("song.flac");
+        let (source, lyrics) =
+            read_file_lyrics(TrackFile::new(dir.path(), &song)).expect("the sidecar reads");
+        assert_eq!(source, LyricsSource::Sidecar);
+        assert!(lyrics.synced);
+        assert_eq!(
+            lyrics.lines,
+            [
+                ("Chorus".to_owned(), Some(12_000)),
+                (String::new(), Some(20_000)),
+                ("Chorus".to_owned(), Some(45_000)),
+            ]
         );
     }
 }

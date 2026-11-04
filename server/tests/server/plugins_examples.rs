@@ -134,8 +134,11 @@ where
     }
 }
 
+/// Every example's manifest validates, and a manifest written for an older
+/// plugin API is refused before any of its code runs, the message saying
+/// where the porting guide is.
 #[test]
-fn every_example_manifest_validates() {
+fn example_and_older_manifests_are_judged() {
     let mut names = Vec::new();
     for entry in std::fs::read_dir(repo().join("examples/plugins")).unwrap() {
         let dir = entry.unwrap().path();
@@ -154,12 +157,7 @@ fn every_example_manifest_validates() {
             "webhook-scrobbler",
         ]
     );
-}
 
-/// A manifest written for an older plugin API is refused before any of its
-/// code runs, and the message says where the porting guide is.
-#[test]
-fn manifests_for_older_plugin_apis_are_refused() {
     for version in [0, 1] {
         let text = format!(
             "[plugin]\nname = \"old-toy\"\napi_version = {version}\n\
@@ -171,7 +169,8 @@ fn manifests_for_older_plugin_apis_are_refused() {
             format!(
                 "old-toy: written for api_version {version}; this DroppedNeedle reads \
                  api_version 2; see Porting a v2 plugin in PLUGINS.md"
-            )
+            ),
+            "api_version {version}"
         );
     }
 }
@@ -530,9 +529,12 @@ async fn crashes_restart_hangs_time_out_and_the_environment_is_scrubbed() {
     wait_until_back(&rig, 2).await;
 }
 
-/// Wait until the probe has restarted `restarts` times and answers again.
+/// Wait until the probe has restarted `restarts` times and answers again,
+/// bounded in wall-clock time as [`wait_for`] is: a restart waits out its
+/// backoff and a cold Python start, both slow on a loaded host.
 async fn wait_until_back(rig: &Rig, restarts: u64) {
-    for _ in 0..200 {
+    let deadline = Instant::now() + crate::common::PATIENCE;
+    loop {
         let status = rig.host.get("probe").unwrap().runtime_status().unwrap();
         if status.restarts >= restarts
             && status.state == RuntimeState::Running
@@ -545,7 +547,10 @@ async fn wait_until_back(rig: &Rig, restarts: u64) {
         {
             return;
         }
+        assert!(
+            Instant::now() < deadline,
+            "the plugin did not come back after restart {restarts}: {status:?}"
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    panic!("the plugin did not come back after restart {restarts}");
 }

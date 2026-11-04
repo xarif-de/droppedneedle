@@ -33,7 +33,7 @@ use crate::publish::{MAX_PLAN_SUBJECTS, PublishError, Sandbox, collision_key};
 use crate::scan::models::EffectivePolicy;
 use crate::scan::roots::RootRegistry;
 use crate::scan::sqlite_store::holds_new_files;
-use crate::tags::{self, TagField};
+use crate::tags::{self, TagField, TrackFile};
 use droppedneedle_kernel::db::Lane;
 
 /// Why an album's match keeps its files from being managed, if it does.
@@ -599,22 +599,26 @@ fn plan_file(
         .sandbox
         .resolve_no_symlink(&track.root_id, &track.relative_path)
         .map_err(unreadable)?;
+    let file = TrackFile::new(
+        ctx.sandbox.root_dir(&track.root_id).map_err(unreadable)?,
+        &path,
+    );
     let hashed = crate::publish::paths::hash_regular_file(&path).map_err(unreadable)?;
     let fingerprint = FileFingerprint {
         size: hashed.size,
         sha256: hashed.sha256,
     };
-    let doc = crate::publish::staging::document_from_file(&path).map_err(|error| {
+    let doc = crate::publish::staging::document_from_file(file).map_err(|error| {
         tracing::info!(%error, track = track.id, "tags unreadable at preview");
         reasons::file_unreadable()
     })?;
     let writable = tags::save::writable(format);
-    let id3v23 = tags::save::id3_lands_as_v23(&path).map_err(|error| {
+    let id3v23 = tags::save::id3_lands_as_v23(file).map_err(|error| {
         tracing::info!(%error, track = track.id, "tags unreadable at preview");
         reasons::file_unreadable()
     })?;
     let lyrics = super::enrich::lyrics(
-        ctx.parts.enrichment.as_deref(),
+        &*ctx.parts.enrichment,
         &ctx.pinned.profile.enrichment.lyrics,
         release,
         release_track,
@@ -695,7 +699,7 @@ fn plan_file(
         } else {
             tags::save::PicturesPlan::Untouched
         };
-        let kept = tags::save::tags_kept(&path, pictures).map_err(|error| {
+        let kept = tags::save::tags_kept(file, pictures).map_err(|error| {
             tracing::info!(%error, track = track.id, "tags unreadable at preview");
             reasons::file_unreadable()
         })?;
@@ -1409,14 +1413,16 @@ fn measure_replaygain(
     if !settings.enabled || settings.mode == ReplayGainMode::Preserve || tracks.is_empty() {
         return;
     }
-    let paths: Vec<(&str, Option<std::path::PathBuf>)> = tracks
+    let paths: Vec<(&str, Option<(&std::path::Path, std::path::PathBuf)>)> = tracks
         .iter()
         .map(|track| {
             (
                 track.id.as_str(),
-                ctx.sandbox
-                    .resolve_no_symlink(&track.root_id, &track.relative_path)
-                    .ok(),
+                ctx.sandbox.root_dir(&track.root_id).ok().zip(
+                    ctx.sandbox
+                        .resolve_no_symlink(&track.root_id, &track.relative_path)
+                        .ok(),
+                ),
             )
         })
         .collect();
@@ -1426,8 +1432,10 @@ fn measure_replaygain(
             needed.extend([TagField::ReplayGainAlbumGain, TagField::ReplayGainAlbumPeak]);
         }
         let complete = paths.iter().all(|(_, path)| {
-            path.as_deref()
-                .and_then(|path| crate::publish::staging::document_from_file(path).ok())
+            path.as_ref()
+                .and_then(|(root, path)| {
+                    crate::publish::staging::document_from_file(TrackFile::new(root, path)).ok()
+                })
                 .is_some_and(|doc| {
                     needed
                         .iter()
@@ -1457,7 +1465,7 @@ fn measure_replaygain(
     let mut whole = true;
     for (track_id, path) in &paths {
         let result = match path {
-            Some(path) => loudness::analyse_cached(path, deadline),
+            Some((root, path)) => loudness::analyse_cached(TrackFile::new(root, path), deadline),
             None => Err(Unanalysed::Undecodable),
         };
         match result {
@@ -1622,7 +1630,7 @@ pub(crate) fn acoustid_values(
     use super::enrich::{AcoustIdAnswer, AcoustIdPrint};
     use droppedneedle_providers::acoustid::{MAX_BATCH, Unanswered};
 
-    let port = parts.enrichment.as_deref();
+    let port = &*parts.enrichment;
     // Without a key no id is looked up, so a file that wants only an id
     // is not decoded.
     let mut keyed: Option<bool> = None;
@@ -1641,18 +1649,21 @@ pub(crate) fn acoustid_values(
                 TagField::AcoustIdFingerprint,
                 false,
             );
-        let may_id = port.is_some()
-            && acoustid_wanted(profile, subject.overrides, TagField::AcoustIdId, false);
+        let may_id = acoustid_wanted(profile, subject.overrides, TagField::AcoustIdId, false);
         if !may_print && !may_id {
             continue;
         }
         let Ok(path) = sandbox.resolve_no_symlink(subject.root_id, subject.relative_path) else {
             continue;
         };
+        let Ok(root) = sandbox.root_dir(subject.root_id) else {
+            continue;
+        };
+        let file = TrackFile::new(root, &path);
         if !tags::format_for_path(&path).is_ok_and(tags::save::writable) {
             continue;
         }
-        let Ok(doc) = crate::publish::staging::document_from_file(&path) else {
+        let Ok(doc) = crate::publish::staging::document_from_file(file) else {
             continue;
         };
         let held = |field: TagField| {
@@ -1680,8 +1691,7 @@ pub(crate) fn acoustid_values(
                 continue;
             }
         };
-        let mut want_id = port.is_some()
-            && recording.is_some()
+        let mut want_id = recording.is_some()
             && acoustid_wanted(
                 profile,
                 subject.overrides,
@@ -1691,11 +1701,9 @@ pub(crate) fn acoustid_values(
         if want_id {
             first_wanting_id.get_or_insert(subject.track_id);
             let has_key = *keyed.get_or_insert_with(|| {
-                port.is_some_and(|port| {
-                    super::enrich::wait(Box::pin(async {
-                        Ok::<_, String>(port.acoustid_lookup(&[], background).await)
-                    })) != Some(AcoustIdAnswer::NoKey)
-                })
+                super::enrich::wait(Box::pin(async {
+                    Ok::<_, String>(port.acoustid_lookup(&[], background).await)
+                })) != Some(AcoustIdAnswer::NoKey)
             });
             if !has_key {
                 outcome = AcoustIdLookup::NoKey;
@@ -1730,7 +1738,7 @@ pub(crate) fn acoustid_values(
                 out_of_time.get_or_insert(subject.track_id);
                 continue;
             }
-            None => match tags::generate_fingerprint(&path) {
+            None => match tags::generate_fingerprint(file) {
                 Ok(found) if !found.fingerprint.is_empty() => {
                     if let Err(error) = parts.identify_store.keep_fingerprint(
                         subject.track_id,
@@ -1777,63 +1785,61 @@ pub(crate) fn acoustid_values(
     let mut unanswered: Option<Unanswered> = None;
     let mut refused = false;
     let mut settings_unreadable = false;
-    if let Some(port) = port {
-        for (index, chunk) in lookups.chunks(MAX_BATCH).enumerate() {
-            let prints: Vec<AcoustIdPrint> =
-                chunk.iter().map(|(_, _, print, _)| print.clone()).collect();
-            let answer = super::enrich::wait(Box::pin(async {
-                Ok::<_, String>(port.acoustid_lookup(&prints, background).await)
-            }))
-            .unwrap_or(AcoustIdAnswer::Unavailable(Unanswered::Failed));
-            let results = match answer {
-                AcoustIdAnswer::Answered(results) => results,
-                AcoustIdAnswer::NoKey => {
-                    outcome = AcoustIdLookup::NoKey;
-                    break;
+    for (index, chunk) in lookups.chunks(MAX_BATCH).enumerate() {
+        let prints: Vec<AcoustIdPrint> =
+            chunk.iter().map(|(_, _, print, _)| print.clone()).collect();
+        let answer = super::enrich::wait(Box::pin(async {
+            Ok::<_, String>(port.acoustid_lookup(&prints, background).await)
+        }))
+        .unwrap_or(AcoustIdAnswer::Unavailable(Unanswered::Failed));
+        let results = match answer {
+            AcoustIdAnswer::Answered(results) => results,
+            AcoustIdAnswer::NoKey => {
+                outcome = AcoustIdLookup::NoKey;
+                break;
+            }
+            AcoustIdAnswer::KeyRefused => {
+                refused = true;
+                outcome = AcoustIdLookup::NoKey;
+                break;
+            }
+            answer @ (AcoustIdAnswer::Unavailable(_) | AcoustIdAnswer::SettingsUnreadable) => {
+                match answer {
+                    AcoustIdAnswer::Unavailable(why) => unanswered = Some(why),
+                    _ => settings_unreadable = true,
                 }
-                AcoustIdAnswer::KeyRefused => {
-                    refused = true;
-                    outcome = AcoustIdLookup::NoKey;
-                    break;
-                }
-                answer @ (AcoustIdAnswer::Unavailable(_) | AcoustIdAnswer::SettingsUnreadable) => {
-                    match answer {
-                        AcoustIdAnswer::Unavailable(why) => unanswered = Some(why),
-                        _ => settings_unreadable = true,
-                    }
-                    outcome = AcoustIdLookup::Unavailable;
-                    // The files whose ids wait, this chunk's and every
-                    // later one's.
-                    extras.acoustid_waiting.extend(
-                        lookups[index * MAX_BATCH..]
-                            .iter()
-                            .map(|(track, ..)| (*track).to_owned()),
-                    );
-                    break;
-                }
-            };
-            outcome = AcoustIdLookup::Answered;
-            for ((track, revision, print, recording), results) in chunk.iter().zip(&results) {
-                let matched = results.iter().any(|result| {
-                    result.score() > droppedneedle_providers::acoustid::BATCH_MIN_SCORE
-                        && !result.recordings().is_empty()
-                });
-                if let Err(error) = parts.identify_store.save_fingerprint(
-                    track,
-                    revision,
-                    &print.print,
-                    print.duration_seconds,
-                    matched,
-                ) {
-                    tracing::warn!(%error, track, "fingerprint not kept");
-                }
-                if let Some(id) = acoustid_id_for(results, recording) {
-                    extras
-                        .files
-                        .entry((*track).to_owned())
-                        .or_default()
-                        .acoustid_id = Some(id);
-                }
+                outcome = AcoustIdLookup::Unavailable;
+                // The files whose ids wait, this chunk's and every
+                // later one's.
+                extras.acoustid_waiting.extend(
+                    lookups[index * MAX_BATCH..]
+                        .iter()
+                        .map(|(track, ..)| (*track).to_owned()),
+                );
+                break;
+            }
+        };
+        outcome = AcoustIdLookup::Answered;
+        for ((track, revision, print, recording), results) in chunk.iter().zip(&results) {
+            let matched = results.iter().any(|result| {
+                result.score() > droppedneedle_providers::acoustid::BATCH_MIN_SCORE
+                    && !result.recordings().is_empty()
+            });
+            if let Err(error) = parts.identify_store.save_fingerprint(
+                track,
+                revision,
+                &print.print,
+                print.duration_seconds,
+                matched,
+            ) {
+                tracing::warn!(%error, track, "fingerprint not kept");
+            }
+            if let Some(id) = acoustid_id_for(results, recording) {
+                extras
+                    .files
+                    .entry((*track).to_owned())
+                    .or_default()
+                    .acoustid_id = Some(id);
             }
         }
     }
@@ -2220,7 +2226,7 @@ pub fn plan_album(
         };
     // Only a person's own preview asks MusicBrainz at their priority.
     let mut extras = super::enrich::gather(
-        ctx.parts.enrichment.as_deref(),
+        &*ctx.parts.enrichment,
         &ctx.parts.identify_store,
         &ctx.pinned.profile,
         &mut release,
@@ -2375,7 +2381,7 @@ pub fn plan_one(
                 Ok::<_, ManagementError>(overrides(conn, &scope.album_id, &track.id)?)
             })?;
             let mut extras = super::enrich::gather(
-                ctx.parts.enrichment.as_deref(),
+                &*ctx.parts.enrichment,
                 &ctx.parts.identify_store,
                 &ctx.pinned.profile,
                 &mut release,

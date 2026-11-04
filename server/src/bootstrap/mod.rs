@@ -64,12 +64,12 @@ use droppedneedle_catalog::{
     enrichment::{library::LiveEnrichment, live::production_enrichment},
     lyrics::OnlineLyrics,
     metadata::{
-        Catalog,
+        Catalog, PageSources,
         library::LocalCatalog,
         plugin_sources::{PluginDetailsSource, PluginPurchaseLinks},
         upstream::{LiveCatalogSettings, Upstream},
     },
-    wiring::{CatalogInputs, CatalogPorts, CatalogSetup},
+    wiring::{CatalogInputs, CatalogPorts, CatalogSetup, collections_follows},
 };
 use droppedneedle_compat::{CompatSetup, setup::CompatDeps};
 use droppedneedle_kernel::{
@@ -80,6 +80,7 @@ use droppedneedle_kernel::{
         error::DbError,
     },
     http_client::HttpClientError,
+    jobs::queue::Handlers,
     platform::Platform,
     runtime_config::crypto::CryptoError,
 };
@@ -88,7 +89,7 @@ use droppedneedle_media::playback::listening::ListeningStore;
 use droppedneedle_media::{
     MediaSetup,
     remotes::{
-        connections::{ConnectionResolver, SignInLinks},
+        connections::{ConnectionLinks, SignInLinks},
         plex::ConfiguredPlexServer,
     },
     stream::local_files::LibraryFiles,
@@ -187,9 +188,7 @@ where
 /// per-user connections table (the rows the remotes routes read) in the
 /// platform's database. It only stores links and reads no remote server.
 pub fn sign_in_links(platform: &Platform) -> MediaLinks {
-    MediaLinks::new(Arc::new(SignInLinks::new(Arc::new(
-        ConnectionResolver::over(platform),
-    ))))
+    MediaLinks::new(Arc::new(SignInLinks::new(ConnectionLinks::over(platform))))
 }
 
 /// What [`build_with`] hands back. Every background loop stops on the one
@@ -384,13 +383,14 @@ pub(crate) async fn build_on(
     let listening = ListeningStore::new(db.clone(), crypto.clone(), p.clock.clone());
     // Read live so turning ListenBrainz, Last.fm or lyrics on or off takes effect
     // at once.
+    let lyrics = OnlineLyrics::new(&providers, config_store.live());
     let enrichment = production_enrichment(
         &providers,
         config_store.live(),
         config_store.live(),
-        config_store.live(),
         listening.clone(),
         auth.users.clone(),
+        lyrics.clone(),
     );
     let catalog_inputs = CatalogInputs {
         covers_dir: config.cache_dir.join("covers"),
@@ -401,33 +401,41 @@ pub(crate) async fn build_on(
         youtube_quota_path: config.cache_dir.join(QUOTA_FILE_NAME),
         discover_warmer: config.discover_warmer,
     };
-    // The artist and album pages, with plugin purchase links and details.
-    // The artwork service names artist images through it, and the library
-    // plans covers through that service.
     // The one local catalog: the catalog pages, the library reads,
     // collections' ratings and the player apps all read through it.
     let local = LocalCatalog::new(db.clone());
+    let collections_db = CollectionsDb::new(db.clone(), p.clock.clone());
+    let collections = Stores::new(&collections_db);
+    let collections_state =
+        CollectionsState::over(collections_db, collections.clone(), local.clone());
+    // The artist and album pages, with the follow state, plugin purchase
+    // links and details. The artwork service names artist images through
+    // it, and the library plans covers through that service.
     let catalog = Catalog::new(
         Upstream::new(
             providers.clone(),
             Arc::new(LiveCatalogSettings::new(config_store)),
             auth.users.clone(),
         ),
-        local.clone(),
-    )
-    .with_purchase_links(Arc::new(PluginPurchaseLinks(plugin_host.clone())))
-    .with_details(Arc::new(PluginDetailsSource(plugin_host.clone())))
-    .with_cover_warm(cover_warm.clone());
+        local,
+        PageSources {
+            follows: collections_follows(&collections_state),
+            purchase_links: Arc::new(PluginPurchaseLinks(plugin_host.clone())),
+            details: Arc::new(PluginDetailsSource(plugin_host.clone())),
+            cover_warm: cover_warm.clone(),
+        },
+    );
     let artwork = droppedneedle_catalog::wiring::artwork(p, &catalog_inputs, catalog.clone());
     let covers = artwork.cache().clone();
-    let collections_db = CollectionsDb::new(db.clone(), p.clock.clone());
-    let collections = Stores::new(&collections_db);
+    let cover_warm_jobs = Arc::new(droppedneedle_catalog::artwork::warm::CoverWarmJobs::new(
+        artwork.clone(),
+    ));
     // Flow outcomes (fulfilled requests among them) go to plugins and the
     // event stream.
     let acquire_stores = AcquireStores::open(
         p,
         Arc::new(droppedneedle_acquire::plugin_events::FlowTicks::new(
-            Some(plugin_host.clone()),
+            plugin_host.clone(),
             p.events.clone(),
         )),
     );
@@ -441,16 +449,8 @@ pub(crate) async fn build_on(
         providers.clone(),
         mb_source.clone(),
         queues.queue().clone(),
-        outbound.library(),
-        library_ports(
-            p,
-            &providers,
-            &auth,
-            &artwork,
-            &scans,
-            enrichment.lyrics.clone(),
-            library_core,
-        ),
+        outbound.library(&providers, mb_source.clone(), p.clock.clone()),
+        library_ports(p, &providers, &auth, &artwork, &scans, lyrics, library_core),
     )
     .map_err(stage("library setup"))?;
     let library_services = LibraryServices::build(&library);
@@ -476,21 +476,21 @@ pub(crate) async fn build_on(
         p,
         auth.users.clone(),
         catalog_inputs,
-        Some(enrichment),
+        enrichment,
         CatalogPorts {
             remotes: remotes.clone(),
-            collections: CollectionsState::over(collections_db, collections, local),
+            collections: collections_state,
             catalog,
             artwork,
             library_files: LibraryFiles::new(db.clone(), library.core.root_source()),
             download_readiness: Arc::new(acquire.readiness.clone()),
-            cover_warm: Some(cover_warm),
+            cover_warm,
         },
     );
     // Your Weekly Mix: one builder behind the refresh route, the daily
     // loop and the listening-settings toggle.
     let mix_hooks = Arc::new(droppedneedle_acquire::requests::mix::MixGrantHooks::new(
-        acquire.requests.mixer.clone(),
+        acquire.mixer.clone(),
     ));
     let (media, media_workers) = MediaSetup::build(
         p,
@@ -552,37 +552,54 @@ pub(crate) async fn build_on(
     let concerts = droppedneedle_catalog::concerts::ConcertsSetup::from_platform(p, &providers);
     let precache_sources = jobs::catalog_precache(&catalog_setup, config_store, listening.clone())
         .map_err(stage("jobs setup"))?;
+    // Every kind that can be enqueued, so none waits with nothing to run
+    // it. Library Management queues the media-server rescans after a run,
+    // sent through media's connection resolver; pages queue their image
+    // warms, run through the artwork service.
+    let handlers = media
+        .scrobble_jobs()
+        .into_iter()
+        .fold(Handlers::default(), |handlers, (spec, handler)| {
+            handlers.with(spec, handler)
+        })
+        .with(
+            droppedneedle_media::remotes::refresh::SPEC,
+            Arc::new(droppedneedle_media::remotes::refresh::RefreshJobs::new(
+                media.remotes.service.resolver().clone(),
+                http.shared().clone(),
+                config_store.live(),
+            )),
+        )
+        .with(
+            droppedneedle_library::contrib::worker::SPEC,
+            library.contrib_worker.handler(),
+        )
+        .with(
+            droppedneedle_library::removal::recycle_bin::SPEC,
+            droppedneedle_library::removal::recycle_bin::handler(&library.publishing),
+        )
+        .with(droppedneedle_catalog::artwork::warm::SPEC, cover_warm_jobs)
+        .with(
+            droppedneedle_acquire::imports::jobs::SPEC,
+            acquire.spotify_import_jobs.clone(),
+        )
+        .with(library_removal::SPEC, album_cleanup);
     let jobs = JobsSetup::build(
         p,
-        runtime.checkpoint().clone(),
-        media.jobs(p),
-        concerts.sweep(),
-        precache_sources,
+        jobs::LoopBackends {
+            checkpoint: runtime.checkpoint().clone(),
+            media: media.jobs(p),
+            watcher: concerts.sweep(),
+            precache_sources,
+            mixer: mix_hooks,
+            demand: Arc::new(droppedneedle_catalog::discover::demand::ContentDemand(
+                catalog_setup.discover.content.clone(),
+            )),
+        },
         queues,
         scans.clone(),
-    )
-    .with_jobs(media.scrobble_jobs())
-    .with_media_refresh(p, &media)
-    .with_job(
-        droppedneedle_library::contrib::worker::SPEC,
-        library.contrib_worker.handler(),
-    )
-    .with_job(
-        droppedneedle_library::removal::recycle_bin::SPEC,
-        droppedneedle_library::removal::recycle_bin::handler(&library.publishing),
-    )
-    .with_mixer(mix_hooks)
-    .with_cover_warm_jobs(&catalog_setup)
-    .with_job(
-        droppedneedle_acquire::imports::jobs::SPEC,
-        acquire.spotify_import_jobs.clone(),
-    )
-    .with_job(library_removal::SPEC, album_cleanup)
-    .with_discovery_demand(Arc::new(
-        droppedneedle_catalog::discover::demand::ContentDemand(
-            catalog_setup.discover.content.clone(),
-        ),
-    ));
+        handlers,
+    );
     let admin = AdminSetup::new(
         auth.users.clone(),
         acquire.requests.quota.clone(),
@@ -719,7 +736,7 @@ fn library_ports(
     );
     let scans = scans.clone();
     droppedneedle_library::wiring::LibraryPorts {
-        enrichment: Some(Arc::new(enrichment)),
+        enrichment: Arc::new(enrichment),
         scan_completed: Arc::new(move || scans.bump()),
         core,
     }

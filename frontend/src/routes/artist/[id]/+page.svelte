@@ -4,10 +4,10 @@
 	import {
 		cacheCanonicalLibraryArtistDetail,
 		getLibraryArtistDetailQuery
-	} from '$lib/queries/library/LibraryQueries.svelte';
+	} from '$lib/features/library/queries/LibraryQueries.svelte';
 	import { artistHref } from '$lib/utils/entityRoutes';
-	import LocalArtistPage from './LocalArtistPage.svelte';
-	import ProviderArtistPage from './ProviderArtistPage.svelte';
+	import LocalArtistPage from '$lib/features/artist/components/LocalArtistPage.svelte';
+	import ProviderArtistPage from '$lib/features/artist/components/ProviderArtistPage.svelte';
 
 	interface Props {
 		data: { artistId: string; primarySource: MusicSource };

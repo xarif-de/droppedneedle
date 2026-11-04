@@ -1,8 +1,8 @@
 //! Task and attempt states.
 //!
-//! The persisted vocabulary mirrors the `download_tasks.status` CHECK in
-//! migration 0001 exactly; `retrying` and `awaiting_review` stay SSE-only
-//! signals and are never written. Terminal states have no outgoing edges:
+//! The persisted vocabulary mirrors the `download_tasks.status` CHECK
+//! exactly; `retrying` and `awaiting_review` stay SSE-only signals and are
+//! never written. Terminal states have no outgoing edges:
 //! a retry always spawns a fresh task carrying `retry_count + 1` while the
 //! original stays terminal for audit.
 
@@ -167,8 +167,17 @@ pub fn can_transition(from: TaskStatus, to: TaskStatus) -> bool {
 mod tests {
     use super::*;
 
+    /// Exactly completed, partial, failed and cancelled are terminal (as the
+    /// stores read the stored string), they have no outgoing edge, and the
+    /// happy path from queued to completed exists.
     #[test]
-    fn terminal_states_have_no_outgoing_edges() {
+    fn task_state_edges() {
+        for status in ["completed", "partial", "failed", "cancelled"] {
+            assert!(is_terminal(status), "{status} is terminal");
+        }
+        for status in ["queued", "downloading", "processing"] {
+            assert!(!is_terminal(status), "{status} is not terminal");
+        }
         for from in TaskStatus::ALL {
             if from.is_terminal() {
                 for to in TaskStatus::ALL {
@@ -176,10 +185,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[test]
-    fn happy_path_edges_exist() {
         assert!(can_transition(TaskStatus::Queued, TaskStatus::Downloading));
         assert!(can_transition(
             TaskStatus::Downloading,

@@ -1,10 +1,11 @@
 <script lang="ts">
 	import { page } from '$app/state';
 	import { replaceState } from '$app/navigation';
-	import { useIntegrationStatus } from '$lib/queries/home.svelte';
-	import SettingsTabContent from '$lib/components/settings/SettingsTabContent.svelte';
+	import { useIntegrationStatus } from '$lib/features/home/queries/home.svelte';
+	import SettingsTabContent from '$lib/features/settings/components/SettingsTabContent.svelte';
+	import { isSettingsTabVisible } from '$lib/features/settings/components/settingsTabs';
 	import { authStore } from '$lib/stores/authStore.svelte';
-	import { getUpdateCheckQuery } from '$lib/queries/version.svelte';
+	import { getUpdateCheckQuery } from '$lib/shell/version.svelte';
 	import {
 		Settings2,
 		Music,
@@ -33,11 +34,11 @@
 		Disc3,
 		DatabaseBackup
 	} from 'lucide-svelte';
-	import JellyfinIcon from '$lib/components/JellyfinIcon.svelte';
-	import NavidromeIcon from '$lib/components/NavidromeIcon.svelte';
-	import PlexIcon from '$lib/components/PlexIcon.svelte';
-	import SpotifyIcon from '$lib/components/SpotifyIcon.svelte';
-	import YouTubeIcon from '$lib/components/YouTubeIcon.svelte';
+	import JellyfinIcon from '$lib/media/icons/JellyfinIcon.svelte';
+	import NavidromeIcon from '$lib/media/icons/NavidromeIcon.svelte';
+	import PlexIcon from '$lib/media/icons/PlexIcon.svelte';
+	import SpotifyIcon from '$lib/media/icons/SpotifyIcon.svelte';
+	import YouTubeIcon from '$lib/media/icons/YouTubeIcon.svelte';
 	import Card from '$lib/ui/Card.svelte';
 	import Input from '$lib/ui/Input.svelte';
 	import UnsavedChangesGuard from '$lib/ui/UnsavedChangesGuard.svelte';
@@ -65,9 +66,6 @@
 		{ id: 'personalize', label: 'Personalize', hint: 'Tune your content' },
 		{ id: 'system', label: 'System', hint: 'Maintenance & account' }
 	];
-
-	// Members see only Home and Discover: the pages their Customise buttons open.
-	const memberTabIds = new Set(['home', 'discover']);
 
 	const tabs = [
 		{ id: 'library', label: 'Library', tier: 'setup', icon: Music },
@@ -105,7 +103,7 @@
 		{ id: 'diagnostics', label: 'Diagnostics', tier: 'system', icon: Activity },
 		{ id: 'advanced', label: 'Advanced', tier: 'system', icon: Settings },
 		{ id: 'about', label: 'About', tier: 'system', icon: Info }
-	].filter((tab) => authStore.isAdmin || memberTabIds.has(tab.id));
+	].filter((tab) => isSettingsTabVisible(tab.id, authStore.isAdmin));
 	const requestedTab = page.url.searchParams.get('tab');
 	let activeTab = $state(
 		requestedTab && tabs.some((tab) => tab.id === requestedTab) ? requestedTab : tabs[0].id

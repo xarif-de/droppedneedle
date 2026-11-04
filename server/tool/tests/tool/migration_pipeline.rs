@@ -1,12 +1,14 @@
 //! Migration pipeline end-to-end briefs: a live v2 fixture dir travels export →
 //! validator → dry-run → import, then the migrated instance proves itself.
 //!
-//! One behavior per brief, each on its own scratch fixture: refusal of the
-//! orphaned export, the operator repair, imported counts, login with v2
-//! passwords (rehashing to Argon2id), follows intact, compat re-auth,
-//! settings landed, and idempotent re-import. Nothing here touches the
-//! network; every database is a scratch file.
+//! Each brief builds its own scratch fixture: refusal of the orphaned
+//! export; one journey over the repaired export (counts, follows, idempotent
+//! re-import, compat re-auth, login with v2 passwords rehashing to
+//! Argon2id); settings landed; and the v2 shapes that need a fixture of
+//! their own. Nothing here touches the network; every database is a scratch
+//! file.
 
+use crate::common::Probe;
 use std::path::{Path, PathBuf};
 
 use droppedneedle_kernel::db::Db;
@@ -70,20 +72,18 @@ fn repaired_export(root: &Path) -> (droppedneedle_tool::tooling::fixture::V2Fixt
 }
 
 /// A migrated scratch v3 target with the conflict seeds: strangers holding
-/// both fixture emails, and a Plex binding under a third account. A
-/// writable pool: the serving runtime's pool is read-only by design, and
-/// the offline import owns its writes while the server is stopped.
-async fn seeded_target(root: &Path) -> (PathBuf, sqlx::SqlitePool) {
+/// both fixture emails, and a Plex binding under a third account. Seeded
+/// straight into the file: the offline import owns its writes while the
+/// server is stopped.
+fn seeded_target(root: &Path) -> (PathBuf, PathBuf) {
     let v3_root = root.join("v3");
     std::fs::create_dir_all(v3_root.join("config")).expect("v3 config dir");
     std::fs::create_dir_all(v3_root.join("cache")).expect("v3 cache dir");
     let db_path = v3_root.join("cache").join("library.db");
-    let pool = writable_pool(&db_path).await;
-    droppedneedle_kernel::schema::apply_migrations(&pool)
-        .await
+    droppedneedle_kernel::db::migrate_file(&db_path, &droppedneedle_kernel::schema::CHAIN)
         .expect("scratch schema migrates");
-    seed_conflicts(&pool).await;
-    (v3_root, pool)
+    seed_conflicts(&db_path);
+    (v3_root, db_path)
 }
 
 #[tokio::test]
@@ -109,40 +109,47 @@ async fn orphaned_export_refuses_with_zero_writes() {
         "warnings: {warnings:?}"
     );
 
-    let (v3_root, pool) = seeded_target(&root).await;
-    let counts_before = table_counts(&pool).await;
+    let (v3_root, target_db) = seeded_target(&root);
+    let counts_before = table_counts(&target_db);
     for dry_run in [true, false] {
-        let report = run_pipeline(&text, PASSPHRASE, &v3_root, &pool, dry_run).await;
+        let report = run_pipeline(&text, PASSPHRASE, &v3_root, &target_db, dry_run).await;
         assert_eq!(
             report.exit.code,
             droppedneedle_tool::r#import::ExitCode::FailedValidation,
             "dry_run={dry_run}"
         );
     }
-    assert_eq!(table_counts(&pool).await, counts_before);
+    assert_eq!(table_counts(&target_db), counts_before);
     assert!(!v3_root.join("config").join("config.json").exists());
 }
 
+/// The repaired fixture migrates whole: it validates with only warnings, a
+/// dry run writes nothing and matches the import, every record lands with
+/// its counts, reviewers and follows, a re-import writes nothing, and the
+/// v2 secrets and passwords sign in.
 #[tokio::test]
-async fn operator_repair_converges_to_clean_import() {
-    let root = scratch_dir("repair");
-    let (_fixture, text) = repaired_export(&root);
+async fn a_repaired_v2_fixture_migrates_whole() {
+    let root = scratch_dir("repaired");
+    let (fixture, text) = repaired_export(&root);
+
+    // The operator repair converges to a clean file.
     let root_value: serde_json::Value = serde_json::from_str(&text).expect("json parses");
     let validation = droppedneedle_tool::r#import::validate_export(&root_value);
     assert!(validation.valid(), "errors: {:?}", validation.errors);
     let (_, warnings) = issue_codes(&validation);
     assert!(warnings.contains(&"DANGLING_REVIEWER"));
 
-    let (v3_root, pool) = seeded_target(&root).await;
-    let counts_before = table_counts(&pool).await;
-    let dry_report = run_pipeline(&text, PASSPHRASE, &v3_root, &pool, true).await;
+    // A dry run writes nothing and reports what the import then does.
+    let (v3_root, target_db) = seeded_target(&root);
+    let counts_before = table_counts(&target_db);
+    let dry_report = run_pipeline(&text, PASSPHRASE, &v3_root, &target_db, true).await;
     assert_eq!(
         dry_report.exit.code,
         droppedneedle_tool::r#import::ExitCode::OkWithDrops
     );
-    assert_eq!(table_counts(&pool).await, counts_before);
+    assert_eq!(table_counts(&target_db), counts_before);
     assert!(!v3_root.join("config").join("config.json").exists());
-    let report = run_pipeline(&text, PASSPHRASE, &v3_root, &pool, false).await;
+    let report = run_pipeline(&text, PASSPHRASE, &v3_root, &target_db, false).await;
     assert_eq!(
         report.exit.code,
         droppedneedle_tool::r#import::ExitCode::OkWithDrops
@@ -152,29 +159,16 @@ async fn operator_repair_converges_to_clean_import() {
         report.secrets_reencrypted, dry_report.secrets_reencrypted,
         "dry-run parity"
     );
-}
 
-#[tokio::test]
-async fn imported_counts_match_the_fixture() {
-    // Two users in (both emails nulled onto the pre-seeded strangers), two
-    // local providers in, the Plex binding kept on its existing owner,
-    // three app passwords, three follows, three
-    // approvals with one reviewer nulled.
-    let root = scratch_dir("counts");
-    let (fixture, text) = repaired_export(&root);
-    let (v3_root, pool) = seeded_target(&root).await;
-    let report = run_pipeline(&text, PASSPHRASE, &v3_root, &pool, false).await;
-    assert_eq!(
-        report.exit.code,
-        droppedneedle_tool::r#import::ExitCode::OkWithDrops
-    );
+    // Counts: two users in (both emails nulled onto the pre-seeded
+    // strangers), two local providers in, the Plex binding kept on its
+    // existing owner, three app passwords, three follows, three approvals
+    // with one reviewer nulled.
     // v2's ISO times read back as the same instants, in milliseconds.
-    let alice: (i64, Option<i64>) =
-        sqlx::query_as("SELECT created_at, last_login_at FROM auth_users WHERE id = ?")
-            .bind(&fixture.alice_id)
-            .fetch_one(&pool)
-            .await
-            .expect("alice reads");
+    let alice: (i64, Option<i64>) = target_db.row(
+        "SELECT created_at, last_login_at FROM auth_users WHERE id = ?",
+        rusqlite::params![&fixture.alice_id],
+    );
     assert_eq!(alice, (1_704_067_200_000, Some(1_767_225_600_000)));
     let count = |entity: &str| report.entities.get(entity).expect("entity counted").clone();
     assert_eq!(count("user").imported, 2);
@@ -200,39 +194,25 @@ async fn imported_counts_match_the_fixture() {
         .expect("lastfm settings read");
     assert_eq!(lastfm.api_key.expose(), "lastfm-public-key");
     assert_eq!(lastfm.shared_secret.expose(), "lastfm-shared-plaintext");
+    drop(store);
 
-    let revoked: Vec<(String, i64)> =
-        sqlx::query_as("SELECT name, revoked FROM auth_app_passwords WHERE revoked = 1")
-            .fetch_all(&pool)
-            .await
-            .expect("revoked rows read");
+    let revoked: Vec<(String, i64)> = target_db.rows(
+        "SELECT name, revoked FROM auth_app_passwords WHERE revoked = 1",
+        [],
+    );
     assert_eq!(revoked.len(), 1);
     assert_eq!(revoked[0].0, "old-laptop");
 
     // No sessions survive the import itself: the file carries none.
-    let tokens: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM auth_tokens")
-        .fetch_one(&pool)
-        .await
-        .expect("tokens count");
+    let tokens: i64 = target_db.one("SELECT COUNT(*) FROM auth_tokens", []);
     assert_eq!(tokens, 0);
-}
-
-#[tokio::test]
-async fn reviewers_land_kept_or_nulled() {
-    let root = scratch_dir("reviewers");
-    let (fixture, text) = repaired_export(&root);
-    let (v3_root, pool) = seeded_target(&root).await;
-    run_pipeline(&text, PASSPHRASE, &v3_root, &pool, false).await;
 
     // Bob's approval was reviewed by Alice: a valid reviewer survives
     // verbatim.
-    let kept: (Option<String>, Option<String>) = sqlx::query_as(
+    let kept: (Option<String>, Option<String>) = target_db.row(
         "SELECT reviewed_by_id, reviewed_by_name FROM auto_download_approvals WHERE user_id = ?",
-    )
-    .bind(&fixture.bob_id)
-    .fetch_one(&pool)
-    .await
-    .expect("bob approval reads");
+        rusqlite::params![&fixture.bob_id],
+    );
     assert_eq!(
         kept,
         (Some(fixture.alice_id.clone()), Some("Alice".to_owned()))
@@ -240,27 +220,67 @@ async fn reviewers_land_kept_or_nulled() {
 
     // Alice's second approval was reviewed by a deleted user: the id nulls
     // and the name stays as audit residue.
-    let nulled: (Option<String>, Option<String>) = sqlx::query_as(
+    let nulled: (Option<String>, Option<String>) = target_db.row(
         "SELECT reviewed_by_id, reviewed_by_name FROM auto_download_approvals \
          WHERE user_id = ? AND artist_mbid = ?",
-    )
-    .bind(&fixture.alice_id)
-    .bind(&fixture.artist_two_mbid)
-    .fetch_one(&pool)
-    .await
-    .expect("alice approval reads");
+        rusqlite::params![&fixture.alice_id, &fixture.artist_two_mbid],
+    );
     assert_eq!(nulled, (None, Some("Gone".to_owned())));
-}
 
-#[tokio::test]
-async fn v2_passwords_log_in_and_rehash() {
-    let root = scratch_dir("login");
-    let (fixture, text) = repaired_export(&root);
-    let (v3_root, pool) = seeded_target(&root).await;
-    run_pipeline(&text, PASSPHRASE, &v3_root, &pool, false).await;
+    assert_follows_intact(&target_db, &fixture);
+
+    // A re-import writes nothing: no record, no settings row, no audit row.
+    let runs: i64 = target_db.one("SELECT COUNT(*) FROM import_runs", []);
+    assert_eq!(runs, 1);
+    let rows_before = settings_revisions(&target_db);
+    assert!(!rows_before.is_empty());
+    let policy = &v3_settings(&v3_root)["download_policy"];
+    assert_eq!(policy["quality_min"], "mp3_320");
+    assert_eq!(policy["quality_max"], "lossless");
+    assert_eq!(policy["quality_cutoff"], "lossless");
+    let steps: Vec<(&str, &str)> = policy["quality_recipe"]
+        .as_array()
+        .expect("the policy holds a recipe")
+        .iter()
+        .map(|step| {
+            (
+                step["format"].as_str().expect("format"),
+                step["quality"].as_str().expect("quality"),
+            )
+        })
+        .collect();
+    assert_eq!(steps, [("flac", "hi_res"), ("mp3", "320_plus")]);
+    let line = "the v2 quality range mp3_320 to lossless is now the recipe FLAC, every \
+                resolution, then MP3 320_plus";
+    let again = run_pipeline(&text, PASSPHRASE, &v3_root, &target_db, false).await;
+    for report in [&report, &again] {
+        assert!(
+            report
+                .items
+                .iter()
+                .any(|item| item.key == "download_policy.quality_recipe" && item.detail == line),
+            "{}",
+            report.to_json()
+        );
+    }
+    for (entity, counts) in &again.entities {
+        assert_eq!(counts.imported, 0, "entity {entity} wrote nothing twice");
+    }
+    assert_eq!(
+        settings_revisions(&target_db),
+        rows_before,
+        "no settings row changes on a re-import"
+    );
+    let runs_after: i64 = target_db.one("SELECT COUNT(*) FROM import_runs", []);
+    assert_eq!(runs_after, 1, "a pure re-import writes no audit row");
+
+    // Compat clients re-authenticate on the surviving secrets, then the v2
+    // passwords log in. The login rehash rewrites the provider rows, so it
+    // runs after the re-import check.
     let db = Db::open_for_tests(&v3_root.join("cache").join("library.db")).expect("database opens");
+    assert_compat_reauth(&db, &v3_root, &fixture).await;
     login_rehashes(
-        &pool,
+        &target_db,
         &db,
         "alice",
         &fixture.alice_id,
@@ -268,32 +288,13 @@ async fn v2_passwords_log_in_and_rehash() {
     )
     .await;
     login_rehashes(
-        &pool,
+        &target_db,
         &db,
         "bob",
         &fixture.bob_id,
         &fixture.secrets.bob_password,
     )
     .await;
-}
-
-#[tokio::test]
-async fn follows_survive_intact() {
-    let root = scratch_dir("follows");
-    let (fixture, text) = repaired_export(&root);
-    let (v3_root, pool) = seeded_target(&root).await;
-    run_pipeline(&text, PASSPHRASE, &v3_root, &pool, false).await;
-    assert_follows_intact(&pool, &fixture).await;
-}
-
-#[tokio::test]
-async fn compat_clients_reauth_on_surviving_secrets() {
-    let root = scratch_dir("compat");
-    let (fixture, text) = repaired_export(&root);
-    let (v3_root, pool) = seeded_target(&root).await;
-    run_pipeline(&text, PASSPHRASE, &v3_root, &pool, false).await;
-    let db = Db::open_for_tests(&v3_root.join("cache").join("library.db")).expect("database opens");
-    assert_compat_reauth(&db, &v3_root, &fixture).await;
 }
 
 #[tokio::test]
@@ -305,9 +306,9 @@ async fn settings_land_with_schedule_carry_and_no_plaintext() {
     let (fixture, _) = repaired_export(&root);
     let template = "{albumartist}/{album} ({year})/{track:02d} {title}";
     let text = export_with_naming_template(&root, template);
-    let (v3_root, pool) = seeded_target(&root).await;
-    let dry = run_pipeline(&text, PASSPHRASE, &v3_root, &pool, true).await;
-    let report = run_pipeline(&text, PASSPHRASE, &v3_root, &pool, false).await;
+    let (v3_root, target_db) = seeded_target(&root);
+    let dry = run_pipeline(&text, PASSPHRASE, &v3_root, &target_db, true).await;
+    let report = run_pipeline(&text, PASSPHRASE, &v3_root, &target_db, false).await;
     assert_settings_landed(&v3_root, &fixture);
 
     let library = &v3_settings(&v3_root)["library_settings"];
@@ -323,9 +324,9 @@ async fn settings_land_with_schedule_carry_and_no_plaintext() {
         assert_eq!(render_import_path(SCRIPT, year), golden);
     }
 
-    let rows_before = settings_revisions(&pool).await;
-    let again = run_pipeline(&text, PASSPHRASE, &v3_root, &pool, false).await;
-    assert_eq!(settings_revisions(&pool).await, rows_before);
+    let rows_before = settings_revisions(&target_db);
+    let again = run_pipeline(&text, PASSPHRASE, &v3_root, &target_db, false).await;
+    assert_eq!(settings_revisions(&target_db), rows_before);
     let line =
         format!("the v2 naming template {template} is now the import naming script {SCRIPT}");
     for report in [&dry, &report, &again] {
@@ -366,8 +367,8 @@ async fn a_naming_template_that_cant_be_carried_falls_back_to_the_default() {
     let root = scratch_dir("naming-fallback");
     let _ = repaired_export(&root);
     let text = export_with_naming_template(&root, "{album}/.{ext}");
-    let (v3_root, pool) = seeded_target(&root).await;
-    let report = run_pipeline(&text, PASSPHRASE, &v3_root, &pool, false).await;
+    let (v3_root, target_db) = seeded_target(&root);
+    let report = run_pipeline(&text, PASSPHRASE, &v3_root, &target_db, false).await;
     let library = &v3_settings(&v3_root)["library_settings"];
     assert_eq!(library["naming_script"], DEFAULT_NAMING_SCRIPT);
     assert!(library.get("naming_template").is_none());
@@ -412,8 +413,8 @@ async fn top_level_config_keys_reach_the_import() {
     .expect("export writes");
     let text = std::fs::read_to_string(&export_path).expect("export reads back");
 
-    let (v3_root, pool) = seeded_target(&root).await;
-    let report = run_pipeline(&text, PASSPHRASE, &v3_root, &pool, false).await;
+    let (v3_root, target_db) = seeded_target(&root);
+    let report = run_pipeline(&text, PASSPHRASE, &v3_root, &target_db, false).await;
     assert_eq!(
         v3_settings(&v3_root)["jellyfin_settings"]["jellyfin_url"],
         "http://jellyfin.lan:8096"
@@ -432,64 +433,6 @@ async fn top_level_config_keys_reach_the_import() {
     }));
 }
 
-#[tokio::test]
-async fn reimport_writes_nothing() {
-    let root = scratch_dir("reimport");
-    let (_fixture, text) = repaired_export(&root);
-    let (v3_root, pool) = seeded_target(&root).await;
-    let first = run_pipeline(&text, PASSPHRASE, &v3_root, &pool, false).await;
-    let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM import_runs")
-        .fetch_one(&pool)
-        .await
-        .expect("import runs count");
-    assert_eq!(runs, 1);
-
-    let rows_before = settings_revisions(&pool).await;
-    assert!(!rows_before.is_empty());
-    let policy = &v3_settings(&v3_root)["download_policy"];
-    assert_eq!(policy["quality_min"], "mp3_320");
-    assert_eq!(policy["quality_max"], "lossless");
-    assert_eq!(policy["quality_cutoff"], "lossless");
-    let steps: Vec<(&str, &str)> = policy["quality_recipe"]
-        .as_array()
-        .expect("the policy holds a recipe")
-        .iter()
-        .map(|step| {
-            (
-                step["format"].as_str().expect("format"),
-                step["quality"].as_str().expect("quality"),
-            )
-        })
-        .collect();
-    assert_eq!(steps, [("flac", "hi_res"), ("mp3", "320_plus")]);
-    let line = "the v2 quality range mp3_320 to lossless is now the recipe FLAC, every \
-                resolution, then MP3 320_plus";
-    let again = run_pipeline(&text, PASSPHRASE, &v3_root, &pool, false).await;
-    for report in [&first, &again] {
-        assert!(
-            report
-                .items
-                .iter()
-                .any(|item| item.key == "download_policy.quality_recipe" && item.detail == line),
-            "{}",
-            report.to_json()
-        );
-    }
-    for (entity, counts) in &again.entities {
-        assert_eq!(counts.imported, 0, "entity {entity} wrote nothing twice");
-    }
-    assert_eq!(
-        settings_revisions(&pool).await,
-        rows_before,
-        "no settings row changes on a re-import"
-    );
-    let runs_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM import_runs")
-        .fetch_one(&pool)
-        .await
-        .expect("import runs recount");
-    assert_eq!(runs_after, 1, "a pure re-import writes no audit row");
-}
-
 /// The user data beyond accounts: every section lands with its v2 library
 /// references settled against the carried catalog, a duplicate v2 playlist is counted
 /// instead of breaking the import, sealed connections open under the v3
@@ -501,21 +444,16 @@ async fn user_data_carries_resumes_and_repeats_as_noop() {
 
     let root = scratch_dir("carry");
     let (fixture, text) = repaired_export(&root);
-    let (v3_root, pool) = seeded_target(&root).await;
+    let (v3_root, target_db) = seeded_target(&root);
     let rows = |table: &'static str| {
-        let pool = pool.clone();
-        async move {
-            sqlx::query_scalar::<_, i64>(&format!("SELECT COUNT(*) FROM {table}"))
-                .fetch_one(&pool)
-                .await
-                .expect("table counts")
-        }
+        let target_db = target_db.clone();
+        async move { target_db.one::<i64>(&format!("SELECT COUNT(*) FROM {table}"), []) }
     };
 
     // A crash after three sections keeps them; the rest has not landed.
     // The second playlist from the same source is a conflict, and its entry
     // is left out with a count rather than failing the section.
-    let crashed = run_pipeline_with(&text, PASSPHRASE, &v3_root, &pool, false, Some(3)).await;
+    let crashed = run_pipeline_with(&text, PASSPHRASE, &v3_root, &target_db, false, Some(3)).await;
     assert_eq!(
         crashed.exit.code,
         droppedneedle_tool::r#import::ExitCode::FailedInternal
@@ -533,15 +471,12 @@ async fn user_data_carries_resumes_and_repeats_as_noop() {
     assert_eq!((entries.imported, entries.dropped_invalid), (2, 1));
     // The failed run's audit row holds the sections it did commit.
     let (exit, counts): (String, String) =
-        sqlx::query_as("SELECT exit_code, entity_counts FROM import_runs")
-            .fetch_one(&pool)
-            .await
-            .expect("audit row reads");
+        target_db.row("SELECT exit_code, entity_counts FROM import_runs", []);
     assert_eq!(exit, "FAILED_INTERNAL");
     let counts: serde_json::Value = serde_json::from_str(&counts).expect("counts json");
     assert_eq!(counts["playlist_track"]["imported"], 2);
 
-    let resumed = run_pipeline(&text, PASSPHRASE, &v3_root, &pool, false).await;
+    let resumed = run_pipeline(&text, PASSPHRASE, &v3_root, &target_db, false).await;
     assert_eq!(
         resumed.exit.code,
         droppedneedle_tool::r#import::ExitCode::OkWithDrops,
@@ -589,26 +524,22 @@ async fn user_data_carries_resumes_and_repeats_as_noop() {
     assert_eq!(rows("import_pending_links").await, 1);
     // v2's ISO request times land as milliseconds, and its dormant watch
     // lands watching and due.
-    let request: (i64, i64) = sqlx::query_as(
+    let request: (i64, i64) = target_db.row(
         "SELECT h.requested_at, r.requested_at FROM request_history h \
          JOIN request_history_requesters r USING (musicbrainz_id_lower)",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("request reads");
+        [],
+    );
     assert_eq!(request, (1_700_000_000_250, 1_700_000_000_250));
     // v2's REAL-second download, quarantine, seen and approval times land
     // as milliseconds.
-    let times: (i64, i64, i64, i64, i64) = sqlx::query_as(
+    let times: (i64, i64, i64, i64, i64) = target_db.row(
         "SELECT (SELECT created_at FROM download_tasks), \
          (SELECT updated_at FROM download_attempts), \
          (SELECT quarantined_at FROM download_quarantine), \
          (SELECT first_seen_at FROM wanted_seen_candidates), \
          (SELECT requested_at FROM personal_mix_approvals)",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("times read");
+        [],
+    );
     assert_eq!(
         times,
         (
@@ -620,24 +551,19 @@ async fn user_data_carries_resumes_and_repeats_as_noop() {
         )
     );
     // v2's check outcomes land in v3's spelling, which the wanted view reads.
-    let outcomes: Vec<Option<String>> = sqlx::query_scalar(
+    let outcomes: Vec<Option<String>> = target_db.column(
         "SELECT last_outcome FROM wanted_watches ORDER BY release_group_mbid_lower",
-    )
-    .fetch_all(&pool)
-    .await
-    .expect("outcomes read");
+        [],
+    );
     assert_eq!(
         outcomes,
         [Some("seen".to_owned()), Some("quiet".to_owned())]
     );
-    let dormant: (String, i64, i64) = sqlx::query_as(
+    let dormant: (String, i64, i64) = target_db.row(
         "SELECT state, created_at, next_check_at FROM wanted_watches \
          WHERE release_group_mbid_lower = ?",
-    )
-    .bind(droppedneedle_tool::tooling::fixture::DORMANT_WATCH_MBID)
-    .fetch_one(&pool)
-    .await
-    .expect("dormant watch reads");
+        rusqlite::params![droppedneedle_tool::tooling::fixture::DORMANT_WATCH_MBID],
+    );
     assert_eq!(
         (dormant.0.as_str(), dormant.1),
         ("watching", 1_600_000_000_500)
@@ -650,30 +576,26 @@ async fn user_data_carries_resumes_and_repeats_as_noop() {
         i128::from(dormant.2) <= i128::try_from(now_ms).expect("now fits"),
         "the dormant watch is due now"
     );
-    let history: Option<String> =
-        sqlx::query_scalar("SELECT local_track_id FROM library_play_history WHERE id = 'listen-1'")
-            .fetch_one(&pool)
-            .await
-            .expect("history reads");
+    let history: Option<String> = target_db.one(
+        "SELECT local_track_id FROM library_play_history WHERE id = 'listen-1'",
+        [],
+    );
     assert_eq!(
         history.as_deref(),
         Some(droppedneedle_tool::tooling::fixture::V2_TRACK_ID)
     );
-    let made: i64 = sqlx::query_scalar("SELECT created_at FROM catalog_playlists WHERE id = ?")
-        .bind(PLAYLIST_ID)
-        .fetch_one(&pool)
-        .await
-        .expect("playlist time reads");
+    let made: i64 = target_db.one(
+        "SELECT created_at FROM catalog_playlists WHERE id = ?",
+        rusqlite::params![PLAYLIST_ID],
+    );
     assert_eq!(
         made, 1_748_736_000_000,
         "v2's ISO time lands in milliseconds"
     );
-    let cover: Vec<u8> =
-        sqlx::query_scalar("SELECT image FROM catalog_playlist_covers WHERE playlist_id = ?")
-            .bind(PLAYLIST_ID)
-            .fetch_one(&pool)
-            .await
-            .expect("cover reads");
+    let cover: Vec<u8> = target_db.one(
+        "SELECT image FROM catalog_playlist_covers WHERE playlist_id = ?",
+        rusqlite::params![PLAYLIST_ID],
+    );
     assert_eq!(cover, COVER_BYTES);
     let avatar = v3_root
         .join("cache")
@@ -698,15 +620,12 @@ async fn user_data_carries_resumes_and_repeats_as_noop() {
     // Sealed links open under the v3 key, in the shapes v3 reads.
     let crypto = Crypto::load(&v3_root.join("config")).expect("v3 key loads");
     let link = |service: &'static str| {
-        let pool = pool.clone();
+        let target_db = target_db.clone();
         async move {
-            sqlx::query_scalar::<_, String>(
+            target_db.one::<String>(
                 "SELECT connection_data FROM user_connections WHERE service = ?",
+                rusqlite::params![service],
             )
-            .bind(service)
-            .fetch_one(&pool)
-            .await
-            .expect("link reads")
         }
     };
     let listenbrainz: serde_json::Value = serde_json::from_str(
@@ -764,84 +683,59 @@ async fn user_data_carries_resumes_and_repeats_as_noop() {
 
     // A repeat import writes nothing anywhere, and a playlist deleted in v3
     // since does not come back: each section is carried once.
-    sqlx::query("DELETE FROM catalog_playlists WHERE id = 'playlist-bob'")
-        .execute(&pool)
-        .await
-        .expect("playlist deletes");
-    let before = table_counts(&pool).await;
-    let again = run_pipeline(&text, PASSPHRASE, &v3_root, &pool, false).await;
+    target_db.exec(
+        "DELETE FROM catalog_playlists WHERE id = 'playlist-bob'",
+        [],
+    );
+    let before = table_counts(&target_db);
+    let again = run_pipeline(&text, PASSPHRASE, &v3_root, &target_db, false).await;
     assert!(again.entities.values().all(|counts| counts.imported == 0));
-    assert_eq!(table_counts(&pool).await, before);
+    assert_eq!(table_counts(&target_db), before);
 }
 
 /// Pre-seed the target with the conflict cases: strangers holding both
 /// fixture emails, and a Plex binding under a third account that collides
 /// with Bob's.
-async fn seed_conflicts(pool: &sqlx::SqlitePool) {
+fn seed_conflicts(target_db: &Path) {
     for (id, email, username) in [
         ("carol-id", "alice@example.com", "carol"),
         ("dave-id", "bob@example.com", "dave"),
     ] {
-        sqlx::query(
+        target_db.exec(
             "INSERT INTO auth_users (id, display_name, email, role, created_at, username)
              VALUES (?, ?, ?, 'user', 1767225600000, ?)",
-        )
-        .bind(id)
-        .bind(username)
-        .bind(email)
-        .bind(username)
-        .execute(pool)
-        .await
-        .expect("conflict user seeds");
+            rusqlite::params![id, username, email, username],
+        );
     }
-    sqlx::query(
+    target_db.exec(
         "INSERT INTO auth_users (id, display_name, role, created_at, username)
          VALUES ('mallory-id', 'Mallory', 'user', 1767225600000, 'mallory')",
-    )
-    .execute(pool)
-    .await
-    .expect("mallory seeds");
-    sqlx::query(
+        [],
+    );
+    target_db.exec(
         "INSERT INTO auth_providers (id, user_id, provider, provider_uid, provider_data,
                                      created_at)
          VALUES ('prov-mallory', 'mallory-id', 'plex', 'plex-uid-bob',
                  '{\"token\": \"mallory\"}', 1767225600000)",
-    )
-    .execute(pool)
-    .await
-    .expect("plex binding seeds");
+        [],
+    );
 }
 
 /// Row counts per migrated table, for the zero-writes proofs.
-async fn table_counts(pool: &sqlx::SqlitePool) -> Vec<(String, i64)> {
-    let tables: Vec<String> = sqlx::query_scalar(
+fn table_counts(target_db: &Path) -> Vec<(String, i64)> {
+    let tables: Vec<String> = target_db.column(
         "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
          ORDER BY name",
-    )
-    .fetch_all(pool)
-    .await
-    .expect("tables list");
+        [],
+    );
     let mut counts = Vec::new();
     for table in tables {
-        let total: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM \"{table}\""))
-            .fetch_one(pool)
-            .await
-            .expect("table counts");
+        let total: i64 = target_db.one(&format!("SELECT COUNT(*) FROM \"{table}\""), []);
         counts.push((table, total));
     }
     counts
 }
 
-/// One-connection writable pool over a scratch file.
-async fn writable_pool(db_path: &std::path::Path) -> sqlx::SqlitePool {
-    sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect(&format!("sqlite:{}?mode=rwc", db_path.display()))
-        .await
-        .expect("writable pool opens")
-}
-
-/// Drive the real import pipeline (dry-run or real) over the scratch pool.
 /// The settings stored in the target database, key by key.
 fn v3_settings(v3_root: &Path) -> serde_json::Value {
     let db = rusqlite::Connection::open(v3_root.join("cache").join("library.db"))
@@ -943,21 +837,22 @@ fn render_import_path(script: &str, date: Option<&str>) -> String {
 }
 
 /// Every settings row's key, revision and change time.
-async fn settings_revisions(pool: &sqlx::SqlitePool) -> Vec<(String, i64, i64)> {
-    sqlx::query_as("SELECT key, revision, updated_at FROM config_sections ORDER BY key")
-        .fetch_all(pool)
-        .await
-        .expect("settings rows read")
+fn settings_revisions(target_db: &Path) -> Vec<(String, i64, i64)> {
+    target_db.rows(
+        "SELECT key, revision, updated_at FROM config_sections ORDER BY key",
+        [],
+    )
 }
 
+/// Drive the real import pipeline (dry-run or real) over the scratch target.
 async fn run_pipeline(
     export_text: &str,
     passphrase: &str,
     v3_root: &Path,
-    pool: &sqlx::SqlitePool,
+    target_db: &Path,
     dry_run: bool,
 ) -> droppedneedle_tool::r#import::ImportReport {
-    run_pipeline_with(export_text, passphrase, v3_root, pool, dry_run, None).await
+    run_pipeline_with(export_text, passphrase, v3_root, target_db, dry_run, None).await
 }
 
 /// [`run_pipeline`] with a simulated crash after some carried sections.
@@ -965,7 +860,7 @@ async fn run_pipeline_with(
     export_text: &str,
     passphrase: &str,
     v3_root: &Path,
-    pool: &sqlx::SqlitePool,
+    target_db: &Path,
     dry_run: bool,
     fault_after_sections: Option<usize>,
 ) -> droppedneedle_tool::r#import::ImportReport {
@@ -980,7 +875,7 @@ async fn run_pipeline_with(
     droppedneedle_tool::r#import::run_import(droppedneedle_tool::r#import::ImportRequest {
         export_bytes: export_text.as_bytes().to_vec(),
         passphrase: passphrase.to_owned(),
-        db_path: pool.connect_options().get_filename().to_owned(),
+        db_path: target_db.to_owned(),
         legacy: droppedneedle_kernel::runtime_config::LegacyConfig::at(&config_dir, false),
         crypto,
         v2_config_path: Some(
@@ -1061,19 +956,17 @@ async fn held_downloads_carry_into_the_held_list() {
     )
     .expect("export writes");
     let text = std::fs::read_to_string(&export_path).expect("export reads back");
-    let (v3_root, pool) = seeded_target(&root).await;
+    let (v3_root, target_db) = seeded_target(&root);
 
     let carried_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock after 1970")
         .as_millis();
-    run_pipeline(&text, PASSPHRASE, &v3_root, &pool, false).await;
-    let entries: Vec<(String, Option<String>, i64)> = sqlx::query_as(
+    run_pipeline(&text, PASSPHRASE, &v3_root, &target_db, false).await;
+    let entries: Vec<(String, Option<String>, i64)> = target_db.rows(
         "SELECT group_key, recording_mbid, expires_at FROM acquire_held_entries ORDER BY id",
-    )
-    .fetch_all(&pool)
-    .await
-    .expect("entries read");
+        [],
+    );
     let keys: Vec<(&str, Option<&str>)> = entries
         .iter()
         .map(|(key, recording, _)| (key.as_str(), recording.as_deref()))
@@ -1095,12 +988,10 @@ async fn held_downloads_carry_into_the_held_list() {
             "{key} expires before 90 days after the carry"
         );
     }
-    let files: Vec<(String, String, String, i64)> = sqlx::query_as(
+    let files: Vec<(String, String, String, i64)> = target_db.rows(
         "SELECT path, original_name, reason, created_at FROM acquire_held_files ORDER BY id",
-    )
-    .fetch_all(&pool)
-    .await
-    .expect("files read");
+        [],
+    );
     assert_eq!(
         files,
         vec![
@@ -1128,35 +1019,75 @@ async fn held_downloads_carry_into_the_held_list() {
         b"track bytes"
     );
 
-    run_pipeline(&text, PASSPHRASE, &v3_root, &pool, false).await;
-    let again: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM acquire_held_files")
-        .fetch_one(&pool)
-        .await
-        .expect("files recount");
+    run_pipeline(&text, PASSPHRASE, &v3_root, &target_db, false).await;
+    let again: i64 = target_db.one("SELECT COUNT(*) FROM acquire_held_files", []);
     assert_eq!(again, 2, "a repeat import adds nothing");
 }
 
-/// A v2 download with a text year and a REAL track number carries: the
-/// year lands NULL and the track number as its whole number. One stray
-/// value in a whole-number column must not stop the upgrade.
+/// Stray v2 values carry with safe ones and never stop the upgrade: a text
+/// year lands NULL and a REAL track number as its whole number, unknown
+/// download labels take their defaults, text durations and scores land
+/// NULL, and an unknown request kind or held reason takes its safe value.
 #[tokio::test]
-async fn stray_whole_numbers_carry_as_null_or_whole() {
-    let root = scratch_dir("stray-whole");
+async fn stray_v2_values_carry_as_null_or_default() {
+    let root = scratch_dir("stray");
     let fixture = build_v2_fixture(&root.join("v2")).expect("fixture builds");
-    let v2_db = root.join("v2").join("cache").join("library.db");
+    let v2_cache = root.join("v2").join("cache");
+    let v2_db = v2_cache.join("library.db");
     delete_orphan_rows(&v2_db).expect("repair runs");
+    let held_dir = v2_cache.join("held");
+    std::fs::create_dir_all(&held_dir).expect("v2 held folder");
+    std::fs::write(held_dir.join("stray.flac"), b"held bytes").expect("held file");
     let alice = &fixture.alice_id;
     let v2 = rusqlite::Connection::open(&v2_db).expect("v2 db opens");
     v2.execute_batch(&format!(
         "ALTER TABLE download_tasks ADD COLUMN year INTEGER;
          ALTER TABLE download_tasks ADD COLUMN track_number INTEGER;
+         ALTER TABLE download_tasks ADD COLUMN download_type TEXT;
+         ALTER TABLE download_tasks ADD COLUMN download_client TEXT;
+         ALTER TABLE download_tasks ADD COLUMN source TEXT;
+         ALTER TABLE download_tasks ADD COLUMN origin TEXT;
+         ALTER TABLE download_tasks ADD COLUMN track_duration_seconds REAL;
+         ALTER TABLE download_tasks ADD COLUMN preflight_score REAL;
          INSERT INTO download_tasks (id, user_id, release_group_mbid, artist_name,
              album_title, status, year, track_number, created_at, updated_at)
          VALUES ('download-stray', '{alice}', 'dddddddd-0000-4000-8000-000000000004',
                  'Artist', 'Album', 'completed', 'unknown', 7.4, 1700000000.0,
-                 1700000000.0);"
+                 1700000000.0);
+         INSERT INTO download_tasks (id, user_id, release_group_mbid, artist_name,
+             album_title, status, download_type, download_client, source, origin,
+             created_at, updated_at)
+         VALUES ('download-labels', '{alice}', 'dddddddd-0000-4000-8000-000000000005',
+                 'Artist', 'Album', 'completed', 'mixtape', '', 'carrier-pigeon', 'mystery',
+                 1700000000.0, 1700000000.0),
+                ('download-conversion', '{alice}', 'dddddddd-0000-4000-8000-000000000006',
+                 'Artist', 'Album', 'completed', 'album', 'slskd', 'soulseek',
+                 'edition_conversion', 1700000000.0, 1700000000.0);
+         INSERT INTO download_tasks (id, user_id, release_group_mbid, artist_name,
+             album_title, status, track_duration_seconds, preflight_score, created_at,
+             updated_at)
+         VALUES ('download-stray-real', '{alice}', 'dddddddd-0000-4000-8000-000000000007',
+                 'Artist', 'Album', 'completed', '3:42', 'high', 1700000000.0,
+                 1700000000.0);
+         INSERT INTO request_history (musicbrainz_id_lower, musicbrainz_id, artist_name,
+             album_title, requested_at, status, user_id, request_kind)
+         VALUES ('eeeeeeee-0000-4000-8000-000000000005',
+                 'eeeeeeee-0000-4000-8000-000000000005', 'Artist', 'Album', '1700000000',
+                 'imported', '{alice}', 'playlist');
+         CREATE TABLE held_imports (
+             id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL,
+             release_group_mbid TEXT, duration_seconds REAL,
+             expected_duration_seconds REAL, evidence_score REAL,
+             held_path TEXT NOT NULL, reason TEXT NOT NULL, source_task_id TEXT,
+             status TEXT NOT NULL DEFAULT 'held', created_at REAL NOT NULL);
+         INSERT INTO held_imports (user_id, release_group_mbid, duration_seconds,
+             expected_duration_seconds, evidence_score, held_path, reason, source_task_id,
+             status, created_at)
+         VALUES ('{alice}', 'dddddddd-0000-4000-8000-000000000007', '3:42', 'long',
+                 'strong', '/app/cache/held/stray.flac', 'unheard_of',
+                 'download-stray-real', 'held', 1700000000.0);"
     ))
-    .expect("v2 row seeds");
+    .expect("v2 rows seed");
     drop(v2);
     let export_path = root.join("export.json");
     droppedneedle_tool::export::export_v2_to_file(
@@ -1165,15 +1096,61 @@ async fn stray_whole_numbers_carry_as_null_or_whole() {
     )
     .expect("export writes");
     let text = std::fs::read_to_string(&export_path).expect("export reads back");
-    let (v3_root, pool) = seeded_target(&root).await;
+    let (v3_root, target_db) = seeded_target(&root);
+    run_pipeline(&text, PASSPHRASE, &v3_root, &target_db, false).await;
 
-    run_pipeline(&text, PASSPHRASE, &v3_root, &pool, false).await;
-    let landed: (Option<i64>, Option<i64>) =
-        sqlx::query_as("SELECT year, track_number FROM download_tasks WHERE id = 'download-stray'")
-            .fetch_one(&pool)
-            .await
-            .expect("the download carries");
-    assert_eq!(landed, (None, Some(7)));
+    // Whole-number columns.
+    let landed: (Option<i64>, Option<i64>) = target_db.row(
+        "SELECT year, track_number FROM download_tasks WHERE id = 'download-stray'",
+        [],
+    );
+    assert_eq!(landed, (None, Some(7)), "whole numbers");
+
+    // Download labels.
+    let landed: (String, String, String, String) = target_db.row(
+        "SELECT download_type, download_client, source, origin FROM download_tasks \
+         WHERE id = 'download-labels'",
+        [],
+    );
+    assert_eq!(
+        landed,
+        (
+            "album".to_owned(),
+            "slskd".to_owned(),
+            "soulseek".to_owned(),
+            "user".to_owned()
+        ),
+        "download labels"
+    );
+    let origin: String = target_db.one(
+        "SELECT origin FROM download_tasks WHERE id = 'download-conversion'",
+        [],
+    );
+    assert_eq!(origin, "edition", "download labels");
+
+    // Reals and fixed sets.
+    let download: (Option<f64>, Option<f64>) = target_db.row(
+        "SELECT track_duration_seconds, preflight_score FROM download_tasks \
+         WHERE id = 'download-stray-real'",
+        [],
+    );
+    assert_eq!(download, (None, None), "reals");
+    let kind: String = target_db.one(
+        "SELECT request_kind FROM request_history \
+         WHERE musicbrainz_id_lower = 'eeeeeeee-0000-4000-8000-000000000005'",
+        [],
+    );
+    assert_eq!(kind, "album", "fixed sets");
+    let held: (Option<f64>, Option<f64>, Option<f64>, String) = target_db.row(
+        "SELECT duration_seconds, expected_duration_seconds, evidence_score, reason \
+         FROM acquire_held_files WHERE path = 'stray.flac'",
+        [],
+    );
+    assert_eq!(
+        held,
+        (None, None, None, "held_by_earlier_version".to_owned()),
+        "reals and fixed sets"
+    );
 }
 
 /// The listening preferences Alice lands with after `v2_sql` runs on the v2
@@ -1193,214 +1170,57 @@ async fn landed_listening_prefs(tag: &str, v2_sql: &str) -> (i64, i64, String, i
     )
     .expect("export writes");
     let text = std::fs::read_to_string(&export_path).expect("export reads back");
-    let (v3_root, pool) = seeded_target(&root).await;
-    run_pipeline(&text, PASSPHRASE, &v3_root, &pool, false).await;
-    sqlx::query_as(
+    let (v3_root, target_db) = seeded_target(&root);
+    run_pipeline(&text, PASSPHRASE, &v3_root, &target_db, false).await;
+    target_db.row(
         "SELECT scrobble_to_lastfm, navidrome_handles_external_scrobbles, \
          now_playing_visibility, auto_request_personal_mix FROM user_listening_prefs",
+        [],
     )
-    .fetch_one(&pool)
-    .await
-    .expect("the preferences carry")
 }
 
-/// A v2 database last started before these three columns were added upgrades
-/// all the same: what it has carries and v3's defaults fill the rest.
+/// Listening preferences carry from any v2 table shape: one last started
+/// before the later columns were added carries what it has with v3's
+/// defaults for the rest, and a visibility that is not text carries as
+/// hiding the song, never as showing it.
 #[tokio::test]
-async fn listening_prefs_carry_from_a_v2_table_without_the_later_columns() {
-    let landed = landed_listening_prefs(
-        "prefs-older-v2",
-        "ALTER TABLE user_listening_prefs DROP COLUMN now_playing_visibility;
-         ALTER TABLE user_listening_prefs DROP COLUMN navidrome_handles_external_scrobbles;
-         ALTER TABLE user_listening_prefs DROP COLUMN auto_request_personal_mix;",
-    )
-    .await;
-    assert_eq!(landed, (1, 1, "full".to_owned(), 0));
-}
-
-/// A v2 visibility that is not text carries as hiding the song, never as
-/// showing it.
-#[tokio::test]
-async fn a_visibility_that_is_not_text_carries_as_hidden() {
-    let landed = landed_listening_prefs(
-        "prefs-blob-visibility",
-        "UPDATE user_listening_prefs SET now_playing_visibility = X'00';",
-    )
-    .await;
-    assert_eq!(landed, (1, 1, "track_hidden".to_owned(), 0));
-}
-
-/// A v2 download with values v3's readers do not know carries with the
-/// safe ones: one stray value must not stop the upgrade.
-#[tokio::test]
-async fn stray_download_labels_carry_as_their_defaults() {
-    let root = scratch_dir("stray-labels");
-    let fixture = build_v2_fixture(&root.join("v2")).expect("fixture builds");
-    let v2_db = root.join("v2").join("cache").join("library.db");
-    delete_orphan_rows(&v2_db).expect("repair runs");
-    let alice = &fixture.alice_id;
-    let v2 = rusqlite::Connection::open(&v2_db).expect("v2 db opens");
-    v2.execute_batch(&format!(
-        "ALTER TABLE download_tasks ADD COLUMN download_type TEXT;
-         ALTER TABLE download_tasks ADD COLUMN download_client TEXT;
-         ALTER TABLE download_tasks ADD COLUMN source TEXT;
-         ALTER TABLE download_tasks ADD COLUMN origin TEXT;
-         INSERT INTO download_tasks (id, user_id, release_group_mbid, artist_name,
-             album_title, status, download_type, download_client, source, origin,
-             created_at, updated_at)
-         VALUES ('download-labels', '{alice}', 'dddddddd-0000-4000-8000-000000000005',
-                 'Artist', 'Album', 'completed', 'mixtape', '', 'carrier-pigeon', 'mystery',
-                 1700000000.0, 1700000000.0),
-                ('download-conversion', '{alice}', 'dddddddd-0000-4000-8000-000000000006',
-                 'Artist', 'Album', 'completed', 'album', 'slskd', 'soulseek',
-                 'edition_conversion', 1700000000.0, 1700000000.0);"
-    ))
-    .expect("v2 row seeds");
-    drop(v2);
-    let export_path = root.join("export.json");
-    droppedneedle_tool::export::export_v2_to_file(
-        &export_request(&root.join("v2"), PASSPHRASE),
-        &export_path,
-    )
-    .expect("export writes");
-    let text = std::fs::read_to_string(&export_path).expect("export reads back");
-    let (v3_root, pool) = seeded_target(&root).await;
-    run_pipeline(&text, PASSPHRASE, &v3_root, &pool, false).await;
-    let landed: (String, String, String, String) = sqlx::query_as(
-        "SELECT download_type, download_client, source, origin FROM download_tasks \
-         WHERE id = 'download-labels'",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("the download carries");
-    assert_eq!(
-        landed,
+async fn listening_prefs_carry_from_any_v2_shape() {
+    for (label, v2_sql, expected) in [
         (
-            "album".to_owned(),
-            "slskd".to_owned(),
-            "soulseek".to_owned(),
-            "user".to_owned()
-        )
-    );
-    let origin: String =
-        sqlx::query_scalar("SELECT origin FROM download_tasks WHERE id = 'download-conversion'")
-            .fetch_one(&pool)
-            .await
-            .expect("the conversion carries");
-    assert_eq!(origin, "edition");
-}
-
-/// A v2 download with a text track duration and preflight score, a held
-/// file with text durations and an unknown reason, and a finished request
-/// of an unknown kind carry: the text numbers land NULL, and the kind and
-/// the reason take their safe values. One stray value must not stop the
-/// upgrade.
-#[tokio::test]
-async fn stray_reals_and_fixed_sets_carry_as_null_or_default() {
-    let root = scratch_dir("stray-real");
-    let fixture = build_v2_fixture(&root.join("v2")).expect("fixture builds");
-    let v2_cache = root.join("v2").join("cache");
-    let v2_db = v2_cache.join("library.db");
-    delete_orphan_rows(&v2_db).expect("repair runs");
-    let held_dir = v2_cache.join("held");
-    std::fs::create_dir_all(&held_dir).expect("v2 held folder");
-    std::fs::write(held_dir.join("stray.flac"), b"held bytes").expect("held file");
-    let alice = &fixture.alice_id;
-    let v2 = rusqlite::Connection::open(&v2_db).expect("v2 db opens");
-    v2.execute_batch(&format!(
-        "ALTER TABLE download_tasks ADD COLUMN track_duration_seconds REAL;
-         ALTER TABLE download_tasks ADD COLUMN preflight_score REAL;
-         INSERT INTO download_tasks (id, user_id, release_group_mbid, artist_name,
-             album_title, status, track_duration_seconds, preflight_score, created_at,
-             updated_at)
-         VALUES ('download-stray', '{alice}', 'dddddddd-0000-4000-8000-000000000005',
-                 'Artist', 'Album', 'completed', '3:42', 'high', 1700000000.0,
-                 1700000000.0);
-         INSERT INTO request_history (musicbrainz_id_lower, musicbrainz_id, artist_name,
-             album_title, requested_at, status, user_id, request_kind)
-         VALUES ('eeeeeeee-0000-4000-8000-000000000005',
-                 'eeeeeeee-0000-4000-8000-000000000005', 'Artist', 'Album', '1700000000',
-                 'imported', '{alice}', 'playlist');
-         CREATE TABLE held_imports (
-             id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL,
-             release_group_mbid TEXT, duration_seconds REAL,
-             expected_duration_seconds REAL, evidence_score REAL,
-             held_path TEXT NOT NULL, reason TEXT NOT NULL, source_task_id TEXT,
-             status TEXT NOT NULL DEFAULT 'held', created_at REAL NOT NULL);
-         INSERT INTO held_imports (user_id, release_group_mbid, duration_seconds,
-             expected_duration_seconds, evidence_score, held_path, reason, source_task_id,
-             status, created_at)
-         VALUES ('{alice}', 'dddddddd-0000-4000-8000-000000000005', '3:42', 'long',
-                 'strong', '/app/cache/held/stray.flac', 'unheard_of', 'download-stray',
-                 'held', 1700000000.0);"
-    ))
-    .expect("v2 rows seed");
-    drop(v2);
-    let export_path = root.join("export.json");
-    droppedneedle_tool::export::export_v2_to_file(
-        &export_request(&root.join("v2"), PASSPHRASE),
-        &export_path,
-    )
-    .expect("export writes");
-    let text = std::fs::read_to_string(&export_path).expect("export reads back");
-    let (v3_root, pool) = seeded_target(&root).await;
-
-    run_pipeline(&text, PASSPHRASE, &v3_root, &pool, false).await;
-    let download: (Option<f64>, Option<f64>) = sqlx::query_as(
-        "SELECT track_duration_seconds, preflight_score FROM download_tasks \
-         WHERE id = 'download-stray'",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("the download carries");
-    assert_eq!(download, (None, None));
-    let kind: String = sqlx::query_scalar(
-        "SELECT request_kind FROM request_history \
-         WHERE musicbrainz_id_lower = 'eeeeeeee-0000-4000-8000-000000000005'",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("the request carries");
-    assert_eq!(kind, "album");
-    let held: (Option<f64>, Option<f64>, Option<f64>, String) = sqlx::query_as(
-        "SELECT duration_seconds, expected_duration_seconds, evidence_score, reason \
-         FROM acquire_held_files WHERE path = 'stray.flac'",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("the held file carries");
-    assert_eq!(
-        held,
-        (None, None, None, "held_by_earlier_version".to_owned())
-    );
+            "table without the later columns",
+            "ALTER TABLE user_listening_prefs DROP COLUMN now_playing_visibility;
+             ALTER TABLE user_listening_prefs DROP COLUMN navidrome_handles_external_scrobbles;
+             ALTER TABLE user_listening_prefs DROP COLUMN auto_request_personal_mix;",
+            (1, 1, "full".to_owned(), 0),
+        ),
+        (
+            "visibility that is not text",
+            "UPDATE user_listening_prefs SET now_playing_visibility = X'00';",
+            (1, 1, "track_hidden".to_owned(), 0),
+        ),
+    ] {
+        let landed = landed_listening_prefs("prefs", v2_sql).await;
+        assert_eq!(landed, expected, "case: {label}");
+    }
 }
 
 /// One user logs in with their v2 password through the production login
 /// path; success persists the Argon2id rehash, and a wrong password still
 /// fails.
-async fn login_rehashes(
-    pool: &sqlx::SqlitePool,
-    db: &Db,
-    username: &str,
-    user_id: &str,
-    password: &str,
-) {
+async fn login_rehashes(target_db: &Path, db: &Db, username: &str, user_id: &str, password: &str) {
     use droppedneedle_auth::session::login::{
         LoginContext, LoginError, LoginRequest, LoginService, TransportParam,
     };
     use droppedneedle_auth::sqlite::{AuthDb, Sessions, Users};
 
-    async fn stored(pool: &sqlx::SqlitePool, user_id: &str) -> (String, String) {
-        sqlx::query_as(
+    fn stored(target_db: &Path, user_id: &str) -> (String, String) {
+        target_db.row(
             "SELECT hash_scheme, password_hash FROM auth_providers \
              WHERE user_id = ? AND provider = 'local'",
+            rusqlite::params![user_id],
         )
-        .bind(user_id)
-        .fetch_one(pool)
-        .await
-        .expect("provider row reads")
     }
-    let (scheme, hash) = stored(pool, user_id).await;
+    let (scheme, hash) = stored(target_db, user_id);
     assert_eq!(scheme, "bcrypt");
     assert!(hash.starts_with("$2b$"), "bcrypt carried verbatim: {hash}");
 
@@ -1433,7 +1253,7 @@ async fn login_rehashes(
         .expect("v2 password logs in");
     assert_eq!(success.user_id, user_id);
 
-    let (scheme, hash) = stored(pool, user_id).await;
+    let (scheme, hash) = stored(target_db, user_id);
     assert!(hash.starts_with("$argon2id$"), "rehash persisted: {hash}");
     assert_eq!(scheme, "argon2id", "tag flipped");
 
@@ -1451,17 +1271,15 @@ async fn login_rehashes(
 }
 
 /// Every imported follow reads back with its v2 values.
-async fn assert_follows_intact(
-    pool: &sqlx::SqlitePool,
+fn assert_follows_intact(
+    target_db: &Path,
     fixture: &droppedneedle_tool::tooling::fixture::V2Fixture,
 ) {
-    let rows: Vec<(String, String, String, i64, i64, i64)> = sqlx::query_as(
+    let rows: Vec<(String, String, String, i64, i64, i64)> = target_db.rows(
         "SELECT user_id, artist_mbid, artist_name, auto_download, followed_at, updated_at
          FROM acquire_followed_artists ORDER BY user_id, artist_mbid",
-    )
-    .fetch_all(pool)
-    .await
-    .expect("follows read back");
+        [],
+    );
     assert_eq!(rows.len(), 3);
     assert!(rows.iter().any(|row| row.0 == fixture.alice_id
         && row.1 == fixture.artist_one_mbid

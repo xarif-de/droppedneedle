@@ -8,10 +8,9 @@
 //! long a track is. An album is the gated loudness over every block of
 //! all its tracks, as R128 album gain is defined.
 
-use std::path::Path;
 use std::time::{Duration, Instant};
 
-use super::format_for_path;
+use super::{TrackFile, format_for_path};
 
 /// ReplayGain 2.0 reference loudness.
 const REFERENCE_LUFS: f64 = -18.0;
@@ -204,13 +203,13 @@ pub enum Unanalysed {
 }
 
 /// Measure one file, giving up at `deadline`.
-pub fn analyse(path: &Path, deadline: Instant) -> Result<TrackLoudness, Unanalysed> {
-    let format = format_for_path(path).map_err(|_| Unanalysed::Undecodable)?;
+pub fn analyse(at: TrackFile<'_>, deadline: Instant) -> Result<TrackLoudness, Unanalysed> {
+    let format = format_for_path(at.path()).map_err(|_| Unanalysed::Undecodable)?;
     let mut meter: Option<Meter> = None;
     let mut late = false;
     let mut reshaped = false;
     let mut packets = 0u32;
-    let decoded = super::probe::decode_stream(path, format, |rate, channels, block| {
+    let decoded = super::probe::decode_stream(at, format, |rate, channels, block| {
         let meter = meter.get_or_insert_with(|| Meter::new(rate, channels as usize));
         if meter.filters.len() != channels as usize || meter.rate != rate {
             // A stream that changes shape mid-file is not measured.
@@ -250,16 +249,16 @@ static MEASURED: std::sync::Mutex<Option<Measured>> = std::sync::Mutex::new(None
 
 /// [`analyse`], remembering each file's result by its content hash, so a
 /// file measured once (a preview, then its replan) is not decoded again.
-pub fn analyse_cached(path: &Path, deadline: Instant) -> Result<TrackLoudness, Unanalysed> {
-    let sha = file_sha256(path).map_err(|_| Unanalysed::Undecodable)?;
+pub fn analyse_cached(at: TrackFile<'_>, deadline: Instant) -> Result<TrackLoudness, Unanalysed> {
+    let sha = file_sha256(at).map_err(|_| Unanalysed::Undecodable)?;
     if let Ok(cache) = MEASURED.lock()
         && let Some(found) = cache.as_ref().and_then(|cache| cache.by_sha.get(&sha))
     {
         return Ok(TrackLoudness::clone(found));
     }
-    let found = analyse(path, deadline)?;
+    let found = analyse(at, deadline)?;
     // The file must not have changed while it was decoded.
-    if file_sha256(path).ok().as_deref() == Some(sha.as_str())
+    if file_sha256(at).ok().as_deref() == Some(sha.as_str())
         && let Ok(mut cache) = MEASURED.lock()
     {
         let cache = cache.get_or_insert_with(|| Measured {
@@ -284,9 +283,9 @@ pub fn analyse_cached(path: &Path, deadline: Instant) -> Result<TrackLoudness, U
     Ok(found)
 }
 
-fn file_sha256(path: &Path) -> std::io::Result<String> {
+fn file_sha256(at: TrackFile<'_>) -> std::io::Result<String> {
     use sha2::{Digest, Sha256};
-    let mut file = std::fs::File::open(path)?;
+    let mut file = at.open()?;
     let mut hasher = Sha256::new();
     std::io::copy(&mut file, &mut hasher)?;
     Ok(format!("{:x}", hasher.finalize()))
@@ -310,8 +309,12 @@ mod tests {
             .collect()
     }
 
+    /// The meter reads a reference tone as R128 says and silence as no
+    /// loudness, and analysis decodes each writable format: the fixtures
+    /// are digital silence, so they measure no loudness and no peak (a
+    /// lossy decoder may leave float dust far below one 24-bit step).
     #[test]
-    fn a_full_scale_tone_measures_as_r128_says() {
+    fn loudness_measures_as_r128_says() {
         // EBU Tech 3341: a 997 Hz stereo sine at -23 dBFS reads -23 LUFS.
         let amplitude = 10f32.powf(-23.0 / 20.0);
         let mut meter = Meter::new(48_000, 2);
@@ -321,12 +324,26 @@ mod tests {
         assert!((loudness - -23.0).abs() < 0.1, "{loudness}");
         assert_eq!(gain_text(loudness), "5.00 dB");
         assert!((measured.peak - f64::from(amplitude)).abs() < 1e-3);
-    }
 
-    #[test]
-    fn silence_has_no_loudness() {
         let mut meter = Meter::new(44_100, 2);
         meter.feed(&vec![0.0; 44_100 * 2 * 3]);
-        assert_eq!(meter.finish().loudness(), None);
+        assert_eq!(meter.finish().loudness(), None, "silence");
+
+        let deadline = Instant::now() + Duration::from_secs(60);
+        for name in [
+            "management_full.flac",
+            "management_full.mp3",
+            "management_full.ogg",
+            "management_full.opus",
+            "management_full.m4a",
+        ] {
+            let fixtures =
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures/library");
+            let path = fixtures.join(name);
+            let measured = analyse(TrackFile::new(&fixtures, &path), deadline).expect(name);
+            assert_eq!(measured.loudness(), None, "{name}");
+            assert!(measured.peak < 1e-9, "{name}: {}", measured.peak);
+            assert_eq!(peak_text(measured.peak), "0.000000", "{name}");
+        }
     }
 }

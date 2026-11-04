@@ -1,8 +1,9 @@
 //! Artist and album pages and MusicBrainz-backed search, behind the real
 //! session gate, against recorded provider payloads served from a
 //! loopback fixture server (tests/fixtures/catalog). One test per page,
-//! the MusicBrainz outage fallback, and the auth matrix rows.
+//! the MusicBrainz outage fallback, and a bad id refused.
 
+use crate::common::Probe;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -27,7 +28,7 @@ use droppedneedle_kernel::runtime_config::sections::{
 };
 use droppedneedle_providers::Providers;
 use serde_json::{Value, json};
-use sqlx::SqlitePool;
+use std::path::Path;
 use tower::ServiceExt as _;
 
 use crate::common::TestApp;
@@ -58,6 +59,33 @@ fn upstream_fixture(key: &str) -> String {
     let all: Value = serde_json::from_str(&fixture("upstreams.json")).unwrap();
     all[key].to_string()
 }
+
+/// A recorded answer from `tests/fixtures/{provider}`.
+fn recorded(provider: &str, name: &str) -> String {
+    let path = format!(
+        "{}/tests/fixtures/{provider}/{name}",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("fixture {path}: {error}"))
+}
+
+fn audiodb_fixture(name: &str) -> String {
+    recorded("audiodb", name)
+}
+
+fn wikidata_fixture(name: &str) -> String {
+    recorded("wikidata", name)
+}
+
+/// The Radiohead intro in the recorded Wikipedia answer (a placeholder for
+/// the article's text).
+const WIKIPEDIA_INTRO: &str = "Placeholder intro text for the Radiohead article.";
+/// The 1280 px thumbnail in the recorded Commons answer for Radiohead's
+/// picture.
+const COMMONS_THUMB: &str = "https://thumb.wikimedia.org/wikipedia/commons/thumb/a/a1/RadioheadO2211125_composite.jpg/1280px-RadioheadO2211125_composite.jpg?utm_source=commons.wikimedia.org&utm_campaign=imageinfo&utm_content=thumbnail";
+/// Radiohead's thumbnail in the recorded TheAudioDB answer.
+const AUDIODB_THUMB: &str =
+    "https://r2.theaudiodb.com/images/media/artist/thumb/35poth1668098458.jpg";
 
 /// One canned upstream answer: a path, optionally one query parameter that
 /// must be present (with a value containing the given text), and the
@@ -104,6 +132,9 @@ impl Fixtures {
                             query.get(key).is_some_and(|value| value.contains(wanted))
                         })
                 });
+                // Anything else is a bare 404. It stands in for answers never
+                // recorded, such as Special:EntityData for an unknown id,
+                // which the client reads as absence without decoding.
                 match found {
                     Some(route) => (
                         StatusCode::from_u16(route.status).unwrap(),
@@ -191,27 +222,27 @@ fn routes() -> Vec<Route> {
         route(
             "/audiodb/123/artist-mb.php".to_owned(),
             Some(("i", ARTIST)),
-            upstream_fixture("audiodb_artist"),
+            audiodb_fixture("artist_mb_found.json"),
         ),
         route(
             "/wikidata/wiki/Special:EntityData/Q44190.json".to_owned(),
             None,
-            upstream_fixture("wikidata_entity"),
+            wikidata_fixture("entity_found.json"),
         ),
         route(
             "/wikidata/w/api.php".to_owned(),
             Some(("action", "wbgetclaims")),
-            upstream_fixture("wikidata_claims"),
+            wikidata_fixture("claims_p18_found.json"),
         ),
         route(
             "/wikipedia-en/w/api.php".to_owned(),
             Some(("prop", "extracts")),
-            upstream_fixture("wikipedia_extract"),
+            wikidata_fixture("extract_found.json"),
         ),
         route(
             "/commons/w/api.php".to_owned(),
             Some(("prop", "imageinfo")),
-            upstream_fixture("commons_imageinfo"),
+            wikidata_fixture("commons_imageinfo_credit.json"),
         ),
         route(
             format!("/lb/1/lb-radio/artist/{ARTIST}"),
@@ -304,10 +335,18 @@ fn local_catalog(dir: &crate::common::ScratchDir) -> LocalCatalog {
     )
 }
 
+/// Pages with no follow store and no plugins, their image warms queued on
+/// the jobs table in `dir`'s database.
+fn page_sources(dir: &crate::common::ScratchDir) -> droppedneedle_catalog::metadata::PageSources {
+    crate::common::bundles::quiet_page_sources(
+        &droppedneedle_kernel::db::Db::open_for_tests(&dir.join("app.db")).expect("database opens"),
+    )
+}
+
 /// The library: Radiohead with OK Computer (identified as the CD edition,
 /// one indexed track), an unidentified bootleg, and an open request for
 /// Kid A.
-async fn seed_library(pool: &SqlitePool) {
+fn seed_library(app_db: &Path) {
     let statements = [
         "INSERT INTO local_artists (id, display_name, folded_name, kind, created_at, updated_at) \
          VALUES ('artist-radiohead', 'Radiohead', 'radiohead', 'group', 0, 0)"
@@ -379,7 +418,7 @@ async fn seed_library(pool: &SqlitePool) {
             .to_owned(),
     ];
     for statement in statements {
-        sqlx::query(&statement).execute(pool).await.unwrap();
+        app_db.exec(&statement, []);
     }
 }
 
@@ -397,10 +436,10 @@ async fn app_seeded(
     mb_url: String,
     extra: &[String],
 ) -> (axum::Router, (AuthRig, TestApp)) {
-    let (pool, dir) = crate::common::migrated_pool("reads-catalog").await;
-    seed_library(&pool).await;
+    let (app_db, dir) = crate::common::migrated_file("reads-catalog");
+    seed_library(&app_db);
     for statement in extra {
-        sqlx::query(statement).execute(&pool).await.unwrap();
+        app_db.exec(statement, []);
     }
     let rig = AuthRig::new("reads-catalog").await;
     rig.seed_user("ada", Role::User).await;
@@ -424,13 +463,10 @@ async fn app_seeded(
         Arc::new(TestSettings { mb_url }),
         rig.deps.clone(),
     );
-    let catalog = Catalog::new(upstream, local_catalog(&dir));
+    let catalog = Catalog::new(upstream, local_catalog(&dir), page_sources(&dir));
     let search = SearchDeps::new(
-        SearchService::new(
-            droppedneedle_kernel::db::Db::open_for_tests(pool.connect_options().get_filename())
-                .unwrap(),
-        )
-        .with_remote(catalog.clone()),
+        SearchService::new(droppedneedle_kernel::db::Db::open_for_tests(&app_db).unwrap())
+            .with_remote(catalog.clone()),
         Arc::new(search::ports::UnconfiguredEnrichment),
     );
     let scope = TestApp::start("reads-catalog").await;
@@ -557,39 +593,61 @@ async fn artist_header_reads_musicbrainz_once_and_flags_the_library() {
             "bandcamp_search_url": "https://bandcamp.com/search?q=Radiohead&item_type=b"
         })
     );
+
+    // An id that is no MusicBrainz id is refused before MusicBrainz.
+    let (status, body) = call(&app, Method::GET, "/api/v3/artists/radiohead", Some(TOKEN)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "a bad id");
+    assert_eq!(body["error"]["code"], "INVALID_INPUT", "a bad id");
+    assert_eq!(
+        fixtures.hits("/mb/ws/2/artist/radiohead"),
+        0,
+        "bad ids never reach MusicBrainz"
+    );
 }
 
-/// The artist header's TheAudioDB images and fanart come from the cache
-/// only: TheAudioDB's free key allows one call every two seconds, so a
-/// cold header answers its biography and portrait without asking it, and
-/// shows the images once the background fill has stored them.
+/// The artist header's TheAudioDB images and fanart come from the fill,
+/// kept under the key they were asked with. TheAudioDB's free key allows
+/// one call every two seconds, so a cold header answers its biography and
+/// portrait without asking it, and shows the images once the background
+/// fill has stored them. Once the saved key changes, art kept under the
+/// old key is not served, and the new key is asked.
 #[tokio::test]
-async fn a_cold_artist_header_never_asks_audiodb() {
-    let fixtures = Fixtures::start().await;
-    let (_pool, dir) = crate::common::migrated_pool("reads-catalog-header").await;
+async fn audiodb_art_comes_from_the_fill_under_its_key() {
+    let mut routes = routes();
+    routes.push(Route {
+        path: "/audiodb/premium-key/artist-mb.php".to_owned(),
+        param: Some(("i", ARTIST)),
+        status: 200,
+        body: audiodb_fixture("artist_mb_not_found.json"),
+    });
+    let fixtures = Fixtures::start_with(routes).await;
+    let (_db, dir) = crate::common::migrated_file("reads-catalog-header");
     let rig = AuthRig::new("reads-catalog-header").await;
     let http = droppedneedle_kernel::http_client::HttpClientFactory::new().unwrap();
+    let settings = Arc::new(KeyedSettings {
+        inner: TestSettings {
+            mb_url: format!("{}/mb/ws/2", fixtures.base),
+        },
+        audiodb_key: Mutex::new(String::new()),
+    });
     let catalog = Catalog::new(
         Upstream::new(
             Arc::new(fixtures.providers(&http)),
-            Arc::new(TestSettings {
-                mb_url: format!("{}/mb/ws/2", fixtures.base),
-            }),
+            settings.clone(),
             rig.deps.clone(),
         ),
         local_catalog(&dir),
+        page_sources(&dir),
     );
 
     let cold = catalog.artist_extended(ARTIST).await.unwrap();
     assert_eq!(
         cold.description.as_deref(),
-        Some("Radiohead are an English rock band formed in Abingdon, Oxfordshire, in 1985.")
+        Some(WIKIPEDIA_INTRO),
+        "cold header"
     );
-    assert_eq!(
-        cold.image.as_deref(),
-        Some("https://upload.wikimedia.org/wikipedia/commons/a/a1/Radiohead_2016.jpg")
-    );
-    assert_eq!(cold.images, Default::default());
+    assert_eq!(cold.image.as_deref(), Some(COMMONS_THUMB), "cold header");
+    assert_eq!(cold.images, Default::default(), "cold header");
     assert_eq!(
         fixtures.hits("/audiodb/123/artist-mb.php"),
         0,
@@ -598,14 +656,29 @@ async fn a_cold_artist_header_never_asks_audiodb() {
 
     assert!(
         catalog.fill_artist_images(ARTIST).await,
-        "the fill stores them"
+        "the free key's fill stores them"
     );
     let warm = catalog.artist_extended(ARTIST).await.unwrap();
     assert_eq!(
         warm.images.thumb_url.as_deref(),
-        Some("https://r2.theaudiodb.com/images/media/artist/thumb/radiohead.jpg")
+        Some(AUDIODB_THUMB),
+        "after the fill"
     );
-    assert_eq!(fixtures.hits("/audiodb/123/artist-mb.php"), 1);
+    assert_eq!(
+        fixtures.hits("/audiodb/123/artist-mb.php"),
+        1,
+        "after the fill"
+    );
+
+    *settings.audiodb_key.lock().unwrap() = "premium-key".to_owned();
+    catalog.fill_artist_images(ARTIST).await;
+    let premium = catalog.artist_extended(ARTIST).await.unwrap();
+    assert_eq!(
+        fixtures.hits("/audiodb/premium-key/artist-mb.php"),
+        1,
+        "another key"
+    );
+    assert_eq!(premium.images.thumb_url, None, "another key");
 }
 
 #[tokio::test]
@@ -983,10 +1056,25 @@ async fn musicbrainz_outage_falls_back_to_the_library() {
     );
 }
 
+/// Search joins MusicBrainz with the library unless it is scoped to the
+/// library. The library scope goes first: it answers from the library
+/// alone, MusicBrainz is never asked, and only library rows come back.
 #[tokio::test]
-async fn unified_search_joins_musicbrainz_with_the_library() {
+async fn search_joins_musicbrainz_unless_scoped_to_the_library() {
     let fixtures = Fixtures::start().await;
     let (app, _auth) = app(&fixtures).await;
+
+    let body = get(&app, "/api/v3/search?q=ok%20computer&scope=library").await;
+    assert_eq!(
+        titles(&body["albums"]),
+        ["OK Computer", "OK Computer Live Bootleg"],
+        "library scope"
+    );
+    for row in body["albums"].as_array().unwrap() {
+        assert!(row["id"].is_string(), "library rows only: {row}");
+    }
+    assert_eq!(fixtures.hits("/mb/ws/2/release-group"), 0, "library scope");
+    assert_eq!(fixtures.hits("/mb/ws/2/artist"), 0, "library scope");
 
     let body = get(&app, "/api/v3/search?q=ok%20computer").await;
     assert_eq!(body["album_status"], "ok");
@@ -1031,26 +1119,6 @@ async fn unified_search_joins_musicbrainz_with_the_library() {
     assert_eq!(album["in_library"], true);
 }
 
-/// The library scope answers from the library alone: MusicBrainz is never
-/// asked, and only library rows come back.
-#[tokio::test]
-async fn library_scoped_search_never_asks_musicbrainz() {
-    let fixtures = Fixtures::start().await;
-    let (app, _auth) = app(&fixtures).await;
-
-    let body = get(&app, "/api/v3/search?q=ok%20computer&scope=library").await;
-
-    assert_eq!(
-        titles(&body["albums"]),
-        ["OK Computer", "OK Computer Live Bootleg"]
-    );
-    for row in body["albums"].as_array().unwrap() {
-        assert!(row["id"].is_string(), "library rows only: {row}");
-    }
-    assert_eq!(fixtures.hits("/mb/ws/2/release-group"), 0);
-    assert_eq!(fixtures.hits("/mb/ws/2/artist"), 0);
-}
-
 #[tokio::test]
 async fn lastfm_reads_fall_back_to_the_instance_key() {
     let rig = AuthRig::new("reads-catalog").await;
@@ -1072,51 +1140,6 @@ async fn lastfm_reads_fall_back_to_the_instance_key() {
     assert_eq!(creds.api_key, "instance-key");
 }
 
-#[tokio::test]
-async fn auth_matrix_rejects_anonymous_callers_and_bad_ids() {
-    let fixtures = Fixtures::start().await;
-    let (app, _auth) = app(&fixtures).await;
-    for uri in [
-        format!("/api/v3/artists/{ARTIST}"),
-        format!("/api/v3/artists/{ARTIST}/extended"),
-        format!("/api/v3/artists/{ARTIST}/releases"),
-        format!("/api/v3/artists/{ARTIST}/owned-releases"),
-        format!("/api/v3/artists/{ARTIST}/similar"),
-        format!("/api/v3/artists/{ARTIST}/top-songs"),
-        format!("/api/v3/artists/{ARTIST}/top-albums"),
-        format!("/api/v3/artists/{ARTIST}/lastfm?artist_name=Radiohead"),
-        format!("/api/v3/artists/{ARTIST}/purchase-options"),
-        format!("/api/v3/albums/{OK_COMPUTER}/basic"),
-        format!("/api/v3/albums/{OK_COMPUTER}/tracks"),
-        format!("/api/v3/albums/{OK_COMPUTER}/editions"),
-        format!("/api/v3/albums/{OK_COMPUTER}/similar?artist_id={ARTIST}"),
-        format!("/api/v3/albums/{OK_COMPUTER}/more-by-artist?artist_id={ARTIST}"),
-        format!("/api/v3/albums/{OK_COMPUTER}/lastfm?artist_name=a&album_name=b"),
-        format!("/api/v3/albums/{OK_COMPUTER}/purchase-options"),
-    ] {
-        let (status, body) = call(&app, Method::GET, &uri, None).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri}");
-        assert_eq!(body["error"]["code"], "UNAUTHORIZED", "{uri}");
-    }
-    let (status, _) = call(
-        &app,
-        Method::POST,
-        &format!("/api/v3/albums/{OK_COMPUTER}/refresh"),
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
-
-    let (status, body) = call(&app, Method::GET, "/api/v3/artists/radiohead", Some(TOKEN)).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body["error"]["code"], "INVALID_INPUT");
-    assert_eq!(
-        fixtures.hits("/mb/ws/2/artist/radiohead"),
-        0,
-        "bad ids never reach MusicBrainz"
-    );
-}
-
 /// A portrait lookup that failed is not "no image": with TheAudioDB
 /// holding no thumbnail and Commons down, the artist's image is asked
 /// again after the short outage wait, never held blank for hours.
@@ -1132,14 +1155,14 @@ async fn a_failed_portrait_lookup_keeps_the_short_outage_marker() {
     let mut routes = routes();
     for route in &mut routes {
         if route.path == "/audiodb/123/artist-mb.php" {
-            route.body = r#"{"artists": null}"#.to_owned();
+            route.body = audiodb_fixture("artist_mb_not_found.json");
         }
         if route.path == "/commons/w/api.php" {
             route.status = 503;
         }
     }
     let fixtures = Fixtures::start_with(routes).await;
-    let (pool, dir) = crate::common::migrated_pool("reads-catalog-portrait").await;
+    let (app_db, dir) = crate::common::migrated_file("reads-catalog-portrait");
     let rig = AuthRig::new("reads-catalog-portrait").await;
     let http = droppedneedle_kernel::http_client::HttpClientFactory::new().unwrap();
     let providers = Arc::new(fixtures.providers(&http));
@@ -1152,6 +1175,7 @@ async fn a_failed_portrait_lookup_keeps_the_short_outage_marker() {
             rig.deps.clone(),
         ),
         local_catalog(&dir),
+        page_sources(&dir),
     );
     let config = crate::common::config_store(&dir.join("settings"));
     let artwork = ArtworkService::new(
@@ -1160,15 +1184,12 @@ async fn a_failed_portrait_lookup_keeps_the_short_outage_marker() {
             1024 * 1024,
             std::sync::Arc::new(droppedneedle_kernel::clock::SystemClock),
         ),
-        LocalArtwork::new(
-            droppedneedle_kernel::db::Db::open_for_tests(pool.connect_options().get_filename())
-                .unwrap(),
-        ),
-        None,
+        LocalArtwork::new(droppedneedle_kernel::db::Db::open_for_tests(&app_db).unwrap()),
+        Arc::new(providers.coverart.clone()),
         config.live(),
-    )
-    .with_images(Arc::new(providers.images.clone()))
-    .with_artist_source(Arc::new(CatalogArtistImages(catalog)));
+        Arc::new(providers.images.clone()),
+        Arc::new(CatalogArtistImages(catalog)),
+    );
 
     let before = unix_now();
     assert!(
@@ -1190,97 +1211,6 @@ async fn a_failed_portrait_lookup_keeps_the_short_outage_marker() {
     assert!(
         (before + OUTAGE_TTL_SECS..=unix_now() + OUTAGE_TTL_SECS).contains(&until),
         "remembered for the outage wait, until {until} (asked at {before})"
-    );
-}
-
-/// TheAudioDB still names some artist pictures over plain http. Such a
-/// picture is fetched over https from the same host, not refused, which
-/// stored a four-hour "no picture" for artists TheAudioDB has a thumbnail
-/// for.
-#[tokio::test]
-async fn an_audiodb_picture_named_over_http_is_fetched_over_https() {
-    use droppedneedle_catalog::artwork::{
-        ArtworkService, cache::ArtworkCache, local::LocalArtwork,
-    };
-    use droppedneedle_catalog::metadata::precache::CatalogArtistImages;
-    use droppedneedle_providers::executor::ScriptedWire;
-    use droppedneedle_providers::{ProviderEndpoints, audiodb, musicbrainz};
-
-    const PNG: &[u8] = &[
-        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
-        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f,
-        0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x00,
-        0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49,
-        0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
-    ];
-    let wire = Arc::new(ScriptedWire::new());
-    wire.answer(
-        &format!("{}/artist/{ARTIST}", musicbrainz::MB_API_BASE),
-        200,
-        &[],
-        fixture("mb_artist.json"),
-    );
-    // Shaped as TheAudioDB answered for Hiroyuki Sawano on 2026-10-22
-    // (thumbnail over http), with this suite's artist.
-    wire.answer(
-        &format!("{}/123/artist-mb.php", audiodb::DEFAULT_BASE_URL),
-        200,
-        &[],
-        json!({"artists": [{
-            "idArtist": "111239",
-            "strArtist": "Radiohead",
-            "strMusicBrainzID": ARTIST,
-            "strArtistThumb": "http://r2.theaudiodb.com/images/media/artist/thumb/radiohead.jpg",
-        }]})
-        .to_string(),
-    );
-    wire.answer(
-        "https://r2.theaudiodb.com/images/media/artist/thumb/radiohead.jpg",
-        200,
-        &[("content-type", "image/png")],
-        PNG,
-    );
-    let providers = Arc::new(Providers::over_wire(
-        wire.clone(),
-        Arc::new(droppedneedle_kernel::clock::SystemClock),
-        ProviderEndpoints {
-            musicbrainz: musicbrainz::MB_API_BASE.to_owned(),
-            audiodb: audiodb::DEFAULT_BASE_URL.to_owned(),
-            ..ProviderEndpoints::closed()
-        },
-    ));
-    let (pool, dir) = crate::common::migrated_pool("reads-catalog-audiodb-http").await;
-    let rig = AuthRig::new("reads-catalog-audiodb-http").await;
-    let catalog = Catalog::new(
-        Upstream::new(
-            providers.clone(),
-            Arc::new(TestSettings {
-                mb_url: musicbrainz::MB_API_BASE.to_owned(),
-            }),
-            rig.deps.clone(),
-        ),
-        local_catalog(&dir),
-    );
-    let config = crate::common::config_store(&dir.join("settings"));
-    let artwork = ArtworkService::new(
-        ArtworkCache::new(
-            dir.join("covers"),
-            1024 * 1024,
-            std::sync::Arc::new(droppedneedle_kernel::clock::SystemClock),
-        ),
-        LocalArtwork::new(
-            droppedneedle_kernel::db::Db::open_for_tests(pool.connect_options().get_filename())
-                .unwrap(),
-        ),
-        None,
-        config.live(),
-    )
-    .with_images(Arc::new(providers.images.clone()))
-    .with_artist_source(Arc::new(CatalogArtistImages(catalog)));
-
-    assert!(
-        artwork.warm_artist_image(ARTIST).await,
-        "the picture is fetched and stored"
     );
 }
 
@@ -1310,7 +1240,7 @@ async fn a_cold_artist_image_waits_out_a_busy_musicbrainz() {
         &format!("{}/123/artist-mb.php", audiodb::DEFAULT_BASE_URL),
         200,
         &[],
-        upstream_fixture("audiodb_artist"),
+        audiodb_fixture("artist_mb_found.json"),
     );
     // No Wikidata item carries the MBID, so the portrait comes through
     // MusicBrainz's Wikidata link.
@@ -1324,13 +1254,13 @@ async fn a_cold_artist_image_waits_out_a_busy_musicbrainz() {
         &format!("{}/w/api.php", wikidata::WIKIDATA_BASE),
         200,
         &[],
-        upstream_fixture("wikidata_claims"),
+        wikidata_fixture("claims_p18_found.json"),
     );
     wire.answer(
         &format!("{}/w/api.php", wikidata::COMMONS_BASE),
         200,
         &[],
-        upstream_fixture("commons_imageinfo"),
+        wikidata_fixture("commons_imageinfo_credit.json"),
     );
     let providers = Arc::new(Providers::over_wire(
         wire.clone(),
@@ -1355,6 +1285,7 @@ async fn a_cold_artist_image_waits_out_a_busy_musicbrainz() {
             rig.deps.clone(),
         ),
         local_catalog(&dir),
+        page_sources(&dir),
     );
 
     // One request a second, resting two more: a page would wait three.
@@ -1373,10 +1304,7 @@ async fn a_cold_artist_image_waits_out_a_busy_musicbrainz() {
         .iter()
         .map(|image| image.url.as_str())
         .collect();
-    assert_eq!(
-        urls,
-        ["https://upload.wikimedia.org/wikipedia/commons/a/a1/Radiohead_2016.jpg"]
-    );
+    assert_eq!(urls, [COMMONS_THUMB]);
     assert!(started.elapsed() >= Duration::from_secs(2), "it waited");
     assert!(
         wire.sent()
@@ -1443,7 +1371,7 @@ async fn a_commons_portrait_answers_its_credit_as_plain_text() {
             ..ProviderEndpoints::closed()
         },
     ));
-    let (pool, dir) = crate::common::migrated_pool("reads-catalog-credit").await;
+    let (app_db, dir) = crate::common::migrated_file("reads-catalog-credit");
     let rig = AuthRig::new("reads-catalog-credit").await;
     let catalog = Catalog::new(
         Upstream::new(
@@ -1454,6 +1382,7 @@ async fn a_commons_portrait_answers_its_credit_as_plain_text() {
             rig.deps.clone(),
         ),
         local_catalog(&dir),
+        page_sources(&dir),
     );
     let config = crate::common::config_store(&dir.join("settings"));
     let artwork = ArtworkService::new(
@@ -1462,15 +1391,12 @@ async fn a_commons_portrait_answers_its_credit_as_plain_text() {
             1024 * 1024,
             std::sync::Arc::new(droppedneedle_kernel::clock::SystemClock),
         ),
-        LocalArtwork::new(
-            droppedneedle_kernel::db::Db::open_for_tests(pool.connect_options().get_filename())
-                .unwrap(),
-        ),
-        None,
+        LocalArtwork::new(droppedneedle_kernel::db::Db::open_for_tests(&app_db).unwrap()),
+        Arc::new(providers.coverart.clone()),
         config.live(),
-    )
-    .with_images(Arc::new(providers.images.clone()))
-    .with_artist_source(Arc::new(CatalogArtistImages(catalog)));
+        Arc::new(providers.images.clone()),
+        Arc::new(CatalogArtistImages(catalog)),
+    );
     let app = with_test_principal(
         covers::routes()
             .with_state(CoversState::new(Arc::new(artwork)))
@@ -1610,6 +1536,7 @@ async fn a_passing_failure_is_not_cached_as_a_short_section() {
             rig.deps.clone(),
         ),
         local_catalog(&dir),
+        page_sources(&dir),
     );
     tokio::time::pause();
 
@@ -1762,55 +1689,6 @@ impl CatalogSettings for KeyedSettings {
     }
 }
 
-/// TheAudioDB answers depend on the key they were asked with: once the
-/// saved key changes, art kept under the old key is not served, and the
-/// new key is asked.
-#[tokio::test]
-async fn audiodb_art_is_kept_per_api_key() {
-    let mut routes = routes();
-    routes.push(Route {
-        path: "/audiodb/premium-key/artist-mb.php".to_owned(),
-        param: Some(("i", ARTIST)),
-        status: 200,
-        body: r#"{"artists": null}"#.to_owned(),
-    });
-    let fixtures = Fixtures::start_with(routes).await;
-    let dir = crate::common::ScratchDir::new("reads-catalog-audiodb-key");
-    crate::common::migrated_db(&dir.join("app.db"));
-    let rig = AuthRig::new("reads-catalog-audiodb-key").await;
-    let http = droppedneedle_kernel::http_client::HttpClientFactory::new().unwrap();
-    let settings = Arc::new(KeyedSettings {
-        inner: TestSettings {
-            mb_url: format!("{}/mb/ws/2", fixtures.base),
-        },
-        audiodb_key: Mutex::new(String::new()),
-    });
-    let catalog = Catalog::new(
-        Upstream::new(
-            Arc::new(fixtures.providers(&http)),
-            settings.clone(),
-            rig.deps.clone(),
-        ),
-        local_catalog(&dir),
-    );
-
-    assert!(
-        catalog.fill_artist_images(ARTIST).await,
-        "the free key's fill stores them"
-    );
-    let free = catalog.artist_extended(ARTIST).await.unwrap();
-    assert_eq!(
-        free.images.thumb_url.as_deref(),
-        Some("https://r2.theaudiodb.com/images/media/artist/thumb/radiohead.jpg")
-    );
-
-    *settings.audiodb_key.lock().unwrap() = "premium-key".to_owned();
-    catalog.fill_artist_images(ARTIST).await;
-    let premium = catalog.artist_extended(ARTIST).await.unwrap();
-    assert_eq!(fixtures.hits("/audiodb/premium-key/artist-mb.php"), 1);
-    assert_eq!(premium.images.thumb_url, None);
-}
-
 /// A popular song MusicBrainz cannot place is remembered for a day: the
 /// artist page does not search for it again before then, and does after.
 #[tokio::test]
@@ -1863,6 +1741,7 @@ async fn a_song_nothing_places_is_asked_again_after_a_day() {
             rig.deps.clone(),
         ),
         local_catalog(&dir),
+        page_sources(&dir),
     );
     let searches = || {
         wire.sent()

@@ -1,7 +1,7 @@
 //! Library reads: catalog, decades, suggestions, genres, lyrics.
 //!
 //! `/api/v3` read handlers over the
-//! 0001 baseline `local_*` tables plus `catalog_user_favorites` for the
+//! `local_*` tables plus `catalog_user_favorites` for the
 //! caller's favorite flags. These routes read existing tables only and
 //! sit behind the caller's session; membership and track resolution are
 //! POSTs only because their id lists ride in a body.
@@ -16,7 +16,6 @@
 //! the API document.
 
 pub mod cursor;
-pub(crate) mod definitions;
 pub mod edition_tracks;
 pub mod error;
 pub mod file_lyrics;

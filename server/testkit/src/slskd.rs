@@ -1,14 +1,12 @@
 //! In-repo mock slskd server (axum).
 //!
-//! Ported from v2's slskd mock: the executable record
-//! of live-verified slskd 0.25.1 behavior. Shapes mirror the verified JSON
+//! The executable record of live-verified slskd 0.25.1 behavior. Shapes mirror the verified JSON
 //! (camelCase keys, comma-joined `state` flags, plain-array enqueue
 //! returning `{Enqueued, Failed}`, no batch GUID: correlation is by
 //! `(username, filename)`). No test touches a live slskd instance; every
 //! contract test runs against this on loopback.
 //!
-//! Beyond the v2 mock, this pins three more verified behaviors as
-//! scriptable modes so the tests can assert them:
+//! It also pins three verified behaviors as scriptable modes so the tests can assert them:
 //!
 //! - 429 single-op: one-shot flags make the next search or enqueue answer
 //!   429 (slskd permits only one concurrent operation).
@@ -111,6 +109,8 @@ struct MockState {
     /// Artificial delay (ms) applied inside search/enqueue handlers so the
     /// semaphore test can observe overlap if serialization breaks.
     handler_delay_ms: u64,
+    /// Enqueued files wait in the peer's queue instead of finishing.
+    queue_enqueued: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -449,6 +449,7 @@ async fn enqueue(
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         guard.in_flight -= 1;
+        let queue_enqueued = guard.queue_enqueued;
         let bucket = guard.transfers.entry(username.clone()).or_default();
         for entry in &files {
             let filename = entry
@@ -460,12 +461,17 @@ async fn enqueue(
                 failed.push(json!({"filename": filename, "size": size}));
                 continue;
             }
-            bucket.push(Transfer::completed(
+            let mut transfer = Transfer::completed(
                 Uuid::new_v4().simple().to_string(),
                 &username,
                 filename,
                 size,
-            ));
+            );
+            if queue_enqueued {
+                transfer.bytes_transferred = 0;
+                transfer.state = "Queued, Remotely".to_owned();
+            }
+            bucket.push(transfer);
             enqueued.push(json!({"filename": filename, "size": size}));
         }
     }
@@ -679,6 +685,16 @@ impl MockSlskd {
             .fail_next_enqueue = true;
     }
 
+    /// Leave every later enqueued file waiting in its peer's queue, with
+    /// no bytes moved, instead of finishing it at once.
+    pub fn queue_enqueued(&self, queued: bool) {
+        self.state
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .queue_enqueued = queued;
+    }
+
     /// Delay (ms) inside search/enqueue handlers for the semaphore test.
     pub fn set_handler_delay_ms(&self, delay_ms: u64) {
         self.state
@@ -793,6 +809,7 @@ impl MockSlskd {
         guard.in_flight = 0;
         guard.max_in_flight = 0;
         guard.handler_delay_ms = 0;
+        guard.queue_enqueued = false;
         self.statuses.reset();
     }
 }

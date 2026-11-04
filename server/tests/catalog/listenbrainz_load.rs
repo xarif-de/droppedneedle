@@ -556,6 +556,7 @@ async fn journey(tag: &str, lastfm: bool) -> Measured {
             rig.deps.clone(),
         ),
         LocalCatalog::new(rig.platform.db.clone()),
+        crate::common::bundles::quiet_page_sources(&rig.platform.db),
     );
     let counts = SearchCounts::new(
         &providers,
@@ -572,13 +573,12 @@ async fn journey(tag: &str, lastfm: bool) -> Measured {
         &library,
         &collections.stores,
     );
-    let requests = RequestsState::new(
-        &acquire.db,
-        Arc::new(
+    let requests = RequestsState {
+        quota: Arc::new(
             droppedneedle_acquire::requests::quota::QuotaLedger::unlimited(acquire.db.clone()),
         ),
-        acquire.dispatch.clone(),
-    );
+        ..acquire.requests.clone()
+    };
     let mixes = mix_sources::live_builder(
         &requests,
         &providers,

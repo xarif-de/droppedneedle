@@ -15,9 +15,7 @@
 //! estimate: that only keeps the length out of the rules that settle on
 //! a length alone.
 
-use std::fs::File;
 use std::io::{BufReader, ErrorKind, Read, Seek, SeekFrom};
-use std::path::Path;
 
 /// Bitrates in kbit/s by MPEG version (1, then 2 and 2.5), layer (I, II,
 /// III) and bitrate index. Zero is free format or invalid.
@@ -63,8 +61,8 @@ const HEADER_MASK: u32 = 0xFFFE_0C00;
 /// True when lofty takes this MP3's length from a frame count. A file
 /// with no frame lofty would read, or one that ends early, is an
 /// estimate; only an I/O failure is an error.
-pub fn length_measured(path: &Path) -> std::io::Result<bool> {
-    let mut reader = BufReader::new(File::open(path)?);
+pub fn length_measured(at: super::TrackFile<'_>) -> std::io::Result<bool> {
+    let mut reader = BufReader::new(at.open()?);
     match first_frame_counts_frames(&mut reader) {
         Err(error) if error.kind() == ErrorKind::UnexpectedEof => Ok(false),
         read => read,

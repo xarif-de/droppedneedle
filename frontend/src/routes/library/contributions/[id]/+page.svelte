@@ -16,23 +16,26 @@
 		Trash2
 	} from 'lucide-svelte';
 	import type { PageData } from './$types';
-	import type { ReleaseDraft, ReleaseTextField } from '$lib/types';
-	import ContributionDiscogsSource from '$lib/components/library/ContributionDiscogsSource.svelte';
-	import ContributionDiscogsComparison from '$lib/components/library/ContributionDiscogsComparison.svelte';
-	import ContributionMusicBrainzReview from '$lib/components/library/ContributionMusicBrainzReview.svelte';
+	import type { ReleaseDraft } from '$lib/features/library/queries/types';
+	import type { components } from '$lib/api/v3/openapi';
+	import ContributionDiscogsSource from '$lib/features/library/components/ContributionDiscogsSource.svelte';
+	import ContributionDiscogsComparison from '$lib/features/library/components/ContributionDiscogsComparison.svelte';
+	import ContributionMusicBrainzReview from '$lib/features/library/components/ContributionMusicBrainzReview.svelte';
 	import { authStore } from '$lib/stores/authStore.svelte';
-	import { getLibraryContributionQuery } from '$lib/queries/libraryContributions/LibraryContributionQueries.svelte';
+	import { getLibraryContributionQuery } from '$lib/features/library/queries/LibraryContributionQueries.svelte';
 	import {
 		createCancelLibraryContributionMutation,
 		createRebuildLibraryContributionMutation,
 		createUpdateLibraryContributionMutation
-	} from '$lib/queries/libraryContributions/LibraryContributionMutations.svelte';
+	} from '$lib/features/library/queries/LibraryContributionMutations.svelte';
 	import { withBasePath } from '$lib/utils/basePath';
 	import Button from '$lib/ui/Button.svelte';
 	import Card from '$lib/ui/Card.svelte';
 	import ConfirmDialog from '$lib/ui/ConfirmDialog.svelte';
 	import Field from '$lib/ui/Field.svelte';
 	import Input from '$lib/ui/Input.svelte';
+
+	type ReleaseTextField = components['schemas']['ReleaseTextField'];
 
 	let { data }: { data: PageData } = $props();
 	const contributionQuery = getLibraryContributionQuery(() => data.contributionId);

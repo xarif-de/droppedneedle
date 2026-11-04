@@ -2321,7 +2321,8 @@ export interface paths {
         put?: never;
         /**
          * Retry a failed, cancelled or partial download now. Answers the new
-         *     task. An album retry clears the album's blocklist first.
+         *     task, or the download already fetching the album. An album retry clears
+         *     the album's blocklist first.
          *     `POST /api/v3/downloads/tasks/{task_id}/retry`.
          */
         post: operations["retry_task_handler"];
@@ -7351,8 +7352,7 @@ export interface paths {
         /**
          * Refresh one user's personal mix.
          *     `POST /api/v3/requests/personal-mix/refresh`. Repeat calls while a build
-         *     runs answer `already_running`; unlinked users get 400, and a server
-         *     without the mix builder 409.
+         *     runs answer `already_running`; unlinked users get 400.
          */
         post: operations["refresh_mix_handler"];
         delete?: never;
@@ -11588,7 +11588,7 @@ export interface components {
          * @description The stable code of a [`CandidateNote`].
          * @enum {string}
          */
-        CandidateNoteCode: "complete" | "incomplete" | "lengths" | "quality" | "no_tracklist" | "names_album" | "title_unclear" | "strong" | "weak";
+        CandidateNoteCode: "complete" | "incomplete" | "lengths" | "quality" | "no_tracklist" | "names_album" | "title_unclear" | "strong" | "weak" | "turned_down_before";
         /**
          * @description Why a candidate is outside the download settings. Declared in the order
          *     the page names them: the first that applies is shown.
@@ -16134,8 +16134,6 @@ export interface components {
              * @description Selected MBIDs already followed before this import.
              */
             already_following: number;
-            /** @description Approval batch for a non-admin auto-download mirror; else null. */
-            approval_batch_id?: string | null;
             /**
              * Format: int64
              * @description Brand-new follows with auto-download armed.
@@ -19941,7 +19939,7 @@ export interface components {
          * @description One reason, stored and sent by its snake_case spelling.
          * @enum {string}
          */
-        Reason: "weak_match" | "no_artist_evidence" | "mostly_unmatched" | "tag_mismatch" | "fingerprint_mismatch" | "fingerprint_unconfirmed" | "album_version_only" | "no_release" | "no_tracks" | "version_lower_quality" | "no_better_than_yours" | "owned_elsewhere" | "owned_on_album" | "album_needs_check" | "no_album_match" | "album_not_found" | "tags_disagree" | "not_chosen_edition" | "samples" | "too_many_files" | "interrupted" | "import_failed" | "held_by_earlier_version" | "format_not_listed" | "target_occupied" | "upgrade_blocked" | "library_changed" | "library_unavailable" | "naming_script_failed" | "library_folder_missing" | "library_off" | "local_fault" | "files_missing" | "files_unlisted" | "outside_downloads_folder" | "size_mismatch" | "corrupt" | "no_audio" | "sample" | "wrong_edition" | "not_pinned_edition" | "wrong_album" | "quality_rejected" | "not_an_upgrade" | "wrong_track" | "stalled" | "queue_timeout" | "queue_gave_way" | "never_started" | "deadline" | "source_failed" | "no_source" | "download_failed" | "album_lookup_unavailable" | "recording_unknown" | "no_album_for_recording" | "no_album_folder" | "no_album_release" | "album_releases_exhausted" | "track_not_found" | "nothing_allowed" | "no_download_source" | "settings_unreadable" | "journal_unreadable" | "musicbrainz_unavailable" | "acoustid_unavailable" | "held_for_review" | "tracks_missing" | "already_owned" | "cancelled" | "moved_on";
+        Reason: "weak_match" | "no_artist_evidence" | "mostly_unmatched" | "tag_mismatch" | "fingerprint_mismatch" | "fingerprint_unconfirmed" | "album_version_only" | "no_release" | "no_tracks" | "version_lower_quality" | "no_better_than_yours" | "owned_elsewhere" | "owned_on_album" | "album_needs_check" | "no_album_match" | "album_not_found" | "tags_disagree" | "not_chosen_edition" | "samples" | "too_many_files" | "interrupted" | "import_failed" | "held_by_earlier_version" | "format_not_listed" | "target_occupied" | "upgrade_blocked" | "library_changed" | "library_unavailable" | "naming_script_failed" | "library_folder_missing" | "library_off" | "local_fault" | "files_missing" | "files_unlisted" | "outside_downloads_folder" | "size_mismatch" | "corrupt" | "no_audio" | "sample" | "wrong_edition" | "not_pinned_edition" | "wrong_album" | "quality_rejected" | "not_an_upgrade" | "wrong_track" | "stalled" | "queue_timeout" | "queue_gave_way" | "never_started" | "deadline" | "source_failed" | "no_source" | "download_failed" | "album_lookup_unavailable" | "recording_unknown" | "no_album_for_recording" | "no_album_folder" | "no_album_release" | "album_releases_exhausted" | "track_not_found" | "nothing_allowed" | "no_download_source" | "settings_unreadable" | "journal_unreadable" | "musicbrainz_unavailable" | "acoustid_unavailable" | "held_for_review" | "tracks_missing" | "already_owned" | "cancelled" | "moved_on" | "no_better_copy" | "already_downloading" | "already_in_library";
         /** @description How many reviews one reason holds. */
         ReasonCount: {
             /** Format: int64 */
@@ -27537,7 +27535,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
-            /** @description Not configured (NOT_CONFIGURED) or not built in this version yet (NOT_AVAILABLE) */
+            /** @description Not configured (NOT_CONFIGURED) */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -28284,7 +28282,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
-            /** @description Not configured (NOT_CONFIGURED) or not built in this version yet (NOT_AVAILABLE) */
+            /** @description Not configured (NOT_CONFIGURED) */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -28512,7 +28510,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
-            /** @description Not configured (NOT_CONFIGURED) or not built in this version yet (NOT_AVAILABLE) */
+            /** @description Not configured (NOT_CONFIGURED) */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -29881,7 +29879,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
-            /** @description Not configured (NOT_CONFIGURED) or not built in this version yet (NOT_AVAILABLE) */
+            /** @description Not configured (NOT_CONFIGURED) */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -29946,7 +29944,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
-            /** @description Not configured (NOT_CONFIGURED) or not built in this version yet (NOT_AVAILABLE) */
+            /** @description Not configured (NOT_CONFIGURED) */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -30011,7 +30009,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
-            /** @description Not configured (NOT_CONFIGURED) or not built in this version yet (NOT_AVAILABLE) */
+            /** @description Not configured (NOT_CONFIGURED) */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -30076,7 +30074,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
-            /** @description Not configured (NOT_CONFIGURED) or not built in this version yet (NOT_AVAILABLE) */
+            /** @description Not configured (NOT_CONFIGURED) */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -43457,15 +43455,6 @@ export interface operations {
             };
             /** @description ListenBrainz is not connected */
             400: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Weekly Mix is not available on this server */
-            409: {
                 headers: {
                     [name: string]: unknown;
                 };

@@ -1,20 +1,20 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { ArrowLeft, CalendarClock, ExternalLink, Settings } from 'lucide-svelte';
-	import ArtistImage from '$lib/components/ArtistImage.svelte';
-	import EmptyState from '$lib/components/EmptyState.svelte';
-	import { outsideLink } from '$lib/components/outsideLink';
-	import CitySearchInput from '$lib/components/following/CitySearchInput.svelte';
-	import EventCityManager from '$lib/components/following/EventCityManager.svelte';
+	import ArtistImage from '$lib/media/ArtistImage.svelte';
+	import EmptyState from '$lib/ui/EmptyState.svelte';
+	import { outsideLink } from '$lib/ui/outsideLink';
+	import CitySearchInput from '$lib/features/following/components/CitySearchInput.svelte';
+	import EventCityManager from '$lib/features/following/components/EventCityManager.svelte';
 	import {
 		getConcertsQuery,
 		getEventCitiesQuery
-	} from '$lib/queries/following/FollowQueries.svelte';
+	} from '$lib/features/following/queries/FollowQueries.svelte';
 	import {
 		createMarkConcertsSeenMutation,
 		createReplaceEventCitiesMutation
-	} from '$lib/queries/following/FollowMutations.svelte';
-	import type { CitySearchResult, Concert } from '$lib/queries/following/types';
+	} from '$lib/features/following/queries/FollowMutations.svelte';
+	import type { CitySearchResult, Concert } from '$lib/features/following/queries/types';
 	import { authStore } from '$lib/stores/authStore.svelte';
 	import { KM_PER_MILE } from '$lib/constants';
 	import { withBasePath } from '$lib/utils/basePath';

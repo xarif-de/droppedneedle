@@ -1,0 +1,87 @@
+import { describe, expect, it } from 'vitest';
+
+import {
+	MANAGEMENT_REASON_LABELS,
+	managementReasonLabel,
+	titleManagementValue
+} from './LibraryManagementDisplay';
+
+const ALL_STABLE_CODES = [
+	'MANAGEMENT_DISABLED',
+	'SCAN_HELD_BACK',
+	'LOCAL_METADATA',
+	'IDENTITY_NOT_ACCEPTED',
+	'RELEASE_NOT_SELECTED',
+	'TRACK_NOT_MAPPED',
+	'METADATA_UNAVAILABLE',
+	'OPTIONAL_ENRICHMENT_DEFERRED',
+	'FORMAT_UNSUPPORTED',
+	'FIELD_UNSUPPORTED_BY_FORMAT',
+	'FILE_UNREADABLE',
+	'FILE_CHANGED',
+	'PROFILE_CHANGED',
+	'POLICY_CHANGED',
+	'OVERRIDE_CHANGED',
+	'ROOT_UNAVAILABLE',
+	'ROOT_READ_ONLY',
+	'OUT_OF_ROOT',
+	'SYMLINK_UNSUPPORTED',
+	'PATH_COLLISION_IDENTICAL',
+	'PATH_COLLISION_DIFFERENT',
+	'POSITION_COLLISION',
+	'SIDECAR_COLLISION',
+	'PATH_TOO_LONG',
+	'SCRIPT_VALIDATION_FAILED',
+	'INSUFFICIENT_SPACE',
+	'BASELINE_UNAVAILABLE',
+	'BASELINE_SNAPSHOT_MISSING',
+	'BASELINE_SNAPSHOT_CORRUPT',
+	'UNDO_EXPIRED',
+	'RECOVERY_NEEDS_ATTENTION',
+	'BUNDLE_BLOCKED',
+	'BUNDLE_TOO_LARGE',
+	'RECYCLE_UNAVAILABLE',
+	'DUPLICATE_CHANGED',
+	'EXTERNAL_REFRESH_NOT_CONFIGURED',
+	'EXTERNAL_REFRESH_AUTH_FAILED',
+	'EXTERNAL_REFRESH_NOT_FOUND',
+	'EXTERNAL_REFRESH_UNREACHABLE',
+	'EXTERNAL_REFRESH_FAILED',
+	'EXTERNAL_REFRESH_INTERRUPTED',
+	'ALBUM_CHANGED',
+	'CATALOG_CHANGED',
+	'CHOSEN_EDITION_FITS_NO_FILE',
+	'CHOSEN_EDITION_NOT_LISTED',
+	'INTERRUPTED',
+	'NOT_SCHEDULED',
+	'SIDECAR_UNREADABLE',
+	'UNCONFIRMED_MATCH',
+	'UNMATCHED_ALBUM',
+	'WRITE_FAILED',
+	'TAKEN_OVER',
+	'FILES_CHANGED_OUTSIDE',
+	'CHANGED_OUTSIDE',
+	'EDITION_REMAP_PENDING'
+];
+
+describe('managementReasonLabel', () => {
+	it('gives every stable reason code human copy, with no loss claim and a fallback for new codes', () => {
+		expect(Object.keys(MANAGEMENT_REASON_LABELS).sort()).toEqual([...ALL_STABLE_CODES].sort());
+		for (const code of ALL_STABLE_CODES) {
+			const label = managementReasonLabel(code);
+			expect(label.length, code).toBeGreaterThan(0);
+			expect(label).not.toBe(code);
+			expect(label).not.toContain('_');
+		}
+
+		// The warnings-only field code claims no loss.
+		const field = managementReasonLabel('FIELD_UNSUPPORTED_BY_FORMAT');
+		expect(field).toBe('Some fields cannot be stored in this format');
+		expect(field.toLowerCase()).not.toContain('loss');
+		expect(field.toLowerCase()).not.toContain('lost');
+
+		expect(managementReasonLabel('SOME_FUTURE_CODE')).toBe(
+			titleManagementValue('SOME_FUTURE_CODE')
+		);
+	});
+});

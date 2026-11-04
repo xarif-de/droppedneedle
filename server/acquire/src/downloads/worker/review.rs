@@ -4,7 +4,9 @@
 //! allows and a candidate is recommended, the task is linked to it and
 //! fetched like a hand pick on the next pass. Otherwise the task is parked
 //! on the job and waits for its owner to pick one, or to turn them all
-//! down.
+//! down. An upgrade never waits: it takes a recommended copy whatever the
+//! setting says, and without one it settles on the next pass with the
+//! library copy kept.
 //!
 //! A look can take minutes (every source answers under its own time
 //! limit), so it runs on its own task, never inside the worker pass: polls,
@@ -16,6 +18,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use super::{DownloadWorker, Pass, SourceSet, in_try_order};
+use crate::dispatch::DispatchOrigin;
 use crate::downloads::store::TaskRow;
 use crate::search_jobs::candidates::Pin;
 use crate::search_jobs::review::{ReviewMode, Verdict, verdict};
@@ -64,7 +67,6 @@ impl DownloadWorker {
     pub(super) fn start_review(self: &Arc<Self>, pass: &Pass, task: &TaskRow) -> bool {
         if pass.config.review == ReviewMode::Off
             || task.download_type == "track"
-            || self.targets.is_none()
             || lock(&self.reviews.looked).contains(&task.id)
         {
             return false;
@@ -107,10 +109,7 @@ impl DownloadWorker {
         order: &[crate::downloads::source_tag::SourceTag],
         task: &TaskRow,
     ) -> Reviewed {
-        let Some(targets) = &self.targets else {
-            return Reviewed::Search;
-        };
-        let target = match targets.target(task).await {
+        let target = match self.targets.target(task).await {
             Ok(target) if target.track.is_none() => target,
             Ok(_) => return Reviewed::Search,
             Err(error) => {
@@ -137,6 +136,14 @@ impl DownloadWorker {
         let job_id = uuid::Uuid::new_v4().simple().to_string();
         let ordered: Vec<_> = in_try_order(sources, order).into_iter().cloned().collect();
         let (candidates, _failed) = search_sources(&ordered, &target, &job_id).await;
+        let upgrade = task.origin == DispatchOrigin::Upgrade.as_str();
+        // "Always wait for my pick" covers requests and wanted albums: an
+        // upgrade that waits costs nothing but a growing queue.
+        let mode = if upgrade && mode == ReviewMode::Always {
+            ReviewMode::WhenUnsure
+        } else {
+            mode
+        };
         let outcome = match verdict(mode, &candidates) {
             Verdict::Nothing => return Reviewed::Search,
             Verdict::Park => ReviewOutcome::Park,
@@ -187,7 +194,12 @@ impl DownloadWorker {
                 self.announce_review(&task.user_id, &job_id, JobStatus::Matched, count);
             }
             ReviewOutcome::Park => {
-                tracing::info!(task_id = %task.id, job_id, candidates = count, "download waits for a pick");
+                let what = if upgrade {
+                    "upgrade found no better copy"
+                } else {
+                    "download waits for a pick"
+                };
+                tracing::info!(task_id = %task.id, job_id, candidates = count, "{what}");
                 self.announce_review(&task.user_id, &job_id, JobStatus::Completed, count);
             }
         }

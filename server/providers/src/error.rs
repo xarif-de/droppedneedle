@@ -521,7 +521,8 @@ fn parse_hms(text: &str) -> Option<(u32, u32, u32)> {
     Some((hour, minute, second))
 }
 
-/// Gregorian civil date to unix seconds (Howard Hinnant's days-from-civil).
+/// A UTC date and clock to unix seconds; `None` for a date that does not
+/// exist or one before the epoch. A leap second (`:60`) is kept as given.
 fn civil_to_unix(
     year: i32,
     month: u32,
@@ -530,76 +531,65 @@ fn civil_to_unix(
     minute: u32,
     second: u32,
 ) -> Option<u64> {
-    if month == 0 || month > 12 || day == 0 || day > 31 {
-        return None;
-    }
-    let year = if month <= 2 { year - 1 } else { year };
-    let era = year.div_euclid(400);
-    let year_of_era = year.rem_euclid(400) as u64;
-    let month_prime = (month + 9) % 12;
-    let day_of_year = (153 * month_prime + 2) / 5 + day - 1;
-    let day_of_era =
-        year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + u64::from(day_of_year);
-    let days = era as i64 * 146_097 + day_of_era as i64 - 719_468;
-    let seconds = u64::try_from(days).ok()?;
-    seconds
-        .checked_mul(86_400)?
-        .checked_add(u64::from(hour) * 3_600 + u64::from(minute) * 60 + u64::from(second))
+    let month = time::Month::try_from(u8::try_from(month).ok()?).ok()?;
+    let date = time::Date::from_calendar_date(year, month, u8::try_from(day).ok()?).ok()?;
+    let midnight = u64::try_from(date.midnight().assume_utc().unix_timestamp()).ok()?;
+    midnight.checked_add(u64::from(hour) * 3_600 + u64::from(minute) * 60 + u64::from(second))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// `Retry-After` reads as seconds or any of the three date shapes,
+    /// before the rate-limit reset headers; a time in the past, a negative
+    /// and junk carry no wait.
     #[test]
-    fn retry_after_accepts_seconds_and_the_three_date_shapes() {
+    fn retry_after_reads_seconds_dates_and_reset_headers() {
         let now = 1_700_000_000;
-        let at = |value| parse_retry_after_at(value, now);
-        assert_eq!(at("5"), Some(Duration::from_secs(5)));
-        assert_eq!(at("  12  "), Some(Duration::from_secs(12)));
-        assert_eq!(
-            at("Wed, 01 Jan 2031 00:00:00 GMT"),
-            Some(Duration::from_secs(1_924_992_000 - 1_700_000_000))
-        );
-        // Past dates in each shape, negatives and junk carry no wait.
-        assert_eq!(at("Sunday, 06-Nov-94 08:49:37 GMT"), None);
-        assert_eq!(at("Sun Nov  6 08:49:37 1994"), None);
-        assert_eq!(at("-3"), None);
-        assert_eq!(at("not-a-date"), None);
-        assert_eq!(at(""), None);
-    }
+        let secs = |value| Some(Duration::from_secs(value));
+        for (value, expected) in [
+            ("5", secs(5)),
+            ("  12  ", secs(12)),
+            (
+                "Wed, 01 Jan 2031 00:00:00 GMT",
+                secs(1_924_992_000 - 1_700_000_000),
+            ),
+            ("Sunday, 06-Nov-94 08:49:37 GMT", None),
+            ("Sun Nov  6 08:49:37 1994", None),
+            ("-3", None),
+            ("not-a-date", None),
+            ("", None),
+        ] {
+            assert_eq!(parse_retry_after_at(value, now), expected, "{value:?}");
+        }
 
-    #[test]
-    fn header_lookup_prefers_retry_after_then_rate_limit_resets() {
-        let now = 1_700_000_000;
-        let headers = [("X-RateLimit-Reset", "1700000090"), ("Retry-After", "4")];
-        assert_eq!(
-            retry_delay_from_headers(headers, now),
-            Some(Duration::from_secs(4))
-        );
-        let headers = [("ratelimit-reset", "9")];
-        assert_eq!(
-            retry_delay_from_headers(headers, now),
-            Some(Duration::from_secs(9))
-        );
-        let headers = [("X-RateLimit-Reset", "1700000090")];
-        assert_eq!(
-            retry_delay_from_headers(headers, now),
-            Some(Duration::from_secs(90))
-        );
-        // A reset epoch or a date in the past carries no wait.
-        let headers = [("X-RateLimit-Reset", "1000000000")];
-        assert_eq!(retry_delay_from_headers(headers, now), None);
-        let headers = [("Retry-After", "Sun, 06 Nov 1994 08:49:37 GMT")];
-        assert_eq!(retry_delay_from_headers(headers, now), None);
-        let headers = [("Content-Type", "application/json")];
-        assert_eq!(retry_delay_from_headers(headers, now), None);
-    }
+        type Headers = &'static [(&'static str, &'static str)];
+        let rows: [(Headers, Option<Duration>); 6] = [
+            (
+                &[("X-RateLimit-Reset", "1700000090"), ("Retry-After", "4")],
+                secs(4),
+            ),
+            (&[("ratelimit-reset", "9")], secs(9)),
+            (&[("X-RateLimit-Reset", "1700000090")], secs(90)),
+            (&[("X-RateLimit-Reset", "1000000000")], None),
+            (&[("Retry-After", "Sun, 06 Nov 1994 08:49:37 GMT")], None),
+            (&[("Content-Type", "application/json")], None),
+        ];
+        for (headers, expected) in rows {
+            assert_eq!(
+                retry_delay_from_headers(headers.iter().copied(), now),
+                expected,
+                "{headers:?}"
+            );
+        }
 
-    #[test]
-    fn imf_fixdate_parses_the_epoch() {
-        assert_eq!(parse_imf_fixdate("Thu, 01 Jan 1970 00:00:00 GMT"), Some(0));
-        assert_eq!(parse_imf_fixdate("not a date"), None);
-        assert_eq!(parse_imf_fixdate("Sun, 06 Nov 1994 08:49:37 EST"), None);
+        for (text, expected) in [
+            ("Thu, 01 Jan 1970 00:00:00 GMT", Some(0)),
+            ("not a date", None),
+            ("Sun, 06 Nov 1994 08:49:37 EST", None),
+        ] {
+            assert_eq!(parse_imf_fixdate(text), expected, "{text:?}");
+        }
     }
 }

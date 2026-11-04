@@ -228,7 +228,9 @@ pub struct PluginDownloadSource {
     tag: SourceTag,
     journal: Arc<Journal>,
     policy: ReleasePolicy,
-    targets: Option<Arc<Targets>>,
+    /// Each task's album: a single track is fetched as part of its
+    /// album's release, and a lone-track release is the last resort.
+    targets: Arc<Targets>,
 }
 
 impl PluginDownloadSource {
@@ -238,6 +240,7 @@ impl PluginDownloadSource {
         key: String,
         journal: Arc<Journal>,
         policy: ReleasePolicy,
+        targets: Arc<Targets>,
     ) -> Self {
         let tag = SourceTag::plugin(&key);
         Self {
@@ -246,15 +249,8 @@ impl PluginDownloadSource {
             tag,
             journal,
             policy,
-            targets: None,
+            targets,
         }
-    }
-
-    /// Search each task's album: a single track is fetched as part of
-    /// its album's release, and a lone-track release is the last resort.
-    pub fn with_targets(mut self, targets: Arc<Targets>) -> Self {
-        self.targets = Some(targets);
-        self
     }
 
     /// The album's releases from this source's indexers.
@@ -428,11 +424,15 @@ impl PluginDownloadSource {
             .ok_or_else(|| {
                 SourceError::rejected(Reason::NoSource, format!("unknown download task {task_id}"))
             })?;
-        let target = super::sources::resolve_target(self.targets.as_ref(), &task).await?;
+        let target = super::sources::resolve_target(&self.targets, &task).await?;
         let blocked = super::sources::blocklist(&self.journal, &self.tag).await?;
+        let skipped = super::sources::automatic_blocklist(&self.journal, &task, &self.tag).await?;
         let index = candidate_index.max(0) as usize;
+        // The automatic search review's pick of a copy a landing turned
+        // down for the album is dropped: the walk below finds another.
         if let Some(Pin::Release { identity }) =
             pinned(&self.journal, &task, &self.tag, candidate_index).await
+            && (task.picked_by_person || !skipped.blocks(&identity))
         {
             // The release a person picked from a manual search, found
             // again by its identity (any band and outside the settings
@@ -460,7 +460,7 @@ impl PluginDownloadSource {
         // The releases an automatic pick may take, and whether the settings
         // refused any.
         let automatic = |results: Vec<PluginSearchResult>| -> (Vec<ScoredRelease>, bool) {
-            let scored = score_plugin_releases(results, &self.policy, &blocked);
+            let scored = score_plugin_releases(results, &self.policy, &skipped);
             let refused = scored.iter().any(|release| !release.refusal.is_empty());
             let taken = scored
                 .into_iter()
@@ -489,15 +489,13 @@ impl PluginDownloadSource {
             );
             refused_any |= refused;
             pick = lone.into_iter().find(untried);
-            if pick.is_some()
-                && let Some(targets) = self.targets.as_ref()
-            {
+            if pick.is_some() {
                 let reason = match (track.no_album, album_count) {
                     (Some(reason), _) => reason,
                     (None, 0) => TrackReason::NoAlbumRelease,
                     (None, _) => TrackReason::AlbumReleasesExhausted,
                 };
-                targets.record_lone_track(&task, reason);
+                self.targets.record_lone_track(&task, reason);
             }
         }
         let pick = pick.ok_or_else(|| {
@@ -664,10 +662,13 @@ mod tests {
         }
     }
 
-    // A listed file is the only thing a plugin says about a format before the
-    // download; a release that lists none is left to the landing.
+    /// Plugin releases are scored inside the release policy: a listed file
+    /// in a format the recipe does not list refuses its release, and plugin
+    /// scores rank only inside the policy's gates.
     #[test]
-    fn a_listed_file_the_recipe_does_not_list_refuses_the_release() {
+    fn plugin_releases_stay_inside_the_policy() {
+        // A listed file is the only thing a plugin says about a format before
+        // the download; a release that lists none is left to the landing.
         let policy = ReleasePolicy {
             usenet: UsenetPolicy::v2_defaults(),
             ignored_terms: Vec::new(),
@@ -704,12 +705,10 @@ mod tests {
                 ("flac", false),
                 ("none", false),
                 ("ogg", true)
-            ]
+            ],
+            "listed files"
         );
-    }
 
-    #[test]
-    fn plugin_scores_rank_inside_the_policy_gates() {
         let mut usenet = UsenetPolicy::v2_defaults();
         usenet.max_size_mb = 500;
         let policy = ReleasePolicy {
@@ -752,8 +751,9 @@ mod tests {
                 ("Artist - Album [320]", Band::Auto),
                 ("Artist - Album [overscored]", Band::Auto),
                 ("Artist - Album [maybe]", Band::Manual),
-            ]
+            ],
+            "ranking"
         );
-        assert_eq!(ranked[2].score, 1.0);
+        assert_eq!(ranked[2].score, 1.0, "ranking: an overscored release");
     }
 }

@@ -9,6 +9,7 @@
 //! landing port, publisher and catalog over one scratch database;
 //! MusicBrainz is a scripted release source.
 
+use crate::common::{Probe, track_file};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -176,7 +177,8 @@ fn length_ms(bytes: &[u8], scratch: &Path) -> Option<u64> {
     std::fs::write(&path, bytes).expect("probe copy");
     let format = droppedneedle_library::tags::format_for_path(&path).expect("format");
     let (_, header) =
-        droppedneedle_library::tags::read::read_scan_metadata(&path, format).expect("header");
+        droppedneedle_library::tags::read::read_scan_metadata(track_file(&path), format)
+            .expect("header");
     header
         .duration_seconds
         .map(|seconds| (seconds * 1000.0) as u64)
@@ -306,20 +308,16 @@ async fn dropped_album_lands_and_the_unknown_folder_waits_for_review() {
         shelf.join("0103 Hidden Track.flac").is_file(),
         "the bonus track is kept alongside the album"
     );
-    let drops: i64 = sqlx::query_scalar(
+    let drops: i64 = acquire.db.db().one(
         "SELECT COUNT(*) FROM local_tracks WHERE availability = 'indexed' \
          AND ingest_source = 'drop' AND download_task_id IS NULL",
-    )
-    .fetch_one(acquire.db.db().sqlx())
-    .await
-    .expect("catalog");
+        [],
+    );
     assert_eq!(drops, 3, "indexed as a drop, not a download");
-    let request: String =
-        sqlx::query_scalar("SELECT status FROM request_history WHERE musicbrainz_id_lower = ?1")
-            .bind(GROUP)
-            .fetch_one(acquire.db.db().sqlx())
-            .await
-            .expect("request row");
+    let request: String = acquire.db.db().one(
+        "SELECT status FROM request_history WHERE musicbrainz_id_lower = ?1",
+        rusqlite::params![GROUP],
+    );
     assert_eq!(
         request, "imported",
         "the complete album resolves the request"
@@ -678,14 +676,11 @@ async fn a_hand_match_finds_the_edition_in_a_large_group() {
             "case {case}: {:?}",
             now.items[0].detail
         );
-        let releases: Vec<String> = sqlx::query_scalar(
+        let releases: Vec<String> = acquire.db.db().column(
             "SELECT DISTINCT release_mbid FROM local_album_external_identities \
              WHERE release_group_mbid = ?1",
-        )
-        .bind(group(case))
-        .fetch_all(acquire.db.db().sqlx())
-        .await
-        .expect("identities");
+            rusqlite::params![group(case)],
+        );
         assert_eq!(releases, vec![release_id(case, 130)], "case {case}");
     }
 }
@@ -762,145 +757,131 @@ async fn a_deferred_upload_match_leaves_its_files_as_they_were() {
         .match_album(&held_viewer, entry.id, GROUP, None, &curator.user_id)
         .await;
     assert!(matched.is_err(), "the person is told: {matched:?}");
-    let held = || async {
-        sqlx::query_as::<_, (String, String, Option<String>)>(
+    let held = || {
+        acquire.db.db().row::<(String, String, Option<String>)>(
             "SELECT state, reason, release_mbid FROM acquire_held_files WHERE id = ?1",
+            rusqlite::params![file_id],
         )
-        .bind(file_id)
-        .fetch_one(acquire.db.db().sqlx())
-        .await
-        .expect("held file")
     };
     let as_it_was = (
         "held".to_owned(),
         "fingerprint_mismatch".to_owned(),
         Some(GUESS.to_owned()),
     );
-    assert_eq!(held().await, as_it_was);
+    assert_eq!(held(), as_it_was);
     let now = job_now(&acquire.drops, &curator, &job.id).await;
     assert_eq!(now.items[0].status, DropItemStatus::NeedsReview);
 
     std::fs::create_dir_all(&music).expect("library folder back");
     acquire.held.tend().await;
-    assert_eq!(held().await, as_it_was, "nothing retried it");
+    assert_eq!(held(), as_it_was, "nothing retried it");
     assert!(
         files_under(&music).is_empty(),
         "nothing reached the library"
     );
 }
 
-/// An automatic upload the library could not take is held paired with its
-/// track, so the held loop places it by itself once the library is on.
+/// An automatic upload held at a gate, the library switched off or an
+/// AcoustID outage, lands nothing while it lasts and is placed by the held
+/// loop by itself once the gate clears.
 #[tokio::test]
-async fn an_upload_deferred_with_the_library_off_is_retried_by_itself() {
+async fn a_held_upload_is_placed_once_its_gate_clears() {
     use droppedneedle_kernel::runtime_config::secret_sections::TypedLibrary;
-
-    let (_db, library, dir, auth) = bundles().await;
-    let work = dir.join("work");
-    std::fs::create_dir_all(&work).expect("work dir");
-    let bytes = tagged(&work, "flac_full_01.flac", "Dummy", "Mysterons", 1);
-    let lengths = [length_ms(&bytes, &work)];
-    let acquire = acquire_over(
-        &auth,
-        &library,
-        Arc::new(LibraryLanding::new(
-            &library,
-            every_priority(Arc::new(OneRelease(release(&["Mysterons"], &lengths)))),
-        )),
-    );
-    let switch = |on: bool| {
-        library
-            .settings
-            .store()
-            .update_secret_blocking::<TypedLibrary, String, _>(move |stored| {
-                let mut settings = stored.into_inner();
-                settings.enabled = on;
-                Ok(settings)
-            })
-            .expect("library switch saved");
-        library.core.refresh_registry();
-    };
-    let curator = Viewer {
-        user_id: "u-curator".to_owned(),
-        admin: false,
-    };
-    switch(false);
-    let job = drop_zip(
-        &acquire,
-        &curator,
-        "library-off",
-        &[("Dummy/01 - Mysterons.flac", &bytes)],
-    )
-    .await;
-    assert_eq!(job.items[0].status, DropItemStatus::NeedsReview);
-    let music = dir.join("music");
-    assert!(files_under(&music).is_empty(), "nothing lands while off");
-
-    switch(true);
-    acquire.held.tend().await;
-    assert_eq!(files_under(&music).len(), 1, "the held loop placed it");
-}
-
-/// An upload matched by itself during an AcoustID outage stays held while
-/// it lasts, and the held loop places it once AcoustID answers.
-#[tokio::test]
-async fn an_upload_held_in_an_acoustid_outage_is_retried_by_itself() {
     use droppedneedle_library::identify::sources::AcoustIdUnavailable;
 
-    let (_db, mut library, dir, auth) = bundles().await;
-    let outage = crate::acquire_landing::Outage::new(AcoustIdUnavailable::Unreachable);
-    library.imports.fingerprints = outage.clone();
-    let work = dir.join("work");
-    std::fs::create_dir_all(&work).expect("work dir");
-    let bytes = tagged(&work, "flac_full_01.flac", "Dummy", "Mysterons", 1);
-    let lengths = [length_ms(&bytes, &work)];
-    let acquire = acquire_over(
-        &auth,
-        &library,
-        Arc::new(LibraryLanding::new(
+    for (case, acoustid_down) in [("library-off", false), ("acoustid-down", true)] {
+        let (_db, mut library, dir, auth) = bundles().await;
+        let outage = crate::acquire_landing::Outage::new(AcoustIdUnavailable::Unreachable);
+        if acoustid_down {
+            library.imports.fingerprints = outage.clone();
+        }
+        let work = dir.join("work");
+        std::fs::create_dir_all(&work).expect("work dir");
+        let bytes = tagged(&work, "flac_full_01.flac", "Dummy", "Mysterons", 1);
+        let lengths = [length_ms(&bytes, &work)];
+        let acquire = acquire_over(
+            &auth,
             &library,
-            every_priority(Arc::new(OneRelease(release(&["Mysterons"], &lengths)))),
-        )),
-    );
-    let curator = Viewer {
-        user_id: "u-curator".to_owned(),
-        admin: false,
-    };
-    let job = drop_zip(
-        &acquire,
-        &curator,
-        "acoustid-down",
-        &[("Dummy/01 - Mysterons.flac", &bytes)],
-    )
-    .await;
-    assert_eq!(job.items[0].status, DropItemStatus::NeedsReview);
-    let music = dir.join("music");
-    let reason = || async {
-        sqlx::query_scalar::<_, String>("SELECT reason FROM acquire_held_files")
-            .fetch_one(acquire.db.db().sqlx())
-            .await
-            .expect("held file")
-    };
-    let due_now = || async {
-        acquire
-            .db
-            .write("test.due", |tx| {
-                tx.execute("UPDATE acquire_held_entries SET retry_at = NULL", [])?;
-                Ok(())
-            })
-            .await
-            .expect("due now");
-    };
-    assert_eq!(reason().await, "acoustid_unavailable");
+            Arc::new(LibraryLanding::new(
+                &library,
+                every_priority(Arc::new(OneRelease(release(&["Mysterons"], &lengths)))),
+            )),
+        );
+        let switch = |on: bool| {
+            library
+                .settings
+                .store()
+                .update_secret_blocking::<TypedLibrary, String, _>(move |stored| {
+                    let mut settings = stored.into_inner();
+                    settings.enabled = on;
+                    Ok(settings)
+                })
+                .expect("library switch saved");
+            library.core.refresh_registry();
+        };
+        let curator = Viewer {
+            user_id: "u-curator".to_owned(),
+            admin: false,
+        };
+        if !acoustid_down {
+            switch(false);
+        }
+        let job = drop_zip(
+            &acquire,
+            &curator,
+            case,
+            &[("Dummy/01 - Mysterons.flac", &bytes)],
+        )
+        .await;
+        assert_eq!(job.items[0].status, DropItemStatus::NeedsReview, "{case}");
+        let music = dir.join("music");
 
-    acquire.held.tend().await;
-    assert_eq!(reason().await, "acoustid_unavailable", "still waiting");
-    assert!(files_under(&music).is_empty(), "nothing lands while down");
+        if acoustid_down {
+            let reason = || async {
+                acquire
+                    .db
+                    .db()
+                    .one::<String>("SELECT reason FROM acquire_held_files", [])
+            };
+            let due_now = || async {
+                acquire
+                    .db
+                    .write("test.due", |tx| {
+                        tx.execute("UPDATE acquire_held_entries SET retry_at = NULL", [])?;
+                        Ok(())
+                    })
+                    .await
+                    .expect("due now");
+            };
+            assert_eq!(reason().await, "acoustid_unavailable", "{case}");
 
-    outage.end();
-    due_now().await;
-    acquire.held.tend().await;
-    assert_eq!(files_under(&music).len(), 1, "the held loop placed it");
+            acquire.held.tend().await;
+            assert_eq!(
+                reason().await,
+                "acoustid_unavailable",
+                "{case}: still waiting"
+            );
+            assert!(
+                files_under(&music).is_empty(),
+                "{case}: nothing lands while down"
+            );
+
+            outage.end();
+            due_now().await;
+        } else {
+            assert!(
+                files_under(&music).is_empty(),
+                "{case}: nothing lands while off"
+            );
+            switch(true);
+        }
+        acquire.held.tend().await;
+        assert_eq!(
+            files_under(&music).len(),
+            1,
+            "{case}: the held loop placed it"
+        );
+    }
 }
 
 /// A bonus track of an upload a curator matched, which the library could
@@ -990,17 +971,14 @@ async fn a_matched_uploads_bonus_track_is_not_retried_onto_the_old_guess() {
         .await
         .expect("matched by hand");
     assert_eq!(matched.imported, 2, "{matched:?}");
-    let held = || async {
-        sqlx::query_as::<_, (String, String, Option<String>)>(
+    let held = || {
+        acquire.db.db().row::<(String, String, Option<String>)>(
             "SELECT state, reason, release_mbid FROM acquire_held_files WHERE id = ?1",
+            rusqlite::params![file_id],
         )
-        .bind(file_id)
-        .fetch_one(acquire.db.db().sqlx())
-        .await
-        .expect("held file")
     };
     assert_eq!(
-        held().await,
+        held(),
         ("held".to_owned(), "target_occupied".to_owned(), None),
         "the Match left it unpaired"
     );
@@ -1008,7 +986,7 @@ async fn a_matched_uploads_bonus_track_is_not_retried_onto_the_old_guess() {
     std::fs::remove_file(&taken).expect("place freed");
     acquire.held.tend().await;
     assert_eq!(
-        held().await,
+        held(),
         ("held".to_owned(), "target_occupied".to_owned(), None),
         "nothing retried it"
     );
@@ -1157,10 +1135,7 @@ async fn a_damaged_entry_discards_the_whole_archive() {
     std::fs::write(&upload, &bytes).expect("upload");
 
     let job = upload_and_settle(&acquire, &curator, upload).await;
-    let indexed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM local_tracks")
-        .fetch_one(acquire.db.db().sqlx())
-        .await
-        .expect("catalog");
+    let indexed: i64 = acquire.db.db().one("SELECT COUNT(*) FROM local_tracks", []);
     assert_eq!(indexed, 0, "files of the damaged archive were imported");
     assert_eq!(job.status, DropJobStatus::Failed, "{:?}", job.items);
     assert!(
@@ -1198,8 +1173,11 @@ async fn a_cut_off_upload_survives_a_sweep_that_cannot_read_its_jobs() {
     let config = droppedneedle_kernel::config::AppConfig::with_root(0, &dir);
     // One reader and a short checkout limit, so the busy answer comes
     // without the real five-second wait.
-    let mut db = droppedneedle_kernel::db::DbConfig::new(&config.library_db_path)
-        .with_read_wait(Duration::from_millis(100));
+    let mut db = droppedneedle_kernel::db::DbConfig::new(
+        &config.library_db_path,
+        std::sync::Arc::new(droppedneedle_kernel::clock::SystemClock),
+    )
+    .with_read_wait(Duration::from_millis(100));
     db.readers = 1;
     let runtime = droppedneedle_kernel::db::open_runtime(&db)
         .await

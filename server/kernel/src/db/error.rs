@@ -18,7 +18,14 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum DbError {
     /// The database path or one of its sidecars sits on a network filesystem.
-    #[error("refusing database on non-local filesystem {fs_type} at mount {mount}: {path:?}")]
+    /// The message says how to fix it, Unraid's `/mnt/user` being the usual
+    /// cause.
+    #[error(
+        "refusing database on non-local filesystem {fs_type} at mount {mount}: {path:?}. \
+         SQLite needs a local disk. On Unraid, point the container's /app/cache at a pool \
+         path such as /mnt/cache/appdata/droppedneedle, or set the appdata share to \
+         exclusive access; elsewhere, move it to a local disk"
+    )]
     NonLocalFilesystem {
         /// The path that was refused.
         path: PathBuf,
@@ -152,6 +159,11 @@ pub enum DbError {
         /// Newest migration this binary knows.
         expected: i64,
     },
+    /// The schema runner would refuse the backup at any binary: a v3
+    /// pre-release database older than the bridge, or tables with no stamp.
+    /// `--allow-downgrade` never overrides it.
+    #[error("backup refused: {0}")]
+    BackupRefused(super::migrate::SchemaError),
     /// Backup staging must sit on the same filesystem as the database so the
     /// final rename is atomic.
     #[error("backup staging is not on the database filesystem: {path:?}")]
@@ -176,14 +188,18 @@ pub enum DbError {
         /// Short cause without SQL text, hosts, or paths.
         cause: String,
     },
-    /// Schema migrate or boot assertion failed.
+    /// The schema runner refused the database's stamp or a migration failed.
     #[error(transparent)]
-    Schema(#[from] crate::schema::SchemaError),
-    /// A non-busy SQLite failure on the read path or at boot.
-    #[error(transparent)]
-    Sqlx(#[from] sqlx::Error),
-    /// A non-busy SQLite failure on a dedicated connection or inside a read
-    /// or write closure.
+    Schema(#[from] super::migrate::SchemaError),
+    /// The database file would not take WAL mode, which every connection
+    /// relies on: readers beside the one writer, and checkpoints.
+    #[error("the database refused WAL mode (journal mode {mode})")]
+    WalRefused {
+        /// The journal mode SQLite answered with instead.
+        mode: String,
+    },
+    /// A non-busy SQLite failure on a connection, or inside a read or write
+    /// closure.
     #[error(transparent)]
     Rusqlite(rusqlite::Error),
     /// Filesystem failure around the database or a backup.
@@ -237,30 +253,6 @@ pub enum ChunkedError<E> {
     },
 }
 
-/// True when a sqlx error is lock contention (SQLITE_BUSY or SQLITE_LOCKED),
-/// or a read that waited out the pool's checkout limit.
-///
-/// The lock check mirrors the v2 rule: either the primary result code is
-/// busy or locked, or the message names a lock. A checkout that timed out
-/// is the sqlx pool's form of the read pool's `Busy`: every reader was in
-/// use, which a busy host causes without anything being wrong. Only these
-/// convert; anything else keeps its failure semantics.
-pub fn sqlx_is_busy(error: &sqlx::Error) -> bool {
-    if matches!(error, sqlx::Error::PoolTimedOut) {
-        return true;
-    }
-    if let sqlx::Error::Database(database) = error {
-        if let Some(code) = database.code()
-            && (code.as_ref() == "5" || code.as_ref() == "6")
-        {
-            return true;
-        }
-        let message = database.message().to_lowercase();
-        return message.contains("locked") || message.contains("busy");
-    }
-    false
-}
-
 /// True when a rusqlite error is lock contention (SQLITE_BUSY or SQLITE_LOCKED).
 pub fn rusqlite_is_busy(error: &rusqlite::Error) -> bool {
     match error {
@@ -276,18 +268,6 @@ pub fn rusqlite_is_busy(error: &rusqlite::Error) -> bool {
             text.contains("locked") || text.contains("busy")
         }
         _ => false,
-    }
-}
-
-/// Map a sqlx failure on the data path: busy becomes retryable, the rest
-/// passes through untouched.
-pub fn map_sqlx_busy(operation: &str, error: sqlx::Error) -> DbError {
-    if sqlx_is_busy(&error) {
-        DbError::Busy {
-            operation: operation.to_owned(),
-        }
-    } else {
-        DbError::Sqlx(error)
     }
 }
 

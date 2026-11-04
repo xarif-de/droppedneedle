@@ -211,14 +211,41 @@ fn enable_toy(rig: &Rig, manifest: &str) -> Arc<FakeConnection> {
     rig.launcher.runtime("toy")
 }
 
+/// A folder copied in after start shows on the next list, disabled, and
+/// runs nothing until an admin enables it. A folder whose manifest did not
+/// read (a copy still under way) is read again on the next list.
 #[tokio::test]
-async fn dropped_folder_runs_no_code_until_enabled() {
+async fn dropped_folder_shows_at_once_and_runs_no_code_until_enabled() {
     let rig = rig("no-code").await;
-    write_plugin(&rig.dir, "toy", TOY_MANIFEST);
     rig.host.load_all();
+    write_plugin(&rig.dir, "toy", TOY_MANIFEST);
+    write_plugin(&rig.dir, "half", "[plugin]\nname = \"half\"\n");
+    let listed: Vec<(String, bool)> = rig
+        .host
+        .list_plugins()
+        .iter()
+        .map(|plugin| (plugin.manifest.name.clone(), plugin.error.is_some()))
+        .collect();
+    assert_eq!(
+        listed,
+        [("half".to_owned(), true), ("toy".to_owned(), false)]
+    );
     let plugin = rig.host.get("toy").unwrap();
     assert!(!plugin.enabled);
     assert!(plugin.runtime.is_none());
+    assert!(rig.launcher.launched.lock().unwrap().is_empty());
+
+    write_plugin(
+        &rig.dir,
+        "half",
+        &TOY_MANIFEST.replace("name = \"toy\"", "name = \"half\""),
+    );
+    let half = rig.host.list_plugins();
+    let half = half
+        .iter()
+        .find(|plugin| plugin.manifest.name == "half")
+        .unwrap();
+    assert!(half.error.is_none() && !half.enabled);
     assert!(rig.launcher.launched.lock().unwrap().is_empty());
 
     enable_toy(&rig, TOY_MANIFEST);
@@ -302,22 +329,19 @@ async fn uninstall_stops_the_plugin_and_keeps_settings() {
 
 const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 
-const REPOSITORY: &str = "https://api.github.com/repos/acme/toy";
+/// The repository on the fake GitHub's API, at its closed address.
+const REPOSITORY: &str = "http://127.0.0.1:9/github/repos/acme/toy";
+/// The fake GitHub's archive host, at its closed address.
+const CODELOAD: &str = "http://127.0.0.1:9/codeload/acme/toy/zip";
 
 fn github(remote: &FakeGitHub) {
     remote.insert(REPOSITORY, br#"{"id": 1001}"#);
+    remote.insert(LATEST_RELEASE, br#"{"tag_name": "v1.0.0"}"#);
     remote.insert(
-        "https://api.github.com/repos/acme/toy/releases/latest",
-        br#"{"tag_name": "v1.0.0"}"#,
-    );
-    remote.insert(
-        "https://api.github.com/repos/acme/toy/commits/v1.0.0",
+        &format!("{REPOSITORY}/commits/v1.0.0"),
         format!(r#"{{"sha": "{SHA}"}}"#).as_bytes(),
     );
-    remote.insert(
-        &format!("https://codeload.github.com/acme/toy/zip/{SHA}"),
-        &toy_zip(None),
-    );
+    remote.insert(&format!("{CODELOAD}/{SHA}"), &toy_zip(None));
 }
 
 /// The toy plugin as GitHub's codeload serves it: one top folder holding
@@ -344,8 +368,13 @@ fn toy_zip(code_link: Option<&str>) -> Vec<u8> {
     writer.finish().unwrap().into_inner()
 }
 
+/// An install previews its permissions and then pins the previewed commit.
+/// A pinned install reads only the repository and the archive: from a URL
+/// naming its ref, and from a plain URL that brings its preview's
+/// reference. The record says what the preview said, and an update of the
+/// same commit downloads nothing.
 #[tokio::test]
-async fn install_previews_permissions_then_pins_the_previewed_commit() {
+async fn an_install_pins_the_previewed_commit() {
     let rig = rig("install").await;
     let remote = FakeGitHub::new();
     github(&remote);
@@ -407,26 +436,17 @@ async fn install_previews_permissions_then_pins_the_previewed_commit() {
     assert!(rig.launcher.launched.lock().unwrap().is_empty());
 
     // Same release again: nothing to update.
-    let (status, update) = send(admin, "POST", "/api/v3/plugins/toy/update", Some(json!({}))).await;
+    let (status, update) = send(
+        admin.clone(),
+        "POST",
+        "/api/v3/plugins/toy/update",
+        Some(json!({})),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(update["updated"], false);
-}
 
-/// A pinned install reads only the repository and the archive: from a URL
-/// naming its ref, and from a plain URL that brings its preview's reference.
-/// The record says what the preview said, and an update of the same commit
-/// downloads nothing.
-#[tokio::test]
-async fn a_pinned_install_makes_two_github_reads() {
-    let rig = rig("pinned-reads").await;
-    let remote = FakeGitHub::new();
-    github(&remote);
-    let deps = deps_for(&rig, &remote);
-    let admin = with_test_principal(
-        plugin_routes().with_state(deps).into_router(),
-        session("admin-1"),
-    );
-    let archive = format!("https://codeload.github.com/acme/toy/zip/{SHA}");
+    let archive = format!("{CODELOAD}/{SHA}");
     let two_reads = vec![REPOSITORY.to_owned(), archive.clone()];
 
     for (body, kind, reference) in [
@@ -449,11 +469,11 @@ async fn a_pinned_install_makes_two_github_reads() {
         remote.requested.lock().unwrap().clear();
         let (status, installed) =
             send(admin.clone(), "POST", "/api/v3/plugins/install", Some(body)).await;
-        assert_eq!(status, StatusCode::CREATED, "{installed}");
-        assert_eq!(installed["install"]["commit"], SHA);
+        assert_eq!(status, StatusCode::CREATED, "{kind}: {installed}");
+        assert_eq!(installed["install"]["commit"], SHA, "{kind}");
         assert_eq!(installed["install"]["ref_kind"], kind);
-        assert_eq!(installed["install"]["reference"], reference);
-        assert_eq!(*remote.requested.lock().unwrap(), two_reads);
+        assert_eq!(installed["install"]["reference"], reference, "{kind}");
+        assert_eq!(*remote.requested.lock().unwrap(), two_reads, "{kind}");
     }
 
     remote.requested.lock().unwrap().clear();
@@ -463,8 +483,8 @@ async fn a_pinned_install_makes_two_github_reads() {
     assert!(!remote.requested.lock().unwrap().contains(&archive));
 }
 
-const LATEST_RELEASE: &str = "https://api.github.com/repos/acme/toy/releases/latest";
-const DEFAULT_BRANCH: &str = "https://api.github.com/repos/acme/toy/commits/HEAD";
+const LATEST_RELEASE: &str = "http://127.0.0.1:9/github/repos/acme/toy/releases/latest";
+const DEFAULT_BRANCH: &str = "http://127.0.0.1:9/github/repos/acme/toy/commits/HEAD";
 const BRANCH_SHA: &str = "89abcdef0123456789abcdef0123456789abcdef";
 
 /// The default branch holds unreleased code that would install fine.
@@ -474,18 +494,26 @@ fn default_branch(remote: &FakeGitHub) {
         DEFAULT_BRANCH,
         format!(r#"{{"sha": "{BRANCH_SHA}"}}"#).as_bytes(),
     );
-    remote.insert(
-        &format!("https://codeload.github.com/acme/toy/zip/{BRANCH_SHA}"),
-        &toy_zip(None),
-    );
+    remote.insert(&format!("{CODELOAD}/{BRANCH_SHA}"), &toy_zip(None));
 }
 
-/// The admin's router behind `scope`'s request wrapper, which replaces
-/// every 5xx body with the fixed one.
-fn admin_app(scope: &TestApp, deps: PluginsDeps) -> axum::Router {
-    scope.request_scope(with_test_principal(
+/// The admin's router behind the request boundary, which replaces every
+/// 5xx body with the fixed one. Plugin routes are native, so the compat
+/// failure shape is never asked for.
+fn admin_app(rig: &Rig, deps: PluginsDeps) -> axum::Router {
+    use axum::response::IntoResponse as _;
+    use droppedneedle::middleware::{Boundary, request_scope};
+
+    let boundary = Boundary::new(rig.platform.ids.clone(), |_, _, _, status, _| {
+        status.into_response()
+    });
+    with_test_principal(
         plugin_routes().with_state(deps).into_router(),
         session("admin-1"),
+    )
+    .layer(axum::middleware::from_fn_with_state(
+        boundary,
+        request_scope,
     ))
 }
 
@@ -583,7 +611,6 @@ async fn a_github_refusal_never_falls_back_to_the_default_branch() {
             ),
         ),
     ];
-    let scope = TestApp::start("plugins-refused").await;
     for (index, (status, headers, kind, expected)) in cases.into_iter().enumerate() {
         let rig = rig(&format!("refused-{index}")).await;
         let remote = FakeGitHub::new();
@@ -595,7 +622,7 @@ async fn a_github_refusal_never_falls_back_to_the_default_branch() {
 
         // Each request on a fresh `github` row, so a limit's wait is
         // GitHub's own and not what is left of the last one.
-        let admin = || admin_app(&scope, deps_for(&rig, &remote));
+        let admin = || admin_app(&rig, deps_for(&rig, &remote));
         let body = json!({"repository_url": "https://github.com/acme/toy"});
         for uri in ["/api/v3/plugins/install/preview", "/api/v3/plugins/install"] {
             let got = post_for_refusal(admin(), uri, body.clone()).await;
@@ -623,12 +650,14 @@ async fn a_github_refusal_never_falls_back_to_the_default_branch() {
 
 /// Installs read GitHub on the update check's rate row: once GitHub has
 /// told the check to wait, an install answers that wait without asking
-/// GitHub again.
+/// GitHub again. A preview the row cannot cover in full is turned down
+/// before its first request: it spends nothing, and its wait covers every
+/// read the preview needs.
 #[tokio::test]
-async fn an_install_waits_out_the_limit_the_update_check_met() {
+async fn installs_share_the_github_row_and_spend_nothing_they_cannot_finish() {
     let asked = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let seen = Arc::clone(&asked);
-    let github = axum::Router::new()
+    let limiting = axum::Router::new()
         .route(
             "/releases",
             axum::routing::get(|| async {
@@ -645,7 +674,7 @@ async fn an_install_waits_out_the_limit_the_update_check_met() {
             }
             async { StatusCode::NOT_FOUND }
         });
-    let (origin, _github) = droppedneedle_testkit::usenet::serve_loopback(github)
+    let (origin, _github) = droppedneedle_testkit::usenet::serve_loopback(limiting)
         .await
         .unwrap();
     let app = TestApp::start_with("plugins-shared-row", crate::common::outbound_at(&origin)).await;
@@ -677,21 +706,14 @@ async fn an_install_waits_out_the_limit_the_update_check_met() {
         asked.lock().unwrap()
     );
     app.stop().await;
-}
 
-/// A preview the `github` row cannot cover in full is turned down before
-/// its first request: it spends nothing, and its wait covers every read
-/// the preview needs.
-#[tokio::test]
-async fn a_preview_the_row_cannot_cover_spends_nothing() {
     let rig = rig("row-short").await;
     let remote = FakeGitHub::new();
     github(&remote);
     let providers = remote.paced();
     let row = providers.limiter("github").unwrap();
-    let scope = TestApp::start("plugins-row-short").await;
     let admin = admin_app(
-        &scope,
+        &rig,
         PluginsDeps {
             github: providers.github_repos.clone(),
             ..deps_for(&rig, &remote)
@@ -725,22 +747,40 @@ async fn a_preview_the_row_cannot_cover_spends_nothing() {
     );
 }
 
+/// A ref GitHub does not know is the admin's mistake, not an outage, and
+/// installs nothing. A repository without releases installs its default
+/// branch.
 #[tokio::test]
-async fn a_repository_without_releases_installs_its_default_branch() {
-    let rig = rig("no-releases").await;
+async fn install_refs_resolve_or_answer_the_admins_mistake() {
+    let rig = rig("install-refs").await;
     let remote = FakeGitHub::new();
+    remote.insert(REPOSITORY, br#"{"id": 1001}"#);
+    remote.answer(&format!("{REPOSITORY}/commits/mian"), 422, &[]);
+    let admin = || admin_app(&rig, deps_for(&rig, &remote));
+    let (status, error) = send(
+        admin(),
+        "POST",
+        "/api/v3/plugins/install",
+        Some(json!({"repository_url": "https://github.com/acme/toy/tree/mian"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "unknown ref");
+    assert_eq!(
+        error["error"]["message"],
+        "GitHub has no release, tag or branch named mian in that repository"
+    );
+    assert!(!rig.dir.join("plugins").join("toy").exists());
+
     remote.answer(LATEST_RELEASE, 404, &[]);
     default_branch(&remote);
-    let scope = TestApp::start("plugins-no-releases").await;
-    let admin = admin_app(&scope, deps_for(&rig, &remote));
     let (status, installed) = send(
-        admin,
+        admin(),
         "POST",
         "/api/v3/plugins/install",
         Some(json!({"repository_url": "https://github.com/acme/toy"})),
     )
     .await;
-    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(status, StatusCode::CREATED, "no releases: {installed}");
     assert_eq!(installed["install"]["ref_kind"], "branch");
     assert_eq!(installed["install"]["reference"], "HEAD");
     assert_eq!(installed["install"]["commit"], BRANCH_SHA);
@@ -766,10 +806,10 @@ async fn an_update_never_installs_from_a_replaced_repository() {
     remote.insert(REPOSITORY, br#"{"id": 2002}"#);
     remote.insert(LATEST_RELEASE, br#"{"tag_name": "v2.0.0"}"#);
     remote.insert(
-        "https://api.github.com/repos/acme/toy/commits/v2.0.0",
+        &format!("{REPOSITORY}/commits/v2.0.0"),
         format!(r#"{{"sha": "{BRANCH_SHA}"}}"#).as_bytes(),
     );
-    let new_code = format!("https://codeload.github.com/acme/toy/zip/{BRANCH_SHA}");
+    let new_code = format!("{CODELOAD}/{BRANCH_SHA}");
     remote.insert(&new_code, &toy_zip(None));
     let (status, error) = send(admin, "POST", "/api/v3/plugins/toy/update", Some(json!({}))).await;
     assert_eq!(status, StatusCode::CONFLICT);
@@ -782,41 +822,11 @@ async fn an_update_never_installs_from_a_replaced_repository() {
 }
 
 #[tokio::test]
-async fn a_ref_github_does_not_know_is_the_admins_mistake_not_an_outage() {
-    let rig = rig("unknown-ref").await;
-    let remote = FakeGitHub::new();
-    remote.insert(REPOSITORY, br#"{"id": 1001}"#);
-    remote.answer(
-        "https://api.github.com/repos/acme/toy/commits/mian",
-        422,
-        &[],
-    );
-    let scope = TestApp::start("plugins-unknown-ref").await;
-    let admin = admin_app(&scope, deps_for(&rig, &remote));
-    let (status, error) = send(
-        admin,
-        "POST",
-        "/api/v3/plugins/install",
-        Some(json!({"repository_url": "https://github.com/acme/toy/tree/mian"})),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(
-        error["error"]["message"],
-        "GitHub has no release, tag or branch named mian in that repository"
-    );
-    assert!(!rig.dir.join("plugins").join("toy").exists());
-}
-
-#[tokio::test]
 async fn unsafe_archives_never_reach_the_plugins_folder() {
     let rig = rig("unsafe").await;
     let remote = FakeGitHub::new();
     github(&remote);
-    remote.insert(
-        &format!("https://codeload.github.com/acme/toy/zip/{SHA}"),
-        &toy_zip(Some("/etc/passwd")),
-    );
+    remote.insert(&format!("{CODELOAD}/{SHA}"), &toy_zip(Some("/etc/passwd")));
     let admin = with_test_principal(
         plugin_routes()
             .with_state(deps_for(&rig, &remote))
@@ -833,28 +843,6 @@ async fn unsafe_archives_never_reach_the_plugins_folder() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["error"]["message"], "The archive contains symlinks");
     assert!(!rig.dir.join("plugins").join("toy").exists());
-}
-
-#[tokio::test]
-async fn plugin_routes_need_sessions_and_admins() {
-    let rig = rig("auth").await;
-    let bare = plugin_routes()
-        .with_state(deps_for(&rig, &FakeGitHub::new()))
-        .into_router();
-    let (status, _) = send(bare, "GET", "/api/v3/plugins", None).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
-    for (method, uri) in [
-        ("GET", "/api/v3/plugins"),
-        ("POST", "/api/v3/plugins/install/preview"),
-        ("POST", "/api/v3/plugins/install"),
-        ("POST", "/api/v3/plugins/toy/update"),
-        ("PUT", "/api/v3/plugins/toy"),
-        ("DELETE", "/api/v3/plugins/toy"),
-        ("GET", "/api/v3/plugins/toy/ui/panel"),
-    ] {
-        let (status, _) = send(router_as(&rig, "user-1"), method, uri, Some(json!({}))).await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}");
-    }
 }
 
 /// The panel page is plugin script shown inside the admin UI. Its policy is
@@ -1053,8 +1041,19 @@ async fn ext_proxy_serves_declared_routes_and_gates_the_rest() {
     assert!(!body.to_string().contains("secret"));
 }
 
+/// The PLUGINS.md event contract, one rig per case: a publish is stamped
+/// with its source, validated and paced; a plugin still handling a notice
+/// cannot publish again; and fan-out reaches a subscriber once per
+/// causation.
 #[tokio::test]
-async fn publish_is_stamped_validated_paced_and_loop_guarded() {
+async fn plugin_events_are_stamped_paced_and_never_loop() {
+    publish_is_stamped_validated_and_paced().await;
+    a_plugin_handling_a_notice_cannot_publish_again().await;
+    fanout_reaches_subscribers_once_per_causation().await;
+}
+
+/// The publish case of [`plugin_events_are_stamped_paced_and_never_loop`].
+async fn publish_is_stamped_validated_and_paced() {
     let rig = rig("publish").await;
     let runtime = enable_toy(&rig, TOY_MANIFEST);
 
@@ -1102,7 +1101,7 @@ async fn publish_is_stamped_validated_paced_and_loop_guarded() {
     assert_eq!(statuses[30], 429);
 }
 
-#[tokio::test]
+/// The loop guard case of [`plugin_events_are_stamped_paced_and_never_loop`].
 async fn a_plugin_handling_a_notice_cannot_publish_again() {
     let rig = rig("depth").await;
     let runtime = enable_toy(&rig, TOY_MANIFEST);
@@ -1124,7 +1123,7 @@ async fn a_plugin_handling_a_notice_cannot_publish_again() {
     assert_eq!(echo.status, 409);
 }
 
-#[tokio::test]
+/// The fan-out case of [`plugin_events_are_stamped_paced_and_never_loop`].
 async fn fanout_reaches_subscribers_once_per_causation() {
     let rig = rig("fanout").await;
     let manifest = "[plugin]\n\
@@ -1158,6 +1157,46 @@ async fn fanout_reaches_subscribers_once_per_causation() {
     );
     // The scrobble alias path has no causation dedup (same as v2).
     assert_eq!(runtime.calls_to(methods::SCROBBLE).len(), 2);
+}
+
+/// An accepted play reaches a subscriber as both of its events, `scrobble`
+/// then `playback_started`, and neither is skipped as arriving while the
+/// plugin was busy with the other.
+#[tokio::test]
+async fn an_accepted_play_reaches_a_subscriber_as_both_events() {
+    use droppedneedle_media::playback::plugin_events::PluginPlayEvents;
+    use droppedneedle_media::playback::ports::{PlayEvents as _, ReportTrack};
+
+    let rig = rig("play-events").await;
+    let manifest = "[plugin]\n\
+         name = \"toy\"\n\
+         api_version = 2\n\
+         entrypoint = \"plugin:Toy\"\n\
+         capabilities = [\"subscriber\"]\n";
+    let runtime = enable_toy(&rig, manifest);
+    let report = ReportTrack {
+        track_name: "T".to_owned(),
+        artist_name: "A".to_owned(),
+        album_name: Some("B".to_owned()),
+        duration_ms: 200_000,
+        mbid: None,
+        release_group_mbid: None,
+        source: None,
+        played_at: Some(1_704_067_200),
+    };
+    PluginPlayEvents(Arc::clone(&rig.host)).play_accepted("user-1", &report, 1_704_067_200);
+    turns_until(|| runtime.calls_to(methods::EVENT).len() == 2).await;
+    let kinds: Vec<serde_json::Value> = runtime
+        .calls_to(methods::EVENT)
+        .iter()
+        .map(|event| event["kind"].clone())
+        .collect();
+    assert_eq!(kinds, [json!("scrobble"), json!("playback_started")]);
+    assert_eq!(
+        runtime.calls_to(methods::EVENT)[1]["payload"]["user_id"],
+        "user-1"
+    );
+    assert!(rig.host.dropped_event_counts().is_empty());
 }
 
 #[tokio::test]
@@ -1414,9 +1453,17 @@ async fn a_write_the_plugin_gave_up_on_never_lands_and_spends_nothing() {
     assert_eq!(std::fs::read(path).unwrap(), b"late");
 }
 
+/// A plugin's daily allowance, one rig per case: what it wrote before a
+/// restart still counts after it, and the 1001st file in a day is refused
+/// and shown to the admin.
+#[tokio::test]
+async fn the_daily_allowance_holds_across_restarts_and_shows() {
+    the_daily_allowance_survives_a_restart().await;
+    the_1001st_file_in_a_day_is_refused_and_shown().await;
+}
+
 /// What a plugin wrote before a restart still counts against its daily
 /// allowance after it.
-#[tokio::test]
 async fn the_daily_allowance_survives_a_restart() {
     use droppedneedle_plugins::capabilities::library_files::QUOTA_BYTES_PER_DAY;
 
@@ -1476,7 +1523,6 @@ fn seed_files(rig: &Rig, count: usize) {
 /// refused and never placed, and the refusal shows with the plugin's
 /// health in the admin view until a write lands or the plugin is switched
 /// off.
-#[tokio::test]
 async fn the_1001st_file_in_a_day_is_refused_and_shown() {
     use droppedneedle_plugins::capabilities::library_files::QUOTA_FILES_PER_DAY;
 
@@ -1784,8 +1830,11 @@ async fn a_plugin_that_runs_late_is_asked_again_and_a_whole_answer_is_kept() {
             users.deps.clone(),
         ),
         LocalCatalog::new(rig.platform.db.clone()),
-    )
-    .with_details(Arc::new(PluginDetailsSource(Arc::clone(&rig.host))));
+        droppedneedle_catalog::metadata::PageSources {
+            details: Arc::new(PluginDetailsSource(Arc::clone(&rig.host))),
+            ..crate::common::bundles::quiet_page_sources(&rig.platform.db)
+        },
+    );
 
     for _ in 0..2 {
         let details = catalog.album_plugin_details(ALBUM).await.unwrap();

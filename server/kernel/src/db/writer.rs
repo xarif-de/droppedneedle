@@ -381,12 +381,14 @@ impl LaneIdle {
     }
 }
 
-/// How long admissions waited for their turn since the lane opened.
+/// How long writes waited for their turn since the lane opened.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct WaitTimes {
     /// Turns granted.
     pub admissions: u64,
-    /// The longest any admission waited.
+    /// Foreground writes answered `Busy` after waiting past their limit.
+    pub refused: u64,
+    /// The longest any write waited, granted or refused.
     pub longest: Duration,
     /// Admissions per bucket of [`WAIT_BUCKET_BOUNDS_MS`]; the last entry
     /// counts waits past the largest bound.
@@ -402,6 +404,13 @@ impl WaitTimes {
             .position(|bound| waited <= Duration::from_millis(*bound))
             .unwrap_or(WAIT_BUCKET_BOUNDS_MS.len());
         self.buckets[bucket] += 1;
+    }
+
+    /// A write that waited `waited` and was answered `Busy`: counted apart
+    /// from the turns, and in the longest wait.
+    fn record_refused(&mut self, waited: Duration) {
+        self.refused += 1;
+        self.longest = self.longest.max(waited);
     }
 }
 
@@ -856,7 +865,15 @@ impl Shared {
     fn close(self: &Arc<Self>, grace: Duration) -> bool {
         // A grace too long to add to the clock is no bound at all.
         let deadline = Instant::now().checked_add(grace);
-        self.state().closed = true;
+        {
+            let mut state = self.state();
+            // An earlier close that gave up already answered every waiter;
+            // the write it gave up on ends by itself.
+            if state.gave_up {
+                return true;
+            }
+            state.closed = true;
+        }
         // Closing lifted the WAL hold. A bulk write it held on an idle lane
         // is started here, before the wait below, which would otherwise sit
         // out the whole grace for it.
@@ -933,9 +950,11 @@ impl Shared {
             // with the durable writes among them left where they are.
             let mut at = 0;
             while let Some(waiter) = state.foreground.get(at) {
+                let waited = waiter.queued_at.elapsed();
                 if waiter.durable {
                     at += 1;
-                } else if waiter.queued_at.elapsed() >= self.limits.foreground_wait {
+                } else if waited >= self.limits.foreground_wait {
+                    state.waits.record_refused(waited);
                     overdue.extend(state.foreground.remove(at));
                 } else {
                     break;
@@ -1535,8 +1554,8 @@ impl WriteLane {
     /// write that still holds the lane at the bound is named in the log and
     /// left to end by itself; the writes queued behind it are answered
     /// `LaneClosed`. The first call closes the lane and a later one finds
-    /// nothing to close, unless the first gave up on a write that is still
-    /// running: a later call then waits for that write, up to `grace` again.
+    /// nothing to close and returns at once, also when the first gave up on
+    /// a write that is still running.
     pub async fn shutdown(&self, grace: Duration) {
         let shared = Arc::clone(&self.shared);
         let closed = tokio::task::spawn_blocking(move || shared.close(grace)).await;
@@ -1668,11 +1687,11 @@ fn finish<R, E>(name: &'static str, outcome: Outcome<R, E>) -> Result<R, TxError
     Err(TxError::Lane(lane))
 }
 
-/// Open a dedicated rusqlite connection with the same pragma set as the
-/// reader pool: WAL, `synchronous=NORMAL`, foreign keys on, the 5 s busy
-/// timeout, and the shared mmap, temp-store, cache and autocheckpoint sizes.
-/// Every rusqlite handle in the process goes through here so none of them
-/// drifts from the factory's settings.
+/// Open a dedicated rusqlite connection with the canonical pragma set: WAL,
+/// `synchronous=NORMAL`, foreign keys on, the 5 s busy timeout, and the
+/// mmap, temp-store, cache and autocheckpoint sizes the read pools share
+/// where a read uses them. Every read-write handle in the process goes
+/// through here so none of them drifts from the factory's settings.
 pub fn open_connection(path: &Path) -> Result<Connection, DbError> {
     let connection = Connection::open(path)?;
     apply_connection_pragmas(&connection)?;
@@ -1683,7 +1702,7 @@ pub fn open_connection(path: &Path) -> Result<Connection, DbError> {
 /// for the rare handle not opened from a path (an in-memory test store).
 pub fn apply_connection_pragmas(connection: &Connection) -> Result<(), DbError> {
     connection.busy_timeout(crate::db::BUSY_TIMEOUT)?;
-    // Cache 2 MiB, matching the reader pool. A 16 MiB writer cache stayed
+    // Cache 2 MiB, matching the read pools. A 16 MiB writer cache stayed
     // resident after every 100k scan; 2 MiB keeps scan throughput identical.
     connection.execute_batch(&format!(
         "PRAGMA journal_mode=WAL;
@@ -2027,8 +2046,49 @@ fn short_cause(error: &rusqlite::Error) -> String {
 mod tests {
     use super::*;
 
+    /// With both lanes busy the foreground gets eight grants, then the
+    /// background one; a lone lane drains; a fresh background waiter
+    /// resets the burst as v1 did.
     #[test]
-    fn burst_eight_then_one_while_both_lanes_busy() {
+    fn decide_lane_cases() {
+        for (label, fg, bg, grants, fresh, expected) in [
+            (
+                "lone foreground",
+                true,
+                false,
+                40,
+                false,
+                (Some(Lane::Foreground), 41),
+            ),
+            (
+                "lone background",
+                false,
+                true,
+                40,
+                false,
+                (Some(Lane::Background), 0),
+            ),
+            ("nobody waiting", false, false, 7, false, (None, 7)),
+            (
+                "fresh background waiter",
+                true,
+                true,
+                8,
+                true,
+                (Some(Lane::Foreground), 1),
+            ),
+            (
+                "burst spent",
+                true,
+                true,
+                8,
+                false,
+                (Some(Lane::Background), 0),
+            ),
+        ] {
+            assert_eq!(decide_lane(fg, bg, grants, fresh), expected, "{label}");
+        }
+
         let mut grants = 0;
         let mut seen = Vec::new();
         for _ in 0..18 {
@@ -2059,25 +2119,8 @@ mod tests {
                 Some(foreground),
                 Some(foreground),
                 Some(background),
-            ]
+            ],
+            "burst of eight then one"
         );
-    }
-
-    #[test]
-    fn lone_lane_drains_without_alternation() {
-        let (lane, grants) = decide_lane(true, false, 40, false);
-        assert_eq!((lane, grants), (Some(Lane::Foreground), 41));
-        let (lane, grants) = decide_lane(false, true, 40, false);
-        assert_eq!((lane, grants), (Some(Lane::Background), 0));
-        let (lane, grants) = decide_lane(false, false, 7, false);
-        assert_eq!((lane, grants), (None, 7));
-    }
-
-    #[test]
-    fn fresh_background_waiter_resets_the_burst_like_v1() {
-        let (lane, grants) = decide_lane(true, true, 8, true);
-        assert_eq!((lane, grants), (Some(Lane::Foreground), 1));
-        let (lane, grants) = decide_lane(true, true, 8, false);
-        assert_eq!((lane, grants), (Some(Lane::Background), 0));
     }
 }

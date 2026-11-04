@@ -5,17 +5,17 @@ vi.mock('$app/navigation', () => ({ goto: vi.fn() }));
 
 import { PAGE_SOURCE_KEYS } from '$lib/constants';
 import { queryClient } from '$lib/queries/QueryClient';
-import { LibraryQueryKeyFactory } from '$lib/queries/library/LibraryQueryKeyFactory';
+import { LibraryQueryKeyFactory } from '$lib/features/library/queries/LibraryQueryKeyFactory';
 import { PERSIST } from '$lib/queries/persistedCache';
 import {
 	getMusicBrainzSourceScope,
 	setMusicBrainzSourceScope
 } from '$lib/queries/musicbrainz/sourceScope.svelte';
-import { getScrobblePreferencesQueryOptions } from '$lib/queries/scrobble-preferences.svelte';
+import { getScrobblePreferencesQueryOptions } from '$lib/features/profile/queries/scrobble-preferences.svelte';
 import { authStore, LAST_USER_ID_KEY, type AuthUser } from '$lib/stores/authStore.svelte';
 import '$lib/stores/musicSource';
-import { playerStore } from '$lib/stores/player.svelte';
-import '$lib/stores/scrobble.svelte';
+import { playerStore } from '$lib/features/player/state/player.svelte';
+import '$lib/features/player/state/scrobble.svelte';
 import { fakeApi } from '$lib/test/api';
 import { logout } from '$lib/utils/logout';
 import { clearUserSessionState } from '$lib/utils/userSessionCleanup';

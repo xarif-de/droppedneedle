@@ -1,26 +1,24 @@
 //! Runtime factory: one call from a path to a serving database.
 //!
 //! [`open_runtime`] runs the boot checks in order: create the parent
-//! directory, refuse symlinks and network filesystems, take a verified
-//! backup when the schema is behind, run the schema migrations and assert
-//! `user_version` on a boot pool, open the read-only reader pool with the
-//! full pragma set, then start the writer lane, open the read pools and
-//! wire the checkpoint, wakeup, and backup services.
+//! directory, refuse symlinks and network filesystems, work out the schema
+//! plan from the stamp (a stamp the runner refuses stops boot here, before
+//! any backup), take a verified backup when the plan changes the file, run
+//! the schema runner on one connection with the full pragma set (a file
+//! that refuses WAL mode stops boot here), then start the writer lane, open
+//! the read pools and wire the checkpoint, wakeup, and backup services.
 //!
 //! Backups live in `backups/` next to the database file, so they share its
 //! volume and filesystem (the backup stages and renames in place).
 //!
-//! Connection budget: the sqlx pool carries up to 7 reader connections, the
-//! writer lane owns 1 dedicated connection, and the read pools hold 7
-//! request connections and 2 long ones, all open from boot, for up to 17
-//! handles with exactly one writer. The sqlx pool goes once the last area
-//! reads through [`Db`]. The writer stays a true single connection, which
-//! is what lets the lane enforce the no-await-inside-write-transaction rule
-//! structurally.
+//! Connection budget: the writer lane owns 1 dedicated connection and the
+//! read pools hold 7 request connections and 2 long ones, all open from
+//! boot, for 10 handles with exactly one writer. The writer stays a true
+//! single connection, which is what lets the lane enforce the
+//! no-await-inside-write-transaction rule structurally.
 //!
-//! Schema hooks used (from [`crate::schema`]):
-//! `crate::schema::apply_migrations(&SqlitePool) -> Result<(), SchemaError>`
-//! and `crate::schema::assert_migrated(&SqlitePool) -> Result<(), SchemaError>`.
+//! The schema comes from [`crate::schema::CHAIN`], applied by
+//! [`super::migrate`].
 
 use std::{
     path::{Path, PathBuf},
@@ -28,16 +26,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use sqlx::{
-    SqlitePool,
-    pool::PoolConnectionMetadata,
-    sqlite::{
-        SqliteConnectOptions, SqliteConnection, SqliteJournalMode, SqlitePoolOptions,
-        SqliteSynchronous,
-    },
-};
+use rusqlite::Connection;
 
-use crate::clock::{Clock, SystemClock};
+use crate::clock::Clock;
 
 use super::{
     analyze::AnalyzeService,
@@ -46,30 +37,26 @@ use super::{
     error::DbError,
     fs::{reject_remote_filesystem, reject_symlink},
     handle::Db,
+    migrate::{Stamp, migrate},
     read_pool::{ReadActivity, ReadPools},
     sql,
-    writer::{CancelFlag, LaneLimits, LaneWatch, ReliefPass, Ticker, WriteLane},
+    writer::{CancelFlag, LaneLimits, LaneWatch, ReliefPass, Ticker, WriteLane, open_connection},
 };
 
-/// Reader connections in the sqlx pool, and request connections in the read
-/// pool, which is also how many request reads run at once. Measured on a
-/// 12-core host beside a busy writer: with 10 or more running readers the
-/// writer commits a third less and the heavy reads slow down, and with 4
-/// the cheap reads wait about twice as long.
+/// Request connections in the read pool, which is also how many request
+/// reads run at once. Measured on a 12-core host beside a busy writer: with
+/// 10 or more running readers the writer commits a third less and the heavy
+/// reads slow down, and with 4 the cheap reads wait about twice as long.
 pub const MAX_READERS: u32 = 7;
-/// Warm connections kept ready.
-pub const MIN_CONNECTIONS: u32 = 1;
-/// Pool checkout horizon, shared with the busy timeout.
+/// How long a request read waits for a pooled connection before `Busy`,
+/// the same as the busy timeout.
 pub const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
-/// How long boot waits to open its migration connection, and how long a
+/// How long the boot migration waits on a busy database, and how long a
 /// boot step keeps trying while the database answers busy. Boot serves no
 /// request, so a slow or swapping disk is waited out, not refused.
 pub const BOOT_WAIT: Duration = Duration::from_secs(60);
 /// Lock wait on every connection. The v2 value, unchanged.
 pub const BUSY_TIMEOUT: Duration = Duration::from_millis(5000);
-/// Idle connections older than this are reaped. No max lifetime: SQLite
-/// connections do not go stale.
-pub const IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// Memory-mapped I/O window. The v2 catalog-validation value, unchanged.
 pub const MMAP_SIZE: i64 = 67_108_864;
 /// Page cache per connection, in KiB. Negative means KiB in SQLite units.
@@ -86,11 +73,10 @@ pub const WAL_AUTOCHECKPOINT: i64 = 1000;
 pub struct DbConfig {
     /// Live database file, created with its parent directory when missing.
     pub path: PathBuf,
-    /// Wall time for backups, checkpoints and planner statistics. Defaults
-    /// to the system clock; the server passes the platform's.
+    /// Wall time for backups, checkpoints and planner statistics: the
+    /// platform's, in the server.
     clock: Arc<dyn Clock>,
-    /// Reader connections in the sqlx pool and request connections in the
-    /// read pool. Defaults to [`MAX_READERS`].
+    /// Request connections in the read pool. Defaults to [`MAX_READERS`].
     pub readers: u32,
     /// Lock wait on pool connections. Defaults to [`BUSY_TIMEOUT`].
     pub busy_timeout: Duration,
@@ -102,18 +88,18 @@ pub struct DbConfig {
     /// The WAL sizes, high then low, at which bulk writes are held and let
     /// go. Not a setting: only a test changes them.
     wal_water: (i64, i64),
-    /// How long a request read waits for a pooled connection before `Busy`,
-    /// in the read pool and the sqlx reader pool. Not a setting: only a test
-    /// changes it.
+    /// How long a request read waits for a pooled connection before `Busy`.
+    /// Not a setting: only a test changes it.
     read_wait: Duration,
 }
 
 impl DbConfig {
-    /// Boot with defaults against one database file.
-    pub fn new(path: &Path) -> Self {
+    /// Boot with defaults against one database file, dating backups,
+    /// checkpoints and planner statistics by `clock`.
+    pub fn new(path: &Path, clock: Arc<dyn Clock>) -> Self {
         Self {
             path: path.to_owned(),
-            clock: Arc::new(SystemClock),
+            clock,
             readers: MAX_READERS,
             busy_timeout: BUSY_TIMEOUT,
             shutdown_grace: crate::config::DEFAULT_SHUTDOWN_GRACE,
@@ -121,12 +107,6 @@ impl DbConfig {
             wal_water: (ACTIVE_HIGH_WATER_BYTES, ACTIVE_LOW_WATER_BYTES),
             read_wait: ACQUIRE_TIMEOUT,
         }
-    }
-
-    /// Date backups, checkpoints and planner statistics by `clock`.
-    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
-        self.clock = clock;
-        self
     }
 
     /// Bound shutdown's wait for queued writes by the deployment's grace.
@@ -197,27 +177,8 @@ pub async fn open_runtime(config: &DbConfig) -> Result<DbRuntime, DbError> {
         &backup_dir,
         Arc::clone(&config.clock),
     ));
-    backup_before_upgrade(&path, &backups).await?;
-
-    // Migrations run on a writable pool of their own, closed before the
-    // reader pool opens, so every reader connection is read-only from the
-    // moment it opens. The boot pool connects eagerly with the same pragma
-    // set, so a database that refuses it still fails boot; the reader pool
-    // then opens its connections as reads need them. One connection: the
-    // migrator and the stamp check take turns on it rather than open a
-    // second one while the first is still on its way back to the pool.
-    let boot = open_pool(&path, 1, config.busy_timeout, BOOT_WAIT, false).await?;
-    let migrated = crate::schema::apply_migrations(&boot).await;
-    boot.close().await;
-    migrated?;
-    let pool = open_pool(
-        &path,
-        config.readers,
-        config.busy_timeout,
-        config.read_wait,
-        true,
-    )
-    .await?;
+    let upgrade = backup_before_upgrade(&path, &backups).await?;
+    migrate_at_boot(&path, upgrade).await?;
 
     let lane = WriteLane::open_limited(&path, config.lane_limits)?;
     // Read-only connections, so they open after the writer: it is the
@@ -230,18 +191,17 @@ pub async fn open_runtime(config: &DbConfig) -> Result<DbRuntime, DbError> {
         config.read_wait,
     )?;
     let reads = pools.activity();
-    let db = Db::new(lane, Arc::clone(&pools), pool.clone());
+    let db = Db::new(lane, Arc::clone(&pools));
     let lane = db.lane();
     let (high_water, low_water) = config.wal_water;
     let checkpoint = CheckpointService::new(
         &path,
-        pool.clone(),
+        reads.clone(),
         lane.idle_state(),
         lane.wal_hold(),
         Arc::clone(&config.clock),
     )
-    .with_water(high_water, low_water)
-    .with_pooled_reads(reads.clone());
+    .with_water(high_water, low_water);
     // Cloned before the statistics service is attached: the relief thread
     // shares the policy, the hold and the latest record, and owns nothing
     // that keeps the lane or the read pools alive. A `Db` there would keep
@@ -275,43 +235,88 @@ pub async fn open_runtime(config: &DbConfig) -> Result<DbRuntime, DbError> {
     })
 }
 
-/// Take one verified backup when the stamp is behind the binary, before
-/// the runtime opens a connection or migrates. A missing or fresh database
-/// (stamp 0, no tables) has nothing to lose and skips; a stamp-0 file with
-/// tables is a real database and gets its backup. A failure stops the
-/// boot: migrating without a way back risks the catalog.
-async fn backup_before_upgrade(path: &Path, backups: &BackupService) -> Result<(), DbError> {
+/// Work out the schema plan from the stamp, read without writing, before
+/// the runtime opens a connection or migrates. A stamp the runner refuses
+/// stops boot here, before any backup: backups rotate, and a refusal
+/// repeated at every restart must not rotate out the backups it tells the
+/// user to restore. Otherwise one verified backup is taken whenever the
+/// plan changes the file. A missing or empty database has nothing to lose
+/// and skips. A failed backup stops the boot: migrating without a way back
+/// risks the catalog. True when the plan changes a database that holds
+/// data.
+async fn backup_before_upgrade(path: &Path, backups: &BackupService) -> Result<bool, DbError> {
     if !path.exists() {
-        return Ok(());
+        return Ok(false);
     }
     let probe = path.to_owned();
-    let (found, tables) = tokio::task::spawn_blocking(move || schema_stamp(&probe))
+    let stamp = tokio::task::spawn_blocking(move || Stamp::read_file(&probe))
         .await
         .map_err(|_| DbError::WriteFailed {
             operation: "pre-upgrade check".to_owned(),
             cause: "schema check task failed to join".to_owned(),
         })??;
-    let expected = crate::schema::latest_version();
-    if found >= expected || (found == 0 && tables == 0) {
-        return Ok(());
+    let plan = crate::schema::CHAIN.plan(stamp)?;
+    if !plan.needs_backup() {
+        return Ok(false);
     }
     tracing::info!(
-        found,
-        expected,
+        found = stamp.version,
+        expected = crate::schema::latest_version(),
         "schema upgrade pending; taking a backup first"
     );
     let report = backups.backup(None, &CancelFlag::never()).await?;
     tracing::info!(backup = %report.path.display(), "pre-upgrade backup complete");
-    Ok(())
+    Ok(true)
 }
 
-/// `user_version` and the user table count, read without writing.
-fn schema_stamp(path: &Path) -> Result<(i64, i64), DbError> {
-    let connection =
-        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    let found = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    let tables = connection.query_row(sql::USER_TABLE_COUNT.text(), [], |row| row.get(0))?;
-    Ok((found, tables))
+/// How long opening the boot connection may take before the log says boot
+/// is waiting on the database.
+const SLOW_BOOT: Duration = BUSY_TIMEOUT;
+
+/// Run the schema runner on a connection of its own, closed before the
+/// writer and the read pools open. Boot serves nothing yet, so it waits out
+/// a busy database for up to [`BOOT_WAIT`], and says so once when the
+/// connection is slow to open; the migration itself may take as long as it
+/// needs. A file that refuses WAL mode stops boot at once.
+///
+/// After an `upgrade` the last planner statistics run is forgotten: a
+/// migration may have added indexes or rebuilt tables that SQLite holds no
+/// statistics for, and the next check takes them again.
+async fn migrate_at_boot(path: &Path, upgrade: bool) -> Result<(), DbError> {
+    let joined = |_| DbError::WriteFailed {
+        operation: "schema migration".to_owned(),
+        cause: "migration task failed to join".to_owned(),
+    };
+    let path = path.to_owned();
+    let mut open = tokio::task::spawn_blocking(move || -> Result<Connection, DbError> {
+        let connection = open_connection(&path)?;
+        let mode: String = connection.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+        if !mode.eq_ignore_ascii_case("wal") {
+            return Err(DbError::WalRefused { mode });
+        }
+        connection.busy_timeout(BOOT_WAIT)?;
+        Ok(connection)
+    });
+    let opened = match tokio::time::timeout(SLOW_BOOT, &mut open).await {
+        Ok(opened) => opened,
+        Err(_) => {
+            tracing::warn!(
+                waited_ms = SLOW_BOOT.as_millis() as u64,
+                "the database is slow to open; boot is still waiting on it"
+            );
+            open.await
+        }
+    };
+    let connection = opened.map_err(joined)??;
+    tokio::task::spawn_blocking(move || -> Result<(), DbError> {
+        let connection = migrate(connection, &crate::schema::CHAIN)?;
+        if upgrade {
+            connection.execute(sql::FORGET_ANALYZE.text(), [])?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(joined)?
 }
 
 /// Percent-encode the characters a SQLite URI path cannot carry raw.
@@ -359,14 +364,13 @@ impl DbRuntime {
     }
 
     /// Clean shutdown in order: drain the writer lane, stop the watch
-    /// threads, close the read pools, reclaim the WAL, then close the sqlx
-    /// pool. Draining first means no write lands after the reclaim; the
-    /// reclaim itself is best effort (a held lock leaves the WAL in place),
-    /// so a quiet shutdown leaves no `-wal` or `-shm` behind. The drain is
-    /// bounded by the configured grace: a write that has not returned by
-    /// then is logged and left. Closing the lane lifts the WAL hold, so a
-    /// held bulk write runs in the drain like any other and does not use up
-    /// the grace.
+    /// threads, close the read pools, then reclaim the WAL. Draining first
+    /// means no write lands after the reclaim; the reclaim itself is best
+    /// effort (a held lock leaves the WAL in place), so a quiet shutdown
+    /// leaves no `-wal` or `-shm` behind. The drain is bounded by the
+    /// configured grace: a write that has not returned by then is logged and
+    /// left. Closing the lane lifts the WAL hold, so a held bulk write runs
+    /// in the drain like any other and does not use up the grace.
     ///
     /// The read pools get what is left of that same grace, not one of their
     /// own: a read still running when it ends is named in the log and left,
@@ -382,9 +386,7 @@ impl DbRuntime {
     /// grace: the server gives it what is left of its one shutdown budget.
     /// The watch stop, the read pool close and the WAL reclaim get what is
     /// left of that bound, and a step still running past it is left to finish
-    /// in the background. Closing the sqlx pool waits for connections still
-    /// checked out, so it gets what is left of the same bound and is left
-    /// behind past it.
+    /// in the background. A step that panics is logged.
     pub async fn shutdown_within(self, grace: Duration) {
         // A grace too long to add to the clock is no bound at all.
         let deadline = Instant::now().checked_add(grace);
@@ -402,164 +404,23 @@ impl DbRuntime {
             pools.close(deadline);
             checkpoint.shutdown_truncate()
         });
-        match deadline {
+        let joined = match deadline {
             Some(deadline) => {
                 let left = deadline.saturating_duration_since(Instant::now());
-                if tokio::time::timeout(left, blocking).await.is_err() {
-                    tracing::warn!("database shutdown steps still running at the shutdown bound");
-                }
+                tokio::time::timeout(left, blocking).await.ok()
             }
+            None => Some(blocking.await),
+        };
+        // The reclaim logs its own outcome; a step that panicked is logged
+        // here.
+        match joined {
             None => {
-                let _ = blocking.await;
+                tracing::warn!("database shutdown steps still running at the shutdown bound");
             }
-        }
-        let close = self.db.sqlx().close();
-        match deadline {
-            Some(deadline) => {
-                let left = deadline.saturating_duration_since(Instant::now());
-                if tokio::time::timeout(left, close).await.is_err() {
-                    tracing::warn!("database connections still checked out at the shutdown bound");
-                }
-            }
-            None => close.await,
+            Some(Err(error)) => tracing::error!(%error, "a database shutdown step failed"),
+            Some(Ok(_)) => {}
         }
     }
-}
-
-/// Open a pool with the full connection pragma set. `after_connect` applies
-/// every pragma when a connection opens and fails it loudly on drift; with
-/// `read_only` it also pins `query_only=ON`, so the pool can never write,
-/// and opens no connection until a read asks for one. `acquire_wait` is how
-/// long a caller waits for a connection.
-///
-/// A checkout does no work on the connection: no pragma check and no ping.
-/// The pragmas are per connection and nothing in the process changes them
-/// after open (WAL is a property of the file, and a read-only connection
-/// has no writes for foreign keys to check), and a ping cannot tell an
-/// in-process SQLite connection anything.
-async fn open_pool(
-    path: &Path,
-    readers: u32,
-    busy_timeout: Duration,
-    acquire_wait: Duration,
-    read_only: bool,
-) -> Result<SqlitePool, DbError> {
-    let (options, connect) = pool_options(path, readers, busy_timeout, acquire_wait, read_only);
-    if read_only {
-        return Ok(options.connect_lazy_with(connect));
-    }
-    Ok(options.connect_with(connect).await?)
-}
-
-/// The sqlx reader pool of [`super::Db::open_for_tests`]: the runtime's
-/// reader pool with no idle reaper and no warm connection, either of which
-/// would start a task on a tokio runtime the caller may not have. A
-/// connection opens on first use, inside the wait for it, so the wait is
-/// [`super::TEST_PATIENCE`] and a loaded host does not time it out.
-#[cfg(any(test, feature = "test-support"))]
-pub(in crate::db) fn lazy_reader_pool_for_tests(path: &Path) -> SqlitePool {
-    let (options, connect) = pool_options(
-        path,
-        MAX_READERS,
-        BUSY_TIMEOUT,
-        super::writer::TEST_PATIENCE,
-        true,
-    );
-    options
-        .idle_timeout(None)
-        .min_connections(0)
-        .connect_lazy_with(connect)
-}
-
-/// The options behind [`open_pool`].
-fn pool_options(
-    path: &Path,
-    readers: u32,
-    busy_timeout: Duration,
-    acquire_wait: Duration,
-    read_only: bool,
-) -> (SqlitePoolOptions, SqliteConnectOptions) {
-    let connect = SqliteConnectOptions::new()
-        .filename(path)
-        .create_if_missing(true)
-        .journal_mode(SqliteJournalMode::Wal)
-        .synchronous(SqliteSynchronous::Normal)
-        .busy_timeout(busy_timeout)
-        .foreign_keys(true);
-    let options = SqlitePoolOptions::new()
-        .max_connections(readers.max(1))
-        .min_connections(MIN_CONNECTIONS.min(readers.max(1)))
-        .acquire_timeout(acquire_wait)
-        .test_before_acquire(false)
-        .idle_timeout(Some(IDLE_TIMEOUT))
-        .max_lifetime(None)
-        .after_connect(
-            move |connection: &mut SqliteConnection, _meta: PoolConnectionMetadata| {
-                Box::pin(async move {
-                    let ready = ready_connection(connection, busy_timeout, read_only).await;
-                    // Without this line a pool that can never open a
-                    // connection would only show as callers told "busy".
-                    if let Err(error) = &ready {
-                        tracing::error!(%error, "database connection could not be made ready");
-                    }
-                    ready
-                })
-            },
-        );
-    (options, connect)
-}
-
-/// Apply the pragma set to a new connection, then the read-only pin when
-/// the pool is the reader pool.
-async fn ready_connection(
-    connection: &mut SqliteConnection,
-    busy_timeout: Duration,
-    read_only: bool,
-) -> Result<(), sqlx::Error> {
-    apply_pragmas(connection, busy_timeout).await?;
-    if read_only {
-        sqlx::query("PRAGMA query_only=ON")
-            .execute(&mut *connection)
-            .await?;
-    }
-    Ok(())
-}
-
-/// The full pragma set, applied to every pooled connection at open.
-async fn apply_pragmas(
-    connection: &mut SqliteConnection,
-    busy_timeout: Duration,
-) -> Result<(), sqlx::Error> {
-    let mode: String = sqlx::query_scalar("PRAGMA journal_mode=WAL")
-        .fetch_one(&mut *connection)
-        .await?;
-    if !mode.eq_ignore_ascii_case("wal") {
-        return Err(sqlx::Error::Configuration(
-            format!("database refused WAL mode, got {mode}").into(),
-        ));
-    }
-    sqlx::query("PRAGMA synchronous=NORMAL")
-        .execute(&mut *connection)
-        .await?;
-    sqlx::query(&format!("PRAGMA busy_timeout={}", busy_timeout.as_millis()))
-        .execute(&mut *connection)
-        .await?;
-    sqlx::query("PRAGMA foreign_keys=ON")
-        .execute(&mut *connection)
-        .await?;
-    sqlx::query(&format!("PRAGMA mmap_size={MMAP_SIZE}"))
-        .execute(&mut *connection)
-        .await?;
-    sqlx::query("PRAGMA temp_store=MEMORY")
-        .execute(&mut *connection)
-        .await?;
-    sqlx::query(&format!("PRAGMA cache_size={CACHE_SIZE_KIB}"))
-        .execute(&mut *connection)
-        .await?;
-    sqlx::query(&format!("PRAGMA wal_autocheckpoint={WAL_AUTOCHECKPOINT}"))
-        .execute(&mut *connection)
-        .await?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -575,7 +436,12 @@ mod tests {
         let dir = ScratchDir::new("factory-shutdown").unwrap();
         let db = dir.join("library.db");
         copy_to(&db).unwrap();
-        let mut runtime = open_runtime(&DbConfig::new(&db)).await.unwrap();
+        let mut runtime = open_runtime(&DbConfig::new(
+            &db,
+            std::sync::Arc::new(crate::clock::SystemClock),
+        ))
+        .await
+        .unwrap();
 
         let shared = Arc::new(());
         let (entered_tx, entered) = std::sync::mpsc::channel();

@@ -11,27 +11,42 @@ use droppedneedle_acquire::landing::ports::LandingLibrary;
 use droppedneedle_acquire::plugin_events::FlowTicks;
 use droppedneedle_acquire::wiring::{AcquirePorts, AcquireStores};
 use droppedneedle_auth::users::UsersDeps;
+use droppedneedle_catalog::artwork::warm::CoverWarm;
 use droppedneedle_catalog::collections::{CollectionsState, db::CollectionsDb, store::Stores};
 use droppedneedle_catalog::discover::content::DownloadReadiness;
+use droppedneedle_catalog::enrichment::live::CatalogEnrichment;
+use droppedneedle_catalog::lyrics::{LyricsError, LyricsQuery, OnlineLyricsSource};
 use droppedneedle_catalog::metadata::{
-    Catalog,
+    Catalog, PageSources,
     library::LocalCatalog,
+    ports::{NoDetails, NoFollows, NoPurchaseLinks},
     upstream::{LiveCatalogSettings, Upstream},
 };
+use droppedneedle_catalog::search::ports::UnconfiguredEnrichment;
 use droppedneedle_catalog::wiring::{CatalogInputs, CatalogPorts, CatalogSetup};
+use droppedneedle_kernel::clock::SystemClock;
+use droppedneedle_kernel::db::Db;
+use droppedneedle_kernel::jobs::queue::JobQueue;
 use droppedneedle_kernel::platform::Platform;
 use droppedneedle_library::wiring::{LibraryCore, LibrarySetup};
 use droppedneedle_media::stream::local_files::LibraryFiles;
 use droppedneedle_plugins::host::PluginHost;
 use droppedneedle_providers::Providers;
 
-/// Flow outcomes sent nowhere but the event hub, for rigs that build the
-/// download journal or the acquisition stores by hand.
+use super::acquire::FixedPlugin;
+
+/// Flow outcomes sent nowhere, for rigs that build the download journal
+/// or the acquisition stores by hand.
 pub fn quiet_ticks() -> Arc<dyn TickSink> {
-    Arc::new(FlowTicks::new(
-        None,
-        droppedneedle_kernel::events::EventHub::new(),
-    ))
+    Arc::new(QuietTicks)
+}
+
+struct QuietTicks;
+
+impl TickSink for QuietTicks {
+    fn emit(&self, _kind: &str, _detail: &str, _at: i64) {}
+
+    fn announce(&self, _event: FlowEvent) {}
 }
 
 /// A tick sink that keeps the key of every request announced as having
@@ -101,6 +116,27 @@ pub fn acquire_on(
     )
 }
 
+/// As [`acquire_on`], with the [`FixedPlugin`] installed and enabled as a
+/// download source, and the search review off: the bundle's worker
+/// downloads through the plugin.
+pub fn acquire_serving(
+    platform: &Platform,
+    library: &LibrarySetup,
+    landing: Arc<dyn LandingLibrary>,
+) -> (AcquireSetup, FixedPlugin) {
+    let fixed = FixedPlugin::install(platform, library.core.clone());
+    super::acquire::review_off(platform);
+    let acquire = acquire_hosted(
+        platform,
+        super::auth::AuthRig::on(platform).deps,
+        library,
+        &collections_at(platform).stores,
+        landing,
+        fixed.host.clone(),
+    );
+    (acquire, fixed)
+}
+
 /// As [`acquire_at`], with finished downloads landing through `landing`.
 pub fn acquire_landing_at(
     platform: &Platform,
@@ -109,6 +145,19 @@ pub fn acquire_landing_at(
     collections: &Stores,
     landing: Arc<dyn LandingLibrary>,
 ) -> AcquireSetup {
+    let plugins = idle_host(platform, library.core.clone());
+    acquire_hosted(platform, users, library, collections, landing, plugins)
+}
+
+/// As [`acquire_landing_at`], with plugins on `plugins`.
+pub fn acquire_hosted(
+    platform: &Platform,
+    users: UsersDeps,
+    library: &LibrarySetup,
+    collections: &Stores,
+    landing: Arc<dyn LandingLibrary>,
+    plugins: Arc<PluginHost>,
+) -> AcquireSetup {
     let outbound = super::closed_outbound();
     let providers = Arc::new(Providers::build(
         platform,
@@ -116,11 +165,7 @@ pub fn acquire_landing_at(
         droppedneedle_kernel::db::cache::CacheDb::scratch(),
     ));
     let mb_source = providers.musicbrainz.live_source(platform.settings.live());
-    let plugins = idle_host(platform, library.core.clone());
-    let ticks = Arc::new(FlowTicks::new(
-        Some(plugins.clone()),
-        platform.events.clone(),
-    ));
+    let ticks = Arc::new(FlowTicks::new(plugins.clone(), platform.events.clone()));
     AcquireSetup::build(
         platform,
         users,
@@ -151,8 +196,9 @@ pub fn acquire_landing_at(
 
 /// The production catalog bundle over `platform`, with no provider pair:
 /// collections in `collections`, the catalog and artwork on closed
-/// upstreams, files read through `library`, and download readiness from
-/// `acquire` when there is one.
+/// upstreams and no plugins, files read through `library`, and download
+/// readiness from `acquire` when there is one. Image warms queue on the
+/// platform's jobs table, where nothing runs them.
 pub fn catalog_setup_at(
     platform: &Platform,
     users: UsersDeps,
@@ -161,6 +207,7 @@ pub fn catalog_setup_at(
     collections: CollectionsState,
     acquire: Option<&AcquireSetup>,
 ) -> CatalogSetup {
+    let cover_warm = cover_warm_at(&platform.db);
     let catalog = Catalog::new(
         Upstream::new(
             Arc::new(Providers::unpaced(Arc::new(
@@ -170,6 +217,10 @@ pub fn catalog_setup_at(
             users.clone(),
         ),
         LocalCatalog::new(platform.db.clone()),
+        PageSources {
+            follows: droppedneedle_catalog::wiring::collections_follows(&collections),
+            ..quiet_page_sources(&platform.db)
+        },
     );
     let artwork = droppedneedle_catalog::wiring::artwork(platform, &inputs, catalog.clone());
     let download_readiness: Arc<dyn DownloadReadiness> = match acquire {
@@ -180,7 +231,7 @@ pub fn catalog_setup_at(
         platform,
         users,
         inputs,
-        None,
+        no_enrichment(),
         CatalogPorts {
             remotes: Arc::new(remotes_resolver(platform)),
             collections,
@@ -188,9 +239,55 @@ pub fn catalog_setup_at(
             artwork,
             library_files: LibraryFiles::new(platform.db.clone(), library.core.root_source()),
             download_readiness,
-            cover_warm: None,
+            cover_warm,
         },
     )
+}
+
+/// What a catalog's pages read beyond MusicBrainz and the library, with no
+/// follow store and no plugins: an artist page queues its image warm on
+/// the jobs table in `db`, where nothing runs it.
+pub fn quiet_page_sources(db: &Db) -> PageSources {
+    PageSources {
+        follows: Arc::new(NoFollows),
+        purchase_links: Arc::new(NoPurchaseLinks),
+        details: Arc::new(NoDetails),
+        cover_warm: cover_warm_at(db),
+    }
+}
+
+/// Image warms queued on the jobs table in `db`, where nothing runs them.
+pub fn cover_warm_at(db: &Db) -> CoverWarm {
+    CoverWarm::new(db.clone(), JobQueue::new(db.clone(), Arc::new(SystemClock)))
+}
+
+/// The catalog's enrichment with no provider behind it: search results
+/// carry no listener counts and there are no online lyrics.
+pub fn no_enrichment() -> CatalogEnrichment {
+    CatalogEnrichment {
+        search: Arc::new(UnconfiguredEnrichment),
+        lyrics: Arc::new(NoOnlineLyrics),
+    }
+}
+
+/// Online lyrics switched off: a track whose file carries none has none.
+pub struct NoOnlineLyrics;
+
+impl OnlineLyricsSource for NoOnlineLyrics {
+    fn switched_on(&self) -> bool {
+        false
+    }
+
+    fn lookup<'a>(
+        &'a self,
+        _query: LyricsQuery<'a>,
+        _priority: droppedneedle_providers::RequestPriority,
+    ) -> droppedneedle_catalog::local::stores::BoxFuture<
+        'a,
+        Result<Option<droppedneedle_providers::lrclib::LyricsCandidate>, LyricsError>,
+    > {
+        Box::pin(async { Ok(None) })
+    }
 }
 
 /// The collections database and stores, opened before acquisition is
@@ -230,21 +327,39 @@ impl DownloadReadiness for NoDownloadSource {
 
 /// The connection resolver the app builds: the per-user rows in the
 /// platform's database, sealed with its key, over the admin's server
-/// settings.
+/// settings. plex.tv is not reached: a Plex link stored without a server
+/// token uses its account token.
 pub fn remotes_resolver(
     platform: &Platform,
 ) -> droppedneedle_media::remotes::connections::ConnectionResolver {
-    use droppedneedle_media::remotes::connections::{
-        ConfigServers, ConnectionResolver, CredentialCoder, SqliteConnectionStore,
-    };
-    ConnectionResolver::new(
-        Arc::new(SqliteConnectionStore::new(
-            platform.db.clone(),
-            platform.clock.clone(),
-        )),
-        Arc::new(CredentialCoder::new(platform.crypto.clone())),
-        Arc::new(ConfigServers::new(&platform.settings)),
+    droppedneedle_media::remotes::connections::ConnectionResolver::over(
+        platform,
+        Arc::new(NoPlexTokens),
     )
+}
+
+/// A Plex server-token lookup that never answers, as if plex.tv were
+/// down: the resolver keeps the account token and stores nothing.
+pub struct NoPlexTokens;
+
+impl droppedneedle_media::remotes::connections::PlexServerTokens for NoPlexTokens {
+    fn server_token<'a>(
+        &'a self,
+        _server: &'a droppedneedle_media::remotes::connections::ServerSettings,
+        _auth_token: &'a str,
+        _priority: droppedneedle_providers::RequestPriority,
+    ) -> droppedneedle_media::remotes::source::BoxFuture<
+        'a,
+        Result<Option<String>, droppedneedle_media::remotes::source::AdapterError>,
+    > {
+        Box::pin(async {
+            Err(
+                droppedneedle_media::remotes::source::AdapterError::Transport(
+                    "plex.tv is not reached in this rig".to_owned(),
+                ),
+            )
+        })
+    }
 }
 
 /// The jobs bundle's media inputs for a rig with no media bundle: a fresh
@@ -290,7 +405,7 @@ pub fn media_at(
         None,
         &providers,
         Arc::new(droppedneedle_acquire::requests::mix::MixGrantHooks::new(
-            acquire.requests.mixer.clone(),
+            acquire.mixer.clone(),
         )),
         super::listening_store(platform),
         droppedneedle_kernel::jobs::queue::JobQueue::new(
@@ -410,13 +525,43 @@ pub fn jobs_at(
     );
     droppedneedle::bootstrap::jobs::JobsSetup::build(
         platform,
-        checkpoint,
-        media_jobs(platform),
-        droppedneedle_catalog::concerts::ConcertsSetup::from_platform(platform, &providers).sweep(),
-        sources,
+        quiet_loops(
+            checkpoint,
+            media_jobs(platform),
+            droppedneedle_catalog::concerts::ConcertsSetup::from_platform(platform, &providers)
+                .sweep(),
+            sources,
+        ),
         droppedneedle::bootstrap::jobs::QueueSetup::new(platform),
         scans,
+        droppedneedle_kernel::jobs::queue::Handlers::default(),
     )
+}
+
+/// The loops' backends with no personal mix and no discover warm pass.
+pub fn quiet_loops(
+    checkpoint: droppedneedle_kernel::db::CheckpointService,
+    media: droppedneedle_media::remotes::presence_feed::MediaJobs,
+    watcher: droppedneedle_catalog::concerts::ConcertsSweep,
+    precache_sources: Arc<dyn droppedneedle_kernel::jobs::precache_phases::PrecacheSources>,
+) -> droppedneedle::bootstrap::jobs::LoopBackends {
+    droppedneedle::bootstrap::jobs::LoopBackends {
+        checkpoint,
+        media,
+        watcher,
+        precache_sources,
+        mixer: Arc::new(NoMixer),
+        demand: Arc::new(droppedneedle_kernel::jobs::discovery_demand::NoDemand),
+    }
+}
+
+/// A personal-mix refresh that rebuilds nothing.
+pub struct NoMixer;
+
+impl droppedneedle_kernel::jobs::personal_mix::PersonalMixer for NoMixer {
+    fn run_for_all_users(&self) -> droppedneedle_kernel::jobs::BoxFuture<'_, Result<(), String>> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 /// The cover and artist image cache under the platform's cache folder.
@@ -476,4 +621,38 @@ pub fn settings_closed(platform: &Platform) -> droppedneedle::settings::wiring::
             &Providers::closed(),
         )),
     )
+}
+
+/// A plugin host that launches nothing, on a platform of its own over
+/// `db`'s database and folder, for rigs that build acquisition by hand.
+pub async fn idle_host_over(db: &droppedneedle_acquire::db::AcquireDb) -> Arc<PluginHost> {
+    let platform = platform_over(db).await;
+    let queue = droppedneedle_kernel::jobs::queue::JobQueue::new(
+        platform.db.clone(),
+        platform.clock.clone(),
+    );
+    idle_host(&platform, super::library::library_core(&platform, queue))
+}
+
+/// The requests state of a production acquisition bundle over `db`'s
+/// database and folder, on a platform and library of their own, for rigs
+/// that swap in their own dispatch or quota:
+/// `RequestsState { dispatch, ..requests_over(&db).await }`.
+pub async fn requests_over(
+    db: &droppedneedle_acquire::db::AcquireDb,
+) -> droppedneedle_acquire::requests::RequestsState {
+    let platform = platform_over(db).await;
+    let (library, _) = super::library::library_at(&platform);
+    acquire_at(
+        &platform,
+        super::auth::AuthRig::on(&platform).deps,
+        &library,
+        &collections_at(&platform).stores,
+    )
+    .requests
+}
+
+async fn platform_over(db: &droppedneedle_acquire::db::AcquireDb) -> Platform {
+    let dir = db.path().parent().expect("scratch dir").to_path_buf();
+    super::TestPlatform::on(db.db(), &dir).build().await
 }

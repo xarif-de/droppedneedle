@@ -7,9 +7,8 @@
 //! is private to this module. There is no async API on the write path, so
 //! holding a write transaction across an await is unrepresentable.
 //!
-//! A `Db` carries the lane's writes, reads on two pools of read-only
-//! connections, and the sqlx reader pool until the last area has moved its
-//! reads off it. The [`DbRuntime`] that opened it outlives it, and whoever
+//! A `Db` carries the lane's writes and reads on two pools of read-only
+//! connections. The [`DbRuntime`] that opened it outlives it, and whoever
 //! opens a runtime shuts it down after the last use of its handles, or
 //! exits.
 //!
@@ -65,7 +64,8 @@
 //! checkpoint policy with TRUNCATE reclaim, [`writer`] serializes writes with
 //! foreground-burst-8 fairness, [`backup`] copies the live database out with
 //! the online backup API, [`durable`] reads and writes the job registry's
-//! rows, [`analyze`] keeps the planner statistics fresh, [`fs`]
+//! rows, [`analyze`] keeps the planner statistics fresh, [`migrate`] runs
+//! the schema migrations, [`fs`]
 //! enforces the local-filesystem rule, [`fold`] folds text for
 //! accent-insensitive search, `savepoint` runs a part of a write that may
 //! fail alone, `scope` records which write and read closures a thread is
@@ -91,6 +91,7 @@ pub mod fs;
 pub mod handle;
 #[cfg(test)]
 mod lane_tests;
+pub mod migrate;
 pub mod read_pool;
 mod savepoint;
 mod scope;
@@ -116,14 +117,15 @@ pub use checkpoint::{
     Observation, TRUNCATE_MIN_INTERVAL,
 };
 pub use durable::{JobState, LoopRecord, list_loops};
-pub use error::{ChunkedError, DbError, map_sqlx_busy, rusqlite_is_busy, sqlx_is_busy};
+pub use error::{ChunkedError, DbError, rusqlite_is_busy};
 pub use factory::{
-    ACQUIRE_TIMEOUT, BOOT_WAIT, BUSY_TIMEOUT, CACHE_SIZE_KIB, DbConfig, DbRuntime, IDLE_TIMEOUT,
-    MAX_READERS, MIN_CONNECTIONS, MMAP_SIZE, WAL_AUTOCHECKPOINT, open_runtime,
+    ACQUIRE_TIMEOUT, BOOT_WAIT, BUSY_TIMEOUT, CACHE_SIZE_KIB, DbConfig, DbRuntime, MAX_READERS,
+    MMAP_SIZE, WAL_AUTOCHECKPOINT, open_runtime,
 };
 pub use fold::fold_text;
 pub use fs::{filesystem_is_local, reject_remote_filesystem, reject_symlink, same_filesystem};
 pub use handle::Db;
+pub use migrate::{Chain, Migration, Plan, SchemaError, Stamp, migrate, migrate_file};
 pub use read_pool::{LONG_READERS, OldestRead, ReadActivity};
 pub use savepoint::savepoint;
 pub use scope::block_on;

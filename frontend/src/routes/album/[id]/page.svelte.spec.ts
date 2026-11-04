@@ -8,7 +8,7 @@ const h = vi.hoisted(() => ({ goto: vi.fn() }));
 
 vi.mock('$app/state', () => ({ page: { url: new URL('http://localhost/album/x') } }));
 vi.mock('$app/navigation', () => ({ goto: (...args: unknown[]) => h.goto(...args) }));
-vi.mock('$lib/stores/player.svelte', () => ({
+vi.mock('$lib/features/player/state/player.svelte', () => ({
 	playerStore: {
 		isPlaying: false,
 		nowPlaying: null,
@@ -16,17 +16,18 @@ vi.mock('$lib/stores/player.svelte', () => ({
 		addToQueue: vi.fn(),
 		playNext: vi.fn(),
 		playMultipleNext: vi.fn(),
-		addMultipleToQueue: vi.fn()
+		addMultipleToQueue: vi.fn(),
+		dropTracks: vi.fn()
 	}
 }));
 
-import AlbumPage from './ProviderAlbumPage.svelte';
+import AlbumPage from '$lib/features/album/components/ProviderAlbumPage.svelte';
 import AlbumRoute from './+page.svelte';
 import { authStore } from '$lib/stores/authStore.svelte';
 import { HomeQueryKeyFactory } from '$lib/queries/featureKeys';
 import { setQueryDataWithPersister } from '$lib/queries/QueryClient';
 import { libraryStore } from '$lib/stores/library';
-import { toAuthUser } from '$lib/queries/auth/types';
+import { toAuthUser } from '$lib/features/auth/queries/types';
 
 const albumId = '3f3a6d95-326e-4384-80b0-0744f20f24ff';
 const localAlbumId = 'local-album-1';
@@ -300,7 +301,9 @@ describe('album detail page track removal', () => {
 	async function openRemoveFileDialog(): Promise<void> {
 		await trackRow('Infinite ❤️ Without Fulfillment').getByLabelText('More actions').click();
 		await page.getByRole('menuitem', { name: 'Remove file' }).click();
-		await expect.element(page.getByRole('dialog')).toBeVisible();
+		await expect
+			.element(page.getByRole('dialog'))
+			.toHaveTextContent('Infinite ❤️ Without Fulfillment');
 	}
 
 	it('removes the file and refetches only that album', async () => {

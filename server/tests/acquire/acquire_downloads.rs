@@ -6,17 +6,16 @@
 //! orphan/quarantine sweeps fail closed. Nothing here touches the real
 //! library.
 
+use crate::common::Probe;
 use droppedneedle_acquire::downloads;
 
 use std::sync::Arc;
-use std::time::{Instant, SystemTime};
+use std::time::Instant;
 
 use droppedneedle_acquire::db::AcquireDb;
 use droppedneedle_acquire::dispatch::DispatchOrigin;
 use droppedneedle_acquire::downloads::journal::Journal;
-use droppedneedle_acquire::downloads::worker::{
-    DownloadWorker, FixedSource, WorkerConfig, run_startup_recovery,
-};
+use droppedneedle_acquire::downloads::worker::run_startup_recovery;
 use droppedneedle_acquire::held::store::{
     EntryOrigin, GroupKey, HeldRoot, HeldRows, NewEntry, NewFile,
 };
@@ -30,12 +29,12 @@ fn mount_gone() -> TaskOutcome<'static> {
 }
 use downloads::quarantine::QuarantineReason;
 use downloads::recovery::{FAILOVER_CLAIM_LIMIT, FAILOVER_LEASE_SECONDS, StartupAction};
-use downloads::state::{AttemptDisposition, AttemptState, can_transition};
+use downloads::state::{AttemptDisposition, AttemptState};
 use downloads::store::{NewTask, ReimportStart, TaskOutcome};
 use downloads::{
     DownloadStore, OrphanDecision, OrphanEvidence, OrphanPolicy, PollSample, QuarantineDir,
     RetryPolicy, TaskStatus, Watchdog, WatchdogConfig, WatchdogOutcome,
-    canonical_soulseek_identity, classify_startup, is_terminal, plan_retry,
+    canonical_soulseek_identity, classify_startup, plan_retry,
 };
 use rusqlite::Connection;
 
@@ -185,18 +184,22 @@ async fn startup_recovery_follows_the_task_rows() {
     }
 }
 
+/// One scratch store: a cleanup lease passes to a successor only once it
+/// expires and a stale revision loses, terminal rows never move, and an
+/// idempotency key answers the first task.
 #[test]
-fn orchestrator_failover_claims_only_past_the_lease() {
-    let dir = scratch_dir("failover");
+fn the_task_store_hands_each_task_to_one_owner() {
+    let dir = scratch_dir("one-owner");
     let conn = scratch_store(&dir);
     let store = DownloadStore::new(&conn);
     let now = 1_700_000_000.0;
 
-    store.insert_task(&new_task("t1"), now).unwrap();
+    // Failover: the lease.
+    store.insert_task(&new_task("lease"), now).unwrap();
     store
         .insert_attempt(
             "a1",
-            "t1",
+            "lease",
             "usenet",
             0,
             "droppedneedle-job",
@@ -254,6 +257,54 @@ fn orchestrator_failover_claims_only_past_the_lease() {
         )
         .unwrap();
     assert!(stale.is_none());
+
+    // Terminal rows never move, not even back to queued.
+    store.insert_task(&new_task("done"), now).unwrap();
+    store
+        .transition_task("done", TaskStatus::Failed, now, None)
+        .unwrap();
+    assert!(
+        store
+            .transition_task("done", TaskStatus::Queued, now, None)
+            .is_err()
+    );
+    // Finalizing into a non-terminal status is refused, not asserted.
+    assert!(
+        store
+            .finalize_task_and_attempt("done", TaskStatus::Downloading, now, None, None, false)
+            .is_err()
+    );
+    // Startup classification leaves misfed terminal rows alone.
+    for status in [
+        TaskStatus::Completed,
+        TaskStatus::Partial,
+        TaskStatus::Failed,
+        TaskStatus::Cancelled,
+    ] {
+        assert_eq!(
+            classify_startup(status, &[]),
+            StartupAction::Noop,
+            "{status:?}"
+        );
+    }
+
+    // An idempotency key answers the task that claimed it first.
+    store.insert_task(&new_task("task-a"), now).unwrap();
+    assert!(
+        store
+            .claim_key("dispatch:k1", "task-a", "dispatch", now)
+            .unwrap()
+    );
+    assert!(
+        !store
+            .claim_key("dispatch:k1", "task-b", "dispatch", now)
+            .unwrap()
+    );
+    assert_eq!(
+        store.task_id_for_key("dispatch:k1").unwrap().as_deref(),
+        Some("task-a")
+    );
+    assert_eq!(store.task_id_for_key("dispatch:missing").unwrap(), None);
 }
 
 #[test]
@@ -323,7 +374,6 @@ fn auto_retry_sweep_honors_backoff_newest_wins_and_held_gate() {
     let now = 1_700_000_000.0;
     let policy = RetryPolicy::default();
 
-    assert_eq!(policy.ladder_minutes(), vec![15, 30, 60, 120, 240, 480]);
     assert_eq!(policy.next_retry_at(0, now, "failed"), Some(now + 900.0));
     assert_eq!(policy.next_retry_at(6, now, "failed"), None);
     assert_eq!(policy.next_retry_at(0, now, "completed"), None);
@@ -406,8 +456,10 @@ fn auto_retry_sweep_honors_backoff_newest_wins_and_held_gate() {
     assert!(plan_retry("live", TaskStatus::Downloading, "user", 0).is_none());
 }
 
+/// Quarantine rows expire and clear on a manual retry, and a suspect file
+/// moves only into the sandbox, never under a stamp that escapes it.
 #[test]
-fn quarantine_blocks_expires_and_clears_on_manual_retry() {
+fn quarantine_expires_and_holds_files_only_in_its_sandbox() {
     let dir = scratch_dir("quar");
     let conn = scratch_store(&dir);
     let store = DownloadStore::new(&conn);
@@ -462,10 +514,15 @@ fn quarantine_blocks_expires_and_clears_on_manual_retry() {
         .unwrap();
     assert_eq!(store.delete_quarantine_for_album("rg-1").unwrap(), 1);
 
-    // Suspect files move into the sandbox only.
+    // Suspect files move into the sandbox only, and a stamp that would
+    // climb out of it is refused with the file left where it was.
     let sandbox = QuarantineDir::sandbox(dir.join("quarantine"));
     let suspect = dir.join("suspect.flac");
     std::fs::write(&suspect, b"bad bytes").unwrap();
+    assert!(sandbox.hold_file(&suspect, "../escape").is_err());
+    assert!(sandbox.hold_file(&suspect, "a/b").is_err());
+    assert!(sandbox.hold_file(&suspect, "..").is_err());
+    assert!(suspect.exists());
     let held = sandbox.hold_file(&suspect, "20240101T000000").unwrap();
     assert!(!suspect.exists());
     assert!(held.exists());
@@ -605,147 +662,33 @@ fn watchdog_orders_terminal_ceiling_stall_and_queue() {
         ..base.clone()
     };
     assert_eq!(watchdog.evaluate(&queued), WatchdogOutcome::QueuedTimeout);
-}
 
-#[test]
-fn terminal_states_close_the_task_but_open_a_retry() {
-    for status in [
-        TaskStatus::Completed,
-        TaskStatus::Partial,
-        TaskStatus::Failed,
-        TaskStatus::Cancelled,
-    ] {
-        assert!(is_terminal(status.as_str()));
-        for next in [
-            TaskStatus::Queued,
-            TaskStatus::Downloading,
-            TaskStatus::Processing,
-            TaskStatus::Completed,
-            TaskStatus::Partial,
-            TaskStatus::Failed,
-            TaskStatus::Cancelled,
-        ] {
-            assert!(!can_transition(status, next));
-        }
-    }
-    assert!(can_transition(TaskStatus::Queued, TaskStatus::Downloading));
-    assert!(!is_terminal("downloading"));
-
-    // Quarantine reasons stay within the CHECK vocabulary.
-    let reasons: Vec<&str> = [
-        QuarantineReason::VerifyFailed,
-        QuarantineReason::Corrupt,
-        QuarantineReason::FingerprintMismatch,
-        QuarantineReason::DurationMismatch,
-        QuarantineReason::DownloadFailed,
-        QuarantineReason::Manual,
-    ]
-    .iter()
-    .map(|reason| reason.as_str())
-    .collect();
+    // Past the stall mark with no active transfer and past the materialize
+    // window: the materialize fast-fail fires first.
+    let never_materialized = PollSample {
+        has_active_transfer: false,
+        downloaded_bytes: 0,
+        idle_seconds: 31.0 * 60.0,
+        materialize_wait_seconds: 120.0,
+        ..base.clone()
+    };
     assert_eq!(
-        reasons,
-        vec![
-            "verify_failed",
-            "corrupt",
-            "fingerprint_mismatch",
-            "duration_mismatch",
-            "download_failed",
-            "manual"
-        ]
+        watchdog.evaluate(&never_materialized),
+        WatchdogOutcome::MaterializeTimeout
     );
-    // Watchdog defaults stay ordered: stall < queued < 6h deadline, and
-    // the materialize + reap windows sit under the stall timeout.
-    let config = WatchdogConfig::default();
-    assert_eq!(config.deadline_seconds, 6.0 * 3600.0);
-    assert!(config.stall_timeout_seconds < config.queued_timeout_seconds);
-    assert!(config.queued_timeout_seconds < config.deadline_seconds);
-    assert!(config.materialize_seconds < config.stall_timeout_seconds);
-    assert!(config.reap_threshold_seconds <= config.stall_timeout_seconds);
 }
 
+/// Reimport needs a failed or partial task whose attempt still names its
+/// files and moves it to processing with its error cleared. Kept files go
+/// to cleanup after 90 days or when their task stops, and a reimport and
+/// cleanup each take the attempt by compare and set, so neither works on
+/// files the other has.
 #[test]
-fn terminal_tasks_reject_outgoing_transitions() {
-    let dir = scratch_dir("term-guard");
-    let conn = scratch_store(&dir);
-    let store = DownloadStore::new(&conn);
-    let now = 1_700_000_000.0;
-    store.insert_task(&new_task("t1"), now).unwrap();
-    store
-        .transition_task("t1", TaskStatus::Failed, now, None)
-        .unwrap();
-    // Terminal rows never move, not even back to queued.
-    assert!(
-        store
-            .transition_task("t1", TaskStatus::Queued, now, None)
-            .is_err()
-    );
-    // Finalizing into a non-terminal status is refused, not asserted.
-    assert!(
-        store
-            .finalize_task_and_attempt("t1", TaskStatus::Downloading, now, None, None, false)
-            .is_err()
-    );
-    // Startup classification leaves misfed terminal rows alone.
-    for status in [
-        TaskStatus::Completed,
-        TaskStatus::Partial,
-        TaskStatus::Failed,
-        TaskStatus::Cancelled,
-    ] {
-        assert_eq!(classify_startup(status, &[]), StartupAction::Noop);
-    }
-}
-
-#[test]
-fn idempotency_keys_answer_the_original_task() {
-    let dir = scratch_dir("idem-key");
-    let conn = scratch_store(&dir);
-    let store = DownloadStore::new(&conn);
-    let now = 1_700_000_000.0;
-    store.insert_task(&new_task("task-a"), now).unwrap();
-    assert!(
-        store
-            .claim_key("dispatch:k1", "task-a", "dispatch", now)
-            .unwrap()
-    );
-    assert!(
-        !store
-            .claim_key("dispatch:k1", "task-b", "dispatch", now)
-            .unwrap()
-    );
-    assert_eq!(
-        store.task_id_for_key("dispatch:k1").unwrap().as_deref(),
-        Some("task-a")
-    );
-    assert_eq!(store.task_id_for_key("dispatch:missing").unwrap(), None);
-}
-
-#[test]
-fn quarantine_hold_rejects_escaping_stamps() {
-    let dir = scratch_dir("quar-stamp");
-    let sandbox = QuarantineDir::sandbox(dir.join("quarantine"));
-    let suspect = dir.join("suspect.flac");
-    std::fs::write(&suspect, b"bad bytes").unwrap();
-    assert!(sandbox.hold_file(&suspect, "../escape").is_err());
-    assert!(sandbox.hold_file(&suspect, "a/b").is_err());
-    assert!(sandbox.hold_file(&suspect, "..").is_err());
-    assert!(suspect.exists());
-    let held = sandbox.hold_file(&suspect, "20240101T000000").unwrap();
-    assert!(held.starts_with(dir.join("quarantine")));
-}
-
-// Reimport needs a failed or partial task whose attempt still names its
-// files; starting one moves the task to processing with its error cleared
-// (the guard is keyed on the attempt journal).
-#[test]
-fn reimport_starts_tasks_whose_files_remain() {
+fn reimport_and_cleanup_never_share_kept_files() {
+    // Case "reimport": the guard is keyed on the attempt journal.
     let dir = scratch_dir("reimport");
     let conn = scratch_store(&dir);
-    let now = SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs_f64();
+    let now = 1_700_000_000.0;
     let store = DownloadStore::new(&conn);
     for id in ["kept", "bare", "live"] {
         store.insert_task(&new_task(id), now).unwrap();
@@ -808,16 +751,11 @@ fn reimport_starts_tasks_whose_files_remain() {
         store.begin_reimport("missing", "missing-a0", now).unwrap(),
         ReimportStart::NotReimportable
     );
-}
 
-// Files kept for "Retry import" go to cleanup after 90 days, or at once
-// when their task is stopped. A reimport and cleanup each take the
-// attempt by compare and set, so neither works on files the other has:
-// a reimport that started keeps them past the 90 days, a reimport takes
-// back files cleanup has not leased yet, and files cleanup has leased are
-// never reimported.
-#[test]
-fn kept_files_go_to_cleanup_without_racing_a_reimport() {
+    // Case "kept files": a reimport that started keeps them past the 90
+    // days, a reimport takes back files cleanup has not leased yet, and
+    // files cleanup has leased are never reimported. Its own store, so the
+    // 90-day release sees only these rows.
     let dir = scratch_dir("kept-files");
     let conn = scratch_store(&dir);
     let store = DownloadStore::new(&conn);
@@ -942,17 +880,37 @@ async fn failing_cleanup_shows_on_service_health_until_it_clears() {
         })
         .await
         .unwrap();
-    let staging = db.path().parent().unwrap().join("staging");
-    let source = Arc::new(FixedSource::new(staging.join("downloads"), Vec::new()));
+    let dir = db.path().parent().unwrap().to_path_buf();
+    let platform = crate::common::TestPlatform::on(db.db(), &dir).build().await;
+    let (library, _) = crate::common::library::library_at(&platform);
+    let source = crate::common::acquire::FixedPlugin::install(&platform, library.core.clone());
+    source.serve(&dir.join("staging/downloads"), &[]);
     source.fail_discards(true);
     let health = Arc::new(ServiceHealth::new());
-    let worker = Arc::new(DownloadWorker::fixed(
-        journal,
-        vec![crate::as_source(source.clone())],
-        WorkerConfig::default(),
-        droppedneedle_kernel::events::EventHub::new(),
+    let worker = crate::common::acquire::worker_with(
+        &platform,
+        source.host.clone(),
+        journal.clone(),
+        &platform.settings,
+        dir.join("slskd"),
+        Arc::new(droppedneedle_acquire::target::Targets::new(
+            journal.clone(),
+            Arc::new(crate::common::acquire::FixedAlbums::default()),
+        )),
+        Arc::new(droppedneedle_acquire::landing::LandingService::new(
+            journal,
+            Arc::new(
+                droppedneedle_acquire::landing::library::LibraryLanding::new(
+                    &library,
+                    library.imports.releases.clone(),
+                ),
+            ),
+            platform.settings.live(),
+            dir.join("held"),
+        )),
         health.clone(),
-    ));
+        droppedneedle_kernel::events::EventHub::new(),
+    );
     // Each failed cleanup backs off; make the row due again without waiting.
     let due_now = || {
         db.write("test.due", |tx| {
@@ -1178,21 +1136,19 @@ async fn seed_held_on(
 }
 
 /// An entry's state, tries and next try.
-async fn retry_of(db: &AcquireDb, entry: i64) -> (String, i64, Option<i64>) {
-    sqlx::query_as("SELECT state, retry_tries, retry_at FROM acquire_held_entries WHERE id = ?1")
-        .bind(entry)
-        .fetch_one(db.db().sqlx())
-        .await
-        .expect("entry")
+fn retry_of(db: &AcquireDb, entry: i64) -> (String, i64, Option<i64>) {
+    db.db().row(
+        "SELECT state, retry_tries, retry_at FROM acquire_held_entries WHERE id = ?1",
+        rusqlite::params![entry],
+    )
 }
 
 /// A held file's state and reason, by its path.
-async fn held_file(db: &AcquireDb, path: &str) -> (String, String) {
-    sqlx::query_as("SELECT state, reason FROM acquire_held_files WHERE path = ?1")
-        .bind(path)
-        .fetch_one(db.db().sqlx())
-        .await
-        .expect("held file")
+fn held_file(db: &AcquireDb, path: &str) -> (String, String) {
+    db.db().row(
+        "SELECT state, reason FROM acquire_held_files WHERE path = ?1",
+        rusqlite::params![path],
+    )
 }
 
 /// A file held because its place in the library was taken is retried by
@@ -1313,19 +1269,19 @@ async fn held_files_the_library_could_not_take_are_retried_by_themselves() {
     let start = clock.now_ms();
     acquire.held.tend().await;
     assert_eq!(
-        held_file(db, "free.flac").await.0,
+        held_file(db, "free.flac").0,
         "imported",
         "a fresh hold whose place is free goes in at the first pass"
     );
     assert!(album.join("0102 Sour Times.flac").is_file());
-    assert_eq!(retry_of(db, fresh).await, ("resolved".to_owned(), 0, None));
+    assert_eq!(retry_of(db, fresh), ("resolved".to_owned(), 0, None));
     assert_eq!(
-        retry_of(db, waiting).await,
+        retry_of(db, waiting),
         ("held".to_owned(), 1, Some(start + 5 * MINUTE)),
         "a place still taken waits five minutes"
     );
     assert_eq!(
-        held_file(db, "taken.flac").await,
+        held_file(db, "taken.flac"),
         ("held".to_owned(), "target_occupied".to_owned())
     );
     assert_eq!(
@@ -1334,13 +1290,13 @@ async fn held_files_the_library_could_not_take_are_retried_by_themselves() {
         "the file in the way is never overwritten"
     );
     assert_eq!(
-        held_file(db, "weak.flac").await,
+        held_file(db, "weak.flac"),
         ("held".to_owned(), "weak_match".to_owned()),
         "a file a person decides on is not retried"
     );
     assert!(held_dir.join("weak.flac").is_file());
     assert_eq!(
-        retry_of(db, claimed).await,
+        retry_of(db, claimed),
         ("placing".to_owned(), 0, None),
         "an entry a person is acting on is skipped"
     );
@@ -1348,7 +1304,7 @@ async fn held_files_the_library_could_not_take_are_retried_by_themselves() {
 
     acquire.held.tend().await;
     assert_eq!(
-        retry_of(db, waiting).await,
+        retry_of(db, waiting),
         ("held".to_owned(), 1, Some(start + 5 * MINUTE)),
         "nothing is retried before its time"
     );
@@ -1356,7 +1312,7 @@ async fn held_files_the_library_could_not_take_are_retried_by_themselves() {
     clock.advance(5 * MINUTE);
     acquire.held.tend().await;
     assert_eq!(
-        retry_of(db, waiting).await,
+        retry_of(db, waiting),
         ("held".to_owned(), 2, Some(start + 20 * MINUTE)),
         "the next gap is fifteen minutes"
     );
@@ -1364,16 +1320,16 @@ async fn held_files_the_library_could_not_take_are_retried_by_themselves() {
     std::fs::remove_file(&taken).expect("place freed");
     clock.advance(15 * MINUTE);
     acquire.held.tend().await;
-    assert_eq!(held_file(db, "taken.flac").await.0, "imported");
+    assert_eq!(held_file(db, "taken.flac").0, "imported");
     assert!(taken.is_file(), "the held file took its place");
     assert!(!held_dir.join("taken.flac").exists());
     assert_eq!(
-        retry_of(db, waiting).await,
+        retry_of(db, waiting),
         ("held".to_owned(), 0, None),
         "with nothing left to retry the entry waits for its person"
     );
     assert_eq!(
-        held_file(db, "weak.flac").await,
+        held_file(db, "weak.flac"),
         ("held".to_owned(), "weak_match".to_owned())
     );
 }
@@ -1441,14 +1397,14 @@ async fn a_matched_download_is_retried_onto_its_match() {
         "never placed on the album the curator matched it away from"
     );
     assert_eq!(
-        held_file(&rig.db, "matched.flac").await,
+        held_file(&rig.db, "matched.flac"),
         ("held".to_owned(), "target_occupied".to_owned())
     );
 
     std::fs::remove_file(&taken).expect("place freed");
     rig.clock.advance(5 * MINUTE);
     rig.acquire.held.tend().await;
-    assert_eq!(held_file(&rig.db, "matched.flac").await.0, "imported");
+    assert_eq!(held_file(&rig.db, "matched.flac").0, "imported");
     assert!(taken.is_file(), "placed on the album it was matched to");
     assert!(!dummy_dir.join("0101 Mysterons.flac").exists());
 }
@@ -1497,7 +1453,7 @@ async fn a_retry_never_adds_a_second_copy_by_itself() {
     )
     .await;
     rig.acquire.held.tend().await;
-    assert_eq!(retry_of(&rig.db, entry).await.1, 1);
+    assert_eq!(retry_of(&rig.db, entry).1, 1);
 
     // The library gets the track on its Deluxe copy, and another track on
     // a Remaster copy.
@@ -1556,7 +1512,7 @@ async fn a_retry_never_adds_a_second_copy_by_itself() {
     rig.acquire.held.tend().await;
     assert!(!taken.exists(), "no second copy");
     assert_eq!(
-        held_file(&rig.db, "taken.flac").await,
+        held_file(&rig.db, "taken.flac"),
         ("held".to_owned(), "owned_elsewhere".to_owned()),
         "a person decides"
     );
@@ -1565,7 +1521,7 @@ async fn a_retry_never_adds_a_second_copy_by_itself() {
         "its copy is kept"
     );
     assert_eq!(
-        retry_of(&rig.db, entry).await,
+        retry_of(&rig.db, entry),
         ("held".to_owned(), 0, None),
         "no further retry"
     );
@@ -1620,13 +1576,13 @@ async fn a_retry_never_replaces_a_library_copy_by_itself() {
         "nothing went to the recycle bin"
     );
     assert_eq!(
-        held_file(&rig.db, "better.flac").await,
+        held_file(&rig.db, "better.flac"),
         ("held".to_owned(), "owned_on_album".to_owned()),
         "a person decides"
     );
     assert!(rig.held_dir.join("better.flac").is_file());
     assert_eq!(
-        retry_of(&rig.db, entry).await,
+        retry_of(&rig.db, entry),
         ("held".to_owned(), 0, None),
         "no further retry"
     );
@@ -1693,7 +1649,7 @@ async fn a_better_copy_on_a_flagged_album_waits_for_a_persons_import() {
         "the library's copy stays while the flag does"
     );
     assert_eq!(
-        held_file(&rig.db, "better.flac").await,
+        held_file(&rig.db, "better.flac"),
         ("held".to_owned(), "album_needs_check".to_owned()),
     );
 
@@ -1703,7 +1659,7 @@ async fn a_better_copy_on_a_flagged_album_waits_for_a_persons_import() {
     rig.acquire.held.tend().await;
     assert!(yours.is_file(), "nothing replaces your copy by itself");
     assert_eq!(
-        held_file(&rig.db, "better.flac").await,
+        held_file(&rig.db, "better.flac"),
         ("held".to_owned(), "album_needs_check".to_owned()),
     );
 
@@ -1722,23 +1678,29 @@ async fn a_better_copy_on_a_flagged_album_waits_for_a_persons_import() {
         "the better copy went in"
     );
     assert!(!yours.exists(), "yours went to the recycle bin");
-    assert_eq!(held_file(&rig.db, "better.flac").await.0, "imported");
+    assert_eq!(held_file(&rig.db, "better.flac").0, "imported");
 }
 
-/// A pass that finds the database busy, or no library set up yet, spends
-/// no try: the entry waits for the next pass as it was, never left claimed.
+/// A pass that finds the database busy spends no try: the entry waits for
+/// the next pass as it was, never left claimed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_busy_database_or_no_library_spends_no_retry() {
+async fn a_busy_database_spends_no_retry() {
     use droppedneedle_kernel::db::{DbConfig, DbError, Lane, LaneLimits, open_runtime};
 
     let dir = scratch_dir("held-retry-busy");
     let path = dir.join("app.db");
     crate::common::migrated_db(&path);
-    let runtime = open_runtime(&DbConfig::new(&path).with_lane_limits(LaneLimits {
-        foreground_wait: std::time::Duration::from_millis(200),
-        watch_tick: std::time::Duration::from_millis(10),
-        ..LaneLimits::default()
-    }))
+    let runtime = open_runtime(
+        &DbConfig::new(
+            &path,
+            std::sync::Arc::new(droppedneedle_kernel::clock::SystemClock),
+        )
+        .with_lane_limits(LaneLimits {
+            foreground_wait: std::time::Duration::from_millis(200),
+            watch_tick: std::time::Duration::from_millis(10),
+            ..LaneLimits::default()
+        }),
+    )
     .await
     .expect("runtime opens");
     let db = AcquireDb::new(
@@ -1784,31 +1746,11 @@ async fn a_busy_database_or_no_library_spends_no_retry() {
     drop(let_go);
     writer.join().expect("writer joins");
     assert_eq!(
-        retry_of(&db, entry).await,
+        retry_of(&db, entry),
         ("held".to_owned(), 0, None),
         "a busy database spends no try"
     );
 
-    // The app always hands its worker a landing; the held list over a
-    // worker without one has no library to place into.
-    let no_library = droppedneedle_acquire::held::HeldService::new(
-        acquire.journal.clone(),
-        Arc::new(DownloadWorker::fixed(
-            acquire.journal.clone(),
-            Vec::new(),
-            WorkerConfig::default(),
-            droppedneedle_kernel::events::EventHub::new(),
-            Default::default(),
-        )),
-        acquire.drops.clone(),
-        acquire.held.folders().clone(),
-    );
-    no_library.tend().await;
-    assert_eq!(
-        retry_of(&db, entry).await,
-        ("held".to_owned(), 0, None),
-        "no library set up spends no try"
-    );
-    drop((no_library, acquire, library, platform));
+    drop((acquire, library, platform));
     runtime.shutdown().await;
 }

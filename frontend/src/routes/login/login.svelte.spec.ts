@@ -1,6 +1,6 @@
 import { page, userEvent } from 'vitest/browser';
 import { describe, expect, it, vi, beforeEach } from 'vitest';
-import { render } from 'vitest-browser-svelte';
+import { cleanup, render } from 'vitest-browser-svelte';
 
 const mockLocalMutate = vi.fn().mockResolvedValue({
 	user: {
@@ -27,14 +27,14 @@ vi.mock('$lib/stores/authStore.svelte', () => ({
 }));
 
 // Two providers so the tab bar renders (it only shows when >1 method is enabled).
-vi.mock('$lib/queries/auth/AuthProvidersQuery.svelte', () => ({
+vi.mock('$lib/features/auth/queries/AuthProvidersQuery.svelte', () => ({
 	getAuthProvidersQuery: () => ({
 		data: { local: true, plex: false, jellyfin: true, oidc: false },
 		isSuccess: true
 	})
 }));
 
-vi.mock('$lib/queries/auth/AuthMutations.svelte', () => ({
+vi.mock('$lib/features/auth/queries/AuthMutations.svelte', () => ({
 	createLocalLoginMutation: () => ({ mutateAsync: mockLocalMutate, isPending: false }),
 	createJellyfinLoginMutation: () => ({ mutateAsync: vi.fn(), isPending: false }),
 	createOidcAuthorizeMutation: () => ({ mutateAsync: vi.fn(), isPending: false })
@@ -42,7 +42,7 @@ vi.mock('$lib/queries/auth/AuthMutations.svelte', () => ({
 
 // The page mints Plex pins through the real flow module; these tests never
 // touch the Plex tab, so stub the mutation instead of mounting a QueryClient.
-vi.mock('$lib/queries/plex.svelte', () => ({
+vi.mock('$lib/features/settings/queries/plex.svelte', () => ({
 	createPlexStartMutation: () => ({ mutateAsync: vi.fn(), isPending: false }),
 	pollPlexFlow: vi.fn()
 }));
@@ -67,24 +67,29 @@ describe('login local tab uses a username field', () => {
 		expect(getComputedStyle(submit.element()).backgroundColor).not.toBe('rgba(0, 0, 0, 0)');
 	});
 
-	it('renders a text username input (autocomplete=username), not an email input', async () => {
-		await render(Login);
-		const input = page.getByPlaceholder('Username');
-		await expect.element(input).toBeInTheDocument();
-		const el = input.element() as HTMLInputElement;
-		expect(el.type).toBe('text');
-		expect(el.getAttribute('autocomplete')).toBe('username');
-		// The local tab no longer collects an email address.
-		const textboxes = await page.getByRole('textbox').all();
-		expect(textboxes.length).toBeGreaterThan(0);
-		for (const box of textboxes) {
-			await expect.element(box).not.toHaveAttribute('type', 'email');
+	it('takes a username, not an email, on a tab named for it', async () => {
+		{
+			// Renders a text username input (autocomplete=username), not an email input.
+			await render(Login);
+			const input = page.getByPlaceholder('Username');
+			await expect.element(input).toBeInTheDocument();
+			const el = input.element() as HTMLInputElement;
+			expect(el.type).toBe('text');
+			expect(el.getAttribute('autocomplete')).toBe('username');
+			// The local tab no longer collects an email address.
+			const textboxes = await page.getByRole('textbox').all();
+			expect(textboxes.length).toBeGreaterThan(0);
+			for (const box of textboxes) {
+				await expect.element(box).not.toHaveAttribute('type', 'email');
+			}
 		}
-	});
 
-	it('labels the local tab "Username"', async () => {
-		await render(Login);
-		await expect.element(page.getByRole('button', { name: 'Username' })).toBeInTheDocument();
+		{
+			// Labels the local tab "Username".
+			cleanup();
+			await render(Login);
+			await expect.element(page.getByRole('button', { name: 'Username' })).toBeInTheDocument();
+		}
 	});
 
 	it('offers local-account recovery from the password field', async () => {

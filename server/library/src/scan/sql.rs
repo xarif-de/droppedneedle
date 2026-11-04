@@ -236,8 +236,9 @@ droppedneedle_kernel::sql! {
                      ON CONFLICT(local_album_id) DO UPDATE SET \
                      signature = excluded.signature, checked_at = excluded.checked_at, \
                      art_version = MAX(art_version, excluded.art_version)";
-    pub(super) ALBUM_TRACKS = "SELECT t.local_album_id, t.id, t.file_path, t.stat_revision, \
-         t.file_size_bytes FROM local_tracks t JOIN local_albums a ON a.id = t.local_album_id \
+    pub(super) ALBUM_TRACKS = "SELECT t.local_album_id, t.id, t.file_path, t.relative_path, \
+         t.stat_revision, t.file_size_bytes FROM local_tracks t \
+         JOIN local_albums a ON a.id = t.local_album_id \
          WHERE t.availability = 'indexed' AND a.retired_into_album_id IS NULL \
          ORDER BY t.local_album_id, t.disc_number, t.track_number, t.id";
     pub(super) ALL_ARTWORK = "SELECT local_album_id, source, source_locator, content_hash FROM local_album_artwork";
@@ -276,8 +277,10 @@ droppedneedle_kernel::sql! {
                  AND retired_into_album_id IS NULL AND title_folded = ?2 \
                  AND COALESCE(album_artist_name_folded, '') = ?3)";
     pub(super) ALBUM_HAS_GROUPING_KEY = "SELECT EXISTS(SELECT 1 FROM local_albums WHERE id = ?1 AND grouping_key = ?2)";
+    /// Run once per file. The unary plus keeps `retired_into_album_id IS NULL`,
+    /// true of nearly every album, from ever being taken as an index key.
     pub(super) ALBUMS_FOR_GROUPING = "SELECT id, grouping_key = ?1 AS exact FROM local_albums \
-             WHERE retired_into_album_id IS NULL AND (grouping_key = ?1 \
+             WHERE +retired_into_album_id IS NULL AND (grouping_key = ?1 \
              OR (?2 IS NOT NULL AND title_folded = ?3 AND album_artist_name_folded = ?4 \
                AND (grouping_key = ?2 OR (?2 = 'mbid:' AND grouping_key LIKE 'mbid:%')))) \
              ORDER BY created_at, id";
@@ -1128,6 +1131,7 @@ droppedneedle_kernel::sql! {
         local_album_id: String,
         id: String,
         file_path: String,
+        relative_path: String,
         stat_revision: String,
         file_size_bytes: i64,
     }

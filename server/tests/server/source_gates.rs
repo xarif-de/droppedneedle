@@ -8,6 +8,9 @@
 //! that empties it, and every place must still match its rule, so that work
 //! deletes the entry as it goes.
 
+use std::collections::BTreeSet;
+use std::path::Path;
+
 use regex::Regex;
 
 use crate::common::sources::workspace_sources;
@@ -51,10 +54,6 @@ const TOOL: Place = place(
 const OPENS: &[Place] = &[
     DB,
     place(
-        "kernel/src/schema/template.rs",
-        "the migrated test template, built once per test process",
-    ),
-    place(
         "tool/src/tooling/",
         "the offline tool's upgrade, fixture and recovery steps",
     ),
@@ -80,22 +79,16 @@ const TRANSACTIONS: &[Place] = &[DB, TOOL];
 
 const RULES: &[Rule] = &[
     Rule {
-        what: "opens a SQLite connection or pool, or begins a sqlx transaction",
-        patterns: &[
-            r"Connection::open",
-            r"\bopen_connection\b",
-            r"SqlitePoolOptions",
-            r"SqlitePool::connect",
-            r"SqliteConnection::connect",
-            r"SqliteConnectOptions[^;]*?\.connect\(",
-            r"\.begin\(\)|\.begin_with\(",
-        ],
+        what: "opens a SQLite connection",
+        patterns: &[r"Connection::open", r"\bopen_connection\b"],
         allowed: OPENS,
     },
     Rule {
         what: "controls a transaction by hand",
         patterns: &[
-            r#"(?:r#*)?"\s*(?:BEGIN|COMMIT|END|ROLLBACK|SAVEPOINT|RELEASE)(?:[\s;"]|$)"#,
+            // Upper case anywhere in a literal's first words, or lower case
+            // standing alone, after spaces or an escaped line break.
+            r#"(?:r#*)?"(?:\s|\\[nrt])*(?:(?:BEGIN|COMMIT|END|ROLLBACK|SAVEPOINT|RELEASE)(?:[\s;"]|$)|(?i:begin|commit|rollback|savepoint)(?:\s*[;"]|\s+(?i:transaction|immediate|exclusive|deferred|to)\b))"#,
             r"\btransaction_with_behavior\b",
             r"\.transaction\(\)",
             r"\bunchecked_transaction\b",
@@ -105,7 +98,11 @@ const RULES: &[Rule] = &[
     },
     Rule {
         what: "sets a pragma, which would stay on the lane's connection for later writes",
-        patterns: &[r"\bpragma_update\b", r"PRAGMA\s+[\w.]+\s*="],
+        patterns: &[
+            r"\bpragma_update\w*\b",
+            r"\.pragma\(",
+            r"PRAGMA\s+[\w.]+\s*(?:=|\()",
+        ],
         allowed: &[
             DB,
             TOOL,
@@ -215,6 +212,29 @@ fn the_database_is_reached_one_way() {
     );
 }
 
+/// The workspace reaches SQLite through rusqlite alone, so no package of
+/// the SQLx family is in the lock. Its MySQL driver is what brought in
+/// `rsa` and the advisory against it, which CI no longer ignores.
+#[test]
+fn the_lock_holds_one_sqlite_library() {
+    let lock = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.lock"),
+    )
+    .expect("the lock reads");
+    let lock: toml::Table = lock.parse().expect("the lock parses");
+    // The one line under `server/` that names the crate: the check that it
+    // is gone reads the tree with this line left out.
+    let family = "sqlx";
+    let found: Vec<&str> = lock["package"]
+        .as_array()
+        .expect("the lock lists packages")
+        .iter()
+        .filter_map(|package| package["name"].as_str())
+        .filter(|name| name.starts_with(family))
+        .collect();
+    assert!(found.is_empty(), "back in the lock: {found:?}");
+}
+
 /// Synchronous library code waits on a future only through
 /// `droppedneedle_kernel::db::block_on`, which refuses inside a read or
 /// write closure, so no closure holds the database across a network wait.
@@ -299,15 +319,19 @@ const IDENTITY_RULES: &[Rule] = &[
 /// Album and track identities, match state, their undo rows and their
 /// satellites are written only through `library/src/identity/`. Shipping
 /// code outside it never names one of the tables right after `INSERT
-/// INTO`, `UPDATE`, `DELETE FROM` or `REPLACE INTO`, nor as a string of its
-/// own (the table loop a `format!` statement runs over). Migrations are
-/// SQL files and not read here.
+/// INTO`, `UPDATE`, `DELETE FROM` or `REPLACE INTO`, in any case and
+/// quoted or not, nor as a string of its own (the table loop a `format!`
+/// statement runs over). Migrations are SQL files and not read here.
 #[test]
 fn only_the_identity_module_writes_identity_rows() {
     let tables = IDENTITY_TABLES.join("|");
+    // An identifier may be quoted as SQLite allows: "x", `x` or [x], with
+    // the double quote escaped inside a Rust string.
+    let quote = r#"(?:\\?["`\[])?"#;
+    let unquote = r#"(?:\\?["`\]])?"#;
     let patterns = [
         Regex::new(&format!(
-            r#"(?s)\b(?:INSERT(?:\s+OR\s+\w+)?\s+INTO|UPDATE(?:\s+OR\s+\w+)?|DELETE\s+FROM|REPLACE\s+INTO)[\s\\]+(?:main\.)?(?:{tables})\b"#
+            r#"(?is)\b(?:INSERT(?:\s+OR\s+\w+)?\s+INTO|UPDATE(?:\s+OR\s+\w+)?|DELETE\s+FROM|REPLACE\s+INTO)[\s\\]+(?:{quote}main{unquote}\s*\.\s*)?{quote}(?:{tables})\b"#
         ))
         .unwrap(),
         Regex::new(&format!(r#""(?:{tables})""#)).unwrap(),
@@ -417,11 +441,89 @@ const IDENTITY_USES: &[(&str, &str)] = &[
     ),
 ];
 
+/// The use tree that starts `rest`: a path, ending in a name, `*` or a
+/// brace group, which is taken whole however deep its groups nest.
+fn use_tree(rest: &str) -> &str {
+    let mut depth = 0usize;
+    for (at, letter) in rest.char_indices() {
+        match letter {
+            '{' => depth += 1,
+            '}' if depth > 0 => {
+                depth -= 1;
+                if depth == 0 {
+                    return &rest[..=at];
+                }
+            }
+            _ if depth > 0 => {}
+            letter if letter.is_alphanumeric() || matches!(letter, '_' | ':' | '*') => {}
+            _ => return &rest[..at],
+        }
+    }
+    rest
+}
+
+/// Every path a use tree names, its groups expanded, a rename dropped and
+/// `self` read as the group's own path.
+fn expand_use_tree(tree: &str) -> Vec<String> {
+    let tree = tree.trim();
+    let Some((prefix, inner)) = tree.strip_suffix('}').and_then(|head| head.split_once('{')) else {
+        return tree
+            .split_whitespace()
+            .next()
+            .map(|path| vec![path.to_owned()])
+            .unwrap_or_default();
+    };
+    let mut parts = Vec::new();
+    let (mut depth, mut start) = (0usize, 0);
+    for (at, letter) in inner.char_indices() {
+        match letter {
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(&inner[start..at]);
+                start = at + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&inner[start..]);
+    parts
+        .into_iter()
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .flat_map(|part| {
+            if part == "self" || part.starts_with("self ") {
+                vec![prefix.trim_end_matches("::").to_owned()]
+            } else {
+                expand_use_tree(part)
+                    .into_iter()
+                    .map(|path| format!("{prefix}{path}"))
+                    .collect()
+            }
+        })
+        .collect()
+}
+
+/// The module a source file is, as a path from its crate's root:
+/// `library/src/identity/sql.rs` is `identity::sql`, a `mod.rs` its folder.
+fn module_of(path: &str) -> Vec<&str> {
+    let within = path.split_once("/src/").map_or(path, |(_, within)| within);
+    let mut module: Vec<&str> = within.split('/').collect();
+    if let Some(file) = module.pop() {
+        let name = file.trim_end_matches(".rs");
+        if !matches!(name, "mod" | "lib" | "main") {
+            module.push(name);
+        }
+    }
+    module
+}
+
 /// The identity module uses only what [`IDENTITY_USES`] lists from the
-/// rest of the crate, and every listed use is still made.
+/// rest of the crate, and every listed use is still made. A path is read
+/// from `crate::` or resolved from `super::`, its groups expanded.
 #[test]
 fn the_identity_module_uses_only_what_it_lists() {
-    let path = Regex::new(r"\bcrate::((?:\w+::)*)(\{[^}]*\}|\w+)").unwrap();
+    let path = Regex::new(r"\b(?:crate|((?:super::)*super))::").unwrap();
     let mut used = vec![false; IDENTITY_USES.len()];
     let mut wrong = Vec::new();
     for source in workspace_sources() {
@@ -429,19 +531,32 @@ fn the_identity_module_uses_only_what_it_lists() {
             continue;
         }
         let code = source.shipping_code();
+        let module = module_of(&source.path);
         for found in path.captures_iter(&code) {
-            let prefix = &found[1];
-            let items: Vec<String> = match found[2].strip_prefix('{') {
-                Some(group) => group
-                    .trim_end_matches('}')
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|item| !item.is_empty() && *item != "self")
-                    .map(|item| format!("{prefix}{item}"))
-                    .collect(),
-                None => vec![format!("{prefix}{}", &found[2])],
+            let whole = found.get(0).unwrap();
+            let line = code[..whole.start()].matches('\n').count() + 1;
+            let base: Vec<&str> = match found.get(1) {
+                None => Vec::new(),
+                Some(supers) => {
+                    let up = supers.as_str().matches("super").count();
+                    let Some(kept) = module.len().checked_sub(up) else {
+                        wrong.push(format!(
+                            "{}:{line}: `super::` above the crate root",
+                            source.path
+                        ));
+                        continue;
+                    };
+                    module[..kept].to_vec()
+                }
             };
-            for item in items {
+            let tree = use_tree(&code[whole.end()..]);
+            for item in expand_use_tree(tree) {
+                let item = base
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once(item.as_str()))
+                    .collect::<Vec<_>>()
+                    .join("::");
                 if item == "identity" || item.starts_with("identity::") {
                     continue;
                 }
@@ -450,10 +565,7 @@ fn the_identity_module_uses_only_what_it_lists() {
                 });
                 match allowed {
                     Some(at) => used[at] = true,
-                    None => {
-                        let line = code[..found.get(0).unwrap().start()].matches('\n').count() + 1;
-                        wrong.push(format!("{}:{line}: uses crate::{item}", source.path));
-                    }
+                    None => wrong.push(format!("{}:{line}: uses crate::{item}", source.path)),
                 }
             }
         }
@@ -717,7 +829,6 @@ const IMAGE_WORK: &str = "image work off the async workers, awaited by the reque
 const COVER_FLIGHT: &str =
     "a cover fetch that still lands in the cache when its request stops waiting";
 const COVER_INDEX_LOAD: &str = "the cover cache index load a library view starts once, so the view never waits on the disk; its file work logs its own failure";
-const TEST_TEMPLATE: &str = "the test template migrates on its own thread, once per test process";
 const LOOP_STEP: &str =
     "a blocking step awaited inside a supervised loop, its stop checked between steps";
 const JOB_STEP: &str = "blocking file and store work, awaited by the queued job that runs it, its stop checked between rows";
@@ -735,6 +846,7 @@ const BOOT_STEP: &str = "boot-time file work, awaited before serving";
 const HTTP_SERVER: &str = "the HTTP server, joined by serve at the shutdown deadline";
 const OFFLINE_TOOL: &str = "the offline tool's file and database work, awaited";
 const UPGRADE_RUN: &str = "an upgrade tool run a signed-in admin starts in upgrade mode; it records its own end, and the mode's stop kills its child";
+const FOLDER_LISTING: &str = "a folder listing its asker waits on up to a deadline; one that hangs is left to end, and at most four run at once";
 
 const SPAWN_SITES: &[(&str, usize, &str)] = &[
     ("acquire/src/drop_import/http.rs", 1, UPLOAD_CLEANUP),
@@ -775,8 +887,7 @@ const SPAWN_SITES: &[(&str, usize, &str)] = &[
     ("catalog/src/artwork/warm.rs", 1, WARM_ENQUEUE),
     ("compat/src/library.rs", 1, REQUEST),
     ("compat/src/subsonic/store.rs", 1, REQUEST),
-    ("kernel/src/runtime_config/store.rs", 4, AWAITED),
-    ("kernel/src/schema/template.rs", 1, TEST_TEMPLATE),
+    ("kernel/src/runtime_config/store.rs", 3, AWAITED),
     ("library/src/contrib/live.rs", 1, LOOP_STEP),
     ("library/src/http/mod.rs", 1, REQUEST),
     ("library/src/edition/service.rs", 9, LOOP_STEP),
@@ -791,9 +902,12 @@ const SPAWN_SITES: &[(&str, usize, &str)] = &[
     ("library/src/repairs/mod.rs", 1, LOOP_STEP),
     ("library/src/scan/coordinator.rs", 1, LOOP_STEP),
     ("library/src/scan/pool.rs", 1, LOOP_STEP),
+    ("library/src/scan/roots.rs", 1, FOLDER_LISTING),
     ("library/src/scan/walk.rs", 3, SCAN_WALK),
     ("library/src/service.rs", 1, LOOP_STEP),
-    ("media/src/stream/download.rs", 2, REQUEST),
+    ("media/src/stream/download.rs", 3, REQUEST),
+    ("media/src/stream/framing.rs", 1, REQUEST),
+    ("media/src/stream/gateway.rs", 1, REQUEST),
     ("media/src/stream/local_files.rs", 1, REQUEST),
     ("media/src/stream/plugin_url.rs", 2, REQUEST),
     ("media/src/stream/transcode.rs", 2, TRANSCODE),
@@ -830,10 +944,11 @@ const SPAWN_SITES: &[(&str, usize, &str)] = &[
 /// Every long-lived task runs on the supervisor, so it stops on the one
 /// token and shows in the admin jobs view. A spawn anywhere else is one of
 /// the listed sites, and a listed count that no longer matches fails too.
+/// A thread built with `thread::Builder` counts at its `.spawn(`.
 #[test]
 fn every_spawn_is_supervised_or_listed() {
     let pattern = Regex::new(
-        r"tokio::spawn\(|task::spawn\(|spawn_blocking\(|thread::spawn\(|\b\w*(?:runtime|handle)\.spawn\(",
+        r"tokio::spawn\(|task::spawn\(|spawn_blocking\(|thread::spawn\(|thread::Builder::new\(\)[^;]*?\.spawn(?:_unchecked)?\(|\b\w*(?:runtime|handle)\.spawn\(",
     )
     .unwrap();
     let mut found: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
@@ -1143,6 +1258,364 @@ fn wall_time_comes_from_the_kernel_clock() {
     assert!(
         wrong.is_empty(),
         "read wall time through the kernel clock, or list the file:\n{}",
+        wrong.join("\n")
+    );
+}
+
+/// The tables a trigger follows, from the migrations: the ones read models
+/// are kept from, and the ones whose rows a trigger guards.
+fn trigger_followed_tables(migrations: &[(String, String)]) -> BTreeSet<String> {
+    let trigger = Regex::new(
+        r"(?i)CREATE\s+TRIGGER\s+(?:IF\s+NOT\s+EXISTS\s+)?\w+\s+(?:AFTER|BEFORE|INSTEAD\s+OF)\s+(?:INSERT|DELETE|UPDATE)(?:\s+OF\s+[\w\s,]+?)?\s+ON\s+(\w+)",
+    )
+    .unwrap();
+    migrations
+        .iter()
+        .flat_map(|(_, text)| trigger.captures_iter(text))
+        .map(|found| found[1].to_lowercase())
+        .collect()
+}
+
+/// Every migration file, by name, with its text.
+fn migrations() -> Vec<(String, String)> {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    let mut files: Vec<(String, String)> = std::fs::read_dir(&dir)
+        .expect("migrations list")
+        .map(|entry| entry.expect("entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "sql"))
+        .map(|path| {
+            let name = format!(
+                "migrations/{}",
+                path.file_name().expect("a file name").to_string_lossy()
+            );
+            (
+                name,
+                std::fs::read_to_string(&path).expect("migration reads"),
+            )
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+/// A REPLACE removes the row it conflicts with without firing that row's
+/// delete triggers (recursive triggers are off), so a read model kept by
+/// triggers would keep counting a row that is gone. No statement in the
+/// source or the migrations writes a table a trigger follows with
+/// `REPLACE INTO`, `INSERT OR REPLACE` or `UPDATE OR REPLACE`.
+#[test]
+fn no_replace_on_trigger_followed_tables() {
+    let migrations = migrations();
+    let followed = trigger_followed_tables(&migrations);
+    assert!(
+        followed.contains("local_tracks") && followed.contains("library_play_history"),
+        "the trigger scan finds the followed tables"
+    );
+    let replace = Regex::new(
+        r#"(?i)\b(?:INSERT\s+OR\s+REPLACE\s+INTO|REPLACE\s+INTO|UPDATE\s+OR\s+REPLACE)\s+(?:main\.)?"?(\w+)"#,
+    )
+    .unwrap();
+    // A statement written across lines of a Rust string reads as one line.
+    let continued = Regex::new(r"\\\n\s*").unwrap();
+    let texts = workspace_sources()
+        .into_iter()
+        .map(|source| (source.path.clone(), source.code()))
+        .chain(migrations);
+    let mut wrong = Vec::new();
+    for (path, text) in texts {
+        let text = continued.replace_all(&text, " ");
+        for found in replace.captures_iter(&text) {
+            let table = found[1].to_lowercase();
+            if followed.contains(&table) {
+                wrong.push(format!(
+                    "{path}: {} (a trigger follows `{table}`)",
+                    &found[0]
+                ));
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "write a trigger-followed table with INSERT .. ON CONFLICT DO UPDATE, never REPLACE:\n{}",
+        wrong.join("\n")
+    );
+}
+
+/// Recorded third-party answers and documentation addresses that happen to
+/// spell the dropped v2 music source's name, by path and why.
+const FREE_SOURCE_NAME_ALLOWED: &[(&str, &str)] = &[
+    (
+        "providers/src/audiodb.rs",
+        "AudioDB's own documentation address, which carries the name",
+    ),
+    (
+        "providers/src/rates.rs",
+        "AudioDB's own documentation address, which carries the name",
+    ),
+    (
+        "tests/fixtures/github/releases_list.json",
+        "a recorded GitHub answer: the v2 release notes, as published",
+    ),
+    (
+        "tests/fixtures/listenbrainz/top_release_groups_radiohead.json",
+        "a recorded ListenBrainz answer that links an outside music archive",
+    ),
+];
+
+/// Every file under `server/` but the build folder and the tool crate, as
+/// a path from `server/` and its text.
+fn server_files() -> Vec<(String, String)> {
+    let server = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    let mut pending = vec![server.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).expect("folder lists") {
+            let path = entry.expect("entry").path();
+            let relative = path
+                .strip_prefix(server)
+                .expect("under server/")
+                .to_string_lossy()
+                .replace('\\', "/");
+            if relative == "target" || relative == "tool" {
+                continue;
+            }
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                let bytes = std::fs::read(&path).expect("file reads");
+                files.push((relative, String::from_utf8_lossy(&bytes).into_owned()));
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+/// The v2 lawful music source was dropped: nothing in the server crates,
+/// their tests, the migrations or the API document names it. The tool
+/// crate keeps what it needs to recognise and report the v2 setting.
+#[test]
+fn the_dropped_music_source_is_not_named() {
+    let name = Regex::new(&format!("(?i){}", ["free", ".?", "music"].concat())).unwrap();
+    let files = server_files();
+    assert!(
+        files
+            .iter()
+            .any(|(path, _)| path.starts_with("migrations/"))
+            && files.iter().any(|(path, _)| path.starts_with("openapi/")),
+        "the walk reaches the migrations and the API document"
+    );
+    let mut wrong = Vec::new();
+    let mut used = vec![false; FREE_SOURCE_NAME_ALLOWED.len()];
+    for (path, text) in &files {
+        let Some(found) = name.find(text) else {
+            continue;
+        };
+        match FREE_SOURCE_NAME_ALLOWED
+            .iter()
+            .position(|(allowed, _)| allowed == path)
+        {
+            Some(at) => used[at] = true,
+            None => {
+                let line = text[..found.start()].matches('\n').count() + 1;
+                wrong.push(format!("{path}:{line}: {}", found.as_str()));
+            }
+        }
+    }
+    for ((path, why), used) in FREE_SOURCE_NAME_ALLOWED.iter().zip(used) {
+        if !used {
+            wrong.push(format!(
+                "{path}: allowed ({why}), but no longer matches; remove the entry"
+            ));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "names the dropped music source:\n{}",
+        wrong.join("\n")
+    );
+}
+
+/// The workspace's crates from the bottom: each may depend only on crates
+/// before it. The mock servers in `testkit` are never a shipping
+/// dependency.
+const LAYERS: &[(&str, &str)] = &[
+    ("kernel", "droppedneedle-kernel"),
+    ("providers", "droppedneedle-providers"),
+    ("auth", "droppedneedle-auth"),
+    ("library", "droppedneedle-library"),
+    ("plugins", "droppedneedle-plugins"),
+    ("media", "droppedneedle-media"),
+    ("catalog", "droppedneedle-catalog"),
+    ("acquire", "droppedneedle-acquire"),
+    ("compat", "droppedneedle-compat"),
+    (".", "droppedneedle"),
+    ("tool", "droppedneedle-tool"),
+];
+
+/// A crate's shipping dependencies point down the layers only. Cargo
+/// refuses a cycle; this also refuses an upward edge that makes none, and
+/// any crate of the workspace left off the list.
+#[test]
+fn crates_depend_only_downward() {
+    let server = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest: toml::Table = std::fs::read_to_string(server.join("Cargo.toml"))
+        .expect("manifest reads")
+        .parse()
+        .expect("manifest parses");
+    let members: Vec<&str> = manifest["workspace"]["members"]
+        .as_array()
+        .expect("workspace members")
+        .iter()
+        .map(|member| member.as_str().expect("member path"))
+        .collect();
+    let mut wrong = Vec::new();
+    for member in members
+        .iter()
+        .copied()
+        .filter(|member| *member != "testkit")
+    {
+        if !LAYERS.iter().any(|(folder, _)| *folder == member) {
+            wrong.push(format!(
+                "{member}: a workspace crate with no place in the layers"
+            ));
+        }
+    }
+    for (at, (folder, name)) in LAYERS.iter().enumerate() {
+        let crate_manifest: toml::Table =
+            std::fs::read_to_string(server.join(folder).join("Cargo.toml"))
+                .expect("crate manifest reads")
+                .parse()
+                .expect("crate manifest parses");
+        let Some(dependencies) = crate_manifest
+            .get("dependencies")
+            .and_then(|deps| deps.as_table())
+        else {
+            continue;
+        };
+        for dependency in dependencies.keys() {
+            if !dependency.starts_with("droppedneedle") {
+                continue;
+            }
+            match LAYERS.iter().position(|(_, layer)| layer == dependency) {
+                Some(below) if below < at => {}
+                Some(_) => wrong.push(format!("{name} depends on {dependency}, above it")),
+                None => wrong.push(format!(
+                    "{name} depends on {dependency}, outside the layers"
+                )),
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "crate layers:\n{}", wrong.join("\n"));
+}
+
+/// Where the narration gate looks, from the repository root: code, tests
+/// and config. The tool crate keeps v2's names to read the old data, and
+/// the plugin SDK is left out.
+const NARRATION_ROOTS: &[&str] = &[
+    "server",
+    "frontend/src",
+    "examples/plugins",
+    ".github",
+    "Dockerfile",
+    "Makefile",
+    "entrypoint.sh",
+];
+
+/// Under the roots, what the gate skips and why.
+const NARRATION_SKIPPED: &[(&str, &str)] = &[
+    ("server/target", "build output"),
+    (
+        "server/tool",
+        "the offline tool, which names v2's data as v2 wrote it",
+    ),
+    (
+        "server/tests/fixtures",
+        "recorded third-party answers, kept as they were sent",
+    ),
+];
+
+/// Every file under `root` (a file or a folder), as a path from the
+/// repository root and its text, past the skipped places and any folder
+/// named `node_modules`.
+fn narration_files(repo: &Path, root: &str, files: &mut Vec<(String, String)>) {
+    let mut pending = vec![repo.join(root)];
+    while let Some(path) = pending.pop() {
+        let relative = path
+            .strip_prefix(repo)
+            .expect("under the repository")
+            .to_string_lossy()
+            .replace('\\', "/");
+        if NARRATION_SKIPPED
+            .iter()
+            .any(|(skipped, _)| relative == *skipped)
+            || path.file_name().is_some_and(|name| name == "node_modules")
+        {
+            continue;
+        }
+        if path.is_dir() {
+            for entry in std::fs::read_dir(&path).expect("folder lists") {
+                pending.push(entry.expect("entry").path());
+            }
+        } else if path.is_file() {
+            let bytes = std::fs::read(&path).expect("file reads");
+            files.push((relative, String::from_utf8_lossy(&bytes).into_owned()));
+        }
+    }
+}
+
+/// Comments say what and why, never how the code came to be: no port
+/// narration, and no plan, package, task or review id, which point at
+/// notes outside the repository. Each pattern is spelled in parts so this
+/// file does not match itself.
+#[test]
+fn no_port_narration_or_plan_ids() {
+    let patterns: Vec<Regex> = [
+        format!(r"(?i)\b{}{}", "ported", " from"),
+        format!(r"(?i)\b{}{}", "parity", " with"),
+        r"\bstage[- ][0-9]".to_owned(),
+        r"\bW[0-9]+\.[0-9]+\b".to_owned(),
+        r"\b[A-L][0-9]{1,2}-[0-9]{2}[a-z]?\b".to_owned(),
+        r"\bEUI-[0-9]+".to_owned(),
+        r"\bAM[U]-".to_owned(),
+        r"\bQW[0-9]".to_owned(),
+        r"\bST[0-9]".to_owned(),
+        r"\bSlice [0-9]".to_owned(),
+        format!(
+            r"(?m)(?:^|//[/!]?|#|\*)\s*(?:{}|{}):\s",
+            "Step", "Reviewed-by"
+        ),
+    ]
+    .iter()
+    .map(|pattern| Regex::new(pattern).unwrap())
+    .collect();
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("the repository root");
+    let mut files = Vec::new();
+    for root in NARRATION_ROOTS {
+        narration_files(repo, root, &mut files);
+    }
+    assert!(
+        files
+            .iter()
+            .any(|(path, _)| path.starts_with("frontend/src/"))
+            && files.iter().any(|(path, _)| path == "Dockerfile"),
+        "the walk reaches every root"
+    );
+    let mut wrong = Vec::new();
+    for (path, text) in &files {
+        for pattern in &patterns {
+            for found in pattern.find_iter(text) {
+                let line = text[..found.start()].matches('\n').count() + 1;
+                wrong.push(format!("{path}:{line}: {}", found.as_str().trim()));
+            }
+        }
+    }
+    wrong.sort();
+    assert!(
+        wrong.is_empty(),
+        "port narration or a plan id:\n{}",
         wrong.join("\n")
     );
 }

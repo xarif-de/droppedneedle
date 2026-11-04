@@ -2,14 +2,16 @@
 	Asks before doing something, on top of Modal. Confirming runs `onconfirm`:
 	the dialog stays open and busy until that settles, closes when it succeeds
 	and shows the error when it fails. `phrase` makes the user type a word
-	first.
+	first. `icon` sets a mark beside the title, tinted by `tone`, and
+	`focusTitle` puts focus on the title rather than the first control.
+	`onclose` runs on every close, confirmed or not, once focus is back.
 	Replaces `window.confirm`, the one-off confirm modals such as
 	DeleteAlbumModal, and the typed-phrase confirmations in library management.
 -->
 <script lang="ts">
 	import type { Snippet } from 'svelte';
 	import AsyncButton from './AsyncButton.svelte';
-	import Button from './Button.svelte';
+	import Button, { type KitIcon } from './Button.svelte';
 	import Input from './Input.svelte';
 	import Modal from './Modal.svelte';
 
@@ -20,7 +22,9 @@
 		message?: string;
 		confirmLabel?: string;
 		cancelLabel?: string;
-		tone?: 'primary' | 'danger';
+		tone?: 'primary' | 'warning' | 'danger';
+		icon?: KitIcon;
+		focusTitle?: boolean;
 		/** The user must type this exactly before Confirm unlocks. */
 		phrase?: string;
 		/** A mutation's `isPending`, when the caller runs the work itself. */
@@ -29,6 +33,7 @@
 		canConfirm?: boolean;
 		onconfirm: () => unknown;
 		oncancel?: () => void;
+		onclose?: () => void;
 		children?: Snippet;
 	}
 
@@ -39,11 +44,14 @@
 		confirmLabel = 'Confirm',
 		cancelLabel = 'Cancel',
 		tone = 'primary',
+		icon,
+		focusTitle = false,
 		phrase,
 		pending = false,
 		canConfirm = true,
 		onconfirm,
 		oncancel,
+		onclose,
 		children
 	}: Props = $props();
 
@@ -54,6 +62,9 @@
 	let error = $state<string | null>(null);
 	let typed = $state('');
 	const busy = $derived(pending || running);
+	const iconTone = $derived(
+		tone === 'danger' ? 'error' : tone === 'warning' ? 'warning' : 'accent'
+	);
 
 	$effect(() => {
 		if (open) {
@@ -79,10 +90,11 @@
 
 	function handleClose() {
 		if (!confirmed) oncancel?.();
+		onclose?.();
 	}
 </script>
 
-<Modal bind:open {title} dismissible={!busy} onclose={handleClose}>
+<Modal bind:open {title} {icon} {iconTone} {focusTitle} dismissible={!busy} onclose={handleClose}>
 	{#if message}
 		<p class="text-base-content/70">{message}</p>
 	{/if}
@@ -115,7 +127,7 @@
 		</Button>
 		{#if canConfirm}
 			<AsyncButton
-				variant={tone === 'danger' ? 'danger' : 'primary'}
+				variant={tone}
 				onclick={confirm}
 				pending={busy}
 				disabled={phrase !== undefined && typed !== phrase}

@@ -12,7 +12,7 @@ Use the [feature request template](https://github.com/DroppedNeedle/DroppedNeedl
 
 ## Development setup
 
-The server is Rust (Axum, tokio, SQLite through sqlx and rusqlite). The frontend is SvelteKit with Svelte 5, TanStack Query, Tailwind CSS and daisyUI. The toolchain version is pinned in `rust-toolchain.toml`; rustup picks it up automatically.
+The server is Rust (Axum, tokio, SQLite through rusqlite). The frontend is SvelteKit with Svelte 5, TanStack Query, Tailwind CSS and daisyUI. The toolchain version is pinned in `rust-toolchain.toml`; rustup picks it up automatically.
 
 ### Prerequisites
 
@@ -42,6 +42,10 @@ make frontend-dev
 
 `server/` is a Cargo workspace. Each area is a crate in `server/<name>`, from the bottom: `kernel`, `providers`, `auth`, `library`, `plugins`, `media`, `catalog`, `acquire`, `compat`, then the server crate in `server/src` and the migration tool in `server/tool`. A crate uses only crates below it. Integration tests are split into one binary per area (`library`, `acquire`, `compat`, `catalog`, `media` and `server` for the rest) sharing `server/tests/common`, plus `tool` in `server/tool/tests`. Run one module with `cd server && cargo test --test <binary> <module>` (`cargo test -p droppedneedle-tool --test tool <module>` for the tool), and a crate's unit tests with `cargo test -p droppedneedle-<crate>`.
 
+`frontend/src/lib/` is grouped by feature. A feature (album, artist, library, downloads, settings and so on) lives in `lib/features/<name>/`: its components and their helper modules in `components/`, its query and mutation hooks, key factories and adapters in `queries/`, and its client state in `state/`. Another feature imports only the modules on its public list in `lib/features/public.json`, by their `$lib` path; lint refuses any other path into a feature's folders. When another feature needs one of its modules, add the module to the list. A new feature folder gets an entry there too, which a spec checks along with every listed path. Shared code sits outside the features: the UI kit and the generic page pieces in `lib/ui`, cover and artist images and brand icons in `lib/media`, the app shell and navigation in `lib/shell`, the query client, keys, effects and event dispatcher in `lib/queries`, the API client in `lib/api`, app-wide stores in `lib/stores` and small utilities in `lib/utils`. Routes in `src/routes` stay thin and render their feature's components.
+
+Migrations live in `server/migrations/`, starting from the v3 baseline, and are listed in `server/kernel/src/schema/mod.rs`. A new one takes the next number, is never edited or renumbered once it is on `v3`, and ships its upgrade test. A local development database from before the baseline starts once on a build from before it (which brings it to the last number the baseline replaced), or starts from an empty data folder.
+
 ### Running tests and checks
 
 ```bash
@@ -54,8 +58,11 @@ make frontend-lint          # eslint
 make frontend-format-check  # prettier
 make frontend-test-server   # vitest, node project
 make frontend-test-client   # vitest, browser project
+make library-file-gate      # no file changes in the library outside the publisher
 make check                  # all of the above (not cargo audit, cargo deny or the container test)
 ```
+
+`python3 -I server/scripts/dead-code-scan.py server` fails on a public item nothing references; one that must stay goes in `server/scripts/dead-code-allowlist.txt` with its reason.
 
 The timing budgets are ignored tests, which `.github/workflows/perf.yml` runs in release every Monday and by hand. To run one locally: `cd server && cargo test --release --test server login_p95 -- --ignored --nocapture`.
 
@@ -97,21 +104,21 @@ droppedneedle_kernel::sql! {
 pub(super) fn feed_page(for_user: bool, newest_first: bool) -> String { ... }
 ```
 
-- A statement is a `Statement` constant; pass `CITIES.text()` to rusqlite or sqlx. `+` joins literals, fragments and other `&str` constants at compile time.
+- A statement is a `Statement` constant; pass `CITIES.text()` to rusqlite. `+` joins literals, fragments and other `&str` constants at compile time.
 - A statement that varies by a closed set of choices (a sort order, which optional filters are present, how many values an `IN` list holds) is a family: a function in `sql.rs` whose parameters are all choice types (`bool`, `ListLen`, an enum or struct declared with `sql_choice!`, or a tuple of those) and which returns the text. Nothing from a request is ever joined into SQL. A family over more than 4,096 combinations is split.
 - A table name read from the database goes through `db::statement::quoted_identifier`.
 - The export tool's reads of a v2 database sit in a block that starts with `schema = V2;`, and the test prepares them against the v2 fixture database instead.
 - Each `sql!` block lists its own declarations. A crate that holds a `sql.rs` lists every one of them, one line each, in `statement_files()` at its crate root (compiled only for tests), and has a row in `REGISTRIES` in `server/tests/server/persist_schema.rs`.
 
-`every_registered_statement_prepares` fails when a `sql.rs` is missing from its crate's list or declares something outside its `sql!` block, then prepares every statement, and every family over every combination, against the migrated schema. It catches a renamed column, a dropped table and a second statement after a `;`. It does not check how many values a call site binds, that a column list matches its row mapper, or the query plan.
+`every_registered_statement_prepares` fails when a `sql.rs` is missing from its crate's list or declares something outside its `sql!` block, then prepares every statement, and every family over every combination, against the migrated schema. It catches a renamed column, a dropped table and a second statement after a `;`. It does not check how many values a call site binds or the query plan. A statement that answers more than one column is read through a `row` declared in its `sql!` block, and the test fails when the row's fields differ from the statement's columns.
 
-`raw_sql_stays_in_sql_files` fails on SQL text anywhere else, and on `PRAGMA` or transaction control outside `server/kernel/src/db/`. Test files are exempt. Areas that have not moved their SQL yet are listed in `server/sql-outside-registry.txt`; moving an area deletes its line.
+`raw_sql_stays_in_sql_files` fails on SQL text anywhere else, and on `PRAGMA` or transaction control outside `server/kernel/src/db/`. Test files are exempt, as is the export's bundle builder, whose statements are made at run time from the columns of the v2 database being exported; the few other literals allowed for good are listed in the test with their reasons.
 
 A column that stores an enum as text declares the enum's spellings with `droppedneedle_kernel::spelled!` and carries a `CHECK (column IN (...))` listing exactly those spellings; `every_state_column_lists_exactly_its_enums_values` in `persist_schema.rs` registers each such column with its enum and fails when the two differ.
 
 ## Pull requests
 
-1. Fork the repo and create a branch from the default branch.
+1. Fork the repo and create a branch from `v3`. Until v3 is released, the default branch, `main`, holds v2.
 2. Give your branch a descriptive name: `fix-scrobble-timing`, `feature-playlist-export`, etc.
 3. If you're fixing a bug, mention the issue number in the PR description.
 4. Make sure tests pass before submitting.
@@ -138,7 +145,16 @@ You're still responsible for understanding and testing the code you submit.
 
 Maintainers cut releases. A release is a version tag, `v3.1.0` or `v3.1.0-rc.1` for a pre-release, on a commit of the release branch that CI has passed on. Bump `version` under `[workspace.package]` in `server/Cargo.toml` to the same version, without the `v`, before tagging: the workflow rejects a tag that does not match it. Pushing the tag starts the Release workflow, which checks the tag, the branch and CI, then waits for a maintainer to approve the `release` environment before it publishes `droppedneedle/droppedneedle:<tag>`. `:latest` only moves forward: a pre-release never moves it, and neither does a patch to an older line once a higher full version is tagged.
 
-CI skips commits that change no code. If the commit you want to tag has no v3 CI run, start v3 CI by hand on the release branch first.
+CI is path-filtered: a commit that changes no code gets no v3 CI run, and a run on one that changes only some areas skips the other jobs and still passes. The Release workflow takes any passing v3 CI run on the commit, so start a full one by hand.
+
+Only maintainers tag, and nothing but a version tag publishes a release image. To cut one:
+
+1. Bump `version` in `server/Cargo.toml` to the release version and push that commit to the release branch.
+2. Start v3 CI by hand on that commit, so every job runs, and wait for it to pass.
+3. Check that the latest Frontend CI run on the release branch and the weekly Perf budgets run are green.
+4. Run the release dry run described below.
+5. Push the tag.
+6. Approve the `release` environment when the Release workflow asks.
 
 To rehearse a release without publishing, run the Release workflow by hand with the version you plan to tag and leave `push` unticked. It runs every check, waits for the same approval and builds the image for both architectures without pushing anything.
 

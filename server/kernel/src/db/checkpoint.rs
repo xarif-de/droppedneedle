@@ -33,7 +33,6 @@ use std::{
 use crate::clock::Clock;
 
 use serde::Serialize;
-use sqlx::SqlitePool;
 use tokio::sync::RwLock;
 
 use super::{
@@ -211,7 +210,6 @@ impl Default for BackpressurePolicy {
 #[derive(Clone)]
 pub struct CheckpointService {
     db_path: PathBuf,
-    pool: SqlitePool,
     clock: Arc<dyn Clock>,
     lane_idle: Arc<LaneIdle>,
     policy: Arc<Mutex<BackpressurePolicy>>,
@@ -220,7 +218,7 @@ pub struct CheckpointService {
     hold: Arc<WalHold>,
     /// The read pools' counts. Never the pools themselves or the handle
     /// that owns them: this service is cloned into the relief thread.
-    pooled_reads: Option<ReadActivity>,
+    reads: ReadActivity,
     analyze: Option<super::analyze::AnalyzeService>,
 }
 
@@ -233,36 +231,28 @@ impl std::fmt::Debug for CheckpointService {
 }
 
 impl CheckpointService {
-    /// Wire the service. The pool is read for reader-idle checks only; the
-    /// lane handle feeds the writer-idle half of the `TRUNCATE` gate, and
-    /// `hold` is the lane's hold on bulk writes, which every pass sets.
-    /// `clock` dates each pass.
+    /// Wire the service. `reads` feeds the reader-idle half of the
+    /// `TRUNCATE` gate and the lane handle its writer-idle half; `hold` is
+    /// the lane's hold on bulk writes, which every pass sets. `clock` dates
+    /// each pass.
     pub fn new(
         db_path: &Path,
-        pool: SqlitePool,
+        reads: ReadActivity,
         lane_idle: Arc<LaneIdle>,
         hold: Arc<WalHold>,
         clock: Arc<dyn Clock>,
     ) -> Self {
         Self {
             db_path: db_path.to_owned(),
-            pool,
             clock,
             lane_idle,
             policy: Arc::new(Mutex::new(BackpressurePolicy::new())),
             latest: Arc::new(RwLock::new(None)),
             last_truncate: Arc::new(Mutex::new(None)),
             hold,
-            pooled_reads: None,
+            reads,
             analyze: None,
         }
-    }
-
-    /// Count the read pools in the reader-idle half of the `TRUNCATE` gate.
-    #[must_use]
-    pub(crate) fn with_pooled_reads(mut self, reads: ReadActivity) -> Self {
-        self.pooled_reads = Some(reads);
-        self
     }
 
     /// Other water marks for the backpressure rule.
@@ -368,11 +358,9 @@ impl CheckpointService {
         outcome
     }
 
-    /// True when every pooled connection is back in its pool: the sqlx
-    /// pool's and the read pools'.
+    /// True when every connection of both read pools is back in its pool.
     fn readers_idle(&self) -> bool {
-        self.pool.num_idle() as u32 == self.pool.size()
-            && self.pooled_reads.as_ref().is_none_or(ReadActivity::is_idle)
+        self.reads.is_idle()
     }
 
     /// Run one pass in the given mode and record its outcome. A relief pass
@@ -694,22 +682,27 @@ mod tests {
         assert_eq!(quiet.reader_blocked, Duration::ZERO);
     }
 
+    /// A pass without evidence (`active = -1`) neither counts as progress
+    /// nor lifts a suspension.
     #[test]
-    fn unmeasured_passes_never_feed_the_baseline() {
+    fn an_unmeasured_pass_changes_nothing() {
         let mut policy = BackpressurePolicy::new();
         observe(&mut policy, 0, 100, 100);
         let unmeasured = policy.observe(true, 0, 0, -1, Instant::now(), false);
-        assert!(!unmeasured.progress);
+        assert!(!unmeasured.progress, "baseline: the unmeasured pass");
         let next = observe(&mut policy, 0, 100, 100);
-        assert!(!next.progress, "fabricated zeros must not read as progress");
-    }
+        assert!(
+            !next.progress,
+            "baseline: fabricated zeros must not read as progress"
+        );
 
-    #[test]
-    fn suspension_survives_unmeasured_passes() {
         let mut policy = BackpressurePolicy::new();
         observe(&mut policy, ACTIVE_HIGH_WATER_BYTES + 1, 100, 0);
-        assert!(policy.suspended());
+        assert!(policy.suspended(), "suspension: high water suspends");
         let pass = policy.observe(true, 0, 0, -1, Instant::now(), false);
-        assert!(pass.suspended, "active -1 is evidence-free, not drained");
+        assert!(
+            pass.suspended,
+            "suspension: active -1 is evidence-free, not drained"
+        );
     }
 }

@@ -4733,7 +4733,7 @@
             }
           },
           "409": {
-            "description": "Not configured (NOT_CONFIGURED) or not built in this version yet (NOT_AVAILABLE)",
+            "description": "Not configured (NOT_CONFIGURED)",
             "content": {
               "application/json": {
                 "schema": {
@@ -5731,7 +5731,7 @@
             }
           },
           "409": {
-            "description": "Not configured (NOT_CONFIGURED) or not built in this version yet (NOT_AVAILABLE)",
+            "description": "Not configured (NOT_CONFIGURED)",
             "content": {
               "application/json": {
                 "schema": {
@@ -6033,7 +6033,7 @@
             }
           },
           "409": {
-            "description": "Not configured (NOT_CONFIGURED) or not built in this version yet (NOT_AVAILABLE)",
+            "description": "Not configured (NOT_CONFIGURED)",
             "content": {
               "application/json": {
                 "schema": {
@@ -6945,7 +6945,7 @@
         "tags": [
           "downloads"
         ],
-        "summary": "Retry a failed, cancelled or partial download now. Answers the new\ntask. An album retry clears the album's blocklist first.\n`POST /api/v3/downloads/tasks/{task_id}/retry`.",
+        "summary": "Retry a failed, cancelled or partial download now. Answers the new\ntask, or the download already fetching the album. An album retry clears\nthe album's blocklist first.\n`POST /api/v3/downloads/tasks/{task_id}/retry`.",
         "operationId": "retry_task_handler",
         "parameters": [
           {
@@ -8160,7 +8160,7 @@
             }
           },
           "409": {
-            "description": "Not configured (NOT_CONFIGURED) or not built in this version yet (NOT_AVAILABLE)",
+            "description": "Not configured (NOT_CONFIGURED)",
             "content": {
               "application/json": {
                 "schema": {
@@ -8268,7 +8268,7 @@
             }
           },
           "409": {
-            "description": "Not configured (NOT_CONFIGURED) or not built in this version yet (NOT_AVAILABLE)",
+            "description": "Not configured (NOT_CONFIGURED)",
             "content": {
               "application/json": {
                 "schema": {
@@ -8376,7 +8376,7 @@
             }
           },
           "409": {
-            "description": "Not configured (NOT_CONFIGURED) or not built in this version yet (NOT_AVAILABLE)",
+            "description": "Not configured (NOT_CONFIGURED)",
             "content": {
               "application/json": {
                 "schema": {
@@ -8484,7 +8484,7 @@
             }
           },
           "409": {
-            "description": "Not configured (NOT_CONFIGURED) or not built in this version yet (NOT_AVAILABLE)",
+            "description": "Not configured (NOT_CONFIGURED)",
             "content": {
               "application/json": {
                 "schema": {
@@ -28135,7 +28135,7 @@
         "tags": [
           "requests"
         ],
-        "summary": "Refresh one user's personal mix.\n`POST /api/v3/requests/personal-mix/refresh`. Repeat calls while a build\nruns answer `already_running`; unlinked users get 400, and a server\nwithout the mix builder 409.",
+        "summary": "Refresh one user's personal mix.\n`POST /api/v3/requests/personal-mix/refresh`. Repeat calls while a build\nruns answer `already_running`; unlinked users get 400.",
         "operationId": "refresh_mix_handler",
         "responses": {
           "200": {
@@ -28150,16 +28150,6 @@
           },
           "400": {
             "description": "ListenBrainz is not connected",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            }
-          },
-          "409": {
-            "description": "Weekly Mix is not available on this server",
             "content": {
               "application/json": {
                 "schema": {
@@ -39129,7 +39119,8 @@
           "names_album",
           "title_unclear",
           "strong",
-          "weak"
+          "weak",
+          "turned_down_before"
         ]
       },
       "CandidateRefusal": {
@@ -49187,13 +49178,6 @@
             "format": "int64",
             "description": "Selected MBIDs already followed before this import."
           },
-          "approval_batch_id": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Approval batch for a non-admin auto-download mirror; else null."
-          },
           "auto_download_enabled": {
             "type": "integer",
             "format": "int64",
@@ -58067,7 +58051,10 @@
           "tracks_missing",
           "already_owned",
           "cancelled",
-          "moved_on"
+          "moved_on",
+          "no_better_copy",
+          "already_downloading",
+          "already_in_library"
         ]
       },
       "ReasonCount": {

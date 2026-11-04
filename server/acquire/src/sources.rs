@@ -96,6 +96,20 @@ pub(super) async fn blocklist(
         .map_err(|error| SourceError::LocalFault(error.to_string()))
 }
 
+/// What an automatic pick for `task` skips on one source: the blocklist
+/// plus the copies a landing turned down for its album. A journal that
+/// cannot be read is a local fault.
+pub(super) async fn automatic_blocklist(
+    journal: &Journal,
+    task: &TaskRow,
+    source: &SourceTag,
+) -> Result<Blocklist, SourceError> {
+    journal
+        .read_automatic_blocklist(task, source, journal.db().now_unix_f64())
+        .await
+        .map_err(|error| SourceError::LocalFault(error.to_string()))
+}
+
 /// The releases a task's attempts on one source already fetched.
 pub(super) async fn tried_releases(
     journal: &Journal,
@@ -122,46 +136,38 @@ async fn task_row(journal: &Arc<Journal>, task_id: &str) -> Result<TaskRow, Sour
         })
 }
 
-/// The task's search target, or why it cannot be worked out yet. Without
-/// a target service an album still searches by its names; a single track
-/// waits, since searching for it alone is what this design avoids.
+/// The task's search target, or why it cannot be worked out yet.
 pub(super) async fn resolve_target(
-    targets: Option<&Arc<Targets>>,
+    targets: &Targets,
     task: &TaskRow,
 ) -> Result<SearchTarget, SourceError> {
-    match targets {
-        Some(targets) => targets.target(task).await.map_err(|error| match error {
-            TargetError::Unavailable(reason) => SourceError::Unavailable(reason.to_string()),
-            TargetError::LocalFault(detail) => SourceError::LocalFault(detail),
-        }),
-        None if task.download_type == "track" => Err(SourceError::Unavailable(
-            TrackReason::AlbumLookupUnavailable.to_string(),
-        )),
-        None => Ok(SearchTarget {
-            artist: task.artist_name.clone(),
-            album_title: task.album_title.clone(),
-            year: None,
-            tracklist: Vec::new(),
-            wanted: Vec::new(),
-            track: None,
-        }),
-    }
+    targets.target(task).await.map_err(|error| match error {
+        TargetError::Unavailable(reason) => SourceError::Unavailable(reason.to_string()),
+        TargetError::LocalFault(detail) => SourceError::LocalFault(detail),
+    })
 }
 
 /// slskd behind the fetch seam.
 pub struct SlskdSource {
     repo: Arc<SlskdRepository<ReqwestSlskdHttp>>,
     journal: Arc<Journal>,
-    targets: Option<Arc<Targets>>,
+    /// Each task's edition to rank against; single tracks are fetched as
+    /// part of their album.
+    targets: Arc<Targets>,
 }
 
 impl SlskdSource {
-    /// Adapter over a configured repository and the shared journal.
-    pub fn new(repo: Arc<SlskdRepository<ReqwestSlskdHttp>>, journal: Arc<Journal>) -> Self {
+    /// Adapter over a configured repository and the shared journal,
+    /// ranking against each task's target.
+    pub fn new(
+        repo: Arc<SlskdRepository<ReqwestSlskdHttp>>,
+        journal: Arc<Journal>,
+        targets: Arc<Targets>,
+    ) -> Self {
         Self {
             repo,
             journal,
-            targets: None,
+            targets,
         }
     }
 
@@ -205,13 +211,6 @@ impl SlskdSource {
         Ok(paths)
     }
 
-    /// Rank against each task's edition and fetch single tracks as part
-    /// of their album.
-    pub fn with_targets(mut self, targets: Arc<Targets>) -> Self {
-        self.targets = Some(targets);
-        self
-    }
-
     /// A manual search: the album's folders, ranked against the edition's
     /// tracklist the same way the automatic path ranks them, with folders
     /// outside the band or the recipe last. Blocklisted files are left out.
@@ -251,12 +250,18 @@ impl SlskdSource {
             return Err(SourceError::Unavailable("slskd not configured".to_owned()));
         }
         let task = task_row(&self.journal, task_id).await?;
-        let target = resolve_target(self.targets.as_ref(), &task).await?;
+        let target = resolve_target(&self.targets, &task).await?;
         // Blocklisted peer/file pairs never re-enqueue, and neither does a
         // peer this task already tried: a failover walks to the best
         // remaining folder, so the list shrinking under quarantine never
-        // skips a candidate.
-        let blocked = blocklist(&self.journal, &SourceTag::Soulseek).await?;
+        // skips a candidate. Nor does a copy a landing turned down for the
+        // album, unless a person picked it.
+        let blocked = automatic_blocklist(&self.journal, &task, &SourceTag::Soulseek).await?;
+        let pin_blocked = if task.picked_by_person {
+            blocklist(&self.journal, &SourceTag::Soulseek).await?
+        } else {
+            blocked.clone()
+        };
         let mut tried = Vec::new();
         for json in self
             .journal
@@ -313,7 +318,7 @@ impl SlskdSource {
                 username, files, ..
             }) => files
                 .into_iter()
-                .filter(|file| !blocked.blocks_file(&username, &file.filename))
+                .filter(|file| !pin_blocked.blocks_file(&username, &file.filename))
                 .map(|file| EnqueueFile {
                     username: username.clone(),
                     filename: file.filename,
@@ -335,8 +340,8 @@ impl SlskdSource {
                         SourceError::rejected(reason, detail)
                     }
                 })?;
-            if let (Some(reason), Some(targets)) = (choice.lone_reason, self.targets.as_ref()) {
-                targets.record_lone_track(&task, reason);
+            if let Some(reason) = choice.lone_reason {
+                self.targets.record_lone_track(&task, reason);
             }
             choice
                 .pick
@@ -480,18 +485,22 @@ pub struct SabnzbdSource {
     policy: UsenetPolicy,
     journal: Arc<Journal>,
     category: Option<String>,
-    targets: Option<Arc<Targets>>,
+    /// Each task's album (a single track is fetched in its album's
+    /// release) and the edition tracklist releases are ordered against.
+    targets: Arc<Targets>,
 }
 
 impl SabnzbdSource {
     /// Adapter over a configured queue, the indexers it searches (in
-    /// order: the first copy of a release wins), and the journal.
+    /// order: the first copy of a release wins), the journal, and each
+    /// task's target.
     pub fn new(
         queue: Arc<SabnzbdQueue>,
         indexers: Vec<Arc<dyn Indexer>>,
         policy: UsenetPolicy,
         journal: Arc<Journal>,
         category: Option<String>,
+        targets: Arc<Targets>,
     ) -> Self {
         Self {
             queue,
@@ -499,15 +508,8 @@ impl SabnzbdSource {
             policy,
             journal,
             category,
-            targets: None,
+            targets,
         }
-    }
-
-    /// Search each task's album (a single track is fetched in its album's
-    /// release) and order releases against the edition's tracklist.
-    pub fn with_targets(mut self, targets: Arc<Targets>) -> Self {
-        self.targets = Some(targets);
-        self
     }
 
     /// What an automatic pick has to go on: [`Self::listed`] split into the
@@ -635,9 +637,7 @@ impl SabnzbdSource {
             (None, 0) => TrackReason::NoAlbumRelease,
             (None, _) => TrackReason::AlbumReleasesExhausted,
         };
-        if let Some(targets) = self.targets.as_ref() {
-            targets.record_lone_track(task, reason);
-        }
+        self.targets.record_lone_track(task, reason);
         Ok(lone)
     }
 }
@@ -725,7 +725,15 @@ impl SabnzbdSource {
         }
         let task = task_row(&self.journal, task_id).await?;
         let index = candidate_index.max(0) as usize;
-        let pin = pinned(&self.journal, &task, &SourceTag::Usenet, candidate_index).await;
+        // The automatic search review's pick of a copy a landing turned
+        // down for the album is dropped: the walk below finds another.
+        let automatic = automatic_blocklist(&self.journal, &task, &SourceTag::Usenet).await?;
+        let pin = pinned(&self.journal, &task, &SourceTag::Usenet, candidate_index)
+            .await
+            .filter(|pin| match pin {
+                Pin::Release { identity } => task.picked_by_person || !automatic.blocks(identity),
+                Pin::Soulseek { .. } => true,
+            });
         // Crash-retry dedup: the job name is deterministic per
         // (task, index), so a repeat enqueue after a crash between the
         // client add and the journal write re-attaches to the existing
@@ -761,7 +769,7 @@ impl SabnzbdSource {
             }
             Err(error) => return Err(sab_error(error)),
         }
-        let target = resolve_target(self.targets.as_ref(), &task).await?;
+        let target = resolve_target(&self.targets, &task).await?;
         let blocked = blocklist(&self.journal, &SourceTag::Usenet).await?;
         let pinned_pick = matches!(pin, Some(Pin::Release { .. }));
         let pick = match pin {
@@ -781,7 +789,7 @@ impl SabnzbdSource {
                 })?,
             _ => {
                 let tried = tried_releases(&self.journal, task_id, &SourceTag::Usenet).await?;
-                self.pick(&task, &target, &blocked, &tried)
+                self.pick(&task, &target, &automatic, &tried)
                     .await
                     .map_err(|reason| {
                         SourceError::rejected(
@@ -953,14 +961,13 @@ impl DownloadSource for SabnzbdSource {
 /// state of the writes that put a task's files in place.
 pub struct JournalOwnership {
     journal: Arc<Journal>,
-    library: Option<Arc<dyn LandingLibrary>>,
+    library: Arc<dyn LandingLibrary>,
 }
 
 impl JournalOwnership {
     /// Ownership lookups over the shared journal, asking `library` about
-    /// the writes behind a task. Without a library no task's writes count
-    /// as settled.
-    pub fn new(journal: Arc<Journal>, library: Option<Arc<dyn LandingLibrary>>) -> Self {
+    /// the writes behind a task.
+    pub fn new(journal: Arc<Journal>, library: Arc<dyn LandingLibrary>) -> Self {
         Self { journal, library }
     }
 }
@@ -999,14 +1006,7 @@ impl OrphanOwnership for JournalOwnership {
 
     /// A journal that cannot be asked is not settled: the folder stays.
     async fn bundles_settled(&self, task_id: &str) -> Result<bool, SourceError> {
-        let Some(library) = &self.library else {
-            tracing::warn!(
-                task_id,
-                "no library to ask about this download's writes; its folder is kept"
-            );
-            return Ok(false);
-        };
-        match library.publish_settled(task_id).await {
+        match self.library.publish_settled(task_id).await {
             Ok(settled) => Ok(settled),
             Err(error) => {
                 tracing::warn!(

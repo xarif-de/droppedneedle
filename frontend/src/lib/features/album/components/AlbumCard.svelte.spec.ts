@@ -1,0 +1,40 @@
+import { page } from 'vitest/browser';
+import { describe, expect, it, vi } from 'vitest';
+import { render } from 'vitest-browser-svelte';
+
+import type { Album } from '$lib/features/album/queries/types';
+
+const { emptyComponent } = vi.hoisted(() => ({
+	emptyComponent: () => {
+		const C = function () {};
+		C.prototype = {};
+		return { default: C };
+	}
+}));
+
+vi.mock('$lib/features/downloads/queries/DownloadMutations.svelte', () => ({
+	createRequestAlbumMutation: () => ({ mutateAsync: vi.fn(), isPending: false })
+}));
+vi.mock('$lib/media/AlbumImage.svelte', emptyComponent);
+vi.mock('./AlbumCardOverlay.svelte', emptyComponent);
+
+import AlbumCard from './AlbumCard.svelte';
+
+const album: Album = {
+	title: 'OK Computer',
+	artist: 'Radiohead',
+	year: 1997,
+	musicbrainz_id: 'b1392450-e666-3926-a536-22c65f834433',
+	in_library: false,
+	requested: false
+} as Album;
+
+describe('AlbumCard', () => {
+	it('offers the request with no download source set up, since the request waits for one', async () => {
+		await render(AlbumCard, { album });
+
+		await expect
+			.element(page.getByRole('button', { name: 'Request OK Computer' }))
+			.toBeInTheDocument();
+	});
+});
