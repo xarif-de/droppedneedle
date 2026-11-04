@@ -1,0 +1,7 @@
+# github.com publication (kubernetes/forgejo README "Opt-in GitHub publication"): the public
+# source of every fork release (AGPL §13 source offer for music.xarif.de).
+# Issues and pull requests belong upstream: github.com/DroppedNeedle/DroppedNeedle.
+# explicit: retired as archive/docker--droppedneedle, the copy stays claimed and gets archived
+name: droppedneedle
+description: xarif fork of DroppedNeedle/DroppedNeedle (v3) — upstream v3 plus a few changes offered upstream; see XARIF.md
+homepage: https://github.com/DroppedNeedle/DroppedNeedle
