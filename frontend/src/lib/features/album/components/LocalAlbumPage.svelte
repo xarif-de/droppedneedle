@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
-	import { ChevronLeft, Disc3, FileUp, ListMusic, Play, Shuffle } from 'lucide-svelte';
+	import { Disc3, FileUp, ListMusic, Play, Shuffle } from 'lucide-svelte';
 	import AlbumImage from '$lib/media/AlbumImage.svelte';
 	import LibraryFormatBadge from '$lib/features/library/components/LibraryFormatBadge.svelte';
 	import NoFilesBadge from '$lib/features/library/components/NoFilesBadge.svelte';
@@ -13,6 +13,7 @@
 	import AlbumOrganizationDialog from '$lib/features/library-management/components/AlbumOrganizationDialog.svelte';
 	import LocalAlbumTrackList from '$lib/features/library/components/LocalAlbumTrackList.svelte';
 	import AlbumDownloadButton from './AlbumDownloadButton.svelte';
+	import BackButton from '$lib/ui/BackButton.svelte';
 	import Button from '$lib/ui/Button.svelte';
 	import Card from '$lib/ui/Card.svelte';
 	import RatingStars from '$lib/ui/RatingStars.svelte';
@@ -139,15 +140,9 @@
 <svelte:head><title>{album?.title ?? 'Album'} · Library</title></svelte:head>
 
 <main class="container mx-auto p-4 md:p-6 lg:p-8">
-	<Button
-		variant="ghost"
-		size="sm"
-		icon={ChevronLeft}
-		class="mb-5"
-		onclick={() => goto(withBasePath('/library/albums'))}
-	>
-		Albums
-	</Button>
+	<div class="mb-5">
+		<BackButton fallback="/library/albums" />
+	</div>
 
 	{#if albumQuery.isLoading}
 		<div class="grid gap-6 md:grid-cols-[16rem_1fr]">
