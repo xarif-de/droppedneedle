@@ -6,6 +6,5 @@ musicbrainz-user-agent-form base=2b0e19975a05d999f60c3518705d1cbee541b514 pr=loc
 metabrainz-rates base=2b0e19975a05d999f60c3518705d1cbee541b514 pr=local
 metabrainz-shared-budget base=2b0e19975a05d999f60c3518705d1cbee541b514 pr=local
 login-redirects-to-sso base=2b0e19975a05d999f60c3518705d1cbee541b514 pr=local
-no-404-for-missing-art-and-unserved-subsonic base=2b0e19975a05d999f60c3518705d1cbee541b514 pr=local
-removed-tracks-leave-the-player base=2b0e19975a05d999f60c3518705d1cbee541b514 pr=removed-tracks-leave-the-player
+no-404-for-missing-art-and-unserved-subsonic base=45914c6bfa75083c2e965ca2a85512ea73cdd291 pr=local
 ci-package-mirror base=2b0e19975a05d999f60c3518705d1cbee541b514 pr=local
