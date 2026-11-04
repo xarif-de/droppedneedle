@@ -50,7 +50,7 @@ pub use automatic::{
 pub use custom::{Custom, custom_edition};
 pub(crate) use fold::fold_legacy;
 pub use fold::{
-    FOLD_REASON, FOLD_UNDONE, FoldUndo, Folded, TakeoverMark, fold_undoable, fold_undone, undo_fold,
+    FOLD_REASON, FoldUndo, Folded, TakeoverMark, fold_undoable, fold_undone, undo_fold,
 };
 pub use import::{ImportedFile, adopt_import, import_album};
 pub(crate) use import::{save_album, save_track};
@@ -64,6 +64,7 @@ pub use person::{
 };
 pub(crate) use person::{TrackRow, drop_edition, upsert_track_identity};
 pub use release::ReleaseIdentity;
+pub use sql::asked_groups;
 pub use undo::{AutomaticUndo, AutomaticUndone, undo, undo_automatic};
 
 /// Why a person's identity command wrote nothing.

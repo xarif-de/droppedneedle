@@ -37,7 +37,8 @@ vi.mock('$app/environment', () => ({ browser: true }));
 vi.mock('$lib/stores/theme.svelte', () => ({}));
 vi.mock('$lib/api/client', () => ({ api: { v3: { GET: state.apiGet } } }));
 vi.mock('$lib/constants', () => ({
-	AUTH_FREE_PATHS: ['/login', '/setup']
+	AUTH_FREE_PATHS: ['/login', '/setup', '/upgrade'],
+	UPGRADE_PATH: '/upgrade'
 }));
 vi.mock('$lib/queries/QueryClient', () => ({
 	queryClient: {
@@ -141,7 +142,7 @@ describe('+layout load session bootstrap', () => {
 	it('keeps the session intact and reports an unreachable server when /api/v3/me times out', async () => {
 		state.user = user;
 		state.apiGet
-			.mockResolvedValueOnce({ setup_required: false })
+			.mockResolvedValueOnce({ setup_required: false, code_required: false })
 			.mockRejectedValueOnce(new TransportError('TRANSPORT_TIMEOUT', 'GET', '/api/v3/me'));
 
 		await expect(loadPage()).rejects.toMatchObject({
@@ -169,7 +170,7 @@ describe('+layout load session bootstrap', () => {
 			throw new Error('IndexedDB unavailable');
 		});
 		state.apiGet
-			.mockResolvedValueOnce({ setup_required: false })
+			.mockResolvedValueOnce({ setup_required: false, code_required: false })
 			.mockRejectedValueOnce(new ApiError(401, 'Unauthorized'));
 
 		await expect(loadPage()).rejects.toMatchObject({ status: 302, location: '/login' });
@@ -231,7 +232,9 @@ describe('+layout load session bootstrap', () => {
 	});
 
 	it('runs setup and session hydration only once across in-app navigation', async () => {
-		state.apiGet.mockResolvedValueOnce({ setup_required: false }).mockResolvedValueOnce(user);
+		state.apiGet
+			.mockResolvedValueOnce({ setup_required: false, code_required: false })
+			.mockResolvedValueOnce(user);
 
 		await expect(loadPage()).resolves.toEqual({ primarySource: 'listenbrainz', user });
 		await expect(loadPage()).resolves.toEqual({ primarySource: 'listenbrainz', user });
@@ -248,7 +251,7 @@ describe('+layout load session bootstrap', () => {
 
 	it('retains setup state across navigation without repeating bootstrap requests', async () => {
 		state.apiGet
-			.mockResolvedValueOnce({ setup_required: true })
+			.mockResolvedValueOnce({ setup_required: true, code_required: false })
 			.mockRejectedValueOnce(new ApiError(401, 'Unauthorized'));
 
 		await expect(loadPage('/login')).resolves.toEqual({
@@ -278,5 +281,19 @@ describe('+layout load session bootstrap', () => {
 		await expect(loadPage('/setup')).rejects.toMatchObject({ status: 302, location: '/' });
 		expect(state.apiGet).not.toHaveBeenCalled();
 		expect(state.ensureQueryData).not.toHaveBeenCalled();
+	});
+
+	it('sends a server started on v2 data to the upgrade page, which loads without the bootstrap', async () => {
+		state.apiGet.mockRejectedValueOnce(
+			new ApiError(503, 'An upgrade is needed', 'UPGRADE_REQUIRED')
+		);
+
+		await expect(loadPage('/library')).rejects.toMatchObject({
+			status: 302,
+			location: '/upgrade'
+		});
+		state.apiGet.mockReset();
+		await expect(loadPage('/upgrade')).resolves.toMatchObject({ user: null });
+		expect(state.apiGet).not.toHaveBeenCalled();
 	});
 });

@@ -1217,8 +1217,13 @@ async fn assert_hot_plans(db: &Db) {
             }
         }
     }
+    // A minimum-tracks filter asks for one album's track at a place; the
+    // page itself never skips rows.
     for text in &lists {
-        assert!(!text.contains("OFFSET"), "a list pages by offset: {text}");
+        assert!(
+            !text.replace("LIMIT 1 OFFSET ?))", "").contains("OFFSET"),
+            "a list pages by offset: {text}"
+        );
     }
 
     // The first page and a deep page of each order an index holds walk that
@@ -1419,12 +1424,7 @@ async fn assert_hot_plans(db: &Db) {
         (
             "artist totals",
             sql::ARTIST_TOTALS.text().to_owned(),
-            vec![
-                ExplainBind::Text(None),
-                ExplainBind::Text(None),
-                ExplainBind::Text(None),
-                ExplainBind::Text(None),
-            ],
+            vec![ExplainBind::Text(None), ExplainBind::Text(None)],
         ),
         ("stats", sql::STATS.text().to_owned(), Vec::new()),
     ] {
@@ -1473,6 +1473,106 @@ async fn assert_hot_plans(db: &Db) {
             .all(|line| line.contains("(id=?")),
         "artist tag ids reach tracks and albums by id from the credits: {plan:?}"
     );
+
+    assert_filter_plans(db).await;
+}
+
+/// The album and artist lists' filters (formats, minimum tracks, an album
+/// out of the recycle bin) reach each album's tracks, an artist's credits
+/// and led albums, and a track's bin rows by key: a filtered page walks
+/// the same index its unfiltered page does, and only the format counts
+/// walk every album.
+async fn assert_filter_plans(db: &Db) {
+    let by_key = |plan: &[String], aliases: &[&str]| {
+        aliases.iter().all(|alias| {
+            plan.iter()
+                .filter(|line| {
+                    line.starts_with(&format!("SEARCH {alias} "))
+                        || line.starts_with(&format!("SCAN {alias} "))
+                        || line.as_str() == format!("SCAN {alias}")
+                })
+                .all(|line| line.starts_with("SEARCH ") && line.contains("=?"))
+        })
+    };
+    let album_aliases = ["t2", "mat", "gbt", "gbr", "gbj"];
+    for (name, text) in [
+        ("album page", sql::album_page(AlbumSort::Name, false, false)),
+        (
+            "album page, deep",
+            sql::album_page(AlbumSort::Name, false, true),
+        ),
+        ("album count", sql::ALBUM_COUNT.text().to_owned()),
+        ("led albums", sql::led_album_page(false)),
+        ("led album count", sql::LED_ALBUM_COUNT.text().to_owned()),
+    ] {
+        let plan = explain_unbound(db, &text).await;
+        assert!(
+            by_key(&plan, &album_aliases),
+            "{name} reaches each album's tracks and bin rows by key: {plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|line| line.contains("SCAN local_tracks")),
+            "{name} never walks the tracks: {plan:?}"
+        );
+    }
+    let plan = explain_unbound(db, &sql::album_page(AlbumSort::Name, false, false)).await;
+    assert!(
+        plan.iter()
+            .any(|line| line.contains("idx_local_albums_search")),
+        "a filtered album page still walks the title index: {plan:?}"
+    );
+
+    let plan = explain(db, sql::ALBUM_FORMAT_COUNTS.text(), &[]).await;
+    assert!(
+        by_key(&plan, &["t2"]) && !plan.iter().any(|line| line.contains("SCAN local_tracks")),
+        "format counts probe each album's tracks by key: {plan:?}"
+    );
+
+    let artist_aliases = ["mla", "ml", "map"];
+    for scope in [
+        ArtistScope::All,
+        ArtistScope::AlbumArtists,
+        ArtistScope::Contributors,
+        ArtistScope::WithMusic,
+    ] {
+        for sort in ARTIST_SORTS {
+            for after in [false, true] {
+                let plan =
+                    explain_unbound(db, &sql::artist_page(scope, sort, true, after, true)).await;
+                assert!(
+                    by_key(&plan, &artist_aliases),
+                    "{scope:?} by {sort:?} filtered by tracks reaches them by key: {plan:?}"
+                );
+                let sorts = |plan: &[String]| {
+                    plan.iter()
+                        .filter(|line| line.contains("TEMP B-TREE FOR"))
+                        .count()
+                };
+                let unfiltered =
+                    explain_unbound(db, &sql::artist_page(scope, sort, true, after, false)).await;
+                // The minimum is tested on the walk's rows as they come, so
+                // a sorted walk stops once the page is full: the walk stays
+                // a co-routine of its own, never folded into the test, and
+                // the outer order is read as the walk gives it, not sorted
+                // again.
+                assert_eq!(
+                    sorts(&plan),
+                    sorts(&unfiltered),
+                    "{scope:?} by {sort:?} filtered by tracks sorts only as its walk does: {plan:?}"
+                );
+                assert!(
+                    plan.iter().any(|line| line.starts_with("CO-ROUTINE"))
+                        && plan.iter().any(|line| line.starts_with("SCAN (subquery")),
+                    "{scope:?} by {sort:?} filtered by tracks reads its walk in order: {plan:?}"
+                );
+            }
+        }
+        let plan = explain_unbound(db, &sql::artist_scope_count(scope, true)).await;
+        assert!(
+            by_key(&plan, &artist_aliases),
+            "{scope:?} counted by tracks reaches them by key: {plan:?}"
+        );
+    }
 }
 
 /// Plays on the small fixture: `u1` has ties in both the last play (t2 and
@@ -1503,15 +1603,17 @@ async fn seed_small_plays(fixture: &Fixture) {
             sql.push_str(", ");
         }
         sql.push_str(&format!(
-            "('play-{index}', '{user}', {track}, '{album}', 'x', 'x', '{at}')"
+            "('play-{index}', '{user}', {track}, '{album}', 'x', 'x', {})",
+            play_at(at)
         ));
     }
     write_batch(fixture, "small plays", sql).await;
 }
 
-/// Played marks on the small fixture, with plays of their own in the forms
-/// v2 wrote. `u1` marked t1 unplayed in the second of its middle play (so
-/// only the last counts), t6 unplayed after all its plays, t7 played with
+/// Played marks on the small fixture, with plays of their own whose times
+/// came in the forms v2 wrote, converted as the upgrade converts them. `u1`
+/// marked t1 unplayed in the second of its middle play (so only the last
+/// counts), t6 unplayed after all its plays, t7 played with
 /// no play, and t2 played after an earlier unplayed mark. `u3` has plays
 /// with a space for the `T`, fractional seconds and `Z`, and an offset:
 /// t8 marked unplayed just before its play, and t9 in the second of its
@@ -1541,10 +1643,10 @@ async fn seed_small_marks(fixture: &Fixture) {
          ('u1', 'One', 'user', 0), ('u3', 'Three', 'user', 0); \
          INSERT INTO library_play_history (id, user_id, local_track_id, local_album_id, \
          track_name, artist_name, played_at) VALUES \
-         ('v2-1', 'u3', 't8', 'al5', 'x', 'x', '2026-01-05 12:00:00'), \
-         ('v2-2', 'u3', 't9', 'al5', 'x', 'x', '2026-01-06T10:00:00.500Z'), \
-         ('v2-3', 'u3', 't9', 'al5', 'x', 'x', '2026-01-04T10:00:00Z'), \
-         ('v2-4', 'u3', 't4', 'al2', 'x', 'x', '2026-01-03T09:00:00+01:00'); \
+         ('v2-1', 'u3', 't8', 'al5', 'x', 'x', CAST(round(unixepoch('2026-01-05 12:00:00', 'subsec') * 1000) AS INTEGER)), \
+         ('v2-2', 'u3', 't9', 'al5', 'x', 'x', CAST(round(unixepoch('2026-01-06T10:00:00.500Z', 'subsec') * 1000) AS INTEGER)), \
+         ('v2-3', 'u3', 't9', 'al5', 'x', 'x', CAST(round(unixepoch('2026-01-04T10:00:00Z', 'subsec') * 1000) AS INTEGER)), \
+         ('v2-4', 'u3', 't4', 'al2', 'x', 'x', CAST(round(unixepoch('2026-01-03T09:00:00+01:00', 'subsec') * 1000) AS INTEGER)); \
          INSERT INTO catalog_user_play_marks (user_id, local_track_id, marked_played_at, \
          marked_unplayed_at) VALUES ",
     );
@@ -1581,7 +1683,7 @@ async fn rule_values(
     .await;
     let plays: Vec<(Option<String>, Option<String>, Option<i64>)> = fetch(
         db,
-        "SELECT local_track_id, local_album_id, CAST(strftime('%s', played_at) AS INTEGER) \
+        "SELECT local_track_id, local_album_id, played_at / 1000 \
          FROM library_play_history WHERE user_id = ?",
         vec![text(user)],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -1974,6 +2076,12 @@ const TRACK_INSERT: &str = "INSERT INTO local_tracks (id, local_album_id, root_i
      album_artist_name_folded, disc_number, track_number, year, duration_seconds, file_format, \
      availability, ingest_source, imported_at, membership_source) VALUES ";
 
+/// A play's stored time: the instant the ISO text `at` names, in
+/// milliseconds, as the upgrade converts one.
+fn play_at(at: &str) -> String {
+    format!("CAST(round(unixepoch('{at}', 'subsec') * 1000) AS INTEGER)")
+}
+
 /// A play recorded the way playback records one: the track's album and
 /// first credited artist looked up with it, all empty for an unknown track.
 fn recorded_play(id: &str, user: &str, track: &str, at: &str) -> String {
@@ -1984,9 +2092,10 @@ fn recorded_play(id: &str, user: &str, track: &str, at: &str) -> String {
          SELECT '{id}', '{user}', t.id, t.local_album_id, \
          COALESCE((SELECT x.local_artist_id FROM local_track_artists x \
                    WHERE x.local_track_id = t.id ORDER BY x.position LIMIT 1), a.album_artist_id), \
-         'x', 'x', NULL, NULL, NULL, NULL, NULL, '{at}' \
+         'x', 'x', NULL, NULL, NULL, NULL, NULL, {} \
          FROM (SELECT 1) LEFT JOIN local_tracks t ON t.id = '{track}' \
-         LEFT JOIN local_albums a ON a.id = t.local_album_id;"
+         LEFT JOIN local_albums a ON a.id = t.local_album_id;",
+        play_at(at)
     )
 }
 
@@ -2047,8 +2156,8 @@ async fn album_play_summary_follows_every_write() {
         &fixture,
         "summary loose plays",
         "INSERT INTO library_play_history (id, user_id, track_name, artist_name, played_at) \
-         VALUES ('loose-1', 'u2', 'x', 'x', '2026-02-02T00:00:00Z'), \
-         ('loose-2', 'u3', 'x', 'x', '2026-02-03 08:00:00'); \
+         VALUES ('loose-1', 'u2', 'x', 'x', CAST(round(unixepoch('2026-02-02T00:00:00Z', 'subsec') * 1000) AS INTEGER)), \
+         ('loose-2', 'u3', 'x', 'x', CAST(round(unixepoch('2026-02-03 08:00:00', 'subsec') * 1000) AS INTEGER)); \
          UPDATE library_play_history SET local_track_id = t.id, \
          local_album_id = t.local_album_id, \
          local_artist_id = COALESCE((SELECT x.local_artist_id FROM local_track_artists x \
@@ -2948,7 +3057,8 @@ async fn history_plans_read_the_listeners_plays_first() {
             }
             plays.push_str(&format!(
                 "('plan-{user}-{index}', 'u{user}', '{track}', '{album}', 'x', 'x', \
-                 '2026-01-01T00:00:{index:02}+00:00')"
+                 {})",
+                play_at(&format!("2026-01-01T00:00:{index:02}+00:00"))
             ));
         }
     }
@@ -2968,7 +3078,8 @@ async fn history_plans_read_the_listeners_plays_first() {
             let album = if index < 40 { "'al1'" } else { "NULL" };
             trackless.push_str(&format!(
                 "('plan-none-{user}-{index}', 'u{user}', {album}, 'x', 'x', \
-                 '2025-12-01T00:00:00+00:00')"
+                 {})",
+                play_at("2025-12-01T00:00:00+00:00")
             ));
         }
     }
@@ -3016,9 +3127,17 @@ async fn history_plans_read_the_listeners_plays_first() {
     assert_history_plans(fixture.db(), "with statistics").await;
 }
 
+/// The release group the 100k seed's album `album` is: its files' tags name
+/// it, and every even album's match row too.
+fn perf_group(album: usize) -> String {
+    format!("0a0b0c0d-0000-4000-8000-{album:012}")
+}
+
 /// Seed 500 artists, 10,000 albums, and 100,000 tracks through the writer
 /// lane, so the FTS oracle and format totals populate exactly like
 /// production writes. Deterministic names; the miss query hits nothing.
+/// Every file's tags name its album's release group, and every even album
+/// is matched to it, so ownership reads meet both kinds.
 async fn seed_100k(fixture: &Fixture) {
     let mut artists = String::from(
         "INSERT INTO local_artists (id, display_name, folded_name, kind, created_at, updated_at) VALUES ",
@@ -3073,7 +3192,8 @@ async fn seed_100k(fixture: &Fixture) {
              path_hash, file_size_bytes, file_mtime_ns, stat_revision, title, title_folded, \
              artist_name, artist_name_folded, album_title, album_title_folded, album_artist_name, \
              album_artist_name_folded, disc_number, track_number, year, duration_seconds, \
-             file_format, availability, ingest_source, imported_at, membership_source) VALUES ",
+             file_format, availability, ingest_source, imported_at, membership_source, \
+             embedded_release_group_mbid) VALUES ",
         );
         let mut credits = String::from(
             "INSERT INTO local_track_artists (local_track_id, position, local_artist_id, role) VALUES ",
@@ -3090,7 +3210,7 @@ async fn seed_100k(fixture: &Fixture) {
                  4000, 1, 'ps{id:06}', 'Perf Track {id:06}', 'perf track {id:06}', \
                  'Perf Artist {:04}', 'perf artist {:04}', 'Perf Album {:05}', 'perf album {:05}', \
                  'Perf Artist {:04}', 'perf artist {:04}', 1, {}, 1994, 200.0, '{format}', 'indexed', \
-                 'scan', 1000000, 'automatic')",
+                 'scan', 1000000, 'automatic', '{}')",
                 id / 10,
                 (id / 10) / 20,
                 (id / 10) / 20,
@@ -3099,6 +3219,7 @@ async fn seed_100k(fixture: &Fixture) {
                 (id / 10) / 20,
                 (id / 10) / 20,
                 id % 10 + 1,
+                perf_group(id / 10),
             ));
             credits.push_str(&format!(
                 "('p-t{id:06}', 0, 'p-a{:04}', 'main')",
@@ -3109,6 +3230,221 @@ async fn seed_100k(fixture: &Fixture) {
         credits.push(';');
         write_batch(fixture, "perf tracks", tracks).await;
         write_batch(fixture, "perf track credits", credits).await;
+    }
+    let matches: Vec<String> = (0..10000)
+        .step_by(2)
+        .map(|album| {
+            format!(
+                "('p-al{album:05}', 'musicbrainz', '{}', 'automatic', 1000000)",
+                perf_group(album)
+            )
+        })
+        .collect();
+    write_batch(
+        fixture,
+        "perf album matches",
+        format!(
+            "INSERT INTO local_album_external_identities (local_album_id, provider, \
+             release_group_mbid, decision_source, selected_at) VALUES {};",
+            matches.join(", ")
+        ),
+    )
+    .await;
+}
+
+/// A probe of one release group's owners, as acquisition asks it.
+const GROUP_OWNED: &str = concat!(
+    "SELECT EXISTS (",
+    droppedneedle_library::owns_group!("= ?1"),
+    ")"
+);
+
+/// The plan lines of the ownership reads that name one group or a list,
+/// with no line that walks the tracks, the matches or the albums.
+async fn assert_owned_plans(db: &Db) {
+    let one = [ExplainBind::Text(None)];
+    let three = [ExplainBind::Text(None); 3];
+    let owners = sql::owners_by_group(ListLen::new(3));
+    let feed = concat!(
+        "SELECT n.release_group_mbid FROM acquire_new_release_feed n WHERE NOT EXISTS (",
+        droppedneedle_library::owns_group!("= +n.release_group_mbid_lower"),
+        ")"
+    );
+    for (name, text, binds) in [
+        ("group owned", GROUP_OWNED, &one[..]),
+        ("page album", sql::LOCAL_ALBUM.text(), &one[..]),
+        ("live copy", sql::LIVE_COPY_BY_GROUP.text(), &one[..]),
+        ("owners by group", owners.as_str(), &three[..]),
+        ("feed not owned", feed, &[][..]),
+    ] {
+        let plan = explain(db, text, binds).await;
+        for index in [
+            "idx_local_album_identity_rg_lower",
+            "idx_local_tracks_release_group_lower",
+        ] {
+            assert!(
+                plan.iter().any(|line| line.contains(index)),
+                "{name}: no {index} in {plan:?}"
+            );
+        }
+        assert!(
+            !plan.iter().any(|line| {
+                let mut words = line.split_whitespace();
+                words.next() == Some("SCAN")
+                    && matches!(
+                        words.next(),
+                        Some("ogt" | "oga" | "oge" | "ogb" | "gce" | "b" | "e" | "t")
+                    )
+            }),
+            "{name} scans: {plan:?}"
+        );
+    }
+}
+
+/// Ownership reads reach a group's albums by key, through the two lowered
+/// indexes: the matches' release group and the files' tagged one.
+#[tokio::test]
+async fn owned_plans_probe_by_key() {
+    let fixture = seed_small().await;
+    assert_owned_plans(fixture.db()).await;
+}
+
+/// Acceptance: the ownership reads on a 100k catalog with half its albums
+/// matched and every file tagged. A keyed probe holds the 10 ms budget; the
+/// whole owned set is timed and reported. Ignored by default, as the other
+/// timings are.
+#[tokio::test]
+#[ignore = "100k acceptance timing; run explicitly with --release on reference hardware"]
+async fn perf_100k_owned_reads_hold_p95() {
+    let fixture = seed_small().await;
+    seed_100k(&fixture).await;
+    let db = fixture.db().clone();
+    db.write(Lane::Foreground, "analyze", |tx| {
+        tx.execute_batch("ANALYZE")?;
+        Ok::<_, DbError>(())
+    })
+    .await
+    .expect("analyze runs");
+    assert_owned_plans(&db).await;
+    let groups: Vec<String> = (0..20).map(|n| perf_group(n * 499)).collect();
+    let owners = sql::owners_by_group(ListLen::new(groups.len()));
+    let list: Vec<Value> = groups.iter().map(|group| text(group)).collect();
+    let keyed: Vec<(&str, String, Vec<Value>)> = vec![
+        (
+            "group_owned_matched",
+            GROUP_OWNED.to_owned(),
+            vec![text(&perf_group(4242))],
+        ),
+        (
+            "group_owned_tags",
+            GROUP_OWNED.to_owned(),
+            vec![text(&perf_group(4243))],
+        ),
+        (
+            "group_owned_miss",
+            GROUP_OWNED.to_owned(),
+            vec![text("0a0b0c0d-0000-4000-8000-ffffffffffff")],
+        ),
+        (
+            "page_album_matched",
+            sql::LOCAL_ALBUM.text().to_owned(),
+            vec![text(&perf_group(4242))],
+        ),
+        (
+            "page_album_tags",
+            sql::LOCAL_ALBUM.text().to_owned(),
+            vec![text(&perf_group(4243))],
+        ),
+        (
+            "live_copy_matched",
+            sql::LIVE_COPY_BY_GROUP.text().to_owned(),
+            vec![text(&perf_group(4242))],
+        ),
+        ("owners_by_group_20", owners, list),
+    ];
+    let worklist = concat!(
+        "SELECT o.group_mbid, t.file_format FROM (",
+        droppedneedle_library::all_owners!(),
+        ") o JOIN local_tracks t ON t.local_album_id = o.album_id \
+         WHERE +t.availability = 'indexed'"
+    );
+    let whole: Vec<(&str, String, Vec<Value>)> = vec![
+        ("owned_set", sql::OWNED_GROUPS.text().to_owned(), Vec::new()),
+        ("upgrade_worklist", worklist.to_owned(), Vec::new()),
+    ];
+    let mut report = Vec::new();
+    for (budgeted, rows) in [(true, &keyed), (false, &whole)] {
+        for (name, statement, values) in rows {
+            let mut samples = Vec::new();
+            for round in 0..53 {
+                let tick = std::time::Instant::now();
+                let found: Vec<Value> =
+                    fetch(&db, statement, values.clone(), |row| row.get(0)).await;
+                let ms = tick.elapsed().as_secs_f64() * 1000.0;
+                if round >= 3 {
+                    samples.push(ms);
+                }
+                assert!(!found.is_empty() || name.ends_with("miss"), "{name}");
+            }
+            let p95 = percentile(&mut samples, 95.0);
+            let p50 = percentile(&mut samples, 50.0);
+            report.push(format!("{name}: p50 {p50:.2} ms, p95 {p95:.2} ms"));
+            if budgeted && !cfg!(debug_assertions) {
+                assert!(
+                    p95 < 10.0,
+                    "{name} p95 {p95:.2} ms exceeds the 10 ms budget"
+                );
+            }
+        }
+    }
+    eprintln!("100k ownership reads:\n{}", report.join("\n"));
+}
+
+/// Acceptance: an artist page's owned songs on the 100k catalog, for an
+/// artist leading 20 albums (200 tracks, half matched, half known by their
+/// tags), hold the 100 ms page budget. Ignored by default, as the other
+/// timings are.
+#[tokio::test]
+#[ignore = "100k acceptance timing; run explicitly with --release: cargo test --release -p droppedneedle-catalog --lib perf_100k_artist_songs -- --ignored --nocapture"]
+async fn perf_100k_artist_songs_hold_the_page_budget() {
+    const ARTIST: &str = "0a0b0c0d-1111-4000-8000-000000000000";
+    let fixture = seed_small().await;
+    seed_100k(&fixture).await;
+    write_batch(
+        &fixture,
+        "perf artist link",
+        format!(
+            "INSERT INTO local_artist_external_identities (local_artist_id, provider, \
+             provider_artist_id, decision_source, selected_at) \
+             VALUES ('p-a0250', 'musicbrainz', '{ARTIST}', 'manual', 1000000);"
+        ),
+    )
+    .await;
+    let db = fixture.db().clone();
+    db.write(Lane::Foreground, "analyze", |tx| {
+        tx.execute_batch("ANALYZE")?;
+        Ok::<_, DbError>(())
+    })
+    .await
+    .expect("analyze runs");
+    let mut samples = Vec::new();
+    for round in 0..53 {
+        let tick = std::time::Instant::now();
+        let found = fetch(&db, sql::ARTIST_SONGS.text(), vec![text(ARTIST)], |row| {
+            sql::ArtistSongColumns::read(row)
+        })
+        .await;
+        let ms = tick.elapsed().as_secs_f64() * 1000.0;
+        if round >= 3 {
+            samples.push(ms);
+        }
+        assert_eq!(found.len(), 200, "every track of the artist's albums");
+    }
+    let p95 = percentile(&mut samples, 95.0);
+    let p50 = percentile(&mut samples, 50.0);
+    eprintln!("100k artist songs: p50 {p50:.2} ms, p95 {p95:.2} ms");
+    if !cfg!(debug_assertions) {
+        assert!(p95 < 100.0, "artist songs p95 {p95:.2} ms exceeds 100 ms");
     }
 }
 
@@ -3136,10 +3472,13 @@ async fn seed_100k_plays(fixture: &Fixture) {
             };
             sql.push_str(&format!(
                 "('p-n{chunk}-{index}', 'p-u1', {album}, 'x', 'x', \
-                 '2025-12-{:02}T{:02}:{:02}:00+00:00')",
-                chunk + 1,
-                index / 60 % 24,
-                index % 60,
+                 {})",
+                play_at(&format!(
+                    "2025-12-{:02}T{:02}:{:02}:00+00:00",
+                    chunk + 1,
+                    index / 60 % 24,
+                    index % 60,
+                )),
             ));
         }
         write_batch(fixture, "perf plays with no track", sql).await;
@@ -3171,11 +3510,14 @@ async fn seed_100k_plays(fixture: &Fixture) {
             }
             sql.push_str(&format!(
                 "('p-h{chunk_index}-{index}', '{user}', 'p-t{track:06}', 'p-al{:05}', 'x', 'x', \
-                 '2026-01-{:02}T{:02}:{:02}:00+00:00')",
+                 {})",
                 track / 10,
-                minute / 1440 + 1,
-                (minute / 60) % 24,
-                minute % 60,
+                play_at(&format!(
+                    "2026-01-{:02}T{:02}:{:02}:00+00:00",
+                    minute / 1440 + 1,
+                    (minute / 60) % 24,
+                    minute % 60,
+                )),
             ));
         }
         write_batch(fixture, "perf plays", sql).await;
@@ -3254,12 +3596,12 @@ fn percentile(sorted: &mut [f64], pct: f64) -> f64 {
 /// Acceptance: every standard read holds the 10 ms p95 budget on a seeded
 /// 100k catalog, 50 samples after 3 warmup per endpoint. Ignored by
 /// default: timing is machine-dependent, so CI guards the mechanisms
-/// (fixture pages, totals, and plan tests above) while this runs explicitly
-/// with --release on reference hardware, matching the HTTP bench
-/// shape (checkpointed store, optimized build). Debug runs only report
-/// timings: an unoptimized build adds milliseconds per call there.
+/// (fixture pages, totals, and plan tests above) while the weekly perf job
+/// runs this with --release, matching the HTTP bench shape (checkpointed
+/// store, optimized build). Debug runs only report timings: an unoptimized
+/// build adds milliseconds per call there.
 #[tokio::test]
-#[ignore = "100k acceptance timing; run explicitly with --release on reference hardware"]
+#[ignore = "100k acceptance timing; run explicitly with --release: cargo test --release -p droppedneedle-catalog --lib perf_100k_endpoints -- --ignored --nocapture"]
 async fn perf_100k_endpoints_hold_p95() {
     let fixture = seed_small().await;
     seed_100k(&fixture).await;
@@ -3345,6 +3687,13 @@ async fn perf_100k_endpoints_hold_p95() {
         "library_contributors_by_appearances",
         "library_artists_by_appearances",
         "library_artists_by_album_count",
+        "library_albums_formats",
+        "library_albums_in_a_format",
+        "library_albums_without_a_format",
+        "library_albums_min_tracks",
+        "library_artists_min_tracks",
+        "library_album_artists_min_tracks_by_album_count",
+        "library_contributors_min_tracks",
         "search_songs_hit",
         "search_songs_miss",
         "search_songs_short",
@@ -3357,10 +3706,14 @@ async fn perf_100k_endpoints_hold_p95() {
     // and a song search whose words are in every track ("perf", "artist")
     // reads the whole FTS index and ranks every track, as the player's
     // common-word search page does.
+    // A filter almost nothing passes walks the whole list for its page:
+    // every album's format, or every artist's tracks up to the minimum.
     let mut reported: Vec<(&str, Vec<f64>)> = [
         "library_tracks_random",
         "search_songs_common",
         "search_songs_deep_offset",
+        "library_albums_in_a_rare_format",
+        "library_artists_min_tracks_none_reach",
     ]
     .into_iter()
     .map(|name| (name, Vec::new()))
@@ -3377,21 +3730,48 @@ async fn perf_100k_endpoints_hold_p95() {
             samples.push(tick.elapsed().as_secs_f64() * 1000.0);
         }
     }
+    // Totals counted again on every read, as after a catalog write: timed
+    // after the warm reads, which they would otherwise leave cold.
+    let mut cold: Vec<(&str, Vec<f64>)> = [
+        "library_albums_formats_cold",
+        "library_albums_in_a_format_cold",
+        "library_albums_without_a_format_cold",
+        "library_albums_min_tracks_cold",
+        "library_artists_min_tracks_cold",
+        "library_album_artists_min_tracks_by_album_count_cold",
+        "library_contributors_min_tracks_cold",
+    ]
+    .into_iter()
+    .map(|name| (name, Vec::new()))
+    .collect();
+    for _ in 0..50 {
+        for (name, samples) in &mut cold {
+            let tick = std::time::Instant::now();
+            read_timed(&fixture.catalog, &search, name, &deep).await;
+            samples.push(tick.elapsed().as_secs_f64() * 1000.0);
+        }
+    }
     let mut report = Vec::new();
-    for (name, samples) in reported.iter_mut().chain(&mut endpoints) {
+    for (name, samples) in reported.iter_mut().chain(&mut endpoints).chain(&mut cold) {
         let p95 = percentile(samples, 95.0);
         let p50 = percentile(samples, 50.0);
         report.push(format!("{name}: p50 {p50:.2} ms, p95 {p95:.2} ms"));
     }
     eprintln!("100k catalog p95:\n{}", report.join("\n"));
-    for (name, samples) in &mut endpoints {
+    // A cold read is paid once per catalog revision, so it is held to the
+    // 100 ms budget of a whole page rather than the 10 ms of a warm read.
+    let budgets = endpoints
+        .iter_mut()
+        .map(|endpoint| (endpoint, 10.0))
+        .chain(cold.iter_mut().map(|endpoint| (endpoint, 100.0)));
+    for ((name, samples), budget) in budgets {
         let p95 = percentile(samples, 95.0);
         // The budget binds release runs; debug runs report only, since
         // an unoptimized build adds milliseconds per call there.
         if !cfg!(debug_assertions) {
             assert!(
-                p95 < 10.0,
-                "{name} p95 {p95:.2} ms exceeds the 10 ms budget:\n{}",
+                p95 < budget,
+                "{name} p95 {p95:.2} ms exceeds the {budget} ms budget:\n{}",
                 report.join("\n")
             );
         }
@@ -3429,6 +3809,15 @@ async fn read_timed(
 
 /// One read of a timed library endpoint.
 async fn read_endpoint(catalog: &LocalCatalog, name: &str, deep: &(After, After, After)) {
+    // A cold read counts its totals again, as the first read after a
+    // catalog write does.
+    let name = match name.strip_suffix("_cold") {
+        Some(warm) => {
+            catalog.forget_totals();
+            warm
+        }
+        None => name,
+    };
     let first = After::default();
     let random = After {
         seed: 42,
@@ -3525,6 +3914,90 @@ async fn read_endpoint(catalog: &LocalCatalog, name: &str, deep: &(After, After,
         "library_recently_added" => {
             catalog.recently_added(20).await.expect("recent");
         }
+        "library_albums_formats" => {
+            catalog.album_format_counts().await.expect("format counts");
+        }
+        "library_albums_in_a_format"
+        | "library_albums_without_a_format"
+        | "library_albums_in_a_rare_format"
+        | "library_albums_min_tracks" => {
+            // Every 100k album holds two tracks of each format and is
+            // filed under FLAC, the first by name; none is Opus.
+            let filter = match name {
+                "library_albums_in_a_format" => AlbumFilter {
+                    formats: vec!["flac".to_owned()],
+                    ..Default::default()
+                },
+                "library_albums_without_a_format" => AlbumFilter {
+                    formats: vec!["mp3".to_owned()],
+                    without_formats: true,
+                    ..Default::default()
+                },
+                "library_albums_in_a_rare_format" => AlbumFilter {
+                    formats: vec!["opus".to_owned()],
+                    ..Default::default()
+                },
+                _ => AlbumFilter {
+                    min_tracks: Some(5),
+                    ..Default::default()
+                },
+            };
+            catalog
+                .list_albums(&filter, AlbumSort::Name, false, 50, &first)
+                .await
+                .expect("lists");
+        }
+        "library_artists_min_tracks" | "library_artists_min_tracks_none_reach" => {
+            // A 100k artist holds 200 tracks.
+            let min = if name == "library_artists_min_tracks" {
+                5
+            } else {
+                201
+            };
+            catalog
+                .artist_list(
+                    ArtistScope::All,
+                    None,
+                    None,
+                    ArtistSort::Name,
+                    false,
+                    50,
+                    &first,
+                    Some(min),
+                )
+                .await
+                .expect("lists");
+        }
+        "library_album_artists_min_tracks_by_album_count" => {
+            catalog
+                .artist_list(
+                    ArtistScope::AlbumArtists,
+                    None,
+                    None,
+                    ArtistSort::AlbumCount,
+                    true,
+                    50,
+                    &first,
+                    Some(5),
+                )
+                .await
+                .expect("lists");
+        }
+        "library_contributors_min_tracks" => {
+            catalog
+                .artist_list(
+                    ArtistScope::Contributors,
+                    None,
+                    None,
+                    ArtistSort::Name,
+                    false,
+                    50,
+                    &first,
+                    Some(2),
+                )
+                .await
+                .expect("lists");
+        }
         "local_search_miss" => {
             catalog
                 .list_albums(&miss_albums, AlbumSort::Name, false, 20, &first)
@@ -3544,7 +4017,7 @@ async fn read_endpoint(catalog: &LocalCatalog, name: &str, deep: &(After, After,
 /// albums) hold the same 10 ms p95 budget on the seeded 100k catalog, and
 /// the common-word search page and the 1000-row search3 page 100 ms.
 #[tokio::test]
-#[ignore = "100k acceptance timing; run explicitly with --release on reference hardware"]
+#[ignore = "100k acceptance timing; run explicitly with --release: cargo test --release -p droppedneedle-catalog --lib perf_100k_player -- --ignored --nocapture"]
 async fn perf_100k_player_pages_hold_p95() {
     use local::player::{AlbumOrder, AlbumQuery, OrderKey, TrackOrder, TrackQuery};
 

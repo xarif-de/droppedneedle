@@ -1,9 +1,323 @@
-//! The identity commands' statements, and the two sets of decision
-//! sources every other statement takes from here.
+//! The identity commands' statements, the two sets of decision sources
+//! every other statement takes from here, and what owning a release group
+//! means.
+
+// `sql!` joins one token per part, so a part built by a definition macro
+// is written in parentheses.
+#![allow(unused_parens, clippy::double_parens)]
 
 use droppedneedle_kernel::db::time::Millis;
 
 use super::DecisionSource;
+
+// What it means for the library to own a release group, once, for the
+// catalog and acquisition alike.
+//
+// An album owns a group when it is live with an indexed file and
+//
+// - it has a match row on the group, unless that row is a guess flagged
+//   `NAMED_GROUP_DIFFERS`: any other flag, a custom edition or a row with
+//   no release still counts; or
+// - it holds such a guess, or has no row and no flag at all, and its files
+//   name the group with no file naming another. A value that is not one
+//   well-formed MBID names nothing.
+//
+// So a match taken off, withdrawn or undone, or a finished identification
+// that found nothing, leaves a flag and tags never bring the album back.
+//
+// Each definition is a macro that expands to a string literal, so it fits
+// in `concat!` and in the `sql!` blocks of the crates above this one.
+
+/// The shape of a lowered MBID, for `GLOB`.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! mbid_shape {
+    () => {
+        "[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-\
+         [0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-\
+         [0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]\
+         [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]"
+    };
+}
+
+/// The decision sources that are a person's choice, for `IN`.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! persons_choice {
+    () => {
+        "('manual','legacy_import')"
+    };
+}
+
+/// A track's recording id as pages, players and lookups read it: its match
+/// row's, else the id in the file's own tags, over a track identity alias
+/// and a track alias. A row of any source counts, a guess's included, so
+/// the id is shown, sent and used to find a file, and never stored as
+/// identity or used to identify or own anything.
+#[macro_export]
+macro_rules! recording_mbid {
+    ($identity:literal, $track:literal) => {
+        concat!(
+            "COALESCE(",
+            $identity,
+            ".recording_mbid, ",
+            $track,
+            ".embedded_recording_mbid)"
+        )
+    };
+}
+
+/// The album, a column holding its id, carries a match flag of any state.
+#[macro_export]
+macro_rules! match_flagged {
+    ($album_id:literal) => {
+        concat!(
+            "EXISTS (SELECT 1 FROM library_album_match_state mfs WHERE mfs.local_album_id = ",
+            $album_id,
+            ")"
+        )
+    };
+}
+
+/// The album, a column holding its id, carries a match flag in `$state`:
+/// `unconfirmed` (a best guess) or `unmatched` (nothing fits).
+#[macro_export]
+macro_rules! match_flag_state {
+    ($album_id:literal, $state:literal) => {
+        concat!(
+            "EXISTS (SELECT 1 FROM library_album_match_state mfst WHERE mfst.local_album_id = ",
+            $album_id,
+            " AND mfst.state = '",
+            $state,
+            "')"
+        )
+    };
+}
+
+/// Live albums holding a guess their files' tags contradict on a release
+/// group: `album_id`, `title` and the lowered `group_mbid`. Owning nothing
+/// through the guess, such an album settles no want for the group, though
+/// the person may have it. `$test` finishes the comparison of the lowered
+/// group, as in [`owns_group!`].
+#[macro_export]
+macro_rules! doubted_guesses {
+    ($test:literal) => {
+        concat!(
+            "SELECT dge.local_album_id AS album_id, dgb.title AS title, \
+             lower(dge.release_group_mbid) AS group_mbid \
+             FROM local_album_external_identities dge \
+             JOIN local_albums dgb ON dgb.id = dge.local_album_id \
+             WHERE lower(dge.release_group_mbid) ",
+            $test,
+            " AND dge.provider = 'musicbrainz' \
+             AND EXISTS (SELECT 1 FROM library_album_match_state dgs \
+             WHERE dgs.local_album_id = dge.local_album_id \
+             AND dgs.reason_code = 'NAMED_GROUP_DIFFERS') \
+             AND +dgb.retired_into_album_id IS NULL AND +dgb.has_indexed_track = 1"
+        )
+    };
+}
+
+/// The album, a column holding its id, holds a guess its files' tags
+/// contradict (flagged `NAMED_GROUP_DIFFERS`): its row names no copy of the
+/// group it guessed.
+#[macro_export]
+macro_rules! named_group_guess {
+    ($album_id:literal) => {
+        concat!(
+            "EXISTS (SELECT 1 FROM library_album_match_state ngg WHERE ngg.local_album_id = ",
+            $album_id,
+            " AND ngg.reason_code = 'NAMED_GROUP_DIFFERS')"
+        )
+    };
+}
+
+/// An album's match is accepted, over an album identity alias: it names a
+/// release, the album carries no match flag, and no custom edition is
+/// active on it. Any decision source counts. Proof, merges and retag joins
+/// read this tier; pages, playback and compat need only a row.
+macro_rules! accepted {
+    ($identity:literal) => {
+        concat!(
+            "trim(COALESCE(",
+            $identity,
+            ".release_mbid, '')) <> '' \
+             AND NOT EXISTS (SELECT 1 FROM library_album_match_state acs \
+             WHERE acs.local_album_id = ",
+            $identity,
+            ".local_album_id) \
+             AND NOT EXISTS (SELECT 1 FROM library_custom_edition_active acc \
+             WHERE acc.local_album_id = ",
+            $identity,
+            ".local_album_id)"
+        )
+    };
+}
+pub(crate) use accepted;
+
+/// An album identification has not reached yet, over an album alias: no
+/// match row and no flag row of any state. Only then may a file's own tags
+/// stand in for the album's identity.
+#[macro_export]
+macro_rules! not_yet_identified {
+    ($album:literal) => {
+        concat!(
+            "NOT EXISTS (SELECT 1 FROM local_album_external_identities nyi_e \
+             WHERE nyi_e.local_album_id = ",
+            $album,
+            ".id AND nyi_e.provider = 'musicbrainz') \
+             AND NOT EXISTS (SELECT 1 FROM library_album_match_state nyi_s \
+             WHERE nyi_s.local_album_id = ",
+            $album,
+            ".id)"
+        )
+    };
+}
+
+/// Another indexed file of the track's album names another group, over a
+/// track alias.
+#[macro_export]
+macro_rules! names_another_group {
+    ($track:literal) => {
+        concat!(
+            "EXISTS (SELECT 1 FROM local_tracks oga WHERE oga.local_album_id = ",
+            $track,
+            ".local_album_id AND +oga.availability = 'indexed' \
+             AND lower(trim(oga.embedded_release_group_mbid)) GLOB '",
+            $crate::mbid_shape!(),
+            "' AND lower(trim(oga.embedded_release_group_mbid)) <> lower(trim(",
+            $track,
+            ".embedded_release_group_mbid)))"
+        )
+    };
+}
+
+/// The albums that own a group: `album_id` and the lowered `group_mbid`,
+/// one row per album and group. `$test` finishes the comparison of a lowered
+/// group: `= ?1`, or `= +column` correlated (the plus drops the column's
+/// affinity, which would keep the planner off the index), is a keyed probe
+/// through the two lowered indexes, and `IN (SELECT g FROM asked)` a list.
+/// The whole set is [`all_owners!`].
+#[macro_export]
+macro_rules! owns_group {
+    ($test:literal) => {
+        concat!(
+            "SELECT oge.local_album_id AS album_id, lower(oge.release_group_mbid) AS group_mbid \
+             FROM local_album_external_identities oge \
+             JOIN local_albums ogb ON ogb.id = oge.local_album_id \
+             WHERE lower(oge.release_group_mbid) ",
+            $test,
+            " AND oge.provider = 'musicbrainz' \
+             AND +ogb.retired_into_album_id IS NULL AND +ogb.has_indexed_track = 1 \
+             AND NOT EXISTS (SELECT 1 FROM library_album_match_state ogn \
+             WHERE ogn.local_album_id = oge.local_album_id \
+             AND ogn.reason_code = 'NAMED_GROUP_DIFFERS') \
+             UNION SELECT ogt.local_album_id, lower(ogt.embedded_release_group_mbid) \
+             FROM local_tracks ogt JOIN local_albums ogb ON ogb.id = ogt.local_album_id \
+             WHERE ogt.embedded_release_group_mbid IS NOT NULL \
+             AND lower(ogt.embedded_release_group_mbid) ",
+            $test,
+            " AND +ogt.availability = 'indexed' \
+             AND +ogb.retired_into_album_id IS NULL \
+             AND lower(trim(ogt.embedded_release_group_mbid)) GLOB '",
+            $crate::mbid_shape!(),
+            "' AND (EXISTS (SELECT 1 FROM library_album_match_state ogn \
+             WHERE ogn.local_album_id = ogt.local_album_id \
+             AND ogn.reason_code = 'NAMED_GROUP_DIFFERS') OR (",
+            $crate::not_yet_identified!("ogb"),
+            ")) AND NOT ",
+            $crate::names_another_group!("ogt")
+        )
+    };
+}
+
+/// The albums a lookup by release group may open, over the same finish of
+/// the comparison as [`owns_group!`]: every live or file-less copy with a
+/// row on the group, unless it is a guess flagged `NAMED_GROUP_DIFFERS`,
+/// and every album that owns the group.
+#[macro_export]
+macro_rules! group_copies {
+    ($test:literal) => {
+        concat!(
+            "SELECT gce.local_album_id FROM local_album_external_identities gce \
+             WHERE lower(gce.release_group_mbid) ",
+            $test,
+            " AND gce.provider = 'musicbrainz' \
+             AND NOT EXISTS (SELECT 1 FROM library_album_match_state gcn \
+             WHERE gcn.local_album_id = gce.local_album_id \
+             AND gcn.reason_code = 'NAMED_GROUP_DIFFERS') \
+             UNION SELECT album_id FROM (",
+            $crate::owns_group!($test),
+            ")"
+        )
+    };
+}
+
+/// The one album a lookup by release group opens, of [`group_copies!`]:
+/// live, a copy with files first, then one a person chose, then the
+/// oldest. The catalog pages, playback, downloads and removals read it, so
+/// each opens the album the others say is in the library.
+#[macro_export]
+macro_rules! copy_of_group {
+    ($test:literal) => {
+        concat!(
+            "SELECT gcb.id FROM local_albums gcb \
+             LEFT JOIN local_album_external_identities gco ON gco.local_album_id = gcb.id \
+             AND gco.provider = 'musicbrainz' AND lower(gco.release_group_mbid) ",
+            $test,
+            " WHERE gcb.id IN (",
+            $crate::group_copies!($test),
+            ") AND +gcb.retired_into_album_id IS NULL \
+             ORDER BY gcb.has_indexed_track DESC, \
+             COALESCE(gco.decision_source, '') NOT IN ",
+            $crate::persons_choice!(),
+            ", gcb.created_at, gcb.id LIMIT 1"
+        )
+    };
+}
+
+/// Every album that owns a group, with the group: [`owns_group!`]'s rule
+/// read album by album, so the whole set costs one pass over the tagged
+/// files. Only whole-library reads use it; the pair test holds the two to
+/// one answer.
+#[macro_export]
+macro_rules! all_owners {
+    () => {
+        concat!(
+            "SELECT oae.local_album_id AS album_id, lower(oae.release_group_mbid) AS group_mbid \
+             FROM local_album_external_identities oae \
+             JOIN local_albums oab ON oab.id = oae.local_album_id \
+             WHERE oae.provider = 'musicbrainz' \
+             AND +oab.retired_into_album_id IS NULL AND +oab.has_indexed_track = 1 \
+             AND NOT EXISTS (SELECT 1 FROM library_album_match_state oan \
+             WHERE oan.local_album_id = oae.local_album_id \
+             AND oan.reason_code = 'NAMED_GROUP_DIFFERS') \
+             UNION ALL SELECT oat.local_album_id, min(lower(oat.embedded_release_group_mbid)) \
+             FROM local_tracks oat JOIN local_albums oab ON oab.id = oat.local_album_id \
+             WHERE oat.embedded_release_group_mbid IS NOT NULL \
+             AND +oat.availability = 'indexed' AND +oab.retired_into_album_id IS NULL \
+             AND lower(trim(oat.embedded_release_group_mbid)) GLOB '",
+            $crate::mbid_shape!(),
+            "' GROUP BY oat.local_album_id \
+             HAVING min(lower(trim(oat.embedded_release_group_mbid))) \
+             = max(lower(trim(oat.embedded_release_group_mbid))) \
+             AND (EXISTS (SELECT 1 FROM library_album_match_state oan \
+             WHERE oan.local_album_id = oat.local_album_id \
+             AND oan.reason_code = 'NAMED_GROUP_DIFFERS') OR (",
+            $crate::not_yet_identified!("oab"),
+            "))"
+        )
+    };
+}
+
+/// The `asked(g)` table an [`owns_group!`] list form reads,
+/// one bound lowered group per row, ready to go before its `SELECT`.
+pub fn asked_groups(len: droppedneedle_kernel::db::statement::ListLen) -> String {
+    format!(
+        "WITH asked(g) AS (VALUES {}) ",
+        vec!["(?)"; len.get()].join(",")
+    )
+}
 
 droppedneedle_kernel::sql! {
     /// Decision sources automatic work may replace: identification's own
@@ -13,7 +327,7 @@ droppedneedle_kernel::sql! {
     /// Decision sources that are a person's choice, made now or carried
     /// over from v2. Checked against
     /// [`DecisionSource::is_persons_choice`](super::DecisionSource::is_persons_choice).
-    pub(crate) fragment PERSONS = "('manual','legacy_import')";
+    pub(crate) fragment PERSONS = (persons_choice!());
     /// The track table, read through its album index. With no planner
     /// statistics (before the first ANALYZE) the list-order index led by
     /// `availability` looks as good, and would walk every indexed track.
@@ -219,19 +533,26 @@ droppedneedle_kernel::sql! {
              consumed_at = NULL, consumed_action_id = NULL";
 
     /// The copy of one release group (`?1`, lowercase; provider `?2`) the
-    /// library shows and acquisition follows: a copy with files first, then
-    /// one picked by hand (`manual`), then the oldest, over live albums. Its
-    /// release may be NULL. The unary plus keeps the planner off the
-    /// retired-album index, as the catalog's album reads do.
-    pub(super) COPY_SHOWN = "SELECT e.local_album_id, e.release_mbid, e.decision_source, \
+    /// library shows and acquisition follows, the one album
+    /// [`copy_of_group!`] opens, with its row on the group. An album owned
+    /// through its files' tags holds no such row: its release and source
+    /// read NULL, and no other copy's release stands in.
+    pub(super) COPY_SHOWN = "SELECT b.id AS local_album_id, e.release_mbid, e.decision_source, \
              (SELECT COUNT(*) FROM local_tracks t WHERE t.local_album_id = b.id \
               AND t.availability = 'indexed') AS file_count \
-             FROM local_album_external_identities e \
-             JOIN local_albums b ON b.id = e.local_album_id \
-             WHERE lower(e.release_group_mbid) = ?1 AND e.provider = ?2 \
-             AND +b.retired_into_album_id IS NULL \
-             ORDER BY b.has_indexed_track DESC, e.decision_source <> 'manual', b.created_at, \
-             b.id LIMIT 1";
+             FROM local_albums b LEFT JOIN local_album_external_identities e \
+             ON e.local_album_id = b.id AND e.provider = ?2 \
+             AND lower(e.release_group_mbid) = ?1 AND NOT " + (named_group_guess!("b.id")) + " \
+             WHERE b.id = (" + (copy_of_group!("= ?1")) + ")";
+    /// Whether any album owns release group `?1` (lowered).
+    pub(super) GROUP_OWNED = "SELECT EXISTS (" + (owns_group!("= ?1")) + ")";
+    /// Whether the album (`?1`) carries a flag a landing must keep: a
+    /// person's detach, an undone automatic edition, or a guess the files
+    /// contradict.
+    pub(super) FLAG_A_LANDING_KEEPS = "SELECT EXISTS (SELECT 1 FROM library_album_match_state \
+             WHERE local_album_id = ?1 \
+             AND reason_code IN ('NAMED_GROUP_DIFFERS', 'DETACHED_BY_PERSON', \
+             'AUTOMATIC_EDITION_UNDONE'))";
 
     // -----------------------------------------------------------------
     // Reads.
@@ -564,6 +885,11 @@ droppedneedle_kernel::sql! {
              ON CONFLICT (local_album_id) DO UPDATE SET state = 'unmatched', \
              reason_code = excluded.reason_code, release_mbid = NULL, candidates_json = '[]', \
              updated_at = excluded.updated_at";
+    /// Mark the album (`?1`) unmatched with reason `?2`, at `?3`, unless it
+    /// carries a flag already.
+    pub(super) MARK_UNMATCHED_UNLESS_FLAGGED = "INSERT INTO library_album_match_state \
+             (local_album_id, state, reason_code, release_mbid, candidates_json, updated_at) \
+             VALUES (?1, 'unmatched', ?2, NULL, '[]', ?3) ON CONFLICT (local_album_id) DO NOTHING";
     /// Clear the album's (`?1`) match flag when its reason is `?2`.
     pub(super) CLEAR_FLAG_WITH_REASON = "DELETE FROM library_album_match_state \
              WHERE local_album_id = ?1 AND reason_code = ?2";
@@ -685,6 +1011,12 @@ droppedneedle_kernel::sql! {
              ON CONFLICT (local_album_id) DO UPDATE SET state = excluded.state, \
              reason_code = excluded.reason_code, release_mbid = excluded.release_mbid, \
              updated_at = excluded.updated_at";
+    /// Flag the album (`?1`) unmatched with reason `?2` on release `?3`, at
+    /// `?4`, unless it carries a flag already.
+    pub(super) FLAG_UNPLACEABLE = "INSERT INTO library_album_match_state (local_album_id, \
+             state, reason_code, release_mbid, candidates_json, updated_at) \
+             VALUES (?1, 'unmatched', ?2, ?3, '[]', ?4) \
+             ON CONFLICT (local_album_id) DO NOTHING";
     pub(super) QUEUE_REMAP = "INSERT INTO library_edition_remap_queue (local_album_id, \
              release_mbid, chosen_by_user_id, queued_at, origin) \
              VALUES (?1, lower(?2), (SELECT id FROM auth_users WHERE id = ?3), ?4, ?5) \
@@ -941,7 +1273,7 @@ droppedneedle_kernel::sql! {
     pub(super) row CopyRow for [COPY_SHOWN] {
         local_album_id: String,
         release_mbid: Option<String>,
-        decision_source: DecisionSource,
+        decision_source: Option<DecisionSource>,
         file_count: i64,
     }
     pub(super) row CustomAlbumFacts for [CUSTOM_ALBUM_FACTS] {

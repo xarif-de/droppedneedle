@@ -600,8 +600,8 @@ async fn wrong_key_health_message_is_uniform_and_leaks_nothing() {
 fn recipe_ranking_prefers_flac_then_320_with_dsd_rejected() {
     let policy = DownloadPolicy::default();
 
-    // With no saved recipe the band's tiers rank, best first: FLAC
-    // (bitrate unknown, not a fidelity axis) outranks 320 MP3.
+    // The default recipe ranks FLAC (bitrate unknown, not a fidelity axis)
+    // above 320 MP3.
     let flac = policy.recipe_rank("flac", None, Some(16), Some(44100));
     let mp3 = policy.recipe_rank("mp3", Some(320), None, None);
     let low_mp3 = policy.recipe_rank("mp3", Some(128), None, None);
@@ -1005,7 +1005,6 @@ fn one_tier_policy(tier: &str, format: RecipeFormat, quality: RecipeQuality) -> 
         quality_min: tier.to_owned(),
         quality_max: tier.to_owned(),
         quality_cutoff: tier.to_owned(),
-        flac_mp3_only: true,
         quality_recipe: vec![QualityRecipeEntry {
             format,
             quality,

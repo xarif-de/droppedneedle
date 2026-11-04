@@ -32,7 +32,7 @@ use droppedneedle_acquire::held::store::{
 use droppedneedle_acquire::reason::Reason;
 use droppedneedle_acquire::requests::ledger::{RequestStatus, WantedWatch, WatchKind, WatchState};
 use droppedneedle_acquire::requests::models::RequestKind;
-use droppedneedle_acquire::search_jobs::store::{COMPLETED, JobPayload, JobStore, NewJob};
+use droppedneedle_acquire::search_jobs::store::{JobPayload, JobStatus, JobStore, NewJob};
 use serde_json::{Value, json};
 use utoipa::OpenApi as _;
 
@@ -544,6 +544,7 @@ const CALLER_KEYED_OPERATIONS: &[(&str, &str)] = &[
         "DELETE",
         "/api/v3/discover/queue/ignored/{release_group_mbid}",
     ),
+    ("PUT", "/api/v3/library/albums/{album_id}/looks-wrong"),
 ];
 
 /// Operations that take a user-owned id in the body, each driven by
@@ -650,6 +651,11 @@ const EXACT_EXEMPTIONS: &[(&str, &str, &str)] = &[
         SHARED_ALBUM,
     ),
     (
+        "DELETE",
+        "/api/v3/library/albums/{album_id}/looks-wrong",
+        SHARED_ALBUM,
+    ),
+    (
         "POST",
         "/api/v3/library/albums/{album_id}/edition/extras/remove",
         SHARED_ALBUM,
@@ -751,6 +757,7 @@ const EXACT_EXEMPTIONS: &[(&str, &str, &str)] = &[
         SHARED_REVIEW,
     ),
     ("POST", "/api/v3/library/reviews/{id}/detach", SHARED_REVIEW),
+    ("POST", "/api/v3/library/reviews/{id}/reopen", SHARED_REVIEW),
     (
         "POST",
         "/api/v3/library/reviews/{id}/dismiss",
@@ -1162,6 +1169,7 @@ async fn seed(app: &TestApp, kind: Owned, owner: &Who, n: u32) -> Ids {
                     quiet_streak: 0,
                     next_check_at: u64::MAX / 2,
                     new_candidate_count: 1,
+                    last_outcome: None,
                 })
                 .await
                 .expect("watch enrols");
@@ -1253,7 +1261,7 @@ async fn seed(app: &TestApp, kind: Owned, owner: &Who, n: u32) -> Ids {
             .await
             .expect("job seeds");
             assert!(
-                jobs.finish(&job_id, COMPLETED, JobPayload::default(), None)
+                jobs.finish(&job_id, JobStatus::Completed, JobPayload::default(), None)
                     .await
                     .expect("job finishes")
             );
@@ -1662,6 +1670,34 @@ async fn caller_keyed_state_stays_with_its_caller() {
         body["albums"]["own-album"],
         json!(4),
         "B's write took A's rating: {body}"
+    );
+
+    // "Looks wrong" marks: each is its own person's, and the count is
+    // everyone's.
+    let mark = "/api/v3/library/albums/own-album/looks-wrong";
+    let edition = "/api/v3/library/albums/own-album/edition";
+    let (status, body) = call(&app, &ada, "PUT", mark, Some(json!({"looks_wrong": true}))).await;
+    ok(status, &body, "A marks the album");
+    let (status, body) = call(&app, &bob, "GET", edition, None).await;
+    ok(status, &body, "B reads the edition");
+    assert_eq!(
+        (
+            body["looks_wrong"].clone(),
+            body["looks_wrong_count"].clone()
+        ),
+        (json!(false), json!(1)),
+        "B sees A's mark as B's own: {body}"
+    );
+    let (status, body) = call(&app, &bob, "PUT", mark, Some(json!({"looks_wrong": false}))).await;
+    ok(status, &body, "B takes back a mark B never made");
+    let (_, body) = call(&app, &ada, "GET", edition, None).await;
+    assert_eq!(
+        (
+            body["looks_wrong"].clone(),
+            body["looks_wrong_count"].clone()
+        ),
+        (json!(true), json!(1)),
+        "B's write took A's mark: {body}"
     );
 
     // Follows and auto-download.

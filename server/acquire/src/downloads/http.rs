@@ -177,6 +177,16 @@ pub struct DownloadTaskResponse {
     pub reason: Option<DownloadTaskReason>,
     /// The import's decision on the newest landing.
     pub decision: Option<ImportDecisionView>,
+    /// A library album whose edition is a guess of this album, though its
+    /// files name another: "You may have this".
+    pub maybe_have: Option<MaybeHaveView>,
+}
+
+/// A library album that may already be the one a download hunts for.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct MaybeHaveView {
+    pub album_id: String,
+    pub title: String,
 }
 
 impl From<TaskView> for DownloadTaskResponse {
@@ -251,7 +261,7 @@ impl From<TaskView> for DownloadTaskResponse {
                 view
             }),
             decision: facts.decision.map(|decision| ImportDecisionView {
-                outcome: decision.outcome,
+                outcome: decision.outcome.as_str().to_owned(),
                 reason_code: decision.reason_code,
                 reason_text: decision
                     .reason_code
@@ -265,6 +275,9 @@ impl From<TaskView> for DownloadTaskResponse {
                 files_held: decision.files_held,
                 decided_at: decision.decided_at,
             }),
+            maybe_have: facts
+                .doubted_guess
+                .map(|(album_id, title)| MaybeHaveView { album_id, title }),
         }
     }
 }
@@ -1111,7 +1124,7 @@ impl From<JobView> for SearchJobResponse {
             .collect();
         Self {
             job_id: view.row.id,
-            status: view.row.status,
+            status: view.row.status.as_str().to_owned(),
             artist_name: view.row.artist_name,
             album_title: view.row.album_title,
             year: view.row.year,

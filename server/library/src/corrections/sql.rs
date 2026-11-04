@@ -7,6 +7,7 @@ use droppedneedle_kernel::db::statement::ListLen;
 use droppedneedle_kernel::db::time::Millis;
 
 use crate::identify::sql::CURRENT_PROOF;
+use crate::identity::sql::accepted;
 use crate::jobs::sql::live_job;
 use crate::publish::sql::HAS_BYTES_RECORD;
 use crate::scan::sqlite_store::sql::holds;
@@ -36,16 +37,16 @@ droppedneedle_kernel::sql! {
              JOIN local_artists a ON a.id = c.artist AND a.retired_into_artist_id IS NULL \
              GROUP BY c.mbid HAVING COUNT(*) > 1 ORDER BY c.mbid";
     pub(super) FOLLOW_MOVED = "INSERT OR IGNORE INTO local_artist_merge_candidates (id, left_artist_id, \
-                     right_artist_id, reason_code, created_at, updated_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?5)";
+                     right_artist_id, reason_code, state, created_at, updated_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?6, ?5, ?5)";
     pub(super) ANY_WAITING = "SELECT EXISTS (SELECT 1 FROM local_artist_merge_candidates \
          WHERE reason_code = ?1 AND state = 'open')";
     pub(super) FOLLOW_WAITING = "SELECT id, left_artist_id, right_artist_id FROM local_artist_merge_candidates \
              WHERE reason_code = ?1 AND state = 'open' ORDER BY id";
     pub(super) BUMP_ARTIST_REVISION = "UPDATE local_artists SET updated_at = ?2, row_revision = row_revision + 1 WHERE id = ?1";
     pub(super) RECORD_MOVE = "INSERT OR IGNORE INTO local_artist_merge_candidates (id, left_artist_id, \
-         right_artist_id, reason_code, created_at, updated_at) \
-         SELECT ?1, ?2, ?3, ?4, ?5, ?5 WHERE NOT EXISTS (SELECT 1 FROM local_artists \
+         right_artist_id, reason_code, state, created_at, updated_at) \
+         SELECT ?1, ?2, ?3, ?4, ?6, ?5, ?5 WHERE NOT EXISTS (SELECT 1 FROM local_artists \
           WHERE id IN (?2, ?3) AND kind = 'various_artists')";
     pub(super) FOLLOW_RENAMED = "SELECT DISTINCT m.left_artist_id FROM local_artist_merge_candidates m \
              WHERE m.reason_code IN (?1, ?2) AND m.state = 'open' \
@@ -66,7 +67,7 @@ droppedneedle_kernel::sql! {
          WHERE local_artist_id = ?1 AND provider = 'musicbrainz'";
     pub(super) REPOINT_MERGE_CANDIDATES = "UPDATE OR IGNORE local_artist_merge_candidates SET right_artist_id = ?2, \
          updated_at = ?3, row_revision = row_revision + 1 \
-         WHERE reason_code IN (?4, ?5, ?6) AND state = 'open' AND right_artist_id = ?1 \
+         WHERE reason_code IN (?4, ?5, ?6) AND state = ?7 AND right_artist_id = ?1 \
          AND left_artist_id <> ?2";
     pub(super) REPOINT_ALBUM_CREDITS = "UPDATE local_album_artists SET local_artist_id = ?2, row_revision = row_revision + 1 \
          WHERE local_artist_id = ?1";
@@ -86,13 +87,9 @@ droppedneedle_kernel::sql! {
     pub(super) DROP_LIVE_TRACK_ALIASES = "DELETE FROM local_track_aliases WHERE EXISTS (SELECT 1 FROM local_tracks t \
          WHERE t.id = local_track_aliases.alias AND t.availability = 'indexed')";
     pub(super) TRACK_ALIAS_TARGET = "SELECT local_track_id, moves_overrides FROM local_track_aliases WHERE alias = ?1";
+    /// The album's (`?1`) release, lowered, while its match is accepted.
     pub(super) ACCEPTED_RELEASE = "SELECT lower(trim(e.release_mbid)) FROM local_album_external_identities e \
-         WHERE e.local_album_id = ?1 AND e.provider = 'musicbrainz' \
-         AND trim(COALESCE(e.release_mbid, '')) <> '' \
-         AND NOT EXISTS (SELECT 1 FROM library_album_match_state s \
-           WHERE s.local_album_id = e.local_album_id) \
-         AND NOT EXISTS (SELECT 1 FROM library_custom_edition_active c \
-           WHERE c.local_album_id = e.local_album_id)";
+         WHERE e.local_album_id = ?1 AND e.provider = 'musicbrainz' AND " + (accepted!("e"));
     pub(super) PAIRS_AMONG = "SELECT t.id, t.local_album_id, t.availability, lower(trim(i.release_track_mbid)), \
          lower(NULLIF(trim(i.release_mbid), '')), \
          (SELECT x.local_track_id FROM local_track_aliases x WHERE x.alias = t.id) \
@@ -174,7 +171,7 @@ droppedneedle_kernel::sql! {
     pub(super) DROP_OPEN_RETAG_PAIRS = "DELETE FROM library_retag_pairs WHERE old_album_id = ?1 AND state = 'open'";
     pub(super) REPOINT_ALBUM_ALIASES = "UPDATE local_album_aliases SET local_album_id = ?2 WHERE local_album_id = ?1";
     pub(super) ADD_MERGED_ALBUM_ALIAS = "INSERT OR IGNORE INTO local_album_aliases (alias, local_album_id, kind, created_at) \
-         VALUES (?1, ?2, 'merged_album', ?3)";
+         VALUES (?1, ?2, ?4, ?3)";
     pub(super) DROP_ALBUM_TAKEOVER = "DELETE FROM library_album_takeovers WHERE local_album_id = ?1";
     pub(super) COPY_EXCLUSION = "INSERT OR IGNORE INTO library_management_exclusions (local_album_id, reason, \
          excluded_by_user_id, excluded_at) SELECT ?2, reason, excluded_by_user_id, excluded_at \
@@ -480,7 +477,7 @@ droppedneedle_kernel::sql! {
     WHERE o.availability = 'missing' \
     AND o.missing_at >= (SELECT MIN(started_at) FROM library_scan_runs) \
     AND (?1 IS NULL OR a.id = ?1) AND (?2 IS NULL OR b.id = ?2) \
-    AND trim(COALESCE(ae.release_mbid, '')) <> '' \
+    AND " + (accepted!("ae")) + " AND " + (accepted!("be")) + " \
     AND EXISTS (SELECT 1 FROM local_track_external_identities oi \
       WHERE oi.local_track_id = o.id AND oi.provider = 'musicbrainz' \
       AND trim(COALESCE(oi.release_track_mbid, '')) <> '') \
@@ -488,10 +485,6 @@ droppedneedle_kernel::sql! {
       WHERE t.local_album_id = a.id AND t.availability = 'indexed') \
     AND EXISTS (SELECT 1 FROM local_tracks t \
       WHERE t.local_album_id = b.id AND t.availability = 'indexed') \
-    AND NOT EXISTS (SELECT 1 FROM library_album_match_state s \
-      WHERE s.local_album_id IN (a.id, b.id)) \
-    AND NOT EXISTS (SELECT 1 FROM library_custom_edition_active c \
-      WHERE c.local_album_id IN (a.id, b.id)) \
     ORDER BY a.id, b.id";
     /// Open pairs with a reason a person decides on, both albums live, the
     /// new album standing for the album it was merged into since, and with
@@ -591,16 +584,16 @@ droppedneedle_kernel::sql! {
          updated_at = CAST(round(?3 * 1000) AS INTEGER), row_revision = row_revision + 1 WHERE id = ?1";
     pub(super) REPOINT_ARTIST_ALIASES = "UPDATE local_artist_aliases SET local_artist_id = ?2 WHERE local_artist_id = ?1";
     pub(super) ALIAS_RETIRED_ARTIST = "INSERT OR IGNORE INTO local_artist_aliases (alias, local_artist_id, kind, created_at) \
-         VALUES (?1, ?2, 'merged_artist', CAST(round(?3 * 1000) AS INTEGER))";
+         VALUES (?1, ?2, ?4, CAST(round(?3 * 1000) AS INTEGER))";
     pub(super) REPOINT_CREDIT_PROOFS = "UPDATE library_artist_credit_proofs SET \
          local_artist_id = CASE WHEN local_artist_id = ?1 THEN ?2 ELSE local_artist_id END, \
          source_local_artist_id = CASE WHEN source_local_artist_id = ?1 THEN ?2 \
          ELSE source_local_artist_id END, updated_at = CAST(?3 * 1000 AS INTEGER), \
          row_revision = row_revision + 1 \
          WHERE local_artist_id = ?1 OR source_local_artist_id = ?1";
-    pub(super) RESOLVE_MERGE_CANDIDATES = "UPDATE local_artist_merge_candidates SET state = 'resolved', \
-             updated_at = CAST(round(?3 * 1000) AS INTEGER), \
-         row_revision = row_revision + 1 WHERE state = 'open' \
+    pub(super) RESOLVE_MERGE_CANDIDATES = "UPDATE local_artist_merge_candidates SET state = ?3, \
+             updated_at = CAST(round(?2 * 1000) AS INTEGER), \
+         row_revision = row_revision + 1 WHERE state = ?4 \
          AND (left_artist_id = ?1 OR right_artist_id = ?1)";
     /// The row artist `?1` was merged into, when it was.
     pub(super) ARTIST_RETIRED_INTO = "SELECT retired_into_artist_id FROM local_artists WHERE id = ?1";
@@ -611,7 +604,7 @@ droppedneedle_kernel::sql! {
     /// Make the rows merged into `?1` before it open `?2`: an artist id
     /// follows `retired_into_artist_id` one hop at most.
     pub(super) ALIAS_ROWS_MERGED_INTO = "INSERT OR IGNORE INTO local_artist_aliases (alias, local_artist_id, kind, created_at) \
-         SELECT lower(id), ?2, 'merged_artist', CAST(round(?3 * 1000) AS INTEGER) \
+         SELECT lower(id), ?2, ?4, CAST(round(?3 * 1000) AS INTEGER) \
          FROM local_artists WHERE retired_into_artist_id = ?1";
     /// Credits of retired artist `?1` under exactly the name `?3`, or no
     /// name of their own, with no id: these move to `?2`.

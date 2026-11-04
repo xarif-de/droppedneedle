@@ -652,7 +652,7 @@ describe('track failure reporting', () => {
 		});
 	}
 
-	it('retries the same track once before advancing', async () => {
+	it('retries the same track once, silently, before advancing', async () => {
 		playerStore.playQueue(singleSourceItems(2));
 		await vi.advanceTimersByTimeAsync(0);
 
@@ -661,19 +661,54 @@ describe('track failure reporting', () => {
 
 		// Retry reloads the same track instead of skipping onward.
 		expect(playerStore.currentIndex).toBe(0);
-		expect(toastStore.notify).toHaveBeenLastCalledWith(
-			'"Track 1" failed on local (stream failed), retrying...',
-			'warning'
-		);
+		expect(toastStore.notify).not.toHaveBeenCalled();
 
 		fireCurrentTrackError();
 		await vi.advanceTimersByTimeAsync(2100);
 
 		expect(playerStore.currentIndex).toBe(1);
-		expect(toastStore.notify).toHaveBeenLastCalledWith(
-			'"Track 1" failed on local (stream failed), skipping...',
-			'warning'
-		);
+		expect(toastStore.notify).toHaveBeenCalledTimes(1);
+		expect(toastStore.notify).toHaveBeenCalledWith('Skipped "Track 1": can\'t play it', 'warning');
+	});
+
+	function playFor(seconds: number): void {
+		for (let t = 1; t <= seconds; t++) {
+			capturedProgressCallbacks.forEach((cb) => cb(t, 600));
+		}
+	}
+
+	it('earns its retry back after 30 seconds heard, so a second drop still retries', async () => {
+		playerStore.playQueue(singleSourceItems(2));
+		await vi.advanceTimersByTimeAsync(0);
+
+		for (let drop = 0; drop < 2; drop++) {
+			playFor(30);
+			fireCurrentTrackError();
+			await vi.advanceTimersByTimeAsync(2100);
+			expect(playerStore.currentIndex).toBe(0);
+			expect(toastStore.notify).not.toHaveBeenCalled();
+		}
+
+		fireCurrentTrackError();
+		await vi.advanceTimersByTimeAsync(2100);
+		expect(playerStore.currentIndex).toBe(1);
+	});
+
+	it('keeps spending its steps when it fails before 30 seconds or only seeks past them', async () => {
+		playerStore.playQueue(singleSourceItems(2));
+		await vi.advanceTimersByTimeAsync(0);
+
+		playFor(29);
+		fireCurrentTrackError();
+		await vi.advanceTimersByTimeAsync(0);
+
+		playFor(5);
+		capturedProgressCallbacks.forEach((cb) => cb(500, 600));
+		fireCurrentTrackError();
+		await vi.advanceTimersByTimeAsync(2100);
+
+		expect(playerStore.currentIndex).toBe(1);
+		expect(toastStore.notify).toHaveBeenCalledTimes(1);
 	});
 
 	it('falls back to the next available source before skipping', async () => {
@@ -700,67 +735,16 @@ describe('track failure reporting', () => {
 		expect(playerStore.currentIndex).toBe(0);
 		expect(playerStore.queue[0].sourceType).toBe('local');
 		expect(playerStore.queue[0].trackSourceId).toBe('file-1');
-		expect(toastStore.notify).toHaveBeenLastCalledWith(
-			'"Plex Track" failed on plex, trying local...',
-			'warning'
-		);
+		expect(toastStore.notify).not.toHaveBeenCalled();
 
 		fireCurrentTrackError();
 		await vi.advanceTimersByTimeAsync(2100);
 
 		expect(playerStore.currentIndex).toBe(1);
-		expect(toastStore.notify).toHaveBeenLastCalledWith(
-			'"Plex Track" failed on local (stream failed), skipping...',
+		expect(toastStore.notify).toHaveBeenCalledTimes(1);
+		expect(toastStore.notify).toHaveBeenCalledWith(
+			'Skipped "Plex Track": can\'t play it',
 			'warning'
 		);
-	});
-
-	it('drops a local track the library no longer has, with one notice', async () => {
-		mockApiHead.mockResolvedValue(new Response(null, { status: 404 }));
-		playerStore.playQueue(singleSourceItems(3));
-		await vi.advanceTimersByTimeAsync(0);
-
-		// One failed load reports more than once.
-		fireCurrentTrackError();
-		fireCurrentTrackError();
-		await vi.advanceTimersByTimeAsync(0);
-
-		expect(mockApiHead).toHaveBeenCalledTimes(1);
-		expect(playerStore.queue.map((item) => item.trackSourceId)).toEqual(['vid-1', 'vid-2']);
-		expect(playerStore.nowPlaying?.trackName).toBe('Track 2');
-		expect(toastStore.notify).toHaveBeenCalledWith('"Track 1" is no longer in the library', 'info');
-		expect(toastStore.notify).not.toHaveBeenCalledWith(
-			expect.stringContaining('retrying'),
-			'warning'
-		);
-	});
-
-	it('resumes the next track paused when the saved one left the library', async () => {
-		playerStore.playQueue(singleSourceItems(2));
-		await vi.advanceTimersByTimeAsync(0);
-		vi.clearAllMocks();
-		mockApiHead.mockResolvedValue(new Response(null, { status: 404 }));
-
-		playerStore.resumeSession();
-		await vi.advanceTimersByTimeAsync(0);
-		fireCurrentTrackError();
-		await vi.advanceTimersByTimeAsync(0);
-
-		expect(playerStore.queue.map((item) => item.trackSourceId)).toEqual(['vid-1']);
-		expect(playerStore.nowPlaying?.trackName).toBe('Track 2');
-		expect(playerStore.isPlaying).toBe(false);
-		expect(toastStore.notify).toHaveBeenCalledWith('"Track 1" is no longer in the library', 'info');
-	});
-
-	it('takes the tracks a removal took out of the queue', async () => {
-		playerStore.playQueue(singleSourceItems(3));
-		await vi.advanceTimersByTimeAsync(0);
-
-		playerStore.dropTracks(['vid-0', 'vid-2', 'not-queued']);
-		await vi.advanceTimersByTimeAsync(0);
-
-		expect(playerStore.queue.map((item) => item.trackSourceId)).toEqual(['vid-1']);
-		expect(playerStore.currentIndex).toBe(0);
-		expect(playerStore.nowPlaying?.trackName).toBe('Track 2');
 	});
 });

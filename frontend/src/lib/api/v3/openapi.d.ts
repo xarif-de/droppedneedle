@@ -1015,9 +1015,9 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Trade an app connect code and its PKCE verifier for an app password of
-         *     the user who allowed it. The code is gone after this call, whatever it
-         *     answers.
+         * The OAuth 2.0 token endpoint: trade an app connect code and its PKCE
+         *     verifier for an app password of the user who allowed it. The code is
+         *     gone after this call, whatever it answers.
          */
         post: operations["app_connect_token_handler"];
         delete?: never;
@@ -1389,7 +1389,9 @@ export interface paths {
         put?: never;
         /**
          * First-admin setup. Creates the admin and logs them in (201 + session,
-         *     v2 parity) iff no users exist; otherwise 409. The account and its
+         *     v2 parity) iff no users exist; otherwise 409. On a server that logged a
+         *     setup code it also needs that code, checked before anything else is: a
+         *     missing or wrong one answers the same 401. The account and its
          *     session are one write: a busy or failed setup leaves nothing, so a retry
          *     can still run it. The emptiness check runs inside that transaction, so
          *     concurrent setups, or a setup racing a first federated login (whose role
@@ -2980,7 +2982,10 @@ export interface paths {
         /**
          * Choose the album's edition: any release, from this album's release
          *     group or another. Files the edition has no track for keep their
-         *     recording; nothing automatic changes the choice afterwards.
+         *     recording; nothing automatic changes the choice afterwards. With
+         *     `use_anyway`, a release that fits none of the files is taken placing
+         *     none: the files lose any track they had, and the album waits for its
+         *     files to be matched by hand.
          */
         put: operations["choose_edition"];
         post?: never;
@@ -3003,7 +3008,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** "Looks right": confirm the album's unconfirmed best guess. */
+        /** "That's right": confirm the album's unconfirmed best guess. */
         post: operations["confirm_edition"];
         delete?: never;
         options?: never;
@@ -3242,6 +3247,31 @@ export interface paths {
         put?: never;
         post?: never;
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v3/library/albums/{album_id}/looks-wrong": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * "Looks wrong": mark the album's match as looking wrong, so curators
+         *     check it, or take your own mark back. Each person's mark is their own.
+         */
+        put: operations["mark_looks_wrong"];
+        post?: never;
+        /**
+         * A curator finds nothing wrong with the album's match: every "Looks
+         *     wrong" mark on it goes. Choosing, confirming or handing back its
+         *     edition clears them too.
+         */
+        delete: operations["clear_looks_wrong"];
         options?: never;
         head?: never;
         patch?: never;
@@ -5157,6 +5187,26 @@ export interface paths {
         put?: never;
         /** Keep the album as tagged: nothing seals, and the review settles. */
         post: operations["keep_tagged_review"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v3/library/reviews/{id}/reopen": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Reopen a review whose tags were kept, or that was left for later: it
+         *     waits for a decision again. The album stays as it is.
+         */
+        post: operations["reopen_review"];
         delete?: never;
         options?: never;
         head?: never;
@@ -8975,6 +9025,168 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v3/upgrade/continue": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Open the app: the upgrade page stops and the normal app starts in its
+         *     place. The next request reaches the app, which shows its own sign-in.
+         */
+        post: operations["upgrade_continue"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v3/upgrade/fresh": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Start fresh: v2's files move into the `v2-backup` folders, nothing is
+         *     imported, and v3 starts empty. Going back to v2 still works.
+         */
+        post: operations["upgrade_fresh"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v3/upgrade/preflight": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Run every check the upgrade runs before it moves anything, changing
+         *     nothing, and wait for it.
+         */
+        post: operations["upgrade_preflight"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v3/upgrade/progress": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The latest upgrade, fresh start or undo: its step, how far along, and
+         *     its result or failure once it has ended.
+         */
+        get: operations["upgrade_progress"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v3/upgrade/sign-in": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Sign in to the upgrade page with a v2 admin's password or the one-time
+         *     code from the server's log. Attempts are limited per address, and
+         *     passwords per username too.
+         */
+        post: operations["upgrade_sign_in"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v3/upgrade/start": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Start the upgrade. On v2 data it needs a pre-flight with nothing to fix
+         *     and every address change it listed acknowledged. An interrupted upgrade
+         *     is finished: the tool puts the v2 files back first, then upgrades.
+         */
+        post: operations["upgrade_start"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v3/upgrade/state": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Where the upgrade stands, and whether this caller is signed in to the
+         *     upgrade page.
+         */
+        get: operations["upgrade_state"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v3/upgrade/undo": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Go back to v2: the v3 data is deleted and v2's files come back from the
+         *     backup. Also finishes going back from an interrupted upgrade.
+         */
+        post: operations["upgrade_undo"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v3/users/{id}/avatar": {
         parameters: {
             query?: never;
@@ -9259,6 +9471,16 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /**
+         * @description An address change the caller has made at the outside service, as the
+         *     pre-flight listed it.
+         */
+        AcknowledgedWarning: {
+            /** @description The feature the change concerns. */
+            feature: components["schemas"]["UpgradeCallbackFeature"];
+            new_address?: null | components["schemas"]["UpgradeAddress"];
+            old_address?: null | components["schemas"]["UpgradeAddress"];
+        };
         /** @description Mutation outcome for approve/reject/cancel/retry/clear. */
         ActionResponse: {
             /** @description Human outcome. */
@@ -9938,7 +10160,8 @@ export interface components {
              * Format: int64
              * @description Tracks the album's edition has: the matched MusicBrainz release's
              *     tracklist while the catalog holds it, else the totals its files'
-             *     tags give. `None` when neither tells.
+             *     tags give; a guess the files' tags contradict counts by its tags.
+             *     `None` when neither tells.
              */
             expected_track_count?: number | null;
             /** @description True when the caller favorited this album. */
@@ -10097,37 +10320,47 @@ export interface components {
              */
             replaces_existing: boolean;
         };
-        /** @description A refused trade. */
+        /** @description A refused trade (400). */
         AppConnectTokenError: {
-            /**
-             * @description `invalid_grant` (the code is unknown, used or expired, or does not
-             *     fit the app, address or verifier) or `invalid_request` (the body is
-             *     not a trade).
-             */
-            error: string;
+            /** @description What was wrong. */
+            error: components["schemas"]["AppConnectTokenErrorCode"];
         };
-        /** @description The app's code trade. */
+        /**
+         * @description Why a trade was refused, as RFC 6749 section 5.2 names it.
+         * @enum {string}
+         */
+        AppConnectTokenErrorCode: "invalid_request" | "invalid_client" | "invalid_grant" | "unsupported_grant_type";
+        /** @description The app's code trade, sent form-encoded. */
         AppConnectTokenRequest: {
-            /** @description The app's id, as in the request. */
+            /** @description The app's id, as in the authorization request. */
             client_id: string;
             /** @description The one-time code the browser handed back. */
             code: string;
             /** @description The PKCE verifier the challenge was made from. */
             code_verifier: string;
-            /** @description The return address, as in the request. */
+            /** @description Must be `authorization_code`. */
+            grant_type: string;
+            /** @description The return address, exactly as in the authorization request. */
             redirect_uri: string;
         };
-        /** @description The app password the trade mints. */
+        /** @description The app password a trade mints. */
         AppConnectTokenResponse: {
-            /** @description The app password, shown this once. Subsonic takes it as `apiKey`. */
-            app_password: string;
-            /** @description Its id, as listed under the user's app passwords. */
-            id: string;
-            /** @description Its name, as listed. */
-            name: string;
-            /** @description The signed-in user's login name. */
+            /**
+             * @description The app password, shown this once. Subsonic takes it as `apiKey`,
+             *     or as the password next to `username`.
+             */
+            access_token: string;
+            /** @description Always `Bearer`. */
+            token_type: components["schemas"]["AppConnectTokenType"];
+            /** @description The login name of the user who allowed it. */
             username: string;
         };
+        /**
+         * @description The kind of token handed out. Libraries expect `Bearer`; the token is
+         *     an app password, used the way any app password is.
+         * @enum {string}
+         */
+        AppConnectTokenType: "Bearer";
         /** @description Create an app password. */
         AppPasswordCreate: {
             /** @description Name; defaults to `App password`. */
@@ -10781,6 +11014,15 @@ export interface components {
              * @default true
              */
             never_replace_with_smaller: boolean;
+            /**
+             * @description Replace the album's cover (embedded, and its one `cover.*` file)
+             *     with the Cover Art Archive's front for an accepted exact release.
+             *     The replaced file goes to the recycle bin; Undo puts it back. Read
+             *     only while external artwork is on. Left out while off, so profiles
+             *     and share codes saved before it keep their revisions and hashes.
+             * @default false
+             */
+            use_edition_cover: boolean;
         };
         /**
          * @description Artwork output format.
@@ -11573,6 +11815,12 @@ export interface components {
             expected_identity_revision: number;
             /** @description Any MusicBrainz release, from this album's release group or another. */
             release_mbid: string;
+            /**
+             * @description Take the release even when it fits none of the files ("Use
+             *     anyway"): no file is placed, and each reaches a track only by a
+             *     match by hand. A release that fits a file is chosen as without it.
+             */
+            use_anyway?: boolean;
         };
         /** @description City suggestions. Empty means the geocoder knows no such place. */
         CitySearchResponse: {
@@ -11746,6 +11994,11 @@ export interface components {
              * @default
              */
             redirect_uri: string;
+            /**
+             * @description Must be `code`.
+             * @default
+             */
+            response_type: string;
             /**
              * @description The app's own value, handed back unchanged; up to 512 bytes.
              * @default
@@ -12540,13 +12793,6 @@ export interface components {
              */
             download_stall_timeout_minutes: number;
             /**
-             * @description Reject non-FLAC/MP3 candidates. A v2 recipe requires this on: v2
-             *     gates recipe saves on it, the quality snapshot carries it, and the
-             *     matcher and orchestrator consumers all read it.
-             * @default true
-             */
-            flac_mp3_only: boolean;
-            /**
              * @description Terms that reject a candidate.
              * @default []
              */
@@ -12599,20 +12845,20 @@ export interface components {
              */
             quality_cutoff: string;
             /**
-             * @description Best accepted tier label.
+             * @description Best accepted tier label, set from the recipe.
              * @default lossless
              */
             quality_max: string;
             /**
-             * @description Worst accepted tier label.
+             * @description Worst accepted tier label, set from the recipe.
              * @default mp3_320
              */
             quality_min: string;
             /**
-             * @description Closed v2 quality recipe (empty means a v1 policy).
-             * @default []
+             * @description Ordered quality recipe, earlier entries preferred. Automatic work takes
+             *     only what it lists. A save needs at least one entry.
              */
-            quality_recipe: components["schemas"]["QualityRecipeEntry"][];
+            quality_recipe?: components["schemas"]["QualityRecipeEntry"][];
             /**
              * @description Terms a candidate must carry.
              * @default []
@@ -12785,6 +13031,7 @@ export interface components {
             /** @description Files of this task wait in the held list for a decision. */
             held_for_review: boolean;
             id: string;
+            maybe_have?: null | components["schemas"]["MaybeHaveView"];
             /**
              * Format: double
              * @description When the next automatic retry is due, if one will run.
@@ -13184,6 +13431,7 @@ export interface components {
              */
             matched_by_hand: boolean;
             note?: null | components["schemas"]["ReasonView"];
+            suggested?: null | components["schemas"]["EditionSuggestionView"];
             title: string;
             /** Format: int32 */
             track_number: number;
@@ -13316,6 +13564,11 @@ export interface components {
             /** @description Who chose the edition, for a chosen one. */
             chosen_by_user_id?: string | null;
             /**
+             * @description Titles of the files whose audio sounds like another track of the
+             *     guess (`AUDIO_DISAGREES`).
+             */
+            disputed_tracks: string[];
+            /**
              * @description `release` (a MusicBrainz release), `custom` (a custom edition),
              *     `group_only` (a release group with no release chosen) or `none`.
              */
@@ -13343,6 +13596,18 @@ export interface components {
              *     writes no tags or names there, and downloads land as they came.
              */
             keeps_own_tags: boolean;
+            /** @description The caller marked the album's match "Looks wrong". */
+            looks_wrong: boolean;
+            /**
+             * Format: int32
+             * @description How many people marked it.
+             */
+            looks_wrong_count: number;
+            /**
+             * @description The release group every file's tags name, when the guess fits
+             *     another (`NAMED_GROUP_DIFFERS`): its editions are worth a look.
+             */
+            named_release_group_mbid?: string | null;
             placing?: null | components["schemas"]["EditionPlacingView"];
             /** @description Why the edition is what it is, and what to do about it. */
             reason: components["schemas"]["ReasonView"];
@@ -13357,6 +13622,14 @@ export interface components {
             undo_available: boolean;
             /** @description That write is still to happen. */
             writing: boolean;
+        };
+        /** @description An edition track suggested for a file. */
+        EditionSuggestionView: {
+            /** Format: int32 */
+            disc_number: number;
+            /** Format: int32 */
+            position: number;
+            release_track_mbid: string;
         };
         /**
          * @description One tag that changes. Several values are joined with "; "; absent
@@ -14149,16 +14422,20 @@ export interface components {
             handed_back: boolean;
         };
         /**
-         * @description Health payload, in the v2 shape. The route is public, so it says
-         *     nothing about the server's internals; admins read those from the
-         *     admin routes.
+         * @description Health payload. The route is public, so it says nothing about the
+         *     server's internals; admins read those from the admin routes.
          */
         HealthResponse: {
             /** @description Human-readable running message. */
             message: string;
-            /** @description Service state, `ok` when serving. */
-            status: string;
+            /** @description What the server is doing. */
+            status: components["schemas"]["HealthStatus"];
         };
+        /**
+         * @description What the server is doing, as the health check reports it.
+         * @enum {string}
+         */
+        HealthStatus: "ok" | "upgrade";
         /** @description What an action did. */
         HeldActionResponse: {
             /** @description Files the library already held, so nothing was added. */
@@ -14176,6 +14453,11 @@ export interface components {
         HeldEntryResponse: {
             album_title?: string | null;
             artist_name?: string | null;
+            /**
+             * @description The library album whose match a person should check before the
+             *     better copy held here can go in: its "Check this album" target.
+             */
+            check_album_id?: string | null;
             /**
              * Format: int64
              * @description When it was made, in milliseconds.
@@ -14299,6 +14581,26 @@ export interface components {
          * @enum {string}
          */
         HeldRecheckStatus: "imported" | "still_held" | "error";
+        /**
+         * @description How much of one release group the library holds, over every album that
+         *     owns it: their tracks add up, to the edition's count at most.
+         */
+        HeldTracks: {
+            /**
+             * Format: int64
+             * @description Tracks the edition has; `None` when neither the matched release nor
+             *     the files' tags tell. A guess the files' tags contradict counts by
+             *     its tags.
+             */
+            expected?: number | null;
+            /**
+             * Format: int64
+             * @description Tracks the library holds.
+             */
+            held: number;
+            /** @description Lowercase release-group id. */
+            id: string;
+        };
         /** @description One listening-history entry. */
         HistoryEntry: {
             /** @description Track album. */
@@ -15490,8 +15792,13 @@ export interface components {
             /** @description Release-group (or release) ids, at most 500 after de-duplication. */
             album_ids?: string[];
         };
-        /** @description Membership answer. Both lists are lowercase and sorted. */
+        /** @description Membership answer. Every list is lowercase and sorted by id. */
         LibraryMembershipResponse: {
+            /**
+             * @description For each asked release group the library owns, how many of its
+             *     tracks the library holds and how many its edition has.
+             */
+            held_tracks: components["schemas"]["HeldTracks"][];
             /** @description Asked ids the library holds with at least one streamable track. */
             owned_ids: string[];
             /** @description Asked ids with an open acquisition request. */
@@ -15967,9 +16274,16 @@ export interface components {
             /** @description Username, matched case-insensitively. */
             username: string;
         };
+        /** @description Mark an album's match as looking wrong, or take the mark back. */
+        LooksWrongBody: {
+            looks_wrong: boolean;
+        };
+        /** @description The caller's own "Looks wrong" mark. */
+        LooksWrongView: {
+            looks_wrong: boolean;
+        };
         /**
-         * @description Liveness of a loop row. The table's CHECK still allows `idle`, which
-         *     nothing writes since every loop runs on the supervisor.
+         * @description Liveness of a background loop.
          * @enum {string}
          */
         LoopState: "running" | "stopped" | "failed";
@@ -16715,6 +17029,11 @@ export interface components {
             source: components["schemas"]["SourceName"];
             /** @description Album tracks, when found. */
             tracks: components["schemas"]["RemotesTrackView"][];
+        };
+        /** @description A library album that may already be the one a download hunts for. */
+        MaybeHaveView: {
+            album_id: string;
+            title: string;
         };
         /**
          * @description MusicBrainz source tier.
@@ -18020,18 +18339,34 @@ export interface components {
                 album_id: string;
                 artist_name: string;
                 /**
+                 * Format: int32
+                 * @description Indexed files the album holds.
+                 */
+                file_count: number;
+                guess?: null | components["schemas"]["WaitingGuessView"];
+                /**
                  * Format: int64
-                 * @description The identity's row revision, 0 when the album has none. "Looks
+                 * @description The identity's row revision, 0 when the album has none. "That's
                  *     right" echoes it.
                  */
                 identity_revision: number;
+                /**
+                 * Format: int32
+                 * @description How many people marked the match "Looks wrong".
+                 */
+                looks_wrong_count: number;
                 reason: components["schemas"]["ReasonView"];
                 release_group_mbid?: string | null;
                 release_mbid?: string | null;
-                /** @description `unconfirmed` or `unmatched`. */
+                /** @description `unconfirmed` or `unmatched`; in the "Looks wrong" list, any state. */
                 state: components["schemas"]["EditionState"];
+                /** @description The album as its files have it. */
                 title: string;
-                /** Format: double */
+                /**
+                 * Format: double
+                 * @description When it was listed (epoch seconds): the match, or the newest
+                 *     "Looks wrong" mark.
+                 */
                 updated_at: number;
             }[];
             /** @description Pass back as `cursor` for the next page; null on the last. */
@@ -19230,12 +19565,11 @@ export interface components {
             sample_rate_hz?: number | null;
         };
         /**
-         * @description How the stored quality settings read: a v1 tier range, a v2 recipe, a
-         *     policy with codecs a recipe cannot express, or a recipe that does not
-         *     validate.
+         * @description How the stored quality settings read: a usable recipe, or a section or
+         *     recipe that does not validate.
          * @enum {string}
          */
-        QualityRecipeStatus: "v1" | "v2" | "non_convertible" | "invalid";
+        QualityRecipeStatus: "v2" | "invalid";
         /** @description One blocklisted release. */
         QuarantineEntry: {
             /** @description The client label: `slskd`, `sabnzbd`, or the source for plugins. */
@@ -19607,7 +19941,7 @@ export interface components {
          * @description One reason, stored and sent by its snake_case spelling.
          * @enum {string}
          */
-        Reason: "weak_match" | "no_artist_evidence" | "mostly_unmatched" | "tag_mismatch" | "fingerprint_mismatch" | "fingerprint_unconfirmed" | "album_version_only" | "no_release" | "no_tracks" | "version_lower_quality" | "no_better_than_yours" | "owned_elsewhere" | "owned_on_album" | "no_album_match" | "album_not_found" | "tags_disagree" | "not_chosen_edition" | "samples" | "too_many_files" | "interrupted" | "import_failed" | "held_by_earlier_version" | "target_occupied" | "upgrade_blocked" | "library_changed" | "library_unavailable" | "naming_script_failed" | "library_folder_missing" | "library_off" | "local_fault" | "files_missing" | "files_unlisted" | "outside_downloads_folder" | "size_mismatch" | "corrupt" | "no_audio" | "sample" | "wrong_edition" | "not_pinned_edition" | "wrong_album" | "quality_rejected" | "not_an_upgrade" | "wrong_track" | "stalled" | "queue_timeout" | "queue_gave_way" | "never_started" | "deadline" | "source_failed" | "no_source" | "download_failed" | "album_lookup_unavailable" | "recording_unknown" | "no_album_for_recording" | "no_album_folder" | "no_album_release" | "album_releases_exhausted" | "track_not_found" | "no_download_source" | "settings_unreadable" | "journal_unreadable" | "musicbrainz_unavailable" | "acoustid_unavailable" | "held_for_review" | "tracks_missing" | "already_owned" | "cancelled" | "moved_on";
+        Reason: "weak_match" | "no_artist_evidence" | "mostly_unmatched" | "tag_mismatch" | "fingerprint_mismatch" | "fingerprint_unconfirmed" | "album_version_only" | "no_release" | "no_tracks" | "version_lower_quality" | "no_better_than_yours" | "owned_elsewhere" | "owned_on_album" | "album_needs_check" | "no_album_match" | "album_not_found" | "tags_disagree" | "not_chosen_edition" | "samples" | "too_many_files" | "interrupted" | "import_failed" | "held_by_earlier_version" | "format_not_listed" | "target_occupied" | "upgrade_blocked" | "library_changed" | "library_unavailable" | "naming_script_failed" | "library_folder_missing" | "library_off" | "local_fault" | "files_missing" | "files_unlisted" | "outside_downloads_folder" | "size_mismatch" | "corrupt" | "no_audio" | "sample" | "wrong_edition" | "not_pinned_edition" | "wrong_album" | "quality_rejected" | "not_an_upgrade" | "wrong_track" | "stalled" | "queue_timeout" | "queue_gave_way" | "never_started" | "deadline" | "source_failed" | "no_source" | "download_failed" | "album_lookup_unavailable" | "recording_unknown" | "no_album_for_recording" | "no_album_folder" | "no_album_release" | "album_releases_exhausted" | "track_not_found" | "nothing_allowed" | "no_download_source" | "settings_unreadable" | "journal_unreadable" | "musicbrainz_unavailable" | "acoustid_unavailable" | "held_for_review" | "tracks_missing" | "already_owned" | "cancelled" | "moved_on";
         /** @description How many reviews one reason holds. */
         ReasonCount: {
             /** Format: int64 */
@@ -21570,8 +21904,8 @@ export interface components {
             /** @description Result bucket. */
             kind: components["schemas"]["SearchKind"];
             /**
-             * @description MusicBrainz id: the hit's own for MusicBrainz hits, the accepted
-             *     identity for library rows. Absent means unidentified, never failure.
+             * @description MusicBrainz id: the hit's own for MusicBrainz hits, the match row's
+             *     for library rows. Absent means unidentified, never failure.
              */
             musicbrainz_id?: string | null;
             /** @description True when an acquisition request is open for this album. */
@@ -21901,6 +22235,8 @@ export interface components {
         };
         /** @description First-admin setup body. Runs only against an empty user table. */
         SetupBody: {
+            /** @description The code from the server log, when the setup status asks for one. */
+            code?: string | null;
             /** @description Display name; defaults to the username casing. */
             display_name?: string | null;
             /** @description Optional email. */
@@ -21914,6 +22250,11 @@ export interface components {
         };
         /** @description Setup-required probe for the SPA first-run gate. */
         SetupStatusBody: {
+            /**
+             * @description True when setup also needs the code from the server log: the server
+             *     was started fresh from v2 and no account exists yet.
+             */
+            code_required: boolean;
             /** @description True when no users exist yet and setup must run. */
             setup_required: boolean;
         };
@@ -22128,6 +22469,12 @@ export interface components {
         StatsView: {
             /**
              * Format: int64
+             * @description Albums to check, each once: a best guess, marked "Looks wrong" or
+             *     with an open review.
+             */
+            check_count: number;
+            /**
+             * Format: int64
              * @description Albums the caller favorited.
              */
             favorite_albums: number;
@@ -22146,6 +22493,11 @@ export interface components {
                 [key: string]: number;
             };
             /**
+             * Format: int64
+             * @description Albums whose edition is a best guess.
+             */
+            guess_count: number;
+            /**
              * Format: double
              * @description When the last library scan finished successfully, unix seconds.
              */
@@ -22157,7 +22509,17 @@ export interface components {
             local_only_count: number;
             /**
              * Format: int64
-             * @description Identification reviews waiting on a person.
+             * @description Albums someone marked "Looks wrong".
+             */
+            looks_wrong_count: number;
+            /**
+             * Format: int64
+             * @description Albums nothing on MusicBrainz fits.
+             */
+            not_found_count: number;
+            /**
+             * Format: int64
+             * @description Identification reviews waiting on a person ("Needs you").
              */
             review_count: number;
             /**
@@ -22835,6 +23197,21 @@ export interface components {
             /** @description Preferred source type. */
             source_type?: string | null;
         };
+        /**
+         * @description An address, whole when v2's settings name the host, else the path to
+         *     put after the scheme and host DroppedNeedle is opened at.
+         */
+        UpgradeAddress: {
+            /** @enum {string} */
+            kind: "full";
+            /** @description A full address. */
+            value: string;
+        } | {
+            /** @enum {string} */
+            kind: "path";
+            /** @description A path, the base path included. */
+            value: string;
+        };
         /** @description Upgrade one album. */
         UpgradeAlbumRequest: {
             album_title: string;
@@ -22843,6 +23220,102 @@ export interface components {
             release_group_mbid: string;
             /** Format: int64 */
             year?: number | null;
+        };
+        /** @description The two folders the v2 files are kept in. */
+        UpgradeBackupFolders: {
+            /** @description The cache folder's backup. */
+            cache: string;
+            /** @description The config folder's backup. */
+            config: string;
+        };
+        /** @description Something that stops the upgrade until it is fixed. */
+        UpgradeBlocker: {
+            /** @description What it is. */
+            code: components["schemas"]["UpgradeCode"];
+            /** @description What to do about it, as a sentence. */
+            fix: string;
+            /** @description What is wrong, as a sentence. */
+            message: string;
+        };
+        /**
+         * @description A feature whose callback address changes with the upgrade.
+         * @enum {string}
+         */
+        UpgradeCallbackFeature: "single_sign_on" | "spotify" | "musicbrainz_contributions";
+        /**
+         * @description What `upgrade --check` found. It runs every check the upgrade runs
+         *     before it moves anything, and changes nothing.
+         */
+        UpgradeCheck: {
+            /** @description What stops the upgrade until it is fixed. */
+            blockers: components["schemas"]["UpgradeBlocker"][];
+            /**
+             * @description What the export carries, by the names `upgrade-report.json` counts
+             *     under: what the upgrade would move, at most. The import can still
+             *     leave a record out, and its report then lists it. None when the
+             *     export could not be tried.
+             */
+            counts?: {
+                [key: string]: number;
+            } | null;
+            /** @description What the folders hold. */
+            layout: components["schemas"]["UpgradeFoundLayout"];
+            /**
+             * Format: int64
+             * @description Follows and approvals of deleted users the upgrade would remove
+             *     from the v2 database first. They are not in `counts`.
+             */
+            orphans: number;
+            /**
+             * @description Addresses that change with the upgrade, which `--callbacks-changed`
+             *     acknowledges.
+             */
+            warnings: components["schemas"]["UpgradeWarning"][];
+        };
+        /**
+         * @description Why the upgrade cannot start, or why a run failed.
+         * @enum {string}
+         */
+        UpgradeCode: "UNKNOWN_LAYOUT" | "UNSUPPORTED_PATHS" | "BACKUP_EXISTS" | "V2_WAL_PRESENT" | "NOT_ENOUGH_DISK" | "V2_KEY_NOT_FOUND" | "V2_KEY_INVALID" | "V2_KEY_MISMATCH" | "V2_CONFIG_UNREADABLE" | "V2_CONFIG_INVALID" | "MISSING_INSTANCE_ID" | "V2_DATABASE_ERROR" | "EXPORT_FAILED" | "VALIDATION_FAILED" | "CALLBACKS_TO_CHANGE" | "NO_ADMIN_CAN_SIGN_IN" | "LOCKED" | "TOOL_RUNNING" | "FILE_ERROR" | "OCCUPIED" | "NOT_A_FOLDER" | "RANDOM_FAILED" | "ORPHAN_REPAIR_FAILED" | "IMPORT_SETUP_FAILED" | "IMPORT_FAILED" | "ROLLBACK_FAILED" | "BACKUP_NOT_REMOVED" | "NO_BACKUP" | "ALREADY_V2" | "BACKUP_STILL_NEEDED" | "CONFIRMATION_NEEDED" | "USAGE" | "ENVIRONMENT_INVALID" | "INTERNAL";
+        /** @description The run failed or stopped. */
+        UpgradeFailure: {
+            /** @description What went wrong. */
+            code: components["schemas"]["UpgradeCode"];
+            /** @description The error, as the tool prints it. */
+            message: string;
+            /** @description Where the v2 files are now. */
+            v2_files: components["schemas"]["UpgradeV2Files"];
+        };
+        /**
+         * @description What the data folders hold, as the check found them.
+         * @enum {string}
+         */
+        UpgradeFoundLayout: "v2" | "interrupted" | "v3" | "empty" | "unknown";
+        /** @description Start fresh's confirmation. */
+        UpgradeFreshBody: {
+            /** @description Must be true: nothing comes across from v2. */
+            confirm: boolean;
+        };
+        /**
+         * @description Where the upgrade stands.
+         * @enum {string}
+         */
+        UpgradeLayout: "needs_upgrade" | "interrupted" | "finished";
+        /**
+         * @description How a run ended well.
+         * @enum {string}
+         */
+        UpgradeOutcome: "upgraded" | "started_fresh" | "undone" | "already_v3" | "no_v2_data";
+        /** @description What the pre-flight found: the check, or why it could not run. */
+        UpgradePreflightBody: {
+            check?: null | components["schemas"]["UpgradeCheck"];
+            failure?: null | components["schemas"]["UpgradeFailure"];
+        };
+        /** @description The latest run and where the upgrade stands. */
+        UpgradeProgressBody: {
+            /** @description Where the upgrade stands. */
+            layout: components["schemas"]["UpgradeLayout"];
+            run?: null | components["schemas"]["UpgradeRun"];
         };
         /** @description What an upgrade ask did. */
         UpgradeRequestResponse: {
@@ -22853,6 +23326,99 @@ export interface components {
             status: string;
             task_id?: string | null;
         };
+        /** @description The run finished. */
+        UpgradeResult: {
+            backup?: null | components["schemas"]["UpgradeBackupFolders"];
+            /** @description How it ended. */
+            outcome: components["schemas"]["UpgradeOutcome"];
+            summary?: null | components["schemas"]["UpgradeSummary"];
+        };
+        /** @description The latest run of the upgrade, a fresh start or an undo. */
+        UpgradeRun: {
+            /**
+             * Format: int64
+             * @description Parts of the step done, when it counts them.
+             */
+            done?: number | null;
+            failure?: null | components["schemas"]["UpgradeFailure"];
+            /** @description The step's label. */
+            label?: string | null;
+            result?: null | components["schemas"]["UpgradeResult"];
+            /** @description True until it ends. */
+            running: boolean;
+            step?: null | components["schemas"]["UpgradeStep"];
+            /** @description What the run does. */
+            task: components["schemas"]["UpgradeTask"];
+            /**
+             * Format: int64
+             * @description Parts the step has, when it knows.
+             */
+            total?: number | null;
+        };
+        /** @description How to sign in to the upgrade page. */
+        UpgradeSignInBody: {
+            /** @enum {string} */
+            method: "password";
+            /** @description The v2 password. */
+            password: string;
+            /** @description The v2 username. */
+            username: string;
+        } | {
+            /** @description The code, with or without its dashes. */
+            code: string;
+            /** @enum {string} */
+            method: "code";
+        };
+        /** @description What start needs. */
+        UpgradeStartBody: {
+            /** @description Every address change the latest pre-flight listed. */
+            acknowledged?: components["schemas"]["AcknowledgedWarning"][];
+        };
+        /** @description Where the upgrade stands, for anyone. */
+        UpgradeStateBody: {
+            /** @description Where the upgrade stands. */
+            layout: components["schemas"]["UpgradeLayout"];
+            /** @description Whether this caller's upgrade sign-in is valid. */
+            signed_in: boolean;
+        };
+        /**
+         * @description The steps a run goes through, in the order they can come.
+         * @enum {string}
+         */
+        UpgradeStep: "recover" | "move_aside" | "export" | "export_again" | "dry_run" | "import" | "remove_backup" | "roll_back" | "undo";
+        /** @description What the upgrade did, as its text summary says it. */
+        UpgradeSummary: {
+            /** @description What stayed behind in v2, one line each. */
+            left_behind: string[];
+            /**
+             * @description Records moved to v3, by the names the report counts under; kinds
+             *     with none moved are left out.
+             */
+            moved: {
+                [key: string]: number;
+            };
+            /**
+             * Format: int64
+             * @description Records left out or changed on the way, each listed in the report.
+             */
+            needs_attention: number;
+            /** @description What is worth a look, one line each. */
+            notes: string[];
+            /**
+             * Format: int64
+             * @description Follows and approvals of deleted users removed from the v2 database.
+             */
+            orphans_removed: number;
+            /** @description Where the full report, `upgrade-report.json`, was saved. */
+            report: string;
+            /** @description Settings v2 had nothing saved for, now at v3's defaults. */
+            settings_defaulted: string[];
+        };
+        /**
+         * @description What a run in the progress read does.
+         * @enum {string}
+         */
+        UpgradeTask: "upgrade" | "fresh" | "undo";
         /** @description Upgrade one track. */
         UpgradeTrackRequest: {
             album_title?: string | null;
@@ -22863,6 +23429,20 @@ export interface components {
             recording_mbid: string;
             release_group_mbid?: string | null;
             track_title: string;
+        };
+        /**
+         * @description Where the v2 files are after a failed run.
+         * @enum {string}
+         */
+        UpgradeV2Files: "untouched" | "put_back" | "in_backup";
+        /** @description A change at an outside service to acknowledge before the upgrade. */
+        UpgradeWarning: {
+            /** @description The feature it concerns. */
+            feature: components["schemas"]["UpgradeCallbackFeature"];
+            /** @description What to do, as sentences. */
+            message: string;
+            new_address?: null | components["schemas"]["UpgradeAddress"];
+            old_address?: null | components["schemas"]["UpgradeAddress"];
         };
         /**
          * @description Which Usenet search side is active. Reads collapse unknown values to
@@ -23002,19 +23582,47 @@ export interface components {
             album_id: string;
             artist_name: string;
             /**
+             * Format: int32
+             * @description Indexed files the album holds.
+             */
+            file_count: number;
+            guess?: null | components["schemas"]["WaitingGuessView"];
+            /**
              * Format: int64
-             * @description The identity's row revision, 0 when the album has none. "Looks
+             * @description The identity's row revision, 0 when the album has none. "That's
              *     right" echoes it.
              */
             identity_revision: number;
+            /**
+             * Format: int32
+             * @description How many people marked the match "Looks wrong".
+             */
+            looks_wrong_count: number;
             reason: components["schemas"]["ReasonView"];
             release_group_mbid?: string | null;
             release_mbid?: string | null;
-            /** @description `unconfirmed` or `unmatched`. */
+            /** @description `unconfirmed` or `unmatched`; in the "Looks wrong" list, any state. */
             state: components["schemas"]["EditionState"];
+            /** @description The album as its files have it. */
             title: string;
-            /** Format: double */
+            /**
+             * Format: double
+             * @description When it was listed (epoch seconds): the match, or the newest
+             *     "Looks wrong" mark.
+             */
             updated_at: number;
+        };
+        /** @description The guess an album holds, as its row in the list names it. */
+        WaitingGuessView: {
+            artist_name: string;
+            /**
+             * Format: int32
+             * @description Files the guess accounts for closely.
+             */
+            matched_files: number;
+            release_group_mbid: string;
+            release_mbid?: string | null;
+            title: string;
         };
         /**
          * @description Why a live request waits. It starts by itself once the cause clears.
@@ -23053,6 +23661,7 @@ export interface components {
             created_at: number;
             /** @description The whole album or the gaps of a short one. */
             kind: components["schemas"]["WatchKind"];
+            last_outcome?: null | components["schemas"]["WatchOutcome"];
             /** @description Release-group MBID. */
             musicbrainz_id: string;
             /**
@@ -23190,6 +23799,11 @@ export interface components {
          * @enum {string}
          */
         WatchKind: "missing" | "partial";
+        /**
+         * @description What a wanted watch's last check found.
+         * @enum {string}
+         */
+        WatchOutcome: "found" | "seen" | "dispatched" | "quiet" | "outside_settings" | "error" | "in_library" | "imported";
         /**
          * @description A wanted watch's state. The `wanted_watches.state` CHECK lists exactly
          *     these values.
@@ -25738,6 +26352,8 @@ export interface operations {
     app_connect_request_handler: {
         parameters: {
             query?: {
+                /** @description Must be `code`. */
+                response_type?: string;
                 /** @description The app's id, one listed in the `app_connect` settings. */
                 client_id?: string;
                 /**
@@ -25798,7 +26414,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["AppConnectTokenRequest"];
+                "application/x-www-form-urlencoded": components["schemas"]["AppConnectTokenRequest"];
             };
         };
         responses: {
@@ -25811,22 +26427,13 @@ export interface operations {
                     "application/json": components["schemas"]["AppConnectTokenResponse"];
                 };
             };
-            /** @description `invalid_grant` or `invalid_request` */
+            /** @description The trade is refused, as RFC 6749 section 5.2 names it */
             400: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
                     "application/json": components["schemas"]["AppConnectTokenError"];
-                };
-            };
-            /** @description App connect is off: no app is listed */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
             /** @description Too many trades from this address; see `Retry-After` */
@@ -26499,6 +27106,15 @@ export interface operations {
             };
             /** @description Invalid username, password, or email */
             400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description The code from the server log is missing or wrong */
+            401: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -29925,7 +30541,7 @@ export interface operations {
                     "application/json": components["schemas"]["EditionChoiceView"];
                 };
             };
-            /** @description Not a release id, or the release fits none of the files */
+            /** @description Not a release id, or the release fits none of the files and `use_anyway` is not set */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -30934,6 +31550,108 @@ export interface operations {
             };
             /** @description Not authenticated */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Unknown album */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    mark_looks_wrong: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Local album id */
+                album_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["LooksWrongBody"];
+            };
+        };
+        responses: {
+            /** @description The caller's mark */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LooksWrongView"];
+                };
+            };
+            /** @description No `looks_wrong` given */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Unknown album */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    clear_looks_wrong: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Local album id */
+                album_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description No mark is left */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Curator role required */
+            403: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -37489,6 +38207,69 @@ export interface operations {
             };
         };
     };
+    reopen_review: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Review id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ReviewActionBody"];
+            };
+        };
+        responses: {
+            /** @description Reopened review */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ReviewView"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Curator role required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Unknown review id */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description The review is not closed, or changed since it was read (STALE_REVISION) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
     restore_review: {
         parameters: {
             query?: never;
@@ -38575,7 +39356,7 @@ export interface operations {
         parameters: {
             query?: {
                 /** @description Default: `unconfirmed`. */
-                state?: "unconfirmed" | "unmatched";
+                state?: "unconfirmed" | "unmatched" | "looks_wrong";
                 /** @description Page size, 1 to 200 (default 50); more is read as 200. */
                 limit?: number;
                 /** @description `next_cursor` from the previous page. */
@@ -39252,15 +40033,6 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["SectionPrefsResponse"];
-                };
-            };
-            /** @description Section prefs are unwired */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
         };
@@ -44795,15 +45567,6 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
-            /** @description Catalog reads are unwired */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
         };
     };
     preview_library_policy_impact: {
@@ -44877,15 +45640,6 @@ export interface operations {
                     "application/json": components["schemas"]["LibraryRestorableRootsResponse"];
                 };
             };
-            /** @description Catalog reads are unwired */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
         };
     };
     restore_library_roots: {
@@ -44921,15 +45675,6 @@ export interface operations {
             };
             /** @description Expected revision is stale */
             409: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Catalog reads are unwired */
-            503: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -45957,7 +46702,7 @@ export interface operations {
     stream_get: {
         parameters: {
             query?: {
-                /** @description Requested output codec: mp3, opus, or raw */
+                /** @description Requested output codec: mp3, opus, flac, or raw */
                 format?: string;
                 /** @description Client bitrate cap in kbps (0 or unset means uncapped) */
                 max_bitrate?: number;
@@ -46059,7 +46804,7 @@ export interface operations {
     stream_head: {
         parameters: {
             query?: {
-                /** @description Requested output codec: mp3, opus, or raw */
+                /** @description Requested output codec: mp3, opus, flac, or raw */
                 format?: string;
                 /** @description Client bitrate cap in kbps (0 or unset means uncapped) */
                 max_bitrate?: number;
@@ -46150,6 +46895,302 @@ export interface operations {
             };
             /** @description Not authenticated */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    upgrade_continue: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The app is starting */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Not signed in to the upgrade page */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description A run is under way, the folders do not hold v3 data, or another program is using them */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    upgrade_fresh: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpgradeFreshBody"];
+            };
+        };
+        responses: {
+            /** @description The fresh start began */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UpgradeProgressBody"];
+                };
+            };
+            /** @description Not confirmed */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Not signed in to the upgrade page */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description A run is under way, or the folders already hold v3 data */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    upgrade_preflight: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description What the check found */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UpgradePreflightBody"];
+                };
+            };
+            /** @description Not signed in to the upgrade page */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description A run is under way, the folders already hold v3 data, or an upgrade did not finish */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    upgrade_progress: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The latest run */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UpgradeProgressBody"];
+                };
+            };
+            /** @description Not signed in to the upgrade page */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    upgrade_sign_in: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpgradeSignInBody"];
+            };
+        };
+        responses: {
+            /** @description Signed in; the upgrade cookie is set */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UpgradeStateBody"];
+                };
+            };
+            /** @description The sign-in did not pass */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Too many attempts from this address or for this username */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    upgrade_start: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpgradeStartBody"];
+            };
+        };
+        responses: {
+            /** @description The upgrade started */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UpgradeProgressBody"];
+                };
+            };
+            /** @description Not signed in to the upgrade page */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No pre-flight, something to fix, an address change not acknowledged, a run under way, or nothing to upgrade */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    upgrade_state: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Where the upgrade stands */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UpgradeStateBody"];
+                };
+            };
+        };
+    };
+    upgrade_undo: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Going back to v2 began */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UpgradeProgressBody"];
+                };
+            };
+            /** @description Not signed in to the upgrade page */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description A run is under way, or the folders already hold v2 data */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

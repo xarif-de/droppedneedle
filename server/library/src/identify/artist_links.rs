@@ -42,8 +42,8 @@ use sha2::{Digest as _, Sha256};
 use super::merged_ids;
 use super::sqlite::stored_release;
 use super::stores::StoreError;
-use crate::catalog_actions::ArtistAction;
 use crate::catalog_actions::record_artist_action;
+use crate::catalog_actions::{ActionKind, ArtistAction};
 use crate::catalog_revision::bump_catalog;
 use crate::corrections::artist_convergence::{CREDITS_MOVED, MOVED_BY_NAME, MOVED_WITH_ID};
 use crate::corrections::continuation::accepted_release;
@@ -93,18 +93,22 @@ pub enum CreditState {
     Projected,
 }
 
-impl CreditState {
-    pub const ALL: [Self; 3] = [
-        Self::WaitingForIdentity,
-        Self::AmbiguousCreditStructure,
-        Self::Projected,
-    ];
-}
-
-crate::scan::models::spelled!(CreditState {
+droppedneedle_kernel::spelled!(CreditState {
     WaitingForIdentity => "waiting_for_identity",
     AmbiguousCreditStructure => "ambiguous_credit_structure",
     Projected => "projected",
+});
+
+/// What a credit proof is for: an album credit or a track credit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ProofSubject {
+    Album,
+    Track,
+}
+
+droppedneedle_kernel::spelled!(ProofSubject {
+    Album => "album",
+    Track => "track",
 });
 
 /// Have the next sweep work album `album` through again: which rows its
@@ -329,17 +333,17 @@ struct Proof {
 }
 
 impl Proof {
-    fn kind(&self) -> &'static str {
+    fn kind(&self) -> ProofSubject {
         if self.track.is_some() {
-            "track"
+            ProofSubject::Track
         } else {
-            "album"
+            ProofSubject::Album
         }
     }
 
     fn hash(&self, album: &str) -> String {
         let parts = [
-            self.kind(),
+            self.kind().as_str(),
             &self.subject,
             album,
             &self.position.to_string(),
@@ -617,7 +621,7 @@ fn store_proofs(
     proofs: &[Proof],
     now_ms: i64,
 ) -> rusqlite::Result<(BTreeSet<String>, Vec<MovedProof>)> {
-    type Key = (String, String, i64);
+    type Key = (ProofSubject, String, i64);
     let existing: Vec<StoredProof> = tx
         .prepare_cached(crate::identify::sql::STORED_PROOFS.text())?
         .query_map(params![album], StoredProof::read)?
@@ -626,11 +630,7 @@ fn store_proofs(
         .iter()
         .map(|proof| {
             (
-                (
-                    proof.kind().to_owned(),
-                    proof.subject.clone(),
-                    proof.position,
-                ),
+                (proof.kind(), proof.subject.clone(), proof.position),
                 (proof, proof.hash(album)),
             )
         })
@@ -816,11 +816,6 @@ impl UnlinkReason {
     }
 }
 
-/// The audit's action kinds for a change to an artist's link: one set
-/// where there was none, one moved to another id, one removed.
-pub const LINK_SET: &str = "artist_link_set";
-pub const LINK_MOVED: &str = "artist_link_moved";
-pub const LINK_REMOVED: &str = "artist_link_removed";
 /// The audit's reasons: the app linked a row its proofs and files name,
 /// the app's link went because nothing proves it any more or gave way to
 /// a person's link on another row, or a person set or cleared the link.
@@ -1098,10 +1093,10 @@ pub(crate) fn audit_link(
     now: f64,
 ) -> rusqlite::Result<()> {
     let kind = match (before, after) {
-        (None, _) => LINK_SET,
-        (Some(old), Some(new)) if old == new => LINK_SET,
-        (Some(_), Some(_)) => LINK_MOVED,
-        (Some(_), None) => LINK_REMOVED,
+        (None, _) => ActionKind::ArtistLinkSet,
+        (Some(old), Some(new)) if old == new => ActionKind::ArtistLinkSet,
+        (Some(_), Some(_)) => ActionKind::ArtistLinkMoved,
+        (Some(_), None) => ActionKind::ArtistLinkRemoved,
     };
     record_artist_action(
         tx,

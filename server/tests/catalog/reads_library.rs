@@ -448,6 +448,41 @@ async fn sqlite_format_filter_artist_sort_and_release_group_lookup() {
     );
 }
 
+/// A web player picks its transcode by this name: an MP4 file with a bit
+/// depth is ALAC, and one without stays what it is.
+#[tokio::test]
+async fn an_alac_track_is_named_apart_from_aac() {
+    let fixture = sqlite_fixture().await;
+    fixture
+        .runtime
+        .db()
+        .write(
+            droppedneedle_kernel::db::Lane::Foreground,
+            "mp4 tracks",
+            |tx| {
+                tx.execute_batch(
+                    "UPDATE local_tracks SET file_format = 'm4a', bit_depth = 16 WHERE id = 't1'; \
+                     UPDATE local_tracks SET file_format = 'm4a' WHERE id = 't2'",
+                )
+                .map_err(droppedneedle_kernel::db::DbError::from)
+            },
+        )
+        .await
+        .expect("seed batch runs");
+    let (tracks, _) = fixture
+        .catalog
+        .album_tracks("al1", 50, 0)
+        .await
+        .expect("tracks list");
+    assert_eq!(
+        tracks
+            .iter()
+            .map(|track| track.format.as_str())
+            .collect::<Vec<_>>(),
+        ["alac", "m4a"]
+    );
+}
+
 #[tokio::test]
 async fn sqlite_album_tracks_and_copies() {
     let fixture = sqlite_fixture().await;
@@ -1130,32 +1165,74 @@ async fn lists_filter_by_formats_and_minimum_tracks() {
         ])
     );
 
-    // Aurora: Opener, Closer and Single (credited, on albums she leads);
-    // Boreal leads Lone Peak's one track, Guest is credited on it.
-    for (query, want, totals) in [
-        ("min_tracks=2", vec!["a1"], (1, 1, 0)),
-        ("min_tracks=2&scope=contributors", vec![], (0, 1, 0)),
-        ("min_tracks=3&scope=album_artists", vec!["a1"], (1, 1, 0)),
-        ("min_tracks=4", vec![], (0, 0, 0)),
-        (
-            "sort=album_count&order=desc&min_tracks=2&scope=album_artists",
-            vec!["a1"],
-            (1, 1, 0),
-        ),
-    ] {
-        let (status, page) = get(app(), &format!("/api/v3/library/artists?{query}")).await;
-        assert_eq!(status, StatusCode::OK, "{query}: {page}");
-        assert_eq!(ids(&page), want, "{query}");
-        assert_eq!(
+    // An artist passes the minimum when the count its card shows reaches
+    // it: an album artist's tracks on the albums it leads, a contributor's
+    // appearances. Each tab's total counts the same artists, in every
+    // order.
+    let reaching = |scope: &str, field: &str, min: u64| {
+        let app = app();
+        let scope = scope.to_owned();
+        let field = field.to_owned();
+        async move {
+            let (status, page) = get(app, &format!("/api/v3/library/artists?scope={scope}")).await;
+            assert_eq!(status, StatusCode::OK, "{page}");
+            let mut ids: Vec<String> = page["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|artist| artist[field.as_str()].as_u64().unwrap() >= min)
+                .map(|artist| artist["id"].as_str().unwrap().to_owned())
+                .collect();
+            ids.sort();
+            ids
+        }
+    };
+    let mut seen_filtered_out = false;
+    for min in 2..=4 {
+        let led = reaching("album_artists", "led_track_count", min).await;
+        let appearing = reaching("contributors", "appearance_track_count", min).await;
+        for (query, want) in [
+            (format!("scope=album_artists&min_tracks={min}"), &led),
             (
-                page["total"].as_u64().unwrap(),
-                page["album_artist_total"].as_u64().unwrap(),
-                page["contributor_total"].as_u64().unwrap()
+                format!("scope=album_artists&sort=album_count&order=desc&min_tracks={min}"),
+                &led,
             ),
-            totals,
-            "{query}"
-        );
+            (format!("scope=contributors&min_tracks={min}"), &appearing),
+        ] {
+            let (status, page) = get(app(), &format!("/api/v3/library/artists?{query}")).await;
+            assert_eq!(status, StatusCode::OK, "{query}: {page}");
+            assert_eq!(ids(&page), *want, "{query}");
+            assert_eq!(page["total"], serde_json::json!(want.len()), "{query}");
+            // The filtered page keeps the unfiltered page's order.
+            let in_order = |page: &Value| -> Vec<String> {
+                page["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|artist| artist["id"].as_str().unwrap().to_owned())
+                    .filter(|id| want.contains(id))
+                    .collect()
+            };
+            let unfiltered = query.replace(&format!("&min_tracks={min}"), "");
+            let (status, all) = get(app(), &format!("/api/v3/library/artists?{unfiltered}")).await;
+            assert_eq!(status, StatusCode::OK, "{unfiltered}: {all}");
+            assert_eq!(in_order(&page), in_order(&all), "{query}");
+            assert_eq!(
+                (
+                    page["album_artist_total"].as_u64().unwrap(),
+                    page["contributor_total"].as_u64().unwrap()
+                ),
+                (led.len() as u64, appearing.len() as u64),
+                "{query}"
+            );
+        }
+        let all = reaching("album_artists", "led_track_count", 1).await;
+        seen_filtered_out |= led.len() < all.len();
     }
+    assert!(
+        seen_filtered_out,
+        "the fixture has an artist the minimum drops"
+    );
 }
 
 /// An album shows how many tracks its edition has next to the ones the
@@ -1256,98 +1333,4 @@ async fn library_holds_a_group_only_through_an_indexed_track_on_a_live_copy() {
         !library_holds(db, "rg3").await.unwrap(),
         "a merged-away copy holds nothing"
     );
-}
-
-/// An album a removal took the last files of leaves the web lists and its
-/// artist's page, and still opens by its id. One whose files left the
-/// disk after a removal stays listed, so a vanished folder still shows.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_removed_album_leaves_the_web_lists() {
-    use crate::common::compat::{CompatApp, PLAYER};
-
-    let rig = CompatApp::unscanned("reads-library-removed").await;
-    rig.app.seed(ALBUM_KINDS).await;
-    rig.app
-        .seed(
-            "INSERT INTO local_albums (id, root_id, grouping_key, title, title_folded, \
-             album_artist_name, album_artist_name_folded, album_artist_id, year, \
-             grouping_source, created_at, updated_at) VALUES \
-             ('al-removed', 'root', 'k-removed', 'Set Removed', 'set removed', 'Aurora', \
-             'aurora', 'ar-aurora', 2000, 'automatic', 80, 80), \
-             ('al-vanished', 'root', 'k-vanished', 'Set Vanished', 'set vanished', 'Aurora', \
-             'aurora', 'ar-aurora', 2001, 'automatic', 90, 90); \
-             INSERT INTO local_tracks (id, local_album_id, root_id, file_path, relative_path, \
-             path_hash, file_size_bytes, file_mtime_ns, stat_revision, title, title_folded, \
-             album_title, album_title_folded, file_format, availability, missing_at, \
-             ingest_source, imported_at, membership_source) VALUES \
-             ('tk-removed', 'al-removed', 'root', '/m/7.flac', '7.flac', 'h7', 1000, 1, 's7', \
-             'Binned', 'binned', 'Set Removed', 'set removed', 'flac', 'missing', 50000, 'scan', \
-             1, 'automatic'), \
-             ('tk-binned', 'al-vanished', 'root', '/m/8.flac', '8.flac', 'h8', 1000, 1, 's8', \
-             'Binned', 'binned', 'Set Vanished', 'set vanished', 'flac', 'missing', 50000, 'scan', \
-             1, 'automatic'), \
-             ('tk-vanished', 'al-vanished', 'root', '/m/9.flac', '9.flac', 'h9', 1000, 1, 's9', \
-             'Vanished', 'vanished', 'Set Vanished', 'set vanished', 'flac', 'missing', 60000, \
-             'scan', 1, 'automatic'); \
-             INSERT INTO library_catalog_actions (id, action_kind, local_album_id, \
-             local_track_id, before_json, after_json, reason_code, created_at) VALUES \
-             ('act-removed', 'remove_track', 'al-removed', 'tk-removed', '{}', '{}', \
-             'ALBUM_FILES_RECYCLED', 50000), \
-             ('act-binned', 'remove_track', 'al-vanished', 'tk-binned', '{}', '{}', \
-             'FILE_RECYCLED', 50000);",
-        )
-        .await;
-    let (status, login) = rig
-        .app
-        .call(
-            "POST",
-            "/api/v3/auth/login",
-            &[],
-            Some(serde_json::json!({
-                "username": PLAYER,
-                "password": format!("{PLAYER}-password-1234"),
-                "transport": "bearer",
-            })),
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK, "{login}");
-    let bearer = format!("Bearer {}", login["token"].as_str().expect("token"));
-    let native = [("authorization", bearer.as_str())];
-    let listed = [
-        "al-empty",
-        "al-excluded",
-        "al-live",
-        "al-missing",
-        "al-pair-a",
-        "al-pair-b",
-        "al-vanished",
-    ];
-
-    let (status, page) = rig
-        .app
-        .call("GET", "/api/v3/library/albums?limit=200", &native, None)
-        .await;
-    assert_eq!(status, StatusCode::OK, "{page}");
-    assert_eq!(sorted_ids(&page["items"], "id"), listed);
-    assert_eq!(page["total"], 7, "{page}");
-
-    let (status, led) = rig
-        .app
-        .call(
-            "GET",
-            "/api/v3/library/artists/ar-aurora/albums?limit=200",
-            &native,
-            None,
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK, "{led}");
-    assert_eq!(sorted_ids(&led["items"], "id"), listed);
-    assert_eq!(led["total"], 7, "{led}");
-
-    let (status, album) = rig
-        .app
-        .call("GET", "/api/v3/library/albums/al-removed", &native, None)
-        .await;
-    assert_eq!(status, StatusCode::OK, "{album}");
-    assert_eq!(album["id"], "al-removed", "{album}");
 }

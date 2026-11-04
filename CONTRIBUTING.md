@@ -57,6 +57,8 @@ make frontend-test-client   # vitest, browser project
 make check                  # all of the above (not cargo audit, cargo deny or the container test)
 ```
 
+The timing budgets are ignored tests, which `.github/workflows/perf.yml` runs in release every Monday and by hand. To run one locally: `cd server && cargo test --release --test server login_p95 -- --ignored --nocapture`.
+
 Browser tests use Playwright. Install the browser once with `make frontend-browser-install`.
 
 A browser spec renders the real component with `renderWithQuery` from `frontend/src/lib/test/render.ts`, which gives each test a fresh TanStack `QueryClient` with no retries and no persister. It answers the component's requests with `fakeApi` from `frontend/src/lib/test/api.ts`: routes are keyed by method and contract template (`'GET /api/v3/albums/{album_id}/basic'`), each answer is typed as that operation's response from the generated contract, so svelte-check fails a fixture that drifts from the server, and `apiError(status, code)` builds an error answer. A request with no route fails the test and names it. Mock the player, `$app/navigation` and things outside the browser, never the query modules, the api client or TanStack.
@@ -85,9 +87,9 @@ droppedneedle_kernel::sql! {
     /// Fixed text other statements are built from.
     fragment FEED_COLUMNS = "f.source, f.source_event_id, f.city";
     /// One user's cities.
-    pub(super) CITIES = "SELECT city_name FROM user_event_cities WHERE user_id = ?";
+    pub(super) CITIES = "SELECT city_name FROM catalog_event_cities WHERE user_id = ?";
     /// A statement joined from constant parts at compile time.
-    pub(super) FEED = "SELECT " + FEED_COLUMNS + " FROM live_event_feed f";
+    pub(super) FEED = "SELECT " + FEED_COLUMNS + " FROM catalog_live_event_feed f";
     /// One statement per combination of the builder's choices.
     family FEED_PAGE = feed_page;
 }
@@ -104,6 +106,8 @@ pub(super) fn feed_page(for_user: bool, newest_first: bool) -> String { ... }
 `every_registered_statement_prepares` fails when a `sql.rs` is missing from its crate's list or declares something outside its `sql!` block, then prepares every statement, and every family over every combination, against the migrated schema. It catches a renamed column, a dropped table and a second statement after a `;`. It does not check how many values a call site binds, that a column list matches its row mapper, or the query plan.
 
 `raw_sql_stays_in_sql_files` fails on SQL text anywhere else, and on `PRAGMA` or transaction control outside `server/kernel/src/db/`. Test files are exempt. Areas that have not moved their SQL yet are listed in `server/sql-outside-registry.txt`; moving an area deletes its line.
+
+A column that stores an enum as text declares the enum's spellings with `droppedneedle_kernel::spelled!` and carries a `CHECK (column IN (...))` listing exactly those spellings; `every_state_column_lists_exactly_its_enums_values` in `persist_schema.rs` registers each such column with its enum and fails when the two differ.
 
 ## Pull requests
 

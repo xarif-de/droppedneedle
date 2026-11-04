@@ -7,28 +7,32 @@
 //! - **Has files.** An album has files when `has_indexed_track = 1` (kept
 //!   by triggers): at least one of its tracks is indexed. Missing tracks
 //!   (gone from disk or in the recycle bin) and excluded ones do not count.
-//!   The web UI lists a live album without files, with no tracks; player
-//!   apps never see it.
-//! - **Removed.** An album without files whose last files left it by a
-//!   removal (a person's, a duplicate resolution's, an upgrade's): its
-//!   newest missing track has a `remove_track` action from that moment
-//!   on. The web UI's lists leave it out; it still opens by its id, so its
-//!   page and the recycle bin can put it back. Files missing from disk
-//!   since keep it listed, so a folder that vanished still shows.
+//!   Player apps never see a live album without files.
+//! - **Listed.** The web UI's album lists show a live album, with or
+//!   without files, until everything of a file-less album has been through
+//!   the recycle bin and left it
+//!   ([`droppedneedle_library::album_gone_through_bin`]): a removed album
+//!   is listed, marked "no files", while any of its files can still be put
+//!   back. One whose files vanished from disk stays listed. Every album
+//!   still opens by its id.
 //! - **Live track.** A track every read shows is indexed and sits on a
 //!   live album. Merges retire only emptied albums, so a track left on a
 //!   retired one is a leftover no read lists, counts or returns.
 //! - **Owned** means live and has files. Membership, search's
 //!   `in_library`, the catalog pages' local fallback, Discover and follows
-//!   all read this one meaning. A release group is owned when any copy of
-//!   it is. An artist is owned when it is live and credited on an owned
-//!   album. Being identified (`linked`) is not ownership.
-//! - **Recording id.** A track's recording id in an answer is the accepted
-//!   identity's, else the one in the file's tags. It is shown and sent,
-//!   never stored as identity and never used to match or own anything. The
-//!   web player sends it with a play through another server or a YouTube
-//!   link, and such a play is filed by the id it carries
-//!   (`library/src/repairs/plays.rs`).
+//!   all read this one meaning. A release group is owned by the one
+//!   definition catalog and acquisition share,
+//!   [`droppedneedle_library::owns_group`]. An artist is owned when it is
+//!   live and credited on an owned album. Being identified (`linked`) is not
+//!   ownership.
+//! - **Recording id.** A track's recording id in an answer is its match
+//!   row's, else the one in the file's tags: one definition,
+//!   [`droppedneedle_library::recording_mbid`], which media and acquire
+//!   read too. It is shown and sent, and Weekly Mix finds the library file
+//!   for a recording it picked by it; it is never stored as identity and
+//!   never used to identify or own anything. The web player sends it with a
+//!   play through another server or a YouTube link, and such a play is
+//!   filed by the id it carries (`library/src/repairs/plays.rs`).
 //! - Every join to an `*_external_identities` table names the provider.
 //!
 //! Each definition is a macro that expands to a string literal over the
@@ -43,23 +47,18 @@ macro_rules! live_album {
     };
 }
 
-/// An album the web UI lists, over an album alias: live, and not removed.
+/// An album the web UI's lists show, over an album alias: live, and with
+/// files or with something of it not yet through the recycle bin.
 macro_rules! listed_album {
     ($album:literal) => {
         concat!(
             "+",
             $album,
-            ".retired_into_album_id IS NULL AND NOT (+",
+            ".retired_into_album_id IS NULL AND (+",
             $album,
-            ".has_indexed_track = 0 AND EXISTS (SELECT 1 FROM local_tracks rmt \
-             WHERE rmt.local_album_id = ",
-            $album,
-            ".id AND rmt.availability = 'missing' AND rmt.missing_at = \
-             (SELECT MAX(rml.missing_at) FROM local_tracks rml WHERE rml.local_album_id = ",
-            $album,
-            ".id AND +rml.availability = 'missing') AND EXISTS (SELECT 1 \
-             FROM library_catalog_actions rma WHERE rma.local_track_id = rmt.id \
-             AND rma.action_kind = 'remove_track' AND rma.created_at >= rmt.missing_at)))"
+            ".has_indexed_track = 1 OR NOT (",
+            droppedneedle_library::album_gone_through_bin!(concat!($album, ".id")),
+            "))"
         )
     };
 }
@@ -92,25 +91,6 @@ macro_rules! owned_album {
     };
 }
 
-/// The order a lookup by release group picks a copy in, over an album
-/// alias and its identity alias: a copy with files first, then one picked
-/// by hand, then the oldest. The same order as the identity read
-/// acquisition follows.
-macro_rules! copy_order {
-    ($album:literal, $identity:literal) => {
-        concat!(
-            $album,
-            ".has_indexed_track DESC, ",
-            $identity,
-            ".decision_source <> 'manual', ",
-            $album,
-            ".created_at ASC, ",
-            $album,
-            ".id ASC"
-        )
-    };
-}
-
 /// The provider every identity join names, over an identity alias.
 macro_rules! musicbrainz {
     ($identity:literal) => {
@@ -118,29 +98,18 @@ macro_rules! musicbrainz {
     };
 }
 
-/// A track's recording id: the accepted identity's, else the file's own,
-/// over an identity alias and a track alias.
-macro_rules! recording_mbid {
-    ($identity:literal, $track:literal) => {
+/// A track's format as a person or a browser needs it: an MP4 file is AAC or
+/// ALAC, and the scan reads a bit depth only from ALAC.
+macro_rules! track_codec {
+    ($track:literal) => {
         concat!(
-            "COALESCE(",
-            $identity,
-            ".recording_mbid, ",
+            "CASE WHEN ",
             $track,
-            ".embedded_recording_mbid)"
-        )
-    };
-}
-
-/// Every owned release group, lowercased: a subquery for `IN (...)`.
-macro_rules! owned_release_groups {
-    () => {
-        concat!(
-            "SELECT lower(oe.release_group_mbid) FROM local_album_external_identities oe \
-             JOIN local_albums ob ON ob.id = oe.local_album_id WHERE ",
-            $crate::local::definitions::musicbrainz!("oe"),
-            " AND ",
-            $crate::local::definitions::owned_album!("ob")
+            ".file_format = 'm4a' AND ",
+            $track,
+            ".bit_depth IS NOT NULL THEN 'alac' ELSE ",
+            $track,
+            ".file_format END"
         )
     };
 }
@@ -162,21 +131,90 @@ macro_rules! owned_artist {
 }
 
 pub(crate) use {
-    copy_order, listed_album, live_album, live_track, musicbrainz, owned_album, owned_artist,
-    owned_release_groups, recording_mbid,
+    listed_album, live_album, live_track, musicbrainz, owned_album, owned_artist, track_codec,
 };
+
+/// A track an album's track count counts, over a track alias and the
+/// album's id column: an indexed track on that album, whoever is credited
+/// on it. The album's card, the minimum-tracks filters and an artist's
+/// led-album tracks all count this.
+macro_rules! album_track {
+    ($track:expr, $album_id:expr) => {
+        concat!(
+            $track,
+            ".local_album_id = ",
+            $album_id,
+            " AND ",
+            $track,
+            ".availability = 'indexed'"
+        )
+    };
+}
 
 /// Album `$album`'s primary format: its most common indexed track format,
 /// lowercased; NULL for an album without indexed tracks.
 macro_rules! album_primary_format {
     ($album:literal) => {
         concat!(
-            "LOWER((SELECT t2.file_format FROM local_tracks t2 WHERE t2.local_album_id = ",
-            $album,
-            ".id AND t2.availability = 'indexed' \
-             GROUP BY t2.file_format ORDER BY COUNT(*) DESC, t2.file_format LIMIT 1))"
+            "LOWER((SELECT t2.file_format FROM local_tracks t2 WHERE ",
+            $crate::local::definitions::album_track!("t2", concat!($album, ".id")),
+            " GROUP BY t2.file_format ORDER BY COUNT(*) DESC, t2.file_format LIMIT 1))"
         )
     };
 }
 
-pub(crate) use album_primary_format;
+/// The album list's minimum-tracks filter over an album alias: at least
+/// the bound number of [`album_track!`]s, or no minimum (NULL). It asks
+/// for the track at the minimum's place, so it reads that many at most.
+/// Binds the minimum, then the minimum less one.
+macro_rules! album_min_tracks {
+    ($album:literal) => {
+        concat!(
+            "(? IS NULL OR EXISTS (SELECT 1 FROM local_tracks mat WHERE ",
+            $crate::local::definitions::album_track!("mat", concat!($album, ".id")),
+            " LIMIT 1 OFFSET ?))"
+        )
+    };
+}
+
+/// The album-artist list's minimum-tracks filter over an artist id column:
+/// the [`album_track!`]s of the owned albums the artist leads, the count
+/// its card shows, reach the bound number, or no minimum (NULL). It asks
+/// for the track at the minimum's place, so it reads that many at most.
+/// Binds the minimum, then the minimum less one.
+macro_rules! artist_min_led_tracks {
+    ($artist_id:literal) => {
+        concat!(
+            "(? IS NULL OR EXISTS (SELECT 1 FROM local_albums mla \
+             INDEXED BY idx_local_albums_artist_id \
+             JOIN local_tracks ml INDEXED BY idx_local_tracks_album_availability ON ",
+            $crate::local::definitions::album_track!("ml", "mla.id"),
+            " WHERE mla.album_artist_id = ",
+            $artist_id,
+            " AND ",
+            $crate::local::definitions::owned_album!("mla"),
+            " LIMIT 1 OFFSET ?))"
+        )
+    };
+}
+
+/// The contributor list's minimum-tracks filter over an artist id column:
+/// the artist's appearances, its tracks on live albums someone else leads
+/// as the kept credit pairs count them and its card shows, reach the bound
+/// number, or no minimum (NULL). Binds the minimum, then the minimum less
+/// one.
+macro_rules! artist_min_appearances {
+    ($artist_id:literal) => {
+        concat!(
+            "(? IS NULL OR (SELECT COALESCE(SUM(map.indexed_tracks), 0) \
+             FROM library_artist_album_credits map WHERE map.local_artist_id = ",
+            $artist_id,
+            " AND map.live = 1 AND map.appearance = 1) > ?)"
+        )
+    };
+}
+
+pub(crate) use {
+    album_min_tracks, album_primary_format, album_track, artist_min_appearances,
+    artist_min_led_tracks,
+};

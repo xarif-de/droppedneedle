@@ -7,7 +7,7 @@ use std::sync::Arc;
 use super::poll::PollMemory;
 use super::{Attempt, DownloadWorker, Pass, failover_exhausted, handled_count, live_attempt};
 use crate::downloads::sources::{DownloadSource, SourceError, SourceHandle};
-use crate::downloads::state::{AttemptState, TaskStatus};
+use crate::downloads::state::{AttemptDisposition, AttemptState, TaskStatus};
 use crate::downloads::store::{AttemptRow, StoreError, TaskOutcome, TaskRow};
 use crate::reason::Reason;
 use crate::target::reasons::TrackReason;
@@ -193,7 +193,12 @@ impl DownloadWorker {
                         SourceError::Rejected {
                             reason: refused, ..
                         } => {
-                            if TrackReason::from_reason(*refused).is_some() {
+                            // "Only copies your settings refuse" says more
+                            // than another source having nothing.
+                            if *refused == Reason::NothingAllowed
+                                || (reason != Some(Reason::NothingAllowed)
+                                    && TrackReason::from_reason(*refused).is_some())
+                            {
                                 reason = Some(*refused);
                             }
                         }
@@ -330,7 +335,7 @@ impl DownloadWorker {
                                 *revision,
                                 AttemptState::CleanupPending,
                                 now,
-                                Some("discard"),
+                                Some(AttemptDisposition::Discard),
                                 None,
                                 true,
                             )?

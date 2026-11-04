@@ -20,7 +20,6 @@ const recipe: QualityRecipeEntry[] = [
 const basePolicy: DownloadPolicySettings = {
 	quality_min: 'mp3_320',
 	quality_max: 'lossless',
-	flac_mp3_only: true,
 	preflight_score_auto_accept: 0.7,
 	preflight_score_manual_min: 0.5,
 	download_stall_timeout_minutes: 30,
@@ -216,44 +215,6 @@ describe('SettingsDownloadPolicy quality recipe', () => {
 		expect(container.ownerDocument.activeElement?.getAttribute('data-preset')).toBe(
 			'best_available'
 		);
-	});
-
-	it('projects a legacy v1 lossless tier into all FLAC buckets and displays the migration notice', async () => {
-		h.policy = {
-			...structuredClone(basePolicy),
-			quality_recipe: [],
-			quality_recipe_status: 'v1',
-			quality_recipe_error: null
-		};
-		const { container } = await render(SettingsDownloadPolicy);
-		await expect.element(page.getByRole('alert').first()).toHaveTextContent(/projected/i);
-		expect(
-			rows(container)
-				.slice(0, 5)
-				.map((row) => row.textContent)
-		).toEqual([
-			expect.stringContaining('Above 24-bit / 192 kHz'),
-			expect.stringContaining('24-bit / 192 kHz'),
-			expect.stringContaining('24-bit / 96 kHz'),
-			expect.stringContaining('24-bit / 48 kHz'),
-			expect.stringContaining('CD quality')
-		]);
-		await page.getByRole('button', { name: 'Save acquisition policy' }).click();
-		const saved = h.mutateAsync.mock.calls[0][0] as Record<string, unknown>;
-		expect(saved.quality_recipe_status).toBe('v2');
-		expect(saved.quality_recipe).toEqual([
-			{ format: 'flac', quality: 'hi_res' },
-			{ format: 'flac', quality: '24_192' },
-			{ format: 'flac', quality: '24_96' },
-			{ format: 'flac', quality: '24_48' },
-			{ format: 'flac', quality: 'cd' },
-			{
-				format: 'mp3',
-				quality: '320_plus',
-				min_bitrate_kbps: 320,
-				max_bitrate_kbps: null
-			}
-		]);
 	});
 
 	it('preserves the draft after a failed save and restores it with Discard', async () => {

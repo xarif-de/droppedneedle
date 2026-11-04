@@ -1,5 +1,8 @@
 //! The SQL of the repairs module.
 
+// `sql!` needs a macro call in parentheses to take it as one part.
+#![allow(unused_parens, clippy::double_parens)]
+
 use droppedneedle_kernel::db::statement::ListLen;
 use droppedneedle_kernel::db::time::Millis;
 
@@ -7,6 +10,7 @@ use super::models::{ApplyResult, Confidence, FindingCode, FindingState};
 use crate::identity::DecisionSource;
 use crate::identity::sql::REVISABLE;
 use crate::jobs::sql::live_job;
+use crate::scan::models::GroupingSource;
 
 droppedneedle_kernel::sql_choice! {
     /// Which albums a repair job covers.
@@ -41,7 +45,7 @@ droppedneedle_kernel::sql! {
     family FINDING_COUNTS = finding_counts;
     pub(super) EXPORT_RUN = "SELECT * FROM library_scan_runs WHERE id = ?1";
     pub(super) EXPORT_RUN_SCOPES = "SELECT root_id, relative_path, effective_policy, policy_revision, estimated_count, \
-         discovered_count, discovery_state, reconciliation_state, phase_timings_json, error_code \
+         discovered_count, discovery_state, phase_timings_json, error_code \
          FROM library_scan_run_scopes WHERE run_id = ?1 ORDER BY scope_sequence";
     pub(super) EXPORT_RUN_INVENTORY = "SELECT root_id, relative_path, comparison_result, processing_state, failure_code, \
          file_size_bytes FROM library_scan_inventory WHERE run_id = ?1 \
@@ -105,14 +109,14 @@ droppedneedle_kernel::sql! {
     pub(super) DROP_REPAIR_IDENTIFY_JOB = "DELETE FROM library_identify_jobs WHERE local_album_id = ?1 \
                  AND state = 'queued' AND kind = 'historical' \
                  AND requested_by_user_id IS NULL AND created_at = ?2";
-    pub(super) BY_RECORDING = "SELECT t.id, COALESCE(ti.recording_mbid, t.embedded_recording_mbid) = ?1 AS unchallenged \
+    pub(super) BY_RECORDING = "SELECT t.id, " + (crate::recording_mbid!("ti", "t")) + " = ?1 AS unchallenged \
          FROM local_tracks t \
          LEFT JOIN local_track_external_identities ti ON ti.local_track_id = t.id \
          WHERE t.id IN (SELECT local_track_id FROM local_track_external_identities \
                         WHERE recording_mbid = ?1 \
                         UNION SELECT id FROM local_tracks WHERE embedded_recording_mbid = ?1) \
          AND t.availability = 'indexed' ORDER BY t.id";
-    pub(super) NAME_FITS = "SELECT t.id, t.duration_seconds AS seconds, ti.recording_mbid AS accepted, \
+    pub(super) NAME_FITS = "SELECT t.id, t.duration_seconds AS seconds, ti.recording_mbid AS matched, \
          t.embedded_recording_mbid AS tag \
          FROM local_tracks t \
          LEFT JOIN local_track_external_identities ti ON ti.local_track_id = t.id \
@@ -503,7 +507,7 @@ droppedneedle_kernel::sql! {
         title_folded: String,
         artist_name: String,
         artist_folded: String,
-        grouping_source: String,
+        grouping_source: GroupingSource,
         grouping_locked: bool,
     }
     pub(super) row HygieneIdentity for [IDENTITY] {
@@ -561,7 +565,7 @@ droppedneedle_kernel::sql! {
     pub(super) row NameFit for [NAME_FITS] {
         id: String,
         seconds: Option<f64>,
-        accepted: Option<String>,
+        matched: Option<String>,
         tag: Option<String>,
     }
     pub(super) row UnfiledPlay for [STEP] {

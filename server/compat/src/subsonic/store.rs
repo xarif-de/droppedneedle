@@ -125,12 +125,12 @@ fn view_track(track: PlayerTrack, local_first: bool) -> ViewTrack {
     }
 }
 
-/// An album's `musicBrainzId`, as Navidrome sends it: the release. An
-/// accepted match with no known release sends its release group; tag ids
-/// count only as a release.
+/// An album's `musicBrainzId`, as Navidrome sends it: the release. A match
+/// row with no known release sends its release group; tag ids count only
+/// as a release.
 fn album_musicbrainz_id(ids: Option<&AlbumIds>) -> Option<String> {
     let ids = ids?;
-    if ids.accepted {
+    if ids.matched {
         ids.release_mbid
             .clone()
             .or_else(|| ids.release_group_mbid.clone())
@@ -306,7 +306,7 @@ impl SubsonicStore {
             .map(|album| album.record.id.clone())
             .collect::<Vec<_>>();
         let player_ids = self.library.player_ids(&ids, &[]).await?;
-        let counts = self.library.release_song_counts(&ids, &player_ids).await?;
+        let counts = self.library.release_song_counts(&ids).await?;
         let local_first = self.library.local_art_first();
         let mut views = albums
             .into_iter()
@@ -451,6 +451,28 @@ impl SubsonicStore {
             return Ok(None);
         };
         Ok(Some((artist, self.albums_for_caller(albums).await?)))
+    }
+
+    /// The caller's play count and last play of an artist's tracks, or
+    /// `None` before the first. Read for one artist's folder only: the
+    /// artist lists carry no plays.
+    pub async fn artist_plays(
+        &self,
+        artist_mbid: &str,
+    ) -> Result<Option<(i64, Option<String>)>, CompatError> {
+        let Some(user_id) = &self.caller else {
+            return Ok(None);
+        };
+        let plays = self
+            .library
+            .plays(user_id, "artist", &[artist_mbid.to_owned()])
+            .await?;
+        Ok(plays.get(artist_mbid).map(|(count, last)| {
+            (
+                *count as i64,
+                whole(*last).and_then(|at| iso_text(at.max(0) as u64)),
+            )
+        }))
     }
 
     /// Album by release-group mbid, or None.

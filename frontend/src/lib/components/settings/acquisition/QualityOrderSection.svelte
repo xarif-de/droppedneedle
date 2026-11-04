@@ -89,12 +89,7 @@
 	});
 	const pendingPresetLabel = $derived(pendingPresetKey ? PRESETS[pendingPresetKey].label : '');
 	const summary = $derived(recipeSummary(qualityRecipe));
-	const migrationAlert = $derived(
-		migrationStatus === 'v1' ||
-			migrationStatus === 'invalid' ||
-			migrationStatus === 'non_convertible' ||
-			migrationStatus === 'projected'
-	);
+	const migrationAlert = $derived(migrationStatus === 'invalid');
 	const recipeValidationError = $derived.by(() => {
 		for (let index = 0; index < qualityRecipe.length; index += 1) {
 			const error = validateRecipeEntry(
@@ -153,7 +148,7 @@
 	});
 
 	function requestPreset(key: PresetKey) {
-		if (!dirty && migrationStatus !== 'non_convertible' && migrationStatus !== 'invalid') {
+		if (!dirty && !migrationAlert) {
 			applyPreset(key);
 			return;
 		}
@@ -310,16 +305,9 @@
 					{migrationMessage ||
 						'Your saved policy is unchanged until you choose a replacement preset.'}
 				</p>
-				{#if migrationStatus === 'projected'}
-					<p class="mt-1 text-xs text-base-content/70">
-						This projected recipe is safe to review. Saving it adopts the v2 recipe for new
-						acquisitions.
-					</p>
-				{:else}
-					<p class="mt-1 text-xs text-base-content/70">
-						Choose a replacement preset below to create a valid FLAC and MP3 recipe.
-					</p>
-				{/if}
+				<p class="mt-1 text-xs text-base-content/70">
+					Choose a replacement preset below to create a valid FLAC and MP3 recipe.
+				</p>
 			</div>
 		</div>
 	{/if}
@@ -387,7 +375,8 @@
 			<div>
 				<h4 class="font-semibold">Try in this order</h4>
 				<p class="text-sm text-base-content/60">
-					Soulseek prefers earlier entries when copies are equally complete.
+					Soulseek prefers earlier entries when copies are equally complete. Anything not listed
+					here is only downloaded if you pick it.
 				</p>
 			</div>
 			<span class="text-xs uppercase tracking-[0.12em] text-base-content/45"

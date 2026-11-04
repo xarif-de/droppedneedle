@@ -14,6 +14,7 @@
 
 use std::{
     collections::HashMap,
+    panic::AssertUnwindSafe,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -95,22 +96,27 @@ impl<T: Send + Sync + 'static, E: Send + Sync + 'static> Singleflight<T, E> {
                     // stop mid-way, holding what it holds, for good.
                     let done = Arc::new(AtomicBool::new(false));
                     let finished = Arc::clone(&done);
+                    let name = key.to_owned();
                     let task = tokio::spawn(async move {
-                        let outcome = factory().await.map(Arc::new).map_err(Arc::new);
+                        let outcome = AssertUnwindSafe(async move { factory().await })
+                            .catch_unwind()
+                            .await
+                            .map(|result| result.map(Arc::new).map_err(Arc::new));
                         finished.store(true, Ordering::Release);
+                        if outcome.is_err() {
+                            tracing::error!(key = name.as_str(), "a coalesced flight panicked");
+                        }
                         outcome
                     });
                     let flight = async move {
                         match task.await {
-                            Ok(outcome) => outcome,
-                            Err(error) => match error.try_into_panic() {
-                                // The fetch panicked: its callers panic too,
-                                // as they did when they drove it themselves.
-                                Ok(payload) => std::panic::resume_unwind(payload),
-                                // Cancelled: only the runtime shutting down
-                                // does that, and its callers go with it.
-                                Err(_) => std::future::pending().await,
-                            },
+                            Ok(Ok(outcome)) => outcome,
+                            // The fetch panicked: its callers panic too, as
+                            // they did when they drove it themselves.
+                            Ok(Err(payload)) => std::panic::resume_unwind(payload),
+                            // Cancelled: only the runtime shutting down does
+                            // that, and its callers go with it.
+                            Err(_) => std::future::pending().await,
                         }
                     }
                     .boxed()
@@ -276,7 +282,7 @@ mod tests {
     /// gives back what it holds: the artwork resizes share three permits,
     /// and a browser abandoning a cover mid-resize once kept its permit
     /// for good, until every later resize hung (music.xarif.de, 2026-10-31).
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_flight_nobody_waits_for_still_finishes_and_lets_go() {
         let flights = Singleflight::<u32>::new();
         let permits = Arc::new(tokio::sync::Semaphore::new(1));

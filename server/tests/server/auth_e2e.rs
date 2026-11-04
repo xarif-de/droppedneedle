@@ -169,6 +169,7 @@ impl E2e {
                 ),
             ),
             droppedneedle::bootstrap::sign_in_links(p),
+            None,
         )
     }
 
@@ -255,32 +256,37 @@ impl E2e {
             ),
         );
         let backup_dir = p.config.root_app_dir.join("backups");
+        // Concerts over the scratch database and the rig's providers, whose
+        // addresses are closed, so no row can reach a real provider.
+        let concerts = droppedneedle_catalog::concerts::ConcertsSetup::from_platform(p, &providers);
         let jobs = droppedneedle::bootstrap::jobs::JobsSetup::build(
             p,
             self.runtime.checkpoint().clone(),
             media.jobs(p),
-            None,
+            concerts.sweep(),
+            droppedneedle::bootstrap::jobs::catalog_precache(
+                &catalog_setup,
+                &p.settings,
+                crate::common::listening_store(p),
+            )
+            .expect("the catalog bundle has its pages and artwork"),
+            droppedneedle::bootstrap::jobs::QueueSetup::new(p),
             droppedneedle::bootstrap::jobs::ScansEnded::default(),
         );
-        // Concerts over the scratch database and the rig's providers, whose
-        // addresses are closed, so no row can reach a real provider.
-        let concerts = droppedneedle_catalog::concerts::ConcertsSetup::from_platform(p, &providers);
         let admin = droppedneedle::admin::AdminSetup::new(
             auth.users.clone(),
             acquire.requests.quota.clone(),
-            providers.cache.clone(),
             providers.clone(),
-        )
-        .with_db(droppedneedle::admin::AdminDb::new(p.db.clone()))
-        .with_backups(std::sync::Arc::new(
-            droppedneedle_kernel::db::BackupService::new(
+            p.db.clone(),
+            std::sync::Arc::new(droppedneedle_kernel::db::BackupService::new(
                 &self.db_path,
                 &backup_dir,
                 p.clock.clone(),
-            ),
-        ))
-        .with_checkpoint(self.runtime.checkpoint().clone())
-        .with_precache(jobs.precache_trigger());
+            )),
+            self.runtime.checkpoint().clone(),
+            jobs.precache_trigger(),
+            crate::common::bundles::covers_at(p),
+        );
         // The production plugins bundle over the scratch plugins folder,
         // launching nothing, reading GitHub through the rig's providers.
         let ticks = droppedneedle_plugins::wiring::tick_store(p);
@@ -297,14 +303,7 @@ impl E2e {
             ticks,
             providers.github_repos.clone(),
         );
-        let settings =
-            droppedneedle::settings::wiring::SettingsSetup::for_tests(Arc::clone(&p.ids))
-                .expect("test settings bundle builds")
-                .with_library_catalog(Arc::new(
-                    droppedneedle::settings::library_catalog::SqliteLibraryPolicyCatalog {
-                        pool: p.db.sqlx().clone(),
-                    },
-                ));
+        let settings = crate::common::bundles::settings_closed(p);
         AppState::new(
             Arc::clone(&p.ids),
             p.config.clone(),
@@ -570,7 +569,10 @@ async fn journey_a_setup_login_sessions_logoutall_relogin() {
 
     let (status, body, _) = call(e2e.router(), "GET", "/api/v3/auth/setup/status", &[], None).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, json!({"setup_required": true}));
+    assert_eq!(
+        body,
+        json!({"setup_required": true, "code_required": false})
+    );
 
     let (_admin, setup_cookie) =
         setup_admin(e2e.router(), "e2e-admin", "e2e-admin-password-1", "cookie").await;
@@ -578,7 +580,10 @@ async fn journey_a_setup_login_sessions_logoutall_relogin() {
 
     let (status, body, _) = call(e2e.router(), "GET", "/api/v3/auth/setup/status", &[], None).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, json!({"setup_required": false}));
+    assert_eq!(
+        body,
+        json!({"setup_required": false, "code_required": false})
+    );
 
     // Cookie login: session in the cookie, nothing sensitive in the body.
     let (status, body, headers) =
@@ -1098,6 +1103,9 @@ enum Declared {
     Admin,
     /// `[{"wrapped_key": []}]`: the wrapped API key, never a session.
     WrappedKey,
+    /// `[{"upgrade_session": []}]`: the upgrade page's own sign-in, served
+    /// only in upgrade mode.
+    UpgradeSession,
 }
 
 /// One documented operation and the posture it declares.
@@ -1167,6 +1175,7 @@ fn declared(security: &Value) -> Option<Declared> {
         ("session", ["curator"]) => Some(Declared::Curator),
         ("session", ["admin"]) => Some(Declared::Admin),
         ("wrapped_key", []) => Some(Declared::WrappedKey),
+        ("upgrade_session", []) => Some(Declared::UpgradeSession),
         _ => None,
     }
 }
@@ -1194,6 +1203,9 @@ const PUBLIC_OPERATIONS: &[(&str, &str)] = &[
     // Token-identified callbacks from MusicBrainz and Spotify.
     ("GET", "/api/v3/library/contributions/musicbrainz/callback"),
     ("GET", "/api/v3/acquire/spotify/auth/callback"),
+    // Upgrade mode's state read and sign-in, served only there.
+    ("GET", "/api/v3/upgrade/state"),
+    ("POST", "/api/v3/upgrade/sign-in"),
 ];
 
 /// The operations that take the wrapped API key, pinned the same way.
@@ -1202,6 +1214,22 @@ const WRAPPED_KEY_OPERATIONS: &[(&str, &str)] = &[
     ("GET", "/api/v3/wrapped/user/{user_id}"),
     ("GET", "/api/v3/wrapped/server"),
 ];
+
+/// The operations that take the upgrade page's sign-in, pinned the same
+/// way. Upgrade mode alone serves them, so the app answers each with 404.
+const UPGRADE_SESSION_OPERATIONS: &[(&str, &str)] = &[
+    ("POST", "/api/v3/upgrade/preflight"),
+    ("POST", "/api/v3/upgrade/start"),
+    ("POST", "/api/v3/upgrade/fresh"),
+    ("GET", "/api/v3/upgrade/progress"),
+    ("POST", "/api/v3/upgrade/undo"),
+    ("POST", "/api/v3/upgrade/continue"),
+];
+
+/// Upgrade mode's operations, which the app does not serve.
+fn upgrade_mode_only(path: &str) -> bool {
+    path.starts_with("/api/v3/upgrade/")
+}
 
 /// What one operation needs beyond its declared posture.
 #[derive(Debug, Clone, Copy)]
@@ -1236,6 +1264,12 @@ const EXCEPTIONS: &[(&str, &str, Exception, &str)] = &[
         "/api/v3/held/{entry_id}/match",
         Exception::Body(item_match_body),
         "an empty object fails to decode before the handler runs",
+    ),
+    (
+        "PUT",
+        "/api/v3/library/albums/{album_id}/looks-wrong",
+        Exception::Body(looks_wrong_body),
+        "any signed-in user marks an album; an empty object fails to decode before the handler runs",
     ),
     (
         "POST",
@@ -1309,6 +1343,11 @@ fn item_match_body() -> Value {
     json!({"release_group_mbid": "e2e-dummy-id"})
 }
 
+/// Taking back a mark the caller never made: nothing changes.
+fn looks_wrong_body() -> Value {
+    json!({"looks_wrong": false})
+}
+
 /// A BrainzMash binding on a non-BrainzMash selection: refused with 400
 /// before anything is probed.
 fn verify_body() -> Value {
@@ -1376,6 +1415,11 @@ fn public_and_own_credential_operations_are_pinned() {
         pinned(WRAPPED_KEY_OPERATIONS),
         "the wrapped-key operations changed; edit WRAPPED_KEY_OPERATIONS after review"
     );
+    assert_eq!(
+        with(Declared::UpgradeSession),
+        pinned(UPGRADE_SESSION_OPERATIONS),
+        "the upgrade-session operations changed; edit UPGRADE_SESSION_OPERATIONS after review"
+    );
     for (method, path, _, _) in EXCEPTIONS {
         assert!(
             operations
@@ -1413,6 +1457,7 @@ enum Expect {
 fn expect(role: CallerRole, posture: Declared) -> Expect {
     match (role, posture) {
         (_, Declared::WrappedKey) => Expect::NoSession,
+        (_, Declared::UpgradeSession) => unreachable!("upgrade mode's operations are 404 here"),
         (_, Declared::User) => Expect::Admitted,
         (CallerRole::Trusted | CallerRole::Admin, Declared::Curator) => Expect::Admitted,
         (CallerRole::Admin, Declared::Admin) => Expect::Admitted,
@@ -1451,6 +1496,16 @@ async fn credentialed_pass(matrix: &MatrixApp, operations: &[Operation], caller:
         };
         let auth = caller.auth.clone();
         let headers = [("authorization", auth.as_str())];
+        if upgrade_mode_only(&op.path) {
+            let body = request_body(method, exception);
+            let (status, body, _) = call(matrix.fresh(), method, &uri, &headers, body).await;
+            assert_eq!(
+                status,
+                StatusCode::NOT_FOUND,
+                "the app does not serve {method} {uri} to the {who} pass: {body}"
+            );
+            continue;
+        }
         let (status, body) = match exception {
             Some(Exception::StatusOnly) => (
                 call_status(matrix.fresh(), method, &uri, &headers).await,
@@ -1548,6 +1603,14 @@ async fn auth_on_every_endpoint() {
             StatusCode::TOO_MANY_REQUESTS,
             "{method} {uri}: the anonymous pass tripped the limiter"
         );
+        if upgrade_mode_only(&op.path) {
+            assert_eq!(
+                status,
+                StatusCode::NOT_FOUND,
+                "the app does not serve {method} {uri}: {response_body}"
+            );
+            continue;
+        }
         match op.posture {
             Declared::Public => assert_ne!(
                 status,
@@ -1566,6 +1629,7 @@ async fn auth_on_every_endpoint() {
                     "{method} {uri}: a shared-secret rejection must not send a Bearer challenge"
                 );
             }
+            Declared::UpgradeSession => unreachable!("upgrade mode's operations are 404 here"),
             Declared::User | Declared::Curator | Declared::Admin => {
                 assert_eq!(
                     status,
@@ -1617,6 +1681,14 @@ async fn auth_on_every_endpoint() {
     credentialed_pass(&matrix, &operations, &mut user).await;
     credentialed_pass(&matrix, &operations, &mut trusted).await;
     credentialed_pass(&matrix, &operations, &mut admin).await;
+
+    // The admin pass saved the wrapped settings with its dummy body, as the
+    // route does in the app; put the key back before trying it.
+    e2e.store
+        .save_secret_blocking(WrappedSettings {
+            api_key: Secret::new(TEST_WRAPPED_KEY),
+        })
+        .expect("wrapped key saves");
 
     // The wrapped key admits where no session can.
     for op in operations
@@ -1778,7 +1850,10 @@ async fn setup_edges() {
     // Empty database: setup required.
     let (status, body, _) = call(e2e.router(), "GET", "/api/v3/auth/setup/status", &[], None).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, json!({"setup_required": true}));
+    assert_eq!(
+        body,
+        json!({"setup_required": true, "code_required": false})
+    );
 
     // Login before setup: no users, so the uniform invalid-credentials 401
     // (v2 behavior; the dummy-hash verify runs behind it).
@@ -1802,7 +1877,10 @@ async fn setup_edges() {
     assert_eq!(status, StatusCode::CREATED);
     let (status, body, _) = call(e2e.router(), "GET", "/api/v3/auth/setup/status", &[], None).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, json!({"setup_required": false}));
+    assert_eq!(
+        body,
+        json!({"setup_required": false, "code_required": false})
+    );
 
     // ...and a second setup is refused with the v2 conflict.
     let (status, body, _) = call(
@@ -1978,44 +2056,6 @@ async fn rate_limits_key_by_client_and_username() {
     );
 }
 
-/// The v1 callbacks kept for migrated apps are limited like their v3 twins:
-/// each reaches a write, and the OIDC one shares the sign-in class.
-#[tokio::test]
-async fn the_legacy_callbacks_meet_the_limiter() {
-    let e2e = E2e::open("legacy-burst").await;
-    let app = held_clock_router(&e2e);
-    let mut limited = 0;
-    for _ in 0..30 {
-        let (status, _, _) = call_raw(
-            app.clone(),
-            "GET",
-            "/api/v1/auth/oidc/callback?code=c&state=s",
-            &[],
-        )
-        .await;
-        if status == StatusCode::TOO_MANY_REQUESTS {
-            limited += 1;
-        }
-    }
-    assert_eq!(limited, 25, "the v1 OIDC callback");
-    let (status, _, _) = call(
-        app.clone(),
-        "POST",
-        "/api/v3/auth/oidc/authorize",
-        &[],
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "one bucket");
-    for uri in [
-        "/api/v1/me/connections/spotify/auth/callback",
-        "/api/v1/library/contributions/musicbrainz/callback",
-    ] {
-        let (_, headers, _) = call_raw(app.clone(), "GET", uri, &[]).await;
-        assert_eq!(headers["x-ratelimit-limit"], "60", "{uri}");
-    }
-}
-
 /// One unauthenticated client bursting at a sign-in route is limited on its
 /// own class before it can spend the provider row every client shares.
 #[tokio::test]
@@ -2126,7 +2166,11 @@ async fn busy_setup_leaves_no_admin_and_a_retry_runs_it() {
     assert_eq!(body["error"]["code"], "SERVER_BUSY", "{body}");
     assert!(headers.contains_key("retry-after"));
     let (_, body, _) = call(e2e.router(), "GET", "/api/v3/auth/setup/status", &[], None).await;
-    assert_eq!(body, json!({"setup_required": true}), "no admin was left");
+    assert_eq!(
+        body,
+        json!({"setup_required": true, "code_required": false}),
+        "no admin was left"
+    );
 
     crate::common::break_schema(e2e.db(), "DROP TRIGGER slow_session;").await;
     let (status, body, _) =
@@ -2423,7 +2467,7 @@ fn percentile(sorted: &[Duration], pct: f64) -> Duration {
 }
 
 #[tokio::test]
-#[ignore = "login timing budget; run explicitly with --release: cargo test --release --test it login_p95 -- --ignored"]
+#[ignore = "login timing budget; run explicitly with --release: cargo test --release --test server login_p95 -- --ignored --nocapture"]
 async fn login_p95_within_login_budget() {
     const N: usize = 50;
     const BUDGET: Duration = Duration::from_millis(600);
@@ -2469,6 +2513,7 @@ async fn login_p95_within_login_budget() {
     let p50 = percentile(&samples, 50.0);
     let p95 = percentile(&samples, 95.0);
     let max = samples[samples.len() - 1];
+    println!("login over {N} logins: p50 {p50:?}, p95 {p95:?}, max {max:?}");
     assert!(
         p95 <= BUDGET,
         "FINDING: login p95 {p95:?} exceeds the 600ms login budget \

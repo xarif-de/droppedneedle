@@ -1,4 +1,13 @@
-export const AUTH_FREE_PATHS = ['/login', '/setup', '/auth/callback', '/recover-password'];
+// The page a server started on v2 data serves in place of the app.
+export const UPGRADE_PATH = '/upgrade';
+
+export const AUTH_FREE_PATHS = [
+	'/login',
+	'/setup',
+	'/auth/callback',
+	'/recover-password',
+	UPGRADE_PATH
+];
 
 // Pages shown without the app shell (no navigation, no player): the signed-out
 // ones, and the app connect confirmation, which needs a session but is a

@@ -12,7 +12,7 @@ use std::sync::Arc;
 use droppedneedle_acquire::db::AcquireDb;
 use droppedneedle_acquire::downloads::SourceTag;
 use droppedneedle_acquire::downloads::journal::Journal;
-use droppedneedle_acquire::downloads::landing_rows::ImportDecisionRow;
+use droppedneedle_acquire::downloads::landing_rows::{ImportDecisionRow, ImportOutcome};
 use droppedneedle_acquire::downloads::queue_rows::Viewer as HeldViewer;
 use droppedneedle_acquire::downloads::sources::SourceHandle;
 use droppedneedle_acquire::downloads::state::{AttemptState, TaskStatus};
@@ -2471,6 +2471,114 @@ async fn a_landing_waits_out_its_own_stopped_publish() {
     assert_eq!(files_under(&music, "flac").len(), 1);
 }
 
+/// A complete album that arrives with a bonus file in a format the recipe
+/// does not list (a Usenet or plugin release, fetched whole) is imported
+/// without that file, which pairs with no track.
+#[tokio::test]
+async fn a_bonus_file_the_recipe_does_not_list_is_left_out() {
+    let db = AcquireDb::scratch().expect("scratch db");
+    db.add_user("u-ada", "Ada", "user").await.expect("user");
+    let dir = db.path().parent().expect("scratch dir").to_path_buf();
+    let config = Arc::new(
+        ConfigStore::scratch(&dir, Crypto::from_key_bytes(&[7u8; 32]).expect("key"))
+            .expect("config"),
+    );
+    let platform = TestPlatform::on(db.db(), &dir)
+        .settings(config)
+        .build()
+        .await;
+    let (library, _) = library_at(&platform);
+    let music = dir.join("music");
+    std::fs::create_dir_all(&music).expect("music root");
+    library
+        .scans
+        .add_root(
+            Some("music".to_owned()),
+            music.to_string_lossy().into_owned(),
+            EffectivePolicy::Automatic,
+        )
+        .expect("root adds");
+    let job = dir.join("downloads").join("job");
+    let titles = &TITLES[..];
+    let tracks: Vec<PathBuf> = TITLES
+        .iter()
+        .zip(FIXTURES)
+        .zip(1u32..)
+        .map(|((title, fixture), number)| {
+            let file = land_file(
+                &job,
+                &format!("{number:02} - {title}.flac"),
+                fixture,
+                title,
+                number,
+            );
+            // The tracks name their release, as a scene release's do.
+            save_tags(
+                &file,
+                &[TagEdit::new(
+                    TagField::MusicBrainzReleaseId,
+                    vec![GOOD_RELEASE.to_owned()],
+                )],
+            )
+            .expect("release id");
+            file
+        })
+        .collect();
+    let bonus = land_file(
+        &job,
+        "99 - Interview.ogg",
+        "management_full.ogg",
+        "Interview",
+        99,
+    );
+    let lengths: Vec<_> = tracks.iter().map(|track| length_ms(track)).collect();
+    let releases: Arc<dyn ReleaseSource> = Arc::new(Releases(vec![release(
+        GOOD_RELEASE,
+        GOOD_GROUP,
+        titles,
+        &lengths,
+    )]));
+    let acquire = acquire_over(
+        &platform,
+        &library,
+        Arc::new(LibraryLanding::new(&library, every_priority(releases))),
+    );
+    acquire
+        .journal
+        .run("test.seed", |store| {
+            store.insert_task(&new_task("t-bonus", GOOD_GROUP), 1.0)
+        })
+        .await
+        .expect("task");
+    let task = acquire.journal.read_task("t-bonus").await.unwrap().unwrap();
+    let report = acquire
+        .landing
+        .land(
+            &task,
+            None,
+            Landed {
+                mounts: vec![dir.join("downloads").into()],
+                files: tracks
+                    .into_iter()
+                    .chain([bonus])
+                    .map(Reported::path)
+                    .collect(),
+            },
+            false,
+        )
+        .await;
+    assert!(
+        matches!(report.result, LandingResult::Imported { complete: true }),
+        "{:?}",
+        report.result
+    );
+    assert_eq!(files_under(&music, "flac").len(), 2);
+    assert!(
+        files_under(&music, "ogg").is_empty(),
+        "the bonus is left out"
+    );
+}
+
 /// A person confirmed a pick outside the quality band: the attempt that
 /// fetched exactly that pick imports its files, while the same files from
 /// any other attempt of the task (a failover) are refused on quality.
@@ -2585,10 +2693,10 @@ async fn a_quality_waiver_keeps_only_the_pinned_attempts_files() {
             );
             assert_eq!(files_under(&music, "flac").len(), 1);
         } else {
-            let LandingResult::Rejected(rejection) = result else {
+            let LandingResult::Held { code, .. } = result else {
                 panic!("an attempt that is not the pick was kept: {result:?}");
             };
-            assert_eq!(rejection.code, Reason::QualityRejected);
+            assert_eq!(code.code(), "format_not_listed");
             assert!(files_under(&music, "flac").is_empty());
         }
     }
@@ -2616,13 +2724,20 @@ async fn a_wait_after_an_import_does_not_hide_it() {
                 AttemptState::InUse,
                 1.0,
             )?;
-            for (outcome, at) in [("imported", 2.0), ("deferred", 3.0)] {
+            for (outcome, at) in [
+                (ImportOutcome::Imported, 2.0),
+                (ImportOutcome::Deferred, 3.0),
+            ] {
                 store.record_import_decision(&ImportDecisionRow {
                     task_id: "t-again".to_owned(),
                     attempt_id: Some("t-again-a0".to_owned()),
-                    outcome: outcome.to_owned(),
+                    outcome,
                     files_total: 2,
-                    files_imported: if outcome == "imported" { 2 } else { 0 },
+                    files_imported: if outcome == ImportOutcome::Imported {
+                        2
+                    } else {
+                        0
+                    },
                     checks_json: "[]".to_owned(),
                     missing_positions: "[]".to_owned(),
                     decided_at: at,
@@ -3843,7 +3958,7 @@ impl JoinRig {
         self.sql(&format!(
             "INSERT INTO library_play_history (id, user_id, local_track_id, local_album_id, \
              track_name, artist_name, played_at) SELECT 'play-{track}', 'u-ada', id, \
-             local_album_id, title, 'Portishead', '2026-01-01T00:00:00Z' FROM local_tracks \
+             local_album_id, title, 'Portishead', 1767225600000 FROM local_tracks \
              WHERE id = '{track}'; \
              INSERT INTO catalog_user_favorites (user_id, item_kind, item_id, created_at) \
              VALUES ('u-ada', 'track', '{track}', 0);"
@@ -6882,7 +6997,7 @@ impl LandingLibrary for Shaky {
         release: &'a str,
         release_track: &'a str,
         recording: &'a str,
-    ) -> BoxFuture<'a, Vec<OwnedCopy>> {
+    ) -> BoxFuture<'a, Result<Vec<OwnedCopy>, DbError>> {
         self.inner
             .owned_copies(group, album, release, release_track, recording)
     }
@@ -6892,7 +7007,7 @@ impl LandingLibrary for Shaky {
         track_id: &'a str,
         planned: &'a PlannedAlbum,
         release: &'a Release,
-    ) -> BoxFuture<'a, Option<VersionRow>> {
+    ) -> BoxFuture<'a, Result<Option<VersionRow>, DbError>> {
         self.inner.version_row(track_id, planned, release)
     }
 
@@ -6996,6 +7111,9 @@ enum Have {
     /// A copy holding "Mysterons" in another version, on no track of NEW;
     /// the download replaces it.
     Version,
+    /// An album with no match whose "Mysterons" from this fixture names
+    /// the group and whose "Sour Times" names another: it owns nothing.
+    Mixed(&'static str),
 }
 
 /// One row: the plan (what the library has, the file, its origin, what
@@ -7021,6 +7139,8 @@ struct Row {
     gate: Gate,
     /// The hold a person imports it from, under `PersonChoseFile`.
     held_for: Reason,
+    /// The copy's match is a best guess, which tagging would not touch.
+    flagged: bool,
     expect: Seen,
 }
 
@@ -7127,6 +7247,7 @@ impl IntakeCase {
             _grounds: (platform, db),
         };
         let sour = copy_rel(s, SOUR_TIMES);
+        let source = if row.flagged { "automatic" } else { "manual" };
         let (copy, old) = match row.have {
             Have::Nothing => (None, None),
             Have::Copy(fixture) => {
@@ -7136,9 +7257,26 @@ impl IntakeCase {
                 rig.scan().await;
                 let old = rig.track_at(&mysterons);
                 let album = rig.album_of(&old);
-                rig.set_edition(&album, &e.group, &e.new.id, "manual");
-                rig.place(&old, &e.new, 0, "manual");
-                rig.place(&rig.track_at(&sour), &e.new, 1, "manual");
+                rig.set_edition(&album, &e.group, &e.new.id, source);
+                rig.place(&old, &e.new, 0, source);
+                rig.place(&rig.track_at(&sour), &e.new, 1, source);
+                (Some(album), Some(old))
+            }
+            Have::Mixed(fixture) => {
+                let mysterons = copy_rel(s, &format!("0101 Mysterons.{}", ext(fixture)));
+                rig.plant_from(&mysterons, fixture, 0, &e.new);
+                rig.plant(&sour, 1, &e.new);
+                rig.scan().await;
+                let old = rig.track_at(&mysterons);
+                let album = rig.album_of(&old);
+                rig.sql(&format!(
+                    "DELETE FROM local_album_external_identities WHERE local_album_id = '{album}'; \
+                     DELETE FROM library_album_match_state WHERE local_album_id = '{album}'; \
+                     UPDATE local_tracks SET embedded_release_group_mbid = '{}' \
+                     WHERE id = '{}';",
+                    e.other.release_group_id,
+                    rig.track_at(&sour)
+                ));
                 (Some(album), Some(old))
             }
             Have::Planned => {
@@ -7157,12 +7295,21 @@ impl IntakeCase {
                 rig.scan().await;
                 let old = rig.track_at(&o);
                 let album = rig.album_of(&old);
-                rig.set_edition(&album, &e.group, &e.new.id, "manual");
-                rig.place(&rig.track_at(&sour), &e.new, 1, "manual");
+                rig.set_edition(&album, &e.group, &e.new.id, source);
+                rig.place(&rig.track_at(&sour), &e.new, 1, source);
                 rig.listen(&old);
                 (Some(album), Some(old))
             }
         };
+        if row.flagged
+            && let Some(album) = &copy
+        {
+            rig.sql(&format!(
+                "INSERT INTO library_album_match_state (local_album_id, state, reason_code, \
+                 candidates_json, updated_at) VALUES ('{album}', 'unconfirmed', 'WEAK_MATCH', \
+                 '[]', 1);"
+            ));
+        }
         if row.taken {
             let taken = rig
                 .music
@@ -7241,6 +7388,15 @@ impl IntakeCase {
         .fetch_all(self.rig.acquire.db.db().sqlx())
         .await
         .expect("tracks")
+    }
+
+    /// Whether an old "Mysterons" went to the recycle bin.
+    fn old_recycled(&self) -> bool {
+        let bin = self.rig.music.join(".recycle");
+        files_under(&bin, "flac")
+            .into_iter()
+            .chain(files_under(&bin, "mp3"))
+            .any(|path| path.to_string_lossy().contains("Mysterons"))
     }
 
     /// Run `row` through `door` and say what became of the file.
@@ -7565,6 +7721,7 @@ async fn one_plan_and_gate_give_one_outcome_through_every_door() {
         changes: 0,
         gate: Auto,
         held_for: Reason::TagMismatch,
+        flagged: false,
         expect: Seen::Imported { joined: false },
     };
     let owned = |fixture, heard| Row {
@@ -7757,6 +7914,159 @@ async fn one_plan_and_gate_give_one_outcome_through_every_door() {
     }
 }
 
+/// A row's doors for its gate.
+fn doors_of(gate: Gate) -> &'static [Door] {
+    match gate {
+        Gate::Automatic => &[Door::Place, Door::Landing],
+        Gate::PersonChoseAlbum => &[Door::Place, Door::DropMatch],
+        Gate::PersonChoseFile => &[Door::Place, Door::HeldImport],
+        Gate::HeldRetry => &[],
+    }
+}
+
+/// A better "Mysterons" for an album tagging would not touch: the copy's
+/// match is a best guess (its file replaced in place, or "Replace tracks
+/// you have in another version"), or it has no match and its files' tags
+/// disagree. Whether downloaded or uploaded, the new file is held and the
+/// old one stays where it is.
+#[tokio::test]
+async fn an_upgrade_on_a_flagged_album_is_held_and_the_old_copy_stays() {
+    use Gate::{Automatic as Auto, PersonChoseAlbum as Album};
+    let base = Row {
+        have: Have::Copy("mp3_full_01.mp3"),
+        file: "flac_full_01.flac",
+        upgrade: true,
+        heard: Some(true),
+        down: false,
+        length_agrees: false,
+        taken: false,
+        changes: 0,
+        gate: Auto,
+        held_for: Reason::TagMismatch,
+        flagged: true,
+        expect: Seen::Held(Reason::AlbumNeedsCheck),
+    };
+    let rows = [
+        ("flagged copy, downloaded", base),
+        (
+            "flagged copy, uploaded",
+            Row {
+                gate: Album,
+                ..base
+            },
+        ),
+        (
+            "flagged version",
+            Row {
+                have: Have::Version,
+                upgrade: false,
+                ..base
+            },
+        ),
+        (
+            "tags disagree, downloaded",
+            Row {
+                have: Have::Mixed("mp3_full_01.mp3"),
+                flagged: false,
+                ..base
+            },
+        ),
+        (
+            "tags disagree, uploaded",
+            Row {
+                have: Have::Mixed("mp3_full_01.mp3"),
+                flagged: false,
+                gate: Album,
+                ..base
+            },
+        ),
+    ];
+    for (name, row) in rows {
+        for door in doors_of(row.gate) {
+            let case = IntakeCase::new(&row).await;
+            let seen = case.run(&row, *door).await;
+            assert_eq!(seen, row.expect, "{name}, through {door:?}");
+            let old = case.old.as_deref().expect("an old copy");
+            let kept = case.mysterons().await;
+            assert!(
+                kept.iter().any(|(track, _)| track == old),
+                "{name}, through {door:?}: the old copy stays indexed"
+            );
+            assert!(
+                !case.old_recycled(),
+                "{name}, through {door:?}: nothing went to the recycle bin"
+            );
+        }
+    }
+}
+
+/// A person importing that held file passes the check: a better file
+/// replaces the old copy, and one no better stays held.
+#[tokio::test]
+async fn importing_that_held_file_replaces_when_better() {
+    let base = Row {
+        have: Have::Copy("mp3_full_01.mp3"),
+        file: "flac_full_01.flac",
+        upgrade: true,
+        heard: Some(true),
+        down: false,
+        length_agrees: false,
+        taken: false,
+        changes: 0,
+        gate: Gate::PersonChoseFile,
+        held_for: Reason::AlbumNeedsCheck,
+        flagged: true,
+        expect: Seen::Imported { joined: true },
+    };
+    let rows = [
+        ("flagged copy", base),
+        (
+            "flagged version",
+            Row {
+                have: Have::Version,
+                upgrade: false,
+                ..base
+            },
+        ),
+        (
+            "flagged copy, no better",
+            Row {
+                have: Have::Copy("flac_full_01.flac"),
+                expect: Seen::Held(Reason::NoBetterThanYours),
+                ..base
+            },
+        ),
+        (
+            "tags disagree",
+            Row {
+                have: Have::Mixed("mp3_full_01.mp3"),
+                flagged: false,
+                ..base
+            },
+        ),
+    ];
+    for (name, row) in rows {
+        for door in doors_of(row.gate) {
+            let case = IntakeCase::new(&row).await;
+            let seen = case.run(&row, *door).await;
+            let replaced = matches!(row.expect, Seen::Imported { .. });
+            if matches!(row.have, Have::Mixed(_)) {
+                assert!(
+                    matches!(seen, Seen::Imported { .. }),
+                    "{name}, through {door:?}: {seen:?}"
+                );
+            } else {
+                assert_eq!(seen, row.expect, "{name}, through {door:?}");
+            }
+            assert_eq!(
+                case.old_recycled(),
+                replaced,
+                "{name}, through {door:?}: the old copy is in the recycle bin"
+            );
+        }
+    }
+}
+
 // Only a measured length outranks a fingerprint. An MP3 with no frame
 // count has only an estimated length: inside 3 s of the track's, it still
 // does not vouch for a file AcoustID hears as another recording, so the
@@ -7774,6 +8084,7 @@ async fn an_estimated_length_never_outranks_a_fingerprint() {
         changes: 0,
         gate: Gate::Automatic,
         held_for: Reason::FingerprintMismatch,
+        flagged: false,
         expect: Seen::Held(Reason::FingerprintMismatch),
     };
     for door in [Door::Place, Door::HeldRecheck] {

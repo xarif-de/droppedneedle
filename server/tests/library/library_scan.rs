@@ -144,30 +144,6 @@ fn query(library: &LibrarySetup, sql: &str) -> i64 {
         .unwrap_or_else(|error| panic!("{sql}: {error}"))
 }
 
-/// The multi-disc naming preset names disc folders after the medium
-/// (`{medium_format} {medium_number:02d}`, path-cleaned `12_ Vinyl 01`).
-/// Such folders fold into their album like `CD1`, so a double vinyl the
-/// library organized itself stays one album.
-#[tokio::test]
-async fn disc_folders_named_after_the_medium_stay_one_album() {
-    let scratch = ScratchDir::new("scan-medium-discs");
-    let music = scratch.join("music");
-    plant(&music, "Album/12_ Vinyl 01/01.mp3", "mp3_full_01.mp3");
-    plant(&music, "Album/12_ Vinyl 02/01.mp3", "mp3_full_01.mp3");
-    let library = bundle(&scratch).await;
-
-    let run = scan(&library).await;
-    assert_eq!(count(&run, Counter::Indexed), 2);
-    assert_eq!(
-        query(
-            &library,
-            "SELECT COUNT(DISTINCT local_album_id) FROM local_tracks"
-        ),
-        1,
-        "both vinyls are one album"
-    );
-}
-
 /// The catalog holds what the tags say, with provenance and header
 /// durations, the changed albums are offered to identification once, and
 /// neither scan nor a no-op rescan writes a byte of music.
@@ -508,38 +484,45 @@ async fn a_scan_records_whether_each_length_was_measured() {
 }
 
 /// A file read before track totals were kept has an edition row without
-/// one. An incremental scan does not read the unchanged file again, so the
-/// total stays unknown; a "rescan files" reads it, stores the total and
+/// one. The next scan reads the unchanged file's total into that row and
 /// moves the catalog revision, which tells player apps to read the
-/// library again.
+/// library again, with no "rescan files". A file whose tags name no total
+/// is recorded as read, so later scans leave it alone.
 #[tokio::test]
-async fn rescanning_files_stores_the_track_total_an_older_read_skipped() {
+async fn a_scan_fills_the_track_total_an_older_read_skipped() {
     let scratch = ScratchDir::new("scan-track-total");
-    plant(
-        &scratch.join("music"),
-        "Album/01.flac",
-        "management_full.flac",
-    );
+    let music = scratch.join("music");
+    plant(&music, "Album/01.flac", "management_full.flac");
+    plant(&music, "Other/01.flac", "flac_no_tags.flac");
     let library = bundle(&scratch).await;
     scan(&library).await;
-    let total = "SELECT COUNT(*) FROM local_track_edition_tags WHERE total_tracks = 9";
-    assert_eq!(query(&library, total), 1, "a new file's total is read");
+    let total = |value: i64| {
+        query(
+            &library,
+            &format!("SELECT COUNT(*) FROM local_track_edition_tags WHERE total_tracks = {value}"),
+        )
+    };
+    assert_eq!((total(9), total(0)), (1, 1), "a new file's total is read");
     let revision = "SELECT value FROM library_catalog_revision WHERE singleton = 1";
     library
         .scan_store
         .db()
         .run_sql("UPDATE local_track_edition_tags SET total_tracks = NULL")
         .expect("an older read");
-
-    let run = scan(&library).await;
-    assert_eq!(count(&run, Counter::Unchanged), 1);
-    assert_eq!(query(&library, total), 0, "an unchanged file is not read");
     let before = query(&library, revision);
 
-    let run = scan_as(&library, ScanKind::RescanFiles).await;
-    assert_eq!(run.state.scan_state(), ScanState::Completed);
-    assert_eq!(query(&library, total), 1, "a rescan reads it");
-    assert!(query(&library, revision) > before, "the revision moves");
+    let run = scan(&library).await;
+    assert_eq!(count(&run, Counter::Unchanged), 2);
+    assert_eq!((total(9), total(0)), (1, 1), "the scan fills both");
+    let filled = query(&library, revision);
+    assert!(filled > before, "the revision moves");
+
+    scan(&library).await;
+    assert_eq!(
+        query(&library, revision),
+        filled,
+        "a filled row is not read again"
+    );
 }
 
 /// A vanished file is marked missing, never deleted. A scope that loses
@@ -2828,7 +2811,7 @@ fn listener_acts(album: &str) -> String {
     format!(
         "INSERT INTO library_play_history (id, user_id, local_track_id, local_album_id, \
          track_name, artist_name, played_at) SELECT 'play-1', 'listener', id, local_album_id, \
-         'Song', 'Artist', '2026-01-01T00:00:00Z' {moved}; \
+         'Song', 'Artist', 1767225600000 {moved}; \
          INSERT OR IGNORE INTO auth_users (id, display_name, role, created_at) VALUES ('listener', 'Person', 'user', 1); \
          INSERT INTO catalog_user_favorites (user_id, item_kind, item_id, created_at) \
          SELECT 'listener', 'album', local_album_id, 0 {moved}; \
@@ -4504,7 +4487,7 @@ async fn retag_across_a_cancelled_scan_is_joined_at_the_next() {
         let play = if played {
             "INSERT INTO library_play_history (id, user_id, local_track_id, local_album_id, \
              track_name, artist_name, played_at) SELECT 'play-1', 'listener', id, \
-             local_album_id, 'Song', 'Artist', '2026-01-01T00:00:00Z' FROM local_tracks \
+             local_album_id, 'Song', 'Artist', 1767225600000 FROM local_tracks \
              WHERE relative_path = 'a/t299.flac';"
         } else {
             ""
@@ -6324,7 +6307,7 @@ async fn continued_tracks_follow_their_files_back_and_forth() {
     assert_eq!(rig.stars_and_aliases(&new).0, 1, "what moved stays");
     rig.run(&format!(
         "INSERT INTO library_play_history (id, user_id, local_track_id, track_name, \
-         artist_name, played_at) VALUES ('back', 'listener', '{old}', 'T', 'A', '2026');"
+         artist_name, played_at) VALUES ('back', 'listener', '{old}', 'T', 'A', 0);"
     ));
     rig.lose(&first).await;
     assert_eq!(rig.aliases(), vec![(old.clone(), new.clone())]);
@@ -6482,8 +6465,9 @@ async fn an_edition_choice_moves_nothing_onto_a_file_it_leaves_out() {
     .expect("candidate");
     let mut db = droppedneedle_kernel::db::open_connection(&rig.db()).expect("db opens");
     let tx = db.transaction().expect("transaction");
-    let choice = droppedneedle_library::edition::choice::choose(&tx, &album, &candidate, None, 1.0)
-        .expect("edition chosen");
+    let choice =
+        droppedneedle_library::edition::choice::choose(&tx, &album, &candidate, None, false, 1.0)
+            .expect("edition chosen");
     tx.commit().expect("committed");
     assert_eq!(choice.extra_track_ids, vec![extra.clone()]);
     assert_eq!(rig.stars_and_aliases(&old), (1, 0));
@@ -8236,7 +8220,7 @@ impl ArtistRig {
              VALUES ('{user}', 'artist', '{artist}', 1); \
              INSERT INTO library_play_history (id, user_id, local_artist_id, track_name, \
              artist_name, played_at) VALUES ('{user}-{artist}', '{user}', '{artist}', 'Song', \
-             'Artist', '2026-01-01T00:00:00Z');"
+             'Artist', 1767225600000);"
         ));
     }
 
@@ -10256,7 +10240,7 @@ async fn another_album_copied_over_an_old_one_comes_in_as_new_tracks() {
          VALUES ('listener', 'album', '{album}', 1); \
          INSERT INTO library_play_history (id, user_id, local_track_id, local_album_id, \
          track_name, artist_name, played_at) VALUES ('play-1', 'listener', '{}', '{album}', \
-         'Old Two', 'Artist', '2026-01-01T00:00:00Z'); \
+         'Old Two', 'Artist', 1767225600000); \
          INSERT INTO catalog_playlists (id, name, created_at, updated_at) VALUES ('list', 'List', 0, 0); \
          INSERT INTO catalog_playlist_tracks (id, playlist_id, position, track_name, artist_name, \
          album_name, album_id, track_source_id, source_type, created_at) VALUES ('entry', \

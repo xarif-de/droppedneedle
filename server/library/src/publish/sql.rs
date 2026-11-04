@@ -5,16 +5,58 @@
 #![allow(unused_parens, clippy::double_parens)]
 
 use super::journal::{JournalKind, JournalState, MgmtState};
+use crate::scan::models::Availability;
 
-/// Where a file is in the recycle bin: its copy's row is not marked as gone,
-/// and its copy reached the bin or its row waits for an admin, the state
-/// `$needs_attention` binds.
-macro_rules! in_bin {
-    ($needs_attention:literal) => {
+/// Where a file is in the recycle bin, over a replacement alias and its
+/// journal row's alias: its copy's row is not marked as gone, and its copy
+/// reached the bin or its row waits for an admin, the state
+/// `$needs_attention` names (a bind, or the state quoted).
+#[macro_export]
+macro_rules! in_recycle_bin {
+    ($replacement:literal, $journal:literal, $needs_attention:literal) => {
         concat!(
-            "r.expired_at IS NULL AND (r.recycled_at IS NOT NULL OR j.state = ",
+            $replacement,
+            ".expired_at IS NULL AND (",
+            $replacement,
+            ".recycled_at IS NOT NULL OR ",
+            $journal,
+            ".state = ",
             $needs_attention,
             ")"
+        )
+    };
+}
+
+macro_rules! in_bin {
+    ($needs_attention:literal) => {
+        $crate::in_recycle_bin!("r", "j", $needs_attention)
+    };
+}
+
+/// Everything of an album, a column holding its id, went through the
+/// recycle bin and has left it: the album has tracks, each of them is
+/// missing because its file went to the bin (a copy reached the bin no
+/// earlier than the track went missing: a removal marks the track missing
+/// in its commit and its copy lands after), and none is there now (put
+/// back, expired or emptied). A track missing for another reason (its
+/// folder vanished, even after an earlier trip to the bin and back) or
+/// one excluded keeps the album out of this.
+#[macro_export]
+macro_rules! album_gone_through_bin {
+    ($album_id:expr) => {
+        concat!(
+            "EXISTS (SELECT 1 FROM local_tracks gbt WHERE gbt.local_album_id = ",
+            $album_id,
+            ") AND NOT EXISTS (SELECT 1 FROM local_tracks gbt WHERE gbt.local_album_id = ",
+            $album_id,
+            " AND (gbt.availability <> 'missing' OR gbt.missing_at IS NULL \
+             OR NOT EXISTS (SELECT 1 FROM library_publish_replacements gbr \
+             WHERE gbr.replaced_track_id = gbt.id AND gbr.recycled_at >= gbt.missing_at) \
+             OR EXISTS (SELECT 1 FROM library_publish_replacements gbr \
+             JOIN library_publish_journal gbj ON gbj.id = gbr.journal_id \
+             WHERE gbr.replaced_track_id = gbt.id AND ",
+            $crate::in_recycle_bin!("gbr", "gbj", "'needs_attention'"),
+            ")))"
         )
     };
 }
@@ -84,11 +126,17 @@ droppedneedle_kernel::sql! {
              AND j.state = ?5 \
              AND (r.recycled_at > ?2 OR (r.recycled_at = ?2 AND r.journal_id > ?3)) \
              ORDER BY r.recycled_at, r.journal_id LIMIT ?4";
-    /// The tracks a put-back not yet settled holds, and NULL when it puts
-    /// back a file with no track (a sidecar): `?1` to `?6` are the
-    /// unsettled states, `?7` the put-back kind.
-    pub(super) EXPIRY_HELD_TRACKS = "SELECT DISTINCT track_id FROM library_publish_journal \
+    /// The put-back rows not yet settled, with their bundles and tracks:
+    /// `?1` to `?6` are the unsettled states, `?7` the put-back kind.
+    pub(super) EXPIRY_HELD_PUT_BACKS = "SELECT id, bundle_id, track_id \
+             FROM library_publish_journal \
              WHERE state IN (?1, ?2, ?3, ?4, ?5, ?6) AND kind = ?7";
+    /// Whether row `?1`'s copy was of a track on an album with no files.
+    pub(super) EXPIRY_OF_FILELESS_ALBUM = "SELECT EXISTS (SELECT 1 \
+             FROM library_publish_replacements r \
+             JOIN local_tracks t ON t.id = r.replaced_track_id \
+             JOIN local_albums a ON a.id = t.local_album_id \
+             WHERE r.journal_id = ?1 AND a.has_indexed_track = 0)";
     /// Record that row `?1`'s copy left the bin at `?2` (unix
     /// milliseconds): expired, found gone, or put back.
     pub(super) EXPIRY_MARK = "UPDATE library_publish_replacements SET expired_at = ?2 \
@@ -189,12 +237,16 @@ droppedneedle_kernel::sql! {
              WHERE removed_at < ?1 OR (removed_at = ?1 AND bundle_id < ?2) \
              ORDER BY removed_at DESC, bundle_id DESC LIMIT ?3";
     /// The files in the bin of the bundles in the JSON array `?1`: each
-    /// copy, its row's state and its track's album. `?2` is the state of a
-    /// row that waits for an admin.
+    /// copy, its row's state and its track's album (for a cover a generated
+    /// one replaced, the album of its bundle's tracks). `?2` is the state
+    /// of a row that waits for an admin.
     pub(super) BIN_FILES = "SELECT j.bundle_id, r.recycle_to, j.state, t.local_album_id \
              FROM library_publish_replacements r \
              JOIN library_publish_journal j ON j.id = r.journal_id \
-             LEFT JOIN local_tracks t ON t.id = r.replaced_track_id \
+             LEFT JOIN local_tracks t ON t.id = COALESCE(r.replaced_track_id, \
+                 CASE WHEN j.kind = 'output' THEN (SELECT a.track_id FROM library_publish_journal a \
+                 WHERE a.bundle_id = j.bundle_id AND a.kind = 'audio' AND a.track_id IS NOT NULL \
+                 ORDER BY a.id LIMIT 1) END) \
              WHERE j.bundle_id IN (SELECT value FROM json_each(?1)) AND " + (in_bin!("?2")) + " \
              ORDER BY j.bundle_id, r.journal_id";
     /// The undo records of the bundles in the JSON array `?1`: reason,
@@ -228,9 +280,9 @@ droppedneedle_kernel::sql! {
     pub(crate) BIN_COUNT = "SELECT COUNT(*) FROM library_publish_replacements r \
              JOIN library_publish_journal j ON j.id = r.journal_id WHERE " + (in_bin!("?1"));
     /// The copies an empty at `?1` (unix milliseconds) would try: the expiry's
-    /// due rows with no retention, each with its track. `?2` is the state of
-    /// a row that is done.
-    pub(super) BIN_DUE = "SELECT r.recycle_to, r.replaced_track_id \
+    /// due rows with no retention, each with its row and track. `?2` is the
+    /// state of a row that is done.
+    pub(super) BIN_DUE = "SELECT r.journal_id, r.recycle_to, r.replaced_track_id \
              FROM library_publish_replacements r \
              JOIN library_publish_journal j ON j.id = r.journal_id \
              WHERE r.expired_at IS NULL AND r.recycled_at IS NOT NULL AND r.recycled_at < ?1 \
@@ -293,6 +345,11 @@ droppedneedle_kernel::sql! {
     /// read as [`TRACK_LISTED_BELOW`] reads them.
     pub(super) TRACKS_LISTED_BELOW = "SELECT COUNT(*) FROM local_tracks \
              WHERE root_id = ?1 AND relative_path >= ?2 || '/' AND relative_path < ?2 || '0' \
+             AND availability = 'indexed'";
+    /// The paths of the tracks listed in library folder `?1` from `?2` up
+    /// to, not including, `?3`.
+    pub(super) TRACKS_LISTED_FROM = "SELECT relative_path FROM local_tracks \
+             WHERE root_id = ?1 AND relative_path >= ?2 AND relative_path < ?3 \
              AND availability = 'indexed'";
     /// The track at root `?1`, path `?2`, with its availability.
     pub(super) TRACK_AT = "SELECT id, availability FROM local_tracks \
@@ -491,6 +548,18 @@ droppedneedle_kernel::sql! {
              VALUES (?1, 'baseline', ?2)";
     pub(super) BASELINE_ROW = "SELECT blob_sha256, original_root, original_rel
                  FROM library_publish_baselines WHERE track_id = ?1";
+    /// Keep a cover file's first replaced bytes for track `?1` at
+    /// `?2`/`?3`; a cover kept there before wins.
+    pub(super) WRITE_COVER_BASELINE = "INSERT OR IGNORE INTO library_publish_cover_baselines \
+             (track_id, root_id, rel, blob_sha256, created_at) VALUES (?1, ?2, ?3, ?4, ?5)";
+    /// The cover files kept as track `?1`'s originals.
+    pub(super) COVER_BASELINES = "SELECT root_id, rel, blob_sha256 \
+             FROM library_publish_cover_baselines WHERE track_id = ?1 ORDER BY root_id, rel";
+    /// Whether bytes `?2` are a file a publish generated for track `?1` or
+    /// another track of its album, at any path.
+    pub(super) GENERATED_BEFORE = "SELECT EXISTS (SELECT 1 FROM library_publish_outputs \
+             WHERE sha256 = ?2 AND (track_id = ?1 OR track_id IN (SELECT t.id FROM local_tracks t \
+             WHERE t.local_album_id = (SELECT a.local_album_id FROM local_tracks a WHERE a.id = ?1))))";
     pub(super) V2_ORIGINAL_MISSING = "SELECT (EXISTS(SELECT 1 FROM library_track_management_state m \
                  WHERE m.local_track_id = ?1 AND m.baseline_id IS NOT NULL) \
                  OR EXISTS(SELECT 1 FROM library_management_baselines v \
@@ -550,6 +619,11 @@ droppedneedle_kernel::sql! {
         replaced_track_id: Option<String>,
         binned_stat_json: Option<String>,
     }
+    pub(super) row ExpiryHeldRow for [EXPIRY_HELD_PUT_BACKS] {
+        id: String,
+        bundle_id: String,
+        track_id: Option<String>,
+    }
     pub(super) row BinEntry for [EXPIRY_ENTRIES] {
         recycle_to: String,
         left_bin: bool,
@@ -592,6 +666,7 @@ droppedneedle_kernel::sql! {
         cover_available: bool,
     }
     pub(super) row BinDueRow for [BIN_DUE] {
+        journal_id: String,
         recycle_to: String,
         replaced_track_id: Option<String>,
     }
@@ -614,11 +689,11 @@ droppedneedle_kernel::sql! {
     pub(super) row TrackPlace for [TRACK_PLACE] {
         root_id: String,
         relative_path: String,
-        availability: String,
+        availability: Availability,
     }
     pub(super) row TrackAvailability for [TRACK_AT, GIVE_UP_DESTINATION] {
         id: String,
-        availability: String,
+        availability: Availability,
     }
     pub(super) row JournalName for [JOURNAL_NAMES] {
         dest_root: String,
@@ -640,7 +715,7 @@ droppedneedle_kernel::sql! {
         id: String,
         root_id: String,
         relative_path: String,
-        availability: String,
+        availability: Availability,
         stat_revision: String,
         local_album_id: String,
         album_revision: Option<i64>,
@@ -700,6 +775,11 @@ droppedneedle_kernel::sql! {
         blob_sha256: String,
         expiry_day: i64,
     }
+    pub(super) row CoverBaseline for [COVER_BASELINES] {
+        root_id: String,
+        rel: String,
+        blob_sha256: String,
+    }
     pub(super) row BaselineRow for [BASELINE_ROW] {
         blob_sha256: String,
         original_root: String,
@@ -708,5 +788,17 @@ droppedneedle_kernel::sql! {
     pub(super) row WrittenState for [TRACK_WRITTEN_STATE] {
         written_sha256: Option<String>,
         v2_path_revision: Option<String>,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::JournalState;
+
+    /// [`album_gone_through_bin!`] writes the held state as text.
+    #[test]
+    fn the_bin_rule_names_the_held_state() {
+        let state = format!("gbj.state = '{}'", JournalState::NeedsAttention.as_str());
+        assert!(album_gone_through_bin!("a.id").contains(&state));
     }
 }

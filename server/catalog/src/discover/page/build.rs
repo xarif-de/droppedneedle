@@ -2462,9 +2462,7 @@ pub async fn mark_ownership(db: &Db, page: &mut DiscoverResponse) {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        SectionKey, TASK_TIMEOUT, in_order_until, mix_split, mixes_deadline, section_bound,
-    };
+    use super::{in_order_until, mix_split};
 
     /// The second mix never finishes: the first is kept, the third is not
     /// reached, and the set is reported incomplete. The deadline has
@@ -2479,31 +2477,6 @@ mod tests {
             Some(n)
         });
         assert_eq!(in_order_until(deadline, builds).await, (vec![1], false));
-    }
-
-    /// Three mixes of 30 s each, as a cold build against a provider paced
-    /// near one read a second takes: all of them fit the mixes' bound,
-    /// though each alone runs past the bound on one read.
-    #[tokio::test(start_paused = true)]
-    async fn slow_mixes_all_fit_their_own_bound() {
-        let builds = [1, 2, 3].map(|n| async move {
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-            Some(n)
-        });
-        let deadline = mixes_deadline(tokio::time::Instant::now());
-        assert_eq!(
-            in_order_until(deadline, builds).await,
-            (vec![1, 2, 3], true)
-        );
-    }
-
-    /// The outer bound leaves the mixes room to stop at their own deadline;
-    /// every other shelf keeps the bound on one read.
-    #[test]
-    fn the_mixes_shelf_is_bounded_past_its_deadline() {
-        let now = tokio::time::Instant::now();
-        assert!(now + section_bound(SectionKey::DailyMixes) > mixes_deadline(now));
-        assert_eq!(section_bound(SectionKey::TopPicks), TASK_TIMEOUT);
     }
 
     #[test]

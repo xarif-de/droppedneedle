@@ -1,12 +1,14 @@
 //! Composition root: one call from deployment config to a router and the
 //! background work behind it.
 //!
-//! [`build`] opens the database (taking a verified backup first when the
-//! schema is about to change), stamps the web UI, wires every bundle,
-//! runs startup recovery, and starts the background loops. [`serve`]
-//! (in `serve.rs`) owns the listener and the shutdown order. `main` only
-//! parses arguments, tunes the allocator, starts the runtime and hands in
-//! the stop signal.
+//! [`run`] takes the data lock and looks at the data folders ([`claim`]):
+//! on v2 data it serves upgrade mode first (`crate::upgrade_mode`), then
+//! the app once the upgrade is done. [`build`] opens the database (taking
+//! a verified backup first when the schema is about to change), stamps the
+//! web UI, wires every bundle, runs startup recovery, and starts the
+//! background loops. [`serve`] (in `serve.rs`) owns the listener and the
+//! shutdown order. `main` only parses arguments, tunes the allocator,
+//! starts the runtime and hands in the stop signal.
 
 pub mod data_dirs;
 pub mod jobs;
@@ -14,29 +16,33 @@ pub mod key_check;
 mod outbound;
 pub mod platform;
 mod serve;
+mod setup_code;
+pub(crate) mod sql;
+pub mod upgrade_progress;
 
 use std::{fmt::Display, future::Future, sync::Arc, time::Duration};
 
 use axum::Router;
+use futures_util::FutureExt as _;
 use thiserror::Error;
+use tokio::net::TcpListener;
 
 pub use outbound::{Outbound, Port};
 pub use platform::{Opened, open_platform};
 pub use serve::{Background, ServeError, Stopped, bind, serve};
 
-use data_dirs::BootRefusal;
+use data_dirs::{BootRefusal, DataDirs, Layout};
 use jobs::JobsSetup;
 
 use crate::{
     AppState,
-    admin::{AdminDb, AdminSetup, quota::reload_overrides},
+    admin::AdminSetup,
     app::create_app_with_web,
     settings::{
         effects::{Effects, LiveSaveEffects},
-        library_catalog::SqliteLibraryPolicyCatalog,
-        section_prefs::{SqliteLinkStatus, SqliteSectionPrefsStore},
         wiring::SettingsSetup,
     },
+    upgrade_mode::{Ended, ToolCommand},
     web::{WebError, WebUi},
 };
 use droppedneedle_acquire::{
@@ -47,6 +53,7 @@ use droppedneedle_acquire::{
 use droppedneedle_auth::{
     federated::{MediaLinks, settings::InstallIds},
     prod::ProdAuth,
+    session::one_time_code::OneTimeCode,
     wiring::AuthSetup,
 };
 use droppedneedle_catalog::{
@@ -67,7 +74,11 @@ use droppedneedle_catalog::{
 use droppedneedle_compat::{CompatSetup, setup::CompatDeps};
 use droppedneedle_kernel::{
     config::AppConfig,
-    db::{BOOT_WAIT, datalock::DataLockError, error::DbError},
+    db::{
+        BOOT_WAIT,
+        datalock::{DataLock, DataLockError},
+        error::DbError,
+    },
     http_client::HttpClientError,
     platform::Platform,
     runtime_config::crypto::CryptoError,
@@ -192,8 +203,92 @@ pub struct Built {
     pub background: Background,
 }
 
+/// What the data folders let a server start as.
+pub enum Claimed {
+    /// An empty or v3 folder: the app, under both of a server's locks.
+    App(DataLock),
+    /// A v2 folder, or one an upgrade left halfway: upgrade mode, under the
+    /// server lock alone, so the upgrade it runs can take the folder.
+    Upgrade {
+        /// The server lock.
+        lock: DataLock,
+        /// An upgrade started here and did not finish.
+        interrupted: bool,
+    },
+}
+
+/// Take the data lock and look at the data folders, before anything else
+/// touches them: a v2 folder never gains a v3 key, database or settings
+/// file. The shared lock is held while they are looked at, so an upgrade or
+/// import running now stops the start rather than moving files under the
+/// look. A folder that is neither v2 nor v3, or one a restore left
+/// unfinished, is refused.
+pub async fn claim(config: &AppConfig) -> Result<Claimed, BootError> {
+    let server = DataLock::server_only(&config.library_db_path)?;
+    let shared = DataLock::shared(&config.library_db_path)?;
+    let dirs = DataDirs::from_config(config);
+    let layout = tokio::task::spawn_blocking(move || {
+        data_dirs::refuse_unfinished_restore(&dirs.db_path).map(|()| data_dirs::detect(&dirs))
+    })
+    .await
+    .map_err(|error| BootError::Stage {
+        stage: "data directory check",
+        message: error.to_string(),
+    })??;
+    match layout {
+        Layout::Empty | Layout::V3 => Ok(Claimed::App(server.joined(shared))),
+        Layout::V2 | Layout::Interrupted => {
+            drop(shared);
+            Ok(Claimed::Upgrade {
+                lock: server,
+                interrupted: layout == Layout::Interrupted,
+            })
+        }
+        Layout::Unknown(reason) => Err(BootRefusal::Unknown(reason).into()),
+    }
+}
+
+/// Serve `config`'s data folders on `listener` until `signal`: the app, or
+/// on v2 data the upgrade page first and then, once the upgrade is done and
+/// continued, the app in this same process on this same listener.
+pub async fn run(
+    listener: TcpListener,
+    config: AppConfig,
+    outbound: Outbound,
+    tool: ToolCommand,
+    signal: impl Future<Output = ()> + Send + 'static,
+) -> Result<Stopped, BootError> {
+    // One signal for both servers, so a stop between them is not lost.
+    let signal = signal.boxed().shared();
+    let (listener, lock, code) = match claim(&config).await? {
+        Claimed::App(lock) => (listener, lock, None),
+        Claimed::Upgrade { lock, interrupted } => {
+            match crate::upgrade_mode::serve(
+                listener,
+                &config,
+                lock,
+                interrupted,
+                tool,
+                signal.clone(),
+            )
+            .await?
+            {
+                Ended::Stopped(stopped) => return Ok(stopped),
+                Ended::Continued {
+                    listener,
+                    lock,
+                    code,
+                } => (listener, lock, Some(code)),
+            }
+        }
+    };
+    let built = build_on(config, outbound, lock, code).await?;
+    Ok(serve(listener, built.router, built.background, signal).await)
+}
+
 /// Build the production graph against the real outside services and start
-/// its background work.
+/// its background work. A v2 folder, or one an upgrade left halfway, is
+/// refused: only [`run`] serves upgrade mode.
 pub async fn build(config: AppConfig) -> Result<(Router, Background), BootError> {
     let built = build_with(config, Outbound::live()).await?;
     Ok((built.router, built.background))
@@ -201,18 +296,40 @@ pub async fn build(config: AppConfig) -> Result<(Router, Background), BootError>
 
 /// Build the production graph and start its background work, reaching
 /// every outside service with an address fixed in code at the one
-/// `outbound` gives.
+/// `outbound` gives. A v2 folder, or one an upgrade left halfway, is
+/// refused.
 pub async fn build_with(config: AppConfig, outbound: Outbound) -> Result<Built, BootError> {
-    // The data lock, the key, the database, the supervisor, the settings
-    // and the one event hub: every bundle below publishes into it from the
-    // moment it is built, and the revision loops feed it after each commit.
+    let lock = match claim(&config).await? {
+        Claimed::App(lock) => lock,
+        Claimed::Upgrade {
+            interrupted: false, ..
+        } => return Err(BootRefusal::V2.into()),
+        Claimed::Upgrade {
+            interrupted: true, ..
+        } => return Err(BootRefusal::Interrupted.into()),
+    };
+    build_on(config, outbound, lock, None).await
+}
+
+/// [`build_with`] under `data_lock`, both of a server's locks. `setup_seed`
+/// is upgrade mode's unused sign-in code, which first-admin setup asks for
+/// when it needs a code at all.
+pub(crate) async fn build_on(
+    config: AppConfig,
+    outbound: Outbound,
+    data_lock: DataLock,
+    setup_seed: Option<OneTimeCode>,
+) -> Result<Built, BootError> {
+    // The key, the database, the supervisor, the settings and the one
+    // event hub: every bundle below publishes into it from the moment it
+    // is built, and the revision loops feed it after each commit.
     let Opened {
         platform,
         runtime,
         cache_db,
         web,
         data_lock,
-    } = open_platform(config).await?;
+    } = open_platform(config, data_lock).await?;
     let p = &platform;
     let (db, config_store, config, http) = (&p.db, &p.settings, &p.config, &p.http);
     let (crypto, supervisor, events) = (&p.crypto, &p.supervisor, &p.events);
@@ -247,10 +364,11 @@ pub async fn build_with(config: AppConfig, outbound: Outbound) -> Result<Built, 
     // same limiters, so production holds one limiter set. The answer cache
     // stays shared with the admin stats and clear routes.
     let providers = Arc::new(Providers::build(p, outbound.providers(), cache_db.clone()));
-    let provider_cache = providers.cache.clone();
+    let prod_auth = ProdAuth::new(p);
+    let setup_code = setup_code::setup_code(config, &prod_auth.users, setup_seed).await?;
     let auth = AuthSetup::build(
         p,
-        ProdAuth::new(p),
+        prod_auth,
         &providers,
         Arc::new(ConfiguredPlexServer::new(
             http.shared().clone(),
@@ -258,6 +376,7 @@ pub async fn build_with(config: AppConfig, outbound: Outbound) -> Result<Built, 
             InstallIds::new(config_store.clone()),
         )),
         sign_in_links(p),
+        setup_code,
     );
 
     // The one listening store: discovery, wrapped, the Weekly Mix,
@@ -300,6 +419,7 @@ pub async fn build_with(config: AppConfig, outbound: Outbound) -> Result<Built, 
     .with_details(Arc::new(PluginDetailsSource(plugin_host.clone())))
     .with_cover_warm(cover_warm.clone());
     let artwork = droppedneedle_catalog::wiring::artwork(p, &catalog_inputs, catalog.clone());
+    let covers = artwork.cache().clone();
     let collections_db = CollectionsDb::new(db.clone(), p.clock.clone());
     let collections = Stores::new(&collections_db);
     // Flow outcomes (fulfilled requests among them) go to plugins and the
@@ -417,21 +537,12 @@ pub async fn build_with(config: AppConfig, outbound: Outbound) -> Result<Built, 
         library.scans.clone(),
         &catalog_setup,
     ));
-    let admin = AdminSetup::new(
-        auth.users.clone(),
-        acquire.requests.quota.clone(),
-        provider_cache.clone(),
-        providers.clone(),
-    )
-    .with_db(AdminDb::new(db.clone()))
-    .with_backups(runtime.backups().clone())
-    .with_checkpoint(runtime.checkpoint().clone());
     // Durable quota overrides back into the live ledger. A failure warns
     // instead of stopping the boot; the admin can re-save.
     match wait_out_busy(
         "quota overrides",
         |error: &DbError| matches!(error, DbError::Busy { .. }),
-        || reload_overrides(db.sqlx(), &acquire.requests.quota),
+        || acquire.requests.quota.reload_overrides(),
     )
     .await
     {
@@ -439,14 +550,17 @@ pub async fn build_with(config: AppConfig, outbound: Outbound) -> Result<Built, 
         Err(error) => tracing::warn!(%error, "quota overrides failed to reload; defaults apply"),
     }
     let concerts = droppedneedle_catalog::concerts::ConcertsSetup::from_platform(p, &providers);
+    let precache_sources = jobs::catalog_precache(&catalog_setup, config_store, listening.clone())
+        .map_err(stage("jobs setup"))?;
     let jobs = JobsSetup::build(
         p,
         runtime.checkpoint().clone(),
         media.jobs(p),
-        Some(concerts.sweep()),
+        concerts.sweep(),
+        precache_sources,
+        queues,
         scans.clone(),
     )
-    .with_queue(queues)
     .with_jobs(media.scrobble_jobs())
     .with_media_refresh(p, &media)
     .with_job(
@@ -458,7 +572,6 @@ pub async fn build_with(config: AppConfig, outbound: Outbound) -> Result<Built, 
         droppedneedle_library::removal::recycle_bin::handler(&library.publishing),
     )
     .with_mixer(mix_hooks)
-    .with_precache_sources_from(&catalog_setup, config_store, listening.clone())
     .with_cover_warm_jobs(&catalog_setup)
     .with_job(
         droppedneedle_acquire::imports::jobs::SPEC,
@@ -470,11 +583,16 @@ pub async fn build_with(config: AppConfig, outbound: Outbound) -> Result<Built, 
             catalog_setup.discover.content.clone(),
         ),
     ));
-    let admin = match &catalog_setup.artwork {
-        Some(artwork) => admin.with_covers(artwork.cache().clone()),
-        None => admin,
-    }
-    .with_precache(jobs.precache_trigger());
+    let admin = AdminSetup::new(
+        auth.users.clone(),
+        acquire.requests.quota.clone(),
+        providers.clone(),
+        db.clone(),
+        runtime.backups().clone(),
+        runtime.checkpoint().clone(),
+        jobs.precache_trigger(),
+        covers,
+    );
     let download_worker = acquire.worker.clone();
     let roots_library = library.scans.clone();
     // Each section's declared effects run after every committed change to
@@ -496,26 +614,15 @@ pub async fn build_with(config: AppConfig, outbound: Outbound) -> Result<Built, 
     {
         tracing::warn!("the settings effects loop was already running");
     }
-    let scans = Arc::new(LocalCatalog::new(db.clone()));
     let settings = SettingsSetup::build(
         p,
         effects,
         &outbound,
         library.management_settings.clone(),
-        scans,
-        &providers,
+        SettingsSetup::live_probes(p, &providers),
+        auth.users.lastfm.clone(),
         library.bins.clone(),
-    )
-    .with_section_prefs(
-        Arc::new(SqliteSectionPrefsStore { db: db.clone() }),
-        Arc::new(SqliteLinkStatus {
-            pool: db.sqlx().clone(),
-            lastfm: auth.users.lastfm.clone(),
-        }),
-    )
-    .with_library_catalog(Arc::new(SqliteLibraryPolicyCatalog {
-        pool: db.sqlx().clone(),
-    }));
+    );
     let plugins = PluginsSetup::build(p, plugin_host, plugin_ticks, providers.github_repos.clone());
     plugins.sync_ticks().await;
 

@@ -12,16 +12,21 @@ use droppedneedle_kernel::db::statement::ListLen;
 use droppedneedle_library::corrections::continuation::CURRENT_TRACK;
 use rusqlite::types::Value;
 
-use super::definitions::album_primary_format;
 use super::definitions::{
-    copy_order, listed_album, live_album, live_track, musicbrainz, owned_album, owned_artist,
-    owned_release_groups, recording_mbid,
+    album_min_tracks, album_primary_format, album_track, artist_min_appearances,
+    artist_min_led_tracks, listed_album, live_album, live_track, musicbrainz, owned_album,
+    owned_artist, track_codec,
 };
 use super::player::{
     AlbumKey, AlbumSequence, AlbumShape, HistoryKey, ItemKind, KeyedBy, PlayedFilter, TextMatch,
     TrackKey, TrackSequence, TrackShape,
 };
 use super::stores::{AlbumSort, ArtistScope, ArtistSort, TrackSort};
+use droppedneedle_library::identity::asked_groups;
+use droppedneedle_library::{
+    all_owners, copy_of_group, match_flag_state, named_group_guess, not_yet_identified, owns_group,
+    recording_mbid,
+};
 
 droppedneedle_kernel::sql! {
     /// One album's aggregate columns over [`ALBUM_JOINS`].
@@ -56,13 +61,14 @@ droppedneedle_kernel::sql! {
          ON rte.local_artist_id = a.album_artist_id AND ",
         musicbrainz!("rte"),
         " LEFT JOIN local_album_artwork w ON w.local_album_id = a.id \
-         LEFT JOIN local_tracks t ON t.local_album_id = a.id AND t.availability = 'indexed'"
+         LEFT JOIN local_tracks t ON ",
+        album_track!("t", "a.id")
     ));
     /// The album list's filters, shared by its page and its count: listed
     /// albums, with or without files. Binds: the pattern three times, the
     /// artist twice, the decade three times, the formats (`,flac,mp3,`)
     /// twice and whether the album must have one of them (1) or none (0),
-    /// the minimum indexed tracks twice.
+    /// then the minimum tracks as [`album_min_tracks!`] binds it.
     pub(crate) fragment ALBUM_FILTER = (concat!(
         listed_album!("a"),
         " AND (? IS NULL OR a.title_folded LIKE ? ESCAPE '\\' \
@@ -71,17 +77,15 @@ droppedneedle_kernel::sql! {
          AND (? IS NULL OR (a.year >= ? AND a.year < ? + 10)) \
          AND (? IS NULL OR (instr(?, ',' || COALESCE(",
         album_primary_format!("a"),
-        ", '') || ',') > 0) = ?) \
-         AND (? IS NULL OR (SELECT COUNT(*) FROM local_tracks t3 \
-         WHERE t3.local_album_id = a.id AND t3.availability = 'indexed') >= ?)"
+        ", '') || ',') > 0) = ?) AND ",
+        album_min_tracks!("a")
     ));
-    /// How many live albums each primary format has, most first. An album
-    /// without indexed tracks has no format and is not counted.
+    /// How many albums with files each primary format has, most first.
     pub(crate) ALBUM_FORMAT_COUNTS = (concat!(
         "SELECT format, COUNT(*) FROM (SELECT ",
         album_primary_format!("a"),
         " AS format FROM local_albums a WHERE ",
-        live_album!("a"),
+        owned_album!("a"),
         ") WHERE format IS NOT NULL GROUP BY format ORDER BY 2 DESC, 1"
     ));
     /// A shuffle seed's three numbers as one row `s` beside the rows a
@@ -126,11 +130,9 @@ droppedneedle_kernel::sql! {
         FROM library_album_takeovers WHERE local_album_id = ?1 \
         AND NOT EXISTS (SELECT 1 FROM library_management_exclusions \
         WHERE local_album_id = ?1) LIMIT 1";
-    /// The live copy one release group names: one with files first, then
-    /// one picked by hand, then the oldest.
+    /// The album one release group (`?1`, any case) opens.
     pub(crate) ALBUM_BY_GROUP = "SELECT " + ALBUM_COLUMNS + " " + ALBUM_JOINS
-        + " WHERE ae.release_group_mbid = ? AND " + (live_album!("a"))
-        + " GROUP BY a.id ORDER BY " + (copy_order!("a", "ae")) + " LIMIT 1";
+        + " WHERE a.id = (" + (copy_of_group!("= lower(?1)")) + ") GROUP BY a.id";
     /// Other listed albums of an album's release group, oldest first.
     pub(crate) ALBUM_COPIES = "SELECT " + ALBUM_COLUMNS + " " + ALBUM_JOINS
         + " WHERE ae.release_group_mbid = \
@@ -179,7 +181,9 @@ droppedneedle_kernel::sql! {
          t.disc_number AS disc_number, t.track_number AS track_number, t.year AS year, \
          COALESCE((SELECT g.name FROM local_track_genres g \
          WHERE g.local_track_id = t.id ORDER BY g.position LIMIT 1), t.genre) AS genre, \
-         t.duration_seconds AS duration_seconds, t.file_format AS format, \
+         t.duration_seconds AS duration_seconds, ",
+        track_codec!("t"),
+        " AS format, \
          t.bit_rate AS bit_rate, t.sample_rate AS sample_rate, \
          t.bit_depth AS bit_depth, t.channels AS channels, \
          t.file_size_bytes AS file_size_bytes, t.imported_at / 1000.0 AS date_added, \
@@ -375,23 +379,9 @@ droppedneedle_kernel::sql! {
         COALESCE(SUM(CASE WHEN " + LED_PREDICATE + " THEN 1 ELSE 0 END), 0) AS led, \
         COALESCE(SUM(CASE WHEN NOT (" + LED_PREDICATE + ") AND (" + CREDITED_PREDICATE
         + ") THEN 1 ELSE 0 END), 0) AS contributors ";
-    /// Live artists matching the name filter (bound twice) and holding at
-    /// least the minimum tracks (bound twice, see [`ARTIST_MIN_TRACKS`]).
+    /// Live artists matching the name filter (bound twice).
     pub(crate) fragment ARTIST_NAME_FILTER = " WHERE r.retired_into_artist_id IS NULL \
-        AND (? IS NULL OR r.folded_name LIKE ? ESCAPE '\\')" + ARTIST_MIN_TRACKS;
-    /// Artist `r` holds at least the bound number of indexed tracks (bound
-    /// twice): the tracks credited to it, plus the tracks on the albums it
-    /// leads that do not credit it. Both counts reach the tracks by key.
-    pub(crate) fragment ARTIST_MIN_TRACKS = " AND (? IS NULL OR ((SELECT COUNT(*) \
-        FROM local_track_artists mta \
-        JOIN local_tracks mt INDEXED BY sqlite_autoindex_local_tracks_1 \
-        ON mt.id = mta.local_track_id \
-        WHERE mta.local_artist_id = r.id AND +mt.availability = 'indexed') \
-        + (SELECT COUNT(*) FROM local_albums mla INDEXED BY idx_local_albums_artist_id \
-        JOIN local_tracks ml INDEXED BY idx_local_tracks_album_availability \
-        ON ml.local_album_id = mla.id AND ml.availability = 'indexed' \
-        WHERE mla.album_artist_id = r.id AND NOT EXISTS (SELECT 1 FROM local_track_artists mc \
-        WHERE mc.local_track_id = ml.id AND mc.local_artist_id = r.id))) >= ?)";
+        AND (? IS NULL OR r.folded_name LIKE ? ESCAPE '\\')";
     /// The artist list's totals: credited, leading and contributing artists
     /// matching the name filter (bound twice).
     pub(crate) ARTIST_TOTALS = ARTIST_TOTAL_COLUMNS + ARTIST_JOINS + ARTIST_NAME_FILTER;
@@ -433,11 +423,25 @@ droppedneedle_kernel::sql! {
     /// Indexed tracks per format, the zero rows left out as GROUP BY would.
     pub(crate) STATS_FORMATS = "SELECT file_format AS format, indexed_tracks AS total \
         FROM catalog_track_format_stats WHERE indexed_tracks > 0";
-    /// Review, local-only and last-scan totals. Local-only albums are owned
-    /// albums with no identity row; the last scan is the newest completed
-    /// run.
+    /// Review, Check albums, local-only and last-scan totals; `to_check`
+    /// counts each album once, whichever of the three lists it is on. Local-only
+    /// albums are owned albums with no identity row; best guesses and
+    /// albums nothing fits are live albums with that match state; the last
+    /// scan is the newest completed run.
     pub(crate) STATS_EXTRAS = "SELECT \
         (SELECT COUNT(*) FROM library_identify_reviews WHERE state = 'pending') AS reviews, \
+        (SELECT COUNT(*) FROM local_albums a WHERE a.retired_into_album_id IS NULL \
+         AND " + (match_flag_state!("a.id", "unconfirmed")) + ") AS guesses, \
+        (SELECT COUNT(*) FROM local_albums a WHERE a.retired_into_album_id IS NULL \
+         AND " + (match_flag_state!("a.id", "unmatched")) + ") AS not_found, \
+        (SELECT COUNT(DISTINCT w.local_album_id) FROM library_album_looks_wrong w \
+         JOIN local_albums a ON a.id = w.local_album_id \
+         WHERE a.retired_into_album_id IS NULL) AS looks_wrong, \
+        (SELECT COUNT(*) FROM local_albums a WHERE a.retired_into_album_id IS NULL AND ("
+        + (match_flag_state!("a.id", "unconfirmed")) + " \
+         OR EXISTS (SELECT 1 FROM library_album_looks_wrong w WHERE w.local_album_id = a.id) \
+         OR EXISTS (SELECT 1 FROM library_identify_reviews r \
+         WHERE r.local_album_id = a.id AND r.state = 'pending'))) AS to_check, \
         (SELECT COUNT(*) FROM local_albums a WHERE " + (owned_album!("a"))
         + " AND NOT EXISTS (SELECT 1 FROM local_album_external_identities i \
         WHERE i.local_album_id = a.id AND " + (musicbrainz!("i")) + ")) AS local_only, \
@@ -491,12 +495,9 @@ droppedneedle_kernel::sql! {
     /// Owned albums identified as one of the releases: album id and the
     /// lowercase release.
     family OWNERS_BY_RELEASE = owners_by_release;
-    /// The live copy of one release group (`?1`, lowercase) when no copy is
-    /// owned: one with files first, then one picked by hand, then the oldest.
-    pub(crate) LIVE_COPY_BY_GROUP = "SELECT b.id FROM local_album_external_identities e \
-        JOIN local_albums b ON b.id = e.local_album_id \
-        WHERE lower(e.release_group_mbid) = ?1 AND " + (musicbrainz!("e")) + " AND "
-        + (live_album!("b")) + " ORDER BY " + (copy_order!("b", "e")) + " LIMIT 1";
+    /// The album one release group (`?1`, lowercase) opens when no copy is
+    /// owned.
+    pub(crate) LIVE_COPY_BY_GROUP = (copy_of_group!("= ?1"));
 
     /// Every identified artist credited on an owned album: lowercase MBID
     /// and display name, by name.
@@ -533,7 +534,7 @@ droppedneedle_kernel::sql! {
         WHERE album_credit.local_album_id = t.local_album_id \
         AND album_credit.local_artist_id = credit.local_artist_id) LIMIT 1";
     /// Every owned release group, lowercase and sorted.
-    pub(crate) OWNED_GROUPS = "SELECT DISTINCT * FROM (" + (owned_release_groups!())
+    pub(crate) OWNED_GROUPS = "SELECT DISTINCT group_mbid FROM (" + (all_owners!())
         + ") ORDER BY 1";
     /// Request statuses that count as requested on catalog pages: open, not
     /// finished.
@@ -555,37 +556,51 @@ droppedneedle_kernel::sql! {
         + (musicbrainz!("ae")) + " AND " + (owned_album!("b"))
         + " ORDER BY b.year IS NULL, b.year DESC, b.title_folded";
     /// The indexed tracks one artist MBID (lowercase) is credited on, on
-    /// identified owned albums: title, recording MBID, the album's release
-    /// group, disc, track and whether the artist leads the album. Copies in
-    /// the order a lookup by release group picks them, so the first track of
-    /// a group is the one it plays.
-    /// Tracks are reached from the artist's credits by key, as in
-    /// [`ARTIST_APPEARS`].
-    pub(crate) ARTIST_SONGS = "SELECT t.title, " + (recording_mbid!("ti", "t"))
-        + ", e.release_group_mbid, t.disc_number, t.track_number, \
-        b.album_artist_id = ae.local_artist_id \
+    /// albums that own a release group by [`owns_group!`], so a lookup by
+    /// that group opens the album: title, recording MBID, the lowercase group,
+    /// album title, disc, track and whether the artist leads the album. An
+    /// album owns its matched group, or the group its tags name. The artist's
+    /// own albums come first, then the oldest. Tracks are reached from the
+    /// artist's credits by key, as in [`ARTIST_APPEARS`].
+    pub(crate) ARTIST_SONGS = "SELECT title, recording_mbid, release_group_mbid, album_title, \
+        disc_number, track_number, own_album FROM (SELECT t.title AS title, "
+        + (recording_mbid!("ti", "t")) + " AS recording_mbid, \
+        CASE WHEN EXISTS (SELECT 1 FROM (" + (owns_group!("= lower(e.release_group_mbid)"))
+        + ") owner WHERE owner.album_id = b.id) THEN lower(e.release_group_mbid) \
+        WHEN EXISTS (SELECT 1 FROM (" + (owns_group!("= lower(t.embedded_release_group_mbid)"))
+        + ") owner WHERE owner.album_id = b.id) THEN lower(t.embedded_release_group_mbid) \
+        END AS release_group_mbid, b.title AS album_title, t.disc_number AS disc_number, \
+        t.track_number AS track_number, b.album_artist_id IS ae.local_artist_id AS own_album, \
+        b.year AS year, b.id AS album_id \
         FROM local_artist_external_identities ae \
         JOIN local_track_artists credit ON credit.local_artist_id = ae.local_artist_id \
         JOIN local_tracks t INDEXED BY sqlite_autoindex_local_tracks_1 \
         ON t.id = credit.local_track_id \
         JOIN local_albums b ON b.id = t.local_album_id \
-        JOIN local_album_external_identities e ON e.local_album_id = b.id AND "
+        LEFT JOIN local_album_external_identities e ON e.local_album_id = b.id AND "
         + (musicbrainz!("e")) + " LEFT JOIN local_track_external_identities ti \
         ON ti.local_track_id = t.id AND " + (musicbrainz!("ti"))
         + " WHERE lower(ae.provider_artist_id) = ? AND " + (musicbrainz!("ae"))
-        + " AND " + (owned_album!("b")) + " AND t.availability = 'indexed' \
-        ORDER BY " + (copy_order!("b", "e")) + ", t.disc_number, t.track_number";
+        + " AND " + (owned_album!("b")) + " AND t.availability = 'indexed') \
+        WHERE release_group_mbid IS NOT NULL \
+        ORDER BY own_album DESC, year IS NULL, year, album_id, disc_number, track_number";
+    pub(crate) row ArtistSongColumns for [ARTIST_SONGS] {
+        title: String,
+        recording_mbid: Option<String>,
+        release_group_mbid: String,
+        album_title: String,
+        disc_number: i64,
+        track_number: i64,
+        own_album: bool,
+    }
     /// The live copy of one release group (lowercase), with or without
     /// files, for the catalog pages: its id, title, tagged album artist,
     /// year, album artist MBID and whether it has files.
     pub(crate) LOCAL_ALBUM = "SELECT b.id, b.title, COALESCE(b.album_artist_name, ''), b.year, \
         (SELECT ae.provider_artist_id FROM local_artist_external_identities ae \
          WHERE ae.local_artist_id = b.album_artist_id AND " + (musicbrainz!("ae"))
-        + "), b.has_indexed_track \
-        FROM local_album_external_identities e \
-        JOIN local_albums b ON b.id = e.local_album_id \
-        WHERE lower(e.release_group_mbid) = ? AND " + (musicbrainz!("e")) + " AND "
-        + (live_album!("b")) + " ORDER BY " + (copy_order!("b", "e")) + " LIMIT 1";
+        + "), b.has_indexed_track FROM local_albums b WHERE b.id = ("
+        + (copy_of_group!("= ?1")) + ")";
     /// The catalog pages' tracks of one album: disc, track and title order.
     pub(crate) LOCAL_ALBUM_TRACKS = "SELECT " + TRACK_COLUMNS + " " + TRACK_JOINS
         + " WHERE t.local_album_id = ? AND t.availability = 'indexed' \
@@ -736,15 +751,11 @@ droppedneedle_kernel::sql! {
         "catalog_user_play_marks m INDEXED BY sqlite_autoindex_catalog_user_play_marks_1";
     /// The plays, as `h`, through the index over listener, track and time.
     pub(crate) fragment PLAYS = "library_play_history h INDEXED BY idx_play_history_user_track";
-    /// The time of the play `h` in whole seconds. `played_at` is ISO text
-    /// whose form varies (rows from v2), so it is read as seconds, never compared
-    /// as text; one SQLite cannot read gives NULL. `unixepoch` gives what
-    /// `CAST(strftime('%s', ...) AS INTEGER)` gives at a fraction of the
-    /// cost.
-    pub(crate) fragment PLAY_SECONDS = "unixepoch(h.played_at)";
+    /// The time of the play `h` in whole seconds, from its milliseconds.
+    pub(crate) fragment PLAY_SECONDS = "h.played_at / 1000";
     /// Whether the play `h` is later than the unplayed mark `m`, in whole
-    /// seconds. A time SQLite cannot read is never later.
-    pub(crate) fragment AFTER_MARK = "unixepoch(h.played_at) > m.marked_unplayed_at / 1000";
+    /// seconds.
+    pub(crate) fragment AFTER_MARK = "h.played_at / 1000 > m.marked_unplayed_at / 1000";
     /// One listener's plays per album, one row each: `id`, `plays` and
     /// `played_at`, the latest. Subsonic's recently and most played album
     /// lists read them here; marks do not weigh in. Binds: the listener
@@ -835,12 +846,15 @@ droppedneedle_kernel::sql! {
     family PLAYER_PLAY_STATS = player_play_stats;
     /// Which of some ids of one kind exist for a player.
     family PLAYER_EXISTING = player_existing;
-    /// The accepted and tag ids of some albums.
+    /// The match and tag ids of some albums.
     family PLAYER_ALBUM_IDS = player_album_ids;
     /// The track and disc totals the tags of some albums' tracks carry,
     /// per disc.
     family PLAYER_ALBUM_DISC_TOTALS = player_album_disc_totals;
-    /// The accepted MusicBrainz ids of some artists.
+    /// Some albums' held tracks and the release that may tell their
+    /// edition's count.
+    family ALBUM_EDITION_TRACKS = album_edition_tracks;
+    /// The matched MusicBrainz ids of some artists.
     family PLAYER_ARTIST_IDS = player_artist_ids;
     /// The tag ids of some artists.
     family ARTIST_TAG_IDS = artist_tag_ids;
@@ -1367,9 +1381,9 @@ fn counts_scope(
     }
 }
 
-/// One page of artist keys in a scope: the name filter (bound twice), with
-/// `min_tracks` the minimum tracks (bound twice), the cursor, the limit.
-/// Without it a count sort walks the kept counts alone.
+/// One page of artist keys in a scope: the name filter (bound twice), the
+/// cursor, with `min_tracks` the minimum tracks as [`min_tracks_test`]
+/// binds it, the limit. A count sort walks the kept counts.
 pub(crate) fn artist_page(
     scope: ArtistScope,
     sort: ArtistSort,
@@ -1378,18 +1392,78 @@ pub(crate) fn artist_page(
     min_tracks: bool,
 ) -> String {
     let keys = artist_keys(scope, sort, descending);
-    if counts_walk(scope, sort) {
-        return format!(
-            "SELECT {} FROM library_artist_counts s \
-             WHERE {} AND (? IS NULL OR s.folded_name LIKE ? ESCAPE '\\'){}{} ORDER BY {} LIMIT ?",
+    if !counts_walk(scope, sort) {
+        return artist_list_page(scope, sort, descending, after_cursor, false, min_tracks);
+    }
+    let page = |lead: &str, limit: &str| {
+        format!(
+            "SELECT {lead}{} FROM library_artist_counts s \
+             WHERE {} AND (? IS NULL OR s.folded_name LIKE ? ESCAPE '\\'){} ORDER BY {} LIMIT {limit}",
             key_columns(&keys),
             counts_scope(scope, sort, descending, after_cursor),
-            min_tracks_clause(min_tracks).replace("= r.id", "= s.local_artist_id"),
             after(&keys, after_cursor),
             order_by(&keys)
-        );
+        )
+    };
+    if min_tracks {
+        with_min_tracks(scope, &keys, |lead| page(lead, "-1"))
+    } else {
+        page("", "?")
     }
-    artist_list_page(scope, sort, descending, after_cursor, false, min_tracks)
+}
+
+/// A page of `keys` that keeps only artists holding the minimum tracks of
+/// `scope` ([`min_tracks_test`]): the page's ordered walk, built by `page`
+/// with a leading column and no limit, read in order with the minimum
+/// tested on each row until the page is full. Testing it inside the walk
+/// would test every artist before a sort. The walk's limit of -1 keeps
+/// SQLite from folding the outer test into it, and SQLite reads the walk
+/// as a co-routine, in its order; an outer `ORDER BY` would sort the page
+/// a second time (the plan gate holds the shape, and the list test holds
+/// the filtered order to the unfiltered one).
+fn with_min_tracks(
+    scope: ArtistScope,
+    keys: &[OrderKey],
+    page: impl FnOnce(&str) -> String,
+) -> String {
+    let (id, _) = keys.last().copied().unwrap_or(("r.id", false));
+    let columns = (0..keys.len())
+        .map(|index| format!("k{index}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "SELECT {columns} FROM ({}) WHERE {} LIMIT ?",
+        page(&format!("{id} AS min_artist, ")),
+        min_tracks_test(scope, false)
+    )
+}
+
+/// The minimum-tracks test of an artist list's `scope`, over the
+/// `min_artist` column of a page's walk, or over `r.id` when `over_artist`:
+/// album artists by their led tracks, contributors by their appearances,
+/// each the count its card shows, and the other scopes by either. Binds
+/// the minimum, then the minimum less one, twice for the other scopes.
+fn min_tracks_test(scope: ArtistScope, over_artist: bool) -> &'static str {
+    match (scope, over_artist) {
+        (ArtistScope::AlbumArtists, false) => artist_min_led_tracks!("min_artist"),
+        (ArtistScope::AlbumArtists, true) => artist_min_led_tracks!("r.id"),
+        (ArtistScope::Contributors, false) => artist_min_appearances!("min_artist"),
+        (ArtistScope::Contributors, true) => artist_min_appearances!("r.id"),
+        (ArtistScope::All | ArtistScope::WithMusic, false) => concat!(
+            "(",
+            artist_min_led_tracks!("min_artist"),
+            " OR ",
+            artist_min_appearances!("min_artist"),
+            ")"
+        ),
+        (ArtistScope::All | ArtistScope::WithMusic, true) => concat!(
+            "(",
+            artist_min_led_tracks!("r.id"),
+            " OR ",
+            artist_min_appearances!("r.id"),
+            ")"
+        ),
+    }
 }
 
 droppedneedle_kernel::sql_choice! {
@@ -1435,11 +1509,6 @@ pub(crate) fn favorite_artist_page_shapes(
     )
 }
 
-/// [`ARTIST_MIN_TRACKS`] when a page filters by it, else nothing.
-fn min_tracks_clause(min_tracks: bool) -> &'static str {
-    if min_tracks { ARTIST_MIN_TRACKS } else { "" }
-}
-
 /// The order of a user's favourite artists: [`artist_keys`] off the kept
 /// counts, since the favourites drive the walk.
 pub(crate) fn favorite_artist_keys(sort: ArtistSort, descending: bool) -> Vec<OrderKey> {
@@ -1447,8 +1516,9 @@ pub(crate) fn favorite_artist_keys(sort: ArtistSort, descending: bool) -> Vec<Or
 }
 
 /// One page of a user's favourite artists in a scope: the user, the name
-/// filter (bound twice), with `min_tracks` the minimum tracks (bound
-/// twice), the cursor, the limit. Ordered by [`favorite_artist_keys`].
+/// filter (bound twice), the cursor, with `min_tracks` the minimum tracks
+/// as [`min_tracks_test`] binds it, the limit. Ordered by
+/// [`favorite_artist_keys`].
 pub(crate) fn favorite_artist_page(
     scope: ArtistScope,
     sort: ArtistSort,
@@ -1472,17 +1542,23 @@ fn artist_list_page(
     } else {
         artist_keys(scope, sort, descending)
     };
-    format!(
-        "SELECT {} FROM {} \
-         WHERE r.retired_into_artist_id IS NULL AND ({}) \
-         AND (? IS NULL OR r.folded_name LIKE ? ESCAPE '\\'){}{} ORDER BY {} LIMIT ?",
-        key_columns(&keys),
-        artist_from(sort, favorites),
-        artist_scope_predicate(scope),
-        min_tracks_clause(min_tracks),
-        after(&keys, after_cursor),
-        order_by(&keys)
-    )
+    let page = |lead: &str, limit: &str| {
+        format!(
+            "SELECT {lead}{} FROM {} \
+             WHERE r.retired_into_artist_id IS NULL AND ({}) \
+             AND (? IS NULL OR r.folded_name LIKE ? ESCAPE '\\'){} ORDER BY {} LIMIT {limit}",
+            key_columns(&keys),
+            artist_from(sort, favorites),
+            artist_scope_predicate(scope),
+            after(&keys, after_cursor),
+            order_by(&keys)
+        )
+    };
+    if min_tracks {
+        with_min_tracks(scope, &keys, |lead| page(lead, "-1"))
+    } else {
+        page("", "?")
+    }
 }
 
 /// One page of artist ids in a scope at an offset, for the player apps:
@@ -1491,7 +1567,7 @@ pub(crate) fn artist_offset_page(scope: ArtistScope, sort: ArtistSort, descendin
     format!(
         "SELECT r.id FROM {} \
          WHERE r.retired_into_artist_id IS NULL AND ({}) \
-         AND (? IS NULL OR r.folded_name LIKE ? ESCAPE '\\'){ARTIST_MIN_TRACKS} \
+         AND (? IS NULL OR r.folded_name LIKE ? ESCAPE '\\') \
          ORDER BY {} LIMIT ? OFFSET ?",
         artist_from(sort, false),
         artist_scope_predicate(scope),
@@ -1517,21 +1593,34 @@ fn artist_from(sort: ArtistSort, favorites: bool) -> String {
     format!("{artists}{counts}")
 }
 
-/// How many artists of one scope match the name filter (bound twice).
-pub(crate) fn artist_scope_count(scope: ArtistScope) -> String {
+/// How many artists of one scope match the name filter (bound twice) and,
+/// with `min_tracks`, hold the scope's minimum tracks as
+/// [`min_tracks_test`] binds it.
+pub(crate) fn artist_scope_count(scope: ArtistScope, min_tracks: bool) -> String {
     format!(
-        "SELECT COUNT(*) {ARTIST_JOINS}{ARTIST_NAME_FILTER} AND ({})",
-        artist_scope_predicate(scope)
+        "SELECT COUNT(*) {ARTIST_JOINS}{ARTIST_NAME_FILTER} AND ({}){}",
+        artist_scope_predicate(scope),
+        scope_min_tracks(scope, min_tracks)
     )
 }
 
 /// [`artist_scope_count`] among one user's favourites, the user bound
 /// first.
-pub(crate) fn favorite_artist_scope_count(scope: ArtistScope) -> String {
+pub(crate) fn favorite_artist_scope_count(scope: ArtistScope, min_tracks: bool) -> String {
     format!(
-        "SELECT COUNT(*) FROM {FAVORITE_ARTISTS} {ARTIST_IDENTITY}{ARTIST_NAME_FILTER} AND ({})",
-        artist_scope_predicate(scope)
+        "SELECT COUNT(*) FROM {FAVORITE_ARTISTS} {ARTIST_IDENTITY}{ARTIST_NAME_FILTER} AND ({}){}",
+        artist_scope_predicate(scope),
+        scope_min_tracks(scope, min_tracks)
     )
+}
+
+/// [`min_tracks_test`] over `r.id` when a count filters by it.
+fn scope_min_tracks(scope: ArtistScope, min_tracks: bool) -> String {
+    if min_tracks {
+        format!(" AND {}", min_tracks_test(scope, true))
+    } else {
+        String::new()
+    }
 }
 
 /// The artist projection for `ids` artists.
@@ -1547,9 +1636,9 @@ pub(crate) fn artist_rows(ids: ListLen) -> String {
 pub(crate) fn artist_album_counts(ids: ListLen) -> String {
     format!(
         "SELECT la.album_artist_id AS id, COUNT(*) AS total, \
-         SUM((SELECT COUNT(*) FROM local_tracks t WHERE t.local_album_id = la.id \
-         AND t.availability = 'indexed')) AS tracks \
+         SUM((SELECT COUNT(*) FROM local_tracks t WHERE {})) AS tracks \
          FROM local_albums la WHERE la.album_artist_id IN ({}) AND {} GROUP BY 1",
+        album_track!("t", "la.id"),
         marks(ids),
         owned_album!("la")
     )
@@ -1602,24 +1691,25 @@ pub(crate) fn current_albums(ids: ListLen) -> String {
 /// Owned albums holding one of `ids` lowercase release groups.
 pub(crate) fn owners_by_group(ids: ListLen) -> String {
     format!(
-        "SELECT e.local_album_id, lower(e.release_group_mbid) \
-         FROM local_album_external_identities e JOIN local_albums b ON b.id = e.local_album_id \
-         WHERE lower(e.release_group_mbid) IN ({}) AND {} AND {}",
-        marks(ids),
-        musicbrainz!("e"),
-        owned_album!("b")
+        "{}SELECT album_id, group_mbid FROM ({})",
+        asked_groups(ids),
+        owns_group!("IN (SELECT g FROM asked)")
     )
 }
 
-/// Owned albums identified as one of `ids` lowercase releases.
+/// Owned albums identified as one of `ids` lowercase releases, never through
+/// a guess flagged `NAMED_GROUP_DIFFERS`. Tags are not read: nothing indexes
+/// a track's tagged release, and a tag-only album is reached by its group.
 pub(crate) fn owners_by_release(ids: ListLen) -> String {
     format!(
         "SELECT e.local_album_id, lower(e.release_mbid) \
          FROM local_album_external_identities e JOIN local_albums b ON b.id = e.local_album_id \
-         WHERE e.release_mbid IS NOT NULL AND lower(e.release_mbid) IN ({}) AND {} AND {}",
+         WHERE e.release_mbid IS NOT NULL AND lower(e.release_mbid) IN ({}) AND {} AND {} \
+         AND NOT {}",
         marks(ids),
         musicbrainz!("e"),
-        owned_album!("b")
+        owned_album!("b"),
+        named_group_guess!("e.local_album_id")
     )
 }
 
@@ -1841,9 +1931,10 @@ pub(crate) fn player_tracks_in(ids: ListLen) -> String {
 /// again, from the same index, for those after the mark. A track marked
 /// played with no play at all comes from the marks by key.
 ///
-/// This rule for a track also lives in the refresh of migration 0065, which
-/// keeps the album values in `library_user_album_plays`. Changing it takes a
-/// migration that recreates that refresh and runs its backfill again.
+/// This rule for a track also lives in the refresh of migration 0065 (as
+/// migration 0130 last made it), which keeps the album values in
+/// `library_user_album_plays`. Changing it takes a migration that recreates
+/// that refresh and runs its backfill again.
 fn track_values(ids: Option<ListLen>) -> String {
     let (plays, marked) = match ids {
         None => (
@@ -2220,7 +2311,7 @@ pub(crate) fn player_play_stats(kind: ItemKind, ids: ListLen) -> String {
     };
     format!(
         "SELECT id, COUNT(*) AS plays, \
-         CAST(strftime('%s', MAX(played_at)) AS REAL) AS last_played FROM ({plays}) GROUP BY id"
+         CAST(MAX(played_at) / 1000 AS REAL) AS last_played FROM ({plays}) GROUP BY id"
     )
 }
 
@@ -2238,18 +2329,36 @@ pub(crate) fn player_existing(kind: ItemKind, ids: ListLen) -> String {
     )
 }
 
-/// For `ids` albums, the accepted match's release and release group, or,
-/// for an album with none, each indexed track's tag ids: an accepted album
-/// is one row with no tracks joined.
+/// For `ids` albums, the match's release and release group, or, for an
+/// album identification has not reached, each indexed track's tag ids: a
+/// matched album is one row with no tracks joined, and an album whose match
+/// was taken off or that found none sends no ids.
 pub(crate) fn player_album_ids(ids: ListLen) -> String {
     format!(
         "SELECT a.id, ae.release_mbid, ae.release_group_mbid, \
          t.embedded_release_mbid, t.embedded_release_group_mbid \
          FROM local_albums a \
          LEFT JOIN local_album_external_identities ae ON ae.local_album_id = a.id AND {} \
-         LEFT JOIN local_tracks t ON ae.local_album_id IS NULL \
+         LEFT JOIN local_tracks t ON ae.local_album_id IS NULL AND {} \
          AND t.local_album_id = a.id AND t.availability = 'indexed' \
          WHERE a.id IN ({})",
+        musicbrainz!("ae"),
+        not_yet_identified!("a"),
+        marks(ids)
+    )
+}
+
+/// For `ids` albums: each one's id, its held tracks, and the release of
+/// its match row unless that match is a guess its files' tags contradict.
+pub(crate) fn album_edition_tracks(ids: ListLen) -> String {
+    format!(
+        "SELECT a.id, (SELECT COUNT(*) FROM local_tracks t WHERE {}), \
+         CASE WHEN {} THEN NULL ELSE ae.release_mbid END \
+         FROM local_albums a \
+         LEFT JOIN local_album_external_identities ae ON ae.local_album_id = a.id AND {} \
+         WHERE a.id IN ({})",
+        album_track!("t", "a.id"),
+        named_group_guess!("a.id"),
         musicbrainz!("ae"),
         marks(ids)
     )
@@ -2257,7 +2366,7 @@ pub(crate) fn player_album_ids(ids: ListLen) -> String {
 
 /// For `ids` albums, one row per disc their indexed tracks are on: the
 /// largest track total and disc total the tracks' tags carry, NULL when
-/// none carries one.
+/// none carries one; a total of 0 is a file read that names none.
 pub(crate) fn player_album_disc_totals(ids: ListLen) -> String {
     format!(
         "SELECT t.local_album_id, t.disc_number, MAX(h.total_tracks), MAX(h.total_discs) \
@@ -2269,7 +2378,7 @@ pub(crate) fn player_album_disc_totals(ids: ListLen) -> String {
     )
 }
 
-/// The accepted MusicBrainz ids of `ids` artists.
+/// The matched MusicBrainz ids of `ids` artists.
 pub(crate) fn player_artist_ids(ids: ListLen) -> String {
     format!(
         "SELECT e.local_artist_id, e.provider_artist_id \

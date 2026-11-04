@@ -18,24 +18,10 @@ pub enum RequestKind {
     Track,
 }
 
-impl RequestKind {
-    /// Parse the `kind` query/body value. Unknown values fail closed to None.
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "album" => Some(Self::Album),
-            "track" => Some(Self::Track),
-            _ => None,
-        }
-    }
-
-    /// Wire form.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Album => "album",
-            Self::Track => "track",
-        }
-    }
-}
+droppedneedle_kernel::spelled!(RequestKind {
+    Album => "album",
+    Track => "track",
+});
 
 /// Album intake body. Names may be omitted only when they resolve; intake
 /// has no catalog lookup, so blank or literal-"Unknown" names are
@@ -491,6 +477,9 @@ pub struct WantedItem {
     pub next_check_at: Option<u64>,
     /// Unseen candidate count.
     pub new_candidate_count: u32,
+    /// What the last check found, once one ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_outcome: Option<super::ledger::WatchOutcome>,
     /// Epoch seconds when created.
     pub created_at: u64,
     /// Artist MBID.

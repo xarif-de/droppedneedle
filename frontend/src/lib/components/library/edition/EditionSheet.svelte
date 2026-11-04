@@ -5,9 +5,11 @@
 	it. On a phone the list and the detail are two steps of one sheet.
 	With `request`, for an album the library does not hold, it picks the
 	edition a request gets: the same list, and the selected edition's tracks.
+	Opened from another page (Check albums, a held download), its closing
+	button says where it goes back to.
 -->
 <script lang="ts">
-	import { onDestroy, untrack } from 'svelte';
+	import { onDestroy, tick, untrack } from 'svelte';
 	import { ChevronLeft, ExternalLink } from 'lucide-svelte';
 	import { coverPath } from '$lib/api/covers';
 	import AlbumImage from '$lib/components/AlbumImage.svelte';
@@ -19,6 +21,7 @@
 	import QueryBoundary from '$lib/ui/QueryBoundary.svelte';
 	import SelectField from '$lib/ui/SelectField.svelte';
 	import { authStore } from '$lib/stores/authStore.svelte';
+	import { toastStore } from '$lib/stores/toast';
 	import { useIntegrationStatus } from '$lib/queries/home.svelte';
 	import type { AlbumView } from '$lib/types';
 	import { getLibraryAlbumDetailQuery } from '$lib/queries/library/LibraryQueries.svelte';
@@ -56,6 +59,9 @@
 	import {
 		LEFT_UNMANAGED_NOTE,
 		SHEET_DESCRIPTION,
+		USED_ANYWAY,
+		USE_ANYWAY,
+		USE_ANYWAY_NOTE,
 		count,
 		editionFactsLine,
 		editionName,
@@ -63,7 +69,6 @@
 		fitLine,
 		fitsNoFile,
 		planFit,
-		summarySentence,
 		trulyMissing,
 		type EditionFactsLike
 	} from './editionCopy';
@@ -80,9 +85,21 @@
 		onclose?: (movedTo: string | null) => void;
 		/** Pick the edition to request instead, for an album with no copies. */
 		request?: EditionRequestPick;
+		/** Names the closing button when the sheet was opened from another page. */
+		backLabel?: string | null;
+		/** A person settled the edition: confirmed it or chose one. */
+		onsettled?: () => void;
 	}
 
-	let { open = $bindable(false), copies, groupMbid, onclose, request }: Props = $props();
+	let {
+		open = $bindable(false),
+		copies,
+		groupMbid,
+		onclose,
+		request,
+		backLabel = null,
+		onsettled
+	}: Props = $props();
 
 	const userId = () => authStore.user?.id;
 	const canEdit = $derived(authStore.isTrusted);
@@ -104,6 +121,8 @@
 	let findTitle = $state('');
 	let findArtist = $state('');
 	let searchArgs = $state<{ title: string; artist: string } | null>(null);
+	// A release group link pasted into "Not listed?": its editions are listed.
+	let pastedGroup = $state<string | null>(null);
 	let actionError = $state<string | null>(null);
 	let noneRight = $state<{ done: string | null; error: string | null }>({
 		done: null,
@@ -141,6 +160,7 @@
 		findTitle = '';
 		findArtist = '';
 		searchArgs = null;
+		pastedGroup = null;
 		actionError = null;
 		noneRight = { done: null, error: null };
 		tracks = null;
@@ -184,6 +204,23 @@
 		() => group,
 		() => open && Boolean(group)
 	);
+	// The album the files' tags name, when the guess fits another: its
+	// editions are listed too.
+	const namedGroup = $derived(
+		status?.named_release_group_mbid && status.named_release_group_mbid !== group
+			? status.named_release_group_mbid
+			: null
+	);
+	const namedEditionsQuery = getAlbumEditionsQuery(
+		userId,
+		() => namedGroup ?? '',
+		() => open && Boolean(namedGroup)
+	);
+	const pastedEditionsQuery = getAlbumEditionsQuery(
+		userId,
+		() => pastedGroup ?? '',
+		() => open && Boolean(pastedGroup) && pastedGroup !== group && pastedGroup !== namedGroup
+	);
 	const searchQuery = getReleaseEditionSearchQuery(
 		userId,
 		() => copyId,
@@ -222,9 +259,9 @@
 		});
 	});
 
-	// Open on the album's own edition, else the closest candidate. A local
-	// album has no editions to list, so it searches by its own title and
-	// artist straight away.
+	// Open on the album's own edition, else the closest candidate. The
+	// search starts filled in with the album's own title and artist; a
+	// local album has no editions to list, so it searches straight away.
 	$effect(() => {
 		if (!open || !status || initialisedFor === copyId) return;
 		initialisedFor = copyId;
@@ -232,10 +269,10 @@
 			currentRelease ??
 			status.candidates.find((candidate) => candidate.release_mbid)?.release_mbid ??
 			null;
-		if (!group && copy) {
+		if (copy) {
 			findTitle = copy.title;
 			findArtist = copy.artist_name;
-			if (canEdit) searchArgs = { title: copy.title, artist: copy.artist_name };
+			if (!group && canEdit) searchArgs = { title: copy.title, artist: copy.artist_name };
 		}
 	});
 
@@ -251,7 +288,13 @@
 
 	const fileCount = $derived(currentPlan?.files.length ?? copy?.track_count ?? 0);
 	const editions = $derived(editionsQuery.data?.items ?? []);
-	const editionByRelease = $derived(new Map(editions.map((item) => [item.release_mbid, item])));
+	const namedEditions = $derived(namedGroup ? (namedEditionsQuery.data?.items ?? []) : []);
+	const pastedEditions = $derived(pastedGroup ? (pastedEditionsQuery.data?.items ?? []) : []);
+	const editionByRelease = $derived(
+		new Map(
+			[...editions, ...namedEditions, ...pastedEditions].map((item) => [item.release_mbid, item])
+		)
+	);
 
 	function factsOf(release: string): EditionFactsLike | null {
 		const item = editionByRelease.get(release);
@@ -322,6 +365,24 @@
 			});
 		}
 		const shown: (string | null)[] = current.map((row) => row.release);
+		const editionRows = (items: typeof editions): EditionRow[] =>
+			[...items]
+				.sort((a, b) => (b.date ?? '').localeCompare(a.date ?? ''))
+				.filter((item) => !shown.includes(item.release_mbid))
+				.map((item) => {
+					shown.push(item.release_mbid);
+					const facts = factsOf(item.release_mbid) ?? {};
+					return {
+						key: item.release_mbid,
+						release: item.release_mbid,
+						name: editionName(facts),
+						facts: editionFactsLine(facts),
+						fit: fits[item.release_mbid] ?? null,
+						current: false,
+						bestGuess: false
+					};
+				});
+		const pasted = editionRows(pastedEditions);
 		const closest: EditionRow[] = [];
 		for (const candidate of status.candidates) {
 			const release = candidate.release_mbid;
@@ -338,22 +399,8 @@
 				bestGuess: false
 			});
 		}
-		const other: EditionRow[] = [...editions]
-			.sort((a, b) => (b.date ?? '').localeCompare(a.date ?? ''))
-			.filter((item) => !shown.includes(item.release_mbid))
-			.map((item) => {
-				shown.push(item.release_mbid);
-				const facts = factsOf(item.release_mbid) ?? {};
-				return {
-					key: item.release_mbid,
-					release: item.release_mbid,
-					name: editionName(facts),
-					facts: editionFactsLine(facts),
-					fit: fits[item.release_mbid] ?? null,
-					current: false,
-					bestGuess: false
-				};
-			});
+		const named = editionRows(namedEditions);
+		const other = editionRows(editions);
 		const found: EditionRow[] = (searchQuery.data?.items ?? [])
 			.filter((item) => !shown.includes(item.release_mbid))
 			.map((item) => ({
@@ -377,7 +424,9 @@
 			}));
 		return [
 			{ id: 'current', label: 'Yours now', rows: current },
+			{ id: 'pasted', label: 'Editions of the album you pasted', rows: pasted },
 			{ id: 'closest', label: 'Closest to your files', rows: closest },
+			{ id: 'named', label: 'Editions of the album your files name', rows: named },
 			{ id: 'other', label: 'Other editions of this album', rows: other },
 			{ id: 'search', label: 'Search results', rows: found }
 		];
@@ -405,6 +454,7 @@
 			? status.reason.message
 			: null
 	);
+	const disputed = $derived(status && status.state === 'unconfirmed' ? status.disputed_tracks : []);
 	const steppedBack = $derived(Boolean(hold && hold.kind !== 'your_choice'));
 	const keepsOwnTags = $derived(status?.reason.code === 'FOLDER_KEEPS_TAGS');
 	const letChooseLabel = $derived(
@@ -434,6 +484,40 @@
 		replaceVersions = true;
 		view = 'compare';
 		step = 'detail';
+		void focusDetail();
+	}
+
+	// On a phone the detail replaces the list, so focus moves to its heading.
+	async function focusDetail(): Promise<void> {
+		if (!window.matchMedia('(max-width: 767px)').matches) return;
+		await tick();
+		const heading = document.getElementById('edition-detail-title');
+		(heading ?? document.getElementById('edition-selected'))?.focus();
+	}
+
+	// "Use anyway": an edition none of the files fit becomes the album's,
+	// with no file on it and nothing fetched. The sheet stays on it, where
+	// each file is matched to its track by hand.
+	async function useAnyway(): Promise<void> {
+		const release = selected;
+		if (!release) return;
+		actionError = null;
+		try {
+			const choice = await choose.mutateAsync({
+				userId: userId(),
+				localId: copyId,
+				rgMbid: group || undefined,
+				releaseMbid: release,
+				identityRevision: status?.identity_revision ?? 0,
+				useAnyway: true
+			});
+			if (groupMbid && choice.release_group_mbid !== groupMbid) {
+				movedTo = choice.release_group_mbid;
+			}
+			toastStore.show({ message: USED_ANYWAY, type: 'success' });
+		} catch (error) {
+			actionError = failureSentence(error, "This edition couldn't be chosen.");
+		}
 	}
 
 	async function useEdition(): Promise<void> {
@@ -467,6 +551,7 @@
 			}
 			view = 'next';
 			step = 'detail';
+			onsettled?.();
 		} catch (error) {
 			actionError = failureSentence(error, "This edition couldn't be chosen.");
 			return;
@@ -484,6 +569,8 @@
 		actionError = null;
 		try {
 			await confirm.mutateAsync({ ...guarded(), localId: copyId, rgMbid: group || undefined });
+			toastStore.show({ message: `Confirmed ${copy?.title ?? 'this album'}.`, type: 'success' });
+			onsettled?.();
 		} catch (error) {
 			actionError = failureSentence(error, "This edition couldn't be kept.");
 		}
@@ -535,8 +622,14 @@
 		trackId: string,
 		releaseTrackMbid: string,
 		identityRevision: number
-	): Promise<void> {
-		await matchFile.mutateAsync({ localId: copyId, trackId, releaseTrackMbid, identityRevision });
+	): Promise<number> {
+		const answer = await matchFile.mutateAsync({
+			localId: copyId,
+			trackId,
+			releaseTrackMbid,
+			identityRevision
+		});
+		return answer.identity_revision;
 	}
 
 	async function unmatchTrack(trackId: string): Promise<void> {
@@ -698,7 +791,10 @@
 						<p class="alert alert-warning py-2 text-sm" role="note">{LEFT_UNMANAGED_NOTE}</p>
 					{/if}
 					{#if reasonShown}
-						<p class="text-sm text-base-content/70">{reasonShown}</p>
+						<p class="text-sm text-base-content/70">
+							{reasonShown}{#if disputed.length}
+								Listen to {disputed.join(', ')}.{/if}
+						</p>
 					{/if}
 				</div>
 			{/if}
@@ -724,10 +820,12 @@
 						/>
 						{#if editionsQuery.isLoading}
 							<EditionListSkeleton />
-						{:else if editionsQuery.isError}
+						{:else if editionsQuery.isError || namedEditionsQuery.isError || pastedEditionsQuery.isError}
 							<p class="text-sm text-base-content/60">
-								MusicBrainz isn't answering, so the other editions can't be listed. Paste a release
-								link below instead.
+								{failureSentence(
+									editionsQuery.error ?? namedEditionsQuery.error ?? pastedEditionsQuery.error,
+									"The other editions can't be listed right now."
+								)}
 							</p>
 						{/if}
 						{#if searchQuery.isError}
@@ -744,6 +842,7 @@
 							bind:artist={findArtist}
 							searching={searchQuery.isFetching}
 							onpaste={select}
+							onpastegroup={(mbid) => (pastedGroup = mbid)}
 							onsearch={() => (searchArgs = { title: findTitle.trim(), artist: findArtist.trim() })}
 						/>
 					{/if}
@@ -763,11 +862,13 @@
 				</div>
 
 				<div
+					id="edition-selected"
 					class="flex-col gap-4 px-4 py-4 md:flex md:overflow-y-auto md:px-6 {step === 'list'
 						? 'hidden'
 						: 'flex'}"
 					aria-label="Selected edition"
 					role="region"
+					tabindex="-1"
 				>
 					<Button
 						variant="ghost"
@@ -843,6 +944,11 @@
 						</p>
 						{#if actionError}<p class="text-sm text-error" role="alert">{actionError}</p>{/if}
 					{/if}
+					{#if step === 'detail'}
+						<div class="flex flex-wrap gap-2 md:hidden">
+							{@render footerLinks()}
+						</div>
+					{/if}
 				</div>
 			</div>
 		</div>
@@ -868,7 +974,7 @@
 						{@render primaryAction()}
 					{/if}
 				</div>
-				<Button size="sm" onclick={finish}>Done</Button>
+				<Button size="sm" onclick={finish}>{backLabel ?? 'Done'}</Button>
 			</div>
 		{/if}
 	{/snippet}
@@ -978,21 +1084,23 @@
 {#snippet primaryAction()}
 	{#if primaryKind === 'keep'}
 		<AsyncButton variant="primary" size="sm" pending={confirm.isPending} onclick={keepEdition}
-			>Keep this edition</AsyncButton
+			>That's right</AsyncButton
 		>
 	{:else if primaryKind === 'use'}
 		{@const noneFit = selectedPlan ? fitsNoFile(selectedPlan) : false}
-		<AsyncButton
-			variant="primary"
-			size="sm"
-			pending={choose.isPending}
-			pendingLabel="Matching your files..."
-			disabled={!selectedPlan || noneFit}
-			onclick={useEdition}>Use this edition</AsyncButton
-		>
-		{#if noneFit && selectedPlan}
-			<span class="hidden text-sm text-base-content/65 md:inline"
-				>{summarySentence(selectedPlan)}</span
+		{#if noneFit}
+			<AsyncButton variant="outline" size="sm" pending={choose.isPending} onclick={useAnyway}
+				>{USE_ANYWAY}</AsyncButton
+			>
+			<span class="hidden text-sm text-base-content/65 md:inline">{USE_ANYWAY_NOTE}</span>
+		{:else}
+			<AsyncButton
+				variant="primary"
+				size="sm"
+				pending={choose.isPending}
+				pendingLabel="Matching your files..."
+				disabled={!selectedPlan}
+				onclick={useEdition}>Use this edition</AsyncButton
 			>
 		{/if}
 	{/if}

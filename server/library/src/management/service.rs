@@ -14,7 +14,7 @@ use droppedneedle_kernel::db::Lane;
 use super::models::{
     HistoryFilter, HistoryItem, ItemFilter, ItemPage, JobDetail, JobIntent, JobMode,
     ManagementError, Origin, PinnedProfile, PlannedItem, PreviewHandle, ResultPage, Revisions,
-    Selection, SelectionKind, Summary, TagEditMode,
+    Selection, SelectionKind, Summary, TagEditMode, TagScope,
 };
 use super::planner::{self, PlanContext};
 use super::profile::{self, CompiledScripts};
@@ -146,6 +146,31 @@ impl Management {
             },
             shutdown: None,
         }
+    }
+
+    /// Whether acquisition must leave the album's files where they are: the
+    /// match check tagging makes ([`planner::match_gate`]), lifted only when
+    /// the edition preferences let it manage unconfirmed matches, which do
+    /// not when they cannot be read. A read that fails is an error, never an
+    /// answer: the caller puts the work back.
+    pub async fn refuses_replacing(
+        &self,
+        album_id: &str,
+    ) -> Result<bool, droppedneedle_kernel::db::DbError> {
+        let manage_unconfirmed = planner::manage_unconfirmed(&self.parts);
+        let album = album_id.to_owned();
+        let reason = self
+            .parts
+            .db
+            .read("management.match_gate", move |conn| {
+                Ok::<_, droppedneedle_kernel::db::DbError>(planner::match_gate(
+                    conn,
+                    &album,
+                    manage_unconfirmed,
+                )?)
+            })
+            .await?;
+        Ok(reason.is_some())
     }
 
     /// Hand running jobs back to the queue once `shutdown` is cancelled.
@@ -1473,7 +1498,7 @@ impl Management {
             || intent.tag_edit.as_ref().is_some_and(|edit| {
                 edit.fields
                     .iter()
-                    .any(|field| field.subject_kind == "album")
+                    .any(|field| field.subject_kind == TagScope::Album)
             });
         let picked: usize = albums
             .iter()
@@ -1738,6 +1763,7 @@ impl Management {
                     destination_relative_path: sidecar.dest_rel.clone(),
                 })
                 .collect();
+            item.diff.generated = put_back_files(&file.plan);
             for left in &file.sidecars_left {
                 item.facts.warnings.push(format!(
                     "{left} changed or its old place is taken, so it stays where it is."
@@ -2137,6 +2163,35 @@ impl Management {
         Ok(())
     }
 
+    /// A run that replaces a cover with the edition's archive cover checks
+    /// again, at apply, that the album's match still allows it: accepted,
+    /// exact, and not marked as looking wrong.
+    fn edition_cover_gate(
+        &self,
+        plans: &[crate::publish::PlanItem],
+        items: &[PlannedItem],
+    ) -> Result<(), Refused> {
+        let replaces = plans
+            .iter()
+            .flat_map(|plan| &plan.outputs)
+            .any(|output| output.replaces.is_some());
+        let Some(first) = items.first().filter(|_| replaces) else {
+            return Ok(());
+        };
+        let allowed = self
+            .parts
+            .db
+            .read_blocking("management.edition_cover_gate", |conn| {
+                Ok::<_, ManagementError>(planner::edition_gate(conn, &first.album_id)?)
+            })
+            .map_err(|error| Refused::unread(error, &first.album_id, "match state"))?;
+        if allowed {
+            Ok(())
+        } else {
+            Err(reasons::edition_cover_withdrawn().into())
+        }
+    }
+
     /// Publish one album; the error is the reason every file in it shares.
     fn publish_album(
         &self,
@@ -2155,7 +2210,9 @@ impl Management {
         }
         if !undo {
             self.plan_replacements(items, &mut plans)?;
+            self.edition_cover_gate(&plans, items)?;
         }
+        self.plan_output_bins(&mut plans)?;
         let album_id = items
             .first()
             .map(|item| item.album_id.clone())
@@ -2274,6 +2331,18 @@ fn refuse_activation(snapshot: &Snapshot) -> Result<(), ManagementError> {
 fn token_expiry(expires_at: f64) -> i64 {
     // Rounded as the row keeps it, so issuing and checking sign one value.
     crate::clock::ms(expires_at).div_euclid(1000)
+}
+
+/// The files an undo or restore puts back (a cover a run replaced), as the
+/// preview lists them.
+pub(super) fn put_back_files(plan: &crate::publish::PlanItem) -> Vec<super::models::GeneratedFile> {
+    plan.outputs
+        .iter()
+        .map(|output| super::models::GeneratedFile {
+            kind: output.kind.as_str().to_owned(),
+            destination_relative_path: output.dest_rel.clone(),
+        })
+        .collect()
 }
 
 #[cfg(test)]

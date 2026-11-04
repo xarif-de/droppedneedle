@@ -18,6 +18,7 @@ use std::collections::{BTreeMap, HashSet};
 use super::PublishError;
 use super::paths::{CollisionKey, Sandbox, collision_key};
 use super::tags_seam::TagUpdates;
+use crate::scan::models::Availability;
 use crate::tags::AudioFormat;
 
 /// Content fingerprint pinned on a plan item.
@@ -143,13 +144,19 @@ pub struct GeneratedOutput {
     pub sha256: String,
     pub size: u64,
     pub kind: OutputKind,
-    /// The file at the destination this one replaces (a cover that came
-    /// with imported files, which the archive's cover replaces): set aside
-    /// under the journal, recycled after the commit, put back if the
-    /// publish unwinds. No track goes with it. The bin entry is chosen at
-    /// apply; a plan that still names none is refused.
+    /// The file at the destination this one replaces (a cover the
+    /// archive's front for the album's edition replaces, or that cover
+    /// when Undo brings the old one back): set aside under the journal,
+    /// recycled after the commit, put back if the publish unwinds. Its
+    /// bytes are kept for undo. No track goes with it. The bin entry is
+    /// chosen at apply; a plan that still names none is refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replaces: Option<Replacement>,
+    /// A file Undo or "Restore originals" brings back: the person's own,
+    /// so it is not recorded as one Library Management made, and a later
+    /// restore never takes it away.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub put_back: bool,
 }
 
 /// What a generated file is.
@@ -162,26 +169,10 @@ pub enum OutputKind {
     Lyrics,
 }
 
-impl OutputKind {
-    /// The stored name, for the pages.
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Artwork => "artwork",
-            Self::Lyrics => "lyrics",
-        }
-    }
-
-    /// Parse [`Self::as_str`].
-    #[must_use]
-    pub fn parse(text: &str) -> Option<Self> {
-        match text {
-            "artwork" => Some(Self::Artwork),
-            "lyrics" => Some(Self::Lyrics),
-            _ => None,
-        }
-    }
-}
+droppedneedle_kernel::spelled!(OutputKind {
+    Artwork => "artwork",
+    Lyrics => "lyrics",
+});
 
 /// A file a plan item replaces at its destination.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -557,7 +548,7 @@ pub(crate) fn removal_seals<'a>(
 ) -> Result<BTreeMap<String, RemoveSeal>, PublishError> {
     Ok(own_rows(conn, track_ids)?
         .into_iter()
-        .filter(|(_, row)| row.availability == "indexed")
+        .filter(|(_, row)| row.availability == Availability::Indexed)
         .map(|(id, row)| (id, RemoveSeal::of(&row)))
         .collect())
 }
@@ -619,7 +610,7 @@ impl PlanItem {
 struct OwnRow {
     root_id: String,
     relative_path: String,
-    availability: String,
+    availability: Availability,
     stat_revision: String,
     album_id: String,
     album_revision: Option<i64>,
@@ -686,7 +677,7 @@ pub fn seal_rows(
         let row = current.get(&item.track_id).ok_or_else(changed)?;
         if row.root_id != item.source_root
             || row.relative_path != item.source_rel
-            || row.availability != "indexed"
+            || row.availability != Availability::Indexed
         {
             return Err(changed());
         }
@@ -717,7 +708,7 @@ pub(crate) fn first_moved<'a>(
                 let mapping = (seal.mapping_revision != 0).then_some(seal.mapping_revision as i64);
                 row.root_id == seal.source_root
                     && row.relative_path == seal.source_rel
-                    && row.availability == "indexed"
+                    && row.availability == Availability::Indexed
                     && row.stat_revision == seal.row.stat_revision
                     && row.album_id == seal.row.album_id
                     && row.album_revision == Some(seal.album_identity_revision as i64)
@@ -960,6 +951,11 @@ impl CollisionGate {
                 {
                     return Ok(());
                 }
+                if same_path_self.stale_if_changed {
+                    return Err(PublishError::Validation(
+                        format!("the file at {dest_root}:{dest_rel} changed after planning").into(),
+                    ));
+                }
                 let identical = same_path_self.bytes_match_if_regular(&dest);
                 blockers.push(CollisionEvidence {
                     subject: subject.to_string(),
@@ -1051,6 +1047,9 @@ struct SamePathSelf {
     move_source: Option<(String, String)>,
     /// The bytes of a file this item replaces at its destination.
     replaces_sha256: Option<String>,
+    /// A generated file's replaced file that no longer holds those bytes
+    /// was changed since planning, not taken by another file.
+    stale_if_changed: bool,
 }
 
 impl SamePathSelf {
@@ -1062,6 +1061,7 @@ impl SamePathSelf {
                 sha256: Some(item.fingerprint.sha256.clone()),
                 move_source: None,
                 replaces_sha256: None,
+                stale_if_changed: false,
             }
         } else {
             Self {
@@ -1082,6 +1082,7 @@ impl SamePathSelf {
             sha256: None,
             move_source: None,
             replaces_sha256: None,
+            stale_if_changed: false,
         }
     }
 
@@ -1090,6 +1091,7 @@ impl SamePathSelf {
     fn replacing(replaced: Option<&Replacement>) -> Self {
         Self {
             replaces_sha256: replaced.map(|replaced| replaced.sha256.clone()),
+            stale_if_changed: replaced.is_some(),
             ..Self::absent()
         }
     }

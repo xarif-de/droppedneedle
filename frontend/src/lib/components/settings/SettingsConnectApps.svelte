@@ -11,7 +11,7 @@
 		createSaveConnectAppsSettingsMutation
 	} from '$lib/queries/connect-apps.svelte';
 	import { withBasePath } from '$lib/utils/basePath';
-	import type { AdminAppPasswordView } from '$lib/types';
+	import type { AdminAppPasswordView } from '$lib/queries/connect-apps.svelte';
 	import Button from '$lib/ui/Button.svelte';
 	import Card from '$lib/ui/Card.svelte';
 	import CardTitle from '$lib/ui/CardTitle.svelte';
@@ -19,6 +19,7 @@
 	import NumberField from '$lib/ui/NumberField.svelte';
 	import QueryBoundary from '$lib/ui/QueryBoundary.svelte';
 	import SaveBar from '$lib/ui/SaveBar.svelte';
+	import SettingsAppConnect from './SettingsAppConnect.svelte';
 	import SelectField from '$lib/ui/SelectField.svelte';
 	import ToggleRow from '$lib/ui/ToggleRow.svelte';
 	import { createSettingsSection } from '$lib/ui/settingsSection.svelte';
@@ -130,6 +131,8 @@
 			{/snippet}
 		</QueryBoundary>
 	</Card>
+
+	<SettingsAppConnect />
 
 	<!-- oversight: every user's connected apps (metadata only, never the secret) -->
 	<Card variant="bordered">

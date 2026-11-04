@@ -188,8 +188,8 @@ pub struct ViewAlbum {
     pub genre: Option<String>,
     /// Compilation flag.
     pub is_compilation: Option<bool>,
-    /// Projected MusicBrainz id: the release, or the release group of an
-    /// accepted match with no known release.
+    /// Projected MusicBrainz id: the release, or the release group of a
+    /// match row with no known release.
     pub musicbrainz_album_id: Option<String>,
     /// Projected MusicBrainz artist id.
     pub musicbrainz_artist_id: Option<String>,
@@ -577,6 +577,8 @@ pub fn to_album_child(view: &ViewAlbum) -> SChild {
         created: iso(view.date_added),
         starred: iso(view.starred_at),
         duration: view.total_duration_seconds.map(|d| d.round() as i64),
+        playCount: view.play_count,
+        played: played_iso(view.played_at.as_deref()),
         mediaType: Some("album".to_owned()),
         bitDepth: Some(0),
         samplingRate: Some(0),

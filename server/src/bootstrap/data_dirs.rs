@@ -2,10 +2,11 @@
 //! v2 or half-upgraded one.
 //!
 //! [`detect`] tells an empty, v2, v3 or interrupted layout apart without
-//! changing anything, and [`check_bootable`] lets the server start only on
-//! an empty or v3 one. [`refuse_lost_key`] keeps it off a v3 database whose
-//! key file is gone. The offline upgrade in the tool reads the same layout
-//! before it moves anything.
+//! changing anything, and [`check_bootable`] lets the normal app start only
+//! on an empty or v3 one; a server started on a v2 or interrupted one opens
+//! upgrade mode instead (`crate::upgrade_mode`). [`refuse_lost_key`] keeps
+//! it off a v3 database whose key file is gone. The offline upgrade in the
+//! tool reads the same layout before it moves anything.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -13,6 +14,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::{Connection, OpenFlags};
 use thiserror::Error;
 
+use super::sql;
 use droppedneedle_kernel::config::AppConfig;
 use droppedneedle_kernel::db::backup::{RESTORE_MARKER, WalState, wal_path, wal_state};
 use droppedneedle_kernel::db::factory::sqlite_uri_path;
@@ -75,6 +77,21 @@ impl DataDirs {
         self.cache_dir.join(BACKUP_DIR_NAME)
     }
 
+    /// Whether either folder keeps v2's files: an upgrade or a fresh start
+    /// ran here, and its backup has not been removed. A folder that can't
+    /// be looked at counts as kept, so the setup code fails closed.
+    #[must_use]
+    pub fn holds_backup(&self) -> bool {
+        [self.config_backup(), self.cache_backup()]
+            .iter()
+            .any(|folder| {
+                std::fs::symlink_metadata(folder).map_or_else(
+                    |error| error.kind() != std::io::ErrorKind::NotFound,
+                    |_| true,
+                )
+            })
+    }
+
     /// Where a finished upgrade saves its import report.
     #[must_use]
     pub fn report_file(&self) -> PathBuf {
@@ -132,7 +149,9 @@ pub enum UnknownLayout {
     },
 }
 
-/// Classify the folders. Read-only: nothing is created, locked or changed.
+/// Classify the folders. Read-only: nothing is locked or changed, and
+/// nothing is created except SQLite's `-shm` index beside a database whose
+/// `-wal` file holds writes, which has to be read through it.
 ///
 /// The database decides first. Every v3 migration stamps `user_version`
 /// and v2 never did, so a stamped database is v3 and an unstamped one with
@@ -172,15 +191,15 @@ pub fn detect(dirs: &DataDirs) -> Layout {
 pub enum BootRefusal {
     /// The folders hold a v2 instance.
     #[error(
-        "this is a DroppedNeedle v2 data directory. Stop the container and run \
-         `droppedneedle-tool upgrade`, then start it again. See docs/upgrading-from-v2.md"
+        "this is a DroppedNeedle v2 data directory. Upgrade it first: start the server and \
+         open its web page, or run `droppedneedle-tool upgrade`. See docs/upgrading-from-v2.md"
     )]
     V2,
     /// An upgrade stopped halfway.
     #[error(
-        "an upgrade from v2 did not finish in this data directory. Run \
-         `droppedneedle-tool upgrade` again to finish it, or \
-         `droppedneedle-tool upgrade --undo --yes` to go back to v2"
+        "an upgrade from v2 did not finish in this data directory. Start the server and open \
+         its web page to finish it or go back to v2, or run `droppedneedle-tool upgrade` \
+         again to finish it, or `droppedneedle-tool upgrade --undo --yes` to go back to v2"
     )]
     Interrupted,
     /// The folders hold something that is neither v2 nor v3.
@@ -336,18 +355,16 @@ pub fn holds_data(db_path: &Path) -> bool {
     let Ok(db) = open_read_only(db_path) else {
         return true;
     };
-    ["config_sections", "auth_users"].iter().any(|table| {
-        db.query_row(
-            &format!("SELECT EXISTS(SELECT 1 FROM {table})"),
-            [],
-            |row| row.get::<_, bool>(0),
-        )
-        .unwrap_or_else(|error| {
-            // A table a schema this old does not have yet holds nothing.
-            !matches!(error, rusqlite::Error::SqliteFailure(_, Some(ref message))
+    [sql::ANY_SETTINGS, sql::ANY_ACCOUNT]
+        .iter()
+        .any(|statement| {
+            db.query_row(statement.text(), [], |row| row.get::<_, bool>(0))
+                .unwrap_or_else(|error| {
+                    // A table a schema this old does not have yet holds nothing.
+                    !matches!(error, rusqlite::Error::SqliteFailure(_, Some(ref message))
                 if message.starts_with("no such table"))
+                })
         })
-    })
 }
 
 /// What the database file is.
@@ -394,21 +411,17 @@ fn read_stamp(db_path: &Path) -> Result<(i64, i64), String> {
     // sqlx creates its bookkeeping table before the first migration runs,
     // so on its own that table is still an empty database.
     let tables = db
-        .query_row(
-            "SELECT count(*) FROM sqlite_master WHERE type = 'table' \
-         AND name NOT LIKE 'sqlite_%' AND name <> '_sqlx_migrations'",
-            [],
-            |row| row.get(0),
-        )
+        .query_row(sql::TABLE_COUNT.text(), [], |row| row.get(0))
         .map_err(|error| error.to_string())?;
     Ok((stamp, tables))
 }
 
-/// A read-only connection that creates nothing beside the database: a
-/// cleanly closed one is opened immutable, one with writes still in its
-/// `-wal` file is read through it. One whose `-wal` file cannot be read
-/// is refused, since an immutable open would miss what it holds.
-fn open_read_only(db_path: &Path) -> Result<Connection, String> {
+/// A read-only connection. A cleanly closed database is opened immutable,
+/// which creates nothing beside it. One with writes still in its `-wal`
+/// file is read through that file, so SQLite creates its `-shm` index
+/// beside it. One whose `-wal` file cannot be read is refused, since an
+/// immutable open would miss what it holds.
+pub fn open_read_only(db_path: &Path) -> Result<Connection, String> {
     let opened = match wal_state(db_path) {
         WalState::Unreadable(error) => {
             return Err(format!(

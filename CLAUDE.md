@@ -150,12 +150,16 @@ Run from the repo root. `make help` lists every target.
   `server/src/middleware.rs` is the only place a 5xx body is written and
   logged. A 5xx answers the fixed internal error with the request id,
   except the closed list in `Unavailable` (server busy, media server down,
-  GitHub refusing, limiting or failing a plugin install), each with a
-  fixed sentence. A compat 5xx gets its protocol's failure shape. A message
-  a user must read needs an honest 4xx or a new `Unavailable` row.
+  GitHub refusing, limiting or failing a plugin install, the server waiting
+  for its upgrade from v2), each with a fixed sentence. A compat 5xx gets
+  its protocol's failure shape. A message a user must read needs an honest
+  4xx or a new `Unavailable` row.
 - Request bodies and query strings are read through `ValidJson` and
   `ValidQuery` from `server/kernel/src/extract.rs`, never an area's own
   copy.
+- The app connect token step (`POST /api/v3/auth/app-connect/token`) is
+  OAuth 2.0 (RFC 6749): a form body read by its own parser and the RFC's
+  `{"error"}` shape at 400; its 5xx still go through the boundary.
 - A paged list answers the kernel's `Page<T>` (`server/kernel/src/page.rs`):
   an opaque cursor read through `PageRequest` (one that does not decode
   is a 400), a limit clamped to the list's maximum, `next_cursor` null on
@@ -197,6 +201,8 @@ Run from the repo root. `make help` lists every target.
 - A locked-out admin recovers from the host: stop the server, run
   `droppedneedle-tool recovery-code <user>`, start it again. No route is the
   only way back in.
+- While a v2 backup is kept and no account exists, first-admin setup needs
+  the code from the server log.
 
 **Database**
 - One SQLite file, WAL mode, local filesystem, opened only in
@@ -210,7 +216,8 @@ Run from the repo root. `make help` lists every target.
   its row. One server process per data directory, always: the writer
   lane only orders writes within one process, so boot takes an exclusive
   lock (`DataLock::server`) and a second server on the folder refuses to
-  start.
+  start. A server started on v2 data holds only the server lock
+  (`DataLock::server_only`) until Continue takes the shared lock.
 - One exception: provider answers are cached in `metadata-cache.db` (in
   `CACHE_DIR`, or beside `library.db` when that folder is refused), a
   throwaway file opened in `kernel/src/db/cache/` under a lock of its own,
@@ -271,8 +278,9 @@ Run from the repo root. `make help` lists every target.
   with its owning area's prefix; every table is `STRICT`; a foreign key
   cascades for owned data, sets null for "who did this" and restricts for
   what must outlive its parent, and is indexed (`every_foreign_key_is_indexed`
-  checks it); a state column is backed by a Rust enum with a CHECK listing
-  its values.
+  checks it); a state column is backed by a Rust enum declared through the
+  kernel's `spelled!`, with a CHECK listing exactly its values
+  (`every_state_column_lists_exactly_its_enums_values`).
 - Every table has one owning area, listed in `server/table-owners.txt` and
   checked by a test. Only the owner writes and migrates it.
 - A read model derived from other tables (a summary table or a column) is
@@ -438,7 +446,8 @@ Run from the repo root. `make help` lists every target.
   The catalog revision is a change counter, bumped by every commit that
   changes catalog rows and never compared (a plugin's added file or its
   take-back changes none, so it skips the bump). A write that changes catalog rows bumps it inside its own
-  transaction through `catalog_revision::bump_catalog`; event loops wait on
+  transaction through `catalog_revision::bump_catalog`; so does a bin
+  change that takes a file-less album off the lists. Event loops wait on
   the lane's commit counter (`Db::commits`), never a timer.
 - Automatic work needs an enabled root, the matching trigger, an accepted
   exact MusicBrainz release or a custom edition a curator chose for the
@@ -455,9 +464,27 @@ Run from the repo root. `make help` lists every target.
   The one other link followed is a library folder's `.recycle`, and only
   once its target is checked to lie outside every library and download
   folder.
+- One exception to "never overwrite", opt-in per profile: with "Use the
+  edition's archive cover" on, a run may replace the single `cover.*` in an
+  album's own folder with the Cover Art Archive's front for an accepted
+  exact release not marked "Looks wrong". It does so only through the
+  publisher's replace, never in a folder shared with another album. The
+  old file goes to the recycle bin, and Undo and Restore originals put it
+  back.
 - A configured recycle bin that cannot be reached makes removals and
   upgrades wait; files never fall back to a library folder's `.recycle`
   while it is down.
+- A removal sends the sidecars matching the folder's Library Management
+  patterns (the default list while none is set up) to the recycle bin
+  with the music, and Put back brings them home. One named like a removed
+  file goes only while no other music file of that name stays in the
+  folder, on disk or in the catalog; the folder's others go only once no
+  music is left below it. Folders a removal leaves empty are removed up
+  to the library folder, each only while empty, never through a link,
+  never one holding other music and never under a library folder that is
+  not there; Put back makes them again. A put-back that is not done holds
+  only the bin copies of the removal rows it puts back, or, where its
+  plan can't tell, the copies it might use.
 - "Never overwrite" is enforced by the operating system call that places the
   file, not by a check made before it. A library on a filesystem that offers
   no such call still works and shows a warning.
@@ -487,14 +514,33 @@ Run from the repo root. `make help` lists every target.
 - A publish records each folder it makes, durably, right after making it and
   before anything is written into it. An unwind, forward or after a crash,
   removes exactly those folders, deepest first and only while empty, and
-  never a folder that existed before.
+  never a folder that existed before. A completed removal is not an
+  unwind: it does remove the empty folders it leaves, ones that existed
+  before included.
 - An empty Vorbis comment (`NAME=`) is not kept: it reads as absent and a
   write drops it. It is the one exception to "unrelated tags survive".
 - Publisher phases keep their crash-injection tests. Archive extraction
   rejects traversal and links, and enforces size limits.
+- Acquire replaces no file on an album tagging would refuse (the same
+  check), or on an album with no match whose files' tags name different
+  groups. The new file is held and the old stays. Only a person importing
+  that held file passes the check; the quality comparison still runs.
 
 **Identity** (product rules, not up for debate)
-- Release pins steer the edition hint only, never catalog identity.
+- An edition a person chose is the album's identity; a v2 pin carries as
+  one. Reads of identity have two tiers. Usable (a row exists) serves
+  pages, playback and compat. Accepted (a release, no match flag, no custom
+  edition) serves proof, merges and retag joins. Ownership is one
+  definition, `owns_group!` in `library/src/identity/`, which the catalog
+  and acquire share. An album owns a group through its row, unless the row
+  is a guess flagged `NAMED_GROUP_DIFFERS`. It owns one through its files'
+  tags only when it has no row and no match flag, or holds such a guess,
+  and no file names another group. A match taken off, withdrawn or undone,
+  or a finished identification that found nothing, is never brought back
+  by tags. A landing never clears a person's detach or a
+  `NAMED_GROUP_DIFFERS` flag. The accepted tier, the match flags and a
+  track's recording id (its row's, else its tags') are named once in
+  `library/src/identity/sql.rs`. `source_gates.rs` holds these reads.
 - Manual and imported identities survive rescans and moves. Automatic ones
   stay revisable and retract on contradiction.
 - Automatic artist reconciliation needs provider proof, never name similarity
@@ -537,6 +583,18 @@ Run from the repo root. `make help` lists every target.
   unconfirmed guess.
 - An AcoustID answer that could not be had is never "heard nothing":
   identification and landings wait.
+- A curator may use an edition no file fits ("Use anyway"). It becomes
+  the album's edition as the person's choice and owns its group, but
+  places no file: the files lose any guessed track, and a file reaches a
+  track only by a person's match by hand or by its own MusicBrainz ids.
+  Disc and track numbers, then file order, only suggest a match; nothing
+  applies a suggestion by itself. The album stays flagged
+  `CHOSEN_EDITION_FITS_NO_FILE`, not accepted and replaced by no upgrade,
+  until its first match, and again when its only match is undone.
+  Automatic management waits until every file has its track. The
+  edition's undo takes the choice back with every match
+  made on it; files the app wrote meanwhile are undone through Library
+  management.
 - Album and track identities, match state and their undo rows are written
   only through `library/src/identity/`; a source gate holds it.
 
@@ -573,10 +631,12 @@ Run from the repo root. `make help` lists every target.
   itself (`Gate::HeldRetry`), and that retry never places a file on an
   album a person moved it away from, never adds a second copy and never
   replaces a library copy: those wait for a person.
-- A source outside the download settings is never taken by automatic
-  work (picks, failover, the search review, the wanted watcher). A person
+- A source outside the download settings, or a format or step the quality
+  recipe doesn't list, is never taken by automatic work (picks, failover,
+  the search review, the wanted watcher); such a landing is held, one set
+  per user and album, discarded once a complete copy imports. A person
   may pick it behind a confirm the server enforces, and only that pinned
-  attempt's files skip the quality range (`quality_waived` in the plan
+  attempt's files skip the range and the recipe (`quality_waived` in the plan
   and `pinned` on the handle); every other landing check still runs.
 
 ## Frontend (SvelteKit, Svelte 5, TypeScript)

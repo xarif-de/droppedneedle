@@ -63,6 +63,8 @@
 	const localFormats = $derived(localStats ? topFormats(localStats.format_breakdown) : '');
 
 	const libUnmatched = $derived(libraryStats?.review_count ?? 0);
+	// Albums to check, each once, as the Check albums badge counts them.
+	const libGuesses = $derived(libraryStats?.check_count ?? 0);
 	const libLastScan = $derived(
 		libraryStats?.last_scan_at ? new Date(libraryStats.last_scan_at * 1000) : null
 	);
@@ -83,19 +85,23 @@
 	);
 
 	const needsDecision = $derived(stillMatching === 0 && libUnmatched > 0);
-	const canReview = $derived(needsDecision && authStore.isAdmin);
+	const canReview = $derived(
+		stillMatching === 0 && (libUnmatched > 0 || libGuesses > 0) && authStore.isTrusted
+	);
 	const musicFooter = $derived(
 		stillMatching > 0 && libUnmatched > 0
-			? `${stillMatching.toLocaleString()} still matching, ${libUnmatched.toLocaleString()} need a decision`
+			? `${stillMatching.toLocaleString()} still matching, ${libUnmatched.toLocaleString()} need you`
 			: stillMatching > 0
 				? `${stillMatching.toLocaleString()} still matching`
 				: libUnmatched > 0
-					? `${libUnmatched.toLocaleString()} need review`
-					: localStats && localStats.total_tracks > 0
-						? `${formatBytes(localStats.total_size_bytes)}${localFormats ? ' · ' + localFormats : ''}`
-						: libLastScan
-							? `Scanned ${formatLastUpdated(libLastScan)}`
-							: 'Not scanned yet'
+					? `${libUnmatched.toLocaleString()} need you`
+					: libGuesses > 0
+						? `${libGuesses.toLocaleString()} to check`
+						: localStats && localStats.total_tracks > 0
+							? `${formatBytes(localStats.total_size_bytes)}${localFormats ? ' · ' + localFormats : ''}`
+							: libLastScan
+								? `Scanned ${formatLastUpdated(libLastScan)}`
+								: 'Not scanned yet'
 	);
 	const musicHref = $derived(
 		canReview ? '/library/review' : localEnabled ? '/library/local' : '/library'
@@ -119,7 +125,7 @@
 			musicState === 'prompt'
 				? 'Open library'
 				: canReview
-					? 'Review queue'
+					? 'Check albums'
 					: localEnabled
 						? 'Enter the room'
 						: 'Manage library',

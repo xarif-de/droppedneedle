@@ -22,13 +22,9 @@ pub const DISCOGS_DISPLAY_SECONDS: f64 = 6.0 * 60.0 * 60.0;
 pub const MUSICBRAINZ_RELEASE_EDITOR: &str = "https://musicbrainz.org/release/add";
 /// MB link type for a Discogs release URL attached to a seeded release.
 pub const MUSICBRAINZ_DISCOGS_RELEASE_LINK_TYPE: &str = "76";
-/// Callback path the seed's `redirect_uri` points at.
-/// Relative to the public base URL; v2 installs sent `/api/v1/...`, which
-/// stays served as a shim (see `library::http::contrib`).
+/// Callback path the seed's `redirect_uri` points at, relative to the
+/// public base URL.
 pub const CALLBACK_PATH: &str = "/api/v3/library/contributions/musicbrainz/callback";
-/// The v2 callback path, kept so a seed opened before the upgrade still
-/// lands somewhere real.
-pub const LEGACY_CALLBACK_PATH: &str = "/api/v1/library/contributions/musicbrainz/callback";
 /// Callback token lifetime (30m).
 pub const CALLBACK_TOKEN_SECONDS: f64 = 30.0 * 60.0;
 /// Deterministic provider-payload failure: review immediately, breaker stays
@@ -70,7 +66,7 @@ pub enum ContributionState {
     Cancelled,
 }
 
-crate::scan::models::spelled!(ContributionState {
+droppedneedle_kernel::spelled!(ContributionState {
     Draft => "draft",
     Ready => "ready",
     Seeded => "seeded",
@@ -79,6 +75,32 @@ crate::scan::models::spelled!(ContributionState {
     NeedsReview => "needs_review",
     Stale => "stale",
     Cancelled => "cancelled",
+});
+
+/// How a verification attempt behind a contribution ended, in
+/// `library_identification_attempts.state`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttemptState {
+    Identified,
+    NeedsReview,
+}
+
+droppedneedle_kernel::spelled!(AttemptState {
+    Identified => "identified",
+    NeedsReview => "needs_review",
+});
+
+/// How a contribution's resulting release reached us: MusicBrainz's seed
+/// callback, or a curator naming it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResultSource {
+    Callback,
+    Manual,
+}
+
+droppedneedle_kernel::spelled!(ResultSource {
+    Callback => "callback",
+    Manual => "manual",
 });
 
 /// Follow-up actions the UI may offer. The strings match v2's.

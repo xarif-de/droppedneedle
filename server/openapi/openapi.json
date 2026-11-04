@@ -3136,6 +3136,15 @@
         "operationId": "app_connect_request_handler",
         "parameters": [
           {
+            "name": "response_type",
+            "in": "query",
+            "description": "Must be `code`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
             "name": "client_id",
             "in": "query",
             "description": "The app's id, one listed in the `app_connect` settings.",
@@ -3236,11 +3245,11 @@
         "tags": [
           "auth"
         ],
-        "summary": "Trade an app connect code and its PKCE verifier for an app password of\nthe user who allowed it. The code is gone after this call, whatever it\nanswers.",
+        "summary": "The OAuth 2.0 token endpoint: trade an app connect code and its PKCE\nverifier for an app password of the user who allowed it. The code is\ngone after this call, whatever it answers.",
         "operationId": "app_connect_token_handler",
         "requestBody": {
           "content": {
-            "application/json": {
+            "application/x-www-form-urlencoded": {
               "schema": {
                 "$ref": "#/components/schemas/AppConnectTokenRequest"
               }
@@ -3260,21 +3269,11 @@
             }
           },
           "400": {
-            "description": "`invalid_grant` or `invalid_request`",
+            "description": "The trade is refused, as RFC 6749 section 5.2 names it",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/AppConnectTokenError"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "App connect is off: no app is listed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
                 }
               }
             }
@@ -4141,7 +4140,7 @@
         "tags": [
           "auth"
         ],
-        "summary": "First-admin setup. Creates the admin and logs them in (201 + session,\nv2 parity) iff no users exist; otherwise 409. The account and its\nsession are one write: a busy or failed setup leaves nothing, so a retry\ncan still run it. The emptiness check runs inside that transaction, so\nconcurrent setups, or a setup racing a first federated login (whose role\nis also decided in its insert), leave exactly one admin. The early probe\nonly skips the password hash.",
+        "summary": "First-admin setup. Creates the admin and logs them in (201 + session,\nv2 parity) iff no users exist; otherwise 409. On a server that logged a\nsetup code it also needs that code, checked before anything else is: a\nmissing or wrong one answers the same 401. The account and its\nsession are one write: a busy or failed setup leaves nothing, so a retry\ncan still run it. The emptiness check runs inside that transaction, so\nconcurrent setups, or a setup racing a first federated login (whose role\nis also decided in its insert), leave exactly one admin. The early probe\nonly skips the password hash.",
         "operationId": "setup_handler",
         "requestBody": {
           "content": {
@@ -4183,6 +4182,16 @@
           },
           "400": {
             "description": "Invalid username, password, or email",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "The code from the server log is missing or wrong",
             "content": {
               "application/json": {
                 "schema": {
@@ -9146,7 +9155,7 @@
         "tags": [
           "library management"
         ],
-        "summary": "Choose the album's edition: any release, from this album's release\ngroup or another. Files the edition has no track for keep their\nrecording; nothing automatic changes the choice afterwards.",
+        "summary": "Choose the album's edition: any release, from this album's release\ngroup or another. Files the edition has no track for keep their\nrecording; nothing automatic changes the choice afterwards. With\n`use_anyway`, a release that fits none of the files is taken placing\nnone: the files lose any track they had, and the album waits for its\nfiles to be matched by hand.",
         "operationId": "choose_edition",
         "parameters": [
           {
@@ -9181,7 +9190,7 @@
             }
           },
           "400": {
-            "description": "Not a release id, or the release fits none of the files",
+            "description": "Not a release id, or the release fits none of the files and `use_anyway` is not set",
             "content": {
               "application/json": {
                 "schema": {
@@ -9352,7 +9361,7 @@
         "tags": [
           "library management"
         ],
-        "summary": "\"Looks right\": confirm the album's unconfirmed best guess.",
+        "summary": "\"That's right\": confirm the album's unconfirmed best guess.",
         "operationId": "confirm_edition",
         "parameters": [
           {
@@ -10613,6 +10622,145 @@
           {
             "session": [
               "user"
+            ]
+          }
+        ]
+      }
+    },
+    "/api/v3/library/albums/{album_id}/looks-wrong": {
+      "put": {
+        "tags": [
+          "library management"
+        ],
+        "summary": "\"Looks wrong\": mark the album's match as looking wrong, so curators\ncheck it, or take your own mark back. Each person's mark is their own.",
+        "operationId": "mark_looks_wrong",
+        "parameters": [
+          {
+            "name": "album_id",
+            "in": "path",
+            "description": "Local album id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LooksWrongBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The caller's mark",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LooksWrongView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "No `looks_wrong` given",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Not authenticated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown album",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "session": [
+              "user"
+            ]
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "library management"
+        ],
+        "summary": "A curator finds nothing wrong with the album's match: every \"Looks\nwrong\" mark on it goes. Choosing, confirming or handing back its\nedition clears them too.",
+        "operationId": "clear_looks_wrong",
+        "parameters": [
+          {
+            "name": "album_id",
+            "in": "path",
+            "description": "Local album id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "No mark is left"
+          },
+          "401": {
+            "description": "Not authenticated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Curator role required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown album",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "session": [
+              "curator"
             ]
           }
         ]
@@ -19915,6 +20063,95 @@
         ]
       }
     },
+    "/api/v3/library/reviews/{id}/reopen": {
+      "post": {
+        "tags": [
+          "library management"
+        ],
+        "summary": "Reopen a review whose tags were kept, or that was left for later: it\nwaits for a decision again. The album stays as it is.",
+        "operationId": "reopen_review",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Review id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReviewActionBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Reopened review",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReviewView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Not authenticated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Curator role required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown review id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The review is not closed, or changed since it was read (STALE_REVISION)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "session": [
+              "curator"
+            ]
+          }
+        ]
+      }
+    },
     "/api/v3/library/reviews/{id}/restore": {
       "post": {
         "tags": [
@@ -21486,7 +21723,8 @@
               "description": "Which albums the unconfirmed list shows.",
               "enum": [
                 "unconfirmed",
-                "unmatched"
+                "unmatched",
+                "looks_wrong"
               ]
             }
           },
@@ -22428,16 +22666,6 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/SectionPrefsResponse"
-                }
-              }
-            }
-          },
-          "503": {
-            "description": "Section prefs are unwired",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
                 }
               }
             }
@@ -31102,16 +31330,6 @@
                 }
               }
             }
-          },
-          "503": {
-            "description": "Catalog reads are unwired",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            }
           }
         },
         "security": [
@@ -31216,16 +31434,6 @@
                 }
               }
             }
-          },
-          "503": {
-            "description": "Catalog reads are unwired",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            }
           }
         },
         "security": [
@@ -31277,16 +31485,6 @@
           },
           "409": {
             "description": "Expected revision is stale",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            }
-          },
-          "503": {
-            "description": "Catalog reads are unwired",
             "content": {
               "application/json": {
                 "schema": {
@@ -32807,7 +33005,7 @@
           {
             "name": "format",
             "in": "query",
-            "description": "Requested output codec: mp3, opus, or raw",
+            "description": "Requested output codec: mp3, opus, flac, or raw",
             "required": false,
             "schema": {
               "type": "string"
@@ -32957,7 +33155,7 @@
           {
             "name": "format",
             "in": "query",
-            "description": "Requested output codec: mp3, opus, or raw",
+            "description": "Requested output codec: mp3, opus, flac, or raw",
             "required": false,
             "schema": {
               "type": "string"
@@ -33059,6 +33257,373 @@
             "session": [
               "user"
             ]
+          }
+        ]
+      }
+    },
+    "/api/v3/upgrade/continue": {
+      "post": {
+        "tags": [
+          "upgrade"
+        ],
+        "summary": "Open the app: the upgrade page stops and the normal app starts in its\nplace. The next request reaches the app, which shows its own sign-in.",
+        "operationId": "upgrade_continue",
+        "responses": {
+          "202": {
+            "description": "The app is starting"
+          },
+          "401": {
+            "description": "Not signed in to the upgrade page",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A run is under way, the folders do not hold v3 data, or another program is using them",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "upgrade_session": []
+          }
+        ]
+      }
+    },
+    "/api/v3/upgrade/fresh": {
+      "post": {
+        "tags": [
+          "upgrade"
+        ],
+        "summary": "Start fresh: v2's files move into the `v2-backup` folders, nothing is\nimported, and v3 starts empty. Going back to v2 still works.",
+        "operationId": "upgrade_fresh",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpgradeFreshBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "The fresh start began",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpgradeProgressBody"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Not confirmed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Not signed in to the upgrade page",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A run is under way, or the folders already hold v3 data",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "upgrade_session": []
+          }
+        ]
+      }
+    },
+    "/api/v3/upgrade/preflight": {
+      "post": {
+        "tags": [
+          "upgrade"
+        ],
+        "summary": "Run every check the upgrade runs before it moves anything, changing\nnothing, and wait for it.",
+        "operationId": "upgrade_preflight",
+        "responses": {
+          "200": {
+            "description": "What the check found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpgradePreflightBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Not signed in to the upgrade page",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A run is under way, the folders already hold v3 data, or an upgrade did not finish",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "upgrade_session": []
+          }
+        ]
+      }
+    },
+    "/api/v3/upgrade/progress": {
+      "get": {
+        "tags": [
+          "upgrade"
+        ],
+        "summary": "The latest upgrade, fresh start or undo: its step, how far along, and\nits result or failure once it has ended.",
+        "operationId": "upgrade_progress",
+        "responses": {
+          "200": {
+            "description": "The latest run",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpgradeProgressBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Not signed in to the upgrade page",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "upgrade_session": []
+          }
+        ]
+      }
+    },
+    "/api/v3/upgrade/sign-in": {
+      "post": {
+        "tags": [
+          "upgrade"
+        ],
+        "summary": "Sign in to the upgrade page with a v2 admin's password or the one-time\ncode from the server's log. Attempts are limited per address, and\npasswords per username too.",
+        "operationId": "upgrade_sign_in",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpgradeSignInBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Signed in; the upgrade cookie is set",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpgradeStateBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "The sign-in did not pass",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Too many attempts from this address or for this username",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {}
+        ]
+      }
+    },
+    "/api/v3/upgrade/start": {
+      "post": {
+        "tags": [
+          "upgrade"
+        ],
+        "summary": "Start the upgrade. On v2 data it needs a pre-flight with nothing to fix\nand every address change it listed acknowledged. An interrupted upgrade\nis finished: the tool puts the v2 files back first, then upgrades.",
+        "operationId": "upgrade_start",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpgradeStartBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "The upgrade started",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpgradeProgressBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Not signed in to the upgrade page",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "No pre-flight, something to fix, an address change not acknowledged, a run under way, or nothing to upgrade",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "upgrade_session": []
+          }
+        ]
+      }
+    },
+    "/api/v3/upgrade/state": {
+      "get": {
+        "tags": [
+          "upgrade"
+        ],
+        "summary": "Where the upgrade stands, and whether this caller is signed in to the\nupgrade page.",
+        "operationId": "upgrade_state",
+        "responses": {
+          "200": {
+            "description": "Where the upgrade stands",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpgradeStateBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {}
+        ]
+      }
+    },
+    "/api/v3/upgrade/undo": {
+      "post": {
+        "tags": [
+          "upgrade"
+        ],
+        "summary": "Go back to v2: the v3 data is deleted and v2's files come back from the\nbackup. Also finishes going back from an interrupted upgrade.",
+        "operationId": "upgrade_undo",
+        "responses": {
+          "202": {
+            "description": "Going back to v2 began",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpgradeProgressBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Not signed in to the upgrade page",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A run is under way, or the folders already hold v2 data",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "upgrade_session": []
           }
         ]
       }
@@ -33976,6 +34541,41 @@
   },
   "components": {
     "schemas": {
+      "AcknowledgedWarning": {
+        "type": "object",
+        "description": "An address change the caller has made at the outside service, as the\npre-flight listed it.",
+        "required": [
+          "feature"
+        ],
+        "properties": {
+          "feature": {
+            "$ref": "#/components/schemas/UpgradeCallbackFeature",
+            "description": "The feature the change concerns."
+          },
+          "new_address": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/UpgradeAddress",
+                "description": "The address v3 uses, as the pre-flight gave it."
+              }
+            ]
+          },
+          "old_address": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/UpgradeAddress",
+                "description": "The address v2 registered, as the pre-flight gave it."
+              }
+            ]
+          }
+        }
+      },
       "ActionResponse": {
         "type": "object",
         "description": "Mutation outcome for approve/reject/cancel/retry/clear.",
@@ -35475,7 +36075,7 @@
               "null"
             ],
             "format": "int64",
-            "description": "Tracks the album's edition has: the matched MusicBrainz release's\ntracklist while the catalog holds it, else the totals its files'\ntags give. `None` when neither tells.",
+            "description": "Tracks the album's edition has: the matched MusicBrainz release's\ntracklist while the catalog holds it, else the totals its files'\ntags give; a guess the files' tags contradict counts by its tags.\n`None` when neither tells.",
             "minimum": 0
           },
           "favorite": {
@@ -35748,30 +36348,41 @@
       },
       "AppConnectTokenError": {
         "type": "object",
-        "description": "A refused trade.",
+        "description": "A refused trade (400).",
         "required": [
           "error"
         ],
         "properties": {
           "error": {
-            "type": "string",
-            "description": "`invalid_grant` (the code is unknown, used or expired, or does not\nfit the app, address or verifier) or `invalid_request` (the body is\nnot a trade)."
+            "$ref": "#/components/schemas/AppConnectTokenErrorCode",
+            "description": "What was wrong."
           }
         }
       },
+      "AppConnectTokenErrorCode": {
+        "type": "string",
+        "description": "Why a trade was refused, as RFC 6749 section 5.2 names it.",
+        "enum": [
+          "invalid_request",
+          "invalid_client",
+          "invalid_grant",
+          "unsupported_grant_type"
+        ]
+      },
       "AppConnectTokenRequest": {
         "type": "object",
-        "description": "The app's code trade.",
+        "description": "The app's code trade, sent form-encoded.",
         "required": [
-          "client_id",
-          "redirect_uri",
+          "grant_type",
           "code",
+          "redirect_uri",
+          "client_id",
           "code_verifier"
         ],
         "properties": {
           "client_id": {
             "type": "string",
-            "description": "The app's id, as in the request."
+            "description": "The app's id, as in the authorization request."
           },
           "code": {
             "type": "string",
@@ -35781,39 +36392,45 @@
             "type": "string",
             "description": "The PKCE verifier the challenge was made from."
           },
+          "grant_type": {
+            "type": "string",
+            "description": "Must be `authorization_code`."
+          },
           "redirect_uri": {
             "type": "string",
-            "description": "The return address, as in the request."
+            "description": "The return address, exactly as in the authorization request."
           }
         }
       },
       "AppConnectTokenResponse": {
         "type": "object",
-        "description": "The app password the trade mints.",
+        "description": "The app password a trade mints.",
         "required": [
-          "app_password",
-          "id",
-          "name",
+          "access_token",
+          "token_type",
           "username"
         ],
         "properties": {
-          "app_password": {
+          "access_token": {
             "type": "string",
-            "description": "The app password, shown this once. Subsonic takes it as `apiKey`."
+            "description": "The app password, shown this once. Subsonic takes it as `apiKey`,\nor as the password next to `username`."
           },
-          "id": {
-            "type": "string",
-            "description": "Its id, as listed under the user's app passwords."
-          },
-          "name": {
-            "type": "string",
-            "description": "Its name, as listed."
+          "token_type": {
+            "$ref": "#/components/schemas/AppConnectTokenType",
+            "description": "Always `Bearer`."
           },
           "username": {
             "type": "string",
-            "description": "The signed-in user's login name."
+            "description": "The login name of the user who allowed it."
           }
         }
+      },
+      "AppConnectTokenType": {
+        "type": "string",
+        "description": "The kind of token handed out. Libraries expect `Bearer`; the token is\nan app password, used the way any app password is.",
+        "enum": [
+          "Bearer"
+        ]
       },
       "AppPasswordCreate": {
         "type": "object",
@@ -37399,6 +38016,11 @@
             "type": "boolean",
             "description": "Never replace art with smaller art.",
             "default": true
+          },
+          "use_edition_cover": {
+            "type": "boolean",
+            "description": "Replace the album's cover (embedded, and its one `cover.*` file)\nwith the Cover Art Archive's front for an accepted exact release.\nThe replaced file goes to the recycle bin; Undo puts it back. Read\nonly while external artwork is on. Left out while off, so profiles\nand share codes saved before it keep their revisions and hashes.",
+            "default": false
           }
         }
       },
@@ -39061,6 +39683,10 @@
           "release_mbid": {
             "type": "string",
             "description": "Any MusicBrainz release, from this album's release group or another."
+          },
+          "use_anyway": {
+            "type": "boolean",
+            "description": "Take the release even when it fits none of the files (\"Use\nanyway\"): no file is placed, and each reaches a track only by a\nmatch by hand. A release that fits a file is chosen as without it."
           }
         }
       },
@@ -39395,6 +40021,11 @@
           "redirect_uri": {
             "type": "string",
             "description": "Where the browser hands the result back; exactly one of the app's\nlisted addresses.",
+            "default": ""
+          },
+          "response_type": {
+            "type": "string",
+            "description": "Must be `code`.",
             "default": ""
           },
           "state": {
@@ -41390,11 +42021,6 @@
             "description": "Frozen-transfer stall timeout.",
             "default": 30
           },
-          "flac_mp3_only": {
-            "type": "boolean",
-            "description": "Reject non-FLAC/MP3 candidates. A v2 recipe requires this on: v2\ngates recipe saves on it, the quality snapshot carries it, and the\nmatcher and orchestrator consumers all read it.",
-            "default": true
-          },
           "ignored_terms": {
             "type": "array",
             "items": {
@@ -41452,12 +42078,12 @@
           },
           "quality_max": {
             "type": "string",
-            "description": "Best accepted tier label.",
+            "description": "Best accepted tier label, set from the recipe.",
             "default": "lossless"
           },
           "quality_min": {
             "type": "string",
-            "description": "Worst accepted tier label.",
+            "description": "Worst accepted tier label, set from the recipe.",
             "default": "mp3_320"
           },
           "quality_recipe": {
@@ -41465,8 +42091,7 @@
             "items": {
               "$ref": "#/components/schemas/QualityRecipeEntry"
             },
-            "description": "Closed v2 quality recipe (empty means a v1 policy).",
-            "default": []
+            "description": "Ordered quality recipe, earlier entries preferred. Automatic work takes\nonly what it lists. A save needs at least one entry."
           },
           "required_terms": {
             "type": "array",
@@ -41806,6 +42431,17 @@
           },
           "id": {
             "type": "string"
+          },
+          "maybe_have": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/MaybeHaveView",
+                "description": "A library album whose edition is a guess of this album, though its\nfiles name another: \"You may have this\"."
+              }
+            ]
           },
           "next_retry_at": {
             "type": [
@@ -42854,6 +43490,17 @@
               }
             ]
           },
+          "suggested": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/EditionSuggestionView",
+                "description": "The edition track no file holds that this file may be matched to\nby hand: the one its disc and track number name, or on a whole\nalbum its place in file order. Set only on a file the edition does\nnot place; nothing applies it by itself."
+              }
+            ]
+          },
           "title": {
             "type": "string"
           },
@@ -43112,7 +43759,10 @@
           "identifying",
           "files_by_itself",
           "writing",
-          "keeps_own_tags"
+          "keeps_own_tags",
+          "disputed_tracks",
+          "looks_wrong",
+          "looks_wrong_count"
         ],
         "properties": {
           "album_id": {
@@ -43140,6 +43790,13 @@
             ],
             "description": "Who chose the edition, for a chosen one."
           },
+          "disputed_tracks": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Titles of the files whose audio sounds like another track of the\nguess (`AUDIO_DISAGREES`)."
+          },
           "edition_kind": {
             "$ref": "#/components/schemas/EditionKind",
             "description": "`release` (a MusicBrainz release), `custom` (a custom edition),\n`group_only` (a release group with no release chosen) or `none`."
@@ -43160,6 +43817,23 @@
           "keeps_own_tags": {
             "type": "boolean",
             "description": "A file of the album sits in a folder that keeps its own tags (the\nLocal metadata policy, of the folder or a path rule): the app\nwrites no tags or names there, and downloads land as they came."
+          },
+          "looks_wrong": {
+            "type": "boolean",
+            "description": "The caller marked the album's match \"Looks wrong\"."
+          },
+          "looks_wrong_count": {
+            "type": "integer",
+            "format": "int32",
+            "description": "How many people marked it.",
+            "minimum": 0
+          },
+          "named_release_group_mbid": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The release group every file's tags name, when the guess fits\nanother (`NAMED_GROUP_DIFFERS`): its editions are worth a look."
           },
           "placing": {
             "oneOf": [
@@ -43199,6 +43873,30 @@
           "writing": {
             "type": "boolean",
             "description": "That write is still to happen."
+          }
+        }
+      },
+      "EditionSuggestionView": {
+        "type": "object",
+        "description": "An edition track suggested for a file.",
+        "required": [
+          "disc_number",
+          "position",
+          "release_track_mbid"
+        ],
+        "properties": {
+          "disc_number": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "position": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "release_track_mbid": {
+            "type": "string"
           }
         }
       },
@@ -44938,7 +45636,7 @@
       },
       "HealthResponse": {
         "type": "object",
-        "description": "Health payload, in the v2 shape. The route is public, so it says\nnothing about the server's internals; admins read those from the\nadmin routes.",
+        "description": "Health payload. The route is public, so it says nothing about the\nserver's internals; admins read those from the admin routes.",
         "required": [
           "status",
           "message"
@@ -44949,10 +45647,18 @@
             "description": "Human-readable running message."
           },
           "status": {
-            "type": "string",
-            "description": "Service state, `ok` when serving."
+            "$ref": "#/components/schemas/HealthStatus",
+            "description": "What the server is doing."
           }
         }
+      },
+      "HealthStatus": {
+        "type": "string",
+        "description": "What the server is doing, as the health check reports it.",
+        "enum": [
+          "ok",
+          "upgrade"
+        ]
       },
       "HeldActionResponse": {
         "type": "object",
@@ -45016,6 +45722,13 @@
               "string",
               "null"
             ]
+          },
+          "check_album_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The library album whose match a person should check before the\nbetter copy held here can go in: its \"Check this album\" target."
           },
           "created_at": {
             "type": "integer",
@@ -45354,6 +46067,35 @@
           "still_held",
           "error"
         ]
+      },
+      "HeldTracks": {
+        "type": "object",
+        "description": "How much of one release group the library holds, over every album that\nowns it: their tracks add up, to the edition's count at most.",
+        "required": [
+          "id",
+          "held"
+        ],
+        "properties": {
+          "expected": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Tracks the edition has; `None` when neither the matched release nor\nthe files' tags tell. A guess the files' tags contradict counts by\nits tags.",
+            "minimum": 0
+          },
+          "held": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Tracks the library holds.",
+            "minimum": 0
+          },
+          "id": {
+            "type": "string",
+            "description": "Lowercase release-group id."
+          }
+        }
       },
       "HistoryEntry": {
         "type": "object",
@@ -47735,12 +48477,20 @@
       },
       "LibraryMembershipResponse": {
         "type": "object",
-        "description": "Membership answer. Both lists are lowercase and sorted.",
+        "description": "Membership answer. Every list is lowercase and sorted by id.",
         "required": [
           "owned_ids",
-          "requested_ids"
+          "requested_ids",
+          "held_tracks"
         ],
         "properties": {
+          "held_tracks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HeldTracks"
+            },
+            "description": "For each asked release group the library owns, how many of its\ntracks the library holds and how many its edition has."
+          },
           "owned_ids": {
             "type": "array",
             "items": {
@@ -48747,9 +49497,33 @@
           }
         }
       },
+      "LooksWrongBody": {
+        "type": "object",
+        "description": "Mark an album's match as looking wrong, or take the mark back.",
+        "required": [
+          "looks_wrong"
+        ],
+        "properties": {
+          "looks_wrong": {
+            "type": "boolean"
+          }
+        }
+      },
+      "LooksWrongView": {
+        "type": "object",
+        "description": "The caller's own \"Looks wrong\" mark.",
+        "required": [
+          "looks_wrong"
+        ],
+        "properties": {
+          "looks_wrong": {
+            "type": "boolean"
+          }
+        }
+      },
       "LoopState": {
         "type": "string",
-        "description": "Liveness of a loop row. The table's CHECK still allows `idle`, which\nnothing writes since every loop runs on the supervisor.",
+        "description": "Liveness of a background loop.",
         "enum": [
           "running",
           "stopped",
@@ -50726,6 +51500,22 @@
               "$ref": "#/components/schemas/RemotesTrackView"
             },
             "description": "Album tracks, when found."
+          }
+        }
+      },
+      "MaybeHaveView": {
+        "type": "object",
+        "description": "A library album that may already be the one a download hunts for.",
+        "required": [
+          "album_id",
+          "title"
+        ],
+        "properties": {
+          "album_id": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
           }
         }
       },
@@ -53785,7 +54575,9 @@
                 "state",
                 "reason",
                 "updated_at",
-                "identity_revision"
+                "identity_revision",
+                "file_count",
+                "looks_wrong_count"
               ],
               "properties": {
                 "album_id": {
@@ -53794,10 +54586,33 @@
                 "artist_name": {
                   "type": "string"
                 },
+                "file_count": {
+                  "type": "integer",
+                  "format": "int32",
+                  "description": "Indexed files the album holds.",
+                  "minimum": 0
+                },
+                "guess": {
+                  "oneOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "$ref": "#/components/schemas/WaitingGuessView",
+                      "description": "What \"That's right\" confirms, for a best guess."
+                    }
+                  ]
+                },
                 "identity_revision": {
                   "type": "integer",
                   "format": "int64",
-                  "description": "The identity's row revision, 0 when the album has none. \"Looks\nright\" echoes it."
+                  "description": "The identity's row revision, 0 when the album has none. \"That's\nright\" echoes it."
+                },
+                "looks_wrong_count": {
+                  "type": "integer",
+                  "format": "int32",
+                  "description": "How many people marked the match \"Looks wrong\".",
+                  "minimum": 0
                 },
                 "reason": {
                   "$ref": "#/components/schemas/ReasonView"
@@ -53816,14 +54631,16 @@
                 },
                 "state": {
                   "$ref": "#/components/schemas/EditionState",
-                  "description": "`unconfirmed` or `unmatched`."
+                  "description": "`unconfirmed` or `unmatched`; in the \"Looks wrong\" list, any state."
                 },
                 "title": {
-                  "type": "string"
+                  "type": "string",
+                  "description": "The album as its files have it."
                 },
                 "updated_at": {
                   "type": "number",
-                  "format": "double"
+                  "format": "double",
+                  "description": "When it was listed (epoch seconds): the match, or the newest\n\"Looks wrong\" mark."
                 }
               }
             }
@@ -56314,11 +57131,9 @@
       },
       "QualityRecipeStatus": {
         "type": "string",
-        "description": "How the stored quality settings read: a v1 tier range, a v2 recipe, a\npolicy with codecs a recipe cannot express, or a recipe that does not\nvalidate.",
+        "description": "How the stored quality settings read: a usable recipe, or a section or\nrecipe that does not validate.",
         "enum": [
-          "v1",
           "v2",
-          "non_convertible",
           "invalid"
         ]
       },
@@ -57195,6 +58010,7 @@
           "no_better_than_yours",
           "owned_elsewhere",
           "owned_on_album",
+          "album_needs_check",
           "no_album_match",
           "album_not_found",
           "tags_disagree",
@@ -57204,6 +58020,7 @@
           "interrupted",
           "import_failed",
           "held_by_earlier_version",
+          "format_not_listed",
           "target_occupied",
           "upgrade_blocked",
           "library_changed",
@@ -57240,6 +58057,7 @@
           "no_album_release",
           "album_releases_exhausted",
           "track_not_found",
+          "nothing_allowed",
           "no_download_source",
           "settings_unreadable",
           "journal_unreadable",
@@ -61777,7 +62595,7 @@
               "string",
               "null"
             ],
-            "description": "MusicBrainz id: the hit's own for MusicBrainz hits, the accepted\nidentity for library rows. Absent means unidentified, never failure."
+            "description": "MusicBrainz id: the hit's own for MusicBrainz hits, the match row's\nfor library rows. Absent means unidentified, never failure."
           },
           "requested": {
             "type": "boolean",
@@ -62612,6 +63430,13 @@
           "password"
         ],
         "properties": {
+          "code": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The code from the server log, when the setup status asks for one."
+          },
           "display_name": {
             "type": [
               "string",
@@ -62644,9 +63469,14 @@
         "type": "object",
         "description": "Setup-required probe for the SPA first-run gate.",
         "required": [
-          "setup_required"
+          "setup_required",
+          "code_required"
         ],
         "properties": {
+          "code_required": {
+            "type": "boolean",
+            "description": "True when setup also needs the code from the server log: the server\nwas started fresh from v2 and no account exists yet."
+          },
           "setup_required": {
             "type": "boolean",
             "description": "True when no users exist yet and setup must run."
@@ -63108,9 +63938,19 @@
           "favorite_artists",
           "favorite_tracks",
           "review_count",
+          "guess_count",
+          "not_found_count",
+          "looks_wrong_count",
+          "check_count",
           "local_only_count"
         ],
         "properties": {
+          "check_count": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Albums to check, each once: a best guess, marked \"Looks wrong\" or\nwith an open review.",
+            "minimum": 0
+          },
           "favorite_albums": {
             "type": "integer",
             "format": "int64",
@@ -63141,6 +63981,12 @@
               "type": "string"
             }
           },
+          "guess_count": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Albums whose edition is a best guess.",
+            "minimum": 0
+          },
           "last_scan_at": {
             "type": [
               "number",
@@ -63155,10 +64001,22 @@
             "description": "Albums with streamable tracks and no MusicBrainz identity.",
             "minimum": 0
           },
+          "looks_wrong_count": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Albums someone marked \"Looks wrong\".",
+            "minimum": 0
+          },
+          "not_found_count": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Albums nothing on MusicBrainz fits.",
+            "minimum": 0
+          },
           "review_count": {
             "type": "integer",
             "format": "int64",
-            "description": "Identification reviews waiting on a person.",
+            "description": "Identification reviews waiting on a person (\"Needs you\").",
             "minimum": 0
           },
           "total_albums": {
@@ -64824,6 +65682,51 @@
           }
         }
       },
+      "UpgradeAddress": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "A full address.",
+            "required": [
+              "value",
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "full"
+                ]
+              },
+              "value": {
+                "type": "string",
+                "description": "A full address."
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A path, the base path included.",
+            "required": [
+              "value",
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "path"
+                ]
+              },
+              "value": {
+                "type": "string",
+                "description": "A path, the base path included."
+              }
+            }
+          }
+        ],
+        "description": "An address, whole when v2's settings name the host, else the path to\nput after the scheme and host DroppedNeedle is opened at."
+      },
       "UpgradeAlbumRequest": {
         "type": "object",
         "description": "Upgrade one album.",
@@ -64857,6 +65760,266 @@
           }
         }
       },
+      "UpgradeBackupFolders": {
+        "type": "object",
+        "description": "The two folders the v2 files are kept in.",
+        "required": [
+          "config",
+          "cache"
+        ],
+        "properties": {
+          "cache": {
+            "type": "string",
+            "description": "The cache folder's backup."
+          },
+          "config": {
+            "type": "string",
+            "description": "The config folder's backup."
+          }
+        }
+      },
+      "UpgradeBlocker": {
+        "type": "object",
+        "description": "Something that stops the upgrade until it is fixed.",
+        "required": [
+          "code",
+          "message",
+          "fix"
+        ],
+        "properties": {
+          "code": {
+            "$ref": "#/components/schemas/UpgradeCode",
+            "description": "What it is."
+          },
+          "fix": {
+            "type": "string",
+            "description": "What to do about it, as a sentence."
+          },
+          "message": {
+            "type": "string",
+            "description": "What is wrong, as a sentence."
+          }
+        }
+      },
+      "UpgradeCallbackFeature": {
+        "type": "string",
+        "description": "A feature whose callback address changes with the upgrade.",
+        "enum": [
+          "single_sign_on",
+          "spotify",
+          "musicbrainz_contributions"
+        ]
+      },
+      "UpgradeCheck": {
+        "type": "object",
+        "description": "What `upgrade --check` found. It runs every check the upgrade runs\nbefore it moves anything, and changes nothing.",
+        "required": [
+          "layout",
+          "orphans",
+          "blockers",
+          "warnings"
+        ],
+        "properties": {
+          "blockers": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UpgradeBlocker"
+            },
+            "description": "What stops the upgrade until it is fixed."
+          },
+          "counts": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "What the export carries, by the names `upgrade-report.json` counts\nunder: what the upgrade would move, at most. The import can still\nleave a record out, and its report then lists it. None when the\nexport could not be tried.",
+            "additionalProperties": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "layout": {
+            "$ref": "#/components/schemas/UpgradeFoundLayout",
+            "description": "What the folders hold."
+          },
+          "orphans": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Follows and approvals of deleted users the upgrade would remove\nfrom the v2 database first. They are not in `counts`.",
+            "minimum": 0
+          },
+          "warnings": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UpgradeWarning"
+            },
+            "description": "Addresses that change with the upgrade, which `--callbacks-changed`\nacknowledges."
+          }
+        }
+      },
+      "UpgradeCode": {
+        "type": "string",
+        "description": "Why the upgrade cannot start, or why a run failed.",
+        "enum": [
+          "UNKNOWN_LAYOUT",
+          "UNSUPPORTED_PATHS",
+          "BACKUP_EXISTS",
+          "V2_WAL_PRESENT",
+          "NOT_ENOUGH_DISK",
+          "V2_KEY_NOT_FOUND",
+          "V2_KEY_INVALID",
+          "V2_KEY_MISMATCH",
+          "V2_CONFIG_UNREADABLE",
+          "V2_CONFIG_INVALID",
+          "MISSING_INSTANCE_ID",
+          "V2_DATABASE_ERROR",
+          "EXPORT_FAILED",
+          "VALIDATION_FAILED",
+          "CALLBACKS_TO_CHANGE",
+          "NO_ADMIN_CAN_SIGN_IN",
+          "LOCKED",
+          "TOOL_RUNNING",
+          "FILE_ERROR",
+          "OCCUPIED",
+          "NOT_A_FOLDER",
+          "RANDOM_FAILED",
+          "ORPHAN_REPAIR_FAILED",
+          "IMPORT_SETUP_FAILED",
+          "IMPORT_FAILED",
+          "ROLLBACK_FAILED",
+          "BACKUP_NOT_REMOVED",
+          "NO_BACKUP",
+          "ALREADY_V2",
+          "BACKUP_STILL_NEEDED",
+          "CONFIRMATION_NEEDED",
+          "USAGE",
+          "ENVIRONMENT_INVALID",
+          "INTERNAL"
+        ]
+      },
+      "UpgradeFailure": {
+        "type": "object",
+        "description": "The run failed or stopped.",
+        "required": [
+          "code",
+          "message",
+          "v2_files"
+        ],
+        "properties": {
+          "code": {
+            "$ref": "#/components/schemas/UpgradeCode",
+            "description": "What went wrong."
+          },
+          "message": {
+            "type": "string",
+            "description": "The error, as the tool prints it."
+          },
+          "v2_files": {
+            "$ref": "#/components/schemas/UpgradeV2Files",
+            "description": "Where the v2 files are now."
+          }
+        }
+      },
+      "UpgradeFoundLayout": {
+        "type": "string",
+        "description": "What the data folders hold, as the check found them.",
+        "enum": [
+          "v2",
+          "interrupted",
+          "v3",
+          "empty",
+          "unknown"
+        ]
+      },
+      "UpgradeFreshBody": {
+        "type": "object",
+        "description": "Start fresh's confirmation.",
+        "required": [
+          "confirm"
+        ],
+        "properties": {
+          "confirm": {
+            "type": "boolean",
+            "description": "Must be true: nothing comes across from v2."
+          }
+        }
+      },
+      "UpgradeLayout": {
+        "type": "string",
+        "description": "Where the upgrade stands.",
+        "enum": [
+          "needs_upgrade",
+          "interrupted",
+          "finished"
+        ]
+      },
+      "UpgradeOutcome": {
+        "type": "string",
+        "description": "How a run ended well.",
+        "enum": [
+          "upgraded",
+          "started_fresh",
+          "undone",
+          "already_v3",
+          "no_v2_data"
+        ]
+      },
+      "UpgradePreflightBody": {
+        "type": "object",
+        "description": "What the pre-flight found: the check, or why it could not run.",
+        "properties": {
+          "check": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/UpgradeCheck",
+                "description": "The check's findings: counts, blockers with their fixes, and the\naddress changes to acknowledge."
+              }
+            ]
+          },
+          "failure": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/UpgradeFailure",
+                "description": "Why the check could not run."
+              }
+            ]
+          }
+        }
+      },
+      "UpgradeProgressBody": {
+        "type": "object",
+        "description": "The latest run and where the upgrade stands.",
+        "required": [
+          "layout"
+        ],
+        "properties": {
+          "layout": {
+            "$ref": "#/components/schemas/UpgradeLayout",
+            "description": "Where the upgrade stands."
+          },
+          "run": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/UpgradeRun",
+                "description": "The latest upgrade, fresh start or undo; none yet."
+              }
+            ]
+          }
+        }
+      },
       "UpgradeRequestResponse": {
         "type": "object",
         "description": "What an upgrade ask did.",
@@ -64875,6 +66038,286 @@
             ]
           }
         }
+      },
+      "UpgradeResult": {
+        "type": "object",
+        "description": "The run finished.",
+        "required": [
+          "outcome"
+        ],
+        "properties": {
+          "backup": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/UpgradeBackupFolders",
+                "description": "Where the v2 files are kept; none when there are none to keep."
+              }
+            ]
+          },
+          "outcome": {
+            "$ref": "#/components/schemas/UpgradeOutcome",
+            "description": "How it ended."
+          },
+          "summary": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/UpgradeSummary",
+                "description": "What an upgrade moved; only after an upgrade."
+              }
+            ]
+          }
+        }
+      },
+      "UpgradeRun": {
+        "type": "object",
+        "description": "The latest run of the upgrade, a fresh start or an undo.",
+        "required": [
+          "task",
+          "running"
+        ],
+        "properties": {
+          "done": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Parts of the step done, when it counts them.",
+            "minimum": 0
+          },
+          "failure": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/UpgradeFailure",
+                "description": "Why it failed, once it has."
+              }
+            ]
+          },
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The step's label."
+          },
+          "result": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/UpgradeResult",
+                "description": "How the run finished, once it has."
+              }
+            ]
+          },
+          "running": {
+            "type": "boolean",
+            "description": "True until it ends."
+          },
+          "step": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/UpgradeStep",
+                "description": "The step under way, or the last one."
+              }
+            ]
+          },
+          "task": {
+            "$ref": "#/components/schemas/UpgradeTask",
+            "description": "What the run does."
+          },
+          "total": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Parts the step has, when it knows.",
+            "minimum": 0
+          }
+        }
+      },
+      "UpgradeSignInBody": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "A v2 admin's username and password.",
+            "required": [
+              "username",
+              "password",
+              "method"
+            ],
+            "properties": {
+              "method": {
+                "type": "string",
+                "enum": [
+                  "password"
+                ]
+              },
+              "password": {
+                "type": "string",
+                "description": "The v2 password."
+              },
+              "username": {
+                "type": "string",
+                "description": "The v2 username."
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "The one-time code from the server's log.",
+            "required": [
+              "code",
+              "method"
+            ],
+            "properties": {
+              "code": {
+                "type": "string",
+                "description": "The code, with or without its dashes."
+              },
+              "method": {
+                "type": "string",
+                "enum": [
+                  "code"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "How to sign in to the upgrade page."
+      },
+      "UpgradeStartBody": {
+        "type": "object",
+        "description": "What start needs.",
+        "properties": {
+          "acknowledged": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AcknowledgedWarning"
+            },
+            "description": "Every address change the latest pre-flight listed."
+          }
+        }
+      },
+      "UpgradeStateBody": {
+        "type": "object",
+        "description": "Where the upgrade stands, for anyone.",
+        "required": [
+          "layout",
+          "signed_in"
+        ],
+        "properties": {
+          "layout": {
+            "$ref": "#/components/schemas/UpgradeLayout",
+            "description": "Where the upgrade stands."
+          },
+          "signed_in": {
+            "type": "boolean",
+            "description": "Whether this caller's upgrade sign-in is valid."
+          }
+        }
+      },
+      "UpgradeStep": {
+        "type": "string",
+        "description": "The steps a run goes through, in the order they can come.",
+        "enum": [
+          "recover",
+          "move_aside",
+          "export",
+          "export_again",
+          "dry_run",
+          "import",
+          "remove_backup",
+          "roll_back",
+          "undo"
+        ]
+      },
+      "UpgradeSummary": {
+        "type": "object",
+        "description": "What the upgrade did, as its text summary says it.",
+        "required": [
+          "moved",
+          "needs_attention",
+          "orphans_removed",
+          "left_behind",
+          "notes",
+          "settings_defaulted",
+          "report"
+        ],
+        "properties": {
+          "left_behind": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "What stayed behind in v2, one line each."
+          },
+          "moved": {
+            "type": "object",
+            "description": "Records moved to v3, by the names the report counts under; kinds\nwith none moved are left out.",
+            "additionalProperties": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "needs_attention": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Records left out or changed on the way, each listed in the report.",
+            "minimum": 0
+          },
+          "notes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "What is worth a look, one line each."
+          },
+          "orphans_removed": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Follows and approvals of deleted users removed from the v2 database.",
+            "minimum": 0
+          },
+          "report": {
+            "type": "string",
+            "description": "Where the full report, `upgrade-report.json`, was saved."
+          },
+          "settings_defaulted": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Settings v2 had nothing saved for, now at v3's defaults."
+          }
+        }
+      },
+      "UpgradeTask": {
+        "type": "string",
+        "description": "What a run in the progress read does.",
+        "enum": [
+          "upgrade",
+          "fresh",
+          "undo"
+        ]
       },
       "UpgradeTrackRequest": {
         "type": "object",
@@ -64918,6 +66361,55 @@
           },
           "track_title": {
             "type": "string"
+          }
+        }
+      },
+      "UpgradeV2Files": {
+        "type": "string",
+        "description": "Where the v2 files are after a failed run.",
+        "enum": [
+          "untouched",
+          "put_back",
+          "in_backup"
+        ]
+      },
+      "UpgradeWarning": {
+        "type": "object",
+        "description": "A change at an outside service to acknowledge before the upgrade.",
+        "required": [
+          "feature",
+          "message"
+        ],
+        "properties": {
+          "feature": {
+            "$ref": "#/components/schemas/UpgradeCallbackFeature",
+            "description": "The feature it concerns."
+          },
+          "message": {
+            "type": "string",
+            "description": "What to do, as sentences."
+          },
+          "new_address": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/UpgradeAddress",
+                "description": "The address v3 uses; none for MusicBrainz contributions."
+              }
+            ]
+          },
+          "old_address": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/UpgradeAddress",
+                "description": "The address v2 registered; none for MusicBrainz contributions."
+              }
+            ]
           }
         }
       },
@@ -65192,7 +66684,9 @@
           "state",
           "reason",
           "updated_at",
-          "identity_revision"
+          "identity_revision",
+          "file_count",
+          "looks_wrong_count"
         ],
         "properties": {
           "album_id": {
@@ -65201,10 +66695,33 @@
           "artist_name": {
             "type": "string"
           },
+          "file_count": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Indexed files the album holds.",
+            "minimum": 0
+          },
+          "guess": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/WaitingGuessView",
+                "description": "What \"That's right\" confirms, for a best guess."
+              }
+            ]
+          },
           "identity_revision": {
             "type": "integer",
             "format": "int64",
-            "description": "The identity's row revision, 0 when the album has none. \"Looks\nright\" echoes it."
+            "description": "The identity's row revision, 0 when the album has none. \"That's\nright\" echoes it."
+          },
+          "looks_wrong_count": {
+            "type": "integer",
+            "format": "int32",
+            "description": "How many people marked the match \"Looks wrong\".",
+            "minimum": 0
           },
           "reason": {
             "$ref": "#/components/schemas/ReasonView"
@@ -65223,14 +66740,49 @@
           },
           "state": {
             "$ref": "#/components/schemas/EditionState",
-            "description": "`unconfirmed` or `unmatched`."
+            "description": "`unconfirmed` or `unmatched`; in the \"Looks wrong\" list, any state."
           },
           "title": {
-            "type": "string"
+            "type": "string",
+            "description": "The album as its files have it."
           },
           "updated_at": {
             "type": "number",
-            "format": "double"
+            "format": "double",
+            "description": "When it was listed (epoch seconds): the match, or the newest\n\"Looks wrong\" mark."
+          }
+        }
+      },
+      "WaitingGuessView": {
+        "type": "object",
+        "description": "The guess an album holds, as its row in the list names it.",
+        "required": [
+          "title",
+          "artist_name",
+          "release_group_mbid",
+          "matched_files"
+        ],
+        "properties": {
+          "artist_name": {
+            "type": "string"
+          },
+          "matched_files": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Files the guess accounts for closely.",
+            "minimum": 0
+          },
+          "release_group_mbid": {
+            "type": "string"
+          },
+          "release_mbid": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": {
+            "type": "string"
           }
         }
       },
@@ -65313,6 +66865,17 @@
           "kind": {
             "$ref": "#/components/schemas/WatchKind",
             "description": "The whole album or the gaps of a short one."
+          },
+          "last_outcome": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/WatchOutcome",
+                "description": "What the last check found, once one ran."
+              }
+            ]
           },
           "musicbrainz_id": {
             "type": "string",
@@ -65575,6 +67138,20 @@
         "enum": [
           "missing",
           "partial"
+        ]
+      },
+      "WatchOutcome": {
+        "type": "string",
+        "description": "What a wanted watch's last check found.",
+        "enum": [
+          "found",
+          "seen",
+          "dispatched",
+          "quiet",
+          "outside_settings",
+          "error",
+          "in_library",
+          "imported"
         ]
       },
       "WatchState": {
@@ -66628,6 +68205,12 @@
         "type": "http",
         "scheme": "bearer",
         "description": "A session token. A browser sends the same session as the `droppedneedle_sid` or `__Secure-droppedneedle_sid` cookie. The scope names the posture, not a stored role: `user` is any signed-in account, `curator` is trusted or admin, `admin` is admin only."
+      },
+      "upgrade_session": {
+        "type": "apiKey",
+        "in": "cookie",
+        "name": "droppedneedle_upgrade",
+        "description": "The upgrade page's own sign-in, served only by a server started on v2 data, as `droppedneedle_upgrade` or `__Secure-droppedneedle_upgrade`. No session satisfies it."
       },
       "wrapped_key": {
         "type": "apiKey",

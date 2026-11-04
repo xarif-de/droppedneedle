@@ -49,10 +49,6 @@
 //!   with the shared rate limiter alone. Its `X-Wrapped-API-Key` extractor
 //!   is the only credential, and moving those routes to the public group
 //!   would wrongly make them public.
-//! - The callbacks at their old paths (the v1 Spotify and MusicBrainz
-//!   contribution ones, the v2 OIDC one) stay plain routers outside the
-//!   session gate, rate-limited like the public group, until they are
-//!   removed.
 //! - The compat shims register through the compat mount and merge outside
 //!   the session gate too: they carry their own app-password auth plus the
 //!   compat layers (CORS, limits), and never inherit `/api` session auth.
@@ -69,7 +65,7 @@ use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Pr
 
 use crate::{
     handlers,
-    middleware::request_scope,
+    middleware::{Boundary, request_scope},
     security_headers::{
         ContentSecurity, TransportSecurity, content_security, strict_transport_security,
     },
@@ -97,42 +93,53 @@ pub fn create_app(state: AppState) -> Router {
 /// Build the full application router, serving `web` as the fallback when
 /// given.
 pub fn create_app_with_web(state: AppState, web: Option<WebUi>) -> Router {
-    let base_path = state.config.base_path.clone();
-    let outside_base = Router::new()
-        .fallback(handlers::fallback_404)
-        .layer(middleware::from_fn_with_state(state.clone(), request_scope))
-        .layer(middleware::from_fn_with_state(
-            ContentSecurity::from_state(&state),
-            content_security,
-        ));
+    let boundary = Boundary::from_state(&state);
+    let security = ContentSecurity::from_state(&state);
     let hsts = middleware::from_fn_with_state(
         TransportSecurity::from_state(&state),
         strict_transport_security,
     );
     let app = pre_routing(&state, routes(&state, web))
-        .layer(middleware::from_fn_with_state(state.clone(), request_scope))
+        .layer(middleware::from_fn_with_state(
+            boundary.clone(),
+            request_scope,
+        ))
         .layer(compression_layer())
         .layer(middleware::from_fn_with_state(
-            ContentSecurity::from_state(&state),
+            security.clone(),
             content_security,
         ));
-    let app = if base_path.is_empty() {
-        app
-    } else {
-        // Strip the base by hand rather than with `Router::nest`, which
-        // does not route `{base}/` (the SPA's own root URL) into the app.
-        Router::new().fallback(move |request: Request| async move {
-            match base_relative_uri(&base_path, request.uri()) {
-                Some(uri) => {
-                    let (mut parts, body) = request.into_parts();
-                    parts.uri = uri;
-                    answer(app.oneshot(Request::from_parts(parts, body)).await)
-                }
-                None => answer(outside_base.oneshot(request).await),
+    under_base(&state.config.base_path, app, boundary, security).layer(hsts)
+}
+
+/// `app` served under `base_path`: a request outside the base gets the 404
+/// envelope, with its own request scope and content-security header.
+pub(crate) fn under_base(
+    base_path: &str,
+    app: Router,
+    boundary: Boundary,
+    security: ContentSecurity,
+) -> Router {
+    if base_path.is_empty() {
+        return app;
+    }
+    let base_path = base_path.to_owned();
+    let outside_base = Router::new()
+        .fallback(handlers::fallback_404)
+        .layer(middleware::from_fn_with_state(boundary, request_scope))
+        .layer(middleware::from_fn_with_state(security, content_security));
+    // Strip the base by hand rather than with `Router::nest`, which does
+    // not route `{base}/` (the SPA's own root URL) into the app.
+    Router::new().fallback(move |request: Request| async move {
+        match base_relative_uri(&base_path, request.uri()) {
+            Some(uri) => {
+                let (mut parts, body) = request.into_parts();
+                parts.uri = uri;
+                answer(app.oneshot(Request::from_parts(parts, body)).await)
             }
-        })
-    };
-    app.layer(hsts)
+            None => answer(outside_base.oneshot(request).await),
+        }
+    })
 }
 
 /// `uri` with the base path removed, on a segment boundary: `{base}` and
@@ -190,7 +197,7 @@ fn answer(
 /// Every area mounted through [`Routes`], listed once. Serving and the API
 /// document both read this list.
 fn mount(m: Mount<'_>) -> Mount<'_> {
-    m.area(server_routes(), |_| ())
+    m.area(server_routes(), |_| handlers::HealthStatus::Ok)
         .area(crate::admin::routes(), |state| state.admin.clone())
         .area(crate::settings::wiring::routes(), |state| {
             state.settings.clone()
@@ -264,7 +271,7 @@ fn mount(m: Mount<'_>) -> Mount<'_> {
 }
 
 /// The server crate's own routes.
-fn server_routes() -> Routes {
+fn server_routes() -> Routes<handlers::HealthStatus> {
     Routes::new()
         .public(routes!(handlers::health))
         .public(routes!(handlers::openapi_json))
@@ -338,6 +345,9 @@ fn layered(state: &AppState, routes: Routes) -> Router {
         curator,
         admin,
         wrapped_key,
+        // The upgrade page's routes are served only in upgrade mode
+        // (`crate::upgrade_mode`); no area of the app mounts one.
+        upgrade_session: _,
     } = routes.into_postures();
     let limited = |group: Router| {
         group.route_layer(middleware::from_fn_with_state(
@@ -367,29 +377,7 @@ fn layered(state: &AppState, routes: Routes) -> Router {
 /// Every route and the 404 and 405 fallbacks, at base-relative paths.
 fn routes(state: &AppState, web: Option<WebUi>) -> Router {
     let mounted = layered(state, mount(Mount::serve(state)).routes);
-    // The v1 Spotify and MusicBrainz contribution callbacks: outside the
-    // session gate (token identified), rate-limited like the public group.
-    let legacy_callbacks = state
-        .acquire
-        .legacy_callback_router()
-        .merge(state.library_services.legacy_contrib_callback_router())
-        .layer(middleware::from_fn_with_state(
-            state.auth.limits.clone(),
-            rate_limit,
-        ));
-    // The OIDC callback at its v2 path, so a migrated identity provider
-    // keeps redirecting somewhere real. Public like the v3 one.
-    let oidc_legacy = state
-        .auth
-        .legacy_oidc_router()
-        .layer(middleware::from_fn_with_state(
-            state.auth.limits.clone(),
-            rate_limit,
-        ));
-    let app = mounted
-        .merge(legacy_callbacks)
-        .merge(oidc_legacy)
-        .merge(state.compat.router());
+    let app = mounted.merge(state.compat.router());
     // Dev-only tooling routes (covers-debug). The debug-build gate
     // compiles this mount out of release binaries entirely, so no
     // production process can serve tooling however it was configured.

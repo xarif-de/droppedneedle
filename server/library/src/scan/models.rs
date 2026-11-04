@@ -11,49 +11,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-/// Give a fieldless enum its stored spelling: `as_str`, a `parse` that
-/// answers `None` for any other text, and the codec that binds and reads it,
-/// where any other text is a decode error.
-macro_rules! spelled {
-    ($name:ident { $($variant:ident => $text:literal),+ $(,)? }) => {
-        impl $name {
-            /// The stored spelling.
-            pub const fn as_str(self) -> &'static str {
-                match self {
-                    $($name::$variant => $text),+
-                }
-            }
-
-            /// The value `text` spells, if any.
-            pub fn parse(text: &str) -> Option<Self> {
-                match text {
-                    $($text => Some($name::$variant),)+
-                    _ => None,
-                }
-            }
-        }
-
-        impl rusqlite::types::ToSql for $name {
-            fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
-                Ok(rusqlite::types::ToSqlOutput::from(self.as_str()))
-            }
-        }
-
-        impl rusqlite::types::FromSql for $name {
-            fn column_result(
-                value: rusqlite::types::ValueRef<'_>,
-            ) -> rusqlite::types::FromSqlResult<Self> {
-                let text = value.as_str()?;
-                Self::parse(text).ok_or_else(|| {
-                    rusqlite::types::FromSqlError::Other(
-                        format!("{} has no value {text:?}", stringify!($name)).into(),
-                    )
-                })
-            }
-        }
-    };
-}
-pub(crate) use spelled;
+use droppedneedle_kernel::spelled;
 
 /// A run's counters, one per column of the runs table.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
@@ -113,21 +71,6 @@ spelled!(Counter {
 });
 
 impl Counter {
-    /// Every counter.
-    pub const ALL: [Counter; 11] = [
-        Counter::Total,
-        Counter::Discovered,
-        Counter::Inspected,
-        Counter::New,
-        Counter::Changed,
-        Counter::Indexed,
-        Counter::Unchanged,
-        Counter::Excluded,
-        Counter::Missing,
-        Counter::Errored,
-        Counter::IdentificationEnqueued,
-    ];
-
     /// The runs-table column that holds it, which is also its name.
     pub const fn column(self) -> &'static str {
         self.as_str()
@@ -269,6 +212,12 @@ pub enum Phase {
     Reconciling,
 }
 
+spelled!(Phase {
+    Discovering => "discovering",
+    Indexing => "indexing",
+    Reconciling => "reconciling",
+});
+
 impl Phase {
     /// The phase as the API spells it.
     pub const fn scan_phase(self) -> ScanPhase {
@@ -289,6 +238,37 @@ impl Phase {
         }
     }
 }
+
+/// A pass an ended run owes, in `library_scan_runs.next_end_pass`. The
+/// passes run in the order the store lists them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndPassName {
+    JoinAcrossScans,
+    CarryToFirstHalf,
+    JoinReplaced,
+    KeepDepartures,
+    PlaceScanned,
+    ContinueTracks,
+    ContinueMoved,
+    ConvergeArtists,
+    HoldReplacements,
+    OfferHeldBack,
+    HeldScopes,
+}
+
+spelled!(EndPassName {
+    JoinAcrossScans => "scan_end_join_across_scans",
+    CarryToFirstHalf => "scan_end_carry_to_first_half",
+    JoinReplaced => "scan_end_join_replaced",
+    KeepDepartures => "scan_end_keep_departures",
+    PlaceScanned => "scan_end_place_scanned",
+    ContinueTracks => "scan_end_continue_tracks",
+    ContinueMoved => "scan_end_continue_moved",
+    ConvergeArtists => "scan_end_converge_artists",
+    HoldReplacements => "scan_end_hold_replacements",
+    OfferHeldBack => "scan_end_offer_held_back",
+    HeldScopes => "scan_end_held_scopes",
+});
 
 /// How a run ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -649,8 +629,129 @@ pub struct ScanFailureRecord {
     pub failure_code: FailureCode,
     pub recorded_at: f64,
     pub failure_detail: String,
-    pub phase: ScanPhase,
+    pub phase: Phase,
 }
+
+/// Where a track's title, album title or album artist came from: its tags,
+/// its path, or a stand-in. `absent` is what v2 gave rows it never read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagProvenance {
+    Tag,
+    Parsed,
+    Placeholder,
+    Absent,
+}
+
+spelled!(TagProvenance {
+    Tag => "tag",
+    Parsed => "parsed",
+    Placeholder => "placeholder",
+    Absent => "absent",
+});
+
+/// What indexing made of one inventory row, in
+/// `library_scan_inventory.processing_state`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InventoryState {
+    Pending,
+    Indexed,
+    Skipped,
+    /// The tag-read capacity ran out; the read waits for a later run.
+    Deferred,
+    Failed,
+}
+
+spelled!(InventoryState {
+    Pending => "pending",
+    Indexed => "indexed",
+    Skipped => "skipped",
+    Deferred => "deferred",
+    Failed => "failed",
+});
+
+/// Whether a track's file is in the library, in `local_tracks.availability`:
+/// indexed, taken out of it, or not found by the last walk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Availability {
+    Indexed,
+    Excluded,
+    Missing,
+}
+
+spelled!(Availability {
+    Indexed => "indexed",
+    Excluded => "excluded",
+    Missing => "missing",
+});
+
+/// What an artist row stands for, in `local_artists.kind`. A scan makes
+/// `group` rows; the built-in rows are `various_artists` and `unknown`,
+/// and v2's rows may say `person`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtistKind {
+    Person,
+    Group,
+    VariousArtists,
+    Unknown,
+}
+
+spelled!(ArtistKind {
+    Person => "person",
+    Group => "group",
+    VariousArtists => "various_artists",
+    Unknown => "unknown",
+});
+
+/// Where a track's genre came from, in `local_track_genres.source`. A scan
+/// writes `local`, from the file's tags; the others are v2's, carried by
+/// the upgrade.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenreSource {
+    Local,
+    MusicBrainz,
+    ListenBrainz,
+    LastFm,
+    Override,
+}
+
+spelled!(GenreSource {
+    Local => "local",
+    MusicBrainz => "musicbrainz",
+    ListenBrainz => "listenbrainz",
+    LastFm => "lastfm",
+    Override => "override",
+});
+
+/// Who grouped an album or put a track on its album: the scan, v2's
+/// grouping carried by the upgrade, or a curator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupingSource {
+    Automatic,
+    LegacyImport,
+    Manual,
+}
+
+spelled!(GroupingSource {
+    Automatic => "automatic",
+    LegacyImport => "legacy_import",
+    Manual => "manual",
+});
+
+/// Where an album's cover was found, in `local_album_artwork.source`: an
+/// image in the album's folder or a picture embedded in one of its files.
+/// A `manual` row is left as it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtworkSource {
+    Embedded,
+    Folder,
+    Manual,
+}
+
+spelled!(ArtworkSource {
+    Embedded => "embedded",
+    Folder => "folder",
+    Manual => "manual",
+});
 
 /// Discovery state per (run, scope). The stored values are v2's
 /// scope-discovery column values: a clean walk lands `completed`, a degraded one `partially_read`,

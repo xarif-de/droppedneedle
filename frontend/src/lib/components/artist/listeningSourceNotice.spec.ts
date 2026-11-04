@@ -5,42 +5,38 @@ const answer = (overrides: Partial<SectionSources>): SectionSources => ({
 	source: 'listenbrainz',
 	asked_source: 'listenbrainz',
 	unavailable_sources: [],
+	configured: true,
 	...overrides
 });
 
 describe('listeningSourceNotice', () => {
-	it('stays quiet when the asked service answered', () => {
+	it('stays quiet when the chosen service answered or nothing is set up', () => {
 		expect(listeningSourceNotice([answer({}), undefined])).toBeNull();
+		expect(
+			listeningSourceNotice([answer({ configured: false, unavailable_sources: ['listenbrainz'] })])
+		).toBeNull();
 	});
 
-	it('says ListenBrainz is down and Last.fm stood in', () => {
+	it('says why Last.fm stood in for ListenBrainz', () => {
 		expect(
 			listeningSourceNotice([
 				answer({ source: 'lastfm', unavailable_sources: ['listenbrainz'] }),
 				answer({})
 			])
-		).toBe('ListenBrainz is not available right now, so these lists come from Last.fm.');
+		).toBe('ListenBrainz is unavailable, so these lists come from Last.fm.');
+		expect(listeningSourceNotice([answer({ source: 'lastfm' })])).toBe(
+			'ListenBrainz has nothing here, so these lists come from Last.fm.'
+		);
 	});
 
-	it('says Last.fm had nothing and ListenBrainz stood in', () => {
-		expect(
-			listeningSourceNotice([answer({ source: 'listenbrainz', asked_source: 'lastfm' })])
-		).toBe('Last.fm has nothing for this artist, so these lists come from ListenBrainz.');
-	});
-
-	it('says when neither service answers', () => {
-		expect(
-			listeningSourceNotice([
-				answer({ asked_source: 'lastfm', unavailable_sources: ['lastfm', 'listenbrainz'] })
-			])
-		).toMatch(/^Neither ListenBrainz nor Last\.fm is available/);
-	});
-
-	it('says when the asked service failed and nothing stood in', () => {
+	it('says when the chosen service failed', () => {
 		expect(
 			listeningSourceNotice([
 				answer({ asked_source: 'lastfm', source: 'lastfm', unavailable_sources: ['lastfm'] })
 			])
-		).toBe('Last.fm is not available right now, so these lists may be out of date.');
+		).toBe('Last.fm is unavailable. These lists may be out of date.');
+		expect(
+			listeningSourceNotice([answer({ unavailable_sources: ['listenbrainz', 'lastfm'] })])
+		).toBe('ListenBrainz and Last.fm are unavailable.');
 	});
 });

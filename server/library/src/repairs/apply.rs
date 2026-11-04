@@ -13,6 +13,7 @@ use rusqlite::Transaction;
 
 use super::models::{ApplyResult, FindingCode, FindingState};
 use super::store::{self, OpenFinding};
+use crate::catalog_actions::ActionKind;
 use crate::catalog_actions::CatalogAction;
 use crate::catalog_actions::record_action;
 use crate::catalog_revision::bump_catalog;
@@ -132,7 +133,7 @@ fn apply_finding(
             let Some(candidate) = finding.payload.candidate.as_ref() else {
                 return Ok(None);
             };
-            match choice::choose(tx, album_id, candidate, actor, now) {
+            match choice::choose(tx, album_id, candidate, actor, false, now) {
                 Ok(_) => Ok(Some(ApplyResult::EditionAccepted)),
                 // The edition no longer fits the files: leave the album.
                 Err(OperationError::Invalid(_) | OperationError::NotFound(_)) => Ok(None),
@@ -185,7 +186,7 @@ fn place(
         tx,
         CatalogAction {
             actor: actor.unwrap_or("system"),
-            kind: "accept_management_track_mappings",
+            kind: ActionKind::AcceptManagementTrackMappings,
             album_id,
             job_id: Some(job_id),
             before: serde_json::json!({ "release_mbid": release }),

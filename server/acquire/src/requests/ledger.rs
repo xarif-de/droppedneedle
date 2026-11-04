@@ -9,32 +9,6 @@
 use super::error::RequestsError;
 use super::models::RequestKind;
 
-/// One SQL conversion for a closed set stored as text: the value is its
-/// `as_str`, and text outside the set fails decoding.
-macro_rules! sql_text {
-    ($type:ty) => {
-        impl rusqlite::types::ToSql for $type {
-            fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
-                Ok(rusqlite::types::ToSqlOutput::from(self.as_str()))
-            }
-        }
-
-        impl rusqlite::types::FromSql for $type {
-            fn column_result(
-                value: rusqlite::types::ValueRef<'_>,
-            ) -> rusqlite::types::FromSqlResult<Self> {
-                let text = value.as_str()?;
-                Self::parse(text).ok_or_else(|| {
-                    rusqlite::types::FromSqlError::Other(
-                        format!(concat!("not a ", stringify!($type), ": {}"), text).into(),
-                    )
-                })
-            }
-        }
-    };
-}
-pub(crate) use sql_text;
-
 /// A request row's status. The `request_history.status` CHECK lists
 /// exactly these values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, utoipa::ToSchema)]
@@ -62,44 +36,20 @@ pub enum RequestStatus {
     Rejected,
 }
 
+droppedneedle_kernel::spelled!(RequestStatus {
+    Pending => "pending",
+    Queued => "queued",
+    Downloading => "downloading",
+    AwaitingApproval => "awaiting_approval",
+    Cancelling => "cancelling",
+    Cancelled => "cancelled",
+    Failed => "failed",
+    Imported => "imported",
+    Incomplete => "incomplete",
+    Rejected => "rejected",
+});
+
 impl RequestStatus {
-    /// Every status, in CHECK order.
-    pub const ALL: [Self; 10] = [
-        Self::Pending,
-        Self::Queued,
-        Self::Downloading,
-        Self::AwaitingApproval,
-        Self::Cancelling,
-        Self::Cancelled,
-        Self::Failed,
-        Self::Imported,
-        Self::Incomplete,
-        Self::Rejected,
-    ];
-
-    /// Stored and wire form.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Pending => "pending",
-            Self::Queued => "queued",
-            Self::Downloading => "downloading",
-            Self::AwaitingApproval => "awaiting_approval",
-            Self::Cancelling => "cancelling",
-            Self::Cancelled => "cancelled",
-            Self::Failed => "failed",
-            Self::Imported => "imported",
-            Self::Incomplete => "incomplete",
-            Self::Rejected => "rejected",
-        }
-    }
-
-    /// Read back a stored or requested status.
-    pub fn parse(value: &str) -> Option<Self> {
-        Self::ALL
-            .into_iter()
-            .find(|status| status.as_str() == value)
-    }
-
     /// Asks that keep a row alive.
     pub const fn is_active(self) -> bool {
         matches!(
@@ -132,9 +82,6 @@ impl std::fmt::Display for RequestStatus {
         formatter.write_str(self.as_str())
     }
 }
-
-sql_text!(RequestStatus);
-sql_text!(RequestKind);
 
 /// Whether a request row may move `from -> to`.
 ///
@@ -190,26 +137,44 @@ pub enum WatchState {
     Fulfilled,
 }
 
-impl WatchState {
-    /// Every state, in CHECK order.
-    pub const ALL: [Self; 3] = [Self::Watching, Self::Stopped, Self::Fulfilled];
+droppedneedle_kernel::spelled!(WatchState {
+    Watching => "watching",
+    Stopped => "stopped",
+    Fulfilled => "fulfilled",
+});
 
-    /// Stored and wire form.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Watching => "watching",
-            Self::Stopped => "stopped",
-            Self::Fulfilled => "fulfilled",
-        }
-    }
-
-    /// Read back a stored state.
-    pub fn parse(value: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|state| state.as_str() == value)
-    }
+/// What a wanted watch's last check found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WatchOutcome {
+    /// New copies, shown as a badge.
+    Found,
+    /// Only copies seen before.
+    Seen,
+    /// A download was started.
+    Dispatched,
+    /// No copy anywhere.
+    Quiet,
+    /// Copies exist, but none the download settings allow.
+    OutsideSettings,
+    /// The search or the dispatch failed.
+    Error,
+    /// The album reached the library.
+    InLibrary,
+    /// The album came in through an upload.
+    Imported,
 }
 
-sql_text!(WatchState);
+droppedneedle_kernel::spelled!(WatchOutcome {
+    Found => "found",
+    Seen => "seen",
+    Dispatched => "dispatched",
+    Quiet => "quiet",
+    OutsideSettings => "outside_settings",
+    Error => "error",
+    InLibrary => "in_library",
+    Imported => "imported",
+});
 
 /// What a wanted watch waits for. The `wanted_watches.kind` CHECK lists
 /// exactly these values.
@@ -222,24 +187,10 @@ pub enum WatchKind {
     Partial,
 }
 
-impl WatchKind {
-    /// Stored and wire form.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Missing => "missing",
-            Self::Partial => "partial",
-        }
-    }
-
-    /// Read back a stored kind.
-    pub fn parse(value: &str) -> Option<Self> {
-        [Self::Missing, Self::Partial]
-            .into_iter()
-            .find(|kind| kind.as_str() == value)
-    }
-}
-
-sql_text!(WatchKind);
+droppedneedle_kernel::spelled!(WatchKind {
+    Missing => "missing",
+    Partial => "partial",
+});
 
 /// Whether a watch may move `from -> to`. A stopped watch resumes; a
 /// fulfilled one watches again when its album leaves the library.
@@ -267,27 +218,12 @@ pub enum ApprovalState {
     Revoked,
 }
 
-impl ApprovalState {
-    /// Every state, in CHECK order.
-    pub const ALL: [Self; 4] = [Self::Pending, Self::Approved, Self::Rejected, Self::Revoked];
-
-    /// Stored and wire form.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Pending => "pending",
-            Self::Approved => "approved",
-            Self::Rejected => "rejected",
-            Self::Revoked => "revoked",
-        }
-    }
-
-    /// Read back a stored state.
-    pub fn parse(value: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|state| state.as_str() == value)
-    }
-}
-
-sql_text!(ApprovalState);
+droppedneedle_kernel::spelled!(ApprovalState {
+    Pending => "pending",
+    Approved => "approved",
+    Rejected => "rejected",
+    Revoked => "revoked",
+});
 
 /// Whether an approval may move `from -> to`. A new ask puts a rejected
 /// or revoked row back to pending.
@@ -486,6 +422,8 @@ pub struct WantedWatch {
     pub next_check_at: u64,
     /// Unseen candidate count.
     pub new_candidate_count: u32,
+    /// What the last check found, once one ran.
+    pub last_outcome: Option<WatchOutcome>,
 }
 
 /// One auto-download approval row.

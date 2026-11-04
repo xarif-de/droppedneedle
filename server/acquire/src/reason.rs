@@ -33,6 +33,7 @@ pub enum Reason {
     NoBetterThanYours,
     OwnedElsewhere,
     OwnedOnAlbum,
+    AlbumNeedsCheck,
     NoAlbumMatch,
     AlbumNotFound,
     TagsDisagree,
@@ -42,6 +43,7 @@ pub enum Reason {
     Interrupted,
     ImportFailed,
     HeldByEarlierVersion,
+    FormatNotListed,
     // Library: our side could not take the files yet.
     TargetOccupied,
     UpgradeBlocked,
@@ -80,6 +82,7 @@ pub enum Reason {
     NoAlbumRelease,
     AlbumReleasesExhausted,
     TrackNotFound,
+    NothingAllowed,
     // Wait: nothing is wrong yet; the work resumes by itself.
     NoDownloadSource,
     SettingsUnreadable,
@@ -112,7 +115,7 @@ pub enum ReasonKind {
 
 impl Reason {
     /// Every reason, in declaration order.
-    pub const ALL: [Reason; 68] = [
+    pub const ALL: [Reason; 71] = [
         Self::WeakMatch,
         Self::NoArtistEvidence,
         Self::MostlyUnmatched,
@@ -126,6 +129,7 @@ impl Reason {
         Self::NoBetterThanYours,
         Self::OwnedElsewhere,
         Self::OwnedOnAlbum,
+        Self::AlbumNeedsCheck,
         Self::NoAlbumMatch,
         Self::AlbumNotFound,
         Self::TagsDisagree,
@@ -135,6 +139,7 @@ impl Reason {
         Self::Interrupted,
         Self::ImportFailed,
         Self::HeldByEarlierVersion,
+        Self::FormatNotListed,
         Self::TargetOccupied,
         Self::UpgradeBlocked,
         Self::LibraryChanged,
@@ -171,6 +176,7 @@ impl Reason {
         Self::NoAlbumRelease,
         Self::AlbumReleasesExhausted,
         Self::TrackNotFound,
+        Self::NothingAllowed,
         Self::NoDownloadSource,
         Self::SettingsUnreadable,
         Self::JournalUnreadable,
@@ -208,8 +214,10 @@ impl Reason {
             Self::Interrupted => "interrupted",
             Self::ImportFailed => "import_failed",
             Self::HeldByEarlierVersion => "held_by_earlier_version",
+            Self::FormatNotListed => "format_not_listed",
             Self::TargetOccupied => "target_occupied",
             Self::UpgradeBlocked => "upgrade_blocked",
+            Self::AlbumNeedsCheck => "album_needs_check",
             Self::LibraryChanged => "library_changed",
             Self::LibraryUnavailable => "library_unavailable",
             Self::NamingScriptFailed => "naming_script_failed",
@@ -244,6 +252,7 @@ impl Reason {
             Self::NoAlbumRelease => "no_album_release",
             Self::AlbumReleasesExhausted => "album_releases_exhausted",
             Self::TrackNotFound => "track_not_found",
+            Self::NothingAllowed => "nothing_allowed",
             Self::NoDownloadSource => "no_download_source",
             Self::SettingsUnreadable => "settings_unreadable",
             Self::JournalUnreadable => "journal_unreadable",
@@ -321,11 +330,17 @@ impl Reason {
             }
             Self::ImportFailed => "Something went wrong importing this folder.",
             Self::HeldByEarlierVersion => "An earlier version of DroppedNeedle held these files.",
+            Self::FormatNotListed => {
+                "The files are in a format or quality your download settings don't list."
+            }
             Self::TargetOccupied => {
                 "Another file already sits where this would go in your library."
             }
             Self::UpgradeBlocked => {
                 "Your copy could not be taken away, so the better file was not added. Both are kept."
+            }
+            Self::AlbumNeedsCheck => {
+                "A better copy is waiting: this album's match needs checking first."
             }
             Self::LibraryChanged => {
                 "Something in the library changed while these files were going in, so nothing was changed."
@@ -393,6 +408,9 @@ impl Reason {
             Self::NoAlbumRelease => "No release of the album was found for this track.",
             Self::AlbumReleasesExhausted => {
                 "Every release of the album was tried and none delivered this track."
+            }
+            Self::NothingAllowed => {
+                "Copies were found, but none that your download settings allow."
             }
             Self::TrackNotFound => {
                 "Nobody shares this track, either as part of its album or on its own."
@@ -468,6 +486,9 @@ impl Reason {
             }
             Self::Interrupted => "Pick the album with Match, or discard the files.",
             Self::ImportFailed => "Try Match again. If it keeps failing, check the server log.",
+            Self::FormatNotListed => {
+                "Import them from the held list if you want them. DroppedNeedle tries another source."
+            }
             Self::HeldByEarlierVersion => {
                 "Review them: import the ones that are right, discard the rest."
             }
@@ -476,6 +497,9 @@ impl Reason {
             }
             Self::UpgradeBlocked => {
                 "Nothing to do: DroppedNeedle tries again by itself. If it keeps happening, check the recycle bin folder in Settings, Library."
+            }
+            Self::AlbumNeedsCheck => {
+                "Discard it, or choose Import: it replaces yours only if it is better, and yours then goes to the recycle bin."
             }
             Self::LibraryChanged => "Nothing to do: DroppedNeedle tries again by itself.",
             Self::LibraryUnavailable => {
@@ -542,6 +566,9 @@ impl Reason {
             Self::AlbumReleasesExhausted => {
                 "A single shared copy was tried instead; request the whole album if this keeps failing."
             }
+            Self::NothingAllowed => {
+                "Pick a source to take one anyway, or change your download settings."
+            }
             Self::TrackNotFound => {
                 "It retries later on its own. You can also request the whole album, or pick another edition."
             }
@@ -585,6 +612,7 @@ impl Reason {
             | Self::NoBetterThanYours
             | Self::OwnedElsewhere
             | Self::OwnedOnAlbum
+            | Self::AlbumNeedsCheck
             | Self::NoAlbumMatch
             | Self::AlbumNotFound
             | Self::TagsDisagree
@@ -593,7 +621,8 @@ impl Reason {
             | Self::TooManyFiles
             | Self::Interrupted
             | Self::ImportFailed
-            | Self::HeldByEarlierVersion => ReasonKind::Hold,
+            | Self::HeldByEarlierVersion
+            | Self::FormatNotListed => ReasonKind::Hold,
             Self::TargetOccupied
             | Self::UpgradeBlocked
             | Self::LibraryChanged
@@ -629,7 +658,8 @@ impl Reason {
             | Self::NoAlbumFolder
             | Self::NoAlbumRelease
             | Self::AlbumReleasesExhausted
-            | Self::TrackNotFound => ReasonKind::Source,
+            | Self::TrackNotFound
+            | Self::NothingAllowed => ReasonKind::Source,
             Self::NoDownloadSource
             | Self::SettingsUnreadable
             | Self::JournalUnreadable
@@ -649,6 +679,7 @@ impl Reason {
     pub fn against_source(self) -> bool {
         match self {
             Self::WeakMatch
+            | Self::FormatNotListed
             | Self::NoArtistEvidence
             | Self::MostlyUnmatched
             | Self::TagMismatch
@@ -677,6 +708,7 @@ impl Reason {
             | Self::NoBetterThanYours
             | Self::OwnedElsewhere
             | Self::OwnedOnAlbum
+            | Self::AlbumNeedsCheck
             | Self::NoAlbumMatch
             | Self::AlbumNotFound
             | Self::TagsDisagree
@@ -707,6 +739,7 @@ impl Reason {
             | Self::NoAlbumRelease
             | Self::AlbumReleasesExhausted
             | Self::TrackNotFound
+            | Self::NothingAllowed
             | Self::NoDownloadSource
             | Self::SettingsUnreadable
             | Self::JournalUnreadable
@@ -848,6 +881,7 @@ mod tests {
             (Reason::FingerprintMismatch, Held { local: false }),
             (Reason::AlbumVersionOnly, Held { local: false }),
             (Reason::NoRelease, Held { local: false }),
+            (Reason::FormatNotListed, Held { local: false }),
             (Reason::NoTracks, Held { local: false }),
             (Reason::WrongTrack, Held { local: false }),
             (Reason::VersionLowerQuality, Held { local: true }),
@@ -898,12 +932,14 @@ mod tests {
             (Reason::NoAlbumRelease, Unserved),
             (Reason::AlbumReleasesExhausted, Unserved),
             (Reason::TrackNotFound, Unserved),
+            (Reason::NothingAllowed, Unserved),
             // Uploads have no source; the queue's own states and the
             // reasons no code produces yet say nothing against one.
             (Reason::FingerprintUnconfirmed, PersonHeld),
             (Reason::NoBetterThanYours, PersonHeld),
             (Reason::OwnedElsewhere, PersonHeld),
             (Reason::OwnedOnAlbum, PersonHeld),
+            (Reason::AlbumNeedsCheck, Held { local: true }),
             (Reason::NoAlbumMatch, NotProduced(false)),
             (Reason::AlbumNotFound, NotProduced(false)),
             (Reason::TagsDisagree, NotProduced(false)),

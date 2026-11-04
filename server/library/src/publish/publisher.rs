@@ -31,11 +31,12 @@ use super::planner::{
     AlbumJoin, CapabilityGate, CollisionGate, CommitSeal, DiskPreflight, JoinedTrack, PlanBundle,
     SealError, SealRecheck, SealedPreview, SpaceProbe,
 };
-use super::snapshots::{BlobStore, SnapshotStore, sha256_hex};
+use super::snapshots::{BlobOwner, BlobStore, SnapshotStore, sha256_hex};
 use super::step::{AdoptionFrom, Advanced, Hooks, Run};
 use super::tags_seam::TagDocument;
 use super::{PublishError, paths};
 use crate::clock::LibraryClock as _;
+use crate::scan::models::Availability;
 use droppedneedle_kernel::clock::Clock;
 
 /// One track row in the atomic catalog commit.
@@ -346,7 +347,7 @@ fn changed_under(track_id: &str, bundle_id: &str) -> PublishError {
 /// the catalog still lists as indexed fails the commit until a scan has
 /// seen its file go.
 fn give_up_destination(conn: &Connection, track: &TrackCommit) -> Result<(), PublishError> {
-    let occupant: Option<(String, String)> = conn
+    let occupant: Option<(String, Availability)> = conn
         .query_row(
             crate::publish::sql::GIVE_UP_DESTINATION.text(),
             rusqlite::params![track.root_id, track.rel_path, track.track_id],
@@ -359,7 +360,7 @@ fn give_up_destination(conn: &Connection, track: &TrackCommit) -> Result<(), Pub
     let Some((occupant, availability)) = occupant else {
         return Ok(());
     };
-    if availability == "indexed" {
+    if availability == Availability::Indexed {
         return Err(PublishError::Catalog(
             format!(
                 "track {occupant} is still listed at the destination of track {}",
@@ -1248,7 +1249,7 @@ impl<P: SpaceProbe> Publisher<P> {
                         .iter()
                         .filter_map(|item| Some((item, item.track_id.as_deref()?)));
                     for (item, track_id) in tracks {
-                        let place: Option<(String, String, String)> = conn
+                        let place: Option<(String, String, Availability)> = conn
                             .prepare_cached(super::sql::TRACK_PLACE.text())?
                             .query_row(rusqlite::params![track_id], |row| {
                                 let row = super::sql::TrackPlace::read(row)?;
@@ -1258,7 +1259,7 @@ impl<P: SpaceProbe> Publisher<P> {
                         let ready = place.is_some_and(|(root, rel, availability)| {
                             root == item.root_id
                                 && rel == item.track_rel
-                                && super::put_back::ready(&availability, &rel, &item.relative_path)
+                                && super::put_back::ready(availability, &rel, &item.relative_path)
                         });
                         if !ready {
                             return Err(PublishError::Validation(
@@ -1314,25 +1315,32 @@ impl<P: SpaceProbe> Publisher<P> {
         // makes it. An entry in a bin the session no longer holds is
         // rebound after the commit to the bin that serves its root now, so
         // it passes while that root has one, and waits while it has none.
-        let entries = items
-            .iter()
-            .filter_map(|item| {
-                item.replaces
-                    .as_ref()
-                    .map(|replaced| (item.dest_root.as_str(), replaced.recycle_to.as_str()))
-            })
-            .chain(removal.into_iter().flat_map(|removal| {
-                let tracks = removal.items.iter().filter_map(|item| {
-                    item.file
+        let entries =
+            items
+                .iter()
+                .filter_map(|item| {
+                    item.replaces
                         .as_ref()
-                        .map(|file| (item.seal.root_id.as_str(), file.recycle_to.as_str()))
-                });
-                let sidecars = removal
-                    .sidecars
-                    .iter()
-                    .map(|sidecar| (sidecar.root_id.as_str(), sidecar.file.recycle_to.as_str()));
-                tracks.chain(sidecars)
-            }));
+                        .map(|replaced| (item.dest_root.as_str(), replaced.recycle_to.as_str()))
+                })
+                .chain(items.iter().flat_map(|item| {
+                    item.outputs.iter().filter_map(|output| {
+                        output.replaces.as_ref().map(|replaced| {
+                            (output.dest_root.as_str(), replaced.recycle_to.as_str())
+                        })
+                    })
+                }))
+                .chain(removal.into_iter().flat_map(|removal| {
+                    let tracks = removal.items.iter().filter_map(|item| {
+                        item.file
+                            .as_ref()
+                            .map(|file| (item.seal.root_id.as_str(), file.recycle_to.as_str()))
+                    });
+                    let sidecars = removal.sidecars.iter().map(|sidecar| {
+                        (sidecar.root_id.as_str(), sidecar.file.recycle_to.as_str())
+                    });
+                    tracks.chain(sidecars)
+                }));
         for (root_id, recycle_to) in entries {
             if let Some(cause) = self.sandbox.bins_unknown() {
                 return Err(PublishError::BinsUnknown(cause));
@@ -1571,7 +1579,7 @@ impl<P: SpaceProbe> Publisher<P> {
                 )?;
             }
             for (index, output) in item.outputs.iter().enumerate() {
-                self.prepare_output(bundle, &journal_id, index, output)?;
+                self.prepare_output(bundle, &item.track_id, &journal_id, index, output)?;
             }
             for (index, removal) in item.removals.iter().enumerate() {
                 self.prepare_removal(bundle, &journal_id, index, removal)?;
@@ -1671,7 +1679,7 @@ impl<P: SpaceProbe> Publisher<P> {
                 // only Snapshot error capture raises is already-exists.
                 if baselines.get(&item.track_id)?.is_none() {
                     for sha256 in pictures.keys() {
-                        snapshots.add_ref(sha256, "baseline", &item.track_id)?;
+                        snapshots.add_ref(sha256, BlobOwner::Baseline, &item.track_id)?;
                     }
                     match baselines.capture(
                         &item.track_id,
@@ -1685,7 +1693,7 @@ impl<P: SpaceProbe> Publisher<P> {
                     }
                 }
                 for sha256 in pictures.keys() {
-                    snapshots.add_ref(sha256, "operation", &bundle.id)?;
+                    snapshots.add_ref(sha256, BlobOwner::Operation, &bundle.id)?;
                 }
                 snapshots.record(
                     &format!("{}-{}", bundle.id, item.track_id),
@@ -1768,6 +1776,7 @@ impl<P: SpaceProbe> Publisher<P> {
     fn prepare_output(
         &mut self,
         bundle: &PlanBundle,
+        track_id: &str,
         audio_journal_id: &str,
         index: usize,
         output: &super::planner::GeneratedOutput,
@@ -1798,7 +1807,8 @@ impl<P: SpaceProbe> Publisher<P> {
             )?;
         }
         // The file it replaces must still be the one planned against, and
-        // have a bin entry to go to; it lends the new file its permissions.
+        // have a bin entry to go to; it lends the new file its permissions,
+        // and its bytes are kept for undo before anything moves.
         let mut mode = None;
         if let Some(replaced) = &output.replaces {
             if replaced.recycle_to.is_empty() {
@@ -1806,10 +1816,10 @@ impl<P: SpaceProbe> Publisher<P> {
                     format!("the file {} replaces has no bin entry", output.dest_rel).into(),
                 ));
             }
-            let holds = paths::hash_regular_file(&dest)
+            let held = paths::read_regular_capped(&dest, super::REPLACED_COVER_MAX_BYTES)
                 .ok()
-                .filter(|hashed| hashed.sha256 == replaced.sha256);
-            let Some(holds) = holds else {
+                .filter(|(_, hashed)| hashed.sha256 == replaced.sha256);
+            let Some((held, hashed)) = held else {
                 return Err(PublishError::Validation(
                     format!(
                         "the file {} replaces changed after planning",
@@ -1818,8 +1828,9 @@ impl<P: SpaceProbe> Publisher<P> {
                     .into(),
                 ));
             };
-            self.known.record(holds.stat, &holds.sha256);
+            self.known.record(hashed.stat, &hashed.sha256);
             mode = Some(paths::permission_bits(&dest)?);
+            self.keep_replaced(bundle, track_id, output, &held)?;
         }
         let temp = self.sandbox.temp_path_for(&dest, &journal_id)?;
         self.sandbox.ensure_under_roots(&temp)?;
@@ -1847,6 +1858,44 @@ impl<P: SpaceProbe> Publisher<P> {
         })?;
         write_staged_temp(&temp, &bytes, mode)?;
         self.journal_staged(&journal_id)
+    }
+
+    /// Keep the bytes of a file a generated one replaces: for the run's
+    /// undo, and as the track's original when they are no file Library
+    /// Management wrote for the album (the cover the files came with).
+    fn keep_replaced(
+        &self,
+        bundle: &PlanBundle,
+        track_id: &str,
+        output: &super::planner::GeneratedOutput,
+        bytes: &[u8],
+    ) -> Result<(), PublishError> {
+        let now_ms = self.now_ms;
+        self.blobs.keep(
+            &self.db,
+            Lane::Background,
+            "publish.keep_replaced",
+            &[bytes],
+            |tx, hashes| {
+                let sha256 = hashes.first().ok_or_else(|| {
+                    PublishError::Snapshot("the replaced file was not kept".into())
+                })?;
+                let snapshots = SnapshotStore::new(tx);
+                snapshots.add_ref(sha256, BlobOwner::Operation, &bundle.id)?;
+                if !super::operations::generated_before(tx, track_id, sha256)?
+                    && super::snapshots::BaselineStore::new(tx).capture_cover(
+                        track_id,
+                        &output.dest_root,
+                        &output.dest_rel,
+                        sha256,
+                        now_ms,
+                    )?
+                {
+                    snapshots.add_ref(sha256, BlobOwner::Baseline, track_id)?;
+                }
+                Ok(())
+            },
+        )
     }
 
     /// Journal taking away one generated file (an undo), inserted and

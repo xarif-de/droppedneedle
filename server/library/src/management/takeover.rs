@@ -18,6 +18,7 @@ use rusqlite::{Connection, OptionalExtension as _, Transaction, params};
 use super::models::{ManagementError, PlannedItem};
 use super::reasons::ItemReason;
 use super::sql::{StateRevision, TakeoverCounts, TrackPlace, WaitingTakeover};
+use crate::catalog_actions::ActionKind;
 use crate::catalog_actions::CatalogAction;
 use crate::catalog_actions::record_action;
 use crate::catalog_revision::bump_catalog;
@@ -63,21 +64,12 @@ pub enum Cause {
     ReplacedHandsOff,
 }
 
-crate::scan::models::spelled!(Cause {
+droppedneedle_kernel::spelled!(Cause {
     FilesChanged => "files_changed",
     RetagFollowed => "retag_followed",
     RunUndone => "run_undone",
     ReplacedHandsOff => "replaced_hands_off",
 });
-
-impl Cause {
-    pub const ALL: [Self; 4] = [
-        Self::FilesChanged,
-        Self::RetagFollowed,
-        Self::RunUndone,
-        Self::ReplacedHandsOff,
-    ];
-}
 
 /// Whether the app has a record of this track's file.
 pub fn has_record(conn: &Connection, track_id: &str) -> rusqlite::Result<bool> {
@@ -344,7 +336,7 @@ pub(crate) fn mark(
         tx,
         CatalogAction {
             actor: "",
-            kind: "management_stepped_back",
+            kind: ActionKind::ManagementSteppedBack,
             album_id,
             job_id,
             before: serde_json::json!({}),
@@ -384,7 +376,7 @@ pub(crate) fn stamp_all(tx: &Transaction<'_>, actor: &str, now: f64) -> rusqlite
 fn handed_back_action<'a>(actor: &'a str, album_id: &'a str) -> CatalogAction<'a> {
     CatalogAction {
         actor,
-        kind: "management_handed_back",
+        kind: ActionKind::ManagementHandedBack,
         album_id,
         job_id: None,
         before: serde_json::json!({}),
@@ -438,7 +430,7 @@ pub(crate) fn hand_back_failed(
             conn,
             CatalogAction {
                 actor: "",
-                kind: "management_hand_back_given_up",
+                kind: ActionKind::ManagementHandBackGivenUp,
                 album_id,
                 job_id: None,
                 before: serde_json::json!({}),

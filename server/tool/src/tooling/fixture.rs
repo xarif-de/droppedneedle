@@ -223,6 +223,69 @@ pub fn build_v2_fixture(root: &Path) -> Result<V2Fixture, FixtureError> {
     })
 }
 
+/// Where the callbacks fixture's v2 single sign-on returns to.
+pub const CALLBACKS_OIDC_REDIRECT: &str = "https://music.example.com/api/v1/auth/oidc/callback";
+/// The origin the callbacks fixture's v2 registered its Spotify app under.
+pub const CALLBACKS_SPOTIFY_ORIGIN: &str = "https://music.example.com";
+
+/// The fixture, plus what outside services call back on: single sign-on
+/// on, a Spotify app, and one MusicBrainz contribution open in the release
+/// editor.
+pub fn build_v2_fixture_with_callbacks(root: &Path) -> Result<V2Fixture, FixtureError> {
+    let fixture = build_v2_fixture(root)?;
+    let config_dir = root.join("config");
+    let fernet = crate::export::v2dir::read_data_enc_key(&config_dir)
+        .map_err(|error| FixtureError::Key(error.to_string()))?;
+    let seal = |plaintext: &str| {
+        fernet
+            .encrypt(plaintext)
+            .map_err(|error| FixtureError::Key(error.to_string()))
+    };
+    let mut config = crate::export::v2dir::read_config(&config_dir)
+        .map_err(|error| FixtureError::Io(error.to_string()))?;
+    config.insert(
+        "oidc_settings".to_owned(),
+        json!({
+            "enabled": true,
+            "issuer": "https://sso.example.com",
+            "client_id": "droppedneedle",
+            "client_secret": seal("oidc-secret-plaintext")?,
+            "scopes": "openid email profile",
+            "redirect_uri": CALLBACKS_OIDC_REDIRECT,
+        }),
+    );
+    config.insert(
+        "spotify_settings".to_owned(),
+        json!({
+            "client_id": "spotify-app",
+            "client_secret": seal("spotify-secret-plaintext")?,
+            "enabled": true,
+            "spotify_redirect_origin": CALLBACKS_SPOTIFY_ORIGIN,
+        }),
+    );
+    std::fs::write(
+        config_dir.join("config.json"),
+        serde_json::to_string_pretty(&config)
+            .map_err(|error| FixtureError::Io(error.to_string()))?,
+    )
+    .map_err(|error| FixtureError::Io(error.to_string()))?;
+    let db = Connection::open(root.join("cache").join("library.db"))
+        .map_err(|error| FixtureError::Db(error.to_string()))?;
+    db.execute_batch(&format!(
+        "INSERT INTO library_contribution_drafts (id, local_album_id, created_by_user_id,
+             state, album_row_revision, input_revision, local_snapshot_json,
+             resolved_draft_json, source_selection_json, seeded_at, created_at, updated_at)
+         VALUES ('contrib-open', '{V2_ALBUM_ID}', '{alice}', 'seeded', 1, 'r1', '{{}}',
+                 '{{}}', '{{}}', 1700000700.0, 1700000700.0, 1700000700.0);
+         INSERT INTO library_contribution_callback_tokens (token_hash, contribution_id,
+             requested_by_user_id, expires_at, created_at)
+         VALUES ('token-open', 'contrib-open', '{alice}', 4000000000.0, 1700000700.0);",
+        alice = fixture.alice_id,
+    ))
+    .map_err(|error| FixtureError::Db(error.to_string()))?;
+    Ok(fixture)
+}
+
 /// Random ids minted per fixture build.
 struct FixtureIds {
     alice_id: String,
@@ -843,11 +906,12 @@ fn build_user_data(
                 ('download-running', '{bob}', '{PENDING_REQUEST_MBID}', 'Artist', 'Next',
                  'downloading', NULL, 1700001100.0, NULL, 1700001100.0);
          INSERT INTO wanted_watches (release_group_mbid_lower, release_group_mbid, user_id,
-             artist_name, album_title, kind, state, created_at, next_check_at)
+             artist_name, album_title, kind, state, created_at, next_check_at, last_outcome)
          VALUES ('bbbbbbbb-0000-4000-8000-000000000001', 'BBBBBBBB-0000-4000-8000-000000000001',
-                 '{alice}', 'Artist', 'Rare', 'missing', 'watching', 1700000000.0, 1700086400.0),
+                 '{alice}', 'Artist', 'Rare', 'missing', 'watching', 1700000000.0, 1700086400.0,
+                 'seen_only'),
                 ('{DORMANT_WATCH_MBID}', '{DORMANT_WATCH_MBID}', '{alice}', 'Artist', 'Asleep',
-                 'missing', 'dormant', 1600000000.5, 1900000000.0);
+                 'missing', 'dormant', 1600000000.5, 1900000000.0, 'no_results');
          INSERT INTO wanted_seen_candidates (release_group_mbid_lower, source, identity,
              first_seen_at)
          VALUES ('bbbbbbbb-0000-4000-8000-000000000001', 'soulseek', 'peer/Rare', 1700000300.0);

@@ -401,12 +401,12 @@ export function customEditionSentence(album: string): string {
 export const LEAVE_UNMANAGED_SENTENCE =
 	'DroppedNeedle stops retagging and renaming these files and drops the edition it guessed. Choose "Manage it again" on the album page to undo this.';
 
-export const SHEET_DESCRIPTION = 'Pick the release your copy is, or the one you want it to become.';
+export const SHEET_DESCRIPTION = 'Pick the edition your copy is, or the one you want it to become.';
 
 // The app stepped back from the album by itself; choosing an edition
 // does not hand it back.
 export const LEFT_UNMANAGED_NOTE =
-	'This album is left unmanaged. Choosing an edition does not hand it back: DroppedNeedle leaves its files alone until you choose "Manage it again". Writing the edition\'s tags to the files overwrites the changes made outside DroppedNeedle.';
+	'Left alone. Files stay as they are until you choose Manage it again.';
 
 // Matching one file to an edition track by hand (curators, on the album's
 // own edition).
@@ -426,6 +426,23 @@ export const MATCH_STALE = 'This album just changed. Try again.';
 // "History" is a link for admins.
 export const MATCH_WRITTEN_PARTS = ['Tags written. Undo that in ', 'History', ' first.'] as const;
 export const MATCH_WRITTEN = MATCH_WRITTEN_PARTS.join('');
+
+// An edition none of the files fit, taken anyway: the files are then
+// matched by hand, starting from the track each one's number or order
+// suggests.
+export const USE_ANYWAY = 'Use anyway';
+export const USE_ANYWAY_NOTE = 'No file fits. You match each one to its track next.';
+export const USED_ANYWAY = 'Now match your files to its tracks.';
+export const NONE_MATCHED_YET = 'No file is on this edition yet. Match each one to its track.';
+export const SUGGESTED = 'Suggested';
+export const MATCH_AS_SUGGESTED = 'Match as suggested';
+export const NEEDS_MATCHING = 'Needs matching';
+export const MATCH_FILES = 'Match files';
+
+/** How far "Match as suggested" got before a match was refused. */
+export function matchedSome(done: number, total: number): string {
+	return `Matched ${done} of ${total}.`;
+}
 
 /** A row's button, named with the file it acts on. */
 export function forFile(label: string, title: string): string {

@@ -1,11 +1,16 @@
 //! The SQL of the identify module.
 
+// `sql!` needs a macro call in parentheses to take it as one part.
+#![allow(unused_parens, clippy::double_parens)]
+
 use droppedneedle_kernel::db::time::Millis;
 
+use super::artist_links::ProofSubject;
 use super::models::{IdentifyKind, JobState, MatchFlagState, ReviewState};
 use crate::identity::DecisionSource;
 use crate::identity::sql::PERSONS;
 use crate::identity::sql::REVISABLE;
+use crate::identity::sql::accepted;
 
 droppedneedle_kernel::sql! {
     pub(super) MARK_STALE = "UPDATE library_artist_reconciliation_state SET input_revision = '' \
@@ -128,8 +133,8 @@ droppedneedle_kernel::sql! {
              WHERE artist_mbid = ?1) OR EXISTS (SELECT 1 FROM library_identify_artist_id_checks \
              WHERE canonical_mbid = ?1)";
     pub(super) SUGGEST_MERGE = "INSERT OR IGNORE INTO local_artist_merge_candidates (id, left_artist_id, \
-         right_artist_id, reason_code, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, 'SHARED_PROVIDER_IDENTITY', ?4, ?4)";
+         right_artist_id, reason_code, state, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, 'SHARED_PROVIDER_IDENTITY', ?5, ?4, ?4)";
     pub(super) SETTLE_ARTIST_ID_CHECK = "UPDATE library_identify_artist_id_checks SET state = ?4, canonical_mbid = ?2, \
          checked_at = ?3 WHERE artist_mbid = ?1";
     pub(super) REPOINT_ARTIST_ID_CHECKS = "UPDATE library_identify_artist_id_checks SET canonical_mbid = ?2 \
@@ -273,10 +278,7 @@ droppedneedle_kernel::sql! {
      WHERE proof_album.id = p.local_album_id AND proof_album.retired_into_album_id IS NULL \
      AND proof_identity.row_revision = p.album_identity_revision \
      AND lower(trim(COALESCE(proof_identity.release_mbid, ''))) = lower(trim(p.release_mbid)) \
-     AND NOT EXISTS (SELECT 1 FROM library_album_match_state s \
-       WHERE s.local_album_id = proof_album.id) \
-     AND NOT EXISTS (SELECT 1 FROM library_custom_edition_active c \
-       WHERE c.local_album_id = proof_album.id)) \
+     AND " + (accepted!("proof_identity")) + ") \
      AND CASE p.subject_kind \
      WHEN 'album' THEN EXISTS (SELECT 1 FROM local_album_artists c \
        WHERE c.local_album_id = p.local_album_id AND c.position = p.credit_position \
@@ -492,7 +494,7 @@ droppedneedle_kernel::sql! {
         row_revision: i64,
     }
     pub(super) row StoredProof for [STORED_PROOFS] {
-        subject_kind: String,
+        subject_kind: ProofSubject,
         subject_id: String,
         credit_position: i64,
         evidence_hash: String,

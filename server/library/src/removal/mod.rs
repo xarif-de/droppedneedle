@@ -30,6 +30,7 @@ use droppedneedle_kernel::db::Lane;
 use droppedneedle_kernel::jobs::queue::JobError;
 use rusqlite::{OptionalExtension, Transaction, params};
 
+use crate::catalog_actions::ActionKind;
 use crate::catalog_revision::bump_catalog;
 use crate::clock::LibraryClock as _;
 use crate::management::takeover;
@@ -870,7 +871,7 @@ impl Mutations {
                 record_action(
                     tx,
                     actor,
-                    "management_reenabled",
+                    ActionKind::ManagementReenabled,
                     &canonical,
                     None,
                     &before,
@@ -1036,12 +1037,22 @@ impl Mutations {
                     })
                     .map_or(true, |listed| listed > removed_below)
             };
+            let listed_named = |folder: &str, stem: &str| {
+                self.db
+                    .read_blocking("mutations.sidecar_stem", |conn| {
+                        Ok::<_, MutationError>(remove::tracks_named(conn, root_id, folder, stem)?)
+                    })
+                    .map_or(true, |listed| {
+                        listed.iter().any(|path| !removed.contains(&path.as_str()))
+                    })
+            };
             found.extend(remove::sidecars(&remove::SidecarScope {
                 root_id,
                 root: &root.path,
                 removed: &removed,
                 patterns: &patterns,
                 listed_below: &listed_below,
+                listed_named: &listed_named,
             }));
         }
         found
@@ -1419,7 +1430,7 @@ fn mark_missing(
 fn record_action(
     tx: &Transaction<'_>,
     actor: &str,
-    kind: &str,
+    kind: ActionKind,
     album_id: &str,
     track_id: Option<&str>,
     before: &serde_json::Value,

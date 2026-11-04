@@ -186,6 +186,8 @@ export const EFFECTS = {
 	],
 	/** The connect-apps settings. */
 	connectAppsSettingsChanged: (): Sweep[] => [{ key: ConnectAppsQueryKeyFactory.settings() }],
+	/** The apps that may sign in through the browser. */
+	appConnectSettingsChanged: (): Sweep[] => [{ key: ConnectAppsQueryKeyFactory.appConnect() }],
 	/** The caller's own Connect Apps choices. */
 	myConnectAppsChanged: (userId: string): Sweep[] => [
 		{ key: ConnectAppsQueryKeyFactory.mine(userId) }
@@ -377,7 +379,8 @@ export const EFFECTS = {
 	anyDiscoverChanged: (): Sweep[] => [{ everyScope: [DiscoverQueryKeyFactory.feature] }],
 	/**
 	 * One library album's edition: its status and plans, its detail, tracks
-	 * and copies, the library status the album pages read, and the waiting list.
+	 * and copies, the library status the album pages read, the Check albums
+	 * lists and the counts they show, and the reviews a choice settles.
 	 */
 	editionChanged: (userId: UserId, localId: string): Sweep[] => [
 		{ key: LibraryQueryKeyFactory.catalog.edition(userId, localId) },
@@ -385,7 +388,9 @@ export const EFFECTS = {
 		{ key: LibraryQueryKeyFactory.catalog.albumTracksPrefix(userId, localId) },
 		{ key: LibraryQueryKeyFactory.catalog.albumCopiesPrefix(userId) },
 		{ key: LibraryQueryKeyFactory.albumPrefix(userId) },
-		{ key: LibraryQueryKeyFactory.catalog.unconfirmedPrefix(userId) }
+		{ key: LibraryQueryKeyFactory.catalog.unconfirmedPrefix(userId) },
+		{ key: LibraryQueryKeyFactory.catalog.stats(userId) },
+		{ key: LibraryQueryKeyFactory.reviewsPrefix() }
 	],
 	/** One release group's album page: header, tracklist, editions and where to buy it. */
 	albumGroupChanged: (userId: UserId, group: string): Sweep[] => [
@@ -478,6 +483,7 @@ export const albumHeaderChanged = fact('albumHeaderChanged');
 export const appPasswordsChanged = fact('appPasswordsChanged');
 export const appPasswordRosterChanged = fact('appPasswordRosterChanged');
 export const connectAppsSettingsChanged = fact('connectAppsSettingsChanged');
+export const appConnectSettingsChanged = fact('appConnectSettingsChanged');
 export const myConnectAppsChanged = fact('myConnectAppsChanged');
 export const connectionsChanged = fact('connectionsChanged');
 export const sourcePlaylistsChanged = fact('sourcePlaylistsChanged');

@@ -10,13 +10,14 @@ use droppedneedle_kernel::db::time::Millis;
 
 use crate::identity::sql::PERSONS;
 use crate::scan::models::{
-    Counter, EffectivePolicy, FailureCode, RequestedControl, ScanKind, ScanPhase, ScanTrigger,
-    Verdict,
+    ArtworkSource, Availability, Counter, EffectivePolicy, FailureCode, GroupingSource, Phase,
+    RequestedControl, ScanKind, ScanPhase, ScanTrigger, TagProvenance, Verdict,
 };
 use crate::scan::sqlite_store::sql::{
     MOVED_COLUMNS, MOVED_MATCH, SAME_PLACE, TRACK_GONE, TRACK_PRESENT, WALKED_PAST, awaits_admin,
     covers, fenced_by, held, held_back, holds, refused_scope, walked_past,
 };
+use crate::scan::store::RevisionKind;
 
 impl Choice for Counter {
     fn all() -> Vec<Self> {
@@ -133,9 +134,11 @@ droppedneedle_kernel::sql! {
              AND s.root_id = library_scan_inventory.root_id \
              AND s.relative_path = library_scan_inventory.scope_relative_path \
              AND s.discovery_generation = library_scan_inventory.discovery_generation)";
-    /// Whether track `?1` has its edition hints stored.
+    /// Whether track `?1` has its edition hints stored, its track total
+    /// included: a row from before totals were kept holds NULL there, and
+    /// one read since holds the total or 0 for a file that names none.
     pub(super) HAS_EDITION_TAGS = "SELECT EXISTS(SELECT 1 FROM local_track_edition_tags \
-             WHERE local_track_id = ?1)";
+             WHERE local_track_id = ?1 AND total_tracks IS NOT NULL)";
     /// Whether track `?1`'s row does not say if its length was measured.
     pub(super) LENGTH_UNREAD = "SELECT EXISTS(SELECT 1 FROM local_tracks \
              WHERE id = ?1 AND duration_measured IS NULL)";
@@ -150,6 +153,12 @@ droppedneedle_kernel::sql! {
              SELECT id, ?3, ?4, ?5, ?6, ?7, ?8, ?9 FROM local_tracks \
              WHERE id = ?1 AND stat_revision = ?2 \
              ON CONFLICT (local_track_id) DO NOTHING";
+    /// Store the track total (`?3`, 0 when the file names none) of track
+    /// `?1` read at stat revision `?2` in an edition row stored before
+    /// totals were kept, unless the row moved on since.
+    pub(super) FILL_TRACK_TOTAL = "UPDATE local_track_edition_tags SET total_tracks = ?3 \
+             WHERE local_track_id = ?1 AND total_tracks IS NULL \
+             AND EXISTS (SELECT 1 FROM local_tracks WHERE id = ?1 AND stat_revision = ?2)";
     /// The album of track `?1` when its MusicBrainz match is not settled:
     /// none, or an automatic one without an edition or still unconfirmed.
     /// Only `automatic`: a match v2 took from the files' own ids already
@@ -178,7 +187,7 @@ droppedneedle_kernel::sql! {
              phase_timings_json = ?10, updated_at = ?11, row_revision = row_revision + 1, \
              event_revision = event_revision + 1 WHERE id = ?1";
     pub(super) INSERT_ARTIST = "INSERT INTO local_artists (id, display_name, sort_name, folded_name, normalized_name, \
-         kind, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?4, 'group', ?5, ?5) \
+         kind, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?4, ?6, ?5, ?5) \
          ON CONFLICT (id) DO NOTHING";
     pub(super) LIVE_ARTIST = "SELECT id FROM ( \
          SELECT id, 0 AS rank FROM local_artists WHERE id = ?1 AND retired_into_artist_id IS NULL \
@@ -393,9 +402,9 @@ droppedneedle_kernel::sql! {
     pub(super) WRITE_TRACK_CREDIT = "INSERT INTO local_track_artists (local_track_id, position, local_artist_id, role, \
          credited_name, join_phrase, artist_mbid) VALUES (?1, ?2, ?3, 'main', ?4, ?5, ?6)";
     pub(super) ALBUM_OF_TRACK = "SELECT local_album_id FROM local_tracks WHERE id = ?1";
-    pub(super) DROP_LOCAL_GENRES = "DELETE FROM local_track_genres WHERE local_track_id = ?1 AND source = 'local'";
+    pub(super) DROP_LOCAL_GENRES = "DELETE FROM local_track_genres WHERE local_track_id = ?1 AND source = ?2";
     pub(super) WRITE_LOCAL_GENRE = "INSERT OR IGNORE INTO local_track_genres (local_track_id, position, name, folded_name, \
-         source, source_document_revision) VALUES (?1, ?2, ?3, ?4, 'local', ?5)";
+         source, source_document_revision) VALUES (?1, ?2, ?3, ?4, ?6, ?5)";
     pub(super) RECORD_ALBUM_MOVE = "INSERT INTO library_scan_album_moves (run_id, root_id, relative_path, \
              local_track_id, previous_album_id) VALUES (?1, ?2, ?3, ?4, ?5) \
              ON CONFLICT (run_id, root_id, relative_path) DO UPDATE SET \
@@ -1100,7 +1109,7 @@ droppedneedle_kernel::sql! {
         failure_code: FailureCode,
         recorded_at: Millis,
         failure_detail: String,
-        phase: ScanPhase,
+        phase: Phase,
     }
     pub(super) row FailurePageRow for [RUN_FAILURES_PAGE] {
         rowid: i64,
@@ -1109,7 +1118,7 @@ droppedneedle_kernel::sql! {
         failure_code: FailureCode,
         recorded_at: Millis,
         failure_detail: String,
-        phase: ScanPhase,
+        phase: Phase,
     }
     pub(super) row ArtistNames for [ARTIST_NAMES] {
         display_name: String,
@@ -1124,7 +1133,7 @@ droppedneedle_kernel::sql! {
     }
     pub(super) row ArtworkRow for [ALL_ARTWORK] {
         local_album_id: String,
-        source: String,
+        source: ArtworkSource,
         source_locator: Option<String>,
         content_hash: Option<String>,
     }
@@ -1136,7 +1145,7 @@ droppedneedle_kernel::sql! {
         relative_path: String,
         id: String,
         stat_revision: String,
-        stat_revision_kind: String,
+        stat_revision_kind: RevisionKind,
         file_size_bytes: i64,
         file_mtime_ns: i64,
         tags_read_at: Option<Millis>,
@@ -1154,11 +1163,11 @@ droppedneedle_kernel::sql! {
     pub(super) row TrackFacts for [TRACK_AT_PATH_FACTS] {
         id: String,
         local_album_id: String,
-        availability: String,
+        availability: Availability,
         duration_seconds: Option<f64>,
         embedded_recording_mbid: Option<String>,
         title_folded: String,
-        title_provenance: String,
+        title_provenance: TagProvenance,
         disc_number: i64,
         track_number: i64,
         sample_rate: Option<i64>,
@@ -1166,7 +1175,7 @@ droppedneedle_kernel::sql! {
         channels: Option<i64>,
     }
     pub(super) row TrackMembership for [TRACK_MEMBERSHIP] {
-        membership_source: String,
+        membership_source: GroupingSource,
         locked: bool,
     }
     pub(super) row TrackAndAlbum for [TRACK_AND_ALBUM_AT_PATH] {

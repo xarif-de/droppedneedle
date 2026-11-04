@@ -72,7 +72,7 @@ const OPENS: &[Place] = &[
     ),
     place(
         "src/bootstrap/data_dirs.rs",
-        "the read-only stamp probe of an existing database before the runtime opens it, and its tests",
+        "the read-only stamp probe of an existing database before the runtime opens it, upgrade mode's read of the v2 admins' passwords, and its tests",
     ),
 ];
 
@@ -383,6 +383,7 @@ const IDENTITY_USES: &[(&str, &str)] = &[
         "offers the album to identification and reads its input revision",
     ),
     ("identify::models", "the identity rows' data types"),
+    ("catalog_actions::ActionKind", "the audit row's kind"),
     ("catalog_actions::CatalogAction", "the audit row"),
     ("catalog_actions::record_action", "the audit row"),
     (
@@ -390,6 +391,30 @@ const IDENTITY_USES: &[(&str, &str)] = &[
         "closes an album's pending reviews",
     ),
     ("matching::Release", "the stored release document's type"),
+    (
+        "mbid_shape",
+        "its own SQL definition, exported at the crate root for the areas above",
+    ),
+    (
+        "not_yet_identified",
+        "its own SQL definition, exported at the crate root for the areas above",
+    ),
+    (
+        "names_another_group",
+        "its own SQL definition, exported at the crate root for the areas above",
+    ),
+    (
+        "owns_group",
+        "its own SQL definition, exported at the crate root for the areas above",
+    ),
+    (
+        "group_copies",
+        "its own SQL definition, exported at the crate root for the areas above",
+    ),
+    (
+        "persons_choice",
+        "its own SQL definition, exported at the crate root for the areas above",
+    ),
 ];
 
 /// The identity module uses only what [`IDENTITY_USES`] lists from the
@@ -447,6 +472,223 @@ fn the_identity_module_uses_only_what_it_lists() {
     );
 }
 
+/// A read of identity that shipping code outside `library/src/identity/`
+/// writes by hand: each listed file with how many it holds and why. A new
+/// one goes through the module's named definitions, or is listed here.
+struct IdentityRead {
+    what: &'static str,
+    /// Only files under these are read; empty reads every file.
+    within: &'static [&'static str],
+    sites: &'static [(&'static str, usize, &'static str)],
+}
+
+/// Counts what `find` reports in each file the read covers, outside the
+/// identity module, against the read's listed sites.
+fn identity_read_holds(read: &IdentityRead, find: impl Fn(&str) -> usize) -> Vec<String> {
+    let mut found = std::collections::BTreeMap::new();
+    for source in workspace_sources() {
+        let covered = read.within.is_empty()
+            || read
+                .within
+                .iter()
+                .any(|place| source.path.starts_with(place));
+        if !covered || source.path.starts_with(IDENTITY.path) {
+            continue;
+        }
+        let count = find(&source.shipping_code());
+        if count > 0 {
+            found.insert(source.path.clone(), count);
+        }
+    }
+    let mut wrong = Vec::new();
+    for (path, count) in &found {
+        match read.sites.iter().find(|(listed, _, _)| listed == path) {
+            Some((_, want, _)) if want == count => {}
+            Some((_, want, why)) => wrong.push(format!(
+                "{path}: {count} found, {want} listed ({why}); {}",
+                read.what
+            )),
+            None => wrong.push(format!("{path}: {count} found, none listed; {}", read.what)),
+        }
+    }
+    for (path, want, why) in read.sites {
+        if !found.contains_key(*path) {
+            wrong.push(format!(
+                "{path}: {want} listed, none found; remove the entry ({why})"
+            ));
+        }
+    }
+    wrong
+}
+
+/// Names the match flag table, where `match_flagged!` and
+/// `named_group_guess!` say what the flags mean.
+const MATCH_STATE_READS: IdentityRead = IdentityRead {
+    what: "names library_album_match_state",
+    within: &[],
+    sites: &[
+        (
+            "library/src/edition/sql.rs",
+            3,
+            "the albums waiting on a check and an album's edition view show the flag itself",
+        ),
+        (
+            "library/src/management/sql.rs",
+            1,
+            "tagging's match gate reads the flag's state and reason",
+        ),
+        (
+            "library/src/identify/sql.rs",
+            2,
+            "identification reads the flag it decides on and folds it into its input stamp",
+        ),
+        (
+            "library/src/scan/sql.rs",
+            2,
+            "the scan offers an unsettled album to identification, never one a person detached",
+        ),
+        (
+            "library/src/repairs/sql.rs",
+            3,
+            "the repairs read a flag's reason and its candidates' evidence",
+        ),
+        (
+            "library/src/corrections/sql.rs",
+            1,
+            "the retag join waits on every flag but that of a chosen edition that fitted no file",
+        ),
+    ],
+};
+
+/// Writes the recording rule out, where `recording_mbid!` states it.
+const RECORDING_READS: IdentityRead = IdentityRead {
+    what: "a COALESCE of a recording row and the tag's id",
+    within: &[],
+    sites: &[],
+};
+
+/// Tells a decision source by its stored name, where `PERSONS` and
+/// `REVISABLE` name the sets.
+const DECISION_SOURCE_READS: IdentityRead = IdentityRead {
+    what: "compares decision_source to a literal",
+    within: &[],
+    sites: &[
+        (
+            "library/src/edition/sql.rs",
+            1,
+            "a match by hand stands only on the manual row it wrote",
+        ),
+        (
+            "library/src/scan/sql.rs",
+            1,
+            "only an automatic match is unsettled; a row the tags carried rests on stronger evidence",
+        ),
+        (
+            "catalog/src/youtube/sql.rs",
+            1,
+            "a YouTube link's held tracks keep their own stricter rule",
+        ),
+        (
+            "tool/src/import/carry/sql.rs",
+            2,
+            "the offline import reads the pin rows it has just written as a person's",
+        ),
+    ],
+};
+
+/// Reads the release group a file's tags name, where `owns_group!` says
+/// what the tags may own.
+const TAG_GROUP_READS: IdentityRead = IdentityRead {
+    what: "reads embedded_release_group_mbid",
+    within: &["acquire/src/", "catalog/src/", "media/src/", "compat/src/"],
+    sites: &[
+        (
+            "catalog/src/discover/sql.rs",
+            1,
+            "radio sends an unidentified album's tag group, as the players do",
+        ),
+        (
+            "catalog/src/local/sql.rs",
+            3,
+            "player_album_ids sends an unidentified album's tag ids to player apps; \
+             ARTIST_SONGS keys owns_group! by a track's tag group to find the copy it plays",
+        ),
+        (
+            "acquire/src/landing/sql.rs",
+            2,
+            "the landing keeps copies on an album whose files' tags disagree, which own nothing",
+        ),
+        (
+            "catalog/src/local/perf_tests.rs",
+            1,
+            "the read benchmarks seed their own database",
+        ),
+    ],
+};
+
+/// The text inside each `COALESCE(..)` call, its brackets balanced, so a
+/// call written across lines and strings is read whole.
+fn coalesce_arguments(code: &str) -> Vec<&str> {
+    let call = Regex::new(r"(?i)\bCOALESCE\s*\(").unwrap();
+    call.find_iter(code)
+        .filter_map(|found| {
+            let start = found.end();
+            let mut depth = 1usize;
+            for (at, letter) in code[start..].char_indices() {
+                match letter {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(&code[start..start + at]);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            None
+        })
+        .collect()
+}
+
+/// Shipping code outside `library/src/identity/` reads identity through
+/// the definitions there: the match flags through `match_flagged!` and
+/// `named_group_guess!`, a track's recording through `recording_mbid!`,
+/// the decision sources through `PERSONS` and `REVISABLE`, and the group
+/// a file's tags name, above the library, through `owns_group!`. Each
+/// file that still writes one out is listed with its count and reason.
+#[test]
+fn identity_reads_go_through_their_definitions() {
+    let match_state = Regex::new(r"\blibrary_album_match_state\b").unwrap();
+    let recording = Regex::new(r"\brecording_mbid\b").unwrap();
+    let tag = Regex::new(r"\bembedded_recording_mbid\b").unwrap();
+    let decision_source = Regex::new(
+        r"(?i)(?:\bWHERE|\bAND|\bOR|\bWHEN|\bON|\()[\s\\]*(?:\w+\.)?decision_source[\s\\]*(?:=|<>|!=|\bIS\b(?:[\s\\]+NOT\b)?|(?:\bNOT[\s\\]+)?\bIN\b)[\s\\]*\(?[\s\\]*'",
+    )
+    .unwrap();
+    let tag_group = Regex::new(r"\bembedded_release_group_mbid\b").unwrap();
+    let mut wrong = identity_read_holds(&MATCH_STATE_READS, |code| {
+        match_state.find_iter(code).count()
+    });
+    wrong.extend(identity_read_holds(&RECORDING_READS, |code| {
+        coalesce_arguments(code)
+            .into_iter()
+            .filter(|arguments| recording.is_match(arguments) && tag.is_match(arguments))
+            .count()
+    }));
+    wrong.extend(identity_read_holds(&DECISION_SOURCE_READS, |code| {
+        decision_source.find_iter(code).count()
+    }));
+    wrong.extend(identity_read_holds(&TAG_GROUP_READS, |code| {
+        tag_group.find_iter(code).count()
+    }));
+    assert!(
+        wrong.is_empty(),
+        "read identity through library/src/identity/, or list the file with its reason:\n{}",
+        wrong.join("\n")
+    );
+}
+
 /// Where long-lived tasks start: the loop supervisor (`kernel/src/jobs/`)
 /// and the database's own threads (`kernel/src/db/`), which stop with
 /// `DbRuntime::shutdown`, and the provider cache's writer, which stops with
@@ -486,11 +728,13 @@ const PLUGIN_REPLACED: &str =
     "stops a replaced plugin runtime off the request path; plugin lifecycle";
 const PLUGIN_CHILD: &str =
     "the plugin child's I/O pumps and host-call answers, ended with its pipes";
-const SHARED_FLIGHT: &str = "a coalesced flight that runs to its end, and gives back what it holds, when every caller stopped waiting";
+const SHARED_FLIGHT: &str =
+    "a coalesced flight that runs to its end when every caller stopped waiting, and logs a panic";
 const PROVIDER_FETCH: &str = "a provider fetch shared by its callers, which stores its answer when they stop waiting and logs a panic";
 const BOOT_STEP: &str = "boot-time file work, awaited before serving";
 const HTTP_SERVER: &str = "the HTTP server, joined by serve at the shutdown deadline";
 const OFFLINE_TOOL: &str = "the offline tool's file and database work, awaited";
+const UPGRADE_RUN: &str = "an upgrade tool run a signed-in admin starts in upgrade mode; it records its own end, and the mode's stop kills its child";
 
 const SPAWN_SITES: &[(&str, usize, &str)] = &[
     ("acquire/src/drop_import/http.rs", 1, UPLOAD_CLEANUP),
@@ -516,7 +760,7 @@ const SPAWN_SITES: &[(&str, usize, &str)] = &[
     ("auth/src/sqlite/sessions.rs", 1, SESSION_TOUCH),
     ("auth/src/users/hibp.rs", 1, REQUEST),
     ("catalog/src/metadata/artist.rs", 1, CATALOG_WARM),
-    ("catalog/src/metadata/discovery.rs", 2, CATALOG_WARM),
+    ("catalog/src/metadata/discovery.rs", 1, CATALOG_WARM),
     ("catalog/src/discover/content.rs", 1, DISCOVER_BUILD),
     ("catalog/src/discover/home/mod.rs", 1, DISCOVER_BUILD),
     ("catalog/src/discover/page/mod.rs", 2, DISCOVER_BUILD),
@@ -564,13 +808,20 @@ const SPAWN_SITES: &[(&str, usize, &str)] = &[
     ("providers/src/youtube.rs", 1, REQUEST),
     ("src/admin/handlers.rs", 1, REQUEST),
     ("src/bootstrap/key_check.rs", 1, BOOT_STEP),
-    ("src/bootstrap/mod.rs", 1, BOOT_STEP),
+    ("src/bootstrap/mod.rs", 2, BOOT_STEP),
     ("src/bootstrap/platform.rs", 1, BOOT_STEP),
     ("src/bootstrap/serve.rs", 1, HTTP_SERVER),
+    ("src/bootstrap/setup_code.rs", 1, BOOT_STEP),
     ("src/settings/effects.rs", 1, LOOP_STEP),
     ("src/settings/library_policy_service.rs", 1, REQUEST),
     ("src/settings/services.rs", 3, REQUEST),
     ("src/settings/wiring.rs", 2, REQUEST),
+    ("src/upgrade_mode/mod.rs", 2, BOOT_STEP),
+    ("src/upgrade_mode/mod.rs", 1, HTTP_SERVER),
+    ("src/upgrade_mode/mod.rs", 2, UPGRADE_RUN),
+    ("src/upgrade_mode/mod.rs", 1, REQUEST),
+    ("src/upgrade_mode/mod.rs", 2, AWAITED),
+    ("src/upgrade_mode/sign_in.rs", 1, REQUEST),
     ("tool/src/import/apply.rs", 1, OFFLINE_TOOL),
     ("tool/src/tooling/reset_key.rs", 1, OFFLINE_TOOL),
     ("tool/src/tooling/upgrade.rs", 1, OFFLINE_TOOL),

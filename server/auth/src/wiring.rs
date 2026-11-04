@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use super::app_connect::AppConnectState;
+use super::app_connect::AppConnectService;
 use super::federated::MediaLinks;
 use super::federated::jellyfin_http::JellyfinHttp;
 use super::federated::oidc::OidcLogin;
@@ -22,6 +22,7 @@ use super::prod::ProdAuth;
 use super::routes::federated::{JellyfinRouteState, OidcRouteState, PlexRouteState};
 use super::routes::native::NativeAuthState;
 use super::session::middleware::SessionAuth;
+use super::session::one_time_code::OneTimeCode;
 use super::session::rate_limit::RateLimiter;
 use super::session::stated::StatedAddresses;
 use super::users::UsersDeps;
@@ -54,7 +55,7 @@ pub struct AuthSetup {
     /// Plex journey routes.
     pub plex: PlexRouteState,
     /// Native app sign-in routes.
-    pub app_connect: AppConnectState,
+    pub app_connect: AppConnectService,
     /// The sign-in sections, read by the provider list.
     pub sign_in: SignInSettings,
     /// The security section, read by the response security headers.
@@ -87,12 +88,14 @@ impl AuthSetup {
     /// and user import); `plex_server` reads
     /// the configured Plex server's machine id for the membership gate;
     /// `links` saves the media link a Plex or Jellyfin sign-in hands back.
+    /// `setup_code`, when set, is the code first-admin setup asks for.
     pub fn build(
         platform: &Platform,
         auth: ProdAuth,
         providers: &Providers,
         plex_server: Arc<dyn PlexServerIdentity>,
         links: MediaLinks,
+        setup_code: Option<OneTimeCode>,
     ) -> Self {
         use super::users::hibp::{HibpScreen, PwnedPasswordsHttp};
 
@@ -134,6 +137,7 @@ impl AuthSetup {
             auth.passwords.clone(),
             users.clone(),
             base_path,
+            setup_code,
         )
         .with_limits(limits.clone())
         .with_stated_addresses(stated.clone());
@@ -168,7 +172,7 @@ impl AuthSetup {
             base_path,
         )
         .with_stated_addresses(stated.clone());
-        let app_connect = AppConnectState::new(users.clone(), config_store.live());
+        let app_connect = AppConnectService::new(users.clone(), config_store.live());
         Self {
             users,
             session_auth: SessionAuth::new(auth.sessions.clone(), clock.clone(), base_path)
@@ -210,22 +214,6 @@ impl AuthSetup {
         self.plex = self.plex.with_trusted_proxies(trusted);
         self.limits = limits;
         self
-    }
-
-    /// The OIDC callback at its v2 path. v2 registered
-    /// `/api/v1/auth/oidc/callback` with identity providers and the import
-    /// keeps that redirect URI, so serving it here keeps a migrated SSO
-    /// login working without touching the provider. Mounted outside
-    /// `/api/v3`; like every OIDC step it needs no session.
-    pub fn legacy_oidc_router(&self) -> axum::Router {
-        use super::routes::federated::oidc_callback_handler;
-
-        axum::Router::new()
-            .route(
-                "/api/v1/auth/oidc/callback",
-                axum::routing::get(oidc_callback_handler),
-            )
-            .with_state(self.oidc.clone())
     }
 }
 
@@ -295,7 +283,7 @@ impl FromRef<AuthSetup> for PlexRouteState {
     }
 }
 
-impl FromRef<AuthSetup> for AppConnectState {
+impl FromRef<AuthSetup> for AppConnectService {
     fn from_ref(setup: &AuthSetup) -> Self {
         setup.app_connect.clone()
     }

@@ -40,7 +40,7 @@ use droppedneedle_acquire::downloads::{PlannedAlbum, ReplaceVersion};
 use droppedneedle_acquire::follows::ImportArtist;
 use droppedneedle_acquire::requests::{
     self, RequestsState,
-    ledger::{WantedWatch, WatchKind, WatchState},
+    ledger::{WantedWatch, WatchKind, WatchOutcome, WatchState},
     models::RequestKind,
     quota::{QuotaLedger, QuotaPolicy},
     service::RequestsService,
@@ -322,6 +322,7 @@ fn watch(key: &str, user: &str) -> WantedWatch {
         quiet_streak: 0,
         next_check_at: 1_700_000_000,
         new_candidate_count: 2,
+        last_outcome: None,
     }
 }
 
@@ -832,7 +833,7 @@ async fn wanted_view_and_actions() {
     assert_eq!(resumed["state"], "watching");
     state
         .store
-        .settle_in_library(MBID_A, "in_library", 1_700_000_100)
+        .settle_in_library(MBID_A, WatchOutcome::InLibrary, 1_700_000_100)
         .await
         .unwrap();
     assert_eq!(
@@ -903,7 +904,7 @@ async fn wanted_watches_can_be_removed_and_cleared() {
     }
     state
         .store
-        .settle_in_library(MBID_C, "in_library", 1_700_000_100)
+        .settle_in_library(MBID_C, WatchOutcome::InLibrary, 1_700_000_100)
         .await
         .unwrap();
     let clear = "/api/v3/requests/wanted/clear-finished";
@@ -1642,6 +1643,7 @@ impl droppedneedle_library::edition::port::EditionPlans for PlannedEdition {
             fate: FileFate::Keep,
             edition_track: None,
             note: None,
+            suggested: None,
         };
         let two = self.complete.then_some("t2");
         let mut files = vec![kept("t1"), kept("t3")];
@@ -2073,6 +2075,7 @@ impl droppedneedle_library::edition::port::EditionPlans for LibraryPlan {
                     fate: FileFate::Keep,
                     edition_track: None,
                     note: None,
+                    suggested: None,
                 })
                 .collect();
             Ok(Some(EditionPlan {
@@ -2104,7 +2107,8 @@ async fn land_edition(
 ) {
     let row = droppedneedle_acquire::downloads::landing_rows::ImportDecisionRow {
         task_id: task_id.to_owned(),
-        outcome: outcome.to_owned(),
+        outcome: droppedneedle_acquire::downloads::landing_rows::ImportOutcome::parse(outcome)
+            .unwrap(),
         files_total: 1,
         files_imported: 1,
         checks_json: "[]".to_owned(),

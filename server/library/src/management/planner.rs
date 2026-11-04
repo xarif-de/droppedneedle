@@ -15,7 +15,7 @@ use rusqlite::{Connection, OptionalExtension as _, params};
 use super::models::{
     ArtworkChoice, DesiredDocument, DesiredField, EditionPin, Eligibility, FieldMutation, ItemDiff,
     ItemFacts, ManagementError, PinnedProfile, PlannedItem, SidecarMove, TagEditField,
-    TagEditIntent, TagEditMode,
+    TagEditIntent, TagEditMode, TagScope,
 };
 use super::profile::{self, CompiledScripts, NamingFacts};
 use super::reasons::{self, ItemReason};
@@ -187,7 +187,7 @@ pub fn with_tag_edit(saved: Overrides, edit: &TagEditIntent, track_id: &str) -> 
     let active: Vec<&TagEditField> = edit
         .fields
         .iter()
-        .filter(|field| field.subject_kind == "album" || edit.local_track_id == track_id)
+        .filter(|field| field.subject_kind == TagScope::Album || edit.local_track_id == track_id)
         .collect();
     if active.is_empty() {
         return saved;
@@ -227,7 +227,34 @@ enum AlbumState {
         release_mbid: String,
         release_group_mbid: String,
         album_identity_revision: u64,
+        /// An accepted exact release nobody marked as looking wrong, with
+        /// a profile that uses the edition's archive cover.
+        exact: bool,
     },
+}
+
+/// Whether the album's match is an accepted exact release the archive's
+/// cover for that edition may stand in for: no unconfirmed or unmatched
+/// row and no chosen-but-unplaced reason, whatever "manage unconfirmed"
+/// allows, and nobody marked it as looking wrong.
+pub(crate) fn edition_gate(conn: &Connection, album_id: &str) -> rusqlite::Result<bool> {
+    if match_gate(conn, album_id, false)?.is_some() {
+        return Ok(false);
+    }
+    let looks_wrong: bool = conn.query_row(
+        crate::management::sql::LOOKS_WRONG.text(),
+        params![album_id],
+        |row| row.get(0),
+    )?;
+    Ok(!looks_wrong)
+}
+
+/// Whether the profile replaces covers with the edition's archive cover:
+/// only while it writes cover files.
+pub(crate) fn uses_edition_cover(
+    profile: &droppedneedle_kernel::runtime_config::sections::LibraryManagementProfile,
+) -> bool {
+    profile.artwork.external_enabled && profile.artwork.use_edition_cover
 }
 
 /// Why an edition's tag write leaves the album alone: its identity is no
@@ -340,6 +367,7 @@ fn album_state(
                 release: Box::new(release),
                 release_group_mbid,
                 album_identity_revision: identity.row_revision,
+                exact: false,
             },
             None => AlbumState::Blocked(reasons::release_not_selected()),
         });
@@ -353,11 +381,21 @@ fn album_state(
     let Some(release) = store.release(&release_mbid, None)? else {
         return Ok(AlbumState::Blocked(reasons::release_unavailable()));
     };
+    let exact = uses_edition_cover(&ctx.pinned.profile)
+        && db
+            .read_blocking("management.edition_gate", |conn| {
+                Ok::<_, ManagementError>(edition_gate(conn, album_id)?)
+            })
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, album = album_id, "match state unreadable; the album keeps its cover");
+                false
+            });
     Ok(AlbumState::Ready {
         release: Box::new(release),
         release_mbid,
         release_group_mbid,
         album_identity_revision: identity.row_revision,
+        exact,
     })
 }
 
@@ -822,6 +860,7 @@ fn generated_output(
         size: bytes.len() as u64,
         kind,
         replaces: None,
+        put_back: false,
     })
 }
 
@@ -840,7 +879,7 @@ fn keep_bytes(
     name: &'static str,
     bytes: &[u8],
 ) -> Result<String, ManagementError> {
-    use crate::publish::snapshots::SnapshotStore;
+    use crate::publish::snapshots::{BlobOwner, SnapshotStore};
     ctx.parts
         .core
         .blobs
@@ -851,7 +890,7 @@ fn keep_bytes(
             &[bytes],
             |tx, shas| {
                 let sha = shas[0].clone();
-                SnapshotStore::new(tx).add_ref(&sha, "preview", ctx.job_id)?;
+                SnapshotStore::new(tx).add_ref(&sha, BlobOwner::Preview, ctx.job_id)?;
                 Ok(sha)
             },
         )
@@ -1058,15 +1097,12 @@ fn plan_pictures(
     Ok(())
 }
 
-/// The album's cover file next to its tracks (external artwork): the
-/// archive's cover for the edition, never one that came with the files.
-/// Where the album stays in its folder, a `cover.*` already there is
-/// replaced when it differs (in its own format, so one cover file stays;
-/// it goes to the recycle bin), unless the profile keeps a larger one, and
-/// a folder without one gets `cover.<ext>` even beside other images, which
-/// the pages read after it. An album that moves keeps the old rule: written
-/// only where no cover file the profile recognises sits, in the folder it
-/// ends up in or the one it comes from; the next run replaces it in place.
+/// The album's cover file next to its tracks (external artwork):
+/// written only where no cover file the profile recognises already sits,
+/// in the folder the album ends up in or the one it comes from. With the
+/// archive's cover for the album's exact edition in hand, an album that
+/// stays in its folder has that folder's one `cover.*` replaced instead
+/// (see [`replace_cover`]).
 fn cover_file(
     ctx: &PlanContext<'_>,
     item: &mut PlannedItem,
@@ -1075,8 +1111,6 @@ fn cover_file(
     dest_rel: &str,
     track: &CatalogTrack,
 ) -> Result<Option<crate::publish::GeneratedOutput>, ItemReason> {
-    use droppedneedle_kernel::runtime_config::sections::ArtworkOutputFormat;
-
     let art = &ctx.pinned.profile.artwork;
     if !art.external_enabled {
         return Ok(None);
@@ -1091,146 +1125,59 @@ fn cover_file(
             .unwrap_or_default()
     };
     let dest_folder = folder_of(dest_rel);
-    let in_place = dest_root == track.root_id && dest_folder == folder_of(&track.relative_path);
-    let listed = |root: &str, folder: &str| -> Vec<String> {
+    let stays = dest_root == track.root_id && dest_folder == folder_of(&track.relative_path);
+    let covers = if extras.edition_cover && stays {
+        cover_names(ctx, dest_root, &dest_folder)
+    } else {
+        Vec::new()
+    };
+    if let [name] = covers.as_slice()
+        && let Some(format) = cover_format(name)
+    {
+        return replace_cover(ctx, item, cover, dest_root, &dest_folder, name, format);
+    }
+    let Some(rendered) =
+        super::enrich::render_cover(&cover.bytes, art.external_maximum_size, art.external_format)
+    else {
+        return Ok(None);
+    };
+    let patterns: Vec<Vec<char>> = art
+        .local_file_patterns
+        .iter()
+        .map(|pattern| pattern.to_lowercase().chars().collect())
+        .collect();
+    let has_cover = |root: &str, folder: &str| {
         ctx.sandbox
             .resolve_no_symlink(root, if folder.is_empty() { "." } else { folder })
             .ok()
             .and_then(|dir| std::fs::read_dir(dir).ok())
-            .map(|entries| {
-                entries
-                    .flatten()
-                    .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
-                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
-    let in_folder = |folder: &str, name: &str| {
-        if folder.is_empty() {
-            name.to_owned()
-        } else {
-            format!("{folder}/{name}")
-        }
-    };
-    let format_of = |name: &str| match Path::new(name)
-        .extension()
-        .map(|ext| ext.to_string_lossy().to_lowercase())
-        .as_deref()
-    {
-        Some("jpg" | "jpeg") => Some(ArtworkOutputFormat::Jpeg),
-        Some("png") => Some(ArtworkOutputFormat::Png),
-        Some("webp") => Some(ArtworkOutputFormat::Webp),
-        _ => None,
-    };
-    let is_cover = |name: &str| name.to_lowercase().starts_with("cover.");
-    let mut replaces = None;
-    let (rendered, rel) = if in_place {
-        let names = listed(dest_root, &dest_folder);
-        let own = names
-            .iter()
-            .find(|name| is_cover(name) && format_of(name).is_some());
-        match own {
-            Some(name) => {
-                let rel = in_folder(&dest_folder, name);
-                let held = ctx
-                    .sandbox
-                    .resolve_no_symlink(dest_root, &rel)
-                    .ok()
-                    .and_then(|path| std::fs::read(path).ok());
-                let (Some(held), Some(format)) = (held, format_of(name)) else {
-                    return Ok(None);
-                };
-                // The profile's own encoding when it gives the file's
-                // format, so a cover written before reads as the same;
-                // else re-encoded into the file's format.
-                let Some(rendered) = super::enrich::render_cover(
-                    &cover.bytes,
-                    art.external_maximum_size,
-                    art.external_format,
-                )
-                .filter(|rendered| {
-                    format_of(&format!("x.{}", extension_of(&rendered.mime))) == Some(format)
+            .is_some_and(|entries| {
+                entries.flatten().any(|entry| {
+                    let name: Vec<char> = entry
+                        .file_name()
+                        .to_string_lossy()
+                        .to_lowercase()
+                        .chars()
+                        .collect();
+                    // A `cover.*` file counts even when the profile lists
+                    // no patterns: it is where this one would go.
+                    name.starts_with(&['c', 'o', 'v', 'e', 'r', '.'])
+                        || patterns.iter().any(|pattern| glob(pattern, &name))
                 })
-                .or_else(|| {
-                    super::enrich::render_cover(&cover.bytes, art.external_maximum_size, format)
-                }) else {
-                    return Ok(None);
-                };
-                let held_sha = sha256_hex(&held);
-                if sha256_hex(&rendered.bytes) == held_sha {
-                    return Ok(None);
-                }
-                let larger = art.never_replace_with_smaller
-                    && image_size(&held).is_some_and(|(width, height)| {
-                        u64::from(width) * u64::from(height)
-                            > u64::from(rendered.width) * u64::from(rendered.height)
-                    });
-                if larger {
-                    item.facts.warnings.push(format!(
-                        "{rel} is larger than the archive's cover, so it is kept."
-                    ));
-                    return Ok(None);
-                }
-                replaces = Some(crate::publish::Replacement {
-                    sha256: held_sha,
-                    track_id: None,
-                    recycle_to: String::new(),
-                });
-                (rendered, rel)
-            }
-            None => {
-                let Some(rendered) = super::enrich::render_cover(
-                    &cover.bytes,
-                    art.external_maximum_size,
-                    art.external_format,
-                ) else {
-                    return Ok(None);
-                };
-                let name = format!("cover.{}", extension_of(&rendered.mime));
-                // A cover.* in a format no cover is written in keeps its
-                // name; nothing is written beside it under the same one.
-                if names
-                    .iter()
-                    .any(|existing| existing.eq_ignore_ascii_case(&name))
-                {
-                    return Ok(None);
-                }
-                (rendered, in_folder(&dest_folder, &name))
-            }
-        }
-    } else {
-        let Some(rendered) = super::enrich::render_cover(
-            &cover.bytes,
-            art.external_maximum_size,
-            art.external_format,
-        ) else {
-            return Ok(None);
-        };
-        let patterns: Vec<Vec<char>> = art
-            .local_file_patterns
-            .iter()
-            .map(|pattern| pattern.to_lowercase().chars().collect())
-            .collect();
-        let has_cover = |root: &str, folder: &str| {
-            listed(root, folder).iter().any(|name| {
-                let name: Vec<char> = name.to_lowercase().chars().collect();
-                // A `cover.*` file counts even when the profile lists
-                // no patterns: it is where this one would go.
-                name.starts_with(&['c', 'o', 'v', 'e', 'r', '.'])
-                    || patterns.iter().any(|pattern| glob(pattern, &name))
             })
-        };
-        if has_cover(dest_root, &dest_folder)
-            || has_cover(&track.root_id, &folder_of(&track.relative_path))
-        {
-            return Ok(None);
-        }
-        let name = format!("cover.{}", extension_of(&rendered.mime));
-        (rendered, in_folder(&dest_folder, &name))
     };
-    let mut output = generated_output(ctx, dest_root, &rel, OutputKind::Artwork, &rendered.bytes)?;
-    output.replaces = replaces;
+    if has_cover(dest_root, &dest_folder)
+        || has_cover(&track.root_id, &folder_of(&track.relative_path))
+    {
+        return Ok(None);
+    }
+    let extension = cover_extension(&rendered.mime);
+    let rel = if dest_folder.is_empty() {
+        format!("cover.{extension}")
+    } else {
+        format!("{dest_folder}/cover.{extension}")
+    };
+    let output = generated_output(ctx, dest_root, &rel, OutputKind::Artwork, &rendered.bytes)?;
     item.desired.artwork.push(ArtworkChoice {
         output_kind: "external_art".to_owned(),
         image_type: "front".to_owned(),
@@ -1245,8 +1192,160 @@ fn cover_file(
     Ok(Some(output))
 }
 
-/// The file extension a cover is written with.
-fn extension_of(mime: &str) -> &'static str {
+/// The regular files named `cover.*` (any case) directly in `folder`.
+fn cover_names(ctx: &PlanContext<'_>, root: &str, folder: &str) -> Vec<String> {
+    ctx.sandbox
+        .resolve_no_symlink(root, if folder.is_empty() { "." } else { folder })
+        .ok()
+        .and_then(|dir| std::fs::read_dir(dir).ok())
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| name.to_lowercase().starts_with("cover."))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The image format a cover file's name says, for the ones a cover is
+/// written in.
+fn cover_format(
+    name: &str,
+) -> Option<droppedneedle_kernel::runtime_config::sections::ArtworkOutputFormat> {
+    use droppedneedle_kernel::runtime_config::sections::ArtworkOutputFormat;
+    match Path::new(name)
+        .extension()
+        .map(|extension| extension.to_string_lossy().to_lowercase())
+        .as_deref()
+    {
+        Some("jpg" | "jpeg") => Some(ArtworkOutputFormat::Jpeg),
+        Some("png") => Some(ArtworkOutputFormat::Png),
+        Some("webp") => Some(ArtworkOutputFormat::Webp),
+        _ => None,
+    }
+}
+
+/// Replace the folder's one cover file `name` with the archive's cover for
+/// the album's exact edition, in the file's own name and format, so one
+/// cover file stays. Left alone when it already holds that cover, when it
+/// is larger and the profile never replaces with smaller, when another
+/// album's tracks share the folder, or when it cannot be read. The
+/// publisher sends the old one to the recycle bin and keeps its bytes for
+/// undo.
+fn replace_cover(
+    ctx: &PlanContext<'_>,
+    item: &mut PlannedItem,
+    cover: &super::enrich::Cover,
+    root: &str,
+    folder: &str,
+    name: &str,
+    format: droppedneedle_kernel::runtime_config::sections::ArtworkOutputFormat,
+) -> Result<Option<crate::publish::GeneratedOutput>, ItemReason> {
+    use droppedneedle_kernel::beneath::{RootLinks, open_file_beneath};
+    use std::io::Read as _;
+
+    let art = &ctx.pinned.profile.artwork;
+    let rel = if folder.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{folder}/{name}")
+    };
+    let prefix = if folder.is_empty() {
+        String::new()
+    } else {
+        format!("{folder}/")
+    };
+    let shared = ctx
+        .parts
+        .db
+        .read_blocking("management.cover_folder_shared", |conn| {
+            conn.query_row(
+                crate::management::sql::FOLDER_SHARED.text(),
+                params![root, prefix, item.album_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(ManagementError::from)
+        })
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, folder = rel, "folder's albums unreadable; its cover is kept");
+            true
+        });
+    if shared {
+        item.facts.warnings.push(format!(
+            "{rel} sits in a folder shared with another album, so it is kept."
+        ));
+        return Ok(None);
+    }
+    let cap = crate::publish::REPLACED_COVER_MAX_BYTES;
+    let held = ctx
+        .sandbox
+        .root_dir(root)
+        .ok()
+        .zip(ctx.sandbox.resolve_no_symlink(root, &rel).ok())
+        .and_then(|(dir, path)| open_file_beneath(dir, &path, RootLinks::Follow).ok())
+        .and_then(|file| {
+            let mut bytes = Vec::new();
+            file.take(cap + 1).read_to_end(&mut bytes).ok()?;
+            (bytes.len() as u64 <= cap).then_some(bytes)
+        });
+    let Some(held) = held else {
+        item.facts
+            .warnings
+            .push(format!("{rel} could not be read, so it is kept."));
+        return Ok(None);
+    };
+    // The profile's own encoding when it gives the file's format, so a
+    // cover written before reads as the same; else the file's format.
+    let Some(rendered) =
+        super::enrich::render_cover(&cover.bytes, art.external_maximum_size, art.external_format)
+            .filter(|rendered| {
+                cover_format(&format!("x.{}", cover_extension(&rendered.mime))) == Some(format)
+            })
+            .or_else(|| {
+                super::enrich::render_cover(&cover.bytes, art.external_maximum_size, format)
+            })
+    else {
+        return Ok(None);
+    };
+    let held_sha = sha256_hex(&held);
+    if sha256_hex(&rendered.bytes) == held_sha {
+        return Ok(None);
+    }
+    let larger = art.never_replace_with_smaller
+        && image_size(&held).is_some_and(|(width, height)| {
+            u64::from(width) * u64::from(height)
+                > u64::from(rendered.width) * u64::from(rendered.height)
+        });
+    if larger {
+        item.facts.warnings.push(format!(
+            "{rel} is larger than the archive's cover, so it is kept."
+        ));
+        return Ok(None);
+    }
+    let mut output = generated_output(ctx, root, &rel, OutputKind::Artwork, &rendered.bytes)?;
+    output.replaces = Some(crate::publish::Replacement {
+        sha256: held_sha,
+        track_id: None,
+        recycle_to: String::new(),
+    });
+    item.desired.artwork.push(ArtworkChoice {
+        output_kind: "external_art".to_owned(),
+        image_type: "front".to_owned(),
+        source: "cover_art_archive".to_owned(),
+        mime_type: rendered.mime.clone(),
+        blob_sha256: output.sha256.clone(),
+        width: rendered.width,
+        height: rendered.height,
+        format: format_word(&rendered.mime).to_owned(),
+        destination_relative_path: Some(rel),
+    });
+    Ok(Some(output))
+}
+
+/// The file extension a cover in `mime` is written with.
+fn cover_extension(mime: &str) -> &'static str {
     match mime {
         "image/png" => "png",
         "image/webp" => "webp",
@@ -2097,7 +2196,7 @@ pub fn plan_album(
         }
         return Ok(items);
     }
-    let (mut release, release_mbid, release_group_mbid, album_identity_revision) =
+    let (mut release, release_mbid, release_group_mbid, album_identity_revision, exact) =
         match album_state(ctx, &scope.album_id, person, edition)? {
             AlbumState::Blocked(reason) => {
                 for item in &mut items {
@@ -2110,11 +2209,13 @@ pub fn plan_album(
                 release_mbid,
                 release_group_mbid,
                 album_identity_revision,
+                exact,
             } => (
                 release,
                 release_mbid,
                 release_group_mbid,
                 album_identity_revision,
+                exact,
             ),
         };
     // Only a person's own preview asks MusicBrainz at their priority.
@@ -2124,6 +2225,7 @@ pub fn plan_album(
         &ctx.pinned.profile,
         &mut release,
         !person,
+        exact,
     );
     // Link the album's artists from its match, with any names the lookup
     // just stored, so a run that writes their ids and new names keeps
@@ -2267,6 +2369,7 @@ pub fn plan_one(
             release_mbid,
             release_group_mbid,
             album_identity_revision,
+            exact: _,
         } => {
             let overrides = ctx.parts.db.read_blocking("management.overrides", |conn| {
                 Ok::<_, ManagementError>(overrides(conn, &scope.album_id, &track.id)?)
@@ -2276,6 +2379,7 @@ pub fn plan_one(
                 &ctx.parts.identify_store,
                 &ctx.pinned.profile,
                 &mut release,
+                false,
                 false,
             );
             measure_replaygain(ctx, std::slice::from_ref(track), false, &mut extras);

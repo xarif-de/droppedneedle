@@ -275,19 +275,34 @@ pub(crate) fn stored_release(
 pub struct CopyEdition {
     /// The library album that is the copy.
     pub album_id: String,
-    /// The release its identity names, as stored. `None` when it names none
-    /// (left unmanaged).
+    /// The release its row on the group names, as stored. `None` when it
+    /// names none (left unmanaged) or the album holds no row on the group
+    /// (owned through its files' tags).
     pub release_mbid: Option<String>,
-    /// Who chose the identity.
-    pub source: DecisionSource,
+    /// Who chose that row. `None` when the album holds none.
+    pub source: Option<DecisionSource>,
     /// Indexed tracks the copy holds.
     pub file_count: i64,
 }
 
-/// The copy of `release_group_mbid` the library shows, over live albums, so
-/// a download joins the copy a person sees: a copy with files first, then
-/// one picked by hand (`manual`), then the oldest. The group matches
-/// ignoring ASCII case. `None` when no live copy is identified as the group.
+/// Whether the library owns `release_group_mbid`, in any case: the one
+/// definition in `owns_group!`. An empty group is owned
+/// by nothing.
+pub fn group_owned(conn: &Connection, release_group_mbid: &str) -> rusqlite::Result<bool> {
+    if release_group_mbid.is_empty() {
+        return Ok(false);
+    }
+    conn.prepare_cached(sql::GROUP_OWNED.text())?
+        .query_row(params![release_group_mbid.to_ascii_lowercase()], |row| {
+            row.get(0)
+        })
+}
+
+/// The copy of `release_group_mbid` the library shows, the album
+/// `copy_of_group!` opens, so a download joins the copy a person sees. The
+/// group matches ignoring ASCII case. `None` when no live album is a copy of
+/// the group. A copy owned through its files' tags has no release, and no
+/// other copy's release stands in for it.
 pub fn copy_for_group(
     conn: &Connection,
     release_group_mbid: &str,

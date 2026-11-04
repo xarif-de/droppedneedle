@@ -801,8 +801,8 @@ fn drive<F: std::future::Future>(
 
 /// The scan loop's turn: startup recovery once, then every run that is
 /// due until none is left, then the album art and lyrics sweeps when a run
-/// changed something or a publish asked for them. A cancelled stop ends the run in flight; the next
-/// start resumes it.
+/// changed something or a publish asked for them. A cancelled stop ends
+/// the run in flight; the next start resumes it.
 fn scan_tick(scans: Scans, handle: Handle) -> impl FnMut(&TickCtx) -> TickResult + Send + 'static {
     let mut recovered = false;
     // Album art and the lyrics marks are refreshed once the scans go idle,

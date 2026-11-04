@@ -831,7 +831,7 @@ async fn an_artist_renamed_by_a_managed_run_keeps_its_row() {
          VALUES ('{user}', 'artist', '{artist}', 1); \
          INSERT INTO library_play_history (id, user_id, local_artist_id, track_name, \
          artist_name, played_at) VALUES ('play-1', '{user}', '{artist}', 'Song 1', 'Alpha', \
-         '2026-01-01T00:00:00Z');"
+         1767225600000);"
     ))
     .await;
 
@@ -1136,7 +1136,7 @@ async fn a_management_run_asks_each_media_server_to_rescan_once() {
 
     let jobs = app.state().jobs.scripted().expect("test hooks are on");
     jobs.clock().advance(60 * 60 * 1000);
-    app.state().jobs.queue().expect("jobs table").wake();
+    app.state().jobs.queue().wake();
     let run = format!("/api/v3/library/management/previews/{job}");
     let shown = app
         .until("every server's rescan is done", || {
@@ -1667,6 +1667,7 @@ async fn an_edition_tag_write_planned_after_another_choice_writes_nothing() {
             other,
             shown_revision(&managed.library, &album),
             Some("admin"),
+            false,
         )
         .await
         .expect("another edition chosen");
@@ -1734,6 +1735,7 @@ async fn an_edition_choice_links_its_artists_before_it_answers() {
             REL_1,
             shown_revision(&library, &album),
             Some("admin"),
+            false,
         )
         .await
         .expect("edition chosen");
@@ -2304,7 +2306,7 @@ async fn moved_file_keeps_its_track() {
              VALUES ('listener', 'track', '{track}', 0); \
              INSERT INTO library_play_history (id, user_id, local_track_id, track_name, \
              artist_name, played_at) VALUES ('play-1', 'listener', '{track}', 'Song', \
-             'Artist', '2026-01-01T00:00:00Z');"
+             'Artist', 1767225600000);"
         ))
         .expect("favorite and play seed");
 
@@ -3075,6 +3077,7 @@ async fn choose_first_edition(library: &LibrarySetup, album: &str) {
             REL_1,
             shown_revision(library, album),
             Some("curator"),
+            false,
         )
         .await
         .expect("edition chosen");
@@ -3469,7 +3472,7 @@ async fn release_documents_answer_to_merged_ids() {
 
 /// Contribution journey through the real routes and the SQLite store:
 /// draft, duplicate check, seeded editor, the release editor coming back
-/// on the v1 callback path, verification, and the album linked.
+/// on the callback, verification, and the album linked.
 #[tokio::test]
 async fn library_contribution_seed_callback_verify_links_album() {
     use droppedneedle_library::contrib::models::{
@@ -3626,9 +3629,9 @@ async fn library_contribution_seed_callback_verify_links_album() {
         .expect("callback points at this server")
         .to_owned();
 
-    // The editor sends the browser back, here to the v1 path, signed out.
+    // The editor sends the browser back, signed out.
     let back = format!(
-        "/api/v1/library/contributions/musicbrainz/callback?token={token}&release_mbid={WRONG}"
+        "/api/v3/library/contributions/musicbrainz/callback?token={token}&release_mbid={WRONG}"
     );
     let (status, answer, _) = app.raw("GET", &back, &[], None).await;
     assert_eq!(status, StatusCode::SEE_OTHER);
@@ -4497,6 +4500,13 @@ async fn an_album_removal_takes_its_sidecars_and_leaves_no_folder_behind() {
         .remove_album(&album, true, true, "admin")
         .expect("album removed again");
     assert_eq!(removed.recycled.len(), 6);
+    // Emptying takes only copies that landed before now; this test empties
+    // in the same millisecond, so it moves the landings back.
+    conn.execute(
+        "UPDATE library_publish_replacements SET recycled_at = recycled_at - 10000",
+        [],
+    )
+    .expect("the copies reached the bin a little earlier");
     let report = library
         .publishing
         .empty_recycle_bin(library.clock.now_ms() + 1_000, &|| true)
@@ -4514,22 +4524,26 @@ async fn an_album_removal_takes_its_sidecars_and_leaves_no_folder_behind() {
     assert_eq!(open, 0, "every copy of the removal left the bin");
 }
 
-/// A track takes only its own sidecars while music stays in its folder.
-/// The folder's other sidecars go with the last music file, and a file no
+/// In a folder three albums share, a removal takes only its tracks' own
+/// sidecars while music stays: none named like a file another album keeps
+/// (`b.lrc` stays with `b.flac` when `b.mp3` goes), and not the folder's
+/// art. The last music to go takes the folder's sidecars, and a file no
 /// sidecar pattern names stays, with its folder.
 #[tokio::test]
-async fn a_track_removal_takes_its_own_sidecars_and_the_last_takes_the_folders() {
+async fn a_shared_folder_keeps_its_sidecars_for_the_music_still_there() {
     use droppedneedle_library::removal::Mutations;
 
-    let (_scratch, library, music) = bare_library("lib-remove-track-sidecars").await;
-    plant(&music, "Band/LP/01.flac", "flac_no_tags.flac");
-    plant(&music, "Band/LP/02.flac", "flac_no_tags.flac");
-    for rel in ["Band/LP/01.lrc", "Band/LP/02.lrc", "Band/LP/cover.jpg"] {
+    let (scratch, library, music) = bare_library("lib-remove-shared-folder").await;
+    plant(&music, "Mixed/a.flac", "flac_full_01.flac");
+    plant(&music, "Mixed/b.flac", "flac_no_tags.flac");
+    plant(&music, "Mixed/b.mp3", "mp3_full_01.mp3");
+    for rel in ["Mixed/a.lrc", "Mixed/b.lrc", "Mixed/cover.jpg"] {
         std::fs::write(music.join(rel), rel.as_bytes()).expect("sidecar written");
     }
-    std::fs::write(music.join("Band/LP/notes.txt"), b"mine").expect("note written");
+    std::fs::write(music.join("Mixed/notes.txt"), b"mine").expect("note written");
     add_music_root(&library, &music).await;
     add_admin(&library);
+    let conn = scratch_db(&scratch);
     let track_at = |rel: &str| -> String {
         library
             .scan_store
@@ -4537,74 +4551,52 @@ async fn a_track_removal_takes_its_own_sidecars_and_the_last_takes_the_folders()
             .unwrap()
             .expect("track indexed")
     };
-    let (first, second) = (track_at("Band/LP/01.flac"), track_at("Band/LP/02.flac"));
-    let mutations = Mutations::new(&library);
-
-    let removed = mutations
-        .remove_track_now(&first, seen_track(&library, &first), true, "admin")
-        .expect("first track removed");
-    assert_eq!(removed.recycled.len(), 2, "{:?}", removed.recycled);
-    assert!(!music.join("Band/LP/01.lrc").exists(), "its lyrics went");
-    for rel in ["Band/LP/02.lrc", "Band/LP/cover.jpg"] {
-        assert!(music.join(rel).is_file(), "{rel} stays with the music");
-    }
-
-    let removed = mutations
-        .remove_track_now(&second, seen_track(&library, &second), true, "admin")
-        .expect("last track removed");
-    assert_eq!(removed.recycled.len(), 3, "{:?}", removed.recycled);
-    for rel in ["Band/LP/02.lrc", "Band/LP/cover.jpg"] {
-        assert!(!music.join(rel).exists(), "{rel} went with the last track");
-    }
-    assert_eq!(
-        std::fs::read_dir(music.join("Band/LP"))
-            .expect("folder stays")
-            .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
-            .collect::<Vec<_>>(),
-        ["notes.txt"],
-        "a file no pattern names keeps its folder"
-    );
-}
-
-/// In a folder two albums share, removing one album takes its tracks' own
-/// lyrics but leaves the folder's art to the album still there.
-#[tokio::test]
-async fn a_shared_folder_keeps_its_art_for_the_album_still_there() {
-    use droppedneedle_library::removal::Mutations;
-
-    let (scratch, library, music) = bare_library("lib-remove-shared-folder").await;
-    plant(&music, "Mixed/a.flac", "flac_full_01.flac");
-    plant(&music, "Mixed/b.flac", "flac_no_tags.flac");
-    for rel in ["Mixed/a.lrc", "Mixed/b.lrc", "Mixed/cover.jpg"] {
-        std::fs::write(music.join(rel), rel.as_bytes()).expect("sidecar written");
-    }
-    add_music_root(&library, &music).await;
-    add_admin(&library);
-    let conn = scratch_db(&scratch);
     let album_at = |rel: &str| -> String {
-        let track = library
-            .scan_store
-            .track_at("music", rel)
-            .unwrap()
-            .expect("track indexed");
         conn.query_row(
             "SELECT local_album_id FROM local_tracks WHERE id = ?1",
-            [&track],
+            [&track_at(rel)],
             |row| row.get(0),
         )
         .expect("album id")
     };
-    let (album, other) = (album_at("Mixed/a.flac"), album_at("Mixed/b.flac"));
-    assert_ne!(album, other, "the folder holds two albums");
+    let [tagged, untagged, mp3] = ["Mixed/a.flac", "Mixed/b.flac", "Mixed/b.mp3"].map(album_at);
+    assert!(
+        tagged != untagged && untagged != mp3 && tagged != mp3,
+        "the folder holds three albums"
+    );
+    let mutations = Mutations::new(&library);
 
-    let removed = Mutations::new(&library)
-        .remove_album(&album, true, true, "admin")
+    let removed = mutations
+        .remove_album(&mp3, true, true, "admin")
+        .expect("the mp3's album removed");
+    assert_eq!(removed.recycled.len(), 1, "{:?}", removed.recycled);
+    assert!(
+        music.join("Mixed/b.lrc").is_file(),
+        "b.lrc stays with b.flac"
+    );
+
+    let removed = mutations
+        .remove_album(&tagged, true, true, "admin")
         .expect("album removed");
     assert_eq!(removed.recycled.len(), 2, "{:?}", removed.recycled);
-    assert!(!music.join("Mixed/a.lrc").exists());
+    assert!(!music.join("Mixed/a.lrc").exists(), "its lyrics went");
     for rel in ["Mixed/b.flac", "Mixed/b.lrc", "Mixed/cover.jpg"] {
         assert!(music.join(rel).is_file(), "{rel} stays");
     }
+
+    let last = track_at("Mixed/b.flac");
+    let removed = mutations
+        .remove_track_now(&last, seen_track(&library, &last), true, "admin")
+        .expect("last track removed");
+    assert_eq!(removed.recycled.len(), 3, "{:?}", removed.recycled);
+    assert_eq!(
+        std::fs::read_dir(music.join("Mixed"))
+            .expect("folder stays")
+            .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+            .collect::<Vec<_>>(),
+        ["notes.txt"],
+        "the last track took the folder's sidecars, and a file no pattern names keeps its folder"
+    );
 }
 
 /// A removed album's download and wanted clean-up is written with the
@@ -5194,7 +5186,7 @@ async fn a_removed_album_is_put_back_from_its_page() {
          VALUES ('admin', 'track', '{track}', 0), ('admin', 'album', '{album}', 0); \
          INSERT INTO library_play_history (id, user_id, local_track_id, track_name, \
          artist_name, played_at) VALUES ('play-1', 'admin', '{track}', 'Song', 'Artist', \
-         '2026-01-01T00:00:00Z');",
+         1767225600000);",
         track = tracks[0]
     ))
     .expect("favourites and a play");
@@ -5499,10 +5491,11 @@ async fn expiry_waits_on_a_retention_that_does_not_read() {
 /// Emptying the bin deletes, however young, every copy that reached it
 /// before the moment its count was read and still holds the removed
 /// bytes, and marks its row. A copy changed in the bin is kept and named,
-/// one a put-back is using stays, and a removal made after that moment is
-/// untouched.
+/// the copies a put-back not done is using stay (its sidecar's holding no
+/// other removal's), and a removal made after that moment is untouched.
 #[tokio::test]
 async fn emptying_the_bin_deletes_unchanged_copies_and_keeps_the_rest() {
+    use droppedneedle_library::publish::CrashPoint;
     use droppedneedle_library::publish::expiry::KeptWhy;
     use droppedneedle_library::removal::Mutations;
 
@@ -5510,11 +5503,15 @@ async fn emptying_the_bin_deletes_unchanged_copies_and_keeps_the_rest() {
     for folder in ["A", "B", "C", "D"] {
         plant(&music, &format!("{folder}/01.flac"), "flac_no_tags.flac");
     }
+    for folder in ["A", "C"] {
+        std::fs::write(music.join(format!("{folder}/cover.jpg")), b"jpeg bytes")
+            .expect("cover written");
+    }
     add_music_root(&library, &music).await;
     add_admin(&library);
     let conn = scratch_db(&scratch);
     let mutations = Mutations::new(&library);
-    let remove = |folder: &str| -> String {
+    let remove = |folder: &str| -> (String, String, String) {
         let track = library
             .scan_store
             .track_at("music", &format!("{folder}/01.flac"))
@@ -5527,31 +5524,41 @@ async fn emptying_the_bin_deletes_unchanged_copies_and_keeps_the_rest() {
                 |row| row.get(0),
             )
             .expect("album");
-        mutations
+        let removed = mutations
             .remove_album(&album, true, true, "admin")
             .expect("album removed");
-        track
+        (track, album, removed.removal_id.expect("removal id"))
     };
-    let [a, b, c] = ["A", "B", "C"].map(&remove);
+    let cover_of = |folder: &str| -> (PathBuf, String) {
+        conn.query_row(
+            "SELECT r.recycle_to, r.journal_id FROM library_publish_replacements r \
+             JOIN library_publish_journal j ON j.id = r.journal_id WHERE j.dest_rel = ?1",
+            [format!("{folder}/cover.jpg")],
+            |row| Ok((PathBuf::from(row.get::<_, String>(0)?), row.get(1)?)),
+        )
+        .expect("a cover in the bin")
+    };
+    let [(a, ..), (b, ..), (c, c_album, c_removal)] = ["A", "B", "C"].map(&remove);
     let (a_copy, a_row) = copy_of(&conn, &a);
+    let (a_cover, a_cover_row) = cover_of("A");
     let (b_copy, b_row) = copy_of(&conn, &b);
     let (c_copy, c_row) = copy_of(&conn, &c);
+    let (c_cover, c_cover_row) = cover_of("C");
     let a_size = std::fs::metadata(&a_copy).expect("copy").len();
     std::fs::write(&b_copy, b"changed in the bin").expect("copy changes");
-    conn.execute(
-        "INSERT INTO library_publish_journal (id, bundle_id, kind, dest_root, dest_rel, \
-         staged, staged_sha256, track_id, state) VALUES ('pb-000', 'pb', 'put_back', \
-         'music', 'C/01.flac', '.dn-pb', 'x', ?1, 'staged')",
-        [&c],
-    )
-    .expect("a put-back holds C");
+    library
+        .publishing
+        .arm_publish_crash(Some(CrashPoint::AfterStage));
+    let stopped = mutations.put_back(&c_album, &c_removal, "admin");
+    library.publishing.arm_publish_crash(None);
+    assert!(stopped.is_err(), "C's put-back stops with its files staged");
     conn.execute(
         "UPDATE library_publish_replacements SET recycled_at = recycled_at - 10000",
         [],
     )
     .expect("the copies reached the bin a little earlier");
     let before = library.clock.now_ms();
-    let d = remove("D");
+    let (d, ..) = remove("D");
     let (d_copy, d_row) = copy_of(&conn, &d);
 
     let report = library
@@ -5562,7 +5569,12 @@ async fn emptying_the_bin_deletes_unchanged_copies_and_keeps_the_rest() {
     assert!(report.finished);
     assert!(!a_copy.exists(), "an unchanged copy goes");
     assert!(left_bin(&conn, &a_row));
-    assert_eq!((report.deleted, report.deleted_bytes), (1, a_size));
+    assert!(!a_cover.exists(), "a sidecar no put-back uses goes");
+    assert!(left_bin(&conn, &a_cover_row));
+    assert_eq!(
+        (report.deleted, report.deleted_bytes),
+        (2, a_size + b"jpeg bytes".len() as u64)
+    );
     assert_eq!(std::fs::read(&b_copy).expect("kept"), b"changed in the bin");
     assert!(!left_bin(&conn, &b_row));
     assert_eq!(
@@ -5573,9 +5585,11 @@ async fn emptying_the_bin_deletes_unchanged_copies_and_keeps_the_rest() {
             .collect::<Vec<_>>(),
         [(b_copy, KeptWhy::Changed)]
     );
-    assert!(c_copy.is_file(), "a copy a put-back uses stays");
-    assert!(!left_bin(&conn, &c_row));
-    assert_eq!(report.waited, 1);
+    for (copy, row) in [(&c_copy, &c_row), (&c_cover, &c_cover_row)] {
+        assert!(copy.is_file(), "a copy a put-back uses stays");
+        assert!(!left_bin(&conn, row));
+    }
+    assert_eq!(report.waited, 2);
     assert!(d_copy.is_file(), "a removal made after the count stays");
     assert!(!left_bin(&conn, &d_row));
 }
@@ -5705,6 +5719,197 @@ async fn expiry_and_an_empty_at_once_mark_every_copy() {
         EmptyingState::Idle,
         "a stopped empty clears once the bin is empty"
     );
+}
+
+/// A removed album stays in the album list and on its artist's page,
+/// marked as having no files, while its files are in the recycle bin.
+/// Once the bin is emptied it leaves both lists, and its link still
+/// opens it.
+#[tokio::test]
+async fn a_removed_album_is_listed_until_the_bin_lets_go_of_it() {
+    let rig = Rig::start("lib-removed-listed").await;
+    let app = &rig.app;
+    let auth = app.login_admin().await;
+    let headers = [("authorization", auth.as_str())];
+    let music = app.config.root_app_dir.join("music");
+    plant(&music, "One/LP/01.flac", "flac_full_01.flac");
+    plant(&music, "Two/LP/01.flac", "flac_full_01.flac");
+    app.add_library_folder("music", &music).await;
+    let album_at = |path: &str| -> String {
+        let track = rig
+            .scan_store
+            .track_at("music", path)
+            .unwrap()
+            .expect("track indexed");
+        app.db()
+            .query_row(
+                "SELECT local_album_id FROM local_tracks WHERE id = ?1",
+                [&track],
+                |row| row.get(0),
+            )
+            .expect("album id")
+    };
+    let (removed, kept) = (album_at("One/LP/01.flac"), album_at("Two/LP/01.flac"));
+    let get = |uri: String| {
+        let headers = &headers;
+        async move {
+            let (status, body) = app.call("GET", &uri, headers, None).await;
+            assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+            body
+        }
+    };
+    let album = get(format!("/api/v3/library/albums/{removed}")).await;
+    let artist = album["artist_id"].as_str().expect("artist id").to_owned();
+    let lists = || {
+        let artist = artist.clone();
+        async move {
+            let mut listed = Vec::new();
+            for uri in [
+                "/api/v3/library/albums?limit=50".to_owned(),
+                format!("/api/v3/library/artists/{artist}/albums?limit=50"),
+            ] {
+                let page = get(uri).await;
+                let mut ids: Vec<(String, u64)> = page["items"]
+                    .as_array()
+                    .expect("items")
+                    .iter()
+                    .map(|item| {
+                        let id = item["id"].as_str().expect("id").to_owned();
+                        (id, item["track_count"].as_u64().expect("count"))
+                    })
+                    .collect();
+                ids.sort();
+                assert_eq!(page["total"], json!(ids.len()), "{page}");
+                listed.push(ids);
+            }
+            listed
+        }
+    };
+
+    let uri = format!(
+        "/api/v3/library/albums/{removed}?expected_revision={}&expected_track_count={}\
+         &delete_files=true",
+        album["row_revision"], album["track_count"]
+    );
+    let (status, body) = app.call("DELETE", &uri, &headers, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut both = vec![(removed.clone(), 0), (kept.clone(), 1)];
+    both.sort();
+    assert_eq!(lists().await, [both.clone(), both], "in the bin: listed");
+
+    let summary = get("/api/v3/library/recycle-bin/summary".to_owned()).await;
+    assert_eq!(summary["files"], json!(1), "{summary}");
+    let before = summary["as_of"].as_i64().expect("as of") + 1000;
+    let (status, body) = app
+        .call(
+            "POST",
+            "/api/v3/library/recycle-bin/empty",
+            &headers,
+            Some(json!({ "before": before })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    // The empty runs on the job runner's blocking threads: the bound is
+    // wall time.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let status = get("/api/v3/library/recycle-bin/status".to_owned()).await;
+        if status["state"] == "idle" && status["last_emptied"]["deleted"] == json!(1) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the bin empties: {status}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    let only = vec![(kept.clone(), 1)];
+    assert_eq!(lists().await, [only.clone(), only], "out of the bin: gone");
+    let opened = get(format!("/api/v3/library/albums/{removed}")).await;
+    assert_eq!(opened["id"], json!(removed), "its link still opens it");
+    assert_eq!(opened["track_count"], json!(0));
+    rig.stop().await;
+}
+
+/// An album removed and put back whose folder then vanishes from disk
+/// stays listed: its files went missing after their trip to the bin, not
+/// because of it.
+#[tokio::test]
+async fn an_album_put_back_then_vanished_stays_listed() {
+    let rig = Rig::start("lib-put-back-vanished").await;
+    let app = &rig.app;
+    let auth = app.login_admin().await;
+    let headers = [("authorization", auth.as_str())];
+    let music = app.config.root_app_dir.join("music");
+    plant(&music, "One/LP/01.flac", "flac_full_01.flac");
+    plant(&music, "Two/LP/01.flac", "flac_full_01.flac");
+    app.add_library_folder("music", &music).await;
+    let track = rig
+        .scan_store
+        .track_at("music", "One/LP/01.flac")
+        .unwrap()
+        .expect("track indexed");
+    let album: String = app
+        .db()
+        .query_row(
+            "SELECT local_album_id FROM local_tracks WHERE id = ?1",
+            [&track],
+            |row| row.get(0),
+        )
+        .expect("album id");
+    let get = |uri: String| {
+        let headers = &headers;
+        async move {
+            let (status, body) = app.call("GET", &uri, headers, None).await;
+            assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+            body
+        }
+    };
+    let shown = get(format!("/api/v3/library/albums/{album}")).await;
+    let uri = format!(
+        "/api/v3/library/albums/{album}?expected_revision={}&expected_track_count={}\
+         &delete_files=true",
+        shown["row_revision"], shown["track_count"]
+    );
+    let (status, body) = app.call("DELETE", &uri, &headers, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let removals = get(format!("/api/v3/library/albums/{album}/removals")).await;
+    let removal = removals["items"][0]["id"]
+        .as_str()
+        .expect("removal id")
+        .to_owned();
+    let (status, body) = app
+        .call(
+            "POST",
+            &format!("/api/v3/library/albums/{album}/removals/{removal}/put-back"),
+            &headers,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["missing"], json!([]), "{body}");
+
+    std::fs::remove_dir_all(music.join("One")).expect("the folder vanishes");
+    app.scan_library().await;
+
+    let page = get("/api/v3/library/albums?limit=50".to_owned()).await;
+    let listed: Vec<(&str, u64)> = page["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .map(|item| {
+            (
+                item["id"].as_str().expect("id"),
+                item["track_count"].as_u64().expect("count"),
+            )
+        })
+        .collect();
+    assert!(
+        listed.contains(&(album.as_str(), 0)),
+        "a vanished album stays listed: {page}"
+    );
+    rig.stop().await;
 }
 
 /// The bin page lists a removal with its files and their size, offers
@@ -6729,7 +6934,7 @@ async fn a_library_folder_reached_through_a_symlink_takes_writes() {
     crate::common::library::operations(&library)
         .confirm_match(&album, shown_revision(&library, &album), "admin")
         .expect("match confirmed");
-    let mut settings = lm::initial_settings("");
+    let mut settings = lm::initial_settings();
     for profile in &mut settings.profiles {
         for field in &mut profile.metadata.fields {
             if droppedneedle_library::management::enrich::CREDIT_FIELDS
@@ -6843,6 +7048,210 @@ async fn a_library_folder_reached_through_a_symlink_takes_writes() {
         "{refused:?}"
     );
     assert!(second.exists(), "the file stays");
+}
+
+/// A best guess in Check albums names what "That's right" confirms and
+/// why it is a guess; a "Looks wrong" mark lists the album for curators,
+/// and confirming the guess or approving a review clears every mark.
+#[tokio::test]
+async fn check_albums_names_the_guess_and_settling_clears_looks_wrong() {
+    let rig = Rig::start("lib-check-albums").await;
+    let app = &rig.app;
+    let auth = app.login_admin().await;
+    let headers = [("authorization", auth.as_str())];
+    let music = app.config.root_app_dir.join("music");
+    plant(&music, "album-g/01.flac", "flac_full_01.flac");
+    plant(&music, "album-g/02.flac", "flac_full_02.flac");
+    let paused_at = rig.pause_identification().await;
+    app.add_library_folder("music", &music).await;
+    let track_id = rig
+        .scan_store
+        .track_at("music", "album-g/01.flac")
+        .unwrap()
+        .expect("track indexed");
+    let album = track_album(app, &headers, &track_id).await;
+    let fit = tagged_release(&rig.identify_store, &album);
+    rig.identify.set_recall(RecallResult {
+        releases: vec![fit.clone()],
+        ..RecallResult::default()
+    });
+    rig.resume_identification(paused_at).await;
+    rig.identified(&album, 1).await;
+    let candidates = json!([{
+        "candidate_key": format!("release:{}", fit.id),
+        "release_group_mbid": fit.release_group_id,
+        "release_mbid": fit.id,
+        "album_title": "The Guess",
+        "album_artist_name": "Someone Else",
+        "track_evidence": [{
+            "local_track_id": track_id,
+            "classification": "supported",
+            "evidence_kinds": ["title_and_length"],
+            "recording_mbid": null,
+            "release_track_mbid": null
+        }],
+        "score": 0.8,
+        "reason_code": "CLOSE_MATCH"
+    }]);
+    app.seed_with(
+        "INSERT INTO library_album_match_state (local_album_id, state, reason_code, \
+         release_mbid, candidates_json, updated_at) \
+         VALUES (?1, 'unconfirmed', 'NAMED_GROUP_DIFFERS', ?2, ?3, 1)",
+        rusqlite::params![album, fit.id, candidates.to_string()],
+    )
+    .await;
+    let title = app
+        .call(
+            "GET",
+            &format!("/api/v3/library/albums/{album}"),
+            &headers,
+            None,
+        )
+        .await
+        .1["title"]
+        .as_str()
+        .expect("album title")
+        .to_owned();
+
+    let list = |state: &'static str| async move {
+        let (status, body) = app
+            .call(
+                "GET",
+                &format!("/api/v3/library/unconfirmed?state={state}"),
+                &headers,
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body
+    };
+    let body = list("unconfirmed").await;
+    let row = &body["items"][0];
+    assert_eq!(row["album_id"], json!(album), "{body}");
+    assert_eq!(row["guess"]["title"], json!("The Guess"), "{body}");
+    assert_eq!(row["guess"]["matched_files"], json!(1), "{body}");
+    assert_eq!(row["file_count"], json!(2), "{body}");
+    assert_eq!(
+        row["reason"]["message"],
+        json!(format!(
+            "Your files say {title}. This fits The Guess better."
+        )),
+        "{body}"
+    );
+
+    let mark = format!("/api/v3/library/albums/{album}/looks-wrong");
+    let (status, body) = app
+        .call("PUT", &mark, &headers, Some(json!({"looks_wrong": true})))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let body = list("looks_wrong").await;
+    assert_eq!(body["total"], json!(1), "{body}");
+    assert_eq!(body["items"][0]["looks_wrong_count"], json!(1), "{body}");
+    assert_eq!(body["items"][0]["state"], json!("unconfirmed"), "{body}");
+
+    let edition = format!("/api/v3/library/albums/{album}/edition");
+    let (status, body) = app
+        .call(
+            "POST",
+            &format!("{edition}/confirm"),
+            &headers,
+            Some(json!({
+                "expected_identity_revision": edition_revision(app, &headers, &album).await,
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["state"], json!("chosen"), "{body}");
+    assert_eq!(body["looks_wrong_count"], json!(0), "{body}");
+    assert_eq!(list("looks_wrong").await["total"], json!(0));
+    assert_eq!(list("unconfirmed").await["total"], json!(0));
+
+    // Approving a review settles the album as well.
+    let (status, body) = app
+        .call("PUT", &mark, &headers, Some(json!({"looks_wrong": true})))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    app.seed_with(
+        "INSERT INTO library_identify_reviews (id, local_album_id, reason_code, candidates_json, \
+         state, created_at, updated_at) VALUES ('rv-approve', ?1, 'EDITION_MERGED', ?2, 'pending', 1, 1)",
+        rusqlite::params![album, candidates.to_string()],
+    )
+    .await;
+    let (_, review) = app
+        .call("GET", "/api/v3/library/reviews/rv-approve", &headers, None)
+        .await;
+    let (status, body) = app
+        .call(
+            "POST",
+            "/api/v3/library/reviews/rv-approve/approve",
+            &headers,
+            Some(json!({
+                "candidate_key": format!("release:{}", fit.id),
+                "expected_revision": review["row_revision"],
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(list("looks_wrong").await["total"], json!(0));
+}
+
+/// A person who kept the tags or left a review for later can reopen it;
+/// a review the system closed, with nobody's decision on it, cannot.
+#[tokio::test]
+async fn only_a_review_a_person_closed_reopens() {
+    let rig = Rig::start("lib-review-reopen").await;
+    let app = &rig.app;
+    let auth = app.login_admin().await;
+    let headers = [("authorization", auth.as_str())];
+    app.seed(
+        "INSERT INTO local_artists (id, display_name, folded_name, kind, created_at, updated_at) \
+         VALUES ('re-artist', 'Someone', 'someone', 'person', 0, 0); \
+         INSERT INTO local_albums (id, root_id, grouping_key, title, title_folded, \
+         album_artist_id, grouping_source, created_at, updated_at) VALUES \
+         ('re-album', 'root-1', 'g-re', 'Something', 'something', 're-artist', 'manual', 0, 0); \
+         INSERT INTO library_identify_reviews (id, local_album_id, reason_code, candidates_json, \
+         state, created_at, updated_at) VALUES \
+         ('rv-system', 're-album', 'EDITION_MERGED', '[]', 'dismissed', 1, 1), \
+         ('rv-person', 're-album', 'EDITION_MERGED', '[]', 'pending', 1, 1)",
+    )
+    .await;
+    let revision = |id: &'static str| async move {
+        app.call(
+            "GET",
+            &format!("/api/v3/library/reviews/{id}"),
+            &headers,
+            None,
+        )
+        .await
+        .1["row_revision"]
+            .clone()
+    };
+    let reopen = |id: &'static str, revision: Value| async move {
+        app.call(
+            "POST",
+            &format!("/api/v3/library/reviews/{id}/reopen"),
+            &headers,
+            Some(json!({"expected_revision": revision})),
+        )
+        .await
+    };
+
+    let (status, body) = reopen("rv-system", revision("rv-system").await).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], json!("REVIEW_NOT_CLOSED"), "{body}");
+
+    let (status, kept) = app
+        .call(
+            "POST",
+            "/api/v3/library/reviews/rv-person/keep-tagged",
+            &headers,
+            Some(json!({"expected_revision": revision("rv-person").await})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{kept}");
+    let (status, body) = reopen("rv-person", kept["row_revision"].clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["state"], json!("pending"), "{body}");
 }
 
 /// One edition operation: a person chooses another edition (partial
@@ -8345,7 +8754,7 @@ async fn library_journey_catalog_corrections() {
          VALUES ('listener', 'album', '{album_b}', 'Album B'); \
          INSERT INTO library_play_history (id, user_id, local_album_id, track_name, \
          artist_name, played_at) VALUES ('play-1', 'listener', '{album_b}', 'Song', \
-         'Artist', '2026-01-01T00:00:00Z');"
+         'Artist', 1767225600000);"
     ))
     .await;
     let selection = json!({"track_ids": [b1], "target_album_id": album_a});
@@ -8808,7 +9217,7 @@ async fn a_busy_database_leaves_a_management_job_runnable() {
     let settings = library
         .settings
         .store()
-        .save_blocking(lm::initial_settings(""))
+        .save_blocking(lm::initial_settings())
         .expect("settings saved");
     let management = Management::new(&library);
     let handle = management
@@ -8897,7 +9306,7 @@ async fn a_management_job_whose_worker_died_is_finished_by_its_own_worker() {
     let settings = library
         .settings
         .store()
-        .save_blocking(lm::initial_settings(""))
+        .save_blocking(lm::initial_settings())
         .expect("settings saved");
     let management = Management::new(&library);
     let handle = management
@@ -8987,7 +9396,7 @@ async fn the_management_loop_recovers_at_start_and_wakes_on_enqueue() {
     let settings = library
         .settings
         .store()
-        .save_blocking(lm::initial_settings(""))
+        .save_blocking(lm::initial_settings())
         .expect("settings saved");
     let management = Management::new(&library);
     let preview = |key: &str| {
@@ -9355,7 +9764,7 @@ async fn library_management_preview_apply_undo() {
         .expect("admin row");
     // A second profile names files after their title in place, so the
     // first file's rename only changes letter case.
-    let mut settings = lm::initial_settings("");
+    let mut settings = lm::initial_settings();
     settings.naming_scripts.push(NamingScript {
         id: "in-place".to_owned(),
         name: "In place".to_owned(),
@@ -10074,7 +10483,7 @@ async fn library_management_tools_journey() {
         .confirm_match(&album, shown_revision(&library, &album), "admin")
         .expect("match confirmed");
     // No MusicBrainz credits are scripted here, so the profile writes none.
-    let mut settings = lm::initial_settings("");
+    let mut settings = lm::initial_settings();
     for profile in &mut settings.profiles {
         for field in &mut profile.metadata.fields {
             if droppedneedle_library::management::enrich::CREDIT_FIELDS
@@ -10931,7 +11340,7 @@ async fn library_management_custom_edition_journey() {
     library
         .settings
         .store()
-        .save_blocking(lm::initial_settings(""))
+        .save_blocking(lm::initial_settings())
         .expect("settings saved");
     lm::service::LibraryManagementService::new(Arc::new(library.settings.store().clone()))
         .get_settings()
@@ -11039,201 +11448,6 @@ async fn library_management_custom_edition_journey() {
     );
 }
 
-/// A cover file that came with imported files is not the album's cover:
-/// where the album stays in its folder, the run replaces a `cover.*` that
-/// differs from the archive's (the old one goes to the recycle bin), and a
-/// run after that leaves the replaced cover alone.
-#[tokio::test]
-async fn library_management_replaces_an_imported_cover_file() {
-    use droppedneedle_kernel::runtime_config::sections::LibraryManagement;
-    use droppedneedle_library::management::enrich::{Cover, ScriptedEnrichment};
-    use droppedneedle_library::management::models::{Selection, SelectionKind};
-    use droppedneedle_library::management::service::{Management, PreviewRequest};
-    use droppedneedle_library::management::settings as lm;
-
-    let png = |rgb: [u8; 3]| {
-        let mut bytes = Vec::new();
-        image::RgbImage::from_pixel(8, 8, image::Rgb(rgb))
-            .write_to(
-                &mut std::io::Cursor::new(&mut bytes),
-                image::ImageFormat::Png,
-            )
-            .expect("png");
-        bytes
-    };
-    let archive = png([30, 30, 200]);
-    let (scratch, library, music) = bare_library_with(
-        "lib-management-cover-file",
-        Some(Arc::new(ScriptedEnrichment {
-            cover: Some(Cover {
-                bytes: archive.clone(),
-                mime: "image/png".to_owned(),
-            }),
-            ..Default::default()
-        })),
-    )
-    .await;
-    plant(&music, "art/track.m4a", "management_full.m4a");
-    add_music_root(&library, &music).await;
-    let track = library
-        .scan_store
-        .track_at("music", "art/track.m4a")
-        .unwrap()
-        .expect("track indexed");
-    let album = library
-        .scan_store
-        .album_for_track(&track)
-        .unwrap()
-        .expect("album");
-    scratch
-        .identify
-        .set_recall(ambiguous_recall(&library.identify_store, &album));
-    assert_eq!(library.identification.identify_tick().await, 1);
-    library
-        .scan_store
-        .db()
-        .run_sql(
-            "INSERT INTO auth_users (id, display_name, role, created_at) \
-             VALUES ('admin', 'Admin', 'admin', 0)",
-        )
-        .expect("admin row");
-    crate::common::library::operations(&library)
-        .confirm_match(&album, shown_revision(&library, &album), "admin")
-        .expect("match confirmed");
-    let mut settings = lm::initial_settings("");
-    for profile in settings
-        .profiles
-        .iter_mut()
-        .filter(|profile| profile.id == lm::PICARD_ORGANIZER_PROFILE_ID)
-    {
-        profile.artwork.embedded_enabled = false;
-        profile.artwork.external_enabled = true;
-    }
-    library
-        .settings
-        .store()
-        .save_blocking(settings)
-        .expect("settings saved");
-    lm::service::LibraryManagementService::new(Arc::new(library.settings.store().clone()))
-        .get_settings()
-        .expect("settings normalized");
-    let management = Management::new(&library);
-    let preview = |key: &str| PreviewRequest {
-        selection: Selection {
-            kind: SelectionKind::Albums,
-            ids: vec![album.clone()],
-            catalog_filter: None,
-        },
-        profile_id: lm::PICARD_ORGANIZER_PROFILE_ID.to_owned(),
-        expected_settings_revision: lm::settings_revision(
-            &library
-                .settings
-                .store()
-                .get::<LibraryManagement>()
-                .expect("settings read"),
-        ),
-        expected_policy_revision: library.core.policy_revision().expect("policy revision"),
-        idempotency_key: Some(key.to_owned()),
-        target_root_id: None,
-        overrides: None,
-    };
-    let run = |key: &'static str| {
-        let management = &management;
-        let preview = &preview;
-        let library = &library;
-        async move {
-            let handle = management
-                .create_preview(preview(key), "admin")
-                .expect("preview");
-            assert!(management_step(library).await, "planning runs");
-            let items = management
-                .items(&handle.job_id, -1, 10, &Default::default())
-                .expect("items")
-                .items;
-            let item = items.first().expect("one file");
-            let generated = item.diff.generated.len();
-            // Nothing generated: nothing else changes either, so there is
-            // nothing to apply.
-            if generated == 0 {
-                return generated;
-            }
-            let applied = management_apply(library, &handle).await;
-            assert_eq!(
-                applied.job.state.as_str(),
-                "succeeded",
-                "{:?}",
-                applied.job.terminal_code
-            );
-            generated
-        }
-    };
-    let folder = || {
-        let rel: String =
-            droppedneedle_kernel::db::open_connection(&scratch.to_path_buf().join("app.db"))
-                .expect("db")
-                .query_row(
-                    "SELECT relative_path FROM local_tracks WHERE id = ?1",
-                    [&track],
-                    |row| row.get(0),
-                )
-                .expect("managed path");
-        music
-            .join(rel)
-            .parent()
-            .expect("album folder")
-            .to_path_buf()
-    };
-
-    // The first run organizes the album and writes the archive's cover.
-    assert_eq!(run("cover-1").await, 1);
-    let cover_file = folder().join("cover.png");
-    assert_eq!(std::fs::read(&cover_file).unwrap(), archive);
-
-    // Files brought in later carry another record's cover under that name.
-    let imported = png([200, 30, 30]);
-    std::fs::write(&cover_file, &imported).unwrap();
-    let asked = library
-        .wakeups
-        .revision(droppedneedle_library::jobs::SWEEP_WAKEUP);
-    assert_eq!(run("cover-2").await, 1, "the imported cover is replaced");
-    assert_ne!(
-        library
-            .wakeups
-            .revision(droppedneedle_library::jobs::SWEEP_WAKEUP),
-        asked,
-        "the publish asked for the album art sweep"
-    );
-    assert_eq!(std::fs::read(&cover_file).unwrap(), archive);
-    let binned: Vec<Vec<u8>> = walkdir_files(&music.join(".recycle"))
-        .into_iter()
-        .map(|path| std::fs::read(path).unwrap())
-        .collect();
-    assert_eq!(binned, vec![imported], "the imported cover is in the bin");
-
-    assert_eq!(
-        run("cover-3").await,
-        0,
-        "the archive's cover stays as it is"
-    );
-}
-
-/// Every regular file below `dir`, recursively.
-fn walkdir_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
-    let mut found = Vec::new();
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return found;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            found.extend(walkdir_files(&path));
-        } else if path.is_file() {
-            found.push(path);
-        }
-    }
-    found
-}
-
 /// Embedded art on an M4A file with a scrub on: the cover lands once and
 /// a second run leaves the pictures alone (MP4 stores no picture types),
 /// and the scrub keeps composer, work ids and ISRC while it removes an
@@ -11311,7 +11525,7 @@ async fn library_management_artwork_journey() {
     crate::common::library::operations(&library)
         .confirm_match(&album, shown_revision(&library, &album), "admin")
         .expect("match confirmed");
-    let mut settings = lm::initial_settings("");
+    let mut settings = lm::initial_settings();
     for profile in settings
         .profiles
         .iter_mut()
@@ -11555,7 +11769,7 @@ impl ManagedLibrary {
                  VALUES ('admin', 'Admin', 'admin', 0)",
             )
             .expect("admin row");
-        let mut settings = lm::initial_settings("");
+        let mut settings = lm::initial_settings();
         for profile in settings
             .profiles
             .iter_mut()
@@ -12160,6 +12374,7 @@ async fn management_leaves_a_folder_that_keeps_its_own_tags() {
                 &other,
                 shown_revision(&managed.library, &album),
                 Some("admin"),
+                false,
             )
             .await
             .expect("edition chosen");
@@ -12450,6 +12665,7 @@ async fn unmanaged_changes_do_not_take_the_album_over() {
             other,
             shown_revision(&managed.library, &album),
             Some("admin"),
+            false,
         )
         .await
         .expect("edition chosen");
@@ -14347,6 +14563,7 @@ async fn a_persons_profile_run_takes_the_files_back() {
             other,
             shown_revision(&managed.library, &album),
             Some("admin"),
+            false,
         )
         .await
         .expect("edition chosen");
@@ -14415,6 +14632,7 @@ async fn an_unmanaged_change_stays_accepted_through_every_write() {
             &other,
             shown_revision(&managed.library, &album),
             Some("admin"),
+            false,
         )
         .await
         .expect("edition chosen");
@@ -14800,7 +15018,8 @@ async fn an_import_that_cannot_read_the_albums_match_leaves_it_alone() {
 /// An imported file and a management preview with the same naming script
 /// give the file the same path, so Library Management never moves what an
 /// import placed: for the default import script, Picard's single-disc
-/// script and an `{initial}` one, with a title long enough to be cut.
+/// script, an `{initial}` one and one naming the file's stream values, with a
+/// title long enough to be cut.
 #[tokio::test]
 async fn import_and_management_name_a_file_alike() {
     use droppedneedle_kernel::runtime_config::secret_sections::{
@@ -14820,6 +15039,8 @@ async fn import_and_management_name_a_file_alike() {
             "{initial}/{albumartist}/[{year}] {album}/{disc:02d}-{track:02d} {title}.{ext}",
         )
         .script,
+        "{albumartist}/{album} {bit_depth}-{sample_rate} {bitrate} {quality} {codec}/{title}.{ext}"
+            .to_owned(),
     ];
     let (scratch, library, music) = bare_library("lib-import-naming-alike").await;
     std::fs::create_dir_all(&music).expect("music folder");
@@ -14832,7 +15053,7 @@ async fn import_and_management_name_a_file_alike() {
              VALUES ('admin', 'Admin', 'admin', 0)",
         )
         .expect("admin row");
-    let mut settings = lm::initial_settings("");
+    let mut settings = lm::initial_settings();
     let picard = settings
         .profiles
         .iter()
@@ -15523,6 +15744,7 @@ async fn a_wide_preview_in_a_manual_folder_blocks_without_marking() {
             &edition,
             shown_revision(&managed.library, &album),
             Some("admin"),
+            false,
         )
         .await
         .expect("edition chosen");
@@ -15601,6 +15823,7 @@ async fn undone_profile_run_gives_the_hand_edit_back(name: &str) {
             &edition,
             shown_revision(&managed.library, &album),
             Some("admin"),
+            false,
         )
         .await
         .expect("edition chosen");
@@ -17743,8 +17966,8 @@ async fn a_retagged_and_renamed_album_keeps_what_people_made() {
     db.execute_batch(&format!(
         "INSERT INTO library_play_history (id, user_id, local_track_id, local_album_id, \
          track_name, artist_name, played_at) VALUES \
-         ('p1', 'curator', '{o4}', '{album}', 'Four', 'A', '2026-01-01T00:00:00Z'), \
-         ('p2', 'curator', '{o4}', '{album}', 'Four', 'A', '2026-01-02T00:00:00Z'); \
+         ('p1', 'curator', '{o4}', '{album}', 'Four', 'A', 1767225600000), \
+         ('p2', 'curator', '{o4}', '{album}', 'Four', 'A', 1767312000000); \
          INSERT OR IGNORE INTO auth_users (id, display_name, role, created_at) VALUES ('listener', 'Person', 'user', 1), ('curator', 'Person', 'user', 1); \
          INSERT INTO catalog_user_favorites (user_id, item_kind, item_id, created_at) VALUES \
          ('curator', 'track', '{o4}', 10000), ('listener', 'track', '{o4}', 11000); \
@@ -18367,6 +18590,7 @@ async fn a_persons_match_joins_an_album_retagged_without_its_ids() {
             REL_1,
             shown_revision(&library, &own_row),
             Some("curator"),
+            false,
         )
         .await
         .expect("edition chosen");
@@ -18489,7 +18713,7 @@ async fn an_automatic_album_retagged_without_its_ids_is_joined_at_the_seal() {
     db.execute_batch(&format!(
         "INSERT INTO library_play_history (id, user_id, local_track_id, local_album_id, \
          track_name, artist_name, played_at) VALUES ('p1', 'listener', '{o1}', '{album}', \
-         'T', 'A', '2026-01-01T00:00:00Z'); \
+         'T', 'A', 1767225600000); \
          INSERT OR IGNORE INTO auth_users (id, display_name, role, created_at) VALUES ('listener', 'Person', 'user', 1); \
          INSERT INTO catalog_user_favorites (user_id, item_kind, item_id, created_at) \
          VALUES ('listener', 'track', '{o1}', 1), ('listener', 'album', '{album}', 1); \
@@ -19772,7 +19996,7 @@ fn give_history(db: &rusqlite::Connection, album: &str, track: &str) {
     db.execute_batch(&format!(
         "INSERT INTO library_play_history (id, user_id, local_track_id, local_album_id, \
          track_name, artist_name, played_at) VALUES \
-         ('play-{track}', 'listener', '{track}', '{album}', 'Two', 'A', '2026-01-01T00:00:00Z'); \
+         ('play-{track}', 'listener', '{track}', '{album}', 'Two', 'A', 1767225600000); \
          INSERT OR IGNORE INTO auth_users (id, display_name, role, created_at) VALUES ('listener', 'Person', 'user', 1); \
          INSERT INTO catalog_user_favorites (user_id, item_kind, item_id, created_at) \
          VALUES ('listener', 'track', '{track}', 1); \
@@ -20739,7 +20963,7 @@ async fn retag_pairs_list_join_and_dismiss() {
                  VALUES ('curator', 'album', '{a}', 1); \
                  INSERT INTO library_play_history (id, user_id, local_album_id, track_name, \
                  artist_name, played_at) VALUES ('play-a', 'curator', '{a}', 'Song', 'Artist', \
-                 '2026-01-01T00:00:00Z'); \
+                 1767225600000); \
                  INSERT INTO catalog_playlists (id, name, created_at, updated_at) \
                  VALUES ('list', 'List', 0, 0); \
                  INSERT INTO catalog_playlist_tracks (id, playlist_id, position, track_name, \
@@ -22012,7 +22236,7 @@ fn carried_from_v2(db: &rusqlite::Connection) {
     db.execute(
         "INSERT INTO import_runs (id, instance_id, exported_at, exit_code, \
          entity_counts, applied_at) VALUES ('import-1', 'v2-instance', \
-         '2026-01-01T00:00:00Z', 'OK', '{}', '2026-01-01T00:00:01Z')",
+         1767225600000, 'OK', '{}', 1767225601000)",
         [],
     )
     .expect("import recorded");
@@ -23524,6 +23748,17 @@ impl droppedneedle_library::management::enrich::EnrichmentPort for LiveAcoustId 
             .front_cover(release_mbid, release_group_mbid, background)
     }
 
+    fn edition_cover<'a>(
+        &'a self,
+        release_mbid: &'a str,
+        background: bool,
+    ) -> futures_util::future::BoxFuture<
+        'a,
+        Result<Option<droppedneedle_library::management::enrich::Cover>, String>,
+    > {
+        self.scripted.edition_cover(release_mbid, background)
+    }
+
     fn release_extras<'a>(
         &'a self,
         release_mbid: &'a str,
@@ -23867,7 +24102,7 @@ async fn a_chosen_edition_retagged_with_its_ids_is_placed_and_left_to_the_person
     db.execute_batch(&format!(
         "INSERT INTO library_play_history (id, user_id, local_track_id, local_album_id, \
          track_name, artist_name, played_at) VALUES ('p1', 'admin', '{o1}', '{album}', \
-         'One', 'A', '2026-01-01T00:00:00Z'); \
+         'One', 'A', 1767225600000); \
          INSERT INTO catalog_user_favorites (user_id, item_kind, item_id, created_at) \
          VALUES ('admin', 'track', '{o1}', 1); \
          INSERT INTO catalog_playlists (id, name, created_at, updated_at) VALUES ('list', 'List', 0, 0); \
@@ -24474,7 +24709,7 @@ async fn a_run_that_adds_ids_and_translates_keeps_the_artist() {
          VALUES ('admin', 'artist', '{artist}', 1); \
          INSERT INTO library_play_history (id, user_id, local_artist_id, track_name, \
          artist_name, played_at) VALUES ('play-1', 'admin', '{artist}', 'Song', \
-         'Ryuichi Sakamoto', '2026-01-01T00:00:00Z');"
+         'Ryuichi Sakamoto', 1767225600000);"
     ))
     .expect("favorite and play seeded");
     *scripted.relations.lock().expect("script") =
@@ -24700,7 +24935,7 @@ async fn an_artist_whose_files_carry_a_merged_id_is_linked_and_kept() {
          VALUES ('{user}', 'artist', '{artist}', 1); \
          INSERT INTO library_play_history (id, user_id, local_artist_id, track_name, \
          artist_name, played_at) VALUES ('play-1', '{user}', '{artist}', 'First 1', \
-         'Artist X', '2026-01-01T00:00:00Z');"
+         'Artist X', 1767225600000);"
     ))
     .await;
 
@@ -25477,7 +25712,7 @@ async fn hand_match_album(rig: &Rig, folder: &str) -> HandMatchAlbum {
              VALUES ('{listener}', 'track', '{}', 0); \
              INSERT INTO library_play_history (id, user_id, local_track_id, track_name, \
              artist_name, played_at) VALUES ('play-3', '{listener}', '{}', 'Track 3', \
-             'Artist', '2026-01-01T00:00:00Z');",
+             'Artist', 1767225600000);",
         tracks[2], tracks[2]
     ))
     .await;
@@ -26227,6 +26462,464 @@ async fn a_match_by_hand_is_refused_with_nothing_changed() {
     rig.stop().await;
 }
 
+/// The release an album of junk-tagged files really is, and the release
+/// the app guessed for them.
+const JUNK_RIGHT: &str = "a1b2c3d4-0000-4000-8000-00000000a0a1";
+const JUNK_GUESS: &str = "a1b2c3d4-0000-4000-8000-00000000a0a2";
+
+/// A release of the junk album's three tracks, with the files' lengths:
+/// `titles` per track, ids ending in `tag`.
+fn junk_release(
+    facts: &LocalAlbumFacts,
+    tracks: &[String],
+    tag: char,
+    titles: [&str; 3],
+) -> Release {
+    Release {
+        id: format!("a1b2c3d4-0000-4000-8000-00000000a0a{tag}"),
+        release_group_id: format!("a1b2c3d4-0000-4000-8000-00000000b0b{tag}"),
+        title: facts.title.clone(),
+        artists: vec![CreditedArtist {
+            id: "a1b2c3d4-0000-4000-8000-00000000c0c0".to_owned(),
+            name: facts.album_artist_name.clone(),
+            sort_name: None,
+            join: String::new(),
+        }],
+        tracks: tracks
+            .iter()
+            .enumerate()
+            .map(|(index, track)| {
+                let file = facts
+                    .tracks
+                    .iter()
+                    .find(|file| file.local_track_id == *track)
+                    .expect("file facts");
+                ReleaseTrack {
+                    isrcs: Vec::new(),
+                    genres: Vec::new(),
+                    id: format!("a1b2c3d4-0000-4000-8000-0000000{tag}d00{index}"),
+                    recording_id: format!("a1b2c3d4-0000-4000-8000-0000000{tag}e00{index}"),
+                    title: titles[index].to_owned(),
+                    artists: Vec::new(),
+                    disc: 1,
+                    position: index as u32 + 1,
+                    absolute_position: index as u32 + 1,
+                    length_ms: file.duration_secs.map(|seconds| seconds * 1000),
+                }
+            })
+            .collect(),
+        ..Release::default()
+    }
+}
+
+/// MusicBrainz with nothing to say, for the landing's reads of the library.
+struct NoReleases;
+
+impl droppedneedle_library::identify::sources::ReleaseSource for NoReleases {
+    fn search<'a>(
+        &'a self,
+        _title: &'a str,
+        _artist: &'a str,
+    ) -> futures_util::future::BoxFuture<
+        'a,
+        Result<
+            Vec<droppedneedle_library::identify::sources::ReleaseHit>,
+            droppedneedle_library::identify::sources::SourceError,
+        >,
+    > {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn release<'a>(
+        &'a self,
+        _mbid: &'a str,
+    ) -> futures_util::future::BoxFuture<
+        'a,
+        Result<Option<Release>, droppedneedle_library::identify::sources::SourceError>,
+    > {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn canonical_recording<'a>(
+        &'a self,
+        _mbid: &'a str,
+    ) -> futures_util::future::BoxFuture<
+        'a,
+        Result<Option<String>, droppedneedle_library::identify::sources::SourceError>,
+    > {
+        Box::pin(async { Ok(None) })
+    }
+}
+
+/// A curator takes an album whose files are tagged only "Track 01" to
+/// "Track 03", with no ids, to the release it really is, though no file
+/// fits it. The app had guessed a release that placed the files. The plan
+/// of the right release suggests each file's track by its number.
+/// Choosing it is refused as before; "Use anyway" makes it the person's
+/// edition with no file placed: every guessed track row goes, the album is
+/// flagged as fitting no file, its "Looks wrong" mark is settled, and
+/// "Looks right" has nothing to confirm. Each file then reaches its track
+/// only by a match by hand, and undoing the only match flags the album
+/// again. After a match an upgrade of the group finds no unmatched file to
+/// replace by its guessed recording, and "Undo last change" puts the guess
+/// back with its track rows and forgets the matches. Taken anyway again,
+/// with the unconfirmed matches managed and the folder managed
+/// automatically, the app writes nothing while a file is unmatched and
+/// takes the album once the last one is.
+#[tokio::test]
+async fn a_curator_uses_an_edition_no_junk_tagged_file_fits() {
+    use droppedneedle_acquire::landing::library::LibraryLanding;
+    use droppedneedle_acquire::landing::ports::LandingLibrary as _;
+    use droppedneedle_library::tags::TagField;
+    use droppedneedle_library::tags::save::{TagEdit, save_tags};
+
+    let rig = Rig::start("lib-junk-tagged").await;
+    let app = &rig.app;
+    let music = app.config.root_app_dir.join("music");
+    for (number, fixture) in [
+        (1, "flac_full_01.flac"),
+        (2, "flac_full_02.flac"),
+        (3, "flac_full_02.flac"),
+    ] {
+        let file = plant(&music, &format!("junk/{number:02}.flac"), fixture);
+        save_tags(
+            &file,
+            &[
+                TagEdit::verbatim(TagField::Title, vec![format!("Track {number:02}")]),
+                TagEdit::verbatim(TagField::TrackNumber, vec![number.to_string()]),
+                TagEdit::verbatim(TagField::MusicBrainzRecordingId, Vec::new()),
+                TagEdit::verbatim(TagField::MusicBrainzReleaseTrackId, Vec::new()),
+                TagEdit::verbatim(TagField::MusicBrainzReleaseId, Vec::new()),
+                TagEdit::verbatim(TagField::MusicBrainzReleaseGroupId, Vec::new()),
+                TagEdit::verbatim(TagField::MusicBrainzArtistId, Vec::new()),
+                TagEdit::verbatim(TagField::MusicBrainzAlbumArtistId, Vec::new()),
+            ],
+        )
+        .expect("junk tags saved");
+    }
+    let paused_at = rig.pause_identification().await;
+    app.add_library_folder("music", &music).await;
+    let tracks: Vec<String> = (1..=3)
+        .map(|number| {
+            rig.scan_store
+                .track_at("music", &format!("junk/{number:02}.flac"))
+                .unwrap()
+                .expect("track indexed")
+        })
+        .collect();
+    let album = rig
+        .scan_store
+        .album_for_track(&tracks[0])
+        .unwrap()
+        .expect("album");
+    let facts = rig
+        .identify_store
+        .album_facts(&album)
+        .unwrap()
+        .expect("album facts");
+    assert_eq!(facts.tracks.len(), 3, "one album of three files");
+    let right = junk_release(
+        &facts,
+        &tracks,
+        '1',
+        ["Glass Harbour", "Northern Wire", "Quiet Engine"],
+    );
+    let guess = junk_release(&facts, &tracks, '2', ["Track 01", "Track 02", "Track 03"]);
+    assert_eq!(
+        (right.id.as_str(), guess.id.as_str()),
+        (JUNK_RIGHT, JUNK_GUESS)
+    );
+    let pasted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (offered, listed, late) = (guess.clone(), right.clone(), pasted.clone());
+    rig.identify.recall_from(move |_| {
+        let mut releases = vec![offered.clone()];
+        if late.load(std::sync::atomic::Ordering::SeqCst) {
+            releases.push(listed.clone());
+        }
+        RecallResult {
+            releases,
+            ..RecallResult::default()
+        }
+    });
+    rig.resume_identification(paused_at).await;
+    rig.identified(&album, 1).await;
+    pasted.store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let db = app.db();
+    let guessed: Vec<Option<TrackRow>> =
+        tracks.iter().map(|track| identity_of(&db, track)).collect();
+    for (row, track) in guessed.iter().zip(&guess.tracks) {
+        assert_eq!(
+            row.as_ref().map(|row| row.0.as_str()),
+            Some(track.recording_id.as_str()),
+            "the guess placed each file"
+        );
+    }
+    let guessed_album = album_choice(&db, &album);
+
+    let admin = app.login_admin().await;
+    let admin = [("authorization", admin.as_str())];
+    let curator = app.login_user("curator").await;
+    let (status, body) = app
+        .call(
+            "PUT",
+            &format!("/api/v3/admin/users/{}/role", curator.user_id),
+            &admin,
+            Some(json!({"role": "trusted"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let headers = [("authorization", curator.authorization.as_str())];
+    let edition = format!("/api/v3/library/albums/{album}/edition");
+
+    let (status, plan) = app
+        .call(
+            "GET",
+            &format!("{edition}/plan?release_mbid={JUNK_RIGHT}"),
+            &headers,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{plan}");
+    assert_eq!(plan["kept_count"], json!(0), "{plan}");
+    for (track, release_track) in tracks.iter().zip(&right.tracks) {
+        assert_eq!(
+            plan_file(&plan, track)["suggested"]["release_track_mbid"],
+            json!(release_track.id),
+            "{plan}"
+        );
+    }
+
+    let revision = edition_revision(app, &headers, &album).await;
+    let (status, body) = app
+        .call(
+            "PUT",
+            &edition,
+            &headers,
+            Some(json!({"release_mbid": JUNK_RIGHT, "expected_identity_revision": revision})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["code"], json!("EDITION_FITS_NO_FILE"));
+    assert_eq!(album_choice(&db, &album), guessed_album, "nothing changed");
+    let (status, body) = app
+        .call(
+            "PUT",
+            &format!("/api/v3/library/albums/{album}/looks-wrong"),
+            &headers,
+            Some(json!({"looks_wrong": true})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = app
+        .call(
+            "PUT",
+            &edition,
+            &headers,
+            Some(json!({
+                "release_mbid": JUNK_RIGHT,
+                "expected_identity_revision": revision,
+                "use_anyway": true,
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["retag_files"], json!([]), "{body}");
+    assert_eq!(body["status"]["release_mbid"], json!(JUNK_RIGHT), "{body}");
+    assert_eq!(
+        body["status"]["reason"]["code"],
+        json!("CHOSEN_EDITION_FITS_NO_FILE"),
+        "{body}"
+    );
+    let (source, chooser, _) = album_choice(&db, &album);
+    assert_eq!(
+        (source.as_str(), chooser.as_deref()),
+        ("manual", Some(curator.user_id.as_str()))
+    );
+    for track in &tracks {
+        assert_eq!(identity_of(&db, track), None, "no guessed track survives");
+    }
+    assert_eq!(album_match_state(&db, &album).as_deref(), Some("unmatched"));
+    let forced: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM library_catalog_actions WHERE local_album_id = ?1 \
+             AND action_kind = 'edition_choice' AND json_extract(after_json, '$.use_anyway') = 1",
+            [&album],
+            |row| row.get(0),
+        )
+        .expect("audit reads");
+    assert_eq!(forced, 1, "the audit says it was taken anyway");
+    let marks: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM library_album_looks_wrong WHERE local_album_id = ?1",
+            [&album],
+            |row| row.get(0),
+        )
+        .expect("marks read");
+    assert_eq!(marks, 0, "taking the edition settles its Looks wrong marks");
+    let (status, body) = app
+        .call(
+            "POST",
+            &format!("{edition}/confirm"),
+            &headers,
+            Some(json!({"expected_identity_revision": body["status"]["identity_revision"]})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], json!("NOTHING_TO_CONFIRM"));
+
+    // Each match answers the revision the next one sends.
+    let match_file = |index: usize, revision: &Value| {
+        let uri = format!("{edition}/files/{}", tracks[index]);
+        let body = json!({
+            "release_track_mbid": right.tracks[index].id,
+            "expected_identity_revision": revision,
+        });
+        async move { app.call("PUT", &uri, &headers, Some(body)).await }
+    };
+    let revision = json!(edition_revision(app, &headers, &album).await);
+    let (status, body) = match_file(0, &revision).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["reason"]["code"], json!("CHOSEN"), "{body}");
+    assert_eq!(
+        identity_of(&db, &tracks[0]).map(|row| (row.2, row.5)),
+        Some((Some(right.tracks[0].id.clone()), "manual".to_owned()))
+    );
+
+    // Undoing the only match flags the album again.
+    let (status, body) = app
+        .call(
+            "DELETE",
+            &format!(
+                "{edition}/files/{}?expected_identity_revision={}",
+                tracks[0], body["identity_revision"]
+            ),
+            &headers,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["reason"]["code"],
+        json!("CHOSEN_EDITION_FITS_NO_FILE"),
+        "{body}"
+    );
+    assert_eq!(identity_of(&db, &tracks[0]), None);
+    let (status, body) = match_file(0, &body["identity_revision"]).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // An upgrade of the group: an unmatched file is no copy of the song
+    // its guess named.
+    let landing = LibraryLanding::new(
+        &app.state().library,
+        crate::common::library::every_priority(Arc::new(NoReleases)),
+    );
+    let group = right.release_group_id.as_str();
+    for index in 1..3 {
+        let copies = landing
+            .owned_copies(
+                group,
+                None,
+                JUNK_RIGHT,
+                &right.tracks[index].id,
+                &guess.tracks[index].recording_id,
+            )
+            .await
+            .expect("copies read");
+        assert!(
+            copies
+                .iter()
+                .all(|copy| !tracks[1..].contains(&copy.track_id)),
+            "{copies:?}"
+        );
+    }
+
+    // "Undo last change" after a match: the guess is back.
+    let (status, body) = app
+        .call(
+            "POST",
+            &format!("{edition}/undo"),
+            &headers,
+            Some(json!({"expected_identity_revision": body["identity_revision"]})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(album_choice(&db, &album).0, guessed_album.0);
+    let restored: Vec<Option<TrackRow>> =
+        tracks.iter().map(|track| identity_of(&db, track)).collect();
+    assert_eq!(restored, guessed, "the guess's track rows are back");
+    for track in &tracks {
+        assert!(
+            hand_match_row(&db, track).is_none(),
+            "the matches are forgotten"
+        );
+    }
+
+    // Taken anyway again, with the unconfirmed matches managed and the
+    // folder managed automatically: nothing is written until every file
+    // has its track.
+    let (status, body) = app
+        .call(
+            "PUT",
+            &edition,
+            &headers,
+            Some(json!({
+                "release_mbid": JUNK_RIGHT,
+                "expected_identity_revision": edition_revision(app, &headers, &album).await,
+                "use_anyway": true,
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let page = "/api/v3/settings/edition-preferences";
+    let (status, mut preferences) = app.call("GET", page, &admin, None).await;
+    assert_eq!(status, StatusCode::OK, "{preferences}");
+    preferences["manage_unconfirmed"] = json!(true);
+    let (status, body) = app.call("PUT", page, &admin, Some(preferences)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    activate_automatic_folder(app, &admin, false).await;
+    let bytes = || -> Vec<Vec<u8>> {
+        (1..=3)
+            .map(|number| {
+                std::fs::read(music.join(format!("junk/{number:02}.flac"))).expect("file reads")
+            })
+            .collect()
+    };
+    let before_bytes = bytes();
+    let runs = || -> i64 {
+        db.query_row(
+            "SELECT COUNT(*) FROM library_management_job_snapshots s \
+             WHERE EXISTS (SELECT 1 FROM json_each(s.selection_json, '$.ids') WHERE value = ?1)",
+            [&album],
+            |row| row.get(0),
+        )
+        .expect("runs read")
+    };
+    let runs_before = runs();
+    let mut revision = json!(edition_revision(app, &headers, &album).await);
+    for index in 0..2 {
+        let (status, body) = match_file(index, &revision).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["files_by_itself"],
+            json!(false),
+            "a file is unmatched: {body}"
+        );
+        revision = body["identity_revision"].clone();
+    }
+    assert_eq!(runs(), runs_before, "nothing planned for the album");
+    assert!(before_bytes == bytes(), "nothing written");
+    let (status, body) = match_file(2, &revision).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["files_by_itself"],
+        json!(true),
+        "every file has its track: {body}"
+    );
+    rig.stop().await;
+}
+
 /// Each edition action sends the identity revision the page read. One read
 /// before the album's edition changed is refused with `STALE_REVISION`, and
 /// nothing changes: no choice, hand back, confirmation, undo, recycled
@@ -26837,4 +27530,475 @@ async fn catalog_rows_from_before_the_upgrade_take_a_scan_and_a_merge() {
         .await;
     assert_eq!(status, StatusCode::OK, "{artist}");
     assert_eq!(artist["date_added"], json!(1_700_000_000.5));
+}
+
+/// A small solid PNG of `colour`, standing in for a cover.
+fn cover_png(colour: [u8; 3]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    image::RgbImage::from_pixel(8, 8, image::Rgb(colour))
+        .write_to(
+            &mut std::io::Cursor::new(&mut bytes),
+            image::ImageFormat::Png,
+        )
+        .expect("png");
+    bytes
+}
+
+/// Scripted outside sources whose archive has `edition` as the matched
+/// edition's own front, and another cover as the one the pages show.
+fn edition_sources(
+    edition: Result<Option<Vec<u8>>, String>,
+) -> Arc<droppedneedle_library::management::enrich::ScriptedEnrichment> {
+    use droppedneedle_library::management::enrich::{Cover, ScriptedEnrichment};
+    let cover = |bytes: Vec<u8>| Cover {
+        bytes,
+        mime: "image/png".to_owned(),
+    };
+    Arc::new(ScriptedEnrichment {
+        cover: Some(cover(cover_png([20, 200, 20]))),
+        edition: std::sync::Mutex::new(Some(edition.map(|found| found.map(cover)))),
+        ..Default::default()
+    })
+}
+
+/// A profile that keeps albums where they are and writes cover files with
+/// the edition's archive cover.
+fn edition_cover_profile(
+    profile: &mut droppedneedle_kernel::runtime_config::sections::LibraryManagementProfile,
+) {
+    profile.organization.rename_enabled = false;
+    profile.organization.move_enabled = false;
+    profile.artwork.embedded_enabled = false;
+    profile.artwork.external_enabled = true;
+    profile.artwork.use_edition_cover = true;
+}
+
+impl ManagedLibrary {
+    /// Turn the profile's edition cover on or off.
+    fn use_edition_cover(&self, on: bool) {
+        use droppedneedle_kernel::runtime_config::sections::LibraryManagement;
+        use droppedneedle_library::management::settings as lm;
+        let store = self.library.settings.store();
+        let mut settings = store.get::<LibraryManagement>().expect("settings read");
+        for profile in settings
+            .profiles
+            .iter_mut()
+            .filter(|profile| profile.id == lm::PICARD_ORGANIZER_PROFILE_ID)
+        {
+            profile.artwork.use_edition_cover = on;
+        }
+        store.save_blocking(settings).expect("settings saved");
+        lm::service::LibraryManagementService::new(Arc::new(store.clone()))
+            .get_settings()
+            .expect("settings normalized");
+    }
+
+    /// Preview the album and apply it; returns the run's job id and what
+    /// its file generated.
+    async fn run_album(&self, album: &str, key: &str) -> (String, Vec<String>) {
+        use droppedneedle_library::management::models::SelectionKind;
+        let (handle, items) = self.preview(SelectionKind::Albums, &[album], key).await;
+        let generated = items
+            .iter()
+            .flat_map(|item| &item.diff.generated)
+            .map(|file| file.destination_relative_path.clone())
+            .collect();
+        if items.iter().any(|item| item.diff.changes_anything()) {
+            let applied = management_apply(&self.library, &handle).await;
+            assert_eq!(
+                applied.job.state.as_str(),
+                "succeeded",
+                "{:?}",
+                applied.job.terminal_code
+            );
+        }
+        (handle.job_id, generated)
+    }
+
+    /// Preview the undo of run `job_id` and apply it; returns its items.
+    async fn undo_run(
+        &self,
+        job_id: &str,
+        key: &str,
+    ) -> Vec<droppedneedle_library::management::models::PlannedItem> {
+        let management = self.management();
+        let detail = management.detail(job_id).expect("detail");
+        let undo = management
+            .undo_preview(job_id, detail.job.row_revision, key, "admin")
+            .expect("undo preview");
+        assert!(management_step(&self.library).await, "undo planning runs");
+        let items = management
+            .items(&undo.job_id, -1, 100, &Default::default())
+            .expect("items")
+            .items;
+        let undone = management_apply(&self.library, &undo).await;
+        assert_eq!(
+            undone.job.state.as_str(),
+            "succeeded",
+            "{:?}",
+            undone.job.terminal_code
+        );
+        items
+    }
+
+    /// Restore the album's originals.
+    async fn restore_album(&self, album: &str, key: &str) {
+        use droppedneedle_library::management::models::{Selection, SelectionKind};
+        use droppedneedle_library::management::restore::RestoreRequest;
+        let management = self.management();
+        let handle = management
+            .create_restore_preview(
+                RestoreRequest {
+                    selection: Selection {
+                        kind: SelectionKind::Albums,
+                        ids: vec![album.to_owned()],
+                        catalog_filter: None,
+                    },
+                    expected_settings_revision: self.settings_revision(),
+                    expected_policy_revision: self
+                        .library
+                        .core
+                        .policy_revision()
+                        .expect("policy revision"),
+                    idempotency_key: key.to_owned(),
+                },
+                "admin",
+            )
+            .expect("restore preview queued");
+        assert!(
+            management_step(&self.library).await,
+            "restore planning runs"
+        );
+        let restored = management_apply(&self.library, &handle).await;
+        assert_eq!(
+            restored.job.state.as_str(),
+            "succeeded",
+            "{:?}",
+            restored.job.terminal_code
+        );
+    }
+
+    /// The bytes of every file in the library folder's recycle bin.
+    fn binned(&self) -> Vec<Vec<u8>> {
+        let mut found: Vec<Vec<u8>> = walk_files(&self.music.join(".recycle"))
+            .iter()
+            .map(|path| std::fs::read(path).expect("bin copy reads"))
+            .collect();
+        found.sort();
+        found
+    }
+}
+
+/// With the profile's edition cover on, an album matched to an accepted
+/// release has its folder's one cover file replaced by the archive's front
+/// for that release, in its own name and permission bits; the old one goes
+/// to the recycle bin and a second run changes nothing. Undo puts the old
+/// one back, and it stays the person's: a later "Restore originals" keeps
+/// it. A run with the setting off leaves it alone, and "Restore originals"
+/// after a replacement puts the album's first cover back.
+#[tokio::test]
+async fn the_edition_cover_replaces_a_cover_file_and_undo_and_restore_bring_it_back() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let archive = cover_png([30, 30, 200]);
+    let own = cover_png([200, 30, 30]);
+    let sources = edition_sources(Ok(Some(archive.clone())));
+    let managed =
+        ManagedLibrary::scripted("lm-edition-cover", edition_cover_profile, sources.clone()).await;
+    let (album, _) = managed.add_album("edition", 1).await;
+    let cover = managed.music.join("edition/cover.png");
+    std::fs::write(&cover, &own).unwrap();
+    std::fs::set_permissions(&cover, std::fs::Permissions::from_mode(0o640)).unwrap();
+    let held = || std::fs::read(&cover).expect("cover reads");
+
+    let (run, generated) = managed.run_album(&album, "replace").await;
+    assert_eq!(generated, ["edition/cover.png"]);
+    assert_eq!(held(), archive, "the edition's cover replaced the file");
+    assert_eq!(
+        std::fs::metadata(&cover).unwrap().permissions().mode() & 0o777,
+        0o640
+    );
+    assert_eq!(
+        managed.binned(),
+        std::slice::from_ref(&own),
+        "the old one is in the bin"
+    );
+    assert_eq!(sources.edition_asks.lock().unwrap().len(), 1);
+    let (_, generated) = managed.run_album(&album, "again").await;
+    assert!(generated.is_empty(), "a second run changes nothing");
+
+    let undo = managed.undo_run(&run, "undo").await;
+    assert!(
+        undo.iter()
+            .flat_map(|item| &item.diff.generated)
+            .any(|file| file.destination_relative_path == "edition/cover.png"),
+        "the undo preview lists the cover it puts back"
+    );
+    assert_eq!(held(), own, "undo put the old cover back");
+
+    managed.use_edition_cover(false);
+    let (_, generated) = managed.run_album(&album, "off").await;
+    assert!(generated.is_empty(), "with the setting off the cover stays");
+    managed.restore_album(&album, "restore-after-undo").await;
+    assert_eq!(held(), own, "the cover undo put back is kept");
+
+    managed.use_edition_cover(true);
+    managed.run_album(&album, "replace-again").await;
+    assert_eq!(held(), archive);
+    managed.restore_album(&album, "restore").await;
+    assert_eq!(held(), own, "restore puts the album's first cover back");
+}
+
+/// The edition's cover never replaces a cover file where it may not: an
+/// album marked as looking wrong is never asked about, a folder another
+/// album's tracks share keeps its cover, and an archive that cannot answer
+/// changes no file.
+#[tokio::test]
+async fn the_edition_cover_leaves_a_cover_alone_where_it_may_not_replace_it() {
+    let archive = cover_png([30, 30, 200]);
+    let own = cover_png([200, 30, 30]);
+    let sources = edition_sources(Ok(Some(archive)));
+    let managed = ManagedLibrary::scripted(
+        "lm-edition-cover-left",
+        edition_cover_profile,
+        sources.clone(),
+    )
+    .await;
+    let asks = || sources.edition_asks.lock().unwrap().len();
+
+    let (wrong, _) = managed.add_album("wrong", 1).await;
+    let (shared, _) = managed.add_album("shared", 1).await;
+    let (down, _) = managed.add_album("down", 1).await;
+    for folder in ["wrong", "shared", "down"] {
+        std::fs::write(managed.music.join(format!("{folder}/cover.png")), &own).unwrap();
+    }
+    managed
+        .library
+        .scan_store
+        .db()
+        .run_sql(&format!(
+            "INSERT INTO library_album_looks_wrong (local_album_id, user_id, created_at) \
+             VALUES ('{wrong}', 'admin', 1)"
+        ))
+        .expect("marked as looking wrong");
+    managed
+        .library
+        .scan_store
+        .db()
+        .run_sql(
+            "INSERT INTO local_artists (id, display_name, folded_name, kind, created_at, \
+             updated_at) VALUES ('other-artist', 'Other', 'other', 'person', 1, 1); \
+             INSERT INTO local_albums (id, root_id, grouping_key, title, title_folded, \
+             album_artist_name, album_artist_name_folded, album_artist_id, grouping_source, \
+             created_at, updated_at) VALUES ('other-album', 'music', 'other', 'Other', \
+             'other', 'Other', 'other', 'other-artist', 'automatic', 1, 1); \
+             INSERT INTO local_tracks (id, local_album_id, root_id, file_path, relative_path, \
+             path_hash, file_size_bytes, file_mtime_ns, stat_revision, title, title_folded, \
+             album_title, album_title_folded, file_format, availability, ingest_source, \
+             imported_at, membership_source) VALUES ('other-track', 'other-album', 'music', \
+             '/elsewhere/zz.flac', 'shared/zz.flac', 'other-hash', 1, 1, 's1', 'Other', \
+             'other', 'Other', 'other', 'flac', 'indexed', 'scan', 1, 'automatic');",
+        )
+        .expect("another album in the folder");
+
+    let (_, generated) = managed.run_album(&wrong, "wrong").await;
+    assert!(generated.is_empty());
+    assert_eq!(
+        asks(),
+        0,
+        "an album marked as looking wrong is never asked about"
+    );
+    assert_eq!(
+        std::fs::read(managed.music.join("wrong/cover.png")).unwrap(),
+        own
+    );
+
+    let (_, generated) = managed.run_album(&shared, "shared").await;
+    assert!(generated.is_empty());
+    assert_eq!(asks(), 1);
+    assert_eq!(
+        std::fs::read(managed.music.join("shared/cover.png")).unwrap(),
+        own
+    );
+
+    *sources.edition.lock().unwrap() = Some(Err("the archive answered 503".to_owned()));
+    let (_, generated) = managed.run_album(&down, "down").await;
+    assert!(generated.is_empty());
+    assert_eq!(asks(), 2);
+    assert_eq!(
+        std::fs::read(managed.music.join("down/cover.png")).unwrap(),
+        own,
+        "an archive that cannot answer changes no file"
+    );
+    assert_eq!(managed.binned(), Vec::<Vec<u8>>::new());
+}
+
+/// Undo of a run that replaced a cover file someone has changed since
+/// still undoes the run's tags, and leaves that cover as it is and says so.
+#[tokio::test]
+async fn undo_keeps_an_edited_edition_cover_and_still_undoes_the_tags() {
+    use droppedneedle_library::tags::save::TagEdit;
+    use droppedneedle_library::tags::{AudioFormat, TagField, read::read_tag_only};
+    let archive = cover_png([30, 30, 200]);
+    let own = cover_png([200, 30, 30]);
+    let edited = cover_png([200, 200, 30]);
+    let managed = ManagedLibrary::scripted(
+        "lm-edition-cover-edited",
+        edition_cover_profile,
+        edition_sources(Ok(Some(archive.clone()))),
+    )
+    .await;
+    let (album, tracks) = managed.add_album("edited", 1).await;
+    managed
+        .edit_outside(
+            &tracks[0],
+            TagEdit::verbatim(TagField::Title, vec!["A title of my own".to_owned()]),
+        )
+        .await;
+    let cover = managed.music.join("edited/cover.png");
+    std::fs::write(&cover, &own).unwrap();
+    let track = managed.music.join("edited/01.flac");
+    let title = || {
+        read_tag_only(&track, AudioFormat::Flac)
+            .expect("tags read")
+            .title
+    };
+    let before = title();
+
+    let (run, _) = managed.run_album(&album, "replace").await;
+    assert_eq!(std::fs::read(&cover).unwrap(), archive);
+    assert_ne!(title(), before, "the run wrote the release's title");
+    std::fs::write(&cover, &edited).unwrap();
+
+    let undo = managed.undo_run(&run, "undo").await;
+    assert_eq!(title(), before, "the tags are undone");
+    assert_eq!(
+        std::fs::read(&cover).unwrap(),
+        edited,
+        "the edited cover stays"
+    );
+    assert!(
+        undo.iter()
+            .flat_map(|item| &item.facts.warnings)
+            .any(|warning| warning.contains("edited/cover.png")),
+        "the undo preview says so"
+    );
+}
+
+/// "Restore originals" brings back the cover file the edition's cover
+/// replaced even when that cover is no longer there (someone removed it,
+/// or it moved with the album): the kept original goes back where nothing
+/// stands.
+#[tokio::test]
+async fn restore_brings_the_replaced_cover_back_when_the_archive_cover_is_gone() {
+    let archive = cover_png([30, 30, 200]);
+    let own = cover_png([200, 30, 30]);
+    let managed = ManagedLibrary::scripted(
+        "lm-edition-cover-gone",
+        edition_cover_profile,
+        edition_sources(Ok(Some(archive.clone()))),
+    )
+    .await;
+    let (album, _) = managed.add_album("gone", 1).await;
+    let cover = managed.music.join("gone/cover.png");
+    std::fs::write(&cover, &own).unwrap();
+
+    managed.run_album(&album, "replace").await;
+    assert_eq!(std::fs::read(&cover).unwrap(), archive);
+    std::fs::remove_file(&cover).unwrap();
+
+    managed.restore_album(&album, "restore").await;
+    assert_eq!(
+        std::fs::read(&cover).expect("the original cover is back"),
+        own
+    );
+}
+
+/// The edition's cover follows the album's match up to the moment it is
+/// written: with unconfirmed matches managed, a best guess is never asked
+/// about and keeps its cover, and an album marked as looking wrong after
+/// its preview is refused at apply with its files left as they were.
+#[tokio::test]
+async fn the_edition_cover_is_refused_for_a_guess_and_for_a_match_marked_wrong_after_preview() {
+    use droppedneedle_kernel::runtime_config::sections::EditionPreferences;
+    use droppedneedle_library::management::models::SelectionKind;
+    let archive = cover_png([30, 30, 200]);
+    let own = cover_png([200, 30, 30]);
+    let sources = edition_sources(Ok(Some(archive)));
+    let managed = ManagedLibrary::scripted(
+        "lm-edition-cover-gate",
+        edition_cover_profile,
+        sources.clone(),
+    )
+    .await;
+    let asks = || sources.edition_asks.lock().unwrap().len();
+    let (guess, _) = managed.add_album("guess", 1).await;
+    let (late, late_tracks) = managed.add_album("late", 1).await;
+    for folder in ["guess", "late"] {
+        std::fs::write(managed.music.join(format!("{folder}/cover.png")), &own).unwrap();
+    }
+    let store = managed.library.settings.store();
+    let mut preferences = store.get::<EditionPreferences>().expect("preferences read");
+    preferences.manage_unconfirmed = true;
+    store.save_blocking(preferences).expect("preferences saved");
+    managed
+        .library
+        .scan_store
+        .db()
+        .run_sql(&format!(
+            "INSERT INTO library_album_match_state (local_album_id, state, reason_code, \
+             updated_at) VALUES ('{guess}', 'unconfirmed', 'LOW_CONFIDENCE', 0)"
+        ))
+        .expect("a best guess");
+
+    let (_, generated) = managed.run_album(&guess, "guess").await;
+    assert!(generated.is_empty());
+    assert_eq!(asks(), 0, "a best guess is never asked about");
+    assert_eq!(
+        std::fs::read(managed.music.join("guess/cover.png")).unwrap(),
+        own
+    );
+
+    let track = managed.path(&late_tracks[0]);
+    let before = file_sha256(&track);
+    let (handle, items) = managed
+        .preview(SelectionKind::Albums, &[&late], "late")
+        .await;
+    assert!(
+        items
+            .iter()
+            .flat_map(|item| &item.diff.generated)
+            .any(|file| file.destination_relative_path == "late/cover.png"),
+        "the preview replaces the cover"
+    );
+    managed
+        .library
+        .scan_store
+        .db()
+        .run_sql(&format!(
+            "INSERT INTO library_album_looks_wrong (local_album_id, user_id, created_at) \
+             VALUES ('{late}', 'admin', 1)"
+        ))
+        .expect("marked as looking wrong");
+    management_apply(&managed.library, &handle).await;
+    let results = managed
+        .management()
+        .results(&handle.job_id, -1, 50)
+        .expect("results");
+    assert!(
+        results.items.iter().any(|item| item
+            .failure
+            .as_ref()
+            .is_some_and(|reason| reason.code == "MATCH_CHANGED")),
+        "{:?}",
+        results
+            .items
+            .iter()
+            .map(|item| &item.failure)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        std::fs::read(managed.music.join("late/cover.png")).unwrap(),
+        own
+    );
+    assert_eq!(file_sha256(&track), before, "the files are left alone");
 }

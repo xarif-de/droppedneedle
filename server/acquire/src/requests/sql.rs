@@ -9,7 +9,8 @@
 use droppedneedle_kernel::db::statement::ListLen;
 
 use super::sqlite::HistoryOrder;
-use crate::landing::sql::OWNED_TRACKS_FROM;
+use droppedneedle_library::identity::asked_groups;
+use droppedneedle_library::{owns_group, recording_mbid};
 
 droppedneedle_kernel::sql! {
     /// Settle the rows linked to one task (`?1`) as `?2`, stamping
@@ -298,7 +299,7 @@ droppedneedle_kernel::sql! {
     fragment WATCH_SELECT = "SELECT w.release_group_mbid_lower, w.user_id, u.display_name, \
          w.artist_name, w.album_title, w.artist_mbid, w.year, w.cover_url, w.kind, w.state, \
          w.created_at, w.first_release_date, w.check_count, w.quiet_streak, w.next_check_at, \
-         w.new_candidate_count FROM wanted_watches w LEFT JOIN auth_users u ON u.id = w.user_id";
+         w.new_candidate_count, w.last_outcome FROM wanted_watches w LEFT JOIN auth_users u ON u.id = w.user_id";
     /// One watch by its key.
     pub(crate) WATCH_BY_KEY = WATCH_SELECT + " WHERE w.release_group_mbid_lower = ?1";
     /// Watches of user `?2`, or every watch when `?1`, newest first.
@@ -421,6 +422,30 @@ droppedneedle_kernel::sql! {
          WHERE state = 'pending' AND user_id IN (SELECT id FROM auth_users \
            WHERE role IN ('admin', 'trusted'))";
 
+    /// Every stored quota override.
+    pub(crate) QUOTA_OVERRIDES = "SELECT user_id, request_quota_count, request_quota_days, \
+         storage_quota_gb FROM user_quotas";
+    /// One user's stored quota override.
+    pub(crate) QUOTA_OVERRIDE = "SELECT user_id, request_quota_count, request_quota_days, \
+         storage_quota_gb FROM user_quotas WHERE user_id = ?1";
+    /// One stored quota override.
+    pub(crate) row QuotaOverrideRow for [QUOTA_OVERRIDES, QUOTA_OVERRIDE] {
+        user_id: String,
+        request_quota_count: Option<i64>,
+        request_quota_days: Option<i64>,
+        storage_quota_gb: Option<i64>,
+    }
+    /// Drop one user's quota override.
+    pub(crate) DELETE_QUOTA_OVERRIDE = "DELETE FROM user_quotas WHERE user_id = ?1";
+    /// Store or replace one user's quota override.
+    pub(crate) UPSERT_QUOTA_OVERRIDE = "INSERT INTO user_quotas \
+         (user_id, request_quota_count, request_quota_days, storage_quota_gb) \
+         VALUES (?1, ?2, ?3, ?4) \
+         ON CONFLICT (user_id) DO UPDATE SET \
+         request_quota_count = excluded.request_quota_count, \
+         request_quota_days = excluded.request_quota_days, \
+         storage_quota_gb = excluded.storage_quota_gb";
+
     // What requests read from the library and the accounts.
 
     /// Indexed bytes in the whole library.
@@ -456,8 +481,6 @@ droppedneedle_kernel::sql! {
          OR EXISTS(SELECT 1 FROM library_album_takeovers WHERE local_album_id = ?1) \
          OR EXISTS(SELECT 1 FROM library_management_automatic_queue \
            WHERE local_album_id = ?1 AND retag_followed_at IS NOT NULL)";
-    /// Whether the library holds release group `?1` (lowercased).
-    pub(crate) LIBRARY_HOLDS = "SELECT EXISTS (SELECT 1 " + OWNED_TRACKS_FROM + ")";
     /// Who owns discovery batch `?1`.
     pub(crate) BATCH_OWNER = "SELECT user_id FROM acquire_discovery_batches WHERE id = ?1";
     /// One discovery batch (`?1`): `(id, user, name, section, created_at)`.
@@ -548,19 +571,19 @@ pub(crate) fn history_page(order: HistoryOrder) -> String {
 }
 
 /// Owned tracks of `groups` lowercased release groups:
-/// `(track id, group, recording, track number, disc number)`. The `+`
-/// keeps the planner off the availability index, so tracks are reached
-/// by their album from the group's identity rows.
+/// `(track id, group, recording, track number, disc number)`, the recording
+/// its match row's, else the file's own. The `+` keeps the planner off the
+/// availability index, so tracks are reached by their album from its owners.
 pub(crate) fn mix_library_files(groups: ListLen) -> String {
     format!(
-        "SELECT t.id, lower(ae.release_group_mbid), lower(te.recording_mbid), \
-         t.track_number, t.disc_number FROM local_tracks t \
-         JOIN local_albums b ON b.id = t.local_album_id \
-         JOIN local_album_external_identities ae ON ae.local_album_id = b.id \
-         JOIN local_track_external_identities te \
+        "{}SELECT t.id, o.group_mbid, lower({recording}), \
+         t.track_number, t.disc_number FROM ({}) o \
+         JOIN local_tracks t ON t.local_album_id = o.album_id \
+         LEFT JOIN local_track_external_identities te \
          ON te.local_track_id = t.id AND te.provider = 'musicbrainz' \
-         WHERE b.retired_into_album_id IS NULL AND +t.availability = 'indexed' \
-         AND te.recording_mbid IS NOT NULL AND lower(ae.release_group_mbid) IN ({})",
-        marks(groups)
+         WHERE +t.availability = 'indexed' AND {recording} IS NOT NULL",
+        asked_groups(groups),
+        owns_group!("IN (SELECT g FROM asked)"),
+        recording = recording_mbid!("te", "t"),
     )
 }

@@ -21,7 +21,9 @@
 pub mod apply;
 pub(crate) mod carry;
 pub mod envelope;
+pub(crate) mod naming_carry;
 pub(crate) mod plan;
+pub(crate) mod quality_carry;
 pub mod report;
 pub mod schedule_carry;
 pub(crate) mod settings;

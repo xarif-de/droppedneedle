@@ -11,6 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 
 use crate::export::artist_keys::KEPT_RESERVED_NOTE;
+use crate::export::callbacks::Acknowledged;
 use crate::export::envelope::LeftBehind;
 use droppedneedle_auth::times::to_iso;
 
@@ -57,6 +58,14 @@ pub enum ExitCode {
     #[serde(rename = "FAILED_INTERNAL")]
     FailedInternal,
 }
+
+droppedneedle_kernel::spelled!(ExitCode {
+    Ok => "OK",
+    OkWithDrops => "OK_WITH_DROPS",
+    FailedValidation => "FAILED_VALIDATION",
+    EnvelopeAuthFailed => "ENVELOPE_AUTH_FAILED",
+    FailedInternal => "FAILED_INTERNAL",
+});
 
 /// Per-entity outcome counters.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -160,6 +169,10 @@ pub struct ImportReport {
     pub notes: Vec<String>,
     /// Itemized outcomes with semantic keys.
     pub items: Vec<ReportItem>,
+    /// What the upgrade listed as changing at outside services, and the
+    /// operator acknowledged with `--callbacks-changed`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub acknowledged: Vec<Acknowledged>,
 }
 
 impl ImportReport {
@@ -401,6 +414,7 @@ impl ReportBuilder {
             left_behind: self.left_behind,
             notes: self.notes,
             items: self.items,
+            acknowledged: Vec::new(),
         }
     }
 
@@ -437,6 +451,15 @@ pub(crate) fn now_secs() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0.0, |span| span.as_secs_f64())
+}
+
+/// The current time in unix milliseconds, for the importer's own records.
+pub(crate) fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |span| {
+            i64::try_from(span.as_millis()).unwrap_or(i64::MAX)
+        })
 }
 
 /// Current UTC time as ISO-8601. Falls back to the epoch on clock

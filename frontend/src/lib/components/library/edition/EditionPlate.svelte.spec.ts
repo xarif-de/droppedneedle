@@ -109,7 +109,12 @@ vi.mock('$lib/queries/albums/EditionQueries.svelte', () => ({
 	createMatchEditionFileMutation: () => mutation(),
 	createUnmatchEditionFileMutation: () => mutation(),
 	createSealCustomEditionMutation: () => mutation((...args: unknown[]) => h.seal(...args)),
-	createLeaveAlbumUnmanagedMutation: () => mutation((...args: unknown[]) => h.leave(...args))
+	createLeaveAlbumUnmanagedMutation: () => mutation((...args: unknown[]) => h.leave(...args)),
+	createMarkLooksWrongMutation: () => mutation(),
+	createClearLooksWrongMutation: () => mutation()
+}));
+vi.mock('$lib/queries/downloads/HeldQueries.svelte', () => ({
+	createImportHeldMutation: () => ({ mutate: vi.fn(), isPending: false })
 }));
 vi.mock('$lib/queries/downloads/DownloadQueries.svelte', () => ({
 	getAlbumDownloadsQuery: () => ({
@@ -456,6 +461,43 @@ describe('the edition sheet', () => {
 
 		await sheet().getByRole('button', { name: 'Done' }).click();
 		await expect.element(sheet()).not.toBeInTheDocument();
+	});
+
+	it('offers "Use anyway" for an edition no file fits, and fetches nothing', async () => {
+		const remaster = remasterPlan();
+		h.plans['release-remaster'] = {
+			...remaster,
+			kept_count: 0,
+			missing_count: 4,
+			other_version_count: 0,
+			extra_count: 4,
+			files: remaster.files.map((file) => ({ ...file, fate: 'extra' })),
+			tracks: remaster.tracks.map((track) => ({ ...track, local_track_id: null }))
+		} as EditionPlan;
+		h.choose.mockResolvedValue({
+			album_id: 'local-1',
+			extra_track_ids: [],
+			missing_titles: [],
+			release_group_mbid: 'group-1',
+			release_mbid: 'release-remaster',
+			retag_files: [],
+			status: status({ release_mbid: 'release-remaster', state: 'unmatched' })
+		});
+		await openSheet();
+		await sheet()
+			.getByRole('button', { name: /5th anniversary remaster/ })
+			.click();
+
+		await expect
+			.element(sheet().getByRole('button', { name: 'Use this edition' }))
+			.not.toBeInTheDocument();
+		await sheet().getByRole('button', { name: 'Use anyway' }).click();
+
+		expect(h.choose).toHaveBeenCalledWith(
+			expect.objectContaining({ releaseMbid: 'release-remaster', useAnyway: true })
+		);
+		expect(h.acquire).not.toHaveBeenCalled();
+		await expect.element(sheet()).toBeVisible();
 	});
 
 	it('shows a file that is another version of a track as one row with both lengths', async () => {

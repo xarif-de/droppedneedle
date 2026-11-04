@@ -29,21 +29,28 @@
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use std::fmt::Display;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
-use droppedneedle::bootstrap::data_dirs::{DataDirs, Layout, refuse_unfinished_restore};
+use droppedneedle::bootstrap::data_dirs::{DataDirs, Layout, detect, refuse_unfinished_restore};
+use droppedneedle::bootstrap::upgrade_progress::{
+    self as lines, Address, BackupFolders, CheckResult, Code, Event, FailedLine, Finished,
+    FoundLayout, Line, Outcome, ProgressLine, StepId, StepLine, V2Files,
+};
 use droppedneedle_kernel::config::AppConfig;
 use droppedneedle_kernel::db::datalock::DataLock;
 use droppedneedle_kernel::runtime_config::Secret;
 use droppedneedle_kernel::runtime_config::sections::ContentSecurityPolicyMode;
-use droppedneedle_tool::export::v2dir::V2Dirs;
+use droppedneedle_tool::export::callbacks::{CALLBACKS_CHANGED_FLAG, check_callbacks};
+use droppedneedle_tool::export::v2dir::{V2Dirs, resolve_db_path};
 use droppedneedle_tool::export::{ExportRequest, LeftBehind, export_v2_to_file};
 use droppedneedle_tool::r#import::ExitCode;
 use droppedneedle_tool::tooling::host_settings;
 use droppedneedle_tool::tooling::recovery_code;
 use droppedneedle_tool::tooling::reset_key;
 use droppedneedle_tool::tooling::upgrade::{
-    self, OfflineImport, Step, Summary, UpgradeError, UpgradeRequest, Upgraded,
+    self, FreshStart, OfflineImport, Step, Summary, UpgradeError, UpgradeRequest, Upgraded,
 };
 use serde::Deserialize as _;
 
@@ -52,11 +59,15 @@ const USAGE: &str = "\
 droppedneedle-tool: offline tooling for a DroppedNeedle data directory
 
 Usage:
-  droppedneedle-tool upgrade [--no-backup] [--v2-commit <tag>]
-  droppedneedle-tool upgrade --undo --yes
+  droppedneedle-tool upgrade [--no-backup] [--callbacks-changed] [--v2-commit <tag>]
+      [--progress json]
+  droppedneedle-tool upgrade --check [--callbacks-changed] [--v2-commit <tag>]
+      [--progress json]
+  droppedneedle-tool upgrade --fresh --yes [--progress json]
+  droppedneedle-tool upgrade --undo --yes [--progress json]
   droppedneedle-tool remove-v2-backup
   droppedneedle-tool export --v2-root <dir> --out <file> [--db <path>]
-      [--v2-commit <sha>] [--passphrase-file <file>]
+      [--v2-commit <sha>] [--passphrase-file <file>] [--callbacks-changed]
   droppedneedle-tool validate <file> [--v2-root <dir>] [--passphrase-file <file>]
   droppedneedle-tool import --file <export> --db <v3.db> --config-dir <dir>
       [--cache-dir <dir>] [--passphrase-file <file>] [--v2-config <config.json>]
@@ -77,6 +88,20 @@ folders the way the server does (/app/config and /app/cache unless the
 environment says otherwise). upgrade --undo --yes deletes everything in
 the two folders except the v2-backup folders, then puts the v2 files back.
 remove-v2-backup deletes the kept v2 files.
+
+upgrade --check runs every check the upgrade runs before it moves anything,
+exports to the temporary folder (TMPDIR) to count what would move, and
+changes nothing in the data folders. It exits 1 while something must be fixed first and 3 while the
+upgrade would stop on callback addresses. upgrade --fresh --yes moves the
+v2 files into the v2-backup folders as the upgrade does and imports nothing,
+so v3 starts empty; upgrade --undo --yes goes back. With --progress json
+these commands write one JSON object a line to stdout, and their other text
+to stderr.
+
+When v2 uses single sign-on, Spotify playlist import or MusicBrainz
+contributions, the addresses those services call back on change. upgrade
+and export then list each one and stop with exit code 3, changing nothing.
+Change them, then run again with --callbacks-changed.
 
 restore copies a server backup into an empty folder under the database
 file name the server uses (library.db, or the name LIBRARY_DB_PATH gives),
@@ -206,7 +231,39 @@ Stop the server first. It finds the data the way upgrade does.
 ";
 
 /// Flags that take no value.
-const BARE_FLAGS: &[&str] = &["--allow-downgrade", "--no-backup", "--undo", "--yes"];
+const BARE_FLAGS: &[&str] = &[
+    "--allow-downgrade",
+    CALLBACKS_CHANGED_FLAG,
+    "--check",
+    "--fresh",
+    "--no-backup",
+    "--undo",
+    "--yes",
+];
+
+/// How a command failed, and the exit code that says so.
+enum Failure {
+    /// It failed: exit code 1.
+    Failed(String),
+    /// It was called wrongly: exit code 2.
+    Usage(String),
+    /// It stopped on purpose until the operator acts: exit code 3.
+    Stopped(String),
+}
+
+impl From<String> for Failure {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+
+impl Failure {
+    fn message(&self) -> &str {
+        match self {
+            Self::Failed(message) | Self::Usage(message) | Self::Stopped(message) => message,
+        }
+    }
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -216,16 +273,16 @@ fn main() {
     };
     let outcome = match command {
         "upgrade" => run_upgrade(&args[1..]),
-        "remove-v2-backup" => run_remove_backup(&args[1..]),
+        "remove-v2-backup" => run_remove_backup(&args[1..]).map_err(Failure::from),
         "export" => run_export(&args[1..]),
-        "validate" => run_validate(&args[1..]),
-        "import" => run_import_cmd(&args[1..], false),
-        "dry-run" => run_import_cmd(&args[1..], true),
-        "restore" => run_restore(&args[1..]),
-        "recovery-code" => run_recovery_code(&args[1..]),
-        "reset-key" => run_reset_key(&args[1..]),
-        "public-address" => run_public_address(&args[1..]),
-        "content-security-policy" => run_content_security_policy(&args[1..]),
+        "validate" => run_validate(&args[1..]).map_err(Failure::from),
+        "import" => run_import_cmd(&args[1..], false).map_err(Failure::from),
+        "dry-run" => run_import_cmd(&args[1..], true).map_err(Failure::from),
+        "restore" => run_restore(&args[1..]).map_err(Failure::from),
+        "recovery-code" => run_recovery_code(&args[1..]).map_err(Failure::from),
+        "reset-key" => run_reset_key(&args[1..]).map_err(Failure::from),
+        "public-address" => run_public_address(&args[1..]).map_err(Failure::from),
+        "content-security-policy" => run_content_security_policy(&args[1..]).map_err(Failure::from),
         "help" | "--help" | "-h" => {
             println!("{USAGE}");
             return;
@@ -235,10 +292,16 @@ fn main() {
             std::process::exit(2);
         }
     };
-    if let Err(message) = outcome {
-        eprintln!("{message}");
-        std::process::exit(1);
+    let code = match &outcome {
+        Ok(()) => return,
+        Err(Failure::Failed(_)) => 1,
+        Err(Failure::Usage(_)) => 2,
+        Err(Failure::Stopped(_)) => 3,
+    };
+    if let Err(failure) = outcome {
+        eprintln!("{}", failure.message());
     }
+    std::process::exit(code);
 }
 
 /// One parsed `--flag value` pair walk. Returns the value for `flag`, or an
@@ -314,8 +377,9 @@ fn read_passphrase(args: &[String]) -> Result<Secret, String> {
     Ok(Secret::new(line.trim_end_matches(['\r', '\n']).to_owned()))
 }
 
-/// `export --v2-root <dir> --out <file> [...]`.
-fn run_export(args: &[String]) -> Result<(), String> {
+/// `export --v2-root <dir> --out <file> [...]`. Like the upgrade, it stops
+/// while callback addresses change and `--callbacks-changed` is absent.
+fn run_export(args: &[String]) -> Result<(), Failure> {
     check_flags(
         args,
         &[
@@ -324,17 +388,43 @@ fn run_export(args: &[String]) -> Result<(), String> {
             "--db",
             "--v2-commit",
             "--passphrase-file",
+            CALLBACKS_CHANGED_FLAG,
         ],
         false,
     )?;
+    let v2 = V2Dirs::under_root(std::path::Path::new(&required_flag(args, "--v2-root")?));
+    let db_path = flag_value(args, "--db")?.map(PathBuf::from);
+    let out = required_flag(args, "--out")?;
+    let base_path = AppConfig::load()
+        .map_err(|error| {
+            format!(
+                "{error}\nexport reads v3's deployment settings from the environment, for the \
+                 base path in the addresses it lists. Fix that variable or leave it unset."
+            )
+        })?
+        .base_path;
+    let callbacks = check_callbacks(
+        &v2.config_dir,
+        &resolve_db_path(&v2.cache_dir, db_path.as_deref()),
+        &base_path,
+    )
+    .map_err(|error| format!("{}: {error}", error.code()))?;
+    let acknowledged = has_flag(args, CALLBACKS_CHANGED_FLAG);
+    if callbacks.stops(acknowledged) {
+        return Err(Failure::Stopped(
+            callbacks.stop_message("export", acknowledged),
+        ));
+    }
+    if !callbacks.is_empty() {
+        eprintln!("{}\n", callbacks.acknowledged_message());
+    }
     let request = ExportRequest {
-        v2: V2Dirs::under_root(std::path::Path::new(&required_flag(args, "--v2-root")?)),
-        db_path: flag_value(args, "--db")?.map(PathBuf::from),
+        v2,
+        db_path,
         passphrase: read_passphrase(args)?,
         exported_at: None,
         v2_commit: flag_value(args, "--v2-commit")?,
     };
-    let out = required_flag(args, "--out")?;
     export_v2_to_file(&request, PathBuf::from(&out).as_path())
         .map_err(|error| format!("{}: {error}", error.code()))?;
     println!("wrote {out}");
@@ -554,54 +644,260 @@ fn data_dirs() -> Result<DataDirs, String> {
         .map_err(|error| error.to_string())
 }
 
-/// `upgrade [--no-backup] [--v2-commit <tag>]`, or `upgrade --undo --yes`.
-fn run_upgrade(args: &[String]) -> Result<(), String> {
+/// How long a step's `progress` lines wait for each other.
+const PROGRESS_EVERY: Duration = Duration::from_millis(250);
+
+/// Where an upgrade command reports. Its text goes to stdout, or to stderr
+/// with `--progress json`, where stdout carries only the JSON lines. The
+/// step text goes to stderr either way.
+struct Progress {
+    json: bool,
+    /// The step under way, its total, and when its last progress line went
+    /// out.
+    step: Option<(StepId, Option<u64>, Option<Instant>)>,
+    /// The run started moving v2 files.
+    moved: bool,
+}
+
+impl Progress {
+    fn new(json: bool) -> Self {
+        Self {
+            json,
+            step: None,
+            moved: false,
+        }
+    }
+
+    /// One line of text.
+    fn say(&self, text: impl Display) {
+        if self.json {
+            eprintln!("{text}");
+        } else {
+            println!("{text}");
+        }
+    }
+
+    /// One JSON line, with `--progress json`.
+    fn line(&self, event: Event) {
+        if !self.json {
+            return;
+        }
+        match serde_json::to_string(&Line::new(event)) {
+            Ok(text) => println!("{text}"),
+            Err(error) => eprintln!("cannot write a progress line: {error}"),
+        }
+    }
+
+    fn step(&mut self, step: Step<'_>) {
+        print_step(step);
+        let folders = Some(upgrade::DATA_FOLDERS);
+        let (id, total) = match step {
+            Step::Recovering => (StepId::Recover, folders),
+            Step::MovingAside => (StepId::MoveAside, folders),
+            Step::Exporting => (StepId::Export, None),
+            Step::OrphansRemoved(_) => (StepId::ExportAgain, None),
+            Step::DryRun => (StepId::DryRun, None),
+            Step::Importing => (StepId::Import, None),
+            Step::RemovingBackup => (StepId::RemoveBackup, None),
+            Step::RollingBack => (StepId::RollBack, folders),
+            Step::Undoing => (StepId::Undo, folders),
+            Step::CallbacksAcknowledged(_) => return,
+            Step::FolderDone(done) => return self.progress(done),
+        };
+        self.moved |= matches!(
+            step,
+            Step::Recovering | Step::MovingAside | Step::RollingBack | Step::Undoing
+        );
+        self.step = Some((id, total, None));
+        self.line(Event::Step(StepLine {
+            step: id,
+            label: id.label().to_owned(),
+            total,
+        }));
+    }
+
+    /// A progress line for the current step, at most about four a second.
+    /// The one that reaches the total always goes out.
+    fn progress(&mut self, done: u64) {
+        let Some((step, total, last)) = self.step else {
+            return;
+        };
+        let now = Instant::now();
+        if last.is_some_and(|at| now.duration_since(at) < PROGRESS_EVERY) && Some(done) != total {
+            return;
+        }
+        self.step = Some((step, total, Some(now)));
+        self.line(Event::Progress(ProgressLine { step, done }));
+    }
+
+    /// Where the v2 files are after the run failed, as the folders show it:
+    /// a run can fail on a folder an earlier run left with v2 in its backup
+    /// before it moves anything itself.
+    fn v2_files(&self, dirs: &DataDirs) -> V2Files {
+        let backup = [dirs.config_backup(), dirs.cache_backup()]
+            .iter()
+            .any(|folder| std::fs::symlink_metadata(folder).is_ok());
+        match detect(dirs) {
+            Layout::V2 if self.moved => V2Files::PutBack,
+            Layout::V2 => V2Files::Untouched,
+            Layout::Interrupted => V2Files::InBackup,
+            _ if backup => V2Files::InBackup,
+            _ => V2Files::Untouched,
+        }
+    }
+}
+
+/// A failed upgrade command: its exit, and for `--progress json` the code
+/// and the place of the v2 files its `failed` line gives. No `failed` line
+/// is written without a code: the check's own line says why it exits so.
+struct UpgradeFailed {
+    failure: Failure,
+    code: Option<Code>,
+    v2_files: V2Files,
+}
+
+impl UpgradeFailed {
+    /// A failure before anything changed.
+    fn untouched(failure: Failure, code: Code) -> Self {
+        Self {
+            failure,
+            code: Some(code),
+            v2_files: V2Files::Untouched,
+        }
+    }
+}
+
+/// `upgrade [--no-backup] [--callbacks-changed] [--v2-commit <tag>]`,
+/// `upgrade --check [--callbacks-changed]`, `upgrade --fresh --yes` or
+/// `upgrade --undo --yes`, each with `[--progress json]`.
+fn run_upgrade(args: &[String]) -> Result<(), Failure> {
+    let json = match flag_value(args, "--progress")
+        .map_err(Failure::Usage)?
+        .as_deref()
+    {
+        None => false,
+        Some("json") => true,
+        Some(other) => {
+            return Err(Failure::Usage(format!(
+                "--progress takes json, not {other:?}\n{USAGE}"
+            )));
+        }
+    };
+    let mut out = Progress::new(json);
+    let outcome = upgrade_command(args, &mut out);
+    outcome.map_err(|failed| {
+        if let Some(code) = failed.code {
+            out.line(Event::Failed(FailedLine {
+                code,
+                message: failed.failure.message().to_owned(),
+                v2_files: failed.v2_files,
+            }));
+        }
+        failed.failure
+    })
+}
+
+fn upgrade_command(args: &[String], out: &mut Progress) -> Result<(), UpgradeFailed> {
+    let refused = |message: String| UpgradeFailed::untouched(Failure::Failed(message), Code::Usage);
     check_flags(
         args,
-        &["--no-backup", "--undo", "--yes", "--v2-commit"],
+        &[
+            "--check",
+            "--fresh",
+            "--no-backup",
+            "--progress",
+            "--undo",
+            "--v2-commit",
+            "--yes",
+            CALLBACKS_CHANGED_FLAG,
+        ],
         false,
-    )?;
-    let undo = has_flag(args, "--undo");
-    let v2_commit = flag_value(args, "--v2-commit")?;
-    if undo && (has_flag(args, "--no-backup") || v2_commit.is_some()) {
-        return Err(format!("--undo goes with --yes only\n{USAGE}"));
+    )
+    .map_err(refused)?;
+    let (check, fresh, undo) = (
+        has_flag(args, "--check"),
+        has_flag(args, "--fresh"),
+        has_flag(args, "--undo"),
+    );
+    let (yes, no_backup) = (has_flag(args, "--yes"), has_flag(args, "--no-backup"));
+    let v2_commit = flag_value(args, "--v2-commit").map_err(refused)?;
+    let callbacks_changed = has_flag(args, CALLBACKS_CHANGED_FLAG);
+    let upgrade_flags = no_backup || v2_commit.is_some() || callbacks_changed;
+    let misuse = if usize::from(check) + usize::from(fresh) + usize::from(undo) > 1 {
+        Some("--check, --fresh and --undo go one at a time")
+    } else if fresh && no_backup {
+        Some("--fresh never deletes the v2 files, so it takes no --no-backup")
+    } else if (undo || fresh) && upgrade_flags {
+        Some("--undo and --fresh take only --yes")
+    } else if yes && !(undo || fresh) {
+        Some("--yes goes only with --undo or --fresh")
+    } else if check && no_backup {
+        Some("--check takes no --no-backup")
+    } else {
+        None
+    };
+    if let Some(misuse) = misuse {
+        return Err(UpgradeFailed::untouched(
+            Failure::Usage(format!("{misuse}\n{USAGE}")),
+            Code::Usage,
+        ));
     }
-    if has_flag(args, "--yes") && !undo {
-        return Err(format!("--yes goes with --undo only\n{USAGE}"));
-    }
-    let dirs = data_dirs()?;
+    let config = AppConfig::load().map_err(|error| {
+        UpgradeFailed::untouched(Failure::Failed(error.to_string()), Code::EnvironmentInvalid)
+    })?;
+    let dirs = DataDirs::from_config(&config);
     if undo {
-        return run_undo(&dirs, has_flag(args, "--yes"));
+        return run_undo(&dirs, yes, out);
+    }
+    if fresh {
+        return run_fresh(&dirs, yes, out);
     }
     let request = UpgradeRequest {
         dirs,
-        keep_backup: !has_flag(args, "--no-backup"),
+        keep_backup: !no_backup,
         v2_commit,
+        base_path: config.base_path,
+        callbacks_changed,
         fault: None,
     };
-    let outcome = new_runtime()?
-        .block_on(upgrade::run(&request, &mut print_step))
-        .map_err(|error| upgrade_failure(&error))?;
+    if check {
+        return run_check(&request, &config.temp_dir, out);
+    }
+    let runtime = new_runtime()
+        .map_err(|message| UpgradeFailed::untouched(Failure::Failed(message), Code::Internal))?;
+    let outcome = runtime.block_on(upgrade::run(&request, &mut |step| out.step(step)));
+    let outcome = outcome.map_err(|error| UpgradeFailed {
+        failure: match &error {
+            stopped @ UpgradeError::CallbacksToChange { .. } => {
+                Failure::Stopped(stopped.to_string())
+            }
+            other => Failure::Failed(upgrade_failure(other)),
+        },
+        code: Some(error.code()),
+        v2_files: out.v2_files(&request.dirs),
+    })?;
     match outcome {
-        Upgraded::NothingToDo(Layout::V3) => {
-            println!("This data directory is already on v3. Nothing to do.");
+        Upgraded::NothingToDo(layout) => nothing_to_do(out, &request.dirs, &layout),
+        Upgraded::Done(done) => {
+            let summary = summary_of(&request.dirs, &done);
+            print_summary(out, &request.dirs, &summary, done.backup_kept);
+            out.line(Event::Result(Finished {
+                outcome: Outcome::Upgraded,
+                backup: done.backup_kept.then(|| backup_folders(&request.dirs)),
+                summary: Some(summary),
+            }));
         }
-        Upgraded::NothingToDo(_) => println!(
-            "No v2 data in {} and {}. Nothing to do.",
-            request.dirs.config_dir.display(),
-            request.dirs.cache_dir.display()
-        ),
-        Upgraded::Done(summary) => print_summary(&request.dirs, &summary),
     }
     Ok(())
 }
 
 /// One progress line per step, on stderr so stdout stays the summary.
-fn print_step(step: Step) {
+fn print_step(step: Step<'_>) {
     match step {
         Step::Recovering => {
             eprintln!("An earlier upgrade did not finish. Putting the v2 files back first.");
         }
+        Step::CallbacksAcknowledged(check) => eprintln!("{}\n", check.acknowledged_message()),
         Step::MovingAside => eprintln!("Moving the v2 files into the v2-backup folders."),
         Step::Exporting => eprintln!("Exporting from v2."),
         Step::OrphansRemoved(count) => eprintln!(
@@ -611,6 +907,7 @@ fn print_step(step: Step) {
         Step::DryRun => eprintln!("Checking the import with a dry run."),
         Step::Importing => eprintln!("Importing into v3."),
         Step::RollingBack => eprintln!("The upgrade failed. Putting the v2 files back."),
+        Step::RemovingBackup | Step::Undoing | Step::FolderDone(_) => {}
     }
 }
 
@@ -622,106 +919,330 @@ fn upgrade_failure(error: &UpgradeError) -> String {
         other => other,
     };
     if let UpgradeError::ImportFailed { report, .. } = failed_import {
-        for item in report.items.iter().filter(|item| item.outcome == "error") {
+        let errors: Vec<_> = report
+            .items
+            .iter()
+            .filter(|item| item.outcome == "error")
+            .collect();
+        for item in errors.iter().take(upgrade::LISTED) {
             text.push_str(&format!(
                 "\n  {} {}: {}",
                 item.entity, item.key, item.detail
             ));
         }
+        if errors.len() > upgrade::LISTED {
+            text.push_str(&format!("\n  and {} more", errors.len() - upgrade::LISTED));
+        }
     }
     text
 }
 
-/// What the upgrade moved, what it left, and where the v2 files are now.
-fn print_summary(dirs: &DataDirs, summary: &Summary) {
-    let report = &summary.report;
-    println!("Upgrade complete. This data directory is now on v3.");
+/// What an upgrade or a fresh start found nothing to do on.
+fn nothing_to_do(out: &Progress, dirs: &DataDirs, layout: &Layout) {
+    let outcome = if *layout == Layout::V3 {
+        out.say("This data directory is already on v3. Nothing to do.");
+        Outcome::AlreadyV3
+    } else {
+        out.say(format!(
+            "No v2 data in {} and {}. Nothing to do.",
+            dirs.config_dir.display(),
+            dirs.cache_dir.display()
+        ));
+        Outcome::NoV2Data
+    };
+    out.line(Event::Result(Finished {
+        outcome,
+        backup: None,
+        summary: None,
+    }));
+}
 
-    let mut moved: Vec<(&String, u64)> = report
-        .entities
-        .iter()
-        .map(|(name, counts)| (name, counts.imported))
-        .filter(|(_, imported)| *imported > 0)
-        .collect();
-    moved.sort();
-    if !moved.is_empty() {
-        println!("\nMoved to v3:");
-        for (name, imported) in moved {
-            println!("  {}: {imported}", name.replace('_', " "));
+fn backup_folders(dirs: &DataDirs) -> BackupFolders {
+    BackupFolders {
+        config: dirs.config_backup().display().to_string(),
+        cache: dirs.cache_backup().display().to_string(),
+    }
+}
+
+/// What the upgrade moved and left, from its report.
+fn summary_of(dirs: &DataDirs, done: &Summary) -> lines::Summary {
+    let report = &done.report;
+    lines::Summary {
+        moved: report
+            .entities
+            .iter()
+            .filter(|(_, counts)| counts.imported > 0)
+            .map(|(name, counts)| (name.clone(), counts.imported))
+            .collect(),
+        needs_attention: report
+            .entities
+            .values()
+            .map(|counts| {
+                counts.conflict_kept_existing
+                    + counts.dropped_unknown_user
+                    + counts.dropped_invalid
+                    + counts.nulled_field
+                    + counts.error
+            })
+            .sum(),
+        orphans_removed: u64::try_from(done.orphans_removed).unwrap_or(u64::MAX),
+        left_behind: report.left_behind.iter().map(LeftBehind::line).collect(),
+        notes: report.notes.clone(),
+        settings_defaulted: report.settings_defaulted.clone(),
+        report: dirs.report_file().display().to_string(),
+    }
+}
+
+/// What the upgrade moved, what it left, and where the v2 files are now.
+fn print_summary(out: &Progress, dirs: &DataDirs, summary: &lines::Summary, backup_kept: bool) {
+    out.say("Upgrade complete. This data directory is now on v3.");
+    if !summary.moved.is_empty() {
+        out.say("\nMoved to v3:");
+        for (name, imported) in &summary.moved {
+            out.say(format!("  {}: {imported}", name.replace('_', " ")));
         }
     }
-    let attention: u64 = report
-        .entities
-        .values()
-        .map(|counts| {
-            counts.conflict_kept_existing
-                + counts.dropped_unknown_user
-                + counts.dropped_invalid
-                + counts.nulled_field
-                + counts.error
-        })
-        .sum();
-    if attention > 0 {
-        println!(
-            "\n{attention} record(s) were left out or changed on the way. The report lists each."
-        );
+    if summary.needs_attention > 0 {
+        out.say(format!(
+            "\n{} record(s) were left out or changed on the way. The report lists each.",
+            summary.needs_attention
+        ));
     }
     if summary.orphans_removed > 0 {
-        println!(
+        out.say(format!(
             "\nRemoved {} follows and approvals that belonged to deleted users.",
             summary.orphans_removed
-        );
+        ));
     }
-    if !report.left_behind.is_empty() {
-        println!("\nLeft behind in v2 (not carried to v3):");
-        for item in &report.left_behind {
-            println!("  {}", item.line());
+    if !summary.left_behind.is_empty() {
+        out.say("\nLeft behind in v2 (not carried to v3):");
+        for line in &summary.left_behind {
+            out.say(format!("  {line}"));
         }
     }
-    if !report.notes.is_empty() {
-        println!("\nWorth a look:");
-        for note in &report.notes {
-            println!("  {note}");
+    if !summary.notes.is_empty() {
+        out.say("\nWorth a look:");
+        for note in &summary.notes {
+            out.say(format!("  {note}"));
         }
     }
-    if !report.settings_defaulted.is_empty() {
-        println!(
+    if !summary.settings_defaulted.is_empty() {
+        out.say(format!(
             "\nSettings v2 had nothing saved for, now at v3 defaults:\n  {}",
-            report.settings_defaulted.join(", ")
-        );
+            summary.settings_defaulted.join(", ")
+        ));
     }
 
-    if summary.backup_kept {
-        println!(
+    if backup_kept {
+        out.say(format!(
             "\nYour v2 files are kept in:\n  {}\n  {}",
             dirs.config_backup().display(),
             dirs.cache_backup().display()
-        );
-        println!("Remove them once you are happy with v3:  droppedneedle-tool remove-v2-backup");
-        println!(
-            "Go back to v2:                           droppedneedle-tool upgrade --undo --yes"
-        );
+        ));
+        out.say("Remove them once you are happy with v3:  droppedneedle-tool remove-v2-backup");
+        out.say("Go back to v2:                           droppedneedle-tool upgrade --undo --yes");
     } else {
-        println!("\nThe v2 files were deleted, as asked with --no-backup.");
+        out.say("\nThe v2 files were deleted, as asked with --no-backup.");
     }
-    println!("\nFull report: {}", dirs.report_file().display());
-    println!("Start the server now.");
+    out.say(format!("\nFull report: {}", summary.report));
+    out.say("Start the server now.");
+}
+
+/// `upgrade --check`: what the upgrade would find, changing nothing. It
+/// exits the way the upgrade would stop: 1 for a blocker, 3 for addresses
+/// not yet acknowledged or an admin nobody could get back in, else 0.
+fn run_check(
+    request: &UpgradeRequest,
+    temp_dir: &std::path::Path,
+    out: &mut Progress,
+) -> Result<(), UpgradeFailed> {
+    let result = upgrade::check(request, temp_dir);
+    print_check(out, &request.dirs, &result, request.callbacks_changed);
+    let blocked = result
+        .blockers
+        .iter()
+        .any(|blocker| blocker.code != Code::NoAdminCanSignIn);
+    let stopped = result
+        .blockers
+        .iter()
+        .any(|blocker| blocker.code == Code::NoAdminCanSignIn)
+        || (!result.warnings.is_empty() && !request.callbacks_changed);
+    out.line(Event::Check(result));
+    let failure = if blocked {
+        Failure::Failed("The upgrade cannot start until what the check lists is fixed.".to_owned())
+    } else if stopped {
+        Failure::Stopped("The upgrade would stop here. Do what the check lists first.".to_owned())
+    } else {
+        return Ok(());
+    };
+    Err(UpgradeFailed {
+        failure,
+        code: None,
+        v2_files: V2Files::Untouched,
+    })
+}
+
+/// The check's findings as text.
+fn print_check(out: &Progress, dirs: &DataDirs, result: &CheckResult, acknowledged: bool) {
+    match result.layout {
+        FoundLayout::V3 => {
+            return out.say("This data directory is already on v3. Nothing to do.");
+        }
+        FoundLayout::Empty => {
+            return out.say(format!(
+                "No v2 data in {} and {}. Nothing to do.",
+                dirs.config_dir.display(),
+                dirs.cache_dir.display()
+            ));
+        }
+        FoundLayout::Interrupted => {
+            return out.say(
+                "An earlier upgrade did not finish. The upgrade puts the v2 files back before \
+                 it checks anything: run it, or go back to v2 with droppedneedle-tool upgrade \
+                 --undo --yes.",
+            );
+        }
+        FoundLayout::V2 | FoundLayout::Unknown => {}
+    }
+    if let Some(counts) = &result.counts {
+        out.say("The upgrade would move to v3:");
+        for (name, rows) in counts.iter().filter(|(_, rows)| **rows > 0) {
+            out.say(format!("  {}: {rows}", name.replace('_', " ")));
+        }
+    }
+    if result.orphans > 0 {
+        out.say(format!(
+            "\nIt would first remove {} follows and approvals that belong to deleted users.",
+            result.orphans
+        ));
+    }
+    if !result.blockers.is_empty() {
+        out.say("\nTo fix before upgrading:");
+        for blocker in &result.blockers {
+            out.say(format!(
+                "  {}: {}\n    {}",
+                code_name(blocker.code),
+                blocker.message,
+                blocker.fix
+            ));
+        }
+    }
+    if !result.warnings.is_empty() {
+        out.say(format!(
+            "\nThese change with the upgrade. Change them, then run it with \
+             {CALLBACKS_CHANGED_FLAG}:"
+        ));
+        for warning in &result.warnings {
+            out.say(format!("  {}", warning.message));
+            if let (Some(old), Some(new)) = (&warning.old_address, &warning.new_address) {
+                out.say(format!(
+                    "    from  {}\n    to    {}",
+                    address_text(old),
+                    address_text(new)
+                ));
+            }
+        }
+        out.say(
+            "If your provider allows only one address, change it as you run the upgrade, not \
+             before.",
+        );
+    }
+    if result.blockers.is_empty() && (result.warnings.is_empty() || acknowledged) {
+        out.say("\nReady to upgrade.");
+    }
+}
+
+/// A code as the JSON lines spell it.
+fn code_name(code: Code) -> String {
+    serde_json::to_value(code)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_default()
+}
+
+fn address_text(address: &Address) -> String {
+    match address {
+        Address::Full(text) => text.clone(),
+        Address::Path(path) => format!(
+            "your DroppedNeedle host, such as https://music.example.com, followed by {path}"
+        ),
+    }
+}
+
+/// `upgrade --fresh`: v3 starts empty, with the v2 files kept in the backup
+/// folders. It moves everything in the two folders, so it wants `--yes`.
+fn run_fresh(dirs: &DataDirs, yes: bool, out: &mut Progress) -> Result<(), UpgradeFailed> {
+    if !yes {
+        return Err(UpgradeFailed::untouched(
+            Failure::Failed(format!(
+                "upgrade --fresh moves everything in {} and {} into their v2-backup folders and \
+                 imports nothing, so v3 starts empty. Nothing was changed. Run it again with \
+                 --yes to go ahead.",
+                dirs.config_dir.display(),
+                dirs.cache_dir.display()
+            )),
+            Code::ConfirmationNeeded,
+        ));
+    }
+    let started = upgrade::start_fresh(dirs, &mut |step| out.step(step));
+    let started = started.map_err(|error| UpgradeFailed {
+        failure: Failure::Failed(format!("fresh start failed: {error}")),
+        code: Some(error.code()),
+        v2_files: out.v2_files(dirs),
+    })?;
+    match started {
+        FreshStart::NothingToDo(layout) => nothing_to_do(out, dirs, &layout),
+        FreshStart::Done => {
+            let backup = backup_folders(dirs);
+            out.say("Started fresh. Nothing came across from v2: v3 starts empty.");
+            out.say(format!(
+                "\nYour v2 files are kept in:\n  {}\n  {}",
+                backup.config, backup.cache
+            ));
+            out.say("Remove them once you are happy with v3:  droppedneedle-tool remove-v2-backup");
+            out.say(
+                "Go back to v2:                           droppedneedle-tool upgrade --undo --yes",
+            );
+            out.say("\nStart the server now and create the first admin account.");
+            out.line(Event::Result(Finished {
+                outcome: Outcome::StartedFresh,
+                backup: Some(backup),
+                summary: None,
+            }));
+        }
+    }
+    Ok(())
 }
 
 /// `upgrade --undo`: back to v2. It deletes the v3 data, so it wants
 /// `--yes`.
-fn run_undo(dirs: &DataDirs, yes: bool) -> Result<(), String> {
+fn run_undo(dirs: &DataDirs, yes: bool, out: &mut Progress) -> Result<(), UpgradeFailed> {
     let (config, cache) = (dirs.config_dir.display(), dirs.cache_dir.display());
     if !yes {
-        return Err(format!(
-            "upgrade --undo deletes everything in {config} and {cache} except the v2-backup \
-             folders, then puts the v2 files back. Nothing was changed. Run it again with \
-             --yes to go ahead."
+        return Err(UpgradeFailed::untouched(
+            Failure::Failed(format!(
+                "upgrade --undo deletes everything in {config} and {cache} except the v2-backup \
+                 folders, then puts the v2 files back. Nothing was changed. Run it again with \
+                 --yes to go ahead."
+            )),
+            Code::ConfirmationNeeded,
         ));
     }
-    upgrade::undo(dirs).map_err(|error| format!("undo failed: {error}"))?;
-    println!("Back on v2. The v2 files are in {config} and {cache} again; the v3 data is gone.");
-    println!("Set the image tag back to your v2 version, then start the server.");
+    let undone = upgrade::undo(dirs, &mut |step| out.step(step));
+    undone.map_err(|error| UpgradeFailed {
+        failure: Failure::Failed(format!("undo failed: {error}")),
+        code: Some(error.code()),
+        v2_files: out.v2_files(dirs),
+    })?;
+    out.say(format!(
+        "Back on v2. The v2 files are in {config} and {cache} again; the v3 data is gone."
+    ));
+    out.say("Set the image tag back to your v2 version, then start the server.");
+    out.line(Event::Result(Finished {
+        outcome: Outcome::Undone,
+        backup: None,
+        summary: None,
+    }));
     Ok(())
 }
 
@@ -817,7 +1338,11 @@ fn run_list_admins() -> Result<(), String> {
         .block_on(recovery_code::admin_usernames(&data_dirs()?))
         .map_err(|error| error.to_string())?;
     if names.is_empty() {
-        return Err("No admin account has a username.".to_owned());
+        return Err(
+            "No admin account has a username, so no recovery code can be made for one. An admin \
+             who can still sign in sets one on their Profile page; then run this again."
+                .to_owned(),
+        );
     }
     for name in names {
         println!("{name}");

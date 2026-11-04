@@ -14,10 +14,12 @@ use rusqlite::types::Value;
 use rusqlite::{OptionalExtension as _, Transaction, params, params_from_iter};
 use serde::Serialize;
 
+use crate::scan::models::GroupingSource;
+
 use super::edition::{self, Settle};
 use super::models::{
-    AlbumGroup, CorrectionError, EditionChange, EditionChangeKind, IdentityChoice, MembershipKind,
-    MembershipOutcome, MembershipRequest,
+    AlbumAliasKind, AlbumGroup, CorrectionError, EditionChange, EditionChangeKind, IdentityChoice,
+    MembershipKind, MembershipOutcome, MembershipRequest,
 };
 use super::reasons;
 use crate::identify::sqlite::{bump_identification_stream, offer_album, retarget_references};
@@ -38,7 +40,7 @@ pub(super) struct AlbumRow {
     pub title: String,
     pub album_artist_name: String,
     pub row_revision: i64,
-    pub grouping_source: String,
+    pub grouping_source: GroupingSource,
 }
 
 /// A change as run: what it did and the material its token covers.
@@ -329,7 +331,12 @@ pub(crate) fn retire(
     )?;
     tx.execute(
         crate::corrections::sql::ADD_MERGED_ALBUM_ALIAS.text(),
-        params![album_id, successor, crate::clock::ms(now)],
+        params![
+            album_id,
+            successor,
+            crate::clock::ms(now),
+            AlbumAliasKind::MergedAlbum
+        ],
     )?;
     retarget_references(tx, "album", album_id, successor)?;
     // What a curator set on the old album carries over, unless the
@@ -596,6 +603,6 @@ fn create_split_album(
         title,
         album_artist_name: artist,
         row_revision: 1,
-        grouping_source: "manual".to_owned(),
+        grouping_source: GroupingSource::Manual,
     })
 }
