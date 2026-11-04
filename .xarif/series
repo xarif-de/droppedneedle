@@ -1,0 +1,13 @@
+# Patch topics in stacking order: <topic> base=<upstream sha> pr=<user-fork branch>|local [pr-after=YYYY-MM-DD] [guard=<table>.<column>,…]
+# Each topic is the ref refs/xarif/patch/<topic> (.xarif/pr.sh get/save); fork-sync rebases them onto the target in this order.
+# pr=local: our own policy (rates, the shared MetaBrainz budget, SSO-only login, the User-Agent id slot of musicbrainz-user-agent-form, CI package mirror build args, no 404 for misses behind our WAF: upstream declined status changes in #614), never sent upstream.
+# pr-after: meant for upstream, held back until that day — measured in production first, and upstream may solve it meanwhile.
+musicbrainz-user-agent-form base=2b0e19975a05d999f60c3518705d1cbee541b514 pr=local
+metabrainz-rates base=1714ca351002000ab1c5b97ccdcadf3541b881f7 pr=local
+metabrainz-shared-budget base=2b0e19975a05d999f60c3518705d1cbee541b514 pr=local
+login-redirects-to-sso base=2b0e19975a05d999f60c3518705d1cbee541b514 pr=local
+no-404-for-missing-art-and-unserved-subsonic base=1714ca351002000ab1c5b97ccdcadf3541b881f7 pr=local
+removed-tracks-leave-the-player base=1714ca351002000ab1c5b97ccdcadf3541b881f7 pr=removed-tracks-leave-the-player
+album-back-goes-back base=1714ca351002000ab1c5b97ccdcadf3541b881f7 pr=album-back-goes-back
+removed-album-takes-vanished-files base=1714ca351002000ab1c5b97ccdcadf3541b881f7 pr=removed-album-takes-vanished-files
+ci-package-mirror base=2b0e19975a05d999f60c3518705d1cbee541b514 pr=local
