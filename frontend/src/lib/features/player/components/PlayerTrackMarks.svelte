@@ -7,7 +7,8 @@
 <script lang="ts">
 	import { Heart, Star } from 'lucide-svelte';
 	import { playerStore } from '$lib/features/player/state/player.svelte';
-	import { getLibraryAlbumTracksQuery } from '$lib/features/library/queries/LibraryQueries.svelte';
+	import { createQuery } from '@tanstack/svelte-query';
+	import { getLibraryAlbumStatusQueryOptions } from '$lib/features/library/queries/LibraryQueries.svelte';
 	import { createSetFavoriteMutation } from '$lib/features/library/queries/FavoriteMutations.svelte';
 	import {
 		createSetRatingMutation,
@@ -23,16 +24,21 @@
 			: null
 	);
 
+	// The player names the album by its local id or its release group; the
+	// album's status answers to both and carries its tracks' hearts. It is
+	// the album page's own read, so a heart given there or here shows in
+	// both.
 	const albumId = $derived(trackId ? (playerStore.nowPlaying?.albumId ?? '') : '');
-	// The album's tracks carry the hearts: the album page's own read, so a
-	// heart given there or here shows in both.
-	const tracksQuery = getLibraryAlbumTracksQuery(() => albumId);
+	const statusQuery = createQuery(() => ({
+		...getLibraryAlbumStatusQueryOptions(albumId),
+		enabled: albumId !== ''
+	}));
 	const ratingsQuery = getRatingsQuery(() => (trackId ? { trackIds: [trackId] } : null));
 	const favoriteMutation = createSetFavoriteMutation();
 	const ratingMutation = createSetRatingMutation();
 
 	const favorite = $derived(
-		tracksQuery.data?.items.find((track) => track.id === trackId)?.favorite ?? false
+		statusQuery.data?.tracks.find((track) => track.id === trackId)?.favorite ?? false
 	);
 	const stars = $derived(trackId ? ratingOf(ratingsQuery.data, 'track', trackId) : 0);
 </script>
