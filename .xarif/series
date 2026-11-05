@@ -10,4 +10,8 @@ no-404-for-missing-art-and-unserved-subsonic base=1714ca351002000ab1c5b97ccdcadf
 removed-tracks-leave-the-player base=1714ca351002000ab1c5b97ccdcadf3541b881f7 pr=removed-tracks-leave-the-player
 album-back-goes-back base=1714ca351002000ab1c5b97ccdcadf3541b881f7 pr=album-back-goes-back
 removed-album-takes-vanished-files base=1714ca351002000ab1c5b97ccdcadf3541b881f7 pr=removed-album-takes-vanished-files
+artist-releases-fill-the-discography base=1714ca351002000ab1c5b97ccdcadf3541b881f7 pr=artist-releases-fill-the-discography
+contributors-keep-album-artists base=1714ca351002000ab1c5b97ccdcadf3541b881f7 pr=contributors-keep-album-artists
+library-filters-rating-and-reverse base=1714ca351002000ab1c5b97ccdcadf3541b881f7 pr=library-filters-rating-and-reverse
+player-heart-stars-and-skip base=1714ca351002000ab1c5b97ccdcadf3541b881f7 pr=player-heart-stars-and-skip
 ci-package-mirror base=2b0e19975a05d999f60c3518705d1cbee541b514 pr=local
