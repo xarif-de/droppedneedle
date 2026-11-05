@@ -1,0 +1,172 @@
+# xarif fork of DroppedNeedle/DroppedNeedle, line v3 — how it works: XARIF.md.
+# Functions: git.xarif.de/base/dagger-modules (docs/ci.md, docs/fork.md).
+image:
+  source: .                       # upstream Dockerfile, unchanged
+  tests: .xarif/image-tests.yaml
+  build-args: [PLUGIN_PYTHON=0]   # python3 only runs Python plugins (upstream Dockerfile); we run none
+  publish:
+    branches: []                  # only the fork's release tags v*-xarif.N publish
+    release-build-args: ["COMMIT_TAG=${CI_REF_NAME}"]   # the version check and the MusicBrainz User-Agent name the release
+fork:
+  upstream: https://github.com/DroppedNeedle/DroppedNeedle
+  upstream-branch: v3             # v3 (Rust) lives here; the default branch main is v2 (Python)
+  track: branch                   # v3 has no Releases yet: switch to release with v3.0.0 (XARIF.md)
+  version: 3.0.0                  # server/Cargo.toml [workspace.package] version
+  quarantine: 24h
+  interval: 72h                   # upstream lands ~50 commits a day; one move per 3 days bounds suite runs and conflicts
+  branch: xarif
+  infra-paths: [.forgejo/, .xarif/, dagger-ci.yaml, renovate.json, .gitlab-mirror.yaml, .github-mirror.yaml, XARIF.md]
+  migrations: '(^|/)migrations/[^/]+\.sql$'
+  # upstream 6bc9bf3b folded the sqlx chain 0001-0134 into 0135_baseline.sql and a rusqlite
+  # runner: a database at 134 is backed up, its _sqlx_migrations dropped and stamped 135 in one
+  # transaction; an older one is refused at boot. Production reached 134 on the bridge release
+  # (v3 45914c6b) before this move, so the deletions are accepted.
+  accepted-migrations:
+    - server/migrations/0001_baseline.sql@deleted
+    - server/migrations/0002_download_idempotency.sql@deleted
+    - server/migrations/0003_plugin_tick_state.sql@deleted
+    - server/migrations/0004_import_application.sql@deleted
+    - server/migrations/0005_library_read_perf.sql@deleted
+    - server/migrations/0007_acquire_durable_state.sql@deleted
+    - server/migrations/0010_collections_storage.sql@deleted
+    - server/migrations/0011_library_identify_state.sql@deleted
+    - server/migrations/0012_library_publish_journal.sql@deleted
+    - server/migrations/0013_library_stable_ids.sql@deleted
+    - server/migrations/0014_serving_read_perf.sql@deleted
+    - server/migrations/0015_album_artwork.sql@deleted
+    - server/migrations/0023_spotify_auth_requests.sql@deleted
+    - server/migrations/0024_import_carry.sql@deleted
+    - server/migrations/0025_download_import_decisions.sql@deleted
+    - server/migrations/0026_edition_choice.sql@deleted
+    - server/migrations/0029_drop_import_reasons.sql@deleted
+    - server/migrations/0035_library_management_automatic.sql@deleted
+    - server/migrations/0039_review_states.sql@deleted
+    - server/migrations/0040_drop_unused_tables.sql@deleted
+    - server/migrations/0041_drop_empty_tables.sql@deleted
+    - server/migrations/0042_play_history_user_track.sql@deleted
+    - server/migrations/0043_library_retag_pairs.sql@deleted
+    - server/migrations/0044_library_album_takeovers.sql@deleted
+    - server/migrations/0045_library_album_departures.sql@deleted
+    - server/migrations/0046_edition_remap_place_only.sql@deleted
+    - server/migrations/0047_local_track_aliases.sql@deleted
+    - server/migrations/0048_edition_undo_hold.sql@deleted
+    - server/migrations/0049_track_alias_overrides.sql@deleted
+    - server/migrations/0050_artist_credit_evidence.sql@deleted
+    - server/migrations/0051_publish_operation_author.sql@deleted
+    - server/migrations/0052_hands_off_replacement.sql@deleted
+    - server/migrations/0053_library_scan_held_scopes.sql@deleted
+    - server/migrations/0054_artist_credit_proofs.sql@deleted
+    - server/migrations/0055_library_scan_unjudged_tracks.sql@deleted
+    - server/migrations/0056_library_scan_mounts.sql@deleted
+    - server/migrations/0057_drop_identify_credit_tables.sql@deleted
+    - server/migrations/0058_library_track_release_date.sql@deleted
+    - server/migrations/0059_library_user_ratings.sql@deleted
+    - server/migrations/0060_library_track_hand_matches.sql@deleted
+    - server/migrations/0061_library_track_lyrics.sql@deleted
+    - server/migrations/0062_library_user_play_marks.sql@deleted
+    - server/migrations/0063_identify_artist_id_checks.sql@deleted
+    - server/migrations/0064_library_requeue_parked_reidentifications.sql@deleted
+    - server/migrations/0065_library_user_album_plays.sql@deleted
+    - server/migrations/0066_drop_durable_work_wakeups.sql@deleted
+    - server/migrations/0067_index_foreign_keys.sql@deleted
+    - server/migrations/0068_publish_operation_created_at.sql@deleted
+    - server/migrations/0069_durable_loops.sql@deleted
+    - server/migrations/0070_durable_jobs.sql@deleted
+    - server/migrations/0071_config_sections.sql@deleted
+    - server/migrations/0072_contribution_verification_on_jobs.sql@deleted
+    - server/migrations/0073_remove_unread_settings.sql@deleted
+    - server/migrations/0074_operation_work_bundle_id.sql@deleted
+    - server/migrations/0075_recycle_bin_expiry.sql@deleted
+    - server/migrations/0076_acquire_request_states.sql@deleted
+    - server/migrations/0077_plugin_library_writes.sql@deleted
+    - server/migrations/0078_library_recycle_bin_empties.sql@deleted
+    - server/migrations/0079_library_track_list_orders.sql@deleted
+    - server/migrations/0080_library_artist_counts.sql@deleted
+    - server/migrations/0081_library_genre_artwork_track_lookup.sql@deleted
+    - server/migrations/0082_library_publish_created_folders.sql@deleted
+    - server/migrations/0083_acquire_typed_reasons.sql@deleted
+    - server/migrations/0084_acquire_task_plan.sql@deleted
+    - server/migrations/0085_acquire_held_entries.sql@deleted
+    - server/migrations/0086_library_scan_fence.sql@deleted
+    - server/migrations/0087_acquire_held_retry.sql@deleted
+    - server/migrations/0088_library_placeholder_artist_ids.sql@deleted
+    - server/migrations/0089_library_tracks_download_task_index.sql@deleted
+    - server/migrations/0090_acquire_queue_gave_way.sql@deleted
+    - server/migrations/0091_compat_jellyfin_ids.sql@deleted
+    - server/migrations/0092_library_repair_purpose.sql@deleted
+    - server/migrations/0093_library_lowered_mbid_indexes.sql@deleted
+    - server/migrations/0094_library_track_search_key.sql@deleted
+    - server/migrations/0095_catalog_discover_tables.sql@deleted
+    - server/migrations/0096_acquire_schema_conventions.sql@deleted
+    - server/migrations/0097_library_publish_typed_seams.sql@deleted
+    - server/migrations/0098_catalog_artist_genres.sql@deleted
+    - server/migrations/0099_acquire_discovery_batches.sql@deleted
+    - server/migrations/0100_library_review_revisions.sql@deleted
+    - server/migrations/0101_auth_schema_conventions.sql@deleted
+    - server/migrations/0102_library_media_refresh_jobs.sql@deleted
+    - server/migrations/0103_library_folder_digests.sql@deleted
+    - server/migrations/0104_library_binned_copy_identity.sql@deleted
+    - server/migrations/0105_library_leftover_checks.sql@deleted
+    - server/migrations/0106_library_measured_lengths.sql@deleted
+    - server/migrations/0107_acquire_library_off_reason.sql@deleted
+    - server/migrations/0108_library_scan_fence_resolutions.sql@deleted
+    - server/migrations/0109_library_scan_fence_resolution_guard.sql@deleted
+    - server/migrations/0110_settings_one_recycle_bin.sql@deleted
+    - server/migrations/0111_library_publish_resolution_found.sql@deleted
+    - server/migrations/0112_acquire_acoustid_unavailable.sql@deleted
+    - server/migrations/0113_settings_recycle_retention.sql@deleted
+    - server/migrations/0114_library_scan_schedule_thirty_minutes.sql@deleted
+    - server/migrations/0115_library_jobs_management_publish_conventions.sql@deleted
+    - server/migrations/0116_settings_drop_primary_source.sql@deleted
+    - server/migrations/0117_library_tables_conventions.sql@deleted
+    - server/migrations/0118_catalog_playlists_conventions.sql@deleted
+    - server/migrations/0119_library_catalog_conventions.sql@deleted
+    - server/migrations/0120_compat_user_settings.sql@deleted
+    - server/migrations/0121_catalog_remaining_conventions.sql@deleted
+    - server/migrations/0122_request_watch_removed.sql@deleted
+    - server/migrations/0123_recording_ids_on_links_and_entries.sql@deleted
+    - server/migrations/0124_compat_media_conventions.sql@deleted
+    - server/migrations/0125_acquire_format_not_listed.sql@deleted
+    - server/migrations/0126_looks_wrong_and_album_needs_check.sql@deleted
+    - server/migrations/0127_app_tool_kernel_concerts_conventions.sql@deleted
+    - server/migrations/0128_library_publish_cover_put_back.sql@deleted
+    - server/migrations/0129_library_state_checks.sql@deleted
+    - server/migrations/0130_media_play_history_strict.sql@deleted
+    - server/migrations/0131_auth_user_connections_strict.sql@deleted
+    - server/migrations/0132_catalog_event_start_text.sql@deleted
+    - server/migrations/0133_acquire_download_origin_check.sql@deleted
+    - server/migrations/0134_kernel_loop_states.sql@deleted
+  suites:                         # upstream .github/workflows/v3-ci.yml and frontend-ci.yml, replayed
+    - name: server                # jobs Tests, Clippy, Format; Licenses/Audit = cargo-deny (deny: on for server/Cargo.toml)
+      image: rust:1.89.0-bookworm@sha256:948f9b08a66e7fe01b03a98ef1c7568292e07ec2e4fe90d88c07bb14563c84ff
+      workdir: server             # rustup follows rust-toolchain.toml, also when upstream moves it
+      # tests on 4 threads: the module's default test-threads (base/dagger-modules 92c5325); 16
+      # threads under the runner's 8-CPU quota time out an upstream test (PoolTimedOut)
+      steps:
+        - apt-get update -qq && apt-get install -y -qq --no-install-recommends cmake   # opusic-sys builds a bundled C library
+        - rustup component add clippy rustfmt
+        - cargo fmt --check
+        - cargo clippy --workspace --all-targets -- -D warnings
+        - cargo clippy --workspace --lib --bins -- -D warnings
+        # -j 3: at the default (one build job per CPU) this step filled the dind container's
+        # then 8 GiB and the run thrashed for hours (sync PR #75, 2026-10-27: `cargo test` from
+        # 01:20Z, OOM kill in the runner pod at 03:04Z; kubernetes/forgejo-runner now allows
+        # 12 GiB). Linking the test binaries in parallel is the measured peak: locally
+        # `ld terminated with signal 9` in a 16 GiB VM at the default, green at -j 3.
+        - cargo test --workspace -j 3
+    - name: frontend              # jobs Lint, Format & Type Check, Tests
+      image: node:22-bookworm@sha256:e273cf2a19c7334c03f52e2ca933ecdfc3fbfaad49db7b8bc8c3edd9ac34e9c7
+      workdir: frontend           # .github/node-version: 22; pnpm from package.json packageManager
+      caches: [/root/.local/share/pnpm/store, /root/.cache/ms-playwright]
+      steps:
+        - corepack enable && corepack install
+        - pnpm install --frozen-lockfile
+        - pnpm run lint
+        - pnpm run format:check
+        - pnpm run check
+        # --retry.count=1: a test that fails and then passes is reported as flaky, not red. A flaky
+        # upstream test failed two fork-checks in a row on 2026-10-30 (SearchSuggestions
+        # debounce, ~50 min per rerun); a real regression still fails twice
+        - pnpm exec vitest run --project server --retry.count=1
+        - pnpm exec playwright install --with-deps chromium
+        - pnpm exec vitest run --project client --retry.count=1
