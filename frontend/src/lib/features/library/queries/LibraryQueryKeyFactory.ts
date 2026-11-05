@@ -17,6 +17,12 @@ export interface LibraryV3AlbumsParams {
 	formatMode?: 'with' | 'without';
 	/** Only albums with at least this many tracks in the library. */
 	minTracks?: number;
+	/** Read `minTracks` the other way: only albums with fewer. */
+	tracksBelow?: boolean;
+	/** Only albums the caller rated: this many stars, see `ratingMode`. */
+	rating?: number;
+	/** `at_least` (default) this many stars or more; `at_most` or fewer. */
+	ratingMode?: 'at_least' | 'at_most';
 	/** Only the caller's favourites; without a sort, the newest first. */
 	favorites?: boolean;
 }
@@ -29,6 +35,12 @@ export interface LibraryV3ArtistsParams {
 	scope?: 'all' | 'album_artists' | 'contributors';
 	/** Only artists with at least this many tracks in the library. */
 	minTracks?: number;
+	/** Read `minTracks` the other way: only artists with fewer. */
+	tracksBelow?: boolean;
+	/** Only artists the caller rated: this many stars, see `ratingMode`. */
+	rating?: number;
+	/** `at_least` (default) this many stars or more; `at_most` or fewer. */
+	ratingMode?: 'at_least' | 'at_most';
 	/** Only the caller's favourites; without a sort, the newest first. */
 	favorites?: boolean;
 }
@@ -41,6 +53,13 @@ export interface LibraryV3TracksParams {
 	albumId?: string;
 	artistId?: string;
 	genre?: string;
+	/** Track formats to keep, or with `formatMode: 'without'` to hide. */
+	formats?: string[];
+	formatMode?: 'with' | 'without';
+	/** Only tracks the caller rated: this many stars, see `ratingMode`. */
+	rating?: number;
+	/** `at_least` (default) this many stars or more; `at_most` or fewer. */
+	ratingMode?: 'at_least' | 'at_most';
 	/** Only the caller's favourites; without a sort, the newest first. */
 	favorites?: boolean;
 }
