@@ -11,8 +11,9 @@
 	// keep (With) or hide (Without), each with its count, and the caller's
 	// star rating. Each category has its own direction. The menu changes the
 	// filters as it goes; the list follows. A category is shown only when
-	// the page passes its handler.
-	import { Check, ListFilter, Star, X } from 'lucide-svelte';
+	// the page passes its handler. On the album list the button reads as
+	// the format select it leads with.
+	import { Check, Layers, ListFilter, Star, X } from 'lucide-svelte';
 	import Button from '$lib/ui/Button.svelte';
 	import IconButton from '$lib/ui/IconButton.svelte';
 	import Popover from '$lib/ui/Popover.svelte';
@@ -67,6 +68,12 @@
 	);
 	const label = (min: number) =>
 		tracksMode === 'below' ? `< ${min}` : min <= 1 ? 'Any' : `${min}+`;
+	const buttonLabel = $derived.by(() => {
+		if (!formatCounts || !onFormats) return 'Filter';
+		if (formats.length === 0) return 'All formats';
+		const list = formats.map((format) => format.toUpperCase()).join(', ');
+		return formatMode === 'without' ? `Without ${list}` : list;
+	});
 
 	function toggleFormat(format: string) {
 		const next = formats.includes(format)
@@ -98,7 +105,14 @@
 	</div>
 {/snippet}
 
-<Popover label="Filter" title="Filters" icon={ListFilter} count={active}>
+<Popover
+	label={buttonLabel}
+	title="Filters"
+	icon={formatCounts && onFormats ? Layers : ListFilter}
+	caret={Boolean(formatCounts && onFormats)}
+	count={active}
+	class={formatCounts && onFormats ? 'sm:w-58' : ''}
+>
 	{#snippet children(close)}
 		{#if onMinTracks}
 			<div class="space-y-2">
@@ -175,7 +189,7 @@
 						>
 					{/each}
 				</div>
-				<p class="text-xs text-base-content/60">
+				<p class="text-xs text-muted">
 					{formatMode === 'without'
 						? 'Hides the marked formats.'
 						: 'Shows only the marked formats.'}

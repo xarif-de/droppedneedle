@@ -202,24 +202,20 @@ impl PollTimeSource for EventsPollTime {
 }
 
 /// The lookups library precache warms: the catalog bundle's artist and
-/// album pages and its artwork service. A bundle without them is a boot
-/// error, never a precache that quietly does nothing.
+/// album pages and its artwork service.
 pub fn catalog_precache(
     catalog_setup: &droppedneedle_catalog::wiring::CatalogSetup,
     config: &Arc<ConfigStore>,
     listening: droppedneedle_media::playback::listening::ListeningStore,
-) -> Result<Arc<dyn PrecacheSources>, String> {
-    match (&catalog_setup.metadata, &catalog_setup.artwork) {
-        (Some(catalog), Some(artwork)) => Ok(Arc::new(
-            droppedneedle_catalog::metadata::precache::CatalogPrecache::new(
-                catalog.catalog.clone(),
-                artwork.clone(),
-                config.live(),
-                listening,
-            ),
-        )),
-        _ => Err("the catalog bundle has no artist pages or artwork service".to_owned()),
-    }
+) -> Arc<dyn PrecacheSources> {
+    Arc::new(
+        droppedneedle_catalog::metadata::precache::CatalogPrecache::new(
+            catalog_setup.metadata.catalog.clone(),
+            catalog_setup.artwork.clone(),
+            config.live(),
+            listening,
+        ),
+    )
 }
 
 /// Everything `create_app` and `serve` need for jobs: the supervisor, the
@@ -266,7 +262,8 @@ impl QueueSetup {
         let db = platform.db.clone();
         #[cfg(any(test, feature = "test-support"))]
         if platform.config.test_hooks {
-            use droppedneedle_kernel::clock::{Clock, ManualClock, SystemClock};
+            use droppedneedle_kernel::clock::{Clock, SystemClock};
+            use droppedneedle_kernel::test_support::ManualClock;
             let clock = ManualClock::at(SystemClock.now_ms());
             return Self {
                 queue: JobQueue::new(db, Arc::new(clock.clone())),
@@ -473,11 +470,11 @@ pub mod scripted {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
-    use droppedneedle_kernel::clock::ManualClock;
     use droppedneedle_kernel::jobs::BoxFuture;
     use droppedneedle_kernel::jobs::queue::{
         JobCtx, JobHandler, JobKind, KindSpec, Outcome, PAYLOAD_INVALID,
     };
+    use droppedneedle_kernel::test_support::ManualClock;
     use serde::Deserialize;
     use tokio::sync::Semaphore;
 

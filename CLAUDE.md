@@ -110,7 +110,8 @@ Run from the repo root. `make help` lists every target.
   implementation needs a reason beside it; cutting a dependency between two
   areas is one.
 - Wall time comes from the one kernel clock (`kernel/src/clock.rs`, passed
-  in), never `SystemTime::now()` in an area; tests use its `ManualClock`.
+  in), never `SystemTime::now()` in an area; tests use the kernel's
+  `test_support::ManualClock`.
   Files that still read the system clock are listed with a reason in
   `server/clock-outside-kernel.txt`; `source_gates.rs` fails on any other
   read and on a listed file that no longer reads it.
@@ -697,14 +698,42 @@ Run from the repo root. `make help` lists every target.
   draft, dirty, save, test and mask-means-keep in one place, with the
   unsaved-changes guard; a tab never hand-writes that state.
 - Stores hold client and session state only.
-- UI: Tailwind v4 with DaisyUI tokens in `src/app.css`, no new hex colors.
+- UI: Tailwind v4 with the daisyUI themes and the named colours (muted,
+  title, action, paper, focus, edge, line) in `src/theme.css`, no new hex
+  colors elsewhere.
   Build on `src/lib/ui` (`Button`, `IconButton`, `Card`, `Input`, `Modal`,
   `CardTitle`, `CardActions`, `ConfirmDialog`, `Field`, `TextField`,
-  `NumberField`, `SecretField`, `SelectField`, `TextAreaField`, `ToggleRow`,
-  `RadioCards`,
-  `SaveBar`,
-  `AsyncButton`, `QueryBoundary`, `RatingStars`, `PageShell`, `Toaster`,
-  `CoverPlaceholder`, `UnsavedChangesGuard`):
+  `NumberField`, `SecretField`, `PasswordField`, `SelectField`, `TextAreaField`,
+  `ToggleRow`, `RadioCards`, `StatusChip`, `SectionHead` (a shelf's title
+  row), `ListPageHeader` (a browse page's title, count, lede or a hub's
+  tagline, ticket and record, with an optional brush stroke after the title;
+  `backStyle="link"` puts a mono caps back link over the title, `compact`
+  suits a working page),
+  `SaveBar`, `AsyncButton`, `QueryBoundary`, `RatingStars` (`quiet`
+  in list rows), `StatRow` (counts split by rules), `JumpTabs` (a page's
+  sticky section strip; `look="pills"` fills the current link, `actions` sit at
+  its end, `look="rail"` stands it in a left column with icons, `onjump`
+  opens a folded section first), `HalftonePhoto` (a photo printed as a fading
+  halftone), `FillText` (text that fills its flex parent's height and fades
+  where it is cut), `Knob` (a rotary slider: a dial over a dotted scale),
+  `SideDrawer` (a panel from the right over a dimmed page, with `Tabs`'
+  `caps` look for its tabs), `PageShell`, `Toaster`, `CoverPlaceholder`,
+  `UnsavedChangesGuard`, `Logo`, `PaperPanel` (the light island), `Card`'s
+  `torn` paper and `acid` torn sheet, `Modal`'s and `ConfirmDialog`'s
+  `paper` stock (a confirm that starts a write), `Button`'s condensed caps
+  sizes (`display`, `display-sm`), `paper` outline (a button on a paper card)
+  and `danger-outline` (a red outline beside outline buttons), `AuthFrame`
+  and `AuthCard` (a signed-out page's frame and its torn paper card with
+  folder tabs),
+  the `dn-toolbar` and `dn-list-grid` classes for a list's controls and grid,
+  and the decoration `FritFrame` (the page's dot frame, mounted once by the
+  shell and once by `AuthFrame`), `FritEdge`, `VinylSleeve`, `VinylRecord`, `BarcodeOrnament`,
+  `BarcodeTicket`, `Illustration` (turntable, dripping heart, folder
+  sticker, and the halftone prints record crate, tag boxes and
+  fingerprint), `HalftoneArt` (a record, crowd or map printed in dots, for an
+  empty card's corner); in `src/lib/media` the one
+  album and artist tile, `MediaTile` (`wrapName` in a dense artist grid) and
+  `MediaTileSkeleton`):
   do not hand-write a button, a card, a text input, a modal, a confirm, a
   form row, a `<dialog>` or a query's loading, error and empty branches
   (lint refuses a `<dialog>` outside `src/lib/ui` and any `confirm()`). Lint refuses a
@@ -745,6 +774,10 @@ Run from the repo root. `make help` lists every target.
 ## Testing (brief-first, minimal, fast)
 
 - A test is a short brief saying exactly how one behavior must work.
+- Test-only code lives in the crate's one `test_support` module, or in
+  `server/tests/common` when it needs no crate internals; nothing else in
+  `src/` names the `test-support` feature except the named sites
+  (`source_gates::test_support_stays_in_named_places` lists them).
 - Write one only for what would regress silently and cost something: API
   contracts, auth, security, identity, data loss and other destructive paths,
   compat wire shapes, performance budgets. Not fakes or trivial code.

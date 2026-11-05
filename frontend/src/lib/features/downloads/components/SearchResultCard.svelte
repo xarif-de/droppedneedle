@@ -42,9 +42,7 @@
 	const isUsenet = $derived(candidate.source === 'usenet');
 	const recommended = $derived(candidate.tier === 'recommended');
 	const refusal = $derived(candidate.refusal?.[0] ?? null);
-	const noteTone = $derived(
-		recommended ? 'text-success' : refusal ? 'text-base-content/60' : 'text-warning'
-	);
+	const noteTone = $derived(recommended ? 'text-success' : refusal ? 'text-muted' : 'text-warning');
 	const scoreLabel = $derived(
 		candidate.score != null ? `score ${Math.round(candidate.score * 100)}%` : null
 	);
@@ -92,17 +90,17 @@
 			aria-hidden="true"
 		>
 			{#if isSoulseek}
-				<Disc3 class="size-7 text-base-content/60" />
+				<Disc3 class="size-7 text-muted" />
 			{:else if isUsenet}
-				<Download class="size-7 text-base-content/60" />
+				<Download class="size-7 text-muted" />
 			{:else}
-				<Puzzle class="size-7 text-base-content/60" />
+				<Puzzle class="size-7 text-muted" />
 			{/if}
 		</div>
 
 		<div class="min-w-0 flex-1">
 			<p class="truncate text-base font-semibold" title={candidate.title}>{candidate.title}</p>
-			<p class="truncate text-sm text-base-content/60" title={subtitle}>{subtitle}</p>
+			<p class="truncate text-sm text-muted" title={subtitle}>{subtitle}</p>
 			{#if refusal}
 				<p
 					class="mt-1 flex items-center gap-1 text-xs font-medium text-error"
@@ -195,41 +193,21 @@
 </Card>
 
 <style>
-	/* the sleeve tilt rides on the kit Card, outside this component's scope */
+	/* the lift rides on the kit Card, outside this component's scope */
 	:global(.sleeve-card) {
-		transform: perspective(900px) rotateY(-3deg);
-		transform-style: preserve-3d;
 		transition:
-			transform 0.35s ease,
-			box-shadow 0.35s ease;
-		animation: fade-in-up 0.3s ease both;
+			transform 0.2s ease,
+			border-color 0.2s ease;
 	}
 	:global(.sleeve-card:hover) {
-		transform: perspective(900px) rotateY(0deg) translateY(-2px);
-		box-shadow: 0 12px 30px oklch(from var(--color-base-300) l c h / 0.6);
-	}
-	.sleeve {
-		transform: translateZ(20px) rotateY(6deg);
-		box-shadow: 4px 4px 12px oklch(from var(--color-base-300) l c h / 0.7);
-	}
-	@keyframes fade-in-up {
-		0% {
-			opacity: 0;
-			transform: perspective(900px) rotateY(-3deg) translateY(10px);
-		}
-		100% {
-			opacity: 1;
-			transform: perspective(900px) rotateY(-3deg) translateY(0);
-		}
+		transform: translateY(-1px);
+		border-color: var(--dn-edge);
 	}
 	@media (prefers-reduced-motion: reduce) {
-		:global(.sleeve-card) {
-			animation: none;
-			transition: none;
-		}
+		:global(.sleeve-card),
 		:global(.sleeve-card:hover) {
+			transition: none;
 			transform: none;
-			box-shadow: none;
 		}
 	}
 </style>

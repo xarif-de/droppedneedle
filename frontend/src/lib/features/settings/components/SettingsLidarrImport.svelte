@@ -1,4 +1,5 @@
 <script lang="ts">
+	import SettingsPaneHeader from './SettingsPaneHeader.svelte';
 	import { CloudDownload } from 'lucide-svelte';
 
 	import { getLidarrImportConfigQuery } from '$lib/features/settings/queries/lidarr-import.svelte';
@@ -36,13 +37,10 @@
 </script>
 
 <section class="space-y-4">
-	<header class="space-y-1">
-		<h2 class="text-lg font-semibold">Lidarr Import</h2>
-		<p class="max-w-prose text-sm text-base-content/70">
-			Sync your monitored Lidarr artists into your follows, so you don't have to re-follow them by
-			hand. Lidarr stays independent - this reads your monitored list, it doesn't manage anything.
-		</p>
-	</header>
+	<SettingsPaneHeader
+		title="Lidarr Import"
+		description="Sync your monitored Lidarr artists into your follows, so you don't have to re-follow them by hand. Lidarr stays independent - this reads your monitored list, it doesn't manage anything."
+	/>
 
 	<Card variant="bordered" padding="none">
 		<div>
@@ -52,7 +50,7 @@
 				</div>
 				<div>
 					<h3 class="text-lg font-bold">Connection</h3>
-					<p class="text-sm text-base-content/60">
+					<p class="text-sm text-muted">
 						Save your Lidarr address and API key to unlock artist sync below.
 					</p>
 				</div>

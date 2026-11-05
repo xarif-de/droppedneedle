@@ -61,7 +61,7 @@
 		{#if syncStatus.isMinimized}
 			<!-- Minimized pill -->
 			<button
-				class="flex items-center gap-2 bg-base-200 rounded-full shadow-xl border border-base-300 pl-3 pr-2 py-1.5 w-auto max-w-full cursor-pointer hover:bg-base-300/80 transition-colors animate-slide-in-right ml-auto"
+				class="flex items-center gap-2 bg-base-200 rounded-full shadow-xl border border-line pl-3 pr-2 py-1.5 w-auto max-w-full cursor-pointer hover:bg-base-300/80 transition-colors animate-slide-in-right ml-auto"
 				onclick={() => syncStatus.expand()}
 				aria-label="Expand sync progress"
 			>
@@ -108,7 +108,7 @@
 							<div class="min-w-0">
 								<span class="font-semibold text-sm">{syncStatus.phaseLabel}</span>
 								{#if syncStatus.phaseNumber > 0}
-									<span class="text-xs text-base-content/40 ml-1">
+									<span class="text-xs text-muted ml-1">
 										{syncStatus.phaseNumber}/{syncStatus.totalPhases}
 									</span>
 								{/if}
@@ -146,7 +146,7 @@
 						></div>
 					</div>
 
-					<div class="flex justify-between items-center text-xs text-base-content/50">
+					<div class="flex justify-between items-center text-xs text-muted">
 						{#if syncStatus.totalItems === 0}
 							<span>Cached ✓</span>
 						{:else}
@@ -156,7 +156,7 @@
 					</div>
 
 					{#if syncStatus.currentItem}
-						<div class="text-xs text-base-content/35 truncate mt-1">
+						<div class="text-xs text-muted truncate mt-1">
 							{syncStatus.currentItem}
 						</div>
 					{/if}

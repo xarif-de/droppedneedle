@@ -41,7 +41,7 @@ use crate::publish::planner::UndoRecord;
 pub use crate::publish::planner::{ALBUM_REMOVED, AlbumRemoved, AlbumRemovedJob};
 use crate::publish::put_back::Refusal as PutBackRefusal;
 pub use crate::publish::put_back::{Listed as AlbumRemoval, RemovalKind};
-use crate::publish::remove::{self, Refusal, Target};
+use crate::publish::remove::{self, Guard, Refusal, Target};
 use crate::publish::session::{RemovalDone, RemovalEntry};
 use crate::reasons::Reason;
 use crate::scan::coordinator::ScanRequestError;
@@ -203,11 +203,6 @@ pub const STALE_EXCLUSION: Reason = reason(
 pub const STALE_ALBUM_REMOVAL: Reason = reason(
     "STALE_REVISION",
     "This album changed after you opened it, so nothing was removed.",
-    "Check the album, then remove it again.",
-);
-pub const STALE_ALBUM_TRACKS: Reason = reason(
-    "STALE_REVISION",
-    "This album's tracks changed after you opened it, so nothing was removed.",
     "Check the album, then remove it again.",
 );
 pub const STALE_TRACK_REMOVAL: Reason = reason(
@@ -420,8 +415,10 @@ impl Mutations {
     /// wanted clean-up is queued in the removal's own commit; `stop_wanted`
     /// stops its wanted watch, otherwise a fulfilled watch looks again.
     /// For a batch removal, which names the albums the batch caused rather
-    /// than a revision anyone saw, so nothing checks one. It waits for a
-    /// write in flight instead of answering busy.
+    /// than a revision anyone saw: the album as read here is what it
+    /// removes, and a rename or a track that joins or leaves before its
+    /// commit refuses it. It waits for a write in flight instead of
+    /// answering busy.
     pub fn remove_album(
         &self,
         album_id: &str,
@@ -477,12 +474,21 @@ impl Mutations {
         if expected.is_some() && canonical != album_id {
             return Err(MutationError::Conflict(STALE_ALBUM_REMOVAL));
         }
-        let tracks = self.album_tracks(&canonical)?;
+        let (revisions, tracks) = self.album_with_tracks(&canonical)?;
+        let (revision, listing_revision) =
+            revisions.ok_or(MutationError::NotFound(ALBUM_NOT_FOUND))?;
         let seen = expected.map(|album| Seen::Album {
             id: &canonical,
             album,
         });
         self.check_seen(seen)?;
+        // The revisions read with the tracks, so the commit removes exactly
+        // these: any track joining or leaving since moves the listing one.
+        let guard = Guard::Album {
+            album_id: canonical.clone(),
+            revision,
+            listing_revision,
+        };
         let reason_code = if delete_files {
             "ALBUM_FILES_RECYCLED"
         } else {
@@ -504,6 +510,7 @@ impl Mutations {
             expect_sha256: None,
             undo_album: Some(&canonical),
             seen,
+            guard: Some(guard),
             album_removed: release_group_mbid
                 .clone()
                 .map(|release_group_mbid| AlbumRemoved {
@@ -569,6 +576,10 @@ impl Mutations {
             undo_album: Some(&album_id),
             album_removed: None,
             seen,
+            guard: Some(Guard::Track {
+                track_id: track_id.to_owned(),
+                revision: expected_revision,
+            }),
         };
         let done = self.remove_tracks(&[track], delete_file, &removal)?;
         Ok(Removed {
@@ -604,6 +615,7 @@ impl Mutations {
             undo_album: Some(&album_id),
             album_removed: None,
             seen: None,
+            guard: None,
         };
         let done = self.remove_tracks(&[track], true, &removal)?;
         Ok(Removed {
@@ -665,22 +677,10 @@ impl Mutations {
             .map_err(ExtrasError::Remove)
     }
 
-    /// [`Self::remove_extras`] without its edition check, for a test that
-    /// works on files no edition plans. Tests only.
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn recycle_album_files(
-        &self,
-        album_id: &str,
-        track_ids: &[String],
-        actor: &str,
-    ) -> Result<Removed, MutationError> {
-        self.recycle_extras(album_id, track_ids, actor)
-    }
-
     /// Move some of one album's files into the recycle bin. The undo
     /// record is written in the same commit that takes the tracks out, so
     /// [`Self::put_back`] can put them back.
-    fn recycle_extras(
+    pub(crate) fn recycle_extras(
         &self,
         album_id: &str,
         track_ids: &[String],
@@ -698,6 +698,7 @@ impl Mutations {
             undo_album: Some(album_id),
             album_removed: None,
             seen: None,
+            guard: None,
         };
         let done = self.remove_tracks(&tracks, true, &removal)?;
         Ok(Removed {
@@ -931,9 +932,7 @@ impl Mutations {
             let changed =
                 self.db
                     .write_blocking(Lane::Foreground, "mutations.remove_tracks", |tx| {
-                        if let Some(seen) = removal.seen {
-                            seen.check(tx)?;
-                        }
+                        removal.still_asked(tx)?;
                         let now = self.clock.now_secs();
                         let changed =
                             mark_missing(tx, tracks, removal.reason_code, removal.actor, now)?;
@@ -961,24 +960,22 @@ impl Mutations {
         }
         let mut targets = Vec::with_capacity(tracks.len());
         for track in tracks {
-            let root = registry
-                .resolve(&track.root_id)
-                .ok_or(MutationError::Conflict(FILE_OUTSIDE_ROOT))?;
-            let path = join_inside(&root.path, &track.relative_path)
-                .ok_or(MutationError::Conflict(FILE_OUTSIDE_ROOT))?;
-            let probe =
-                remove::probe(&root.path, &path).map_err(|error| refusal(Refusal::from(error)))?;
-            targets.push(Target {
-                track_id: track.id.clone(),
-                root_id: track.root_id.clone(),
-                relative_path: track.relative_path.clone(),
-                probe,
-                expect_sha256: removal.expect_sha256.map(str::to_owned),
-            });
+            let target = probed_target(
+                &registry,
+                &track.id,
+                &track.root_id,
+                &track.relative_path,
+                removal.expect_sha256,
+            )
+            .map_err(|fault| match fault {
+                TargetFault::OutsideRoot => MutationError::Conflict(FILE_OUTSIDE_ROOT),
+                TargetFault::Unreadable(error) => refusal(Refusal::from(error)),
+            })?;
+            targets.push(target);
         }
         let sidecars = self.sidecars(tracks, &registry);
         // Reading the files above takes time on a large album.
-        self.check_seen(removal.seen)?;
+        self.still_asked(removal)?;
         let done = self
             .publishing
             .publish_removal(
@@ -990,9 +987,24 @@ impl Mutations {
                     album_id: album_id.to_owned(),
                 }),
                 removal.album_removed.clone(),
+                removal.guard.clone(),
                 removal.entry,
             )
-            .map_err(refusal)?;
+            .map_err(|refused| {
+                // The commit refuses rows that changed since the check
+                // above; say so as that check would have.
+                let changed = matches!(
+                    &refused,
+                    Refusal::Publish {
+                        error: PublishError::Catalog(_),
+                        kept: false
+                    }
+                );
+                match self.still_asked(removal) {
+                    Err(stale @ MutationError::Conflict(_)) if changed => stale,
+                    _ => refusal(refused),
+                }
+            })?;
         tracing::info!(
             tracks = done.track_ids.len(),
             recycled = done.recycled.len(),
@@ -1145,21 +1157,39 @@ impl Mutations {
             .read_blocking("mutations.check_seen", |conn| seen.check(conn))
     }
 
+    /// [`Removal::still_asked`] on a read connection.
+    fn still_asked(&self, removal: &Removal<'_>) -> Result<(), MutationError> {
+        self.db
+            .read_blocking("mutations.still_asked", |conn| removal.still_asked(conn))
+    }
+
     fn album_tracks(&self, album_id: &str) -> Result<Vec<TrackFile>, MutationError> {
+        self.album_with_tracks(album_id).map(|(_, tracks)| tracks)
+    }
+
+    /// The album's row and listing revisions, `None` when there is no such
+    /// row, and its listed tracks. One snapshot, so the revisions belong to
+    /// these tracks.
+    fn album_with_tracks(
+        &self,
+        album_id: &str,
+    ) -> Result<(Option<AlbumRevisions>, Vec<TrackFile>), MutationError> {
         self.db.read_blocking("mutations.album_tracks", |conn| {
+            let revision = remove::album_revisions(conn, album_id)?;
             let mut statement = conn.prepare(crate::sql::ALBUM_TRACKS.text())?;
             let rows = statement.query_map([album_id], track_row)?;
-            Ok::<_, MutationError>(rows.collect::<rusqlite::Result<_>>()?)
+            Ok::<_, MutationError>((revision, rows.collect::<rusqlite::Result<_>>()?))
         })
     }
 }
 
 fn track_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TrackFile> {
+    let row = crate::sql::IndexedTrackFile::read(row)?;
     Ok(TrackFile {
-        id: row.get(0)?,
-        album_id: row.get(1)?,
-        root_id: row.get(2)?,
-        relative_path: row.get(3)?,
+        id: row.id,
+        album_id: row.local_album_id,
+        root_id: row.root_id,
+        relative_path: row.relative_path,
     })
 }
 
@@ -1193,6 +1223,35 @@ fn rescan_scopes(album_id: &str, tracks: &[TrackFile], registry: &RootRegistry) 
             });
     }
     scopes.into_values().collect()
+}
+
+/// Why a track's file cannot be taken away.
+pub(crate) enum TargetFault {
+    /// The file's path does not lie inside a known library folder.
+    OutsideRoot,
+    /// The file could not be read.
+    Unreadable(PublishError),
+}
+
+/// The removal target for one track's file: placed inside its library
+/// folder and read once, before the publish lock (see [`remove::probe`]).
+pub(crate) fn probed_target(
+    registry: &RootRegistry,
+    track_id: &str,
+    root_id: &str,
+    relative_path: &str,
+    expect_sha256: Option<&str>,
+) -> Result<Target, TargetFault> {
+    let root = registry.resolve(root_id).ok_or(TargetFault::OutsideRoot)?;
+    let path = join_inside(&root.path, relative_path).ok_or(TargetFault::OutsideRoot)?;
+    let probe = remove::probe(&root.path, &path).map_err(TargetFault::Unreadable)?;
+    Ok(Target {
+        track_id: track_id.to_owned(),
+        root_id: root_id.to_owned(),
+        relative_path: relative_path.to_owned(),
+        probe,
+        expect_sha256: expect_sha256.map(str::to_owned),
+    })
 }
 
 /// Join a stored relative path under its root, refusing anything that
@@ -1232,14 +1291,40 @@ struct Removal<'a> {
     album_removed: Option<AlbumRemoved>,
     /// The row a person saw when they asked for the removal.
     seen: Option<Seen<'a>>,
+    /// The rows the removal was asked against, checked again in its
+    /// commit.
+    guard: Option<Guard>,
 }
 
-/// An album as a person saw it when they asked to remove it. Tracks can join
-/// an album without moving its revision, so the count is checked too.
+impl Removal<'_> {
+    /// Refuse a removal whose rows moved on from what it was asked against:
+    /// what the person saw, then the row's revision as read when it was
+    /// asked.
+    fn still_asked(&self, conn: &rusqlite::Connection) -> Result<(), MutationError> {
+        if let Some(seen) = self.seen {
+            seen.check(conn)?;
+        }
+        match &self.guard {
+            Some(guard) if !guard.holds(conn)? => Err(MutationError::Conflict(match self.seen {
+                Some(Seen::Album { .. }) => STALE_ALBUM_REMOVAL,
+                Some(Seen::Track { .. }) => STALE_TRACK_REMOVAL,
+                None => REMOVAL_CHANGED,
+            })),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// An album's row revision and listing revision.
+type AlbumRevisions = (i64, i64);
+
+/// An album as a person saw it when they asked to remove it. Its listing
+/// revision moves when it is renamed and when a track joins or leaves its
+/// list.
 #[derive(Debug, Clone, Copy)]
 pub struct SeenAlbum {
     pub revision: i64,
-    pub track_count: i64,
+    pub listing_revision: i64,
 }
 
 /// A catalog row as a person saw it.
@@ -1258,11 +1343,10 @@ impl Seen<'_> {
         };
         match self {
             Seen::Album { id, album } => {
-                if read(crate::sql::ALBUM_ROW_REVISION.text(), id)? != Some(album.revision) {
+                if remove::album_revisions(conn, id)?
+                    != Some((album.revision, album.listing_revision))
+                {
                     return Err(MutationError::Conflict(STALE_ALBUM_REMOVAL));
-                }
-                if read(crate::sql::ALBUM_INDEXED_TRACKS.text(), id)? != Some(album.track_count) {
-                    return Err(MutationError::Conflict(STALE_ALBUM_TRACKS));
                 }
             }
             Seen::Track { id, revision } => {

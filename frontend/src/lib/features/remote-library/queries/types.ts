@@ -1,6 +1,7 @@
 import type { components } from '$lib/api/v3/openapi';
 
 export type RemoteSource = components['schemas']['SourceName'];
+export type RemoteAccountMode = components['schemas']['AccountMode'];
 export type RemoteHub = components['schemas']['HubView'];
 export type RemoteAlbumPage = components['schemas']['RemotesAlbumPage'];
 export type RemoteAlbum = components['schemas']['RemotesAlbumView'];
@@ -21,7 +22,6 @@ export type BrowseHeroCard = {
 	value: number | null;
 	href: string;
 	subtitle?: string;
-	colorScheme: 'primary' | 'secondary' | 'accent';
 	icon: 'disc' | 'users' | 'music';
 };
 

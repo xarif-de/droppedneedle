@@ -106,6 +106,25 @@ describe('library tracks page', () => {
 		await expect.element(page.getByRole('button', { name: /Load more/ })).not.toBeInTheDocument();
 	});
 
+	it('sorts by album, A to Z', async () => {
+		const api = fakeApi({
+			'GET /api/v3/library/tracks': {
+				items: [track('t1', 'First Song', 'Aurora')],
+				total: 1,
+				next: null
+			},
+			'GET /api/v3/library/stats': stats
+		});
+		await renderWithQuery(TracksPage, {});
+
+		await expect.element(page.getByText('First Song')).toBeVisible();
+		await userEvent.selectOptions(page.getByRole('combobox', { name: 'Sort tracks' }), 'album');
+		await expect
+			.poll(() => api.calls('GET /api/v3/library/tracks').at(-1)?.query.get('sort'))
+			.toBe('album');
+		expect(api.calls('GET /api/v3/library/tracks').at(-1)?.query.get('order')).toBe('asc');
+	});
+
 	it('sends the format and rating filters, and keeps them for the next visit', async () => {
 		const api = fakeApi({
 			'GET /api/v3/library/tracks': (): TrackPage => ({

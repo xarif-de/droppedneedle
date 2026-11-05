@@ -17,7 +17,7 @@ How DroppedNeedle scans your music, works out which album and edition each folde
 - [Downloading from the library](#downloading-from-the-library)
 - [Lyrics](#lyrics)
 - [Ratings](#ratings)
-- [Favourites](#favourites)
+- [Favorites](#favorites)
 - [Adding a missing album to MusicBrainz](#adding-a-missing-album-to-musicbrainz)
 
 ## Browsing
@@ -41,6 +41,8 @@ While the library is switched off under Settings > Library, nothing changes your
 Between scheduled scans, DroppedNeedle checks your library folders every few minutes and starts a scan when files change. Turn this off with "Watch folders for changes" under Settings > Library > Automatic scanning; scheduled and manual scans still run.
 
 A library folder that is away, such as a share that is not mounted, loses nothing: its albums' covers and lyrics come back with it.
+
+Settings > Library won't let you remove your last library path while the library still has tracks in it. Set the path to Excluded instead if you want it left alone. If a path disappears from the settings while its tracks are still in the library, the page offers to put it back.
 
 Sub-folder rules match folder names without regard to letter case or Unicode form, on every disk. On a case-sensitive disk a rule `Live` also covers a separate `live` folder: a scan treats `live/` as Excluded when the rule is Excluded, and when the rule is included under an excluded folder it walks both. If such a folder is renamed so only its capitals change, a track whose file is at the same place under the new name goes missing at the old one, and its plays, favorites and ratings move across when the match is clear. Tracks it can't tell apart stay missing at the old name with their history.
 
@@ -130,7 +132,7 @@ An album marked "No files" has none of its files in the library now: they are mi
 
 ## Downloading from the library
 
-You can download a single track or a whole album from the library. A track comes as the original file. An album comes as a zip of its files, untouched and uncompressed, and starts downloading straight away, so even a big box set doesn't keep you waiting while the server packs it. Only files the library has scanned, sitting inside one of your library folders, can be downloaded. By default every signed-in user can download; to keep it to trusted users and admins, or admins only, change "Library downloads" under Settings > Security. Streaming is never limited by this setting. The setting is enforced in the web app and on the download addresses of both player-app APIs (Subsonic `download`, Jellyfin `/Items/{id}/Download`), and a player app is told whether its user may download. A player app that saves music through the same address it plays from is not stopped, because the server cannot tell saving from playing. So in player apps the setting holds for apps that use the download address and honour what they are told. It is not a guarantee.
+You can download a single track or a whole album from the library. A track comes as the original file. An album comes as a zip of its files, untouched and uncompressed, and starts downloading straight away, so even a big box set doesn't keep you waiting while the server packs it. Only files the library has scanned, sitting inside one of your library folders, can be downloaded. By default every signed-in user can download; to keep it to trusted users and admins, or admins only, change "Library downloads" under Settings > Security. Streaming is never limited by this setting. The setting is enforced in the web app and on the download addresses of both player-app APIs (Subsonic `download`, Jellyfin `/Items/{id}/Download`), and a player app is told whether its user may download. A player app that saves music through the same address it plays from is not stopped, because the server cannot tell saving from playing. So in player apps the setting holds for apps that use the download address and honor what they are told. It is not a guarantee.
 
 ## Lyrics
 
@@ -146,18 +148,18 @@ While a library track plays, the player shows its heart and its stars beside the
 
 The "highest rated" album list in Subsonic apps shows the albums you rated, best first. When albums, artists or tracks are merged, their ratings move to the one that stays; if you rated both, the one that stays keeps its rating. Jellyfin apps don't show ratings.
 
-## Favourites
+## Favorites
 
-The heart beside the stars adds an album, a track that has a file in your library, or an artist to your favourites; click it again to take it off. To see them, turn on Favourites on the Albums, Artists or Tracks list, or open the Favourites tile on the Library page. The list starts with your newest favourite, and the sort menu still works. On the Tracks list, Play All and Shuffle play only your favourites while the filter is on.
+The heart beside the stars adds an album, a track that has a file in your library, or an artist to your favorites; click it again to take it off. To see them, turn on Favourites on the Albums, Artists or Tracks list, or open the Favourites tile on the Library page. The list starts with your newest favorite, and the sort menu still works. On the Tracks list, Play All and Shuffle play only your favorites while the filter is on.
 
-Favourites are kept per account, and they are the same list player apps use: a heart in the web app is a star in Subsonic apps and a favourite in Jellyfin apps, and the other way round. When albums, artists or tracks are merged, their favourites move to the one that stays. Favourites on a Jellyfin or Navidrome server you linked are that server's own and are shown on its page, apart from these.
+Favorites are kept per account, and they are the same list player apps use: a heart in the web app is a star in Subsonic apps and a favorite in Jellyfin apps, and the other way round. When albums, artists or tracks are merged, their favorites move to the one that stays. Favorites on a Jellyfin or Navidrome server you linked are that server's own and are shown on its page, apart from these.
 
 ## Adding a missing album to MusicBrainz
 
 When an album in your library isn't on MusicBrainz yet, an admin or trusted user can add it from the album page with "Contribute to MusicBrainz". DroppedNeedle never edits MusicBrainz for you; it fills in the MusicBrainz release editor and you check and submit it there, under your own MusicBrainz account.
 
 1. Start the contribution. The draft is built from your files: title, artist, tracklist and lengths. Fix anything that's wrong; every value you change is marked as entered by you.
-2. Optionally pick the matching Discogs release. Its label, catalogue number, barcode and country can fill the draft, and the Discogs link goes along as a source. Discogs data is only shown for six hours, then you select the release again to refresh it.
+2. Optionally pick the matching Discogs release. Its label, catalog number, barcode and country can fill the draft, and the Discogs link goes along as a source. Discogs data is only shown for six hours, then you select the release again to refresh it.
 3. Run the duplicate check. If MusicBrainz already has the release, link to it instead and you're done. If it only has similar releases, confirm they are different editions.
 4. Open the MusicBrainz editor, review and save the release there. MusicBrainz sends you back to DroppedNeedle, which checks the new release in the background (new releases can take a few minutes to show up) and then links the album to it.
 

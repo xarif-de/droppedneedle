@@ -6,13 +6,15 @@
 		createSetFollowMutation
 	} from '$lib/features/following/queries/FollowMutations.svelte';
 	import type { FollowStatus } from '$lib/features/following/queries/types';
-	import Button from '$lib/ui/Button.svelte';
+	import Button, { type ButtonSize } from '$lib/ui/Button.svelte';
 
 	interface Props {
 		artistMbid: string;
+		/** The Follow button's size, to match the buttons beside it. */
+		size?: ButtonSize;
 	}
 
-	let { artistMbid }: Props = $props();
+	let { artistMbid, size = 'sm' }: Props = $props();
 
 	const NOT_FOLLOWING: FollowStatus = {
 		followed: false,
@@ -36,7 +38,7 @@
 <div class="flex flex-col gap-2">
 	<Button
 		variant={status.followed ? 'accent' : 'outline'}
-		size="sm"
+		{size}
 		class="w-fit"
 		onclick={() => followMutation.mutate(!status.followed)}
 		disabled={busy}
@@ -57,7 +59,7 @@
 					disabled={busy}
 					class="toggle toggle-sm toggle-primary"
 				/>
-				<span class="text-sm text-base-content/70">Auto-download new releases</span>
+				<span class="text-sm text-muted">Auto-download new releases</span>
 			</label>
 
 			{#if status.auto_download && status.auto_download_state === 'pending'}
@@ -66,7 +68,7 @@
 					Pending admin approval
 				</span>
 			{:else if declined}
-				<span class="text-xs text-base-content/50">Approval declined</span>
+				<span class="text-xs text-muted">Approval declined</span>
 			{/if}
 		</div>
 	{/if}

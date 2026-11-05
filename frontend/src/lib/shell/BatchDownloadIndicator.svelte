@@ -44,7 +44,7 @@
 	>
 		{#if batchDownloadStore.minimized}
 			<button
-				class="flex items-center gap-2 bg-base-200 rounded-full shadow-xl border border-base-300 pl-3 pr-2 py-1.5 w-auto max-w-full cursor-pointer hover:bg-base-300/80 transition-colors animate-slide-in-right ml-auto"
+				class="flex items-center gap-2 bg-base-200 rounded-full shadow-xl border border-line pl-3 pr-2 py-1.5 w-auto max-w-full cursor-pointer hover:bg-base-300/80 transition-colors animate-slide-in-right ml-auto"
 				onclick={() => batchDownloadStore.toggleMinimized()}
 				aria-label="Expand download progress"
 			>
@@ -107,7 +107,7 @@
 					<div class="mb-2 last:mb-0">
 						<div class="flex items-center justify-between text-xs mb-1">
 							<span class="font-medium truncate mr-2">{job.artistName}</span>
-							<span class="text-base-content/50 shrink-0">
+							<span class="text-muted shrink-0">
 								{completed}/{job.total}
 							</span>
 						</div>

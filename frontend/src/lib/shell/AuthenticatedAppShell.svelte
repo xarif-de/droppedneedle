@@ -32,6 +32,7 @@
 	import DegradedBanner from '$lib/shell/DegradedBanner.svelte';
 	import VersionOverlays from '$lib/shell/VersionOverlays.svelte';
 	import Footer from '$lib/shell/Footer.svelte';
+	import FritFrame from '$lib/ui/FritFrame.svelte';
 	import Toaster from '$lib/ui/Toaster.svelte';
 	import { onMount, onDestroy, untrack } from 'svelte';
 	import { cancelPendingImages } from '$lib/media/lazyImage';
@@ -57,13 +58,16 @@
 	let DiscographyModal = $state<Component | null>(null);
 	let playlistModalRef = $state<PlaylistModalHandle | undefined>(undefined);
 	let showNavigationProgress = $state(false);
-	let currentPath = $state('/');
+	let currentPath = $state(browser ? withoutBasePath(window.location.pathname) : '/');
 	let versionUpdateAvailable = $state(false);
 	let searchOpen = $state(false);
 	let moreOpen = $state(false);
 	// Settings runs as a fixed two-pane app surface: the tab rail and the content
 	// pane scroll, the document itself must not.
 	const isSettingsPane = $derived(currentPath.startsWith('/settings'));
+	// Working pages stay plain: Settings, Library Management and Downloads.
+	const PLAIN_PAGES = /^\/(settings|library\/management|downloads)(\/|$)/;
+	const framed = $derived(!PLAIN_PAGES.test(currentPath));
 
 	// Session-wide reads: the sidebar, page gates, album cards and images use them.
 	getIntegrationStatusQuery();
@@ -250,7 +254,7 @@
 
 {#if showNavigationProgress}
 	<div class="fixed top-0 left-0 right-0 z-120 pointer-events-none">
-		<progress class="progress progress-primary w-full h-1" aria-label="Loading page"></progress>
+		<progress class="progress dn-progress w-full h-1" aria-label="Loading page"></progress>
 	</div>
 {/if}
 
@@ -264,13 +268,16 @@
 		class="drawer-content flex min-w-0 flex-col isolate"
 		class:droppedneedle-pane-mode={isSettingsPane}
 	>
-		<TopBar />
+		<TopBar onsearch={() => (searchOpen = true)} />
 		<LibraryActivityStrip />
 
 		<div
 			class="droppedneedle-main-content flex-1"
 			class:droppedneedle-player-visible={playerStore.isPlayerVisible}
 		>
+			{#if framed}
+				{#key currentPath}<FritFrame />{/key}
+			{/if}
 			{@render children()}
 			{#if !isSettingsPane}<Footer />{/if}
 		</div>
@@ -316,7 +323,13 @@
 {/if}
 
 <style>
+	.dn-progress {
+		color: var(--dn-action);
+	}
+
 	.droppedneedle-main-content {
+		/* holds the dot frame, behind the page inside the column's own stacking context */
+		position: relative;
 		display: flex;
 		flex-direction: column;
 		/* fill at least the viewport below the topbar so a short page's footer still anchors to the bottom */
@@ -341,15 +354,28 @@
 		max-width: 100%;
 	}
 
-	/* app headings use the display face, like modal titles */
-	:global(.droppedneedle-main-content :is(h1, h2)) {
+	/* Page titles and big section headings use the display face, like modal
+	   titles, always uppercase. Anton has one weight and is for big type
+	   only, so an h2 set smaller than text-lg keeps the body face. */
+	:global(
+		.droppedneedle-main-content
+			:is(h1, h2:is(.text-lg, .text-xl, .text-2xl, .text-3xl, .text-4xl, .text-5xl, .text-6xl))
+	) {
 		font-family: var(--font-display);
+		font-weight: 400;
+		letter-spacing: 0.01em;
+		text-transform: uppercase;
 	}
 
-	/* structural labels go uppercase; content names keep their case via .hero-title */
-	:global(.droppedneedle-main-content :is(h1, h2):not(.hero-title)) {
+	/* a page's title is in the title colour (acid in dark, forest in light);
+	   section headings stay in the text colour */
+	:global(.droppedneedle-main-content h1:not(.alert *)) {
+		color: var(--dn-title);
+	}
+
+	/* smaller structural labels go uppercase; content names keep their case via .hero-title */
+	:global(.droppedneedle-main-content h2:not(.hero-title)) {
 		text-transform: uppercase;
-		letter-spacing: 0.02em;
 	}
 
 	.droppedneedle-main-content.droppedneedle-player-visible {

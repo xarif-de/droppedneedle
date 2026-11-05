@@ -12,9 +12,8 @@ use droppedneedle_kernel::db::writer::Lane;
 use droppedneedle_kernel::db::{Db, DbError};
 use droppedneedle_kernel::platform::Platform;
 use droppedneedle_library::contrib::ContribProviders;
-use droppedneedle_library::contrib::scripted::{ScriptedDiscogs, ScriptedMusicBrainz};
 use droppedneedle_library::identify::models::{LocalAlbumFacts, RecallResult};
-use droppedneedle_library::identify::providers::{FakeProviders, IdentifyProviders, RecallOutcome};
+use droppedneedle_library::identify::providers::{IdentifyProviders, RecallOutcome};
 use droppedneedle_library::identify::sources::{
     ArtistAnswer, EditionPage, EditionQuery, Prioritised, ReleaseAnswer, ReleaseSource,
     SourceError, Unanswered,
@@ -22,6 +21,8 @@ use droppedneedle_library::identify::sources::{
 use droppedneedle_library::jobs::service::Operations;
 use droppedneedle_library::management::enrich::EnrichmentPort;
 use droppedneedle_library::repairs::service::RepairWorker;
+use droppedneedle_library::test_support::FakeProviders;
+use droppedneedle_library::test_support::{ScriptedDiscogs, ScriptedMusicBrainz};
 use droppedneedle_library::wiring::{LibraryCore, LibraryPorts, LibraryServices, LibrarySetup};
 use droppedneedle_providers::Providers;
 
@@ -202,6 +203,16 @@ impl ScriptedContrib {
 }
 
 /// The library's services over `library`, built as the server builds them.
+/// The edition preferences a fresh install saves, over a settings store
+/// of their own under `dir`.
+pub fn default_preferences(
+    dir: &std::path::Path,
+) -> droppedneedle_library::edition_prefs::LivePreferences {
+    droppedneedle_library::edition_prefs::LivePreferences::new(&super::config_store(
+        &dir.join("edition-settings"),
+    ))
+}
+
 pub fn services(library: &LibrarySetup) -> LibraryServices {
     LibraryServices::build(library)
 }
@@ -246,7 +257,7 @@ pub fn library_with(
     outbound.identify_providers = Port::given(identify);
     outbound.contribution_providers = Port::given(ScriptedContrib::default().providers());
     let providers = Arc::new(Providers::unpaced(Arc::new(
-        droppedneedle_providers::executor::ScriptedWire::new(),
+        droppedneedle_providers::test_support::ScriptedWire::new(),
     )));
     let mb_source = providers.musicbrainz.live_source(platform.settings.live());
     let queue = droppedneedle_kernel::jobs::queue::JobQueue::new(
@@ -314,10 +325,11 @@ impl TestSql for Db {
 /// What a port's calls answer.
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// Library Management's outside sources holding nothing: no genres, lyrics,
-/// covers or AcoustID key, and MusicBrainz answering every stored release's
-/// tracks with no credits and its artists under their credited names.
-/// Planning over it changes no file for want of outside data.
+/// Library Management's outside sources with nothing to add: genre and
+/// lyrics lookups fail, there is no cover and no AcoustID key, and a
+/// release's extras come from the release document identification stored
+/// (each track's recording with no relations, artists under their credited
+/// names), failing for a release it did not store.
 pub struct NoEnrichment {
     releases: droppedneedle_library::identify::sqlite::SqliteIdentifyStore,
 }

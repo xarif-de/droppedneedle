@@ -26,12 +26,12 @@ use droppedneedle_catalog::collections::db::CollectionsDb;
 use droppedneedle_catalog::collections::store::play_marks::{MarkScope, PlayMarkStore};
 use droppedneedle_kernel::runtime_config::{ConfigStore, Crypto};
 use droppedneedle_library::identify::models::{LocalAlbumFacts, RecallResult};
-use droppedneedle_library::identify::providers::FakeProviders;
 use droppedneedle_library::identify::sqlite::SqliteIdentifyStore;
 use droppedneedle_library::management::automatic::{SETTLE_SECONDS, Settle};
 use droppedneedle_library::management::models::ResultState;
 use droppedneedle_library::matching::{CreditedArtist, Release, ReleaseTrack};
 use droppedneedle_library::scan::SqliteScanStore;
+use droppedneedle_library::test_support::FakeProviders;
 use droppedneedle_library::wiring::LibrarySetup;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -2714,9 +2714,10 @@ fn seen_track(library: &LibrarySetup, track: &str) -> i64 {
 }
 
 /// What a person saw, then a scan changed it: a file rewritten moves its
-/// track's revision, and a file added changes its album's track count, so a
-/// removal sent from the old view moves nothing. A scan that finds nothing new
-/// moves nothing either, or every removal after a scan would be refused.
+/// track's revision, and a file added or a new album title moves its
+/// album's listing revision, so a removal sent from the old view moves
+/// nothing. A scan that finds nothing new moves nothing either, or every
+/// removal after a scan would be refused.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_removal_after_a_scan_changed_what_was_seen_moves_nothing() {
     use droppedneedle_library::tags::TagField;
@@ -2762,14 +2763,16 @@ async fn a_removal_after_a_scan_changed_what_was_seen_moves_nothing() {
         let (status, body) = app.call("GET", &album_uri, &headers, None).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         format!(
-            "expected_revision={}&expected_track_count={}&delete_files=true",
-            body["row_revision"], body["track_count"]
+            "expected_revision={}&expected_listing_revision={}&delete_files=true",
+            body["row_revision"], body["listing_revision"]
         )
     };
 
     let seen = shown_track().await;
+    let seen_album = album_query().await;
     app.scan_library().await;
     assert_eq!(shown_track().await, seen, "nothing changed on disk");
+    assert_eq!(album_query().await, seen_album, "nothing changed on disk");
 
     save_tags(
         &second,
@@ -2811,6 +2814,39 @@ async fn a_removal_after_a_scan_changed_what_was_seen_moves_nothing() {
     assert!(
         first.exists() && second.exists() && third.exists(),
         "no file moved"
+    );
+
+    // A new album title keeps the album and its row revision, which other
+    // readers compare, and moves its listing revision.
+    let seen = album_query().await;
+    let (_, shown) = app.call("GET", &album_uri, &headers, None).await;
+    let renamed = shown["title"].as_str().expect("title").to_uppercase();
+    assert_ne!(
+        json!(renamed),
+        shown["title"],
+        "the fixture's title has lower case"
+    );
+    for file in [&first, &second, &third] {
+        save_tags(
+            file,
+            &[TagEdit::verbatim(TagField::Album, vec![renamed.clone()])],
+        )
+        .expect("album retitled");
+    }
+    app.scan_library().await;
+    let (status, now) = app.call("GET", &album_uri, &headers, None).await;
+    assert_eq!(status, StatusCode::OK, "{now}");
+    assert_eq!(now["title"], json!(renamed), "the same album, renamed");
+    assert_eq!(now["row_revision"], shown["row_revision"]);
+    assert_ne!(now["listing_revision"], shown["listing_revision"]);
+    let (status, body) = app
+        .call("DELETE", &format!("{album_uri}?{seen}"), &headers, None)
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], json!("STALE_REVISION"));
+    assert!(
+        first.exists() && second.exists() && third.exists(),
+        "no file moved after the rename"
     );
 
     let current = album_query().await;
@@ -2860,8 +2896,8 @@ async fn an_album_removal_names_the_row_it_saw() {
             let (status, body) = app.call("GET", &uri, headers, None).await;
             assert_eq!(status, StatusCode::OK, "{body}");
             format!(
-                "expected_revision={}&expected_track_count={}&delete_files=true",
-                body["row_revision"], body["track_count"]
+                "expected_revision={}&expected_listing_revision={}&delete_files=true",
+                body["row_revision"], body["listing_revision"]
             )
         }
     };
@@ -5076,6 +5112,119 @@ async fn a_stopped_removal_keeps_each_file_with_its_track() {
     }
 }
 
+/// An album renamed, or with one track swapped for another, after its
+/// removal was checked but before the removal commits is refused in that
+/// commit, whether a person or a batch asked: nothing moves and every track
+/// stays listed.
+#[tokio::test]
+async fn an_album_that_changes_before_its_removal_commits_keeps_its_files() {
+    use droppedneedle_library::removal::{MutationError, Mutations, SeenAlbum};
+
+    let (scratch, library, music) = bare_library("lib-remove-window").await;
+    let files = [
+        plant(&music, "Kept/01.flac", "flac_no_tags.flac"),
+        plant(&music, "Kept/02.flac", "flac_no_tags.flac"),
+        plant(&music, "Other/01.flac", "flac_no_tags.flac"),
+    ];
+    add_music_root(&library, &music).await;
+    add_admin(&library);
+    let conn = scratch_db(&scratch);
+    let track = |rel: &str| {
+        library
+            .scan_store
+            .track_at("music", rel)
+            .unwrap()
+            .expect("track indexed")
+    };
+    let (kept, leaving, joining) = (
+        track("Kept/01.flac"),
+        track("Kept/02.flac"),
+        track("Other/01.flac"),
+    );
+    let album_of = |track: &str| -> String {
+        conn.query_row(
+            "SELECT local_album_id FROM local_tracks WHERE id = ?1",
+            [track],
+            |row| row.get(0),
+        )
+        .expect("album id")
+    };
+    let (album, other) = (album_of(&kept), album_of(&joining));
+    assert_ne!(album, other);
+    let seen_now = || -> SeenAlbum {
+        conn.query_row(
+            "SELECT row_revision, listing_revision FROM local_albums WHERE id = ?1",
+            [&album],
+            |row| {
+                Ok(SeenAlbum {
+                    revision: row.get(0)?,
+                    listing_revision: row.get(1)?,
+                })
+            },
+        )
+        .expect("album revisions")
+    };
+    let seen = seen_now();
+
+    let renamed = format!("UPDATE local_albums SET title = 'Renamed' WHERE id = '{album}'");
+    let swapped = format!(
+        "UPDATE local_tracks SET local_album_id = CASE id WHEN '{leaving}' THEN '{other}' \
+         ELSE '{album}' END WHERE id IN ('{leaving}', '{joining}')"
+    );
+    for (case, change, person) in [
+        ("renamed, a person asked", renamed, true),
+        ("a track swapped, a batch asked", swapped, false),
+    ] {
+        let writer = scratch_db(&scratch);
+        library.publishing.set_publish_hooks(
+            None,
+            Some(Box::new(move |_| {
+                writer.execute_batch(&change).expect("rows changed");
+            })),
+        );
+        let mutations = Mutations::new(&library);
+        let answer = if person {
+            mutations.remove_album_now(&album, seen, true, true, "admin")
+        } else {
+            mutations.remove_album(&album, true, true, "admin")
+        };
+        library.publishing.set_publish_hooks(None, None);
+        let code = if person {
+            "STALE_REVISION"
+        } else {
+            "REMOVAL_CHANGED"
+        };
+        assert!(
+            matches!(&answer, Err(MutationError::Conflict(reason)) if reason.code == code),
+            "{case}: {answer:?}"
+        );
+        assert!(
+            files.iter().all(|file| file.exists()),
+            "{case}: a file moved"
+        );
+        for track in [&kept, &leaving, &joining] {
+            assert_eq!(availability_of(&conn, track), "indexed", "{case}");
+        }
+        assert!(no_hidden_files(&music), "{case}");
+    }
+
+    // One track in and one out before the person asked keeps the count and
+    // the row revision, but moves the listing revision they saw.
+    let shown = seen_now();
+    conn.execute_batch(&format!(
+        "UPDATE local_tracks SET local_album_id = CASE id WHEN '{joining}' THEN '{other}' \
+         ELSE '{album}' END WHERE id IN ('{leaving}', '{joining}')"
+    ))
+    .expect("tracks swapped");
+    assert_eq!(seen_now().revision, shown.revision);
+    let answer = Mutations::new(&library).remove_album_now(&album, shown, true, true, "admin");
+    assert!(
+        matches!(&answer, Err(MutationError::Conflict(reason)) if reason.code == "STALE_REVISION"),
+        "swapped before the request: {answer:?}"
+    );
+    assert!(files.iter().all(|file| file.exists()), "a file moved");
+}
+
 /// One album of two untagged files per folder `Case{index}`, every file
 /// taken out by Remove extras. Answers the album, its tracks, their
 /// paths and the undo's action id.
@@ -5293,6 +5442,60 @@ async fn a_removed_album_is_put_back_from_its_page() {
         "{refused:?}"
     );
     assert_eq!(availability_of(&conn, &gone_track), "missing");
+}
+
+/// A plugin's file that reaches placement past its deadline, or after the
+/// caller stopped waiting, is never placed: the write answers busy or
+/// cancelled and the library folder is as it was, with no folder made for
+/// it left behind.
+#[tokio::test]
+async fn a_plugin_write_past_its_budget_is_never_placed() {
+    use droppedneedle_library::publish::session::PluginFileRefusal;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    let (_scratch, library, music) = bare_library("lib-plugin-budget").await;
+    plant(&music, "Kept/01.flac", "flac_no_tags.flac");
+    add_music_root(&library, &music).await;
+    let before = snapshot_tree(&music);
+    for (case, late) in [
+        ("past the deadline", true),
+        ("caller stopped waiting", false),
+    ] {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let flag = cancelled.clone();
+        let budget = if late {
+            Duration::from_millis(200)
+        } else {
+            Duration::from_secs(30)
+        };
+        library.publishing.set_publish_hooks(
+            Some(Box::new(move |_: &Path| {
+                if late {
+                    std::thread::sleep(Duration::from_millis(400));
+                } else {
+                    flag.store(true, Ordering::SeqCst);
+                }
+            })),
+            None,
+        );
+        let added = library.core.add_plugin_file(
+            "notes",
+            "plugin/late.txt",
+            b"hello".to_vec(),
+            Instant::now() + budget,
+            &cancelled,
+            &|_, _| Ok(true),
+            &|_, _, _| Ok(()),
+        );
+        library.publishing.set_publish_hooks(None, None);
+        match (late, &added) {
+            (true, Err(PluginFileRefusal::Busy)) | (false, Err(PluginFileRefusal::Cancelled)) => {}
+            _ => panic!("{case}: {added:?}"),
+        }
+        assert_eq!(snapshot_tree(&music), before, "{case}: nothing was placed");
+        assert!(!music.join("plugin").exists(), "{case}: no folder left");
+    }
 }
 
 /// While the library-wide switch is off nothing writes to a library
@@ -5797,9 +6000,8 @@ async fn a_removed_album_is_listed_until_the_bin_lets_go_of_it() {
     };
 
     let uri = format!(
-        "/api/v3/library/albums/{removed}?expected_revision={}&expected_track_count={}\
-         &delete_files=true",
-        album["row_revision"], album["track_count"]
+        "/api/v3/library/albums/{removed}?expected_revision={}&expected_listing_revision={}&delete_files=true",
+        album["row_revision"], album["listing_revision"]
     );
     let (status, body) = app.call("DELETE", &uri, &headers, None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -5878,9 +6080,8 @@ async fn an_album_put_back_then_vanished_stays_listed() {
     };
     let shown = get(format!("/api/v3/library/albums/{album}")).await;
     let uri = format!(
-        "/api/v3/library/albums/{album}?expected_revision={}&expected_track_count={}\
-         &delete_files=true",
-        shown["row_revision"], shown["track_count"]
+        "/api/v3/library/albums/{album}?expected_revision={}&expected_listing_revision={}&delete_files=true",
+        shown["row_revision"], shown["listing_revision"]
     );
     let (status, body) = app.call("DELETE", &uri, &headers, None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -5967,9 +6168,8 @@ async fn an_album_removed_with_a_vanished_file_leaves_the_lists() {
     let shown = get(format!("/api/v3/library/albums/{album}")).await;
     assert_eq!(shown["track_count"], json!(1), "{shown}");
     let uri = format!(
-        "/api/v3/library/albums/{album}?expected_revision={}&expected_track_count={}\
-         &delete_files=true",
-        shown["row_revision"], shown["track_count"]
+        "/api/v3/library/albums/{album}?expected_revision={}&expected_listing_revision={}&delete_files=true",
+        shown["row_revision"], shown["listing_revision"]
     );
     let (status, body) = app.call("DELETE", &uri, &headers, None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -8986,8 +9186,9 @@ async fn a_management_token_confirms_only_for_its_admin_until_the_preview_expire
     use axum::body::Body;
     use axum::http::Request;
     use droppedneedle_auth::users::roles::{Role, SessionKind};
-    use droppedneedle_kernel::clock::{Clock, ManualClock};
+    use droppedneedle_kernel::clock::Clock;
     use droppedneedle_kernel::runtime_config::sections::LibraryManagementRootAssignment;
+    use droppedneedle_kernel::test_support::ManualClock;
     use droppedneedle_library::management::service::Management;
     use droppedneedle_library::management::settings as lm;
     use tower::ServiceExt as _;
@@ -10446,7 +10647,8 @@ async fn library_management_tools_journey() {
     use droppedneedle_library::management::tag_edit::TagEditRequest;
     use droppedneedle_library::tags::{TagField, read_fields};
 
-    use droppedneedle_library::management::enrich::{Cover, LyricsFound, ScriptedEnrichment};
+    use droppedneedle_library::management::enrich::{Cover, LyricsFound};
+    use droppedneedle_library::test_support::ScriptedEnrichment;
     let cover = {
         let mut bytes = Vec::new();
         image::RgbImage::from_pixel(8, 8, image::Rgb([200, 30, 30]))
@@ -11475,12 +11677,13 @@ async fn library_management_custom_edition_journey() {
 #[tokio::test]
 async fn library_management_artwork_journey() {
     use droppedneedle_kernel::runtime_config::sections::LibraryManagement;
-    use droppedneedle_library::management::enrich::{Cover, ScriptedEnrichment};
+    use droppedneedle_library::management::enrich::Cover;
     use droppedneedle_library::management::models::{Selection, SelectionKind};
     use droppedneedle_library::management::service::{Management, PreviewRequest};
     use droppedneedle_library::management::settings as lm;
     use droppedneedle_library::tags::save::read_document;
     use droppedneedle_library::tags::{TagEdit, TagField};
+    use droppedneedle_library::test_support::ScriptedEnrichment;
 
     let cover = {
         let mut bytes = Vec::new();
@@ -11765,7 +11968,7 @@ impl ManagedLibrary {
         configure: impl Fn(
             &mut droppedneedle_kernel::runtime_config::sections::LibraryManagementProfile,
         ),
-        enrichment: Arc<droppedneedle_library::management::enrich::ScriptedEnrichment>,
+        enrichment: Arc<droppedneedle_library::test_support::ScriptedEnrichment>,
     ) -> Self {
         Self::start_with(tag, configure, Some(enrichment)).await
     }
@@ -12959,8 +13162,9 @@ async fn a_mixed_id3v23_file_is_saved_as_v24() {
 #[tokio::test]
 async fn a_scrub_preview_names_the_tags_it_keeps() {
     use crate::library_tags::{flac_inject_pairs, id3_inject_frames};
-    use droppedneedle_library::management::enrich::{Cover, ScriptedEnrichment};
+    use droppedneedle_library::management::enrich::Cover;
     use droppedneedle_library::management::models::{Eligibility, SelectionKind};
+    use droppedneedle_library::test_support::ScriptedEnrichment;
 
     let mut cover = Vec::new();
     image::RgbImage::from_pixel(8, 8, image::Rgb([30, 30, 200]))
@@ -13058,9 +13262,10 @@ async fn a_scrub_preview_names_the_tags_it_keeps() {
 #[tokio::test]
 async fn an_artwork_embed_is_refused_only_when_it_would_lose_a_picture() {
     use crate::library_tags::id3_inject_frames;
-    use droppedneedle_library::management::enrich::{Cover, ScriptedEnrichment};
+    use droppedneedle_library::management::enrich::Cover;
     use droppedneedle_library::management::models::{Eligibility, SelectionKind};
     use droppedneedle_library::tags::save::read_document;
+    use droppedneedle_library::test_support::ScriptedEnrichment;
 
     let mut cover = Vec::new();
     image::RgbImage::from_pixel(8, 8, image::Rgb([30, 30, 200]))
@@ -13318,9 +13523,10 @@ async fn the_picard_profile_writes_its_fields_in_every_format() {
 /// nowhere else). The worker looks, marks the album and writes nothing.
 #[tokio::test]
 async fn a_hand_edit_of_a_managed_field_takes_the_album_over() {
-    use droppedneedle_library::management::enrich::{Cover, ScriptedEnrichment};
+    use droppedneedle_library::management::enrich::Cover;
     use droppedneedle_library::tags::save::{PictureSpec, save_tags_with_pictures};
     use droppedneedle_library::tags::{TagEdit, TagField, read_fields};
+    use droppedneedle_library::test_support::ScriptedEnrichment;
 
     let case = "isrc";
     let managed = ManagedLibrary::start("lib-takeover-isrc", |_| {}).await;
@@ -16229,9 +16435,10 @@ async fn library_journey_review_exclude_restore_dismiss() {
     rig.stop().await;
 }
 
-/// A bulk keep over 30 reviews is one review job, not 30 changes in one
-/// request: a pause holds it between reviews, a resume finishes it, and
-/// every review ends kept as tagged. A retry scoped to one sub-folder
+/// A bulk keep over the 30 reviews of one reason is one review job, not 30
+/// changes in one request: a pause holds it between reviews, a resume
+/// finishes it, and each of them ends kept as tagged while the reviews of
+/// another reason stay open. A retry scoped to one sub-folder
 /// rule is one job over that folder's albums only. The operations loop is
 /// stopped so the journey takes each step itself.
 #[tokio::test]
@@ -16298,8 +16505,22 @@ async fn bulk_review_changes_and_folder_retries_run_as_one_pausable_job() {
     for n in 0..30 {
         file(format!("keep-{n:02}"), inside.clone()).await;
     }
+    // Two reviews of another reason, which a bulk change of one reason
+    // leaves alone.
+    for n in 0..2 {
+        app.seed_with(
+            "INSERT INTO library_identify_reviews (id, local_album_id, reason_code, \
+             candidates_json, state, created_at, updated_at) \
+             VALUES (?1, ?2, 'EDITION_CLEARED_CONFLICT', '[]', 'pending', 1, 1)",
+            [format!("other-{n}"), outside.clone()],
+        )
+        .await;
+    }
 
-    let selection = json!({"action": "keep_tagged", "filter": {}});
+    let selection = json!({
+        "action": "keep_tagged",
+        "filter": {"reason_code": "AUTOMATIC_EDITION_CLEARED_TO_REVIEW"}
+    });
     let (status, preview) = app
         .call(
             "POST",
@@ -16325,7 +16546,7 @@ async fn bulk_review_changes_and_folder_retries_run_as_one_pausable_job() {
     assert_eq!(body["job"]["kind"], json!("bulk_review_apply"));
     assert_eq!(body["job"]["state"], json!("queued"));
     let job_id = body["job"]["id"].as_str().expect("job id").to_owned();
-    assert_eq!(states(), vec![("pending".to_owned(), 30)], "nothing yet");
+    assert_eq!(states(), vec![("pending".to_owned(), 32)], "nothing yet");
 
     for _ in 0..10 {
         assert!(matches!(step().await, ReviewStep::Worked(_)));
@@ -16350,7 +16571,7 @@ async fn bulk_review_changes_and_folder_retries_run_as_one_pausable_job() {
     );
     assert_eq!(
         states(),
-        vec![("pending".to_owned(), 20), ("rejected".to_owned(), 10)]
+        vec![("pending".to_owned(), 22), ("rejected".to_owned(), 10)]
     );
     let (status, body) = app
         .call("GET", "/api/v3/library/reviews/jobs", &headers, None)
@@ -16382,7 +16603,11 @@ async fn bulk_review_changes_and_folder_retries_run_as_one_pausable_job() {
         (finished.completed_count, finished.succeeded_count),
         (30, 30)
     );
-    assert_eq!(states(), vec![("rejected".to_owned(), 30)]);
+    assert_eq!(
+        states(),
+        vec![("pending".to_owned(), 2), ("rejected".to_owned(), 30)],
+        "only the chosen reason's reviews are kept as tagged"
+    );
 
     // A retry of one sub-folder rule picks only the albums inside it.
     let (status, mut settings) = app
@@ -18241,24 +18466,34 @@ async fn a_retagged_and_renamed_album_keeps_what_people_made() {
         assert!(!sent.contains(private), "{private} in {sent}");
     }
 
-    // An album marked from a player app marks the tracks that answer for
-    // it, never an old row that continued into one.
+    // An album, or an album artist, marked from a player app marks the
+    // tracks that answer for it, never an old row that continued into one.
     let path = scratch.join("app.db");
-    PlayMarkStore::new(CollectionsDb::new(
+    let marks = PlayMarkStore::new(CollectionsDb::new(
         droppedneedle_kernel::db::Db::open_for_tests(&path).expect("database opens"),
         std::sync::Arc::new(droppedneedle_kernel::clock::SystemClock),
-    ))
-    .mark("listener", MarkScope::Album(&joined), false)
-    .await
-    .expect("the album is marked");
-    let on_old_rows: i64 = db
+    ));
+    let artist: String = db
         .query_row(
-            "SELECT COUNT(*) FROM catalog_user_play_marks WHERE local_track_id IN (?1, ?2)",
-            [o4, o5],
+            "SELECT album_artist_id FROM local_albums WHERE id = ?1",
+            [&joined],
             |row| row.get(0),
         )
-        .expect("marks count");
-    assert_eq!(on_old_rows, 0, "an album mark skips the continued rows");
+        .expect("the album's artist");
+    for scope in [MarkScope::Album(&joined), MarkScope::AlbumArtist(&artist)] {
+        marks
+            .mark("listener", scope, false)
+            .await
+            .expect("the scope is marked");
+        let on_old_rows: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM catalog_user_play_marks WHERE local_track_id IN (?1, ?2)",
+                [o4, o5],
+                |row| row.get(0),
+            )
+            .expect("marks count");
+        assert_eq!(on_old_rows, 0, "a mark skips the continued rows");
+    }
 
     rescan(&library).await;
     assert_eq!(continuations(&db), 1, "a second scan moves nothing");
@@ -19916,6 +20151,8 @@ async fn scan_held_while(
         }),
         library.registry.clone(),
         Arc::new(droppedneedle_kernel::clock::SystemClock),
+        droppedneedle_library::scan::ScanEventPublisher::new(Arc::new(|_| {})),
+        droppedneedle_library::scan::watcher::WorkWakeups::new(),
     ));
     let registry = library.core.live_registry();
     coordinator
@@ -20556,6 +20793,8 @@ async fn a_file_read_before_its_rename_is_not_listed_twice() {
         }),
         library.registry.clone(),
         Arc::new(droppedneedle_kernel::clock::SystemClock),
+        droppedneedle_library::scan::ScanEventPublisher::new(Arc::new(|_| {})),
+        droppedneedle_library::scan::watcher::WorkWakeups::new(),
     ));
     let registry = library.core.live_registry();
     coordinator
@@ -21612,9 +21851,9 @@ impl ManagedLibrary {
 #[tokio::test]
 async fn the_picard_profile_writes_musicbrainz_credits() {
     use crate::library_tags::{id3_people, id3_txxx_values, mp4_freeform, vorbis_key_values};
-    use droppedneedle_library::management::enrich::ScriptedEnrichment;
     use droppedneedle_library::management::models::SelectionKind;
     use droppedneedle_library::tags::{TagField, read_fields};
+    use droppedneedle_library::test_support::ScriptedEnrichment;
 
     let scripted = Arc::new(ScriptedEnrichment::default());
     let managed = ManagedLibrary::scripted("lib-credits", |_| {}, scripted.clone()).await;
@@ -21802,8 +22041,8 @@ async fn the_picard_profile_writes_musicbrainz_credits() {
 /// worker marks the album and writes nothing.
 #[tokio::test]
 async fn automatic_credits_wait_for_musicbrainz_and_respect_a_hand_edit() {
-    use droppedneedle_library::management::enrich::ScriptedEnrichment;
     use droppedneedle_library::tags::{TagEdit, TagField, read_fields};
+    use droppedneedle_library::test_support::ScriptedEnrichment;
 
     let scripted = Arc::new(ScriptedEnrichment::default());
     let managed = ManagedLibrary::scripted("lib-credits-auto", |_| {}, scripted.clone()).await;
@@ -23449,8 +23688,8 @@ const ID_B: &str = "1d2a3b4c-0000-4000-8000-000000000002";
 #[tokio::test]
 async fn acoustid_ids_come_from_a_lookup_naming_the_files_recording() {
     use droppedneedle_kernel::runtime_config::sections::FieldMode;
-    use droppedneedle_library::management::enrich::{ScriptedAcoustId, ScriptedEnrichment};
     use droppedneedle_library::management::models::SelectionKind;
+    use droppedneedle_library::test_support::{ScriptedAcoustId, ScriptedEnrichment};
 
     let scripted = Arc::new(ScriptedEnrichment::default());
     let managed = ManagedLibrary::scripted(
@@ -23596,7 +23835,7 @@ async fn acoustid_ids_come_from_a_lookup_naming_the_files_recording() {
 /// album is written with its print and no id.
 #[tokio::test]
 async fn automatic_acoustid_without_an_answer() {
-    use droppedneedle_library::management::enrich::{ScriptedAcoustId, ScriptedEnrichment};
+    use droppedneedle_library::test_support::{ScriptedAcoustId, ScriptedEnrichment};
     use rusqlite::OptionalExtension as _;
 
     let scripted = Arc::new(ScriptedEnrichment::default());
@@ -23710,7 +23949,7 @@ async fn automatic_acoustid_without_an_answer() {
 /// The production AcoustID lookup beside the scripted other sources.
 struct LiveAcoustId {
     live: droppedneedle_catalog::enrichment::library::LiveEnrichment,
-    scripted: Arc<droppedneedle_library::management::enrich::ScriptedEnrichment>,
+    scripted: Arc<droppedneedle_library::test_support::ScriptedEnrichment>,
 }
 
 impl droppedneedle_library::management::enrich::EnrichmentPort for LiveAcoustId {
@@ -23805,9 +24044,9 @@ async fn automatic_acoustid_waits_while_library_settings_do_not_read() {
     use droppedneedle_catalog::enrichment::library::LiveEnrichment;
     use droppedneedle_catalog::lyrics::OnlineLyrics;
     use droppedneedle_catalog::metadata::upstream::{LiveCatalogSettings, Upstream};
-    use droppedneedle_library::management::enrich::ScriptedEnrichment;
+    use droppedneedle_library::test_support::ScriptedEnrichment;
     use droppedneedle_providers::Providers;
-    use droppedneedle_providers::executor::ScriptedWire;
+    use droppedneedle_providers::test_support::ScriptedWire;
 
     let rig = crate::common::auth::AuthRig::new("acoustid-unreadable").await;
     let dir = ScratchDir::new("acoustid-unreadable-settings");
@@ -23826,7 +24065,7 @@ async fn automatic_acoustid_waits_while_library_settings_do_not_read() {
             Arc::new(LiveCatalogSettings::new(&settings)),
             rig.deps.clone(),
         ),
-        None,
+        droppedneedle_catalog::test_support::artwork(&rig.platform, &providers),
         OnlineLyrics::new(&providers, settings.live()),
         providers.acoustid.clone(),
         settings.live(),
@@ -23877,8 +24116,8 @@ async fn automatic_acoustid_waits_while_library_settings_do_not_read() {
 /// looks up only the file beside it that holds neither.
 #[tokio::test]
 async fn fill_missing_acoustid_looks_up_only_the_file_without_values() {
-    use droppedneedle_library::management::enrich::{ScriptedAcoustId, ScriptedEnrichment};
     use droppedneedle_library::management::models::SelectionKind;
+    use droppedneedle_library::test_support::{ScriptedAcoustId, ScriptedEnrichment};
 
     let scripted = Arc::new(ScriptedEnrichment::default());
     let managed = ManagedLibrary::scripted("lib-acoustid-fill", |_| {}, scripted.clone()).await;
@@ -24434,10 +24673,10 @@ fn id3_user_values(path: &Path, description: &str) -> Vec<Vec<String>> {
 /// its artist are the same rows.
 #[tokio::test]
 async fn a_translating_profile_writes_english_artist_names() {
-    use droppedneedle_library::management::enrich::ScriptedEnrichment;
     use droppedneedle_library::management::models::SelectionKind;
     use droppedneedle_library::management::service::ApplyRequest;
     use droppedneedle_library::tags::{TagField, read_fields};
+    use droppedneedle_library::test_support::ScriptedEnrichment;
 
     let scripted = Arc::new(ScriptedEnrichment::default());
     let managed = ManagedLibrary::scripted("lib-names", translating, scripted.clone()).await;
@@ -24681,9 +24920,9 @@ fn texts(db: &rusqlite::Connection, sql: &str) -> Vec<String> {
 #[tokio::test]
 async fn a_run_that_adds_ids_and_translates_keeps_the_artist() {
     use droppedneedle_catalog::local::store::LocalCatalog;
-    use droppedneedle_library::management::enrich::ScriptedEnrichment;
     use droppedneedle_library::management::models::SelectionKind;
     use droppedneedle_library::tags::{TagEdit, TagField, save_tags};
+    use droppedneedle_library::test_support::ScriptedEnrichment;
 
     let scripted = Arc::new(ScriptedEnrichment::default());
     let managed = ManagedLibrary::scripted("lib-names-link", translating, scripted.clone()).await;
@@ -25217,9 +25456,9 @@ async fn a_custom_edition_passes_over_the_apps_artist_link() {
 /// answers, waking the queue writes the translated names by itself.
 #[tokio::test]
 async fn translated_names_wait_for_musicbrainz() {
-    use droppedneedle_library::management::enrich::ScriptedEnrichment;
     use droppedneedle_library::management::models::SelectionKind;
     use droppedneedle_library::tags::{TagField, read_fields};
+    use droppedneedle_library::test_support::ScriptedEnrichment;
 
     let scripted = Arc::new(ScriptedEnrichment::default());
     let managed = ManagedLibrary::scripted("lib-names-down", translating, scripted.clone()).await;
@@ -25300,8 +25539,9 @@ async fn translated_names_wait_for_musicbrainz() {
 /// per album, for both parts together.
 #[tokio::test]
 async fn credits_and_names_come_in_one_lookup() {
-    use droppedneedle_library::management::enrich::{ExtrasWanted, ScriptedEnrichment};
+    use droppedneedle_library::management::enrich::ExtrasWanted;
     use droppedneedle_library::management::models::SelectionKind;
+    use droppedneedle_library::test_support::ScriptedEnrichment;
 
     let scripted = Arc::new(ScriptedEnrichment::default());
     let managed = ManagedLibrary::scripted("lib-names-once", translating, scripted.clone()).await;
@@ -27429,8 +27669,9 @@ fn cover_png(colour: [u8; 3]) -> Vec<u8> {
 /// edition's own front, and another cover as the one the pages show.
 fn edition_sources(
     edition: Result<Option<Vec<u8>>, String>,
-) -> Arc<droppedneedle_library::management::enrich::ScriptedEnrichment> {
-    use droppedneedle_library::management::enrich::{Cover, ScriptedEnrichment};
+) -> Arc<droppedneedle_library::test_support::ScriptedEnrichment> {
+    use droppedneedle_library::management::enrich::Cover;
+    use droppedneedle_library::test_support::ScriptedEnrichment;
     let cover = |bytes: Vec<u8>| Cover {
         bytes,
         mime: "image/png".to_owned(),

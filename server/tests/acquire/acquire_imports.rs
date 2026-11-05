@@ -29,6 +29,7 @@ use droppedneedle_acquire::probes::{LiveProbes, ProbeCache, refresh_probes};
 use droppedneedle_acquire::readiness::SourceReadiness;
 use droppedneedle_acquire::settings::{ConfigLidarrSettings, ConfigSpotifySettings};
 use droppedneedle_acquire::target::Targets;
+use droppedneedle_acquire::test_support::imports_router;
 use droppedneedle_acquire::wiring::ClientLives;
 use droppedneedle_auth::users::roles::{Role, SessionKind};
 use droppedneedle_catalog::collections::db::CollectionsDb;
@@ -52,7 +53,7 @@ use droppedneedle_testkit::imports::{
 };
 use droppedneedle_testkit::musicbrainz::MockMusicBrainz;
 use droppedneedle_testkit::slskd::{MOCK_API_KEY, MockSlskd};
-use imports::handlers::{ImportsDeps, imports_router};
+use imports::handlers::ImportsDeps;
 use imports::jobs::{SPEC, SpotifyImportJobs, SpotifyImports};
 use imports::lidarr::LidarrClient;
 use imports::models::{LidarrConnectionSettings, SpotifySettings};
@@ -477,7 +478,7 @@ fn unreadable_settings(
         json!({ section: stored }).to_string(),
     )
     .expect("config.json");
-    Arc::new(droppedneedle_acquire::settings::scratch_settings(dir).expect("settings open"))
+    Arc::new(droppedneedle_acquire::test_support::scratch_settings(dir).expect("settings open"))
 }
 
 /// The bespoke Lidarr settings routes. Settings that do not read are never
@@ -1164,12 +1165,28 @@ async fn unreadable_spotify_settings_refuse_new_imports_and_hold_queued_ones() {
         })
         .await
         .expect("settings save");
-    let requeued =
-        after_commits(&bundle.db, "the job goes back", || latest_in(State::Queued)).await;
-    assert_eq!(requeued.attempts, 0, "the wait spent no attempt");
-    auth.clock.advance(10_000);
+    // It goes back with its attempt returned. Due at once it may run
+    // before the wait sees it queued, so either is the step after the hold.
+    let after = after_commits(&bundle.db, "the job goes back", || async {
+        queue_ref
+            .latest(imports::jobs::KIND, key_ref)
+            .await
+            .expect("job reads")
+            .filter(|row| matches!(row.state, State::Queued | State::Done))
+    })
+    .await;
+    if after.state == State::Queued {
+        assert_eq!(after.attempts, 0, "the wait spent no attempt");
+        auth.clock().advance(10_000);
+    }
     let done = poll_job_done(&bundle, &user_id, "sp-playlist-1").await;
     assert_eq!(done, ImportState::Done, "queued import finishes");
+    let finished = queue_ref
+        .latest(imports::jobs::KIND, key_ref)
+        .await
+        .expect("job reads")
+        .expect("the job row");
+    assert_eq!(finished.attempts, 1, "the wait spent no attempt");
 }
 
 /// A re-import that fails while its tracks are written leaves the playlist
@@ -1616,7 +1633,7 @@ async fn readiness_answers(setup: SourceSetup) -> Vec<bool> {
         JobStore::new(db.clone()),
         worker,
         targets,
-        Arc::new(QuotaLedger::unlimited(db)),
+        Arc::new(QuotaLedger::unlimited(db).expect("quota ledger")),
         platform.events.clone(),
     ));
     let principal = test_principal(&user_id, Role::User, "sess-1", SessionKind::Standard);

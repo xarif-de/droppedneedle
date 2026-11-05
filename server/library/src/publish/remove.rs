@@ -58,6 +58,55 @@ pub enum Probe {
     },
 }
 
+/// The catalog row a removal was asked against, checked before the publish
+/// lock and again inside its commit, so a change in between refuses it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Guard {
+    /// The album's row revision and its listing revision, which moves when
+    /// it is renamed and when a track joins or leaves its list.
+    Album {
+        album_id: String,
+        revision: i64,
+        listing_revision: i64,
+    },
+    /// One track's row revision.
+    Track { track_id: String, revision: i64 },
+}
+
+impl Guard {
+    /// True while the row on `conn` still has the guard's revisions.
+    pub fn holds(&self, conn: &Connection) -> rusqlite::Result<bool> {
+        match self {
+            Self::Album {
+                album_id,
+                revision,
+                listing_revision,
+            } => Ok(album_revisions(conn, album_id)? == Some((*revision, *listing_revision))),
+            Self::Track { track_id, revision } => {
+                let now: Option<i64> = conn
+                    .prepare_cached(crate::sql::TRACK_ROW_REVISION.text())?
+                    .query_row([track_id], |row| row.get(0))
+                    .optional()?;
+                Ok(now == Some(*revision))
+            }
+        }
+    }
+}
+
+/// An album's row revision and listing revision, `None` when there is no
+/// such row.
+pub(crate) fn album_revisions(
+    conn: &Connection,
+    album_id: &str,
+) -> rusqlite::Result<Option<(i64, i64)>> {
+    conn.prepare_cached(crate::sql::ALBUM_REVISIONS.text())?
+        .query_row([album_id], |row| {
+            let row = crate::sql::AlbumRevisions::read(row)?;
+            Ok((row.row_revision, row.listing_revision))
+        })
+        .optional()
+}
+
 /// Why a removal did not happen.
 #[derive(Debug)]
 pub enum Refusal {
@@ -473,6 +522,7 @@ pub fn plan(
         sidecars: kept,
         undo,
         album_removed: None,
+        guard: None,
     })
 }
 
@@ -717,6 +767,13 @@ pub(super) fn commit(
     if let Some(moved) = removal_moved(conn, &removal.items)? {
         return Err(PublishError::Catalog(
             format!("track {moved} changed under bundle {bundle_id}").into(),
+        ));
+    }
+    if let Some(guard) = &removal.guard
+        && !guard.holds(conn)?
+    {
+        return Err(PublishError::Catalog(
+            format!("the rows bundle {bundle_id} was asked against changed").into(),
         ));
     }
     for item in &removal.items {

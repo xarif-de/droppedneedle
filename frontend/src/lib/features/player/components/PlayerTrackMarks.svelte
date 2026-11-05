@@ -46,7 +46,6 @@
 {#if trackId}
 	<div class="hidden sm:flex items-center gap-1 ml-2 sm:ml-4">
 		<IconButton
-			size="sm"
 			icon={Heart}
 			variant={favorite ? 'danger-ghost' : 'ghost'}
 			label={favorite ? 'Remove from favourites' : 'Add to favourites'}

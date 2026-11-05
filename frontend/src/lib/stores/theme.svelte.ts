@@ -7,7 +7,7 @@ const STORAGE_KEY = 'droppedneedle_theme';
 const LIGHT_QUERY = '(prefers-color-scheme: light)';
 // Browser chrome colour per theme: each theme's base-100 in src/theme.css.
 // Hardcoded because the theme is applied before any stylesheet has loaded.
-const THEME_COLOR: Record<Theme, string> = { dark: '#0d120a', light: '#f6f8f3' };
+const THEME_COLOR: Record<Theme, string> = { dark: '#090e0b', light: '#f6f3e8' };
 
 export function parseThemePreference(raw: string | null): ThemePreference {
 	return raw === 'system' || raw === 'light' ? raw : 'dark';
@@ -27,23 +27,26 @@ function readPreference(): ThemePreference {
 	}
 }
 
-function apply(preference: ThemePreference): void {
+function apply(preference: ThemePreference): Theme {
 	const theme = resolveTheme(preference, matchMedia(LIGHT_QUERY).matches);
 	document.documentElement.dataset.theme = theme;
 	document.querySelector('meta[name="theme-color"]')?.setAttribute('content', THEME_COLOR[theme]);
+	return theme;
 }
 
 function createThemeStore() {
 	const initial = readPreference();
 	let preference = $state(initial);
+	// The theme showing now: the preference with 'system' resolved
+	let resolved = $state<Theme>('dark');
 
 	// The root layout imports this module, and the app's stylesheets only
 	// arrive with the lazily loaded shell, so the stored theme is in place
 	// before anything themed paints.
 	if (browser) {
-		apply(initial);
+		resolved = apply(initial);
 		matchMedia(LIGHT_QUERY).addEventListener('change', () => {
-			if (preference === 'system') apply(preference);
+			if (preference === 'system') resolved = apply(preference);
 		});
 	}
 
@@ -54,12 +57,15 @@ function createThemeStore() {
 		} catch {
 			// private mode: the choice lasts for this page only
 		}
-		apply(next);
+		resolved = apply(next);
 	}
 
 	return {
 		get preference() {
 			return preference;
+		},
+		get resolved() {
+			return resolved;
 		},
 		set
 	};

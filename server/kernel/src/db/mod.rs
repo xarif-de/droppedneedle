@@ -70,9 +70,8 @@
 //! accent-insensitive search, `savepoint` runs a part of a write that may
 //! fail alone, `scope` records which write and read closures a thread is
 //! inside, [`datalock`] is the file lock the server holds and the offline
-//! tool takes exclusively, `scratch` is the self-removing directory tests
-//! write under, [`statement`] declares the SQL every area keeps in its
-//! `sql.rs`, `sql` is this module's own, `spelled` is the one codec for a
+//! tool takes exclusively, [`statement`] declares the SQL every area keeps
+//! in its `sql.rs`, `sql` is this module's own, `spelled` is the one codec for a
 //! closed set stored as text ([`spelled!`](crate::spelled)), [`error`] holds the typed
 //! errors, and [`cache`] is the provider cache's own throwaway file, with
 //! its own writer and readers, and [`undo_dir`] is the folder of undo
@@ -95,11 +94,11 @@ pub mod migrate;
 pub mod read_pool;
 mod savepoint;
 mod scope;
-#[cfg(any(test, feature = "test-support"))]
-pub mod scratch;
 mod spelled;
 pub(crate) mod sql;
 pub mod statement;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 pub mod time;
 #[cfg(test)]
 mod time_tests;
@@ -129,9 +128,9 @@ pub use migrate::{Chain, Migration, Plan, SchemaError, Stamp, migrate, migrate_f
 pub use read_pool::{LONG_READERS, OldestRead, ReadActivity};
 pub use savepoint::savepoint;
 pub use scope::block_on;
-pub use undo_dir::UndoDir;
 #[cfg(any(test, feature = "test-support"))]
-pub use writer::TEST_PATIENCE;
+pub use test_support::TEST_PATIENCE;
+pub use undo_dir::UndoDir;
 pub use writer::{
     BACKGROUND_CHUNK_ROWS, BACKGROUND_HARD_BUDGET, BACKGROUND_QUEUE_CAPACITY,
     BACKGROUND_SOFT_BUDGET, Budget, CancelFlag, Durable, DurableLane, FOREGROUND_BURST,

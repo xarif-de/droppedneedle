@@ -22,14 +22,13 @@
 		type SessionUserLike
 	} from '$lib/features/auth/queries/types';
 	import { onDestroy } from 'svelte';
-	import { Eye, EyeOff } from 'lucide-svelte';
 	import JellyfinIcon from '$lib/media/icons/JellyfinIcon.svelte';
 	import PlexIcon from '$lib/media/icons/PlexIcon.svelte';
+	import { Link2, UserRound } from 'lucide-svelte';
+	import AuthCard from '$lib/ui/AuthCard.svelte';
+	import AuthFrame from '$lib/ui/AuthFrame.svelte';
 	import Button from '$lib/ui/Button.svelte';
-	import Card from '$lib/ui/Card.svelte';
-	import Field from '$lib/ui/Field.svelte';
-	import IconButton from '$lib/ui/IconButton.svelte';
-	import Input from '$lib/ui/Input.svelte';
+	import PasswordField from '$lib/ui/PasswordField.svelte';
 	import TextField from '$lib/ui/TextField.svelte';
 
 	type Tab = 'local' | 'plex' | 'jellyfin' | 'oidc';
@@ -180,294 +179,167 @@
 	const availableTabs = $derived(
 		(['local', 'plex', 'jellyfin', 'oidc'] as Tab[]).filter((t) => providers[t])
 	);
+
+	const TAB_LABELS: Record<Tab, string> = {
+		local: 'Username',
+		plex: 'Plex',
+		jellyfin: 'Jellyfin',
+		oidc: 'SSO'
+	};
+
+	const activeError = $derived(
+		{ local: localError, plex: plexError, jellyfin: jfError, oidc: oidcError }[activeTab]
+	);
 </script>
 
 <svelte:head>
 	<title>Sign in - DroppedNeedle</title>
 </svelte:head>
 
-<div class="login-wrap grain min-h-screen flex items-center justify-center p-4">
-	<div class="w-full max-w-md">
-		<div class="login-brand">
-			<img
-				src={withBasePath('/logo_icon.png')}
-				alt=""
-				aria-hidden="true"
-				class="dn-logo login-mark"
-			/>
-			<h1 class="login-wordmark">DroppedNeedle</h1>
-			<div class="login-rule" aria-hidden="true"></div>
-			<p class="login-sub">Sign in to continue</p>
-		</div>
-
-		<Card variant="bordered" padding="none">
-			<div>
-				{#if availableTabs.length > 1}
-					<div class="flex border-b border-base-300 px-2 pt-2">
-						{#each availableTabs as tab (tab)}
-							<button
-								type="button"
-								class="tab-btn"
-								class:tab-btn-active={activeTab === tab}
-								onclick={() => (activeTab = tab)}
-							>
-								{#if tab === 'plex'}<PlexIcon class="h-4 w-4 text-[rgb(var(--brand-plex))]" />
-								{:else if tab === 'jellyfin'}<JellyfinIcon class="h-4 w-4 text-info" />
-								{/if}
-								{tab === 'local'
-									? 'Username'
-									: tab === 'oidc'
-										? 'SSO'
-										: tab.charAt(0).toUpperCase() + tab.slice(1)}
-							</button>
-						{/each}
+<AuthFrame kicker="Sign in to continue">
+	<AuthCard error={activeError} tabs={availableTabs.length > 1 ? methodTabs : undefined}>
+		{#if activeTab === 'local'}
+			<form
+				onsubmit={(e) => {
+					e.preventDefault();
+					void handleLocalLogin();
+				}}
+				class="flex flex-col gap-5"
+			>
+				<TextField
+					label="Username"
+					placeholder="Username"
+					bind:value={username}
+					required
+					autocomplete="username"
+				/>
+				<div>
+					<PasswordField
+						label="Password"
+						placeholder="Password"
+						required
+						bind:value={password}
+						bind:shown={showPassword}
+					/>
+					<div class="mt-2 flex justify-end">
+						<a href={withBasePath('/recover-password')} class="text-sm">Forgot password?</a>
 					</div>
-				{/if}
-
-				<div class="p-6">
-					{#if activeTab === 'local'}
-						<form
-							onsubmit={(e) => {
-								e.preventDefault();
-								void handleLocalLogin();
-							}}
-							class="flex flex-col gap-4"
-						>
-							<TextField
-								label="Username"
-								placeholder="Username"
-								bind:value={username}
-								required
-								autocomplete="username"
-							/>
-							<div>
-								{@render passwordField(
-									'Password',
-									() => password,
-									(value) => (password = value),
-									showPassword,
-									() => (showPassword = !showPassword)
-								)}
-								<div class="mt-1 flex justify-end">
-									<a
-										href={withBasePath('/recover-password')}
-										class="link link-primary text-xs font-medium"
-									>
-										Forgot password?
-									</a>
-								</div>
-							</div>
-							{#if localError}
-								<div class="alert alert-error py-2 text-sm">{localError}</div>
-							{/if}
-							<Button type="submit" variant="primary" class="w-full" loading={localLogin.isPending}>
-								Sign in
-							</Button>
-						</form>
-					{:else if activeTab === 'jellyfin'}
-						<form
-							onsubmit={(e) => {
-								e.preventDefault();
-								void handleJellyfinLogin();
-							}}
-							class="flex flex-col gap-4"
-						>
-							<div class="flex items-center gap-2 mb-1">
-								<JellyfinIcon class="h-5 w-5 text-info" />
-								<span class="text-sm font-medium">Sign in with your Jellyfin account</span>
-							</div>
-							<TextField
-								label="Username"
-								placeholder="Jellyfin username"
-								bind:value={jfUsername}
-								required
-								autocomplete="username"
-							/>
-							{@render passwordField(
-								'Password',
-								() => jfPassword,
-								(value) => (jfPassword = value),
-								jfShowPassword,
-								() => (jfShowPassword = !jfShowPassword)
-							)}
-							{#if jfError}
-								<div class="alert alert-error py-2 text-sm">{jfError}</div>
-							{/if}
-							<Button
-								type="submit"
-								variant="primary"
-								class="w-full"
-								loading={jellyfinLogin.isPending}
-							>
-								Sign in with Jellyfin
-							</Button>
-						</form>
-					{:else if activeTab === 'plex'}
-						<div class="flex flex-col gap-4">
-							<div class="flex items-center gap-2 mb-1">
-								<PlexIcon class="h-5 w-5 text-[rgb(var(--brand-plex))]" />
-								<span class="text-sm font-medium">Sign in with your Plex account</span>
-							</div>
-							<p class="text-sm text-base-content/60">
-								A Plex login window will open. Sign in there and return to this page.
-							</p>
-							{#if plexError}
-								<div class="alert alert-error py-2 text-sm">{plexError}</div>
-							{/if}
-							<Button
-								variant="primary"
-								class="w-full"
-								loading={plexLoading}
-								onclick={() => void handlePlexLogin()}
-							>
-								{#if plexLoading}
-									Waiting for Plex…
-								{:else}
-									<PlexIcon class="h-4 w-4 text-current" />
-									Continue with Plex
-								{/if}
-							</Button>
-						</div>
-					{:else if activeTab === 'oidc'}
-						<div class="flex flex-col gap-4">
-							<p class="text-sm text-base-content/60">
-								Sign in using your organisation's single sign-on provider.
-							</p>
-							{#if oidcError}
-								<div class="alert alert-error py-2 text-sm">{oidcError}</div>
-							{/if}
-							<Button
-								variant="primary"
-								class="w-full"
-								loading={oidcLoading}
-								onclick={() => void handleOidcLogin()}
-							>
-								Continue with SSO
-							</Button>
-						</div>
-					{/if}
 				</div>
-			</div>
-		</Card>
-	</div>
-</div>
-
-{#snippet passwordField(
-	label: string,
-	get: () => string,
-	set: (value: string) => void,
-	shown: boolean,
-	toggle: () => void
-)}
-	<Field {label}>
-		{#snippet children(control)}
-			<div class="join w-full">
-				<Input
-					{...control}
-					{label}
-					type={shown ? 'text' : 'password'}
-					class="join-item w-full"
+				<Button
+					type="submit"
+					variant="primary"
+					size="display"
+					class="w-full"
+					loading={localLogin.isPending}
+				>
+					Sign in
+				</Button>
+			</form>
+		{:else if activeTab === 'jellyfin'}
+			<form
+				onsubmit={(e) => {
+					e.preventDefault();
+					void handleJellyfinLogin();
+				}}
+				class="flex flex-col gap-5"
+			>
+				<h2 class="login-method">Sign in with your Jellyfin account</h2>
+				<TextField
+					label="Username"
+					placeholder="Jellyfin username"
+					bind:value={jfUsername}
+					required
+					autocomplete="username"
+				/>
+				<PasswordField
+					label="Password"
 					placeholder="Password"
 					required
-					autocomplete="current-password"
-					bind:value={get, set}
+					bind:value={jfPassword}
+					bind:shown={jfShowPassword}
 				/>
-				<IconButton
-					label="Show password"
-					icon={shown ? EyeOff : Eye}
-					variant="neutral"
-					shape="square"
-					class="join-item"
-					aria-pressed={shown}
-					onclick={toggle}
-				/>
+				<Button
+					type="submit"
+					variant="primary"
+					size="display"
+					class="w-full"
+					loading={jellyfinLogin.isPending}
+				>
+					Sign in with Jellyfin
+				</Button>
+			</form>
+		{:else if activeTab === 'plex'}
+			<div class="flex flex-col gap-5">
+				<div>
+					<h2 class="login-method">Sign in with your Plex account</h2>
+					<p class="login-line">
+						A Plex login window will open. Sign in there and return to this page.
+					</p>
+				</div>
+				<Button
+					variant="primary"
+					size="display"
+					class="w-full"
+					loading={plexLoading}
+					loadingLabel="Waiting for Plex…"
+					onclick={() => void handlePlexLogin()}
+				>
+					<PlexIcon class="size-5 text-current" />
+					Continue with Plex
+				</Button>
 			</div>
-		{/snippet}
-	</Field>
+		{:else if activeTab === 'oidc'}
+			<div class="flex flex-col gap-5">
+				<p class="login-line">Sign in using your organisation's single sign-on provider.</p>
+				<Button
+					variant="primary"
+					size="display"
+					class="w-full"
+					loading={oidcLoading}
+					onclick={() => void handleOidcLogin()}
+				>
+					Continue with SSO
+				</Button>
+			</div>
+		{/if}
+	</AuthCard>
+</AuthFrame>
+
+{#snippet methodTabs()}
+	{#each availableTabs as tab (tab)}
+		<button
+			type="button"
+			class="dn-auth-tab"
+			aria-pressed={activeTab === tab}
+			onclick={() => (activeTab = tab)}
+		>
+			{#if tab === 'plex'}<PlexIcon class="text-current" />
+			{:else if tab === 'jellyfin'}<JellyfinIcon class="text-current" />
+			{:else if tab === 'oidc'}<Link2 aria-hidden="true" />
+			{:else}<UserRound aria-hidden="true" />
+			{/if}
+			<span class="dn-auth-tab__label">{TAB_LABELS[tab]}</span>
+		</button>
+	{/each}
 {/snippet}
 
 <style>
-	.tab-btn {
-		display: inline-flex;
-		align-items: center;
-		gap: 0.35rem;
-		padding: 0.5rem 0.85rem;
-		font-size: 0.875rem;
-		font-weight: 500;
-		color: oklch(from var(--color-base-content) l c h / 0.45);
-		border-bottom: 2px solid transparent;
-		transition: all 0.15s ease;
-		cursor: pointer;
-		background: none;
-		border-top: none;
-		border-left: none;
-		border-right: none;
-		margin-bottom: -1px;
-	}
-	.tab-btn:hover {
-		color: oklch(from var(--color-base-content) l c h / 0.7);
-	}
-	.tab-btn-active {
-		color: oklch(from var(--color-primary) l c h / 1);
-		border-bottom-color: oklch(from var(--color-primary) l c h / 1);
-	}
-
-	.login-wrap {
-		--grain-opacity: 0.1;
-		position: relative;
-		isolation: isolate;
-		background:
-			radial-gradient(
-				circle at 50% -8rem,
-				oklch(from var(--color-primary) l c h / 0.08),
-				transparent 22rem
-			),
-			var(--color-base-100);
-	}
-
-	.login-brand {
-		display: flex;
-		flex-direction: column;
-		align-items: center;
-		gap: 0.5rem;
-		margin-bottom: 2rem;
-	}
-
-	.login-mark {
-		height: 3rem;
-		width: auto;
-		margin-bottom: 0.25rem;
-		opacity: 0.9;
-	}
-
-	.login-wordmark {
+	.login-method {
 		font-family: var(--font-display);
-		font-weight: 800;
-		font-size: clamp(2.75rem, 14vw, 4rem);
-		line-height: 0.85;
-		letter-spacing: 0.01em;
-		color: oklch(from var(--color-base-content) l c h / 0.95);
-		text-shadow: 0 2px 1px rgb(0 0 0 / 0.4);
-	}
-
-	.login-rule {
-		height: 2px;
-		width: 7rem;
-		border-radius: 999px;
-		background: linear-gradient(
-			to right,
-			transparent,
-			oklch(from var(--color-primary) l c h / 0.6),
-			oklch(from var(--color-accent) l c h / 0.6),
-			transparent
-		);
-	}
-
-	.login-sub {
-		font-family: var(--font-mono);
-		font-size: 0.75rem;
-		letter-spacing: 0.06em;
+		font-size: 1.625rem;
+		font-weight: 400;
+		line-height: 1;
+		letter-spacing: 0.02em;
 		text-transform: uppercase;
-		color: oklch(from var(--color-base-content) l c h / 0.5);
+		color: var(--dn-paper-content);
+	}
+	.login-line {
+		margin-top: 0.625rem;
+		font-size: 0.9375rem;
+		line-height: 1.45;
+		color: var(--dn-muted);
+	}
+	.login-line:first-child {
+		margin-top: 0;
 	}
 </style>

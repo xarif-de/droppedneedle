@@ -26,7 +26,8 @@ describe('LibraryFilterMenu.svelte', () => {
 			rating: 4,
 			onRating
 		});
-		await page.getByRole('button', { name: /Filter/ }).click();
+		// On a list with formats the button reads as the format select.
+		await page.getByRole('button', { name: /FLAC/ }).click();
 
 		await page
 			.getByRole('radiogroup', { name: 'Track filter mode' })
@@ -62,7 +63,7 @@ describe('LibraryFilterMenu.svelte', () => {
 			ratingMode: 'atMost',
 			onRating
 		});
-		const button = page.getByRole('button', { name: /Filter/ });
+		const button = page.getByRole('button', { name: /All formats/ });
 		await expect.element(button).toHaveTextContent('2');
 		await button.click();
 

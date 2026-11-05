@@ -16,6 +16,8 @@
 pub mod playback;
 pub mod remotes;
 pub mod stream;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -41,14 +43,13 @@ use crate::remotes::service::RemotesService;
 use crate::remotes::source::ImportSink;
 use crate::remotes::warmup::{self, MbidIndex};
 use crate::stream::download::DownloadState;
-use crate::stream::gateway::Gateway;
+use crate::stream::gateway::{Gateway, PluginStreams};
 use crate::stream::leases::TranscodeGate;
 use crate::stream::local_files::LibraryFiles;
 use crate::stream::routes::StreamState;
 use crate::stream::transcode::{FfmpegTranscoder, OutFormat, ProcessSpawner, TranscodeSettings};
 use droppedneedle_auth::users::UsersDeps;
 use droppedneedle_kernel::clock::Clock;
-use droppedneedle_kernel::config::AppConfig;
 use droppedneedle_kernel::jobs::CancellationToken;
 use droppedneedle_kernel::jobs::queue::{JobHandler, JobQueue, KindSpec};
 use droppedneedle_kernel::mount::Routes;
@@ -173,7 +174,7 @@ impl MediaSetup {
         let http = http_factory.shared().clone();
         crate::stream::plugin_url::sweep_stale_spools(&app_config.temp_dir);
         let library = LibraryFiles::new(db.clone(), library_roots);
-        let download = DownloadState::new(Some(library.clone()), config.live());
+        let download = DownloadState::new(library.clone(), config.live());
         let resolver = remotes;
         let service = RemotesService::new(
             http.clone(),
@@ -194,18 +195,16 @@ impl MediaSetup {
             ProcessSpawner::with_path(ffmpeg.clone().unwrap_or_else(|| PathBuf::from("ffmpeg")));
         let transcoder = FfmpegTranscoder::new(spawner, Arc::new(TranscodeGate::new()));
         let gateway = Gateway::new(
-            local_root(app_config),
+            library,
+            PluginStreams {
+                host: plugins.clone(),
+                no_redirect: http_factory.direct_no_redirect().clone(),
+                spool_dir: app_config.temp_dir.clone(),
+            },
             reader,
             transcoder,
-            TranscodeSettings::default(),
+            config.live(),
             ffmpeg.is_some(),
-        )
-        .with_settings(config.live())
-        .with_library(library)
-        .with_plugins(
-            plugins.clone(),
-            http_factory.direct_no_redirect().clone(),
-            app_config.temp_dir.clone(),
         );
         let stream = StreamState {
             engine: Arc::new(gateway),
@@ -288,16 +287,6 @@ pub fn routes() -> Routes<MediaSetup> {
         .merge(playback::listening_routes::routes())
 }
 
-/// Every `sql.rs` of this crate, one line each, for the schema test.
-#[cfg(any(test, feature = "test-support"))]
-pub fn statement_files() -> Vec<droppedneedle_kernel::db::statement::StatementFile> {
-    vec![
-        playback::sql::registered(),
-        remotes::sql::registered(),
-        stream::sql::registered(),
-    ]
-}
-
 impl FromRef<MediaSetup> for RemotesDeps {
     fn from_ref(setup: &MediaSetup) -> Self {
         setup.remotes.clone()
@@ -346,10 +335,4 @@ fn transcode_settings(connect_apps: &ConnectApps) -> TranscodeSettings {
         },
         max_bitrate_kbps: connect_apps.transcode_max_bitrate_kbps,
     }
-}
-
-/// The gateway's constructor root, `<root>/music`. The built gateway
-/// resolves local keys against the live library registry instead.
-fn local_root(config: &AppConfig) -> PathBuf {
-    config.root_app_dir.join("music")
 }

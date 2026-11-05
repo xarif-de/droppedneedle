@@ -72,10 +72,9 @@
 <div class="relative inline-flex" bind:this={root}>
 	<Button
 		variant="ghost"
-		size="sm"
 		pill
 		{active}
-		class="w-8 px-0"
+		class="w-10 px-0"
 		aria-label={label}
 		title={label}
 		aria-expanded={open}

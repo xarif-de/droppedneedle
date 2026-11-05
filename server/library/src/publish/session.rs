@@ -121,7 +121,7 @@ pub struct PublishCell {
 /// administrator's "Check again" does.
 #[derive(Clone, Default)]
 pub struct RootPlacement {
-    open: std::sync::Arc<std::sync::Mutex<Option<Sandbox>>>,
+    pub(crate) open: std::sync::Arc<std::sync::Mutex<Option<Sandbox>>>,
 }
 
 impl RootPlacement {
@@ -135,18 +135,6 @@ impl RootPlacement {
             .map_or(PlacementMode::Unknown, |sandbox| {
                 sandbox.placement_mode(root_id)
             })
-    }
-
-    /// Fix a root's mode without probing. Tests only.
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn set_mode(&self, root_id: &str, mode: PlacementMode) {
-        let open = self
-            .open
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(sandbox) = open.as_ref() {
-            sandbox.set_placement_mode(root_id, mode);
-        }
     }
 
     fn follow(&self, session: Option<Sandbox>) {
@@ -1895,63 +1883,6 @@ impl Publishing {
             })
     }
 
-    /// Arm (or clear) a crash point on the open publisher, so a test can
-    /// stop a publish part way as a killed process would. Tests only.
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn arm_publish_crash(&self, point: Option<crate::publish::CrashPoint>) {
-        let registry = self.core.live_registry();
-        let mut cell = self
-            .core
-            .publish
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if cell.refresh(&registry, &self.core.root_dirs).is_ok()
-            && let Ok(open) = cell.open()
-        {
-            open.publisher.set_crash_point(point);
-        }
-    }
-
-    /// Make placement on the open publisher behave like a filesystem
-    /// without one of its steps. Tests only.
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn set_publish_seams(&self, seams: crate::publish::place::Seams) {
-        let registry = self.core.live_registry();
-        let mut cell = self
-            .core
-            .publish
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if cell.refresh(&registry, &self.core.root_dirs).is_ok()
-            && let Ok(open) = cell.open()
-        {
-            open.publisher.set_place_seams(seams);
-        }
-    }
-
-    /// Run `before_place` on the open publisher just before each file is
-    /// placed, and `before_set_aside` just before each file is set aside,
-    /// so a test can put something in the way. Tests only.
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn set_publish_hooks(
-        &self,
-        before_place: Option<crate::publish::publisher::BeforePlace>,
-        before_set_aside: Option<crate::publish::publisher::BeforePlace>,
-    ) {
-        let registry = self.core.live_registry();
-        let mut cell = self
-            .core
-            .publish
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if cell.refresh(&registry, &self.core.root_dirs).is_ok()
-            && let Ok(open) = cell.open()
-        {
-            open.publisher.set_before_place(before_place);
-            open.publisher.set_before_set_aside(before_set_aside);
-        }
-    }
-
     /// Run publish recovery now: reopen (and reconcile) when the roots
     /// changed, and retry any held bundle, so a bundle a crash left half
     /// way is finished or unwound before anyone asks how it ended.
@@ -2016,7 +1947,8 @@ impl Publishing {
     /// commit landed answers what it removed even when a later step failed:
     /// recovery finishes it. `sidecars` go with the tracks, those still as
     /// they were read. `album_removed` queues the album's clean-up in the
-    /// removal's commit. Blocking.
+    /// removal's commit, and the commit refuses once `guard` no longer
+    /// holds. Blocking.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn publish_removal(
         &self,
@@ -2026,6 +1958,7 @@ impl Publishing {
         actor: Option<&str>,
         undo: Option<crate::publish::planner::UndoRecord>,
         album_removed: Option<crate::publish::planner::AlbumRemoved>,
+        guard: Option<crate::publish::remove::Guard>,
         entry: RemovalEntry,
     ) -> Result<RemovalDone, crate::publish::remove::Refusal> {
         use crate::publish::JournalState;
@@ -2062,6 +1995,7 @@ impl Publishing {
             self.core.clock.now_system(),
         )?;
         removal.album_removed = album_removed;
+        removal.guard = guard;
         let track_ids: Vec<String> = removal
             .items
             .iter()

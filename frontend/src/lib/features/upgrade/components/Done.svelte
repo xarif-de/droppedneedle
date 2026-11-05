@@ -5,7 +5,7 @@
 		type UpgradeResult
 	} from '$lib/features/upgrade/queries/UpgradeQueries.svelte';
 	import Button from '$lib/ui/Button.svelte';
-	import Card from '$lib/ui/Card.svelte';
+	import AuthCard from '$lib/ui/AuthCard.svelte';
 	import ConfirmDialog from '$lib/ui/ConfirmDialog.svelte';
 	import { allCounts, headlineCounts } from './upgradeText';
 
@@ -32,15 +32,15 @@
 	);
 </script>
 
-<Card variant="bordered" {title}>
+<AuthCard {title}>
 	<div class="flex flex-col gap-5 text-sm">
 		{#if result?.outcome === 'started_fresh'}
-			<p class="text-base-content/70">
+			<p class="text-muted">
 				Nothing came across from v2. Continue to create the first admin account, with the code from
 				the server log.
 			</p>
 		{:else if !result || result.outcome !== 'upgraded'}
-			<p class="text-base-content/70">The data folders hold v3 data.</p>
+			<p class="text-muted">The data folders hold v3 data.</p>
 		{/if}
 
 		{#if summary}
@@ -50,17 +50,17 @@
 				<dl class="grid grid-cols-2 gap-x-6 gap-y-1 sm:grid-cols-3">
 					{#each moved as [label, count] (label)}
 						<div class="flex justify-between gap-2">
-							<dt class="text-base-content/70">{label}</dt>
+							<dt class="text-muted">{label}</dt>
 							<dd class="font-mono">{count.toLocaleString()}</dd>
 						</div>
 					{/each}
 				</dl>
 				<details class="mt-2">
-					<summary class="cursor-pointer text-base-content/60">Everything</summary>
+					<summary class="cursor-pointer text-muted">Everything</summary>
 					<dl class="mt-2 grid grid-cols-2 gap-x-6 gap-y-1 sm:grid-cols-3">
 						{#each allCounts(summary.moved) as [label, count] (label)}
 							<div class="flex justify-between gap-2">
-								<dt class="text-base-content/70">{label}</dt>
+								<dt class="text-muted">{label}</dt>
 								<dd class="font-mono">{count.toLocaleString()}</dd>
 							</div>
 						{/each}
@@ -109,25 +109,28 @@
 		{#if result?.backup}
 			<section aria-label="v2 backup">
 				<h3 class="mb-1 font-semibold">Your v2 files</h3>
-				<p class="mb-1 text-base-content/70">Kept so you can go back:</p>
+				<p class="mb-1 text-muted">Kept so you can go back:</p>
 				<p class="break-all font-mono text-xs">{result.backup.config}</p>
 				<p class="break-all font-mono text-xs">{result.backup.cache}</p>
 			</section>
 		{/if}
 
 		{#if continueError}
-			<div class="alert alert-error py-2" role="alert">{continueError}</div>
+			<div class="alert alert-soft alert-error py-2" role="alert">{continueError}</div>
 		{/if}
 	</div>
 	{#snippet actions()}
 		<div class="flex w-full flex-col-reverse gap-2 sm:flex-row sm:justify-between">
 			{#if result?.backup}
-				<Button variant="ghost" onclick={() => (confirmUndo = true)}>Go back to v2</Button>
+				<Button variant="ghost" size="display-sm" onclick={() => (confirmUndo = true)}
+					>Go back to v2</Button
+				>
 			{:else}
 				<span></span>
 			{/if}
 			<Button
 				variant="primary"
+				size="display-sm"
 				icon={ArrowRight}
 				iconPosition="end"
 				loading={continuing}
@@ -137,7 +140,7 @@
 			</Button>
 		</div>
 	{/snippet}
-</Card>
+</AuthCard>
 
 <ConfirmDialog
 	bind:open={confirmUndo}

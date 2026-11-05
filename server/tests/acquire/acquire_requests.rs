@@ -20,6 +20,7 @@ use droppedneedle_kernel::runtime_config::sections::DownloadPolicy;
 use droppedneedle_kernel::runtime_config::{ConfigStore, Live};
 use droppedneedle_media::playback::listening::{ListeningStore, PrefsPatch};
 use droppedneedle_media::playback::listening_routes::MixGrants as _;
+use droppedneedle_media::playback::models::MixGrantState;
 use droppedneedle_providers::listenbrainz::playlists::{
     RecommendationPlaylist, RecommendationTrack,
 };
@@ -82,7 +83,7 @@ pub(crate) async fn requests_state() -> (RequestsState, AcquireDb, Arc<DownloadD
         &library,
         &crate::common::bundles::collections_at(&platform).stores,
     );
-    let quota = Arc::new(QuotaLedger::unlimited(acquire.db.clone()));
+    let quota = Arc::new(QuotaLedger::unlimited(acquire.db.clone()).expect("quota ledger"));
     let state = RequestsState {
         quota,
         ..acquire.requests.clone()
@@ -216,7 +217,7 @@ impl Downloads {
 /// The download policy beside `db`, saved as `policy`.
 fn saved_policy(db: &AcquireDb, policy: DownloadPolicy) -> Live<DownloadPolicy> {
     let dir = db.path().parent().expect("scratch dir").join("settings");
-    let store = droppedneedle_acquire::settings::scratch_settings(&dir).expect("settings open");
+    let store = droppedneedle_acquire::test_support::scratch_settings(&dir).expect("settings open");
     store.save_blocking(policy).expect("policy saves");
     store.live()
 }
@@ -687,8 +688,8 @@ async fn cancel_and_retry_respect_owner_and_approval() {
         .parent()
         .expect("scratch dir")
         .join("worker-settings");
-    let settings =
-        droppedneedle_acquire::settings::scratch_settings(&settings_dir).expect("settings open");
+    let settings = droppedneedle_acquire::test_support::scratch_settings(&settings_dir)
+        .expect("settings open");
     let (worker, _) = crate::common::acquire::worker_over(
         &db,
         journal.clone(),
@@ -771,7 +772,7 @@ pub(crate) fn unreadable_policy_store(dir: &std::path::Path) -> ConfigStore {
         }
     });
     std::fs::write(dir.join("config.json"), stored.to_string()).expect("config.json");
-    let store = droppedneedle_acquire::settings::scratch_settings(dir).expect("settings open");
+    let store = droppedneedle_acquire::test_support::scratch_settings(dir).expect("settings open");
     assert!(store.live::<DownloadPolicy>().get().is_err());
     store
 }
@@ -1161,7 +1162,7 @@ async fn standing_grants_wait_for_an_admin_and_follow_the_role() {
     hooks.on_toggle("u-ada", Role::User, true).await;
     assert_eq!(
         hooks.state("u-ada", Role::User, true).await,
-        "pending",
+        MixGrantState::Pending,
         "{case}"
     );
     let approve = "/api/v3/requests/personal-mix-approvals/u-ada/approve";
@@ -1174,7 +1175,7 @@ async fn standing_grants_wait_for_an_admin_and_follow_the_role() {
     );
     assert_eq!(
         hooks.state("u-ada", Role::User, true).await,
-        "approved",
+        MixGrantState::Approved,
         "{case}"
     );
 
@@ -1214,7 +1215,7 @@ async fn standing_grants_wait_for_an_admin_and_follow_the_role() {
     hooks.on_toggle("u-tris", Role::Trusted, true).await;
     assert_eq!(
         hooks.state("u-tris", Role::Trusted, true).await,
-        "approved",
+        MixGrantState::Approved,
         "{case}"
     );
     let trusted = builder.build_for_user("u-tris", false).await.unwrap();
@@ -1234,7 +1235,7 @@ async fn standing_grants_wait_for_an_admin_and_follow_the_role() {
     .expect("demotion");
     assert_eq!(
         hooks.state("u-tris", Role::User, true).await,
-        "none",
+        MixGrantState::None,
         "{case}"
     );
     let demoted = builder.build_for_user("u-tris", true).await.unwrap();
@@ -1593,7 +1594,7 @@ async fn a_busy_database_leaves_an_ask_waiting_until_the_next_pass() {
         runtime.db().clone(),
         Arc::new(droppedneedle_kernel::clock::SystemClock),
     );
-    let settings = droppedneedle_acquire::settings::scratch_settings(&dir.join("settings"))
+    let settings = droppedneedle_acquire::test_support::scratch_settings(&dir.join("settings"))
         .expect("settings open");
     let busy = Arc::new(DownloadDispatch::new(
         Arc::new(Journal::new(held, crate::common::bundles::quiet_ticks())),
@@ -2171,7 +2172,7 @@ async fn edition_acquire_is_held_while_no_source_is_ready() {
     state.edition_plans = Arc::new(PlannedEdition { complete: false });
     let staging = crate::common::ScratchDir::new("edition-held");
     // Sources read from settings where none is set up.
-    let settings = droppedneedle_acquire::settings::scratch_settings(&staging.join("settings"))
+    let settings = droppedneedle_acquire::test_support::scratch_settings(&staging.join("settings"))
         .expect("settings open");
     let (worker, _) = crate::common::acquire::worker_over(
         &db,

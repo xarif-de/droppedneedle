@@ -7,7 +7,8 @@
 		TrackRef
 	} from '$lib/features/discover/queries/types';
 	import type { Snippet } from 'svelte';
-	import { ArrowRight, X, Check, Music2, Tv, Sparkles, Search } from 'lucide-svelte';
+	import { X, Check, Music2, Tv, Sparkles, Search } from 'lucide-svelte';
+	import SectionHead from '$lib/ui/SectionHead.svelte';
 	import CoverPlaceholder from '$lib/ui/CoverPlaceholder.svelte';
 	import { goto } from '$app/navigation';
 	import { withBasePath } from '$lib/utils/basePath';
@@ -31,6 +32,8 @@
 	import Card from '$lib/ui/Card.svelte';
 	import CardTitle from '$lib/ui/CardTitle.svelte';
 	import IconButton from '$lib/ui/IconButton.svelte';
+	import StatusChip from '$lib/ui/StatusChip.svelte';
+	import MediaTile from '$lib/media/MediaTile.svelte';
 
 	interface Props {
 		section: ChartSection;
@@ -41,6 +44,8 @@
 		showPreview?: boolean;
 		/** The row is in the first screen: its first images load without waiting. */
 		eager?: boolean;
+		/** Smaller tiles, for a shelf that shares its row with another. */
+		compact?: boolean;
 	}
 
 	let {
@@ -50,8 +55,11 @@
 		headerActions,
 		hideHeader = false,
 		showPreview = true,
-		eager = false
+		eager = false,
+		compact = false
 	}: Props = $props();
+
+	const tileWidth = $derived(compact ? 'w-28 sm:w-32 md:w-36' : 'w-32 sm:w-36 md:w-44');
 
 	const lazyAt = (i: number) => !eager || i >= EAGER_IMAGE_COUNT;
 
@@ -83,33 +91,15 @@
 
 <section class="mb-6 sm:mb-8">
 	{#if !hideHeader}
-		<div class="flex items-center justify-between mb-3 sm:mb-4">
-			<div class="flex items-center gap-2">
-				{#if headerLink}
-					<a
-						href={withBasePath(headerLink)}
-						class="section-title text-lg sm:text-xl font-bold hover:text-primary transition-colors"
-					>
-						{section.title}
-					</a>
-				{:else}
-					<h2 class="section-title text-lg sm:text-xl font-bold">{section.title}</h2>
-				{/if}
+		<SectionHead
+			title={section.title}
+			href={headerLink ? withBasePath(headerLink) : null}
+			actions={headerActions}
+		>
+			{#snippet chips()}
 				<SourceBadge source={section.source ?? undefined} />
-			</div>
-			{#if headerActions}
-				{@render headerActions()}
-			{/if}
-			{#if headerLink}
-				<a
-					href={withBasePath(headerLink)}
-					class="text-sm text-base-content/50 hover:text-primary transition-colors flex items-center gap-1"
-				>
-					See all
-					<ArrowRight class="w-3.5 h-3.5" />
-				</a>
-			{/if}
-		</div>
+			{/snippet}
+		</SectionHead>
 	{/if}
 
 	{#if section.items.length === 0 && section.fallback_message && showConnectCard}
@@ -126,7 +116,7 @@
 						<Sparkles class="h-5 w-5" />
 					{/if}
 				</div>
-				<p class="text-base-content/70 text-sm">{section.fallback_message}</p>
+				<p class="text-muted text-sm">{section.fallback_message}</p>
 				{#if section.connect_service}
 					<Button variant="primary" size="sm" href={withBasePath('/settings')} class="mt-2">
 						Connect {section.connect_service === 'listenbrainz'
@@ -162,70 +152,67 @@
 					{@const artistHref =
 						artistHrefOrNull(item.musicbrainz_id) ??
 						(item.local_id ? localArtistHref(item.local_id) : null)}
-					<div class="w-32 sm:w-36 md:w-44 shrink-0">
-						<Card
-							variant="raised"
-							padding="none"
-							href={artistHref ?? undefined}
-							data-sveltekit-preload-data={artistHref ? 'hover' : undefined}
-							class="w-full {artistHref ? '' : 'cursor-default opacity-80'}"
-						>
-							<figure class="flex justify-center pt-4 relative">
-								<ArtistImage
-									mbid={item.musicbrainz_id ?? ''}
-									localId={item.local_id}
-									alt={item.name}
-									size="md"
-									lazy={lazyAt(i)}
-								/>
-								{#if !item.musicbrainz_id}
-									<div
-										class="absolute top-2 left-2 badge badge-ghost badge-sm"
-										title="Not linked to MusicBrainz"
-									>
-										<X class="w-3 h-3" />
-									</div>
-								{/if}
-								{#if item.in_library}
-									<div class="absolute top-2 right-2 badge badge-success badge-sm">
-										<Check class="w-3.5 h-3.5" />
-									</div>
-								{/if}
-							</figure>
-							<div class="flex flex-col items-center gap-2 px-2 pb-2 text-center">
-								<CardTitle as="h3" class="text-xs line-clamp-1">{item.name}</CardTitle>
-								{#if item.listen_count}
-									<p class="text-xs text-base-content/50">{formatListenCount(item.listen_count)}</p>
-								{/if}
-							</div>
-						</Card>
-					</div>
+					<MediaTile
+						kind="artist"
+						title={item.name}
+						href={artistHref ?? undefined}
+						class="{tileWidth} shrink-0 {artistHref ? '' : 'opacity-80'}"
+					>
+						{#snippet art()}
+							<ArtistImage
+								mbid={item.musicbrainz_id ?? ''}
+								localId={item.local_id}
+								alt={item.name}
+								size="full"
+								className="w-full h-full"
+								lazy={lazyAt(i)}
+							/>
+						{/snippet}
+						{#snippet meta()}
+							{#if item.listen_count}{formatListenCount(item.listen_count)}{:else}&nbsp;{/if}
+						{/snippet}
+						{#snippet overlay()}
+							{#if !item.musicbrainz_id}
+								<StatusChip size="xs" icon={X} class="absolute top-2 left-2">
+									<span class="sr-only">Not linked to MusicBrainz</span>
+								</StatusChip>
+							{/if}
+							{#if item.in_library}
+								<StatusChip tone="action" size="xs" icon={Check} class="absolute top-2 right-2">
+									<span class="sr-only">In library</span>
+								</StatusChip>
+							{/if}
+						{/snippet}
+					</MediaTile>
 				{:else if item.kind === 'album'}
 					{@const albumHref =
 						albumHrefOrNull(item.musicbrainz_id) ??
 						(item.local_id ? localAlbumHref(item.local_id) : null)}
 					{@const isItemRequested = item.requested || libraryStore.isRequested(item.musicbrainz_id)}
-					<div class="w-32 sm:w-36 md:w-44 shrink-0">
-						<Card
-							variant="raised"
-							padding="none"
+					<div class="{tileWidth} shrink-0">
+						<MediaTile
+							title={item.title}
 							href={albumHref ?? undefined}
-							class="group w-full {albumHref ? '' : 'cursor-default opacity-90'}"
+							class="w-full {albumHref ? '' : 'opacity-90'}"
 						>
-							<figure class="aspect-square overflow-hidden relative">
+							{#snippet art()}
 								<AlbumImage
 									mbid={item.musicbrainz_id || ''}
 									alt={item.title}
-									size="md"
-									rounded="none"
+									size="full"
 									className="w-full h-full"
 									lazy={lazyAt(i)}
 									customUrl={item.cover_url || null}
 								/>
+							{/snippet}
+							{#snippet meta()}
+								{item.artist_name || ' '}
+							{/snippet}
+							{#snippet overlay()}
 								{#if item.in_library}
-									<div class="absolute top-2 left-2 z-20 badge badge-success badge-sm">
-										<Check class="w-3.5 h-3.5" />
-									</div>
+									<StatusChip tone="action" size="xs" icon={Check} class="absolute top-2 left-2">
+										<span class="sr-only">In library</span>
+									</StatusChip>
 								{/if}
 								{#if item.musicbrainz_id && item.in_library}
 									<AlbumCardOverlay
@@ -234,36 +221,33 @@
 										artistName={item.artist_name || 'Unknown'}
 										coverUrl={item.cover_url || null}
 										size="sm"
+										playShown
 									/>
 								{/if}
 								{#if !item.musicbrainz_id && !item.local_id}
 									<IconButton
 										size="xs"
+										variant="neutral"
 										icon={Search}
 										label="Search album"
-										class="absolute bottom-2 right-2"
+										class="absolute right-2 bottom-2"
 										onclick={(e) => {
 											e.stopPropagation();
 											handleAlbumSearch(item);
 										}}
 									/>
 								{/if}
-							</figure>
-							<div class="flex flex-col gap-2 px-2 pb-2">
-								<CardTitle as="h3" class="text-xs line-clamp-1">{item.title}</CardTitle>
-								{#if item.artist_name}
-									<p class="text-xs text-base-content/50 line-clamp-1">{item.artist_name}</p>
-								{/if}
-							</div>
-						</Card>
+							{/snippet}
+						</MediaTile>
 						{#if item.musicbrainz_id && ((!item.in_library && !isItemRequested) || showPreview)}
-							<div class="flex items-center justify-center gap-1 mt-1 pb-1">
+							<div class="flex flex-col gap-1.5 px-1 pt-1 pb-1">
 								{#if !item.in_library && !isItemRequested}
 									<AlbumRequestButton
 										mbid={item.musicbrainz_id}
 										artistName={item.artist_name ?? ''}
 										albumName={item.title}
 										artistMbid={item.artist_id ?? undefined}
+										labelled
 									/>
 								{/if}
 								{#if showPreview && item.musicbrainz_id}
@@ -272,9 +256,9 @@
 										artist={item.artist_name ?? ''}
 										title={item.title}
 										kind="album"
-										size="sm"
 										artistMbid={item.artist_id}
 										coverUrl={item.cover_url}
+										labelled
 									/>
 								{/if}
 							</div>
@@ -309,10 +293,10 @@
 								<div class="flex min-w-0 flex-1 flex-col justify-center gap-2 p-2">
 									<CardTitle as="h3" class="text-xs line-clamp-1">{item.title}</CardTitle>
 									{#if item.artist_name}
-										<p class="text-xs text-base-content/50 line-clamp-1">{item.artist_name}</p>
+										<p class="text-xs text-muted line-clamp-1">{item.artist_name}</p>
 									{/if}
 									{#if item.listened_at}
-										<p class="text-xs text-base-content/40">{formatListenedAt(item.listened_at)}</p>
+										<p class="text-xs text-muted">{formatListenedAt(item.listened_at)}</p>
 									{/if}
 									{#if !item.artist_id}
 										<div class="flex justify-end pt-1">

@@ -18,11 +18,11 @@ use droppedneedle_acquire::dispatch::{
 use droppedneedle_acquire::downloads::journal::Journal;
 use droppedneedle_acquire::downloads::worker::{DownloadWorker, run_startup_recovery};
 use droppedneedle_acquire::downloads::{
-    http::downloads_router,
     state::{AttemptDisposition, AttemptState, TaskStatus},
     store::{NewTask, TaskOutcome},
 };
 use droppedneedle_acquire::reason::Reason;
+use droppedneedle_acquire::test_support::downloads_router;
 use droppedneedle_auth::Role;
 use droppedneedle_auth::session::store::SessionKind;
 use droppedneedle_kernel::db::{DbError, Lane};
@@ -239,7 +239,7 @@ fn settings_beside(journal: &Journal) -> droppedneedle_kernel::runtime_config::C
         .parent()
         .expect("scratch dir")
         .join("settings");
-    droppedneedle_acquire::settings::scratch_settings(&dir).expect("settings open")
+    droppedneedle_acquire::test_support::scratch_settings(&dir).expect("settings open")
 }
 
 fn staging_for(journal: &Journal) -> std::path::PathBuf {
@@ -659,12 +659,13 @@ enum Chosen {
 async fn queued_past_the_wait(
     copies: i64,
     chosen: Chosen,
+    discards_fail: bool,
 ) -> (Vec<(i64, String)>, Option<Reason>, usize) {
     use droppedneedle_acquire::downloads::store::TaskDetails;
     use droppedneedle_acquire::search_jobs::store::{
         JobPayload, JobStore, NewJob, PickedTask, ReviewOutcome,
     };
-    use droppedneedle_kernel::clock::ManualClock;
+    use droppedneedle_kernel::test_support::ManualClock;
 
     let scratch = AcquireDb::scratch().unwrap();
     let clock = Arc::new(ManualClock::at(1_800_000_000_000));
@@ -727,12 +728,29 @@ async fn queued_past_the_wait(
     let mock = MockSlskd::start().await.expect("mock starts");
     mock.script_responses((0..copies).map(soulseek_peer).collect());
     mock.queue_enqueued(true);
+    mock.fail_removals(discards_fail);
     let worker = soulseek_worker(&journal, &mock).await;
     worker.run_once(1).await;
-    clock.advance(16 * 60 * 1000);
+    // Inside the wait the first copy keeps its place.
+    clock.advance(14 * 60 * 1000);
     worker.run_once(2).await;
-    clock.advance(60 * 1000);
+    let waiting = journal
+        .read("test.read", |store| store.list_attempts("t-slow"))
+        .await
+        .unwrap();
+    let waiting: Vec<_> = waiting
+        .into_iter()
+        .map(|attempt| (attempt.candidate_index, attempt.state.as_str().to_owned()))
+        .collect();
+    assert_eq!(
+        waiting,
+        vec![(0, "acquiring".to_owned())],
+        "a copy inside the wait keeps its place"
+    );
+    clock.advance(2 * 60 * 1000);
     worker.run_once(3).await;
+    clock.advance(60 * 1000);
+    worker.run_once(4).await;
     let (attempts, quarantined) = journal
         .read("test.read", |store| {
             Ok((
@@ -754,15 +772,15 @@ async fn queued_past_the_wait(
 
 // A Soulseek copy queued at its peer past the preferred-quality wait gives
 // way only once the next copy is queued: with a second peer it moves, the
-// slow copy is cleaned up and nothing is blocklisted; with one peer it
-// keeps its place. A first copy the automatic review took gives way; one a
-// person picked does not.
+// slow copy is cleaned up (or kept for cleanup while slskd refuses to drop
+// it) and nothing is blocklisted; with one peer it keeps its place. A first
+// copy the automatic review took gives way; one a person picked does not.
 #[tokio::test]
 async fn a_queued_copy_gives_way_only_to_a_copy_that_is_queued() {
     let waiting = |index: i64| (index, "acquiring".to_owned());
     let moved = vec![(0, "complete".to_owned()), waiting(1)];
 
-    let (attempts, outcome, quarantined) = queued_past_the_wait(2, Chosen::Searched).await;
+    let (attempts, outcome, quarantined) = queued_past_the_wait(2, Chosen::Searched, false).await;
     assert_eq!(
         attempts, moved,
         "the next copy is queued, the slow one discarded"
@@ -770,15 +788,24 @@ async fn a_queued_copy_gives_way_only_to_a_copy_that_is_queued() {
     assert_eq!(outcome, Some(Reason::QueueGaveWay));
     assert_eq!(quarantined, 0, "a slow peer is not blocklisted");
 
-    let (attempts, outcome, _) = queued_past_the_wait(1, Chosen::Searched).await;
+    let (attempts, outcome, quarantined) = queued_past_the_wait(2, Chosen::Searched, true).await;
+    assert_eq!(
+        attempts,
+        vec![(0, "cleanup_pending".to_owned()), waiting(1)],
+        "a slow copy slskd will not drop stays for cleanup"
+    );
+    assert_eq!(outcome, Some(Reason::QueueGaveWay));
+    assert_eq!(quarantined, 0, "a slow peer is not blocklisted");
+
+    let (attempts, outcome, _) = queued_past_the_wait(1, Chosen::Searched, false).await;
     assert_eq!(attempts, vec![waiting(0)], "the only peer keeps its place");
     assert_eq!(outcome, None);
 
-    let (attempts, outcome, _) = queued_past_the_wait(2, Chosen::Reviewed).await;
+    let (attempts, outcome, _) = queued_past_the_wait(2, Chosen::Reviewed, false).await;
     assert_eq!(attempts, moved, "an automatic pick gives way");
     assert_eq!(outcome, Some(Reason::QueueGaveWay));
 
-    let (attempts, outcome, _) = queued_past_the_wait(2, Chosen::Picked).await;
+    let (attempts, outcome, _) = queued_past_the_wait(2, Chosen::Picked, false).await;
     assert_eq!(attempts, vec![waiting(0)], "a person's pick stays");
     assert_eq!(outcome, None);
 }
@@ -789,7 +816,7 @@ async fn a_queued_copy_gives_way_only_to_a_copy_that_is_queued() {
 // deadline would blocklist it.
 #[tokio::test]
 async fn a_restart_measures_a_copy_from_its_own_enqueue() {
-    use droppedneedle_kernel::clock::ManualClock;
+    use droppedneedle_kernel::test_support::ManualClock;
 
     let now = 1_800_000_000.0;
     let scratch = AcquireDb::scratch().unwrap();
@@ -884,7 +911,7 @@ async fn a_busy_edition_read_defers_the_dispatch_until_the_edition_reads() {
     .await
     .unwrap();
     let journal = Arc::new(Journal::new(db.clone(), quiet_ticks()));
-    let settings = droppedneedle_acquire::settings::scratch_settings(&dir.join("settings"))
+    let settings = droppedneedle_acquire::test_support::scratch_settings(&dir.join("settings"))
         .expect("settings open");
     let dispatch = DownloadDispatch::new(journal.clone(), Arc::new(UuidGenerator), settings.live());
     let request = DispatchRequest {

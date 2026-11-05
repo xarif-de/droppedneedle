@@ -10,7 +10,7 @@
 </script>
 
 <script lang="ts">
-	import { EllipsisVertical } from 'lucide-svelte';
+	import { Ellipsis, EllipsisVertical } from 'lucide-svelte';
 	import IconButton from '$lib/ui/IconButton.svelte';
 	import type { Component, SvelteComponent } from 'svelte';
 
@@ -34,9 +34,17 @@
 		size?: 'xs' | 'sm';
 		/** What the button is called; name the row when a list has many. */
 		label?: string;
+		/** `button` sits in a row of outlined buttons, at their height. */
+		trigger?: 'icon' | 'button';
 	}
 
-	let { items, position = 'end', size = 'sm', label = 'More actions' }: Props = $props();
+	let {
+		items,
+		position = 'end',
+		size = 'sm',
+		label = 'More actions',
+		trigger = 'icon'
+	}: Props = $props();
 	let detailsEl = $state<HTMLDetailsElement | null>(null);
 	let summaryEl = $state<HTMLElement | null>(null);
 	let menuEl = $state<HTMLUListElement | null>(null);
@@ -134,8 +142,10 @@
 	<IconButton
 		as="summary"
 		bind:ref={summaryEl}
-		size={size === 'xs' ? 'xs' : 'sm'}
-		icon={EllipsisVertical}
+		variant={trigger === 'button' ? 'outline' : 'ghost'}
+		shape={trigger === 'button' ? 'square' : 'circle'}
+		size={trigger === 'button' ? 'md' : size === 'xs' ? 'xs' : 'sm'}
+		icon={trigger === 'button' ? Ellipsis : EllipsisVertical}
 		{label}
 		aria-haspopup="menu"
 		onclick={(e: MouseEvent) => e.stopPropagation()}
@@ -146,7 +156,7 @@
 	<ul
 		bind:this={menuEl}
 		use:portal
-		class="menu bg-base-200/95 backdrop-blur-md rounded-box shadow-lg w-52 p-2"
+		class="menu w-52 rounded-box border border-line bg-base-200 p-2 shadow-lg"
 		style="position: fixed; top: {menuTop}px; left: {menuLeft}px; z-index: 9999;"
 		role="menu"
 		onclick={(e: MouseEvent) => e.stopPropagation()}

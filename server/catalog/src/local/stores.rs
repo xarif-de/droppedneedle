@@ -241,6 +241,8 @@ pub struct AlbumRecord {
 pub struct AlbumPageState {
     /// The album row's revision, which a change to its grouping echoes.
     pub row_revision: i64,
+    /// Moves when the album is renamed or a track joins or leaves it.
+    pub listing_revision: i64,
     /// The newest pending identification review, if any.
     pub pending_review_id: Option<String>,
 }
@@ -395,18 +397,13 @@ pub struct UpgradePolicy {
 }
 
 impl UpgradePolicy {
-    /// The download policy's upgrade settings now; upgrades off when there
-    /// is no policy (test builds) or it cannot be read.
+    /// The download policy's upgrade settings now; upgrades off when it
+    /// cannot be read.
     pub fn read(
-        policy: Option<
-            &droppedneedle_kernel::runtime_config::Live<
-                droppedneedle_kernel::runtime_config::sections::DownloadPolicy,
-            >,
+        policy: &droppedneedle_kernel::runtime_config::Live<
+            droppedneedle_kernel::runtime_config::sections::DownloadPolicy,
         >,
     ) -> Self {
-        let Some(policy) = policy else {
-            return Self::default();
-        };
         match policy.get() {
             Ok(policy) => Self {
                 quality_cutoff: Some(policy.quality_cutoff.clone()),

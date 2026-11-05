@@ -85,7 +85,9 @@
 </script>
 
 <div class="flex flex-col min-w-0">
-	<h3 class="text-lg font-semibold mb-3">Popular Songs</h3>
+	<h3 class="mb-3 font-mono text-xs font-semibold tracking-[0.14em] text-muted uppercase">
+		Popular songs
+	</h3>
 
 	{#if loading}
 		<div class="space-y-2">
@@ -103,7 +105,7 @@
 	{:else if !configured}
 		<Card padding="md" class="flex-1 text-center">
 			<div class="my-auto">
-				<p class="text-base-content/70 text-sm">Connect a music service to see popular songs</p>
+				<p class="text-muted text-sm">Connect a music service to see popular songs</p>
 				<Button variant="primary" size="xs" href={withBasePath('/profile#scrobbling')} class="mt-2">
 					Configure
 				</Button>
@@ -111,7 +113,7 @@
 		</Card>
 	{:else if songs.length === 0}
 		<Card padding="md" class="flex-1 text-center">
-			<p class="my-auto text-base-content/70 text-sm">No song data available</p>
+			<p class="my-auto text-muted text-sm">No song data available</p>
 		</Card>
 	{:else}
 		<div class="space-y-1">

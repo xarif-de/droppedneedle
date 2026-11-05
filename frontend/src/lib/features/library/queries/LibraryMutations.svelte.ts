@@ -33,13 +33,13 @@ export function createRemoveLibraryAlbumMutation() {
 		mutationFn: ({
 			albumId,
 			expectedRevision,
-			expectedTrackCount,
+			expectedListingRevision,
 			stopWanted
 		}: {
 			mbid: string;
 			albumId: string;
 			expectedRevision: number;
-			expectedTrackCount: number;
+			expectedListingRevision: number;
 			stopWanted: boolean;
 		}) =>
 			api.v3.DELETE(
@@ -47,7 +47,7 @@ export function createRemoveLibraryAlbumMutation() {
 					path: { id: albumId },
 					query: {
 						expected_revision: expectedRevision,
-						expected_track_count: expectedTrackCount,
+						expected_listing_revision: expectedListingRevision,
 						delete_files: true,
 						stop_wanted: stopWanted
 					}

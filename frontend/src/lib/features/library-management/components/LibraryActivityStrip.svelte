@@ -155,7 +155,7 @@
 					</div>
 					<LibraryWorkProgress item={primary} compact />
 				</div>
-				<ArrowRight class="h-4 w-4 shrink-0 text-base-content/45" aria-hidden="true" />
+				<ArrowRight class="h-4 w-4 shrink-0 text-muted" aria-hidden="true" />
 			</a>
 
 			{#if primary.effect === 'attention' && primary.kind !== 'recovery'}
@@ -200,7 +200,7 @@
 							<small>{libraryWorkEffect(item)}</small>
 							<LibraryWorkProgress {item} compact />
 						</span>
-						<ArrowRight class="h-4 w-4 shrink-0 text-base-content/40" aria-hidden="true" />
+						<ArrowRight class="h-4 w-4 shrink-0 text-muted" aria-hidden="true" />
 					</a>
 				{/each}
 			</div>
@@ -307,12 +307,13 @@
 		font-weight: 700;
 		letter-spacing: 0.09em;
 		text-transform: uppercase;
-		color: color-mix(in oklab, var(--color-base-content) 52%, transparent);
+		color: var(--color-muted);
 	}
 
 	.library-activity-primary__heading strong {
 		min-width: 0;
-		font-family: var(--font-display);
+		font-family: var(--font-sans);
+		font-weight: 700;
 		font-size: 0.92rem;
 		transition: color 160ms ease;
 	}
@@ -321,7 +322,7 @@
 		min-width: 0;
 		overflow: hidden;
 		font-size: 0.7rem;
-		color: color-mix(in oklab, var(--color-base-content) 48%, transparent);
+		color: var(--color-muted);
 		text-overflow: ellipsis;
 		white-space: nowrap;
 	}
@@ -357,7 +358,8 @@
 	}
 
 	.library-activity-stack__item strong {
-		font-family: var(--font-display);
+		font-family: var(--font-sans);
+		font-weight: 700;
 		font-size: 0.78rem;
 		transition: color 160ms ease;
 	}
@@ -365,7 +367,7 @@
 	.library-activity-stack__item small {
 		margin-bottom: 0.2rem;
 		font-size: 0.65rem;
-		color: color-mix(in oklab, var(--color-base-content) 48%, transparent);
+		color: var(--color-muted);
 	}
 
 	@media (max-width: 640px) {

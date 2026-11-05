@@ -24,8 +24,8 @@
 				<Radar class="h-5 w-5 text-secondary" aria-hidden="true" />
 			</div>
 			<div>
-				<h3 class="font-semibold">Wanted watcher</h3>
-				<p class="text-xs text-base-content/50">
+				<h3 class="dn-set-title">Wanted watcher</h3>
+				<p class="text-xs text-muted">
 					Keeps looking for failed requests. They show under Requests, Wanted.
 				</p>
 			</div>

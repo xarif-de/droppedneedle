@@ -51,8 +51,8 @@ use droppedneedle_kernel::runtime_config::ConfigStore;
 use droppedneedle_kernel::runtime_config::secret_sections::SlskdConnection;
 use droppedneedle_kernel::runtime_config::sections::{DownloadPolicy, WantedWatcher};
 use droppedneedle_providers::RequestPriority;
-use droppedneedle_providers::executor::ScriptedWire;
 use droppedneedle_providers::musicbrainz::MbSource;
+use droppedneedle_providers::test_support::ScriptedWire;
 use droppedneedle_testkit::slskd::{MOCK_API_KEY, MockSlskd};
 
 const NOW: i64 = 1_700_000_000;
@@ -107,7 +107,7 @@ async fn status_of(store: &RequestStore, key: &str) -> String {
 /// Settings beside `db`, at their defaults until a test saves one.
 fn settings(db: &AcquireDb) -> ConfigStore {
     let dir = db.path().parent().expect("scratch dir").join("settings");
-    droppedneedle_acquire::settings::scratch_settings(&dir).expect("settings open")
+    droppedneedle_acquire::test_support::scratch_settings(&dir).expect("settings open")
 }
 
 /// The production dispatch over the download journal on `db`.
@@ -247,7 +247,7 @@ async fn wanted_with_slskd(db: &AcquireDb, slskd_on: bool) -> Wanted {
         })
         .expect("watcher settings save");
     let (sources, slskd) = sources_over(db, &settings, slskd_on).await;
-    let library = Arc::new(LibraryPresence::new());
+    let library = Arc::new(LibraryPresence::over_catalog(db.db().clone()));
     let events = EventHub::new();
     Wanted {
         deps: WantedDeps {
@@ -297,7 +297,11 @@ async fn wanted_watch_lifecycle() {
     assert_eq!((checked.checked, checked.dispatched), (1, 1));
     let queued = tasks(&db).await;
     assert_eq!(queued.len(), 1);
-    assert_eq!(queued[0].origin, "wanted", "a wanted find says so");
+    assert_eq!(
+        queued[0].origin,
+        DispatchOrigin::Wanted,
+        "a wanted find says so"
+    );
     assert_eq!(queued[0].release_group_mbid, "rg-blue");
     let row = rig
         .deps
@@ -349,6 +353,33 @@ async fn wanted_watch_lifecycle() {
         [names::WANTED_FULFILLED]
     );
     assert!(tasks(&db).await.is_empty(), "nothing is downloaded");
+}
+
+// A failed request for an album out 10 days ago is checked again in 2
+// days, the fast end of the cadence, not the 14 an old album waits.
+#[tokio::test]
+async fn a_new_album_is_rechecked_in_two_days() {
+    let db = AcquireDb::scratch().unwrap();
+    let mut rig = wanted(&db).await;
+    // NOW is 2023-11-14 (UTC); the album came out 10 days before.
+    let albums = FixedAlbums {
+        first_release_dates: [("rg-blue".to_owned(), "2023-11-04".to_owned())].into(),
+        ..FixedAlbums::default()
+    };
+    rig.deps.targets = Arc::new(Targets::new(
+        Arc::new(Journal::new(db.clone(), quiet_ticks())),
+        Arc::new(albums),
+    ));
+    seed_request(&rig.deps.ledger, "rg-blue", "failed", None).await;
+
+    assert_eq!(wanted_tick(NOW, &rig.deps).await.enrolled, 1);
+    let watch = rig.deps.watches.get("rg-blue").await.unwrap().unwrap();
+    assert_eq!(watch.first_release_date.as_deref(), Some("2023-11-04"));
+    assert_eq!(
+        watch.next_check_at as i64 - NOW,
+        2 * 86_400,
+        "a new album is checked again in 2 days"
+    );
 }
 
 // The watcher asks only the sources that are turned on. With slskd set up
@@ -449,7 +480,7 @@ async fn status_sweep_settles_what_the_journal_missed() {
     seed_task(&db, "task-done", "rg-done", TaskStatus::Completed).await;
     seed_task(&db, "task-short", "rg-short", TaskStatus::Partial).await;
     seed_task(&db, "task-retry", "rg-retried", TaskStatus::Completed).await;
-    let library = Arc::new(LibraryPresence::new());
+    let library = Arc::new(LibraryPresence::over_catalog(db.db().clone()));
     library.add(&["rg-held", "rg-gone", "rg-partial", "rg-cancelled"]);
     let recorded = Arc::new(crate::common::bundles::FulfilledTicks::default());
     let deps = SyncDeps {
@@ -562,7 +593,7 @@ async fn follow_poll_baselines_then_emits() {
             },
             RequestPriority::BackgroundSync,
         ));
-    let library = Arc::new(LibraryPresence::new());
+    let library = Arc::new(LibraryPresence::over_catalog(db.db().clone()));
     library.add(&["rg-owned"]);
     let settings = settings(&db);
     let downloads = dispatch(&db, &settings);
@@ -701,7 +732,7 @@ async fn upgrade_sweep_gates_cap_and_active() {
     let grabs: Vec<TaskRow> = tasks(&db)
         .await
         .into_iter()
-        .filter(|task| task.origin == "upgrade")
+        .filter(|task| task.origin == DispatchOrigin::Upgrade)
         .collect();
     assert_eq!(grabs.len(), 2);
     assert_eq!(
@@ -885,7 +916,7 @@ async fn follow_rig(db: &AcquireDb, settings: &ConfigStore) -> (FollowDeps, Arc<
         poll: Arc::new(poll),
         downloads,
         requests: requests.clone(),
-        library: Arc::new(LibraryPresence::new()),
+        library: Arc::new(LibraryPresence::over_catalog(db.db().clone())),
         ticks: ticks(db, &EventHub::new()).await,
         preferences: settings.live(),
         today: Arc::new(|| "2024-06-01".to_owned()),
@@ -1100,7 +1131,7 @@ async fn cancelling_a_wanted_download_stops_its_watch() {
     assert_eq!(checked.dispatched, 1);
 
     let requests = RequestsService::new(&RequestsState {
-        quota: Arc::new(QuotaLedger::unlimited(db.clone())),
+        quota: Arc::new(QuotaLedger::unlimited(db.clone()).expect("quota ledger")),
         dispatch: rig.deps.downloads.clone(),
         ..requests_over(&db).await
     });
@@ -1141,7 +1172,7 @@ async fn a_rejected_re_ask_stops_its_watch() {
     wanted_tick(NOW, &rig.deps).await;
 
     let requests = RequestsService::new(&RequestsState {
-        quota: Arc::new(QuotaLedger::unlimited(db.clone())),
+        quota: Arc::new(QuotaLedger::unlimited(db.clone()).expect("quota ledger")),
         dispatch: rig.deps.downloads.clone(),
         ..requests_over(&db).await
     });

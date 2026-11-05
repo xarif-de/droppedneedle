@@ -1,0 +1,402 @@
+/* The kit's shared look over daisyUI's classes, for app.css and auth.css.
+   daisyUI's components sit in sub-layers of `utilities`, so a rule written
+   straight in `utilities` wins over them. Selectors that only colour a
+   control are wrapped in :where() so a caller's own utility still wins. */
+
+@layer base {
+	body {
+		font-size: 1rem;
+	}
+
+	/* one focus ring everywhere: 2px with a 2px gap */
+	:focus-visible {
+		outline: 2px solid var(--dn-focus);
+		outline-offset: 2px;
+	}
+
+	/* Anton has one weight; never let a browser fake a bold one */
+	h1,
+	h2,
+	.font-display {
+		font-synthesis: none;
+	}
+}
+
+@layer utilities {
+	/* Anton is always uppercase, a little open at small sizes */
+	.font-display {
+		text-transform: uppercase;
+		letter-spacing: 0.015em;
+	}
+	/* and for big headings only; a small one reads in Inter instead */
+	.font-display:is(.text-xs, .text-sm, .text-base) {
+		font-family: var(--font-sans);
+		font-weight: 700;
+		letter-spacing: 0.03em;
+	}
+
+	/* Buttons. Button.svelte puts one dn-btn-* class beside `btn`. */
+	:where(.btn) {
+		outline-color: var(--dn-focus);
+		text-shadow: none;
+		transition-duration: 150ms;
+	}
+	:where(.btn):active:not(.btn-active, :disabled, [aria-disabled='true']) {
+		translate: 0 1px;
+	}
+	.dn-btn-md {
+		--fontsize: 0.9375rem;
+		--btn-p: 1.125rem;
+	}
+	/* condensed caps: a page header's and a band's buttons (LISTEN, PLAY ALL) */
+	.dn-btn-display,
+	.dn-btn-display-sm {
+		--fontsize: 1.1875rem;
+		--btn-p: 1.25rem;
+		--size: 2.875rem;
+		gap: 0.625rem;
+		border-radius: 0.625rem;
+		font-family: var(--font-display);
+		font-weight: 400;
+		letter-spacing: 0.04em;
+		text-transform: uppercase;
+		font-synthesis: none;
+	}
+	.dn-btn-display-sm {
+		--fontsize: 1.0625rem;
+		--btn-p: 1rem;
+		--size: 2.375rem;
+		gap: 0.5rem;
+		border-radius: 0.5rem;
+	}
+	.dn-btn-action {
+		--btn-color: var(--dn-action);
+		--btn-fg: var(--dn-action-content);
+		--btn-border: var(--dn-action-edge);
+	}
+	.dn-btn-neutral {
+		--btn-color: var(--color-base-200);
+		--btn-fg: var(--color-base-content);
+		--btn-border: var(--dn-edge);
+	}
+	.dn-btn-outline {
+		--btn-color: var(--color-base-200);
+		--btn-fg: var(--color-base-content);
+		--btn-border: var(--color-base-content);
+	}
+	/* an outline in the paper's ink, for a button on a paper card */
+	.dn-btn-paper {
+		--btn-color: var(--dn-paper);
+		--btn-fg: var(--dn-paper-content);
+		--btn-border: var(--dn-paper-content);
+	}
+	.dn-btn-danger-outline {
+		--btn-color: var(--color-base-200);
+		--btn-fg: var(--color-error);
+		--btn-border: var(--color-error);
+	}
+	.dn-btn-ghost {
+		--btn-bg: transparent;
+		--btn-border: transparent;
+	}
+	.dn-btn-caps {
+		font-family: var(--font-mono);
+		font-size: 0.8125rem;
+		font-weight: 600;
+		letter-spacing: 0.2em;
+		text-transform: uppercase;
+	}
+	.dn-btn-spotify {
+		--btn-color: var(--dn-spotify);
+		--btn-fg: var(--dn-spotify-content);
+		--btn-border: var(--dn-spotify-edge);
+	}
+	@media (hover: hover) {
+		.dn-btn-action:hover {
+			--btn-bg: color-mix(in oklab, var(--dn-action), #000 9%);
+		}
+		.dn-btn-neutral:hover,
+		.dn-btn-outline:hover {
+			--btn-bg: var(--color-neutral);
+		}
+		.dn-btn-danger-outline:hover {
+			--btn-bg: color-mix(in oklab, var(--color-error) 12%, var(--color-base-200));
+		}
+		.dn-btn-ghost:hover {
+			--btn-bg: color-mix(in oklab, var(--color-base-content) 9%, transparent);
+		}
+		.dn-btn-paper:hover {
+			--btn-bg: color-mix(in oklab, var(--dn-paper-content) 10%, var(--dn-paper));
+		}
+	}
+	/* disabled is plainly off, but still readable */
+	:where(.btn):is(:disabled, [aria-disabled='true'], .btn-disabled):not(.dn-btn-loading) {
+		color: var(--dn-muted);
+		opacity: 0.7;
+	}
+	:where(.btn):is(:disabled, [aria-disabled='true'], .btn-disabled):not(
+			.dn-btn-loading,
+			.dn-btn-ghost
+		) {
+		--btn-border: var(--dn-line);
+	}
+	/* a button at work keeps its colours (the service variants paint their own) */
+	.btn.dn-btn-loading:not(.btn-lastfm, .btn-listenbrainz) {
+		--btn-bg: var(--btn-color, var(--color-base-200));
+		background-color: var(--btn-bg);
+		color: var(--btn-fg, var(--color-base-content));
+		cursor: progress;
+	}
+	.btn.dn-btn-ghost.dn-btn-loading {
+		--btn-bg: transparent;
+	}
+
+	/* Text inputs, dropdowns and text areas: a solid surface, a 3:1 edge */
+	:where(.input, .select, .textarea) {
+		background-color: var(--color-base-200);
+		--input-color: var(--dn-edge);
+		box-shadow: none;
+	}
+	:where(.input, .select, .textarea):not(
+		.input-xs,
+		.input-sm,
+		.select-xs,
+		.select-sm,
+		.textarea-xs,
+		.textarea-sm
+	) {
+		--font-size-min: 1rem;
+	}
+	:where(.input, .select, .textarea):is(:focus, :focus-within) {
+		--input-color: var(--dn-focus);
+	}
+	:where(.input-error, .select-error, .textarea-error) {
+		--input-color: var(--color-error);
+	}
+	/* the box may shrink below its text's width (a phone's top bar) */
+	:where(.input) input {
+		min-width: 0;
+	}
+	:where(.input, .textarea, .input input)::placeholder {
+		color: var(--dn-muted);
+		opacity: 1;
+	}
+
+	/* a form row's label reads as the field's name */
+	:where(.fieldset-legend) {
+		font-size: 0.875rem;
+		font-weight: 600;
+		color: var(--color-base-content);
+	}
+	:where(.fieldset .label) {
+		color: var(--dn-muted);
+	}
+
+	/* switches, ticks and radios get the same edge while off */
+	:where(.toggle, .checkbox, .radio):not(:checked, [aria-checked='true']) {
+		--input-color: var(--dn-edge);
+	}
+	:where(.toggle):not(:checked) {
+		color: var(--dn-edge);
+	}
+
+	/* Cards and dialogs: flat tone steps with a hairline */
+	:where(.card) {
+		border-radius: var(--radius-box);
+	}
+	/* the paper card keeps its own ink: muted text and titles read on cream */
+	.dn-card-paper {
+		--dn-muted: color-mix(in oklab, var(--dn-paper-content) 74%, var(--dn-paper));
+		--dn-title: var(--dn-paper-content);
+	}
+	[data-theme='light'] .dn-card-paper {
+		box-shadow: 0 10px 24px -18px color-mix(in oklab, var(--dn-paper-content) 45%, transparent);
+	}
+	/* torn paper: the card's top and bottom edges ripped, through a mask, so
+	   it takes no border and no shadow of its own */
+	.dn-card-torn {
+		--tear: 0.75rem;
+		--tear-top: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 240 12' preserveAspectRatio='none'%3E%3Cpath d='M0 12L0 1L9 2.9L13 5.7L19 3.1L27 5.9L33 5.4L40 6.3L44 3.4L51 5.5L54 5.4L60 7L68 1.8L74 7L81 5.2L87 6.9L95 3.4L100 6.4L105 2L110 3.8L115 7.1L121 5.7L129 1.4L134 4.6L140 3.7L144 6.9L147 3.4L152 5.3L161 4.3L165 3.6L170 3.4L176 3.2L182 5L186 6.9L192 6.6L199 5.1L205 4.3L212 7.1L217 5.6L222 4.8L227 3.1L232 6.2L240 1L240 12Z'/%3E%3C/svg%3E");
+		--tear-bottom: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 240 12' preserveAspectRatio='none'%3E%3Cpath d='M0 0L0 11L9 9.1L13 6.3L19 8.9L27 6.1L33 6.6L40 5.7L44 8.6L51 6.5L54 6.6L60 5L68 10.2L74 5L81 6.8L87 5.1L95 8.6L100 5.6L105 10L110 8.2L115 4.9L121 6.3L129 10.6L134 7.4L140 8.3L144 5.1L147 8.6L152 6.7L161 7.7L165 8.4L170 8.6L176 8.8L182 7L186 5.1L192 5.4L199 6.9L205 7.7L212 4.9L217 6.4L222 7.2L227 8.9L232 5.8L240 11L240 0Z'/%3E%3C/svg%3E");
+		--tear-body: linear-gradient(#000 0 0);
+		border: 0;
+		border-radius: 0.25rem;
+		mask-image: var(--tear-top), var(--tear-body), var(--tear-bottom);
+		mask-position:
+			0 0,
+			0 calc(var(--tear) - 1px),
+			0 100%;
+		mask-size:
+			15rem var(--tear),
+			100% calc(100% - 2 * var(--tear) + 2px),
+			15rem var(--tear);
+		mask-repeat: repeat-x, no-repeat, repeat-x;
+		-webkit-mask-image: var(--tear-top), var(--tear-body), var(--tear-bottom);
+		-webkit-mask-position:
+			0 0,
+			0 calc(var(--tear) - 1px),
+			0 100%;
+		-webkit-mask-size:
+			15rem var(--tear),
+			100% calc(100% - 2 * var(--tear) + 2px),
+			15rem var(--tear);
+		-webkit-mask-repeat: repeat-x, no-repeat, repeat-x;
+	}
+
+	/* the mask would cut a ring drawn outside, so it sits inside the tear */
+	.dn-card-torn:focus-visible {
+		outline: 3px solid var(--dn-paper-content);
+		outline-offset: calc(-1 * var(--tear) - 4px);
+	}
+
+	/* the diagonal stripe block on a ticket or a tile, in the text colour */
+	.dn-stripes {
+		background-image: repeating-linear-gradient(
+			-62deg,
+			currentColor 0 0.28em,
+			transparent 0.28em 0.62em
+		);
+	}
+
+	/* a list page's toolbar: search, toggles and selects in one row, outlined
+	   plainly on the page; on a phone the search takes its own row */
+	.dn-toolbar {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 0.75rem 2rem;
+		margin-bottom: 1.75rem;
+	}
+	.dn-toolbar__grow {
+		position: relative;
+		flex: 1 1 18rem;
+	}
+	.dn-toolbar__select {
+		width: 15rem;
+	}
+	@media (max-width: 639px) {
+		.dn-toolbar {
+			gap: 0.625rem 0.375rem;
+			margin-bottom: 1.25rem;
+		}
+		.dn-toolbar > * {
+			flex: 1 1 auto;
+			min-width: 0;
+		}
+		.dn-toolbar :where(.btn) {
+			--size: 2.5rem;
+			--btn-p: 0.375rem;
+			--fontsize: 0.75rem;
+			gap: 0.25rem;
+			white-space: nowrap;
+		}
+		.dn-toolbar :where(.select) {
+			--size: 2.5rem;
+			padding-inline: 0.5rem 1.5rem;
+		}
+		.dn-toolbar :where(.btn) svg {
+			flex: none;
+		}
+		.dn-toolbar > :is(.dn-toolbar__grow, [role='tablist']) {
+			flex-basis: 100%;
+		}
+		.dn-toolbar__select {
+			width: auto;
+		}
+	}
+
+	/* a browse grid: seven across a wide screen, never fewer than two */
+	.dn-list-grid {
+		display: grid;
+		grid-template-columns: repeat(auto-fill, minmax(min(10rem, calc(50% - 0.625rem)), 1fr));
+		gap: 1.5rem 1.25rem;
+	}
+	@media (max-width: 639px) {
+		.dn-list-grid {
+			gap: 1rem 0.875rem;
+		}
+	}
+
+	.dn-toolbar :where(.input, .select) {
+		--input-color: color-mix(in oklab, var(--color-base-content) 70%, transparent);
+		background-color: transparent;
+	}
+	.dn-toolbar :where(.input, .select):is(:focus, :focus-within) {
+		--input-color: var(--dn-focus);
+	}
+
+	:where(.modal-box) {
+		background-color: var(--color-base-200);
+		border: 1px solid var(--dn-line);
+		box-shadow: 0 24px 64px -24px rgb(0 0 0 / 0.6);
+	}
+	:where(.modal-box) :is(h1, h2, h3) {
+		font-family: var(--font-display);
+		font-weight: 400;
+		text-transform: uppercase;
+		letter-spacing: 0.01em;
+		color: var(--dn-title);
+	}
+
+	/* Tabs: the chosen one is inked in, like a label on a sleeve */
+	:where(.tabs-box) {
+		background-color: var(--color-base-200);
+		border: 1px solid var(--dn-line);
+		box-shadow: none;
+	}
+	:where(.tabs-box > .tab) {
+		color: var(--dn-muted);
+		font-weight: 600;
+	}
+	:where(.tabs-box > .tab):hover {
+		color: var(--color-base-content);
+	}
+	.tabs-box > :is(.tab-active, [aria-selected='true']):not(.tab-disabled, [disabled]) {
+		--tab-bg: var(--color-base-content);
+		color: var(--color-base-100);
+		box-shadow: none;
+	}
+	:where(.tabs-border > .tab) {
+		color: var(--dn-muted);
+		font-weight: 600;
+	}
+	.tabs-border > :is(.tab-active, [aria-selected='true']) {
+		color: var(--color-base-content);
+		--tab-border-color: var(--dn-title);
+	}
+
+	/* menus: the current item reads as a raised step; keep the focus ring */
+	:where(.menu) .menu-active {
+		background-color: var(--color-neutral);
+		color: var(--color-base-content);
+	}
+	.menu li > :focus-visible {
+		outline: 2px solid var(--dn-focus);
+		outline-offset: -2px;
+	}
+
+	/* status labels: bold, readable, never colour alone */
+	:where(.badge) {
+		font-weight: 600;
+		letter-spacing: 0.02em;
+	}
+}
+
+/* Touch screens get 44px controls */
+@media (pointer: coarse) {
+	[data-theme] {
+		--size-field: 0.275rem;
+	}
+}
+
+/* High contrast and forced colours: no decoration at all */
+@media (prefers-contrast: more) {
+	.dn-decor {
+		display: none !important;
+	}
+}
+@media (forced-colors: active) {
+	.dn-decor {
+		display: none !important;
+	}
+}

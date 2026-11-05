@@ -11,13 +11,13 @@ use droppedneedle_library::identify;
 use std::sync::Arc;
 
 use droppedneedle_library::matching::{CreditedArtist, Release, ReleaseTrack};
+use droppedneedle_library::test_support::FakeProviders;
 use identify::models::IdentifyJob;
 use identify::models::JobState;
 use identify::models::{
     AlbumIdentity, AutomaticSeal, DecisionSource, IdentificationOutcome, IdentifyKind,
     IdentityBrief, LocalAlbumFacts, LocalTrackFacts, RecallResult, ReviewState, TrackIdentity,
 };
-use identify::providers::FakeProviders;
 use identify::queue::{
     LEASE_SECONDS, PRIORITY_HISTORICAL_BACKLOG, PRIORITY_NEW_OR_CHANGED, PRIORITY_REVIEW_RETRY,
     PRIORITY_SUPPORTING_MAINTENANCE, terminally_deferred,
@@ -62,6 +62,7 @@ fn rig_with_recall(recall: RecallResult) -> Rig {
     ));
     let providers = Arc::new(FakeProviders::with_recall(recall));
     let service = IdentifyService::new(IdentifyDeps {
+        preferences: crate::common::library::default_preferences(&dir),
         store: store.clone(),
         providers: providers.clone(),
     });
@@ -2639,6 +2640,7 @@ impl identify::providers::IdentifyProviders for DuringRecall {
 
 fn service_during_recall(rig: &Rig, recall: RecallResult, sql: &str) -> IdentifyService {
     IdentifyService::new(IdentifyDeps {
+        preferences: crate::common::library::default_preferences(&rig._dir),
         store: rig.store.clone(),
         providers: Arc::new(DuringRecall {
             recall,
@@ -3015,6 +3017,7 @@ async fn a_moved_release_names_its_own_group() {
         .result;
     assert_eq!(recall.named_group.as_deref(), Some(GROUP_B));
     let service = IdentifyService::new(IdentifyDeps {
+        preferences: crate::common::library::default_preferences(&rig._dir),
         store: rig.store.clone(),
         providers,
     });
@@ -3542,6 +3545,54 @@ fn an_undone_automatic_edition_does_not_return_through_its_tags() {
         rig.identity_tables("album-1")
     );
     assert!(!library_holds(&rig, GROUP_A));
+}
+
+/// A track that lands on an album after its automatic edition leaves that
+/// edition's undo live: the album's track list is not its identity.
+#[test]
+fn an_automatic_edition_undo_outlives_a_later_track() {
+    use droppedneedle_library::edition::decisions;
+
+    let rig = rig_with_recall(RecallResult::default());
+    rig.run(
+        "INSERT INTO auth_users (id, display_name, role, created_at) \
+         VALUES ('curator-1', 'Curator', 'admin', 0);",
+    );
+    tagged_album(&rig, "album-1", "t1", GROUP_A);
+    let sealed = rig.store.seal_automatic(&AutomaticSeal {
+        local_album_id: "album-1".to_owned(),
+        release_group_mbid: GROUP_A.to_owned(),
+        release_mbid: Some(RELEASE_A1.to_owned()),
+        tracks: Vec::new(),
+        flag: None,
+    });
+    assert_eq!(sealed.ok(), Some(true));
+    rig.run(
+        "INSERT INTO local_tracks (id, local_album_id, root_id, file_path, relative_path, \
+             path_hash, file_size_bytes, file_mtime_ns, stat_revision, title, title_folded, \
+             album_title, album_title_folded, file_format, ingest_source, imported_at, \
+             membership_source, availability) \
+         SELECT 't2', local_album_id, root_id, file_path || '2', relative_path || '2', \
+             path_hash || '2', file_size_bytes, file_mtime_ns, stat_revision, title, \
+             title_folded, album_title, album_title_folded, file_format, ingest_source, \
+             imported_at, membership_source, 'indexed' FROM local_tracks WHERE id = 't1';",
+    );
+    let (album_revision, identity_revision) =
+        decisions::live_automatic_edition_undo(&rig.db, "album-1")
+            .expect("reads")
+            .expect("the automatic undo is still live");
+    let undone = rig.change(|tx| {
+        decisions::undo_automatic_edition(
+            tx,
+            "album-1",
+            album_revision,
+            identity_revision,
+            "curator-1",
+            2.0,
+        )
+        .map(|undone| undone.outcome)
+    });
+    assert!(undone.is_ok(), "{undone:?}");
 }
 
 /// A download landing on an album a person detached, or on a guess the
@@ -5136,6 +5187,7 @@ async fn a_held_edition_that_cannot_be_fetched_keeps_the_album() {
         })
         .unwrap();
     let service = IdentifyService::new(IdentifyDeps {
+        preferences: crate::common::library::default_preferences(&rig._dir),
         store: rig.store.clone(),
         providers: Arc::new(HeldRecall {
             recall: recall(vec![release(
@@ -5196,6 +5248,7 @@ async fn a_merged_recording_the_held_edition_resolves_keeps_the_album() {
     held.recording_aliases
         .insert(RETIRED.to_owned(), RECORDING_2.to_owned());
     let service = IdentifyService::new(IdentifyDeps {
+        preferences: crate::common::library::default_preferences(&rig._dir),
         store: rig.store.clone(),
         providers: Arc::new(HeldRecall {
             recall: recall(vec![release(GROUP_A, RELEASE_A2, &[RECORDING_1, RETIRED])]),

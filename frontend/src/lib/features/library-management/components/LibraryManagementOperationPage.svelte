@@ -7,7 +7,6 @@
 		TriangleAlert,
 		CircleCheckBig,
 		Clock3,
-		FolderCog,
 		History,
 		RotateCcw,
 		ServerCog,
@@ -28,6 +27,7 @@
 	import Button from '$lib/ui/Button.svelte';
 	import Card from '$lib/ui/Card.svelte';
 	import ConfirmDialog from '$lib/ui/ConfirmDialog.svelte';
+	import StatusChip from '$lib/ui/StatusChip.svelte';
 	import { withBasePath } from '$lib/utils/basePath';
 	import { createUuid } from '$lib/utils/uuid';
 	import {
@@ -333,33 +333,33 @@
 		{:else if operationQuery.isError}
 			<div class="alert alert-error" role="alert">Could not load this Organization operation.</div>
 		{:else if operation}
-			<header class="management-control-room p-5 sm:p-7">
+			<header class="op-head">
 				<div class="flex flex-wrap items-start gap-4">
-					<div class="management-write-mark"><FolderCog class="h-6 w-6" /></div>
 					<div class="min-w-0 flex-1">
 						<p class="management-kicker">
 							<ShieldAlert class="h-3.5 w-3.5" /> File-writing operation
 						</p>
-						<h1 class="mt-1 font-display text-2xl font-bold sm:text-3xl">
+						<h1 class="lm-page-title mt-2">
 							{titleManagementValue(operation.mode)}
 						</h1>
-						<p class="mt-2 text-sm text-base-content/60">
+						<p class="mt-3 text-muted">
 							{operation.profile_name} · {titleManagementValue(operation.origin)} · started {formatDate(
 								operation.created_at
 							)}
 						</p>
 					</div>
-					<span
-						class="badge badge-lg {operation.state === 'failed'
-							? 'badge-error'
+					<StatusChip
+						size="md"
+						tone={operation.state === 'failed'
+							? 'error'
 							: operation.state === 'succeeded'
-								? 'badge-success'
+								? 'success'
 								: operation.state === 'paused'
-									? 'badge-warning'
-									: 'badge-outline'}">{titleManagementValue(operation.state)}</span
+									? 'warning'
+									: 'neutral'}>{titleManagementValue(operation.state)}</StatusChip
 					>
 				</div>
-				<div class="mt-5">
+				<div class="lm-bordered op-progress mt-6">
 					<span class="sr-only" role="status" aria-live="polite"
 						>Operation phase: {activePhaseLabel}</span
 					>
@@ -389,22 +389,19 @@
 				</div>
 				<div class="mt-4 grid gap-2 sm:grid-cols-4">
 					<div class="management-summary-card">
-						<span class="text-xs text-base-content/50">Succeeded</span><strong
+						<span class="text-xs text-muted">Succeeded</span><strong
 							>{operation.succeeded_count}</strong
 						>
 					</div>
 					<div class="management-summary-card">
-						<span class="text-xs text-base-content/50">Failed</span><strong
-							>{operation.failed_count}</strong
+						<span class="text-xs text-muted">Failed</span><strong>{operation.failed_count}</strong>
+					</div>
+					<div class="management-summary-card">
+						<span class="text-xs text-muted">Skipped</span><strong>{operation.skipped_count}</strong
 						>
 					</div>
 					<div class="management-summary-card">
-						<span class="text-xs text-base-content/50">Skipped</span><strong
-							>{operation.skipped_count}</strong
-						>
-					</div>
-					<div class="management-summary-card">
-						<span class="text-xs text-base-content/50">Revision</span><strong
+						<span class="text-xs text-muted">Revision</span><strong
 							>{operation.operation_row_revision}</strong
 						>
 					</div>
@@ -438,9 +435,7 @@
 						<div>
 							<p class="management-step">After the run</p>
 							<h2 class="font-display text-xl font-semibold">Media server rescans</h2>
-							<p class="mt-1 text-sm text-base-content/55">
-								A failed rescan never undoes the run's changes.
-							</p>
+							<p class="mt-1 text-sm text-muted">A failed rescan never undoes the run's changes.</p>
 						</div>
 					</div>
 					<div class="mt-4 divide-y divide-base-content/10 border-y border-base-content/10">
@@ -449,10 +444,8 @@
 							>
 								<strong>{titleManagementValue(refresh.target)}</strong>
 								<div>
-									<p class="text-sm text-base-content/65">{refreshStatusCopy(refresh)}</p>
-									{#if refresh.attempts || refresh.code}<p
-											class="mt-0.5 text-xs text-base-content/45"
-										>
+									<p class="text-sm text-muted">{refreshStatusCopy(refresh)}</p>
+									{#if refresh.attempts || refresh.code}<p class="mt-0.5 text-xs text-muted">
 											{refresh.attempts}
 											{refresh.attempts === 1 ? 'try' : 'tries'}{#if refresh.code}
 												· {managementReasonLabel(refresh.code)}{/if}
@@ -488,7 +481,7 @@
 					</div>{:else if resultsQuery.isError}<div class="alert alert-error" role="alert">
 						Could not load operation results.
 					</div>{:else if results.length === 0}<div
-						class="rounded-xl border border-dashed border-base-content/15 p-5 text-sm text-base-content/50"
+						class="rounded-xl border border-dashed border-base-content/15 p-5 text-sm text-muted"
 					>
 						No per-file results have been recorded yet.
 					</div>{:else}<LibraryManagementAuditDossiers
@@ -509,11 +502,11 @@
 				<Card variant="bordered" padding="md">
 					<RotateCcw class="h-5 w-5 text-library-manage" />
 					<h2 class="mt-2 font-semibold">Undo this operation</h2>
-					<p class="mt-1 text-sm text-base-content/55">
+					<p class="mt-1 text-sm text-muted">
 						Creates a separate preview from this operation's before-state snapshots. Files changed
 						again later are skipped.
 					</p>
-					<p class="mt-2 text-xs text-base-content/55">{undoStatus}</p>
+					<p class="mt-2 text-xs text-muted">{undoStatus}</p>
 					<Button
 						variant="outline"
 						size="sm"
@@ -521,19 +514,19 @@
 						disabled={!undoAvailable}
 						onclick={() => (undoOpen = true)}>Preview Undo...</Button
 					>{#if operation.undo_available_count > 0 && !undoAvailable && (operation.undo_expires_at == null || operation.undo_expires_at > nowSeconds)}<p
-							class="mt-2 text-xs text-base-content/45"
+							class="mt-2 text-xs text-muted"
 						>
 							Undo becomes available when this operation reaches a successful or stopped state.
 						</p>{/if}
 				</Card>
 				<Card variant="bordered" padding="md">
-					<Clock3 class="h-5 w-5 text-base-content/50" />
+					<Clock3 class="h-5 w-5 text-muted" />
 					<h2 class="mt-2 font-semibold">Original baseline</h2>
-					<p class="mt-1 text-sm text-base-content/55">
+					<p class="mt-1 text-sm text-muted">
 						Restore files to how they were before DroppedNeedle first managed them. This is broader
 						than Undo and leaves restored files unmanaged.
 					</p>
-					{#if operation.baseline_available_count > 0}<p class="mt-2 text-xs text-base-content/55">
+					{#if operation.baseline_available_count > 0}<p class="mt-2 text-xs text-muted">
 							{baselineStatus}
 						</p>{/if}
 					<Button
@@ -573,10 +566,23 @@
 	canConfirm={undoAvailable}
 	onconfirm={previewUndo}
 >
-	{#if operation}<p class="mt-2 text-xs text-base-content/55">{undoStatus}</p>{/if}
+	{#if operation}<p class="mt-2 text-xs text-muted">{undoStatus}</p>{/if}
 	<div class="alert alert-info mt-3 text-sm">
 		<span
 			><strong>Undo is not baseline restore.</strong> It targets only this operation's completed changes.</span
 		>
 	</div>
 </ConfirmDialog>
+
+<style>
+	.op-progress {
+		padding: 1rem 1.25rem;
+		background-color: var(--color-base-200);
+	}
+	.op-progress > div:first-of-type {
+		font-family: var(--font-mono);
+		font-size: 0.8125rem;
+		letter-spacing: 0.08em;
+		text-transform: uppercase;
+	}
+</style>

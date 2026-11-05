@@ -19,6 +19,7 @@ use droppedneedle_library::identify::evidence::local_album;
 use droppedneedle_library::matching::decide::REVIEW_CEILING;
 use droppedneedle_library::matching::score::{heard_on_candidates, match_release};
 use droppedneedle_library::matching::{CreditedArtist, Release, ReleaseTrack};
+use droppedneedle_library::test_support::FakeProviders;
 use droppedneedle_providers::executor::{Prepared, Wire, WireAnswer, WireError};
 use droppedneedle_providers::musicbrainz::{self, MbSource};
 use droppedneedle_providers::{Providers, RequestPriority, TransportKind};
@@ -28,7 +29,7 @@ use identify::models::{
     DecisionSource, IdentificationOutcome, IdentifyKind, LocalAlbumFacts, LocalTrackFacts,
     RecallResult,
 };
-use identify::providers::{FakeProviders, LiveProviders};
+use identify::providers::LiveProviders;
 use identify::service::{IdentifyDeps, IdentifyService};
 use identify::sources::{AcoustIdUnavailable, AudioMatches, FingerprintSource, NoFingerprints};
 use identify::sqlite::SqliteIdentifyStore;
@@ -180,6 +181,7 @@ fn rig_hearing<F: FingerprintSource + 'static>(
         std::sync::Arc::new(droppedneedle_kernel::clock::SystemClock),
     ));
     let service = IdentifyService::new(IdentifyDeps {
+        preferences: crate::common::library::default_preferences(&dir),
         store: store.clone(),
         providers: Arc::new(LiveProviders::new(
             droppedneedle_library::identify::sources::Prioritised::new(
@@ -353,6 +355,7 @@ async fn heard_as_its_neighbour(
     let providers = Arc::new(FakeProviders::with_recall(recall.clone()));
     let mut rig = rig(false);
     rig.service = IdentifyService::new(IdentifyDeps {
+        preferences: crate::common::library::default_preferences(&rig._dir),
         store: rig.store.clone(),
         providers,
     });

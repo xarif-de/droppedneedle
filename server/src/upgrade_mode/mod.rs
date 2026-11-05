@@ -209,8 +209,11 @@ impl UpgradeMode {
             dirs,
             base_path: config.base_path.clone(),
             trusted_proxies: config.trusted_proxies.clone(),
+            // Upgrade mode runs before the platform opens, so its limiter
+            // reads the system clock itself.
             limits: Arc::new(
-                RateLimiter::new().with_trusted_proxies(config.trusted_proxies.clone()),
+                RateLimiter::new(Arc::new(droppedneedle_kernel::clock::SystemClock))
+                    .with_trusted_proxies(config.trusted_proxies.clone()),
             ),
             sign_in,
             tool,
@@ -751,7 +754,7 @@ fn lock_take<T>(mutex: &Mutex<Option<T>>) -> Option<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use droppedneedle_kernel::db::scratch::ScratchDir;
+    use droppedneedle_kernel::test_support::ScratchDir;
 
     /// The upgrade page is never served from a folder someone placed
     /// first: one already there under the name, or a link, is refused, and

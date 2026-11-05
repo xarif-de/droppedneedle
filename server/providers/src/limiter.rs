@@ -669,7 +669,7 @@ impl RateLimiter {
 /// The limiters of every table row, built once and shared.
 #[derive(Debug)]
 pub struct LimiterSet {
-    limiters: Vec<(&'static str, Arc<RateLimiter>)>,
+    pub(crate) limiters: Vec<(&'static str, Arc<RateLimiter>)>,
 }
 
 impl LimiterSet {
@@ -701,25 +701,6 @@ impl LimiterSet {
                         None => limiter,
                     };
                     (row.source, Arc::new(limiter))
-                })
-                .collect(),
-        }
-    }
-
-    /// One limiter per row, none of them paced. Tests only: production
-    /// always paces through [`LimiterSet::new`].
-    #[cfg(any(test, feature = "test-support"))]
-    #[must_use]
-    pub fn unpaced() -> Self {
-        Self {
-            limiters: RATES
-                .iter()
-                .map(|row| {
-                    let unpaced = RateRow {
-                        per_second: Rate::Fixed(0.0),
-                        ..*row
-                    };
-                    (row.source, Arc::new(RateLimiter::from_row(&unpaced)))
                 })
                 .collect(),
         }

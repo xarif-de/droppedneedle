@@ -16,9 +16,26 @@
 		onchange: (rating: number) => void;
 		/** 'sm' on rows, 'md' in headers. */
 		size?: 'sm' | 'md';
+		/**
+		 * For a list row: empty stars draw in the line colour until the row
+		 * sets `--dn-quiet-ink` (on hover or focus within) to bring them up.
+		 */
+		quiet?: boolean;
 	}
 
-	let { value, label, onchange, size = 'sm', class: className = '', ...rest }: Props = $props();
+	let {
+		value,
+		label,
+		onchange,
+		size = 'sm',
+		quiet = false,
+		class: className = '',
+		...rest
+	}: Props = $props();
+
+	const emptyInk = $derived(
+		quiet ? 'text-[color:var(--dn-quiet-ink,var(--dn-line))]' : 'text-edge'
+	);
 
 	const STARS = [1, 2, 3, 4, 5];
 	// Whole class strings, so Tailwind's scan finds every one.
@@ -41,7 +58,7 @@
 	{#each STARS as star (star)}
 		<button
 			type="button"
-			class="btn btn-ghost btn-square {sizes[size].button}"
+			class="btn btn-ghost dn-btn-ghost btn-square {sizes[size].button}"
 			aria-label={star === 1 ? '1 star' : `${star} stars`}
 			aria-pressed={star === value}
 			title={star === value ? 'Clear rating' : undefined}
@@ -52,9 +69,7 @@
 			onblur={() => (preview = 0)}
 		>
 			<Star
-				class="{sizes[size].icon} {star <= shown
-					? 'fill-warning text-warning'
-					: 'text-base-content/30'}"
+				class="{sizes[size].icon} {star <= shown ? 'fill-warning text-warning' : emptyInk}"
 				aria-hidden="true"
 			/>
 		</button>

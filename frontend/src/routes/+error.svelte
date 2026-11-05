@@ -26,13 +26,13 @@
 	<title>{status} - DroppedNeedle</title>
 </svelte:head>
 
-<div class="err-wrap grain">
+<div class="err-wrap">
 	<span class="err-code" aria-hidden="true">{status}</span>
 	<h1 class="err-head">{heading}</h1>
 	<p class="err-blurb">{blurb}</p>
 	<div class="err-actions">
 		<Button variant="ghost" size="sm" href={withBasePath('/')} icon={House}>Home</Button>
-		<Button variant="accent" size="sm" icon={RotateCw} onclick={() => location.reload()}>
+		<Button variant="primary" size="sm" icon={RotateCw} onclick={() => location.reload()}>
 			Retry
 		</Button>
 	</div>
@@ -40,7 +40,6 @@
 
 <style>
 	.err-wrap {
-		--grain-opacity: 0.12;
 		position: relative;
 		display: flex;
 		flex-direction: column;
@@ -53,33 +52,29 @@
 
 	.err-code {
 		font-family: var(--font-display);
-		font-weight: 800;
 		font-size: clamp(6rem, 28vw, 16rem);
-		line-height: 0.78;
-		letter-spacing: -0.01em;
-		color: oklch(from var(--color-base-content) l c h / 0.05);
-		-webkit-text-stroke: 2px oklch(from var(--color-base-content) l c h / 0.18);
-		text-shadow: 0 3px 2px oklch(from var(--color-base-content) 0 0 h / 0.45);
+		line-height: 0.85;
+		color: transparent;
+		-webkit-text-stroke: 2px var(--color-edge);
 		user-select: none;
 	}
 
 	.err-head {
 		margin-top: 1rem;
 		font-family: var(--font-display);
-		font-weight: 700;
-		font-size: clamp(1.5rem, 5vw, 2.25rem);
+		font-size: clamp(1.75rem, 5vw, 2.5rem);
 		line-height: 1;
-		letter-spacing: 0.02em;
+		letter-spacing: 0.01em;
 		text-transform: uppercase;
-		color: oklch(from var(--color-base-content) l c h / 0.9);
+		color: var(--color-title);
 	}
 
 	.err-blurb {
 		margin-top: 0.65rem;
 		max-width: 30rem;
-		font-size: 0.9rem;
+		font-size: 1rem;
 		line-height: 1.5;
-		color: oklch(from var(--color-base-content) l c h / 0.6);
+		color: var(--color-muted);
 	}
 
 	.err-actions {

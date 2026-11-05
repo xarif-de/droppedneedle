@@ -20,19 +20,22 @@ use droppedneedle_catalog::metadata::{
     Catalog, PageSources,
     library::LocalCatalog,
     ports::{NoDetails, NoFollows, NoPurchaseLinks},
-    upstream::{LiveCatalogSettings, Upstream},
+    upstream::{CatalogSettings, LiveCatalogSettings, Upstream},
 };
-use droppedneedle_catalog::search::ports::UnconfiguredEnrichment;
+use droppedneedle_catalog::test_support::UnconfiguredEnrichment;
 use droppedneedle_catalog::wiring::{CatalogInputs, CatalogPorts, CatalogSetup};
-use droppedneedle_kernel::clock::SystemClock;
+use droppedneedle_kernel::clock::Clock;
 use droppedneedle_kernel::db::Db;
 use droppedneedle_kernel::jobs::queue::JobQueue;
 use droppedneedle_kernel::platform::Platform;
+use droppedneedle_kernel::runtime_config::secret_sections::AdvancedSettings;
+use droppedneedle_kernel::runtime_config::sections::{MusicBrainzSettings, UserPreferences};
 use droppedneedle_library::wiring::{LibraryCore, LibrarySetup};
 use droppedneedle_media::stream::local_files::LibraryFiles;
 use droppedneedle_plugins::host::PluginHost;
 use droppedneedle_providers::Providers;
 
+use super::Probe as _;
 use super::acquire::FixedPlugin;
 
 /// Flow outcomes sent nowhere, for rigs that build the download journal
@@ -207,11 +210,11 @@ pub fn catalog_setup_at(
     collections: CollectionsState,
     acquire: Option<&AcquireSetup>,
 ) -> CatalogSetup {
-    let cover_warm = cover_warm_at(&platform.db);
+    let cover_warm = cover_warm_at(&platform.db, platform.clock.clone());
     let catalog = Catalog::new(
         Upstream::new(
             Arc::new(Providers::unpaced(Arc::new(
-                droppedneedle_providers::executor::ScriptedWire::new(),
+                droppedneedle_providers::test_support::ScriptedWire::new(),
             ))),
             Arc::new(LiveCatalogSettings::new(&platform.settings)),
             users.clone(),
@@ -219,7 +222,7 @@ pub fn catalog_setup_at(
         LocalCatalog::new(platform.db.clone()),
         PageSources {
             follows: droppedneedle_catalog::wiring::collections_follows(&collections),
-            ..quiet_page_sources(&platform.db)
+            ..quiet_page_sources(cover_warm.clone())
         },
     );
     let artwork = droppedneedle_catalog::wiring::artwork(platform, &inputs, catalog.clone());
@@ -245,20 +248,68 @@ pub fn catalog_setup_at(
 }
 
 /// What a catalog's pages read beyond MusicBrainz and the library, with no
-/// follow store and no plugins: an artist page queues its image warm on
-/// the jobs table in `db`, where nothing runs it.
-pub fn quiet_page_sources(db: &Db) -> PageSources {
+/// follow store and no plugins: an artist page queues its image warm
+/// through `cover_warm`.
+pub fn quiet_page_sources(cover_warm: CoverWarm) -> PageSources {
     PageSources {
         follows: Arc::new(NoFollows),
         purchase_links: Arc::new(NoPurchaseLinks),
         details: Arc::new(NoDetails),
-        cover_warm: cover_warm_at(db),
+        cover_warm,
     }
 }
 
-/// Image warms queued on the jobs table in `db`, where nothing runs them.
-pub fn cover_warm_at(db: &Db) -> CoverWarm {
-    CoverWarm::new(db.clone(), JobQueue::new(db.clone(), Arc::new(SystemClock)))
+/// A metadata catalog over `db` whose MusicBrainz settings never read, so
+/// a MusicBrainz search fails at once without a request and only what the
+/// cache already holds answers. For rigs that test the library's own reads
+/// beside it.
+pub fn offline_catalog(db: &Db, users: UsersDeps) -> Catalog {
+    Catalog::new(
+        Upstream::new(
+            Arc::new(Providers::unpaced(Arc::new(
+                droppedneedle_providers::test_support::ScriptedWire::new(),
+            ))),
+            Arc::new(NoMusicBrainz),
+            users,
+        ),
+        LocalCatalog::new(db.clone()),
+        quiet_page_sources(cover_warm_at(
+            db,
+            Arc::new(droppedneedle_kernel::clock::SystemClock),
+        )),
+    )
+}
+
+/// Catalog settings whose MusicBrainz section does not read, with the
+/// other sections at their defaults and ListenBrainz off.
+struct NoMusicBrainz;
+
+impl CatalogSettings for NoMusicBrainz {
+    fn musicbrainz(&self) -> Option<MusicBrainzSettings> {
+        None
+    }
+
+    fn preferences(&self) -> UserPreferences {
+        UserPreferences::default()
+    }
+
+    fn advanced(&self) -> AdvancedSettings {
+        AdvancedSettings::default()
+    }
+
+    fn listenbrainz_enabled(&self) -> bool {
+        false
+    }
+
+    fn store_region(&self) -> Option<String> {
+        None
+    }
+}
+
+/// Image warms queued on the jobs table in `db`, stamped by `clock`, where
+/// nothing runs them.
+pub fn cover_warm_at(db: &Db, clock: Arc<dyn Clock>) -> CoverWarm {
+    CoverWarm::new(db.clone(), JobQueue::new(db.clone(), clock))
 }
 
 /// The catalog's enrichment with no provider behind it: search results
@@ -551,7 +602,7 @@ pub fn quiet_loops(
         watcher,
         precache_sources,
         mixer: Arc::new(NoMixer),
-        demand: Arc::new(droppedneedle_kernel::jobs::discovery_demand::NoDemand),
+        demand: Arc::new(droppedneedle_kernel::test_support::NoDemand),
     }
 }
 
@@ -585,9 +636,11 @@ pub fn settings_at(
     let store = platform.settings.clone();
     let (effects, _) = Effects::new(
         store.clone(),
-        Arc::new(LiveSaveEffects::new(Arc::new(
-            droppedneedle_kernel::jobs::events_kick::NoopKick,
-        ))),
+        Arc::new(LiveSaveEffects::new(
+            Arc::new(droppedneedle_kernel::test_support::NoopKick),
+            Arc::new(|| {}),
+            Arc::new(|| {}),
+        )),
     );
     droppedneedle::settings::wiring::SettingsSetup::build(
         platform,
@@ -619,6 +672,7 @@ pub fn settings_closed(platform: &Platform) -> droppedneedle::settings::wiring::
         Arc::new(droppedneedle::settings::verify::LiveProbes::new(
             platform.http.shared().clone(),
             &Providers::closed(),
+            droppedneedle_auth::federated::settings::InstallIds::new(platform.settings.clone()),
         )),
     )
 }
@@ -655,4 +709,115 @@ pub async fn requests_over(
 async fn platform_over(db: &droppedneedle_acquire::db::AcquireDb) -> Platform {
     let dir = db.path().parent().expect("scratch dir").to_path_buf();
     super::TestPlatform::on(db.db(), &dir).build().await
+}
+
+/// One library folder a hand-built stream gateway serves, on a platform
+/// of its own: each file put in it is a catalog track whose id is the
+/// file's name, so a local stream of that key reads it.
+pub struct StreamFolder {
+    platform: Platform,
+    music: super::ScratchDir,
+    _runtime: droppedneedle_kernel::db::DbRuntime,
+    _scratch: super::ScratchDir,
+}
+
+impl StreamFolder {
+    /// An empty folder tagged `tag`.
+    pub async fn new(tag: &str) -> Self {
+        let scratch = super::ScratchDir::new(&format!("stream-{tag}"));
+        let runtime = super::scratch_runtime(&scratch.join("app.db")).await;
+        let platform = super::TestPlatform::on(runtime.db(), &scratch)
+            .build()
+            .await;
+        runtime.exec(
+            "INSERT INTO local_artists (id, display_name, folded_name, kind, created_at, \
+             updated_at) VALUES ('artist-stream', 'Artist', 'artist', 'group', 0, 0)",
+            [],
+        );
+        runtime.exec(
+            "INSERT INTO local_albums (id, root_id, grouping_key, title, title_folded, \
+             album_artist_id, grouping_source, created_at, updated_at) \
+             VALUES ('album-stream', 'root-stream', 'group-stream', 'Stream', 'stream', \
+             'artist-stream', 'manual', 0, 0)",
+            [],
+        );
+        Self {
+            platform,
+            music: super::ScratchDir::new(&format!("stream-{tag}-music")),
+            _runtime: runtime,
+            _scratch: scratch,
+        }
+    }
+
+    /// The folder.
+    pub fn path(&self) -> &std::path::Path {
+        &self.music
+    }
+
+    /// Write `name` with `bytes` into the folder and index it as track
+    /// `name`, its format read from the extension.
+    pub fn put(&self, name: &str, bytes: &[u8]) {
+        std::fs::write(self.music.join(name), bytes).expect("track file writes");
+        self.index(name);
+    }
+
+    /// Index `name` in the folder as track `name`, whatever is at that
+    /// path.
+    pub fn index(&self, name: &str) {
+        let format = name.rsplit_once('.').map_or("", |(_, ext)| ext);
+        self.platform.db.exec(
+            "INSERT INTO local_tracks (id, local_album_id, root_id, file_path, relative_path, \
+             path_hash, file_size_bytes, file_mtime_ns, stat_revision, title, title_folded, \
+             artist_name, artist_name_folded, album_title, album_title_folded, \
+             file_format, availability, ingest_source, imported_at, membership_source) \
+             VALUES (?1, 'album-stream', 'root-stream', ?2, ?1, ?1, 0, 0, 's', ?1, ?1, \
+             'Artist', 'artist', 'Stream', 'stream', ?3, 'indexed', 'scan', 0, 'manual')",
+            rusqlite::params![
+                name,
+                self.music.join(name).to_string_lossy().into_owned(),
+                format
+            ],
+        );
+    }
+
+    /// A gateway over the folder's catalog and folder, a plugin host that
+    /// launches nothing and the platform's `connect_apps` section, reading
+    /// remote keys through `remote` and transcoding through `transcoder`.
+    pub fn gateway<R, T>(
+        &self,
+        remote: R,
+        transcoder: T,
+        ffmpeg_present: bool,
+    ) -> droppedneedle_media::stream::gateway::Gateway<R, T> {
+        use droppedneedle_library::scan::coordinator::SharedResolver;
+        use droppedneedle_library::scan::models::EffectivePolicy;
+        use droppedneedle_library::scan::roots::{LibraryRoot, RootRegistry};
+        use droppedneedle_media::stream::gateway::{Gateway, PluginStreams};
+
+        let roots = SharedResolver::new(RootRegistry::new(
+            vec![LibraryRoot::new(
+                "root-stream",
+                self.music.to_path_buf(),
+                EffectivePolicy::Automatic,
+            )],
+            true,
+            "rev-stream",
+        ));
+        let queue = JobQueue::new(self.platform.db.clone(), self.platform.clock.clone());
+        Gateway::new(
+            LibraryFiles::new(self.platform.db.clone(), roots),
+            PluginStreams {
+                host: idle_host(
+                    &self.platform,
+                    super::library::library_core(&self.platform, queue),
+                ),
+                no_redirect: self.platform.http.direct_no_redirect().clone(),
+                spool_dir: self.platform.config.temp_dir.clone(),
+            },
+            remote,
+            transcoder,
+            self.platform.settings.live(),
+            ffmpeg_present,
+        )
+    }
 }

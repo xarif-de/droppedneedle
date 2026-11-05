@@ -29,7 +29,7 @@ use super::source_tag::SourceTag;
 use super::state::TaskStatus;
 use super::store::QuarantineRow;
 use super::upgrades::{UpgradeAsk, UpgradeError, UpgradeOutcome, Upgrades};
-use crate::dispatch::DispatchTarget;
+use crate::dispatch::{DispatchOrigin, DispatchTarget};
 use crate::downloads::worker::{DownloadWorker, ReimportError};
 use crate::reason::{Reason, ReasonKind};
 use crate::requests::error::RequestsError;
@@ -116,9 +116,8 @@ pub struct DownloadTaskResponse {
     pub download_type: String,
     /// `soulseek`, `usenet` or `plugin:<key>`.
     pub source: String,
-    /// What started the download: `user`, `approval`, `retry`, `wanted`,
-    /// `upgrade`, `edition` or `follow`.
-    pub origin: String,
+    /// What started the download.
+    pub origin: DispatchOrigin,
     pub release_group_mbid: String,
     pub release_mbid: Option<String>,
     pub release_track_mbid: Option<String>,
@@ -981,36 +980,6 @@ pub fn routes() -> Routes<DownloadsRoutes> {
         .user(routes!(activity_summary_handler))
         .admin(routes!(list_quarantine_handler))
         .admin(routes!(delete_quarantine_handler))
-}
-
-/// Queue routes over default settings (upgrades off), for tests. The
-/// settings sit beside the worker's scratch database.
-#[cfg(any(test, feature = "test-support"))]
-pub fn downloads_router(worker: Arc<DownloadWorker>) -> Result<axum::Router, String> {
-    let db = worker.journal().db().clone();
-    let dir = db
-        .path()
-        .parent()
-        .map(|dir| dir.join("settings"))
-        .ok_or_else(|| "scratch database has no directory".to_owned())?;
-    let settings = crate::settings::scratch_settings(&dir)?;
-    let dispatch = crate::dispatch::DownloadDispatch::new(
-        worker.journal().clone(),
-        Arc::new(droppedneedle_kernel::ids::UuidGenerator),
-        settings.live(),
-    );
-    let upgrades = Upgrades::new(
-        crate::flows::stores::UpgradeWorklist::new(db),
-        settings.live(),
-        Arc::new(dispatch),
-    );
-    Ok(routes()
-        .with_state(DownloadsRoutes::new(
-            worker.journal().clone(),
-            worker,
-            upgrades,
-        ))
-        .into_router())
 }
 
 // Manual album searches.

@@ -137,18 +137,17 @@
 	</Button>
 {/snippet}
 
-<Card as="article" variant="bordered" padding="md" class="border-warning/25">
+<Card as="article" variant="bordered" padding="md" class="border-warning/60! sm:p-5">
 	<div class="flex items-start gap-3 sm:gap-4">
 		{#if !compact}
-			<div
-				class="relative size-14 shrink-0 overflow-hidden rounded-xl ring-1 ring-base-content/10 sm:size-16"
-			>
+			<div class="relative size-16 shrink-0 overflow-hidden rounded-sm sm:size-22">
 				{#if entry.release_group_mbid}
 					<AlbumImage
 						mbid={entry.release_group_mbid}
 						alt={title}
-						size="sm"
-						rounded="xl"
+						size="full"
+						requestSize={250}
+						rounded="none"
 						className="h-full w-full"
 					/>
 				{:else}
@@ -159,11 +158,11 @@
 
 		<div class="min-w-0 flex-1">
 			{#if !compact}
-				<h3 class="truncate text-base font-bold">
+				<h3 class="truncate text-lg font-bold sm:text-xl">
 					{#if entry.release_group_mbid}
 						<a
 							href={albumHref(entry.release_group_mbid)}
-							class="transition-colors hover:text-primary motion-reduce:transition-none"
+							class="underline decoration-2 underline-offset-4 transition-colors hover:text-title motion-reduce:transition-none"
 						>
 							{title}
 						</a>
@@ -172,11 +171,11 @@
 					{/if}
 				</h3>
 			{/if}
-			<p class="text-xs text-base-content/60">
+			<p class="mt-1 font-mono text-xs tracking-wide text-muted uppercase">
 				{subtitle} · <span class="whitespace-nowrap">{expiry}</span>
 			</p>
 			{#if retrying}
-				<p class="mt-0.5 flex items-center gap-1.5 text-xs text-base-content/60">
+				<p class="mt-0.5 flex items-center gap-1.5 text-xs text-muted">
 					<RefreshCw
 						class="size-3 shrink-0 {entry.state === 'placing' ? 'animate-spin' : ''}"
 						aria-hidden="true"
@@ -212,7 +211,7 @@
 				<ul class="mt-2 space-y-0.5 text-sm text-base-content/75">
 					{#each reasons as reason (reason.text)}
 						<li>
-							{reason.text}{#if reasons.length > 1}<span class="text-base-content/45"
+							{reason.text}{#if reasons.length > 1}<span class="text-muted"
 									>{` (${reason.count})`}</span
 								>{/if}
 						</li>
@@ -287,7 +286,7 @@
 				<div class="mt-3 border-t border-base-content/8 pt-3">
 					<button
 						type="button"
-						class="flex w-full items-center justify-between gap-3 text-left text-xs font-semibold text-base-content/60 hover:text-base-content"
+						class="flex w-full items-center justify-between gap-3 text-left text-xs font-semibold text-muted hover:text-base-content"
 						onclick={() => (filesOpen = !filesOpen)}
 						aria-expanded={filesOpen}
 					>

@@ -1,13 +1,14 @@
 <!--
 	The fallback for cover or artist art that is missing or still loading: a
-	full-strength gradient with a disc (album) or person (artist) icon on top.
+	full-strength gradient with a mark on top: a record for an album, a
+	person for an artist.
 	The colours come from the id, or from the name when there is no valid id,
 	so an item looks the same on every screen. Fills its nearest positioned
 	ancestor, so the parent must be `relative`. `className` goes on the root,
 	for example to fade the placeholder out once the image is in.
 -->
 <script lang="ts">
-	import { Disc3, Users } from 'lucide-svelte';
+	import { Users } from 'lucide-svelte';
 	import { isValidMbid } from '$lib/utils/formatting';
 	import { coverPlaceholder } from './coverPlaceholder';
 
@@ -32,8 +33,13 @@
 	data-testid="cover-placeholder"
 >
 	{#if kind === 'album'}
-		<Disc3 class="h-1/3 w-1/3" />
+		<svg viewBox="0 0 100 100" class="h-1/2 w-1/2 opacity-80" fill="none" stroke="currentColor">
+			<circle cx="50" cy="50" r="46" stroke-width="5" />
+			<circle cx="50" cy="50" r="36" stroke-width="1.5" opacity="0.6" />
+			<circle cx="50" cy="50" r="29" stroke-width="1.5" opacity="0.6" />
+			<circle cx="50" cy="50" r="10" stroke-width="10" />
+		</svg>
 	{:else}
-		<Users class="h-1/3 w-1/3" />
+		<Users class="h-1/3 w-1/3 opacity-80" />
 	{/if}
 </div>

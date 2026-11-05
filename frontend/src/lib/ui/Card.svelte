@@ -1,7 +1,11 @@
 <!--
 	A panel that groups one thing's content. `flat` sits on the page tint,
-	`bordered` is a framed panel, `raised` a tile in a grid. With `href` the
-	whole card is one link named by its title, so it holds no other controls.
+	`bordered` is a framed panel, `raised` a tile in a grid, `paper` a page's
+	one light island (cream with dark ink in dark, raised paper-white in
+	light), `torn` the same stock with its top and bottom edges ripped (a
+	browse tile, a ticket), `acid` a torn sheet of the acid action colour with
+	dark ink (a short static note beside a page's paper). With `href` the whole card is one link named by its title, so it
+	holds no other controls.
 	A caller's `aria-*` attributes pass through, so a `section` card can be
 	named by its own heading with `aria-labelledby`. `ref` binds the card's
 	own element.
@@ -16,7 +20,7 @@
 	import CardTitle from './CardTitle.svelte';
 
 	interface Props extends Omit<HTMLAttributes<HTMLElement>, 'title' | 'children'> {
-		variant?: 'flat' | 'bordered' | 'raised';
+		variant?: 'flat' | 'bordered' | 'raised' | 'paper' | 'torn' | 'acid';
 		padding?: 'none' | 'sm' | 'md' | 'lg';
 		/** Rendered as an `h2`; use `header` for another heading or more than text. */
 		title?: string;
@@ -46,14 +50,20 @@
 	const titleId = $props.id();
 
 	const variants = {
-		flat: 'card bg-base-200',
-		bordered: 'card border border-base-300 bg-base-200',
-		raised: 'card bg-base-100 shadow-sm'
+		flat: 'card border border-base-300 bg-base-200',
+		bordered: 'card border border-line bg-base-200',
+		raised: 'card border border-line bg-base-200',
+		paper: 'card dn-card-paper border border-paper-border bg-paper text-paper-content',
+		torn: 'card dn-card-paper dn-card-torn bg-paper text-paper-content',
+		acid: 'card dn-card-torn bg-action text-action-content'
 	};
 	const linkHover = {
-		flat: 'transition-colors hover:bg-base-300',
-		bordered: 'transition-colors hover:border-primary/40',
-		raised: 'transition hover:shadow-md motion-safe:hover:-translate-y-0.5'
+		flat: 'transition-colors duration-150 hover:bg-neutral',
+		bordered: 'transition-colors duration-150 hover:border-edge hover:bg-neutral',
+		raised: 'transition duration-150 hover:bg-neutral motion-safe:hover:-translate-y-px',
+		paper: 'transition duration-150 hover:border-paper-content motion-safe:hover:-translate-y-px',
+		torn: 'transition duration-150 motion-safe:hover:-translate-y-px',
+		acid: 'transition duration-150 motion-safe:hover:-translate-y-px'
 	};
 	const paddings = {
 		none: 'card-body p-0',
@@ -66,7 +76,7 @@
 		[
 			variants[variant],
 			href !== undefined ? linkHover[variant] : '',
-			href !== undefined ? 'focus-visible:outline-2 focus-visible:outline-primary' : '',
+			href !== undefined ? 'focus-visible:outline-2 focus-visible:outline-focus' : '',
 			className
 		]
 			.filter(Boolean)

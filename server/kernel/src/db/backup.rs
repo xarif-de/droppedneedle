@@ -1086,7 +1086,7 @@ fn finished_backups(backup_dir: &Path) -> Result<Vec<PathBuf>, DbError> {
 /// Where a backup sorts: by the millisecond and then the sequence its
 /// [`backup_file_name`] holds, read as numbers, so `-10` comes after `-9`.
 /// A name of another shape sorts first, by name.
-fn backup_order(path: &Path) -> (Option<(u128, u64)>, PathBuf) {
+pub fn backup_order(path: &Path) -> (Option<(u128, u64)>, PathBuf) {
     let stamp = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -1193,7 +1193,7 @@ mod tests {
     /// bytes as they were.
     #[test]
     fn placing_onto_an_existing_database_never_replaces_it() {
-        let dir = crate::db::scratch::ScratchDir::new("backup-place").unwrap();
+        let dir = crate::test_support::ScratchDir::new("backup-place").unwrap();
         let temp = dir.join(".restore-1-2-3.tmp");
         let target = dir.join("library.db");
         std::fs::write(&temp, b"restored").unwrap();
@@ -1208,7 +1208,7 @@ mod tests {
     /// writes is refused rather than restored without them.
     #[test]
     fn a_backup_with_writes_in_its_wal_is_refused() {
-        let dir = crate::db::scratch::ScratchDir::new("backup-wal").unwrap();
+        let dir = crate::test_support::ScratchDir::new("backup-wal").unwrap();
         let backup = dir.join("library-1-0.db");
         // Held open so the writes stay in the -wal file.
         let writer = Connection::open(&backup).unwrap();

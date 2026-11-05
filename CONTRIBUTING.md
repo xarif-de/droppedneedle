@@ -24,7 +24,14 @@ The server is Rust (Axum, tokio, SQLite through rusqlite). The frontend is Svelt
 
 ### Running locally
 
-Server, with its data in `./dev-data`:
+The short way, from the repo root:
+
+```bash
+make setup   # once: frontend dependencies, the test browser, frontend/.env.development
+make dev     # the server and the Vite dev server together; Ctrl-C stops both
+```
+
+Or one at a time. Server, with its data in `./dev-data`:
 
 ```bash
 make server-run
@@ -131,26 +138,32 @@ Outside pull requests are welcome. Each one is reviewed against the rules in [CL
 - Server: no `unwrap`, `expect` or `panic!` outside tests (clippy enforces it). Services return typed errors; only handlers map them to HTTP status. Blocking file, SQLite or CPU-heavy work runs off the async workers.
 - The server is a single process. Never run two against the same data directory.
 - Frontend: strict TypeScript, no `any`. Svelte 5 runes only. Data fetching goes through TanStack Query hooks and the typed `/api/v3` client.
-- Use existing design tokens (`primary`, `secondary`, etc.) for colours, not hardcoded values.
+- Use existing design tokens (`primary`, `secondary`, etc.) for colors, not hardcoded values.
 - The web UI runs under an enforced content-security policy: no inline scripts, no `eval`, and no static `style="..."` in markup (eslint refuses one; bind styles through Svelte instead). Loading a script, frame, audio clip or connection from a new outside host is an edit to the list in `server/src/security_headers.rs`, with the reason beside it.
 - Run `pnpm run lint` and `pnpm run check` in the frontend before submitting.
 
-## AI-assisted contributions
+## Using AI
 
-If you used AI tools (Copilot, ChatGPT, Claude, etc.) to write code in your PR, please mention it. This isn't a problem and won't get your PR rejected, but it helps reviewers calibrate how much scrutiny to apply. A quick note like "Claude helped with the caching logic" is enough.
+DroppedNeedle is built with a lot of help from AI, and AI-assisted contributions are welcome, including pull requests an AI agent wrote most of.
 
-You're still responsible for understanding and testing the code you submit.
+What we ask is the same as for any pull request:
+
+- A clear description of what changed and why.
+- A change you thought through and talked through with your tools, not a first draft pasted in.
+- Tests that pass, and code you understand well enough to answer questions about.
+
+If you used AI, say so in the pull request: the tool and model (for example Claude Opus 5.5), and roughly how you worked with it. It doesn't change how the pull request is judged. We ask because we're curious what people use. Commit trailers your tool adds, such as `Co-Authored-By`, are fine to keep.
 
 ## Releases
 
 Maintainers cut releases. A release is a version tag, `v3.1.0` or `v3.1.0-rc.1` for a pre-release, on a commit of the release branch that CI has passed on. Bump `version` under `[workspace.package]` in `server/Cargo.toml` to the same version, without the `v`, before tagging: the workflow rejects a tag that does not match it. Pushing the tag starts the Release workflow, which checks the tag, the branch and CI, then waits for a maintainer to approve the `release` environment before it publishes `droppedneedle/droppedneedle:<tag>`. `:latest` only moves forward: a pre-release never moves it, and neither does a patch to an older line once a higher full version is tagged.
 
-CI is path-filtered: a commit that changes no code gets no v3 CI run, and a run on one that changes only some areas skips the other jobs and still passes. The Release workflow takes any passing v3 CI run on the commit, so start a full one by hand.
+CI is path-filtered: a commit that changes no code gets no CI run, and a run on one that changes only some areas skips the other jobs and still passes. The Release workflow takes any passing CI run on the commit, so start a full one by hand.
 
 Only maintainers tag, and nothing but a version tag publishes a release image. To cut one:
 
 1. Bump `version` in `server/Cargo.toml` to the release version and push that commit to the release branch.
-2. Start v3 CI by hand on that commit, so every job runs, and wait for it to pass.
+2. Start CI by hand on that commit, so every job runs, and wait for it to pass.
 3. Check that the latest Frontend CI run on the release branch and the weekly Perf budgets run are green.
 4. Run the release dry run described below.
 5. Push the tag.
@@ -160,4 +173,4 @@ To rehearse a release without publishing, run the Release workflow by hand with 
 
 ## Questions?
 
-Open a thread in [Discord](https://discord.gg/B5suDg7gu2) or start a [GitHub Discussion](https://github.com/DroppedNeedle/DroppedNeedle/discussions).
+Ask in [Discord](https://discord.gg/B5suDg7gu2) or open an [issue](https://github.com/DroppedNeedle/DroppedNeedle/issues).

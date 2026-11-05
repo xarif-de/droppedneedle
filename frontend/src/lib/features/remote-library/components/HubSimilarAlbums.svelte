@@ -4,6 +4,7 @@
 	import { getRemoteSimilarQuery } from '$lib/features/remote-library/queries/RemoteQueries.svelte';
 	import type { RemoteSourceDescriptor } from '$lib/features/remote-library/queries/remoteSources';
 	import type { RemoteAlbum, RemoteTrack } from '$lib/features/remote-library/queries/types';
+	import { Blend } from 'lucide-svelte';
 	import AlbumCarousel from './AlbumCarousel.svelte';
 
 	interface Props {
@@ -47,13 +48,18 @@
 
 {#if seedName || loading || albums.length > 0}
 	<div use:reveal>
-		<HubShelf title={seedName ? `More Like "${seedName}"` : 'More Like This'} {loading}>
+		<HubShelf
+			title={seedName ? `More Like "${seedName}"` : 'More Like This'}
+			icon={Blend}
+			bare
+			{loading}
+		>
 			{#if albums.length > 0}
 				<AlbumCarousel {albums} {onopen} />
 			{:else if similarQuery.isError}
-				<p class="text-sm text-base-content/50">Couldn't load similar albums.</p>
+				<p class="text-sm text-muted">Couldn't load similar albums.</p>
 			{:else if !loading}
-				<p class="text-sm text-base-content/50">No similar albums found.</p>
+				<p class="text-sm text-muted">No similar albums found.</p>
 			{/if}
 		</HubShelf>
 	</div>

@@ -2,7 +2,7 @@
 	import { page } from '$app/state';
 	import { goto } from '$app/navigation';
 	import { withBasePath } from '$lib/utils/basePath';
-	import { ChevronLeft, Disc3, Heart, Search, X } from 'lucide-svelte';
+	import { Disc3, Heart, Search, X } from 'lucide-svelte';
 	import {
 		getLibraryAlbumFormatsQuery,
 		getLibraryAlbumsInfiniteQuery
@@ -17,6 +17,7 @@
 	import LibraryAlbumCard from '$lib/features/library/components/LibraryAlbumCard.svelte';
 	import Button from '$lib/ui/Button.svelte';
 	import IconButton from '$lib/ui/IconButton.svelte';
+	import ListPageHeader from '$lib/ui/ListPageHeader.svelte';
 	import Input from '$lib/ui/Input.svelte';
 	import type { AlbumView } from '$lib/features/library/queries/types';
 
@@ -134,24 +135,17 @@
 
 <svelte:head><title>Albums · Library</title></svelte:head>
 
-<div class="container mx-auto p-4 md:p-6 lg:p-8">
-	<div class="flex items-center gap-4 mb-6">
-		<IconButton
-			icon={ChevronLeft}
-			label="Back to library"
-			onclick={() => goto(withBasePath('/library'))}
-		/>
-		<div>
-			<h1 class="text-3xl font-bold">{params.favorites ? 'Favourite Albums' : 'All Albums'}</h1>
-			<p class="text-base-content/70 text-sm mt-1">
-				{total}
-				{total === 1 ? 'album' : 'albums'}
-			</p>
-		</div>
-	</div>
+<ListPageHeader
+	title={params.favorites ? 'Favourite Albums' : 'All Albums'}
+	count={albumsQuery.data ? `${total.toLocaleString()} ${total === 1 ? 'album' : 'albums'}` : null}
+	ticket="DN / CC 3.2 - ALB"
+	backHref={withBasePath('/library')}
+	backLabel="Back to library"
+/>
 
-	<div class="flex flex-col sm:flex-row gap-3 mb-6">
-		<div class="relative flex-1">
+<div class="px-4 pb-10 sm:px-6 lg:px-8">
+	<div class="dn-toolbar">
+		<div class="dn-toolbar__grow">
 			<Input
 				icon={Search}
 				label="Search albums"
@@ -177,7 +171,7 @@
 			onclick={toggleFavorites}>Favourites</Button
 		>
 		<select
-			class="select"
+			class="select dn-toolbar__select"
 			value={params.sort}
 			onchange={(e) => setParams({ sort: (e.target as HTMLSelectElement).value })}
 			aria-label="Sort albums"
@@ -220,18 +214,18 @@
 			<Button variant="ghost" size="sm" onclick={() => albumsQuery.refetch()}>Retry</Button>
 		</div>
 	{:else if albumsQuery.isLoading}
-		<div class="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6">
-			{#each Array(12) as _, i (`skeleton-${i}`)}
+		<div class="dn-list-grid">
+			{#each Array(14) as _, i (`skeleton-${i}`)}
 				<div class="skeleton aspect-square w-full rounded-lg"></div>
 			{/each}
 		</div>
 	{:else if albums.length === 0}
 		<div class="flex flex-col items-center justify-center min-h-100 text-center">
-			<Disc3 class="h-12 w-12 text-base-content/40 mb-4" strokeWidth={1.5} />
+			<Disc3 class="h-12 w-12 text-muted mb-4" strokeWidth={1.5} />
 			<h2 class="text-2xl font-semibold mb-2">
 				{params.favorites && !params.q && !filtered ? 'No favourites yet' : 'No albums found'}
 			</h2>
-			<p class="text-base-content/70 mb-4">
+			<p class="text-muted mb-4">
 				{params.q || filtered
 					? 'Try a different search or filter.'
 					: params.favorites
@@ -240,16 +234,17 @@
 			</p>
 		</div>
 	{:else}
-		<div class="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6">
+		<div class="dn-list-grid">
 			{#each albums as album (album.id)}
 				<LibraryAlbumCard {album} />
 			{/each}
 		</div>
 
 		{#if albumsQuery.hasNextPage}
-			<div class="mt-6 flex justify-center">
+			<div class="mt-8 flex justify-center">
 				<Button
 					variant="outline"
+					class="min-w-60"
 					loading={albumsQuery.isFetchingNextPage}
 					onclick={() => albumsQuery.fetchNextPage()}
 				>

@@ -6,7 +6,8 @@
 	import ArtistImage from '$lib/media/ArtistImage.svelte';
 	import LocalIdentityBadge from '$lib/features/library/components/LocalIdentityBadge.svelte';
 	import Button from '$lib/ui/Button.svelte';
-	import Card from '$lib/ui/Card.svelte';
+	import ListPageHeader from '$lib/ui/ListPageHeader.svelte';
+	import MediaTile from '$lib/media/MediaTile.svelte';
 	import IconButton from '$lib/ui/IconButton.svelte';
 	import Input from '$lib/ui/Input.svelte';
 	import Tabs, { type TabItem } from '$lib/ui/Tabs.svelte';
@@ -17,7 +18,7 @@
 		ArtistView
 	} from '$lib/features/library/queries/types';
 	import { artistHref } from '$lib/utils/entityRoutes';
-	import { ChevronLeft, Disc3, Heart, Mic, Search, UsersRound, X } from 'lucide-svelte';
+	import { Disc3, Heart, Mic, Search, UsersRound, X } from 'lucide-svelte';
 	import LibraryFilterMenu, {
 		type RatingMode,
 		type TracksMode
@@ -31,7 +32,7 @@
 
 	const browse = $derived.by(() => {
 		const view = page.url.searchParams.get('view') === 'contributors' ? 'contributors' : 'albums';
-		const scope: LibraryArtistScope = view === 'contributors' ? 'contributors' : 'album';
+		const scope: LibraryArtistScope = view === 'contributors' ? 'contributors' : 'album_artists';
 		const favorites = page.url.searchParams.get('favorites') === '1';
 		const rawSort = page.url.searchParams.get('sort') as Sort | null;
 		const validSorts: Sort[] = [
@@ -145,40 +146,31 @@
 
 <svelte:head><title>Artists · Library</title></svelte:head>
 
-<main class="container mx-auto p-4 md:p-6 lg:p-8">
-	<header class="mb-6 flex items-center gap-4">
-		<IconButton
-			icon={ChevronLeft}
-			label="Back to library"
-			onclick={() => goto(withBasePath('/library'))}
-		/>
-		<div>
-			<p class="text-xs font-semibold uppercase tracking-[0.18em] text-primary">Your collection</p>
-			<h1 class="text-3xl font-black tracking-tight">
-				{browse.favorites ? 'Favourite Artists' : 'Artists'}
-			</h1>
-			<p class="mt-1 text-sm text-base-content/60">
-				{browse.scope === 'album'
-					? 'The artists who own releases in your library.'
-					: 'Guests, featured artists, and track-level credits.'}
-			</p>
-		</div>
-	</header>
+<ListPageHeader
+	title={browse.favorites ? 'Favourite Artists' : 'All Artists'}
+	count={response ? `${total.toLocaleString()} ${total === 1 ? 'artist' : 'artists'}` : null}
+	ticket="DN / CC 3.2 - ART"
+	backHref={withBasePath('/library')}
+	backLabel="Back to library"
+/>
 
+<main class="px-4 pb-10 sm:px-6 lg:px-8">
 	<Tabs
 		tabs={viewTabs}
 		selected={browse.view}
 		onselect={selectView}
 		label="Artist library views"
 		idPrefix="artist-views"
-		class="mb-6"
+		class="dn-toolbar"
 	>
-		<div class="mb-6 flex flex-col gap-3 sm:flex-row">
-			<div class="relative flex-1">
+		{#snippet aside()}
+			<div class="dn-toolbar__grow">
 				<Input
 					icon={Search}
 					label="Search artists"
-					placeholder={browse.scope === 'album' ? 'Search album artists…' : 'Search contributors…'}
+					placeholder={browse.scope === 'album_artists'
+						? 'Search album artists…'
+						: 'Search contributors…'}
 					class="w-full pr-12"
 					value={searchInput}
 					oninput={handleSearchInput}
@@ -200,7 +192,7 @@
 				onclick={toggleFavorites}>Favourites</Button
 			>
 			<select
-				class="select"
+				class="select dn-toolbar__select"
 				value="{browse.sortBy}:{browse.sortOrder}"
 				onchange={handleSortChange}
 				aria-label="Sort artists"
@@ -208,7 +200,7 @@
 				{#if browse.favorites}<option value="hearted:asc">Recently favourited</option>{/if}
 				<option value="name:asc">Name A-Z</option>
 				<option value="name:desc">Name Z-A</option>
-				{#if browse.scope === 'album'}
+				{#if browse.scope === 'album_artists'}
 					<option value="album_count:desc">Most releases</option>
 					<option value="album_count:asc">Fewest releases</option>
 				{:else}
@@ -221,7 +213,7 @@
 			<LibraryFilterMenu
 				minTracks={browse.minTracks}
 				tracksMode={browse.tracksMode}
-				tracksLabel={browse.scope === 'album' ? 'Tracks on their albums' : 'Appearances'}
+				tracksLabel={browse.scope === 'album_artists' ? 'Tracks on their albums' : 'Appearances'}
 				onMinTracks={(min, mode) =>
 					setParams({
 						min_tracks: min > 1 ? String(min) : null,
@@ -235,7 +227,13 @@
 						rating_mode: mode === 'atMost' && stars > 0 ? 'at_most' : null
 					})}
 			/>
-		</div>
+		{/snippet}
+
+		<p class="mb-4 font-mono text-xs tracking-wider text-muted uppercase">
+			{browse.scope === 'album_artists'
+				? 'The artists who own releases in your library'
+				: 'Guests, featured artists and track-level credits'}
+		</p>
 
 		{#if artistsQuery.isError}
 			<div class="alert alert-error mb-6">
@@ -243,10 +241,8 @@
 				<Button variant="ghost" size="sm" onclick={() => artistsQuery.refetch()}>Retry</Button>
 			</div>
 		{:else if artistsQuery.isLoading}
-			<div
-				class="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6"
-			>
-				{#each Array(12) as _, index (`skeleton-${index}`)}<ArtistCardSkeleton />{/each}
+			<div class="dn-list-grid">
+				{#each Array(14) as _, index (`skeleton-${index}`)}<ArtistCardSkeleton />{/each}
 			</div>
 		{:else if artists.length === 0}
 			<div class="flex min-h-100 flex-col items-center justify-center text-center">
@@ -258,33 +254,27 @@
 							? 'No favourites here yet'
 							: 'Nothing in this view yet'}
 				</h2>
-				<p class="max-w-md text-base-content/65">
+				<p class="max-w-md text-muted">
 					{browse.q
 						? 'Try a different search term.'
 						: browse.favorites
 							? 'Tap the heart on an artist to add them here.'
-							: browse.scope === 'album'
+							: browse.scope === 'album_artists'
 								? 'Album artists appear here as releases are added to your library.'
 								: 'Track-level guests and featured artists will appear here.'}
 				</p>
 			</div>
 		{:else}
-			<p class="mb-3 text-sm text-base-content/55">
-				{total}
-				{total === 1 ? 'artist' : 'artists'} in this view
-			</p>
-			<div
-				class="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6"
-			>
+			<div class="dn-list-grid">
 				{#each artists as artist (artist.id)}
-					<Card
-						variant="raised"
-						padding="none"
+					<MediaTile
+						kind="artist"
+						title={artist.name}
+						titleAs="h2"
 						href={artistHref(artist.artist_mbid ?? artist.id)}
-						class="group overflow-hidden"
-						aria-label={`Open ${artist.name}`}
+						label={`Open ${artist.name}`}
 					>
-						<figure class="relative aspect-square overflow-hidden p-3">
+						{#snippet art()}
 							<ArtistImage
 								mbid={artist.artist_mbid ?? ''}
 								localId={artist.id}
@@ -292,40 +282,40 @@
 								alt={artist.name}
 								size="full"
 								requestSize={250}
-								className="h-full w-full transition-transform duration-300 motion-safe:group-hover:scale-105"
+								className="h-full w-full"
 							/>
+						{/snippet}
+						{#snippet meta()}
+							{#if browse.scope === 'album_artists'}
+								{artist.album_count}
+								{artist.album_count === 1 ? 'release' : 'releases'} ·
+								{artist.led_track_count}
+								{artist.led_track_count === 1 ? 'track' : 'tracks'}
+							{:else}
+								{artist.appearance_album_count}
+								{artist.appearance_album_count === 1 ? 'release' : 'releases'} ·
+								{artist.appearance_track_count}
+								{artist.appearance_track_count === 1 ? 'appearance' : 'appearances'}
+							{/if}
+						{/snippet}
+						{#snippet overlay()}
 							{#if artist.identity_state === 'local_only'}
 								<LocalIdentityBadge
 									state={artist.identity_state}
 									subject="artist"
 									compact
-									className="absolute left-3 top-3 z-10"
+									className="absolute left-1 top-1 z-10"
 								/>
 							{/if}
-						</figure>
-						<div class="flex flex-col gap-1 p-3 pt-0 text-center">
-							<h2 class="truncate font-semibold">{artist.name}</h2>
-							<p class="text-xs text-base-content/55">
-								{#if browse.scope === 'album'}
-									{artist.album_count}
-									{artist.album_count === 1 ? 'release' : 'releases'} ·
-									{artist.led_track_count}
-									{artist.led_track_count === 1 ? 'track' : 'tracks'}
-								{:else}
-									{artist.appearance_album_count}
-									{artist.appearance_album_count === 1 ? 'release' : 'releases'} ·
-									{artist.appearance_track_count}
-									{artist.appearance_track_count === 1 ? 'appearance' : 'appearances'}
-								{/if}
-							</p>
-						</div>
-					</Card>
+						{/snippet}
+					</MediaTile>
 				{/each}
 			</div>
 			{#if artistsQuery.hasNextPage}
-				<div class="mt-6 flex justify-center">
+				<div class="mt-8 flex justify-center">
 					<Button
 						variant="outline"
+						class="min-w-60"
 						loading={artistsQuery.isFetchingNextPage}
 						onclick={() => artistsQuery.fetchNextPage()}
 					>

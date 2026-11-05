@@ -12,7 +12,8 @@
 	with no Cancel of its own.
 	`titleHref` makes the title a link to the thing the dialog shows; it still
 	names the dialog, and following it closes the dialog.
-	`icon` sets a tinted mark beside the title, in `iconTone`.
+	`icon` sets a tinted mark beside the title, in `iconTone` (`action` is the
+	acid tile with dark ink); a sheet shows it too.
 	`bottomSheet` rises from the bottom edge on a phone and sits centred from
 	`sm` up.
 	`focusTitle` puts focus on the title when it opens, for a dialog that is
@@ -22,11 +23,14 @@
 	changes. The caller closes it by setting `open` to false.
 	`overflowVisible` lets a dropdown inside reach past the box's edge, for a
 	short dialog that holds one.
+	`paper` prints a non-sheet dialog on paper stock (the light theme inside,
+	an Anton title), for a confirm that starts a write to files.
 -->
 <script lang="ts">
 	import type { Snippet } from 'svelte';
 	import { X } from 'lucide-svelte';
 	import type { KitIcon } from './Button.svelte';
+	import IconButton from './IconButton.svelte';
 
 	interface Props {
 		open: boolean;
@@ -38,7 +42,7 @@
 		size?: 'sm' | 'md' | 'lg' | 'xl' | 'sheet';
 		/** A lucide icon shown in a tinted mark beside the title. */
 		icon?: KitIcon;
-		iconTone?: 'accent' | 'warning' | 'error';
+		iconTone?: 'accent' | 'action' | 'warning' | 'error';
 		/** On a phone, rise from the bottom edge. */
 		bottomSheet?: boolean;
 		focusTitle?: boolean;
@@ -50,6 +54,8 @@
 		onrequestclose?: () => void;
 		/** Lets a dropdown inside reach past the box's edge. */
 		overflowVisible?: boolean;
+		/** Cream paper stock with an Anton title, for a confirm that starts a write. */
+		paper?: boolean;
 		onclose?: () => void;
 		children: Snippet;
 		actions?: Snippet;
@@ -69,6 +75,7 @@
 		closeButton = false,
 		onrequestclose,
 		overflowVisible = false,
+		paper = false,
 		onclose,
 		children,
 		actions
@@ -80,6 +87,7 @@
 	const sheet = $derived(size === 'sheet');
 	const iconTones = {
 		accent: 'bg-accent/10 text-accent',
+		action: 'border border-action-edge bg-action text-action-content',
 		warning: 'bg-warning/12 text-warning',
 		error: 'bg-error/12 text-error'
 	};
@@ -144,7 +152,7 @@
 		{#if titleHref}
 			<a
 				href={titleHref}
-				class="rounded-sm transition-colors hover:text-accent focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+				class="rounded-sm transition-colors hover:text-accent"
 				onclick={() => dialog?.close()}>{title}</a
 			>
 		{:else}
@@ -167,21 +175,30 @@
 			data-testid="modal-sheet"
 		>
 			<header
-				class="sticky top-0 z-10 flex items-start justify-between gap-3 border-b border-base-content/10 bg-base-100 px-4 py-3 md:static md:px-6 md:py-4"
+				class="sticky top-0 z-10 flex items-start justify-between gap-3 border-b border-line bg-base-200 px-4 py-3 md:static md:px-6 md:py-4"
 			>
-				<div class="min-w-0">
-					{@render heading('text-lg font-bold')}
+				{#if Icon}
+					<div
+						class="grid h-10 w-10 shrink-0 place-items-center rounded-xl {iconTones[iconTone]}"
+						aria-hidden="true"
+					>
+						<Icon class="h-5 w-5" />
+					</div>
+				{/if}
+				<div class={['min-w-0 flex-1', Icon && 'self-center']}>
+					{@render heading('text-xl leading-tight')}
 					{#if description}
-						<p id={descriptionId} class="mt-0.5 text-sm text-base-content/65">{description}</p>
+						<p id={descriptionId} class="mt-0.5 text-sm text-muted">{description}</p>
 					{/if}
 				</div>
 				{#if dismissible}
-					<button
-						type="button"
-						class="btn btn-square btn-ghost btn-sm"
-						aria-label="Close"
-						onclick={() => requestClose()}><X class="h-4 w-4" /></button
-					>
+					<IconButton
+						shape="square"
+						size="sm"
+						icon={X}
+						label="Close"
+						onclick={() => requestClose()}
+					/>
 				{/if}
 			</header>
 			<div class="flex-1 md:min-h-0">
@@ -189,7 +206,7 @@
 			</div>
 			{#if actions}
 				<div
-					class="sticky bottom-0 z-10 border-t border-base-content/10 bg-base-100 px-4 pt-3 pb-[calc(env(safe-area-inset-bottom)+0.75rem)] md:static md:px-6 md:pb-3"
+					class="sticky bottom-0 z-10 border-t border-line bg-base-200 px-4 pt-3 pb-[calc(env(safe-area-inset-bottom)+0.75rem)] md:static md:px-6 md:pb-3"
 				>
 					{@render actions()}
 				</div>
@@ -201,8 +218,10 @@
 				'modal-box',
 				widths[size as keyof typeof widths],
 				overflowVisible && 'overflow-visible',
+				paper && 'border-2 border-paper-content',
 				bottomSheet && 'max-sm:max-w-none pb-[calc(env(safe-area-inset-bottom)+1.5rem)] sm:pb-6'
 			]}
+			data-theme={paper ? 'light' : undefined}
 		>
 			<div class="flex items-start gap-3">
 				{#if Icon}
@@ -214,18 +233,24 @@
 					</div>
 				{/if}
 				<div class={['min-w-0 flex-1', Icon && 'self-center']}>
-					{@render heading('text-lg font-bold')}
+					{@render heading(
+						paper
+							? 'font-display text-3xl leading-none font-normal uppercase'
+							: 'text-xl leading-tight'
+					)}
 					{#if description}
-						<p id={descriptionId} class="mt-1 text-sm text-base-content/65">{description}</p>
+						<p id={descriptionId} class="mt-1 text-sm text-muted">{description}</p>
 					{/if}
 				</div>
 				{#if closeButton && dismissible}
-					<button
-						type="button"
-						class="btn btn-square btn-ghost btn-sm -mt-1 -mr-2 shrink-0"
-						aria-label="Close"
-						onclick={() => requestClose()}><X class="h-4 w-4" /></button
-					>
+					<IconButton
+						shape="square"
+						size="sm"
+						icon={X}
+						label="Close"
+						class="-mt-1 -mr-2 shrink-0"
+						onclick={() => requestClose()}
+					/>
 				{/if}
 			</div>
 			<div class="pt-4">

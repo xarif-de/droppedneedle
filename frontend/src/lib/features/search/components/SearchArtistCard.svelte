@@ -1,14 +1,17 @@
+<!--
+	One artist result: the Library artist tile with the type and description
+	under the name, then the release count and the listen count once they are
+	fetched, and the discography download over the picture.
+-->
 <script lang="ts">
 	import type { Artist } from '$lib/features/search/queries/types';
 	import type { EnrichmentSource } from '$lib/features/album/queries/types';
 	import { artistHref } from '$lib/utils/entityRoutes';
 	import { imageMbid, isLocalOnlyRow } from '$lib/features/search/queries/SearchV3Adapters';
-	import { formatListenCount } from '$lib/utils/formatting';
-	import { getListenTitle } from '$lib/features/search/queries/enrichment';
-	import { Music2 } from 'lucide-svelte';
 	import ArtistImage from '$lib/media/ArtistImage.svelte';
 	import ArtistCardDownloadButton from '$lib/features/artist/components/ArtistCardDownloadButton.svelte';
-	import Card from '$lib/ui/Card.svelte';
+	import MediaTile from '$lib/media/MediaTile.svelte';
+	import SearchListens from './SearchListens.svelte';
 
 	interface Props {
 		artist: Artist;
@@ -18,25 +21,25 @@
 
 	let { artist, enrichmentSource = null, onenrichmentrequest = undefined }: Props = $props();
 
-	let listenTitle = $derived(getListenTitle(enrichmentSource, 'artist'));
+	const artistLine = $derived(
+		[artist.type_info, artist.disambiguation].filter(Boolean).join(' · ')
+	);
 </script>
 
-<Card
-	variant="raised"
-	padding="none"
+<MediaTile
+	kind="artist"
+	title={artist.title}
+	titleAs="h3"
 	href={artistHref(artist.musicbrainz_id)}
-	onpointerenter={artist.local_id === artist.musicbrainz_id ? undefined : onenrichmentrequest}
-	onfocus={artist.local_id === artist.musicbrainz_id ? undefined : onenrichmentrequest}
-	class="group w-full shrink-0"
+	onintent={artist.local_id === artist.musicbrainz_id ? undefined : onenrichmentrequest}
+	class="w-full shrink-0"
 >
-	{#if !artist.local_id || artist.local_id !== artist.musicbrainz_id}
-		<ArtistCardDownloadButton artistName={artist.title} artistMbid={artist.musicbrainz_id} />
-	{/if}
-	<figure class="flex justify-center pt-4">
+	{#snippet art()}
 		<ArtistImage
 			mbid={imageMbid(artist)}
 			alt={artist.title}
-			size="lg"
+			size="full"
+			className="w-full h-full"
 			requestSize={250}
 			responsiveSizes="(max-width: 639px) 144px, 176px"
 			remoteUrl={artist.thumb_url ?? null}
@@ -44,40 +47,33 @@
 			available={!isLocalOnlyRow(artist)}
 			localId={isLocalOnlyRow(artist) ? artist.local_id : null}
 		/>
-	</figure>
-
-	<div class="flex flex-col items-center gap-0.5 px-3 pb-3 text-center">
-		<h2 class="font-semibold text-sm line-clamp-1">{artist.title}</h2>
-
-		<p class="text-xs text-base-content/60 line-clamp-1 min-h-[1rem]">
-			{#if artist.disambiguation}{artist.disambiguation}{:else}&nbsp;{/if}
-		</p>
-
-		<div class="flex flex-wrap items-center justify-center gap-1 mt-1 min-h-[1.5rem]">
-			{#if artist.release_group_count != null}
-				<span class="badge badge-sm badge-ghost">
-					{artist.release_group_count} release{artist.release_group_count !== 1 ? 's' : ''}
-				</span>
-			{/if}
-			{#if artist.listen_count != null}
-				{#if enrichmentSource === 'lastfm'}
-					<span class="badge badge-sm border-0 bg-lastfm/15 text-lastfm" title={listenTitle}>
-						Last.fm {formatListenCount(artist.listen_count, true)}
-					</span>
-				{:else if enrichmentSource === 'listenbrainz'}
+	{/snippet}
+	{#snippet meta()}
+		{#if artistLine}{artistLine}{:else}&nbsp;{/if}
+	{/snippet}
+	<!-- Both lines are kept while empty, so enrichment fills them in place. -->
+	{#snippet footer()}
+		<div class="flex flex-col items-center gap-1.5">
+			<span class="flex h-5 items-center">
+				{#if artist.release_group_count != null}
 					<span
-						class="badge badge-sm border-0 bg-listenbrainz/15 text-listenbrainz"
-						title={listenTitle}
+						class="rounded-sm border border-edge px-1.5 font-mono text-[0.6875rem] leading-[1.125rem] tracking-wider text-base-content uppercase"
 					>
-						LB {formatListenCount(artist.listen_count, true)}
-					</span>
-				{:else}
-					<span class="badge badge-sm badge-ghost" title={listenTitle}>
-						<Music2 class="inline h-3 w-3" />
-						{formatListenCount(artist.listen_count, true)}
+						{artist.release_group_count}
+						{artist.release_group_count === 1 ? 'release' : 'releases'}
 					</span>
 				{/if}
-			{/if}
+			</span>
+			<span class="flex h-4 items-center">
+				{#if artist.listen_count != null}
+					<SearchListens count={artist.listen_count} source={enrichmentSource} kind="artist" />
+				{/if}
+			</span>
 		</div>
-	</div>
-</Card>
+	{/snippet}
+	{#snippet overlay()}
+		{#if !artist.local_id || artist.local_id !== artist.musicbrainz_id}
+			<ArtistCardDownloadButton artistName={artist.title} artistMbid={artist.musicbrainz_id} />
+		{/if}
+	{/snippet}
+</MediaTile>

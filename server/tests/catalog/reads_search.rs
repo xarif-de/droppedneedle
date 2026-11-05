@@ -116,9 +116,16 @@ fn seed_catalog(app_db: &Path) {
     );
 }
 
-fn search_deps(app_db: PathBuf, enrichment: Arc<dyn EnrichmentPort>) -> SearchDeps {
+/// The search deps over `app_db`, MusicBrainz search failing at once
+/// without a request: these tests read the library's own hits.
+fn search_deps(
+    app_db: PathBuf,
+    enrichment: Arc<dyn EnrichmentPort>,
+    users: droppedneedle_auth::users::UsersDeps,
+) -> SearchDeps {
     let db = droppedneedle_kernel::db::Db::open_for_tests(&app_db).expect("search database opens");
-    SearchDeps::new(SearchService::new(db), enrichment)
+    let remote = crate::common::bundles::offline_catalog(&db, users);
+    SearchDeps::new(SearchService::new(db, remote), enrichment)
 }
 
 /// What a test's router needs alive: the rig its session lives in and the
@@ -137,7 +144,7 @@ async fn app(app_db: PathBuf, enrichment: Arc<dyn EnrichmentPort>) -> (axum::Rou
     let app = scope
         .request_scope(
             search::routes()
-                .with_state(search_deps(app_db, enrichment))
+                .with_state(search_deps(app_db, enrichment, rig.deps.clone()))
                 .into_router()
                 .layer(middleware::from_fn_with_state(
                     rig.session_gate(),
@@ -154,7 +161,7 @@ async fn authed_app() -> (axum::Router, PathBuf, (Held, crate::common::ScratchDi
     seed_catalog(&app_db);
     let (app, held) = app(
         app_db.clone(),
-        Arc::new(search::ports::UnconfiguredEnrichment),
+        Arc::new(droppedneedle_catalog::test_support::UnconfiguredEnrichment),
     )
     .await;
     (app, app_db, (held, dir))
@@ -591,7 +598,11 @@ async fn leak_db_failure_renders_fixed_500_with_error_id() {
     let dir = crate::common::ScratchDir::new("reads-search-no-schema");
     let app_db = dir.join("app.db");
     drop(droppedneedle_kernel::db::open_connection(&app_db).expect("empty database opens"));
-    let (app, _held) = app(app_db, Arc::new(search::ports::UnconfiguredEnrichment)).await;
+    let (app, _held) = app(
+        app_db,
+        Arc::new(droppedneedle_catalog::test_support::UnconfiguredEnrichment),
+    )
+    .await;
     let (status, headers, bytes) = call(
         app,
         Method::GET,
@@ -690,7 +701,7 @@ async fn track_search_survives_vacuum_and_a_table_rebuild() {
     );
     let (app, _held) = app(
         app_db.clone(),
-        Arc::new(search::ports::UnconfiguredEnrichment),
+        Arc::new(droppedneedle_catalog::test_support::UnconfiguredEnrichment),
     )
     .await;
     let queries = ["amber", "cobalt", "dune", "needle 1", "needle"];

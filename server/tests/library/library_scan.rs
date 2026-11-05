@@ -18,20 +18,20 @@ use droppedneedle_kernel::clock::SystemClock;
 use droppedneedle_kernel::db::{Budget, Db, LaneLimits};
 use droppedneedle_kernel::jobs::CancellationToken;
 use droppedneedle_library::identify::models::RecallResult;
-use droppedneedle_library::identify::providers::FakeProviders;
 use droppedneedle_library::identify::service::{IdentifyDeps, IdentifyService};
 use droppedneedle_library::identify::sqlite::SqliteIdentifyStore;
 use droppedneedle_library::repairs::hygiene;
-use droppedneedle_library::scan::ScanFailureRecord;
 use droppedneedle_library::scan::roots::PolicyRule;
 use droppedneedle_library::scan::{
     BlockingPool, Counter, EffectivePolicy, Event, FailureCode, InclusionRule, LibraryRoot,
-    LibraryScanCoordinator, NullTagReader, Phase, RootRegistry, RootSeamError, RunState, ScanKind,
-    ScanPhase, ScanRequest, ScanRun, ScanScope, ScanState, ScanStoreError, ScanTrigger,
-    ScannedTags, SqliteScanStore, StaticResolver, StreamRootSeam, TagReadError, TagReader,
-    WatcherAction, WorkWakeups,
+    LibraryScanCoordinator, Phase, RootRegistry, RootSeamError, RunState, ScanKind, ScanPhase,
+    ScanRequest, ScanRun, ScanScope, ScanState, ScanStoreError, ScanTrigger, ScannedTags,
+    SqliteScanStore, StreamRootSeam, TagReadError, TagReader, WatcherAction, WorkWakeups,
 };
+use droppedneedle_library::scan::{ScanEventPublisher, ScanFailureRecord};
 use droppedneedle_library::tags::TrackFile;
+use droppedneedle_library::test_support::FakeProviders;
+use droppedneedle_library::test_support::{NullTagReader, StaticResolver};
 use droppedneedle_library::wiring::LibrarySetup;
 use sha2::{Digest, Sha256};
 
@@ -223,9 +223,9 @@ async fn scan_catalogs_tags_without_touching_files() {
 /// both sides of a daylight-saving change, and not a minute before.
 #[tokio::test]
 async fn daily_scans_run_at_local_time_across_a_clock_change() {
-    use droppedneedle_kernel::clock::ManualClock;
     use droppedneedle_kernel::config::AppConfig;
     use droppedneedle_kernel::runtime_config::sections::{LibraryScanSchedule, ScanFrequency};
+    use droppedneedle_kernel::test_support::ManualClock;
     // London moves from GMT to BST at 01:00 UTC on Sunday 30 March 2025.
     const SATURDAY_0300_GMT: i64 = 1_743_217_200_000;
     const SUNDAY_0300_BST: i64 = 1_743_300_000_000;
@@ -779,8 +779,9 @@ fn coordinator_on<T: TagReader + 'static>(
         tags,
         Arc::new(StaticResolver::new(registry)),
         Arc::new(SystemClock),
-    )
-    .with_wakeups(WorkWakeups::new());
+        ScanEventPublisher::new(Arc::new(|_| {})),
+        WorkWakeups::new(),
+    );
     let paths = HashMap::from([("music".to_owned(), root.to_owned())]);
     (coordinator, paths)
 }
@@ -1209,7 +1210,7 @@ async fn an_end_pass_that_fails_or_runs_long_still_ends() {
         ..LaneLimits::default()
     };
     let db = Db::open_for_tests_with(&path, limits).expect("database opens");
-    let clock = Arc::new(droppedneedle_kernel::clock::ManualClock::at(
+    let clock = Arc::new(droppedneedle_kernel::test_support::ManualClock::at(
         1_800_000_000_000,
     ));
     let registry = RootRegistry::new(
@@ -1227,8 +1228,9 @@ async fn an_end_pass_that_fails_or_runs_long_still_ends() {
         Arc::new(NullTagReader::new()),
         Arc::new(StaticResolver::new(registry)),
         clock.clone(),
-    )
-    .with_wakeups(WorkWakeups::new());
+        ScanEventPublisher::new(Arc::new(|_| {})),
+        WorkWakeups::new(),
+    );
     let paths = HashMap::from([("music".to_owned(), root.clone())]);
     coordinator.request_run(&request(&root)).expect("requested");
     let first = coordinator.run_once(&paths).await.expect("driven");
@@ -2610,8 +2612,9 @@ impl RegroupRig {
             Arc::clone(&reader),
             Arc::new(StaticResolver::new(registry)),
             Arc::new(SystemClock),
-        )
-        .with_wakeups(WorkWakeups::new());
+            ScanEventPublisher::new(Arc::new(|_| {})),
+            WorkWakeups::new(),
+        );
         Self {
             scratch,
             root,
@@ -3408,6 +3411,7 @@ async fn identify_now(rig: &RegroupRig, album: &str) -> String {
         Arc::new(SystemClock),
     ));
     let service = IdentifyService::new(IdentifyDeps {
+        preferences: crate::common::library::default_preferences(&rig.scratch),
         store: store.clone(),
         providers: Arc::new(FakeProviders::with_recall(RecallResult::default())),
     });
@@ -7980,8 +7984,9 @@ impl ArtistRig {
             Arc::new(droppedneedle_library::adapters::LoftyTagReader),
             Arc::new(StaticResolver::new(registry)),
             Arc::new(SystemClock),
-        )
-        .with_wakeups(WorkWakeups::new());
+            ScanEventPublisher::new(Arc::new(|_| {})),
+            WorkWakeups::new(),
+        );
         Self {
             scratch,
             root,
@@ -10897,7 +10902,7 @@ async fn a_new_copy_at_a_path_needs_the_same_recording_and_new_audio() {
 /// same server after a restart.
 async fn watched(
     scratch: &Path,
-    clock: Arc<droppedneedle_kernel::clock::ManualClock>,
+    clock: Arc<droppedneedle_kernel::test_support::ManualClock>,
 ) -> (droppedneedle_kernel::platform::Platform, LibrarySetup) {
     migrated_db(&scratch.join("app.db"));
     let db = Db::open_for_tests(&scratch.join("app.db")).expect("database opens");
@@ -10944,7 +10949,7 @@ async fn the_folder_watcher_scans_the_changed_folder_across_a_restart() {
             std::fs::create_dir_all(&folder).expect("mkdir");
             std::fs::write(folder.join("cover.jpg"), b"x").expect("write");
         }
-        let clock = Arc::new(droppedneedle_kernel::clock::ManualClock::at(
+        let clock = Arc::new(droppedneedle_kernel::test_support::ManualClock::at(
             1_700_000_000_000,
         ));
         let (_platform, library) = watched(&scratch, clock.clone()).await;
@@ -10978,7 +10983,7 @@ async fn the_folder_watcher_scans_the_changed_folder_across_a_restart() {
     let music = scratch.join("music");
     std::fs::create_dir_all(music.join("A")).expect("mkdir");
     std::fs::write(music.join("A/notes.txt"), b"x").expect("write");
-    let clock = Arc::new(droppedneedle_kernel::clock::ManualClock::at(
+    let clock = Arc::new(droppedneedle_kernel::test_support::ManualClock::at(
         1_700_000_000_000,
     ));
     let (platform, library) = watched(&scratch, clock.clone()).await;

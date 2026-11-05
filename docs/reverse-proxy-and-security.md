@@ -1,6 +1,6 @@
 # Reverse proxy and security
 
-Running DroppedNeedle behind a reverse proxy, telling it its public address, the HSTS and content-security policy settings under Settings > Security, signing out everywhere, and database backups.
+Running DroppedNeedle behind a reverse proxy, telling it its public address, the HSTS and content-security policy settings under Settings > Security, and signing out everywhere. Backups have their own page, [Backups and restore](backups-and-restore.md).
 
 ## Contents
 
@@ -57,7 +57,7 @@ Settings > Security > Content-security policy has two settings. "Policy" is `Enf
 
 Every other response (the API, covers, streams, files) carries a fixed policy under which nothing runs, unless the policy is `Off`. The Subsonic and Jellyfin APIs are not touched, except that the Subsonic picture address (`/subsonic/img`) always sends its own policy, under which nothing runs, whatever this setting says. If your reverse proxy adds a `Content-Security-Policy` of its own, the browser applies both, so it can only make the rules stricter, never looser.
 
-A proxy that rewrites the page or injects a script into it (an analytics snippet, a script optimiser such as Cloudflare's Rocket Loader) leaves a blank page, because the browser refuses the changed script. To tell, open the browser's developer console: it names the content-security policy for each script it refused. The best fix is to turn the rewriting off for DroppedNeedle's address. Until then, set the policy to `Report only`. The Security tab cannot be reached from a blank page, so change it on the host with the server stopped:
+A proxy that rewrites the page or injects a script into it (an analytics snippet, a script optimizer such as Cloudflare's Rocket Loader) leaves a blank page, because the browser refuses the changed script. To tell, open the browser's developer console: it names the content-security policy for each script it refused. The best fix is to turn the rewriting off for DroppedNeedle's address. Until then, set the policy to `Report only`. The Security tab cannot be reached from a blank page, so change it on the host with the server stopped:
 
 ```bash
 docker compose stop droppedneedle
@@ -73,16 +73,4 @@ Profile > Sessions lists the browsers and devices signed in to your account. "Si
 
 ## Backups
 
-A backup is a copy of the database, which holds your settings, accounts, playlists and history, plus the undo copies Library Management keeps. Admins make and check them under Settings > Backups: "Back up now" makes one, and "Check" tests whether a backup would restore. DroppedNeedle also makes one by itself before an upgrade changes the database. The five newest are kept, in the `backups` folder next to `library.db`.
-
-Stored passwords and API keys in a backup are sealed with the key file `config/data_enc.key`. Keep a copy of that file with your backups: a backup cannot be used without it.
-
-Restoring is done on the host, never from the web UI. Stop the server, restore into an empty folder, and start it again on that folder:
-
-```bash
-docker compose stop droppedneedle
-docker compose run --rm droppedneedle droppedneedle-tool restore --backup /app/cache/backups/BACKUP.db --target-dir /app/cache/restored
-docker compose up -d droppedneedle
-```
-
-`restore` checks the backup first and never replaces a file. Point `LIBRARY_DB_PATH` at the restored database, or move it into place, before starting. More detail is in [Upgrading from v2](upgrading-from-v2.md#backups-and-restore).
+Admins make and check database backups under Settings > Backups, and DroppedNeedle makes one by itself before an update changes the database. Keep `config/data_enc.key` with them. Restoring is done on the host, never from the web UI: [Backups and restore](backups-and-restore.md) has the steps.
