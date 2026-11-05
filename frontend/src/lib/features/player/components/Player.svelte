@@ -15,6 +15,10 @@
 	import NowPlayingIndicator from '$lib/features/player/components/NowPlayingIndicator.svelte';
 	import AlbumImage from '$lib/media/AlbumImage.svelte';
 	import IconButton from '$lib/ui/IconButton.svelte';
+	import PlayerTrackMarks from '$lib/features/player/components/PlayerTrackMarks.svelte';
+	import StarPicker from '$lib/features/player/components/StarPicker.svelte';
+	import { libraryTrackId, skipByRating } from '$lib/features/player/state/skipByRating.svelte';
+	import { getRatingsQuery } from '$lib/features/library/queries/ratings.svelte';
 	import { withBasePath } from '$lib/utils/basePath';
 	import { getLyricsQuery } from '$lib/features/player/queries/lyrics.svelte';
 	import { authStore } from '$lib/stores/authStore.svelte';
@@ -35,8 +39,23 @@
 		CircleX,
 		ListMusic,
 		SlidersHorizontal,
-		Music2
+		Music2,
+		FastForward
 	} from 'lucide-svelte';
+
+	// The queue's track ratings, read only while the rating floor is on and
+	// kept fresh by the ratings cache (a rating given anywhere moves it).
+	const queueTrackIds = $derived(
+		skipByRating.minStars > 0
+			? [...new Set(playerStore.queue.map(libraryTrackId).filter((id) => id !== null))].sort()
+			: []
+	);
+	const queueRatings = getRatingsQuery(() =>
+		queueTrackIds.length > 0 ? { trackIds: queueTrackIds } : null
+	);
+	$effect(() => {
+		skipByRating.ratings = queueTrackIds.length > 0 ? (queueRatings.data?.tracks ?? null) : null;
+	});
 
 	let eqPanelOpen = $state(false);
 	let queueDrawerOpen = $state(false);
@@ -194,6 +213,26 @@
 			<div class="flex shrink-0 flex-col items-center justify-center gap-1 sm:flex-1">
 				<div class="flex items-center gap-1 sm:gap-3">
 					{#if playerStore.hasQueue}
+						<span class="hidden sm:inline-flex">
+							<StarPicker
+								label={skipByRating.minStars > 0
+									? `Skipping tracks rated under ${skipByRating.minStars} stars`
+									: 'Skip tracks with low rating'}
+								value={skipByRating.minStars}
+								clear="off"
+								active={skipByRating.minStars > 0}
+								onpick={(stars) => skipByRating.set(stars)}
+							>
+								<span class="relative inline-flex size-5 items-center justify-center">
+									<FastForward class="size-5" aria-hidden="true" />
+									{#if skipByRating.minStars > 0}
+										<span class="badge badge-warning badge-xs absolute -right-2 -top-2 px-1"
+											>{skipByRating.minStars}★</span
+										>
+									{/if}
+								</span>
+							</StarPicker>
+						</span>
 						<IconButton
 							size="sm"
 							icon={Shuffle}
@@ -240,6 +279,8 @@
 						disabled={!playerStore.hasNext}
 						onclick={() => playerStore.nextTrack()}
 					/>
+
+					<PlayerTrackMarks />
 				</div>
 
 				<div class="hidden sm:flex items-center gap-2 w-full max-w-lg">

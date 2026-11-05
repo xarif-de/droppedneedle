@@ -229,10 +229,15 @@ impl Catalog {
         CacheKey::new(Source::MusicBrainz, &[&namespace, "artist", mbid])
     }
 
-    /// Cache key of the artist's release-group list.
+    /// Cache key of the artist's release-group list. Named anew when the
+    /// list began to fall back to the artist's releases, so an empty list
+    /// kept from before is not served for the rest of its two weeks.
     pub(super) fn release_groups_key(&self, mbid: &str) -> CacheKey {
         let (_, namespace) = self.upstream().musicbrainz(RequestPriority::UserInitiated);
-        CacheKey::new(Source::MusicBrainz, &[&namespace, "artist_rgs", mbid])
+        CacheKey::new(
+            Source::MusicBrainz,
+            &[&namespace, "artist_release_groups", mbid],
+        )
     }
 
     /// Cache key of TheAudioDB's artist art.
@@ -640,6 +645,9 @@ impl Catalog {
                     )
                     .await
                     .map_err(mb_search_error)?;
+                if page.count == 0 && page.items.is_empty() {
+                    return catalog.release_groups_of_releases(&artist, priority).await;
+                }
                 let total = page.count;
                 let mut seen = HashSet::new();
                 let items: Vec<ReleaseGroupItem> = page
@@ -667,6 +675,42 @@ impl Catalog {
         )
         .await
         .map(Option::unwrap_or_default)
+    }
+
+    /// The discography of an artist credited on no release group: the
+    /// distinct groups of the releases it is credited on, as MusicBrainz's
+    /// own artist page lists them (a band whose album MusicBrainz credits
+    /// to its singer). The first page of releases is read; a longer list
+    /// stands in unstored, so the next visit reads it again.
+    async fn release_groups_of_releases(
+        &self,
+        artist: &str,
+        priority: RequestPriority,
+    ) -> Result<Fetched<ReleaseGroupList>, CatalogError> {
+        let (client, _) = self.upstream().musicbrainz(priority);
+        let page = client
+            .browse_artist_releases(artist, MAX_PAGE_LIMIT, 0, Criticality::IdentityCritical)
+            .await
+            .map_err(mb_search_error)?;
+        let complete = page.count <= page.releases.len() as u64;
+        let mut seen = HashSet::new();
+        let items: Vec<ReleaseGroupItem> = page
+            .releases
+            .into_iter()
+            .filter_map(|release| release.release_group)
+            .filter(|group| seen.insert(group.id.to_ascii_lowercase()))
+            .map(ReleaseGroupItem::from_wire)
+            .collect();
+        let list = ReleaseGroupList {
+            total: items.len() as u64,
+            items,
+            complete,
+        };
+        Ok(if complete {
+            Fetched::Found(list)
+        } else {
+            Fetched::Partial(list)
+        })
     }
 
     /// Fetch the rest of a large discography at background priority and
