@@ -1,0 +1,11 @@
+# Standard xarif CI (base/dagger-modules docs/ci.md). With the `fork:` section in
+# dagger-ci.yaml the image is built on sync/next and published on v*-xarif.* tags only.
+# Upstream's .github/workflows never run here: Forgejo reads .forgejo/workflows first.
+name: ci
+on:
+  push: { branches: ['**'], tags: ['v*'] }
+  workflow_dispatch:
+jobs:
+  ci:
+    uses: base/dagger-modules/.forgejo/workflows/dagger-ci.yml@main
+    secrets: inherit
