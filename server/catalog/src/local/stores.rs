@@ -105,7 +105,8 @@ droppedneedle_kernel::sql_choice! {
         All,
         /// Artists leading at least one album.
         AlbumArtists,
-        /// Artists appearing without leading.
+        /// Artists appearing without leading, and album artists who also
+        /// appear on albums someone else leads.
         Contributors,
         /// Artists leading an album or credited on a streamable track, which
         /// leaves out empty rows such as an unused placeholder.
@@ -288,6 +289,9 @@ pub struct ArtistRecord {
     pub appearance_track_count: u64,
     /// First import time, unix seconds.
     pub date_added: Option<f64>,
+    /// MusicBrainz's note on the linked artist, while another record has
+    /// the same name.
+    pub disambiguation: Option<String>,
 }
 
 /// One streamable library track: what the track projection reads, and

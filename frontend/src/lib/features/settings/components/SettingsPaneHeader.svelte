@@ -1,12 +1,13 @@
 <!--
 	The head of a settings section: a torn paper block with the section's
 	Anton title, its one-line description and the section's own buttons
-	(refresh, import, new) at the right. Inside, the light theme applies, so
-	the buttons are already measured for paper. `children` holds a further
-	line under the description (a link, a count).
+	(refresh, import, new) at the right. Inside, the sheet's theme applies, so
+	the buttons are already measured for that stock. `children` holds a
+	further line under the description (a link, a count).
 -->
 <script lang="ts">
 	import type { Snippet } from 'svelte';
+	import { themeStore } from '$lib/stores/theme.svelte';
 
 	interface Props {
 		title: string;
@@ -19,7 +20,7 @@
 </script>
 
 <header class="dn-set-head">
-	<div class="dn-set-head__sheet dn-card-torn" data-theme="light">
+	<div class="dn-set-head__sheet dn-card-torn" data-theme={themeStore.paper}>
 		<div class="dn-set-head__text">
 			<h2 class="dn-set-head__title">{title}</h2>
 			{#if description}<p class="dn-set-head__lede">{description}</p>{/if}
@@ -32,7 +33,7 @@
 </header>
 
 <style>
-	/* Read the page theme's paper here, before the sheet switches to light. */
+	/* Read the page theme's paper here, before the sheet switches to its own theme. */
 	.dn-set-head {
 		--paper-bg: var(--dn-paper);
 	}

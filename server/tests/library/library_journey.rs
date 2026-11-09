@@ -429,6 +429,7 @@ fn ambiguous_from(facts: &LocalAlbumFacts) -> RecallResult {
             name: facts.album_artist_name.clone(),
             sort_name: None,
             join: String::new(),
+            disambiguation: None,
         }],
         tracks: facts
             .tracks
@@ -744,6 +745,7 @@ async fn an_artist_renamed_by_a_managed_run_keeps_its_row() {
             name: "Alfa".to_owned(),
             sort_name: Some("Alfa, The".to_owned()),
             join: String::new(),
+            disambiguation: None,
         };
         for release in &mut recall.releases {
             release.artists = vec![alfa.clone()];
@@ -1626,6 +1628,144 @@ async fn an_editions_tags_are_written_as_the_folders_profile_says() {
     for item in items {
         assert_ne!(item["reason_code"], json!("CHANGED_OUTSIDE"), "{item}");
     }
+    rig.stop().await;
+}
+
+/// A tagging script reads what it is allowed to: `primary_genre` keeps
+/// the file's genre rather than clearing it, `custom.MOOD` is the file's
+/// own mood tag, and `publisher` writes the label, except on a file whose
+/// label a person saved.
+#[tokio::test]
+async fn a_tagging_script_reads_the_files_values_and_writes_the_label() {
+    use droppedneedle_library::management::settings::PICARD_ORGANIZER_PROFILE_ID as PICARD;
+    use droppedneedle_library::tags::save::{TagEdit, save_tags};
+    use droppedneedle_library::tags::{TagField, read_fields};
+
+    let rig = Rig::start("lib-script-reads").await;
+    let app = &rig.app;
+    let auth = app.login_admin().await;
+    let admin = [("authorization", auth.as_str())];
+    let music = app.config.root_app_dir.join("music");
+    let file = plant(&music, "album-r/01.flac", "flac_full_01.flac");
+    let other = plant(&music, "album-r/02.flac", "flac_full_02.flac");
+    save_tags(
+        &file,
+        &[TagEdit::native("vorbis:MOOD", vec!["Restless".to_owned()])],
+    )
+    .expect("the mood is set");
+    let paused_at = rig.pause_identification().await;
+    app.add_library_folder("music", &music).await;
+    let track = rig
+        .scan_store
+        .track_at("music", "album-r/01.flac")
+        .unwrap()
+        .expect("track indexed");
+    let album = rig
+        .scan_store
+        .album_for_track(&track)
+        .unwrap()
+        .expect("album");
+    let fit = tagged_release(&rig.identify_store, &album);
+    rig.identify.set_recall(RecallResult {
+        releases: vec![fit.clone()],
+        ..RecallResult::default()
+    });
+    rig.resume_identification(paused_at).await;
+    rig.identified(&album, 1).await;
+    let edition = format!("/api/v3/library/albums/{album}/edition");
+    let (status, body) = app
+        .call(
+            "PUT",
+            &edition,
+            &admin,
+            Some(json!({
+                "release_mbid": fit.id,
+                "expected_identity_revision": edition_revision(app, &admin, &album).await,
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    rig.edition_settled(&album).await;
+
+    let page = "/api/v3/settings/library-management";
+    let (status, saved) = app.call("GET", page, &admin, None).await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    let mut settings = saved.clone();
+    settings
+        .as_object_mut()
+        .expect("settings")
+        .remove("settings_revision");
+    settings["tagging_scripts"]
+        .as_array_mut()
+        .expect("scripts")
+        .push(json!({
+            "id": "44444444-4444-4444-8444-444444444444",
+            "name": "Reads",
+            "source": "set genre = primary_genre\nset comment = custom.MOOD\nset publisher = \"Indie Label\"",
+        }));
+    for profile in settings["profiles"].as_array_mut().expect("profiles") {
+        if profile["id"] == json!(PICARD) {
+            profile["metadata"]["enabled"] = json!(false);
+            profile["metadata"]["tagging_script_ids"] =
+                json!(["44444444-4444-4444-8444-444444444444"]);
+        }
+    }
+    settings["root_assignments"] = json!([{
+        "root_id": "music",
+        "profile_id": PICARD,
+        "enabled": false,
+        "overrides": {"metadata_enabled": true},
+    }]);
+    let (status, body) = app
+        .call(
+            "PUT",
+            page,
+            &admin,
+            Some(json!({
+                "settings": settings,
+                "expected_settings_revision": saved["settings_revision"],
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    app.seed_with(
+        "INSERT INTO library_management_overrides (id, subject_kind, local_track_id, \
+         field_name, value_json, mode, subject_revision, created_at, updated_at) \
+         VALUES ('ov-label', 'track', ?1, 'label', '\"Kept Label\"', 'replace', 1, 1, 1)",
+        [&track],
+    )
+    .await;
+
+    let revision = edition_status(app, &admin, &edition).await["identity_revision"].clone();
+    let tags = format!("{edition}/tags");
+    let ask = json!({"release_mbid": fit.id, "expected_identity_revision": revision});
+    let (status, queued) = app.call("POST", &tags, &admin, Some(ask)).await;
+    assert_eq!(status, StatusCode::OK, "{queued}");
+    let job = queued["job_id"].as_str().expect("job id");
+    let uri = format!("{tags}/{job}");
+    let planned = settled_tag_write(app, &admin, &uri).await;
+    assert_eq!(planned["step"], json!("ready"), "{planned}");
+    write_planned(app, &admin, &uri, &queued["preview_token"]).await;
+
+    // The profile's genres come first, in MusicBrainz's spelling.
+    let fields = read_fields(track_file(&file)).expect("fields read");
+    assert_eq!(
+        fields.get(&TagField::Genre),
+        Some(&vec!["alternative rock".to_owned()])
+    );
+    assert_eq!(
+        fields.get(&TagField::Comment),
+        Some(&vec!["Restless".to_owned()])
+    );
+    assert_eq!(
+        fields.get(&TagField::Label),
+        Some(&vec!["Kept Label".to_owned()])
+    );
+    let fields = read_fields(track_file(&other)).expect("fields read");
+    assert_eq!(
+        fields.get(&TagField::Label),
+        Some(&vec!["Indie Label".to_owned()])
+    );
     rig.stop().await;
 }
 
@@ -3667,6 +3807,7 @@ fn tagged_from(facts: &LocalAlbumFacts) -> Release {
             name: facts.album_artist_name.clone(),
             sort_name: None,
             join: String::new(),
+            disambiguation: None,
         }],
         tracks: facts
             .tracks
@@ -4096,6 +4237,311 @@ async fn artist_duplicate_groups_list_open_and_dismiss() {
     assert_eq!(body["same_name_only_count"], 0, "{body}");
     let (status, _) = app.call("GET", &path, &headers, None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+    rig.stop().await;
+}
+
+/// Tag `file` as the one track of `album` by `name`, with this sort name and
+/// MusicBrainz artist id when given, on both sides, and no release ids.
+fn tag_artist(file: &Path, album: &str, name: &str, sort: Option<&str>, id: Option<&str>) {
+    use droppedneedle_library::tags::TagField;
+    use droppedneedle_library::tags::save::{TagEdit, save_tags};
+    let one = |value: &str| vec![value.to_owned()];
+    let maybe = |value: Option<&str>| value.map(one).unwrap_or_default();
+    let edits = vec![
+        TagEdit::verbatim(TagField::Title, one(&format!("{album} 1"))),
+        TagEdit::verbatim(TagField::TrackNumber, one("1")),
+        TagEdit::verbatim(TagField::Album, one(album)),
+        TagEdit::verbatim(TagField::Compilation, Vec::new()),
+        TagEdit::verbatim(TagField::Artist, one(name)),
+        TagEdit::verbatim(TagField::Artists, one(name)),
+        TagEdit::verbatim(TagField::ArtistSort, maybe(sort)),
+        TagEdit::verbatim(TagField::AlbumArtist, one(name)),
+        TagEdit::verbatim(TagField::AlbumArtists, one(name)),
+        TagEdit::verbatim(TagField::AlbumArtistSort, maybe(sort)),
+        TagEdit::verbatim(TagField::MusicBrainzArtistId, maybe(id)),
+        TagEdit::verbatim(TagField::MusicBrainzAlbumArtistId, maybe(id)),
+        TagEdit::verbatim(TagField::MusicBrainzReleaseId, Vec::new()),
+        TagEdit::verbatim(TagField::MusicBrainzReleaseGroupId, Vec::new()),
+        TagEdit::verbatim(TagField::MusicBrainzRecordingId, Vec::new()),
+        TagEdit::verbatim(TagField::MusicBrainzReleaseTrackId, Vec::new()),
+    ];
+    save_tags(file, &edits).expect("fixture tagged");
+}
+
+/// Two "Poppy"s whose files carry different MusicBrainz ids stay two
+/// records. Their ids are asked about, and once MusicBrainz has answered,
+/// the artist list shows each linked one its note. An artist no other
+/// record shares a name with shows none.
+#[tokio::test]
+async fn namesakes_musicbrainz_tells_apart_stay_two() {
+    use droppedneedle_library::identify::sources::ArtistAnswer;
+    const X: &str = "aaaaaaaa-0000-4000-8000-0000000000a1";
+    const Y: &str = "aaaaaaaa-0000-4000-8000-0000000000a2";
+    const Z: &str = "aaaaaaaa-0000-4000-8000-0000000000a3";
+    let rig = Rig::start("lib-namesakes").await;
+    let app = &rig.app;
+    let auth = app.login_admin().await;
+    let headers = [("authorization", auth.as_str())];
+    let paused = rig.pause_identification().await;
+    let music = app.config.root_app_dir.join("music");
+    for (folder, album, name, id) in [
+        ("x", "Album X", "Poppy", X),
+        ("y", "Album Y", "Poppy", Y),
+        ("z", "Album Z", "Solo", Z),
+    ] {
+        let file = plant(&music, &format!("{folder}/01.flac"), "management_full.flac");
+        tag_artist(&file, album, name, None, Some(id));
+    }
+    app.add_library_folder("music", &music).await;
+    let db = app.db();
+    let record = |id: &str| {
+        texts(
+            &db,
+            &format!(
+                "SELECT DISTINCT local_artist_id FROM local_track_artists WHERE artist_mbid = '{id}'"
+            ),
+        )
+    };
+    let (x, y, z) = (record(X), record(Y), record(Z));
+    assert_eq!((x.len(), y.len(), z.len()), (1, 1, 1));
+    assert_ne!(x, y, "MusicBrainz's ids keep the two apart");
+    assert_eq!(
+        texts(
+            &db,
+            "SELECT artist_mbid || ' ' || state FROM library_identify_artist_id_checks \
+             ORDER BY artist_mbid"
+        ),
+        [format!("{X} pending"), format!("{Y} pending")],
+        "the two ids are asked about"
+    );
+    for (artist, id) in [(&x[0], X), (&y[0], Y), (&z[0], Z)] {
+        app.seed(&format!(
+            "INSERT INTO local_artist_external_identities (local_artist_id, provider, \
+             provider_artist_id, decision_source, selected_at) \
+             VALUES ('{artist}', 'musicbrainz', '{id}', 'manual', 1)"
+        ))
+        .await;
+    }
+    app.seed(&format!(
+        "INSERT INTO library_identify_artist_id_checks (artist_mbid, state, nominated_at, \
+         checked_at, disambiguation) VALUES ('{Z}', 'kept', 1, 2, 'a band')"
+    ))
+    .await;
+    let note = |text: &str| ArtistAnswer::Current {
+        disambiguation: Some(text.to_owned()),
+    };
+    rig.identify.set_artist(X, note("US singer"));
+    rig.identify.set_artist(Y, note("Japanese singer"));
+    rig.resume_identification(paused).await;
+    app.until("MusicBrainz answered both ids", || {
+        let done = texts(
+            &db,
+            "SELECT artist_mbid FROM library_identify_artist_id_checks WHERE state = 'kept' \
+             AND disambiguation IS NOT NULL",
+        )
+        .len()
+            == 3;
+        async move { done.then_some(()) }
+    })
+    .await;
+
+    let (status, body) = app
+        .call("GET", "/api/v3/library/artists?limit=50", &headers, None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut notes: Vec<(String, Value)> = body["items"]
+        .as_array()
+        .expect("artists")
+        .iter()
+        .map(|item| {
+            (
+                item["name"].as_str().unwrap_or_default().to_owned(),
+                item["disambiguation"].clone(),
+            )
+        })
+        .collect();
+    notes.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| a.1.to_string().cmp(&b.1.to_string()))
+    });
+    assert_eq!(
+        notes,
+        [
+            ("Poppy".to_owned(), json!("Japanese singer")),
+            ("Poppy".to_owned(), json!("US singer")),
+            ("Solo".to_owned(), Value::Null),
+        ],
+        "{body}"
+    );
+    rig.stop().await;
+}
+
+/// A join of three records of one name is undone by an admin: each record
+/// gets back its songs, plays, favourites and ratings (a user who
+/// favourited and rated two of them keeps both), a play made after the join
+/// stays on the record kept, and they are marked distinct, so a rescan
+/// keeps them apart. The old id opens its own record again, and a
+/// second undo is refused.
+#[tokio::test]
+async fn an_undone_artist_join_splits_and_stays_split() {
+    use droppedneedle_library::scan::naming::artist_key;
+    let rig = Rig::start("lib-undo-join").await;
+    let app = &rig.app;
+    let auth = app.login_admin().await;
+    let headers = [("authorization", auth.as_str())];
+    let music = app.config.root_app_dir.join("music");
+    let first = plant(&music, "a/01.flac", "management_full.flac");
+    tag_artist(
+        &first,
+        "Album A",
+        "Laura Marling",
+        Some("Marling, Laura"),
+        None,
+    );
+    app.add_library_folder("music", &music).await;
+    let db = app.db();
+    let one = |sql: &str| texts(&db, sql).into_iter().next().unwrap_or_default();
+    let kept = one(
+        "SELECT c.local_artist_id FROM local_track_artists c JOIN local_tracks t \
+         ON t.id = c.local_track_id WHERE t.relative_path = 'a/01.flac'",
+    );
+    let twin = artist_key("laura marling", None);
+    let third = artist_key("LAURA MARLING", None);
+    app.seed(&format!(
+        "INSERT INTO local_artists (id, display_name, folded_name, normalized_name, kind, \
+         created_at, updated_at) VALUES ('{twin}', 'laura marling', 'laura marling', \
+         'laura marling', 'group', 9999999999999, 9999999999999); \
+         INSERT INTO auth_users (id, display_name, role, created_at) \
+         VALUES ('fan', 'Fan', 'user', 1); \
+         INSERT INTO catalog_user_favorites (user_id, item_kind, item_id, created_at) \
+         VALUES ('fan', 'artist', '{twin}', 7); \
+         INSERT INTO catalog_user_ratings (user_id, item_kind, item_id, rating, rated_at) \
+         VALUES ('fan', 'artist', '{twin}', 4, 7); \
+         INSERT INTO library_play_history (id, user_id, local_artist_id, track_name, \
+         artist_name, played_at) VALUES ('before', 'fan', '{twin}', 'Song', 'laura marling', 7); \
+         INSERT INTO local_artists (id, display_name, folded_name, normalized_name, kind, \
+         created_at, updated_at) VALUES ('{third}', 'LAURA MARLING', 'laura marling', \
+         'laura marling', 'group', 9999999999999, 9999999999999); \
+         INSERT INTO catalog_user_favorites (user_id, item_kind, item_id, created_at) \
+         VALUES ('fan', 'artist', '{third}', 8); \
+         INSERT INTO catalog_user_ratings (user_id, item_kind, item_id, rating, rated_at) \
+         VALUES ('fan', 'artist', '{third}', 2, 8);"
+    ))
+    .await;
+    let second = plant(&music, "b/01.flac", "management_full.flac");
+    tag_artist(&second, "Album B", "laura marling", None, None);
+    let last = plant(&music, "c/01.flac", "management_full.flac");
+    tag_artist(&last, "Album C", "LAURA MARLING", None, None);
+    app.scan_library().await;
+    let retired = format!(
+        "SELECT COALESCE(retired_into_artist_id, '-') FROM local_artists WHERE id = '{twin}'"
+    );
+    assert_eq!(one(&retired), kept, "the twins joined");
+    let retired_third = format!(
+        "SELECT COALESCE(retired_into_artist_id, '-') FROM local_artists WHERE id = '{third}'"
+    );
+    assert_eq!(one(&retired_third), kept, "all three joined");
+    app.seed(&format!(
+        "INSERT INTO library_play_history (id, user_id, local_artist_id, track_name, \
+         artist_name, played_at) VALUES ('after', 'fan', '{kept}', 'Song', 'Laura Marling', 8);"
+    ))
+    .await;
+    let (status, body) = app
+        .call(
+            "GET",
+            &format!("/api/v3/library/artists/{twin}"),
+            &headers,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["id"],
+        json!(kept),
+        "the old id opens the joined record"
+    );
+
+    let (status, body) = app
+        .call(
+            "GET",
+            "/api/v3/library/artists/duplicate-groups?state=resolved_automatically",
+            &headers,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let group = &body["items"][0];
+    assert_eq!(
+        group["reason"]["code"], "AUTOMATIC_SAME_NAME_ARTISTS_JOINED",
+        "{body}"
+    );
+    assert_eq!(group["can_undo"], true, "{body}");
+    let undo = format!(
+        "/api/v3/library/artists/duplicate-groups/{}/undo",
+        group["id"].as_str().expect("group id")
+    );
+    let (status, body) = app.call("POST", &undo, &headers, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut restored: Vec<String> = body["restored_artist_ids"]
+        .as_array()
+        .expect("restored ids")
+        .iter()
+        .filter_map(|id| id.as_str().map(str::to_owned))
+        .collect();
+    restored.sort_unstable();
+    let mut expected = vec![twin.clone(), third.clone()];
+    expected.sort_unstable();
+    assert_eq!(restored, expected, "{body}");
+
+    assert_eq!(one(&retired), "-", "the record is its own again");
+    assert_eq!(
+        one(&retired_third),
+        "-",
+        "the third record is its own again"
+    );
+    let on = |sql: &str, artist: &str| texts(&db, &sql.replace("{id}", artist));
+    let credits = "SELECT t.relative_path FROM local_track_artists c JOIN local_tracks t \
+                   ON t.id = c.local_track_id WHERE c.local_artist_id = '{id}' \
+                   UNION ALL SELECT 'album ' || b.title FROM local_albums b \
+                   WHERE b.album_artist_id = '{id}' ORDER BY 1";
+    assert_eq!(on(credits, &twin), ["album Album B", "b/01.flac"]);
+    assert_eq!(on(credits, &third), ["album Album C", "c/01.flac"]);
+    assert_eq!(on(credits, &kept), ["a/01.flac", "album Album A"]);
+    let plays = "SELECT id FROM library_play_history WHERE local_artist_id = '{id}' ORDER BY id";
+    assert_eq!(on(plays, &twin), ["before"]);
+    assert_eq!(on(plays, &kept), ["after"], "a later play stays");
+    let stars = "SELECT user_id || ' ' || created_at FROM catalog_user_favorites \
+                 WHERE item_kind = 'artist' AND item_id = '{id}' \
+                 UNION ALL SELECT user_id || ' rated ' || rating FROM catalog_user_ratings \
+                 WHERE item_kind = 'artist' AND item_id = '{id}' ORDER BY 1";
+    assert_eq!(on(stars, &twin), ["fan 7", "fan rated 4"]);
+    assert_eq!(on(stars, &third), ["fan 8", "fan rated 2"]);
+    assert!(on(stars, &kept).is_empty(), "the join's copies are gone");
+    assert_eq!(
+        one(&format!(
+            "SELECT CAST(COUNT(*) AS TEXT) FROM library_artist_reconciliation_dismissals \
+             WHERE reason_code = 'UNDONE_JOIN' AND '{kept}' IN (left_artist_id, right_artist_id) \
+             AND '{twin}' IN (left_artist_id, right_artist_id)"
+        )),
+        "1",
+        "marked distinct"
+    );
+    let (status, body) = app
+        .call(
+            "GET",
+            &format!("/api/v3/library/artists/{twin}"),
+            &headers,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["id"], json!(twin), "the old id opens its own record");
+
+    app.scan_library().await;
+    assert_eq!(one(&retired), "-", "a rescan keeps them apart");
+    let (status, body) = app.call("POST", &undo, &headers, None).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "ARTIST_JOIN_UNDONE", "{body}");
     rig.stop().await;
 }
 
@@ -4608,6 +5054,7 @@ async fn an_upgrade_held_for_one_file_keeps_that_files_old_copy() {
             name: "The Band".to_owned(),
             sort_name: None,
             join: String::new(),
+            disambiguation: None,
         }],
         tracks: vec![track(1), track(2), track(3)],
         ..Release::default()
@@ -4744,6 +5191,7 @@ async fn an_upgrade_plans_again_when_a_replaced_track_comes_back() {
             name: "The Band".to_owned(),
             sort_name: None,
             join: String::new(),
+            disambiguation: None,
         }],
         tracks: vec![ReleaseTrack {
             id: "20000000-0000-4000-8000-00000000000b".to_owned(),
@@ -5562,6 +6010,7 @@ async fn a_switched_off_library_takes_no_file_changes() {
             name: "The Band".to_owned(),
             sort_name: None,
             join: String::new(),
+            disambiguation: None,
         }],
         tracks: vec![ReleaseTrack {
             id: "20000000-0000-4000-8000-00000000000b".to_owned(),
@@ -6045,10 +6494,10 @@ async fn a_removed_album_is_listed_until_the_bin_lets_go_of_it() {
 }
 
 /// An album removed and put back whose folder then vanishes from disk
-/// stays listed: its files went missing after their trip to the bin, not
-/// because of it.
+/// leaves the lists: the put-back spent its removal, so nothing of it can
+/// be brought home.
 #[tokio::test]
-async fn an_album_put_back_then_vanished_stays_listed() {
+async fn an_album_put_back_then_vanished_leaves_the_lists() {
     let rig = Rig::start("lib-put-back-vanished").await;
     let app = &rig.app;
     let auth = app.login_admin().await;
@@ -6105,35 +6554,29 @@ async fn an_album_put_back_then_vanished_stays_listed() {
     app.scan_library().await;
 
     let page = get("/api/v3/library/albums?limit=50".to_owned()).await;
-    let listed: Vec<(&str, u64)> = page["items"]
+    let listed: Vec<&str> = page["items"]
         .as_array()
         .expect("items")
         .iter()
-        .map(|item| {
-            (
-                item["id"].as_str().expect("id"),
-                item["track_count"].as_u64().expect("count"),
-            )
-        })
+        .map(|item| item["id"].as_str().expect("id"))
         .collect();
     assert!(
-        listed.contains(&(album.as_str(), 0)),
-        "a vanished album stays listed: {page}"
+        !listed.contains(&album.as_str()),
+        "a vanished album leaves the list: {page}"
     );
     rig.stop().await;
 }
 
-/// An album removed with one of its files already gone from disk leaves
-/// the lists once the bin is emptied: the missing file left with it.
+/// An album whose files are gone leaves the lists and its copy's Copies,
+/// opens by id, and is listed again when its files return.
 #[tokio::test]
-async fn an_album_removed_with_a_vanished_file_leaves_the_lists() {
-    let rig = Rig::start("lib-removed-vanished").await;
+async fn an_album_without_files_leaves_the_lists() {
+    let rig = Rig::start("lib-file-less-unlisted").await;
     let app = &rig.app;
     let auth = app.login_admin().await;
     let headers = [("authorization", auth.as_str())];
     let music = app.config.root_app_dir.join("music");
     plant(&music, "a/01.flac", "flac_full_01.flac");
-    plant(&music, "a/02.flac", "flac_full_02.flac");
     plant(&music, "b/01.flac", "flac_full_01.flac");
     rig.pause_identification().await;
     app.add_library_folder("music", &music).await;
@@ -6141,8 +6584,17 @@ async fn an_album_removed_with_a_vanished_file_leaves_the_lists() {
     let store = &rig.scan_store;
     let a1 = store.track_at("music", "a/01.flac").unwrap().expect("a/01");
     let b1 = store.track_at("music", "b/01.flac").unwrap().expect("b/01");
-    let album = store.album_for_track(&a1).unwrap().expect("album a");
+    let gone = store.album_for_track(&a1).unwrap().expect("album a");
     let kept = store.album_for_track(&b1).unwrap().expect("album b");
+    for album in [&gone, &kept] {
+        app.seed_with(
+            "INSERT INTO local_album_external_identities (local_album_id, provider, \
+             release_group_mbid, decision_source, selected_at) \
+             VALUES (?1, 'musicbrainz', 'rg-shared', 'manual', 1)",
+            [album],
+        )
+        .await;
+    }
     let get = |uri: String| {
         let headers = &headers;
         async move {
@@ -6151,8 +6603,7 @@ async fn an_album_removed_with_a_vanished_file_leaves_the_lists() {
             body
         }
     };
-    let listed = || async {
-        let page = get("/api/v3/library/albums?limit=50".to_owned()).await;
+    let ids = |page: &Value| -> Vec<String> {
         let mut ids: Vec<String> = page["items"]
             .as_array()
             .expect("items")
@@ -6162,49 +6613,150 @@ async fn an_album_removed_with_a_vanished_file_leaves_the_lists() {
         ids.sort();
         ids
     };
+    let artist = get(format!("/api/v3/library/albums/{kept}")).await["artist_id"]
+        .as_str()
+        .expect("artist id")
+        .to_owned();
+    let lists = || async {
+        let mut listed = Vec::new();
+        for uri in [
+            "/api/v3/library/albums?limit=50".to_owned(),
+            format!("/api/v3/library/artists/{artist}/albums?limit=50"),
+        ] {
+            let page = get(uri).await;
+            assert_eq!(page["total"], json!(ids(&page).len()), "{page}");
+            listed.push(ids(&page));
+        }
+        listed
+    };
+    let copies = |album: &str| {
+        let uri = format!("/api/v3/library/albums/{album}/copies");
+        async move { ids(&get(uri).await) }
+    };
 
-    std::fs::remove_file(music.join("a/02.flac")).expect("a file vanishes");
+    std::fs::remove_dir_all(music.join("a")).expect("the folder is deleted");
     app.scan_library().await;
-    let shown = get(format!("/api/v3/library/albums/{album}")).await;
-    assert_eq!(shown["track_count"], json!(1), "{shown}");
-    let uri = format!(
-        "/api/v3/library/albums/{album}?expected_revision={}&expected_listing_revision={}&delete_files=true",
-        shown["row_revision"], shown["listing_revision"]
+    let only = vec![kept.clone()];
+    assert_eq!(lists().await, [only.clone(), only], "gone from the lists");
+    assert!(
+        copies(&kept).await.is_empty(),
+        "gone from its copy's Copies"
     );
-    let (status, body) = app.call("DELETE", &uri, &headers, None).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let mut both = vec![album.clone(), kept.clone()];
-    both.sort();
-    assert_eq!(listed().await, both, "in the bin: listed");
+    assert_eq!(
+        copies(&gone).await,
+        std::slice::from_ref(&kept),
+        "its own Copies"
+    );
+    let opened = get(format!("/api/v3/library/albums/{gone}")).await;
+    assert_eq!(opened["id"], json!(gone), "its link still opens it");
+    assert_eq!(opened["track_count"], json!(0), "{opened}");
 
-    let summary = get("/api/v3/library/recycle-bin/summary".to_owned()).await;
-    let before = summary["as_of"].as_i64().expect("as of") + 1000;
-    let (status, body) = app
-        .call(
-            "POST",
-            "/api/v3/library/recycle-bin/empty",
-            &headers,
-            Some(json!({ "before": before })),
+    plant(&music, "a/01.flac", "flac_full_01.flac");
+    app.scan_library().await;
+    let mut both = vec![gone.clone(), kept.clone()];
+    both.sort();
+    assert_eq!(lists().await, [both.clone(), both], "its files are back");
+    rig.stop().await;
+}
+
+/// A heart and rating on a copy whose files are gone follow to the copy
+/// with files; that copy keeps its own rating; plays stay; a local-only
+/// album keeps its heart; the copy's history shows the move.
+#[tokio::test]
+async fn marks_on_a_copy_without_files_follow_to_the_copy_with_files() {
+    use droppedneedle_library::http::history::album_history_view;
+
+    let (scratch, library, music) = bare_library("lib-marks-follow-copy").await;
+    for folder in ["gone", "kept", "local"] {
+        plant(&music, &format!("{folder}/01.flac"), "flac_full_01.flac");
+    }
+    add_music_root(&library, &music).await;
+    let db = droppedneedle_kernel::db::open_connection(&scratch.to_path_buf().join("app.db"))
+        .expect("db opens");
+    let read = |sql: &str| -> Vec<String> {
+        let mut stmt = db.prepare(sql).expect("query prepares");
+        stmt.query_map([], |row| row.get(0))
+            .expect("query runs")
+            .collect::<Result<_, _>>()
+            .expect("rows read")
+    };
+    let album_of = |folder: &str| -> String {
+        db.query_row(
+            "SELECT local_album_id FROM local_tracks WHERE relative_path = ?1",
+            [format!("{folder}/01.flac")],
+            |row| row.get(0),
         )
-        .await;
-    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
-    // The empty runs on the job runner's blocking threads: the bound is
-    // wall time.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    loop {
-        let status = get("/api/v3/library/recycle-bin/status".to_owned()).await;
-        if status["state"] == "idle" && status["last_emptied"].is_object() {
+        .expect("album found")
+    };
+    let (gone, kept, local) = (album_of("gone"), album_of("kept"), album_of("local"));
+    db.execute_batch(&format!(
+        "INSERT INTO local_album_external_identities (local_album_id, provider, \
+         release_group_mbid, release_mbid, decision_source, selected_at) VALUES \
+         ('{gone}', 'musicbrainz', 'rg-shared', 'rel-gone', 'automatic', 1), \
+         ('{kept}', 'musicbrainz', 'rg-shared', 'rel-kept', 'automatic', 1); \
+         INSERT INTO auth_users (id, display_name, role, created_at) \
+         VALUES ('fan', 'Fan', 'user', 1); \
+         INSERT INTO catalog_user_favorites (user_id, item_kind, item_id, created_at) VALUES \
+         ('fan', 'album', '{gone}', 7), ('fan', 'album', '{local}', 7); \
+         INSERT INTO catalog_user_ratings (user_id, item_kind, item_id, rating, rated_at) VALUES \
+         ('fan', 'album', '{gone}', 4, 7), ('fan', 'album', '{kept}', 2, 8); \
+         INSERT INTO library_play_history (id, user_id, local_track_id, local_album_id, \
+         track_name, artist_name, played_at) SELECT 'played', 'fan', id, local_album_id, \
+         'Song', 'Artist', 7 FROM local_tracks WHERE local_album_id = '{gone}'; \
+         INSERT INTO library_management_overrides (id, subject_kind, local_album_id, \
+         field_name, value_json, mode, actor_user_id, reason, subject_revision, created_at, \
+         updated_at) VALUES ('edit', 'album', '{kept}', 'title', '\"Kept\"', 'replace', \
+         'fan', 'tag_editor', 1, 7, 7);"
+    ))
+    .expect("marks and a tag edit planted");
+
+    std::fs::remove_dir_all(music.join("gone")).expect("the copy's folder is deleted");
+    std::fs::remove_dir_all(music.join("local")).expect("the local album's folder is deleted");
+    rescan(&library).await;
+    let worker = crate::common::library::repair_worker(&library);
+    for _ in 0..20 {
+        if !droppedneedle_library::repairs::tick(&worker, "worker").await {
             break;
         }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the bin empties: {status}"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
 
-    assert_eq!(listed().await, [kept], "out of the bin: gone");
-    rig.stop().await;
+    let mut hearts = vec![kept.clone(), local.clone()];
+    hearts.sort();
+    assert_eq!(
+        read("SELECT item_id FROM catalog_user_favorites ORDER BY item_id"),
+        hearts,
+        "the heart followed to the copy with files; the local album kept its own"
+    );
+    assert_eq!(
+        read("SELECT item_id || ' ' || rating FROM catalog_user_ratings"),
+        [format!("{kept} 2")],
+        "the copy keeps its own rating"
+    );
+    assert_eq!(
+        read(
+            "SELECT json_extract(before_json, '$.superseded_ratings[0].rating') \
+             || ' ' || json_extract(before_json, '$.from_album_id') \
+             FROM library_catalog_actions WHERE reason_code = 'MARKS_FOLLOWED_TO_COPY'"
+        ),
+        [format!("4 {gone}")],
+        "the dropped rating is kept in the audit"
+    );
+    assert_eq!(
+        read("SELECT local_album_id FROM library_play_history"),
+        std::slice::from_ref(&gone),
+        "plays stay"
+    );
+    let ops = crate::common::library::operations(&library);
+    let view = album_history_view(&ops, &kept, "fan").expect("history reads");
+    let items = serde_json::to_value(view).expect("history serializes")["items"].clone();
+    assert!(
+        items
+            .as_array()
+            .expect("items")
+            .iter()
+            .any(|item| item["kind"] == "marks_followed"),
+        "{items}"
+    );
 }
 
 /// The bin page lists a removal with its files and their size, offers
@@ -8695,6 +9247,7 @@ async fn edition_plan_pairs_another_version() {
         name: "Someone Else".to_owned(),
         sort_name: None,
         join: String::new(),
+        disambiguation: None,
     }];
     rig.identify.set_recall(RecallResult {
         releases: vec![fit.clone(), other.clone(), stranger],
@@ -9462,6 +10015,7 @@ async fn a_busy_database_leaves_a_management_job_runnable() {
                 idempotency_key: Some("preview-busy".to_owned()),
                 target_root_id: None,
                 overrides: None,
+                include_organized: false,
             },
             "admin",
         )
@@ -9557,6 +10111,7 @@ async fn each_library_worker_recovers_and_wakes() {
                 idempotency_key: Some("preview-dead-worker".to_owned()),
                 target_root_id: None,
                 overrides: None,
+                include_organized: false,
             },
             "admin",
         )
@@ -9644,6 +10199,7 @@ async fn each_library_worker_recovers_and_wakes() {
                     idempotency_key: Some(key.to_owned()),
                     target_root_id: None,
                     overrides: None,
+                    include_organized: false,
                 },
                 "admin",
             )
@@ -10022,6 +10578,7 @@ async fn library_management_preview_apply_undo() {
             idempotency_key: Some(key.to_owned()),
             target_root_id: None,
             overrides: None,
+            include_organized: false,
         };
 
     // The tie was decided as a best guess: its files wait, and say why.
@@ -10137,7 +10694,7 @@ async fn library_management_preview_apply_undo() {
     assert!(music.join(&dest_dir).join("rip.log").exists());
     assert!(!music.join("incoming/cover.jpg").exists());
     let results = management
-        .results(&handle.job_id, -1, 100)
+        .results(&handle.job_id, -1, 100, None)
         .expect("results");
     assert!(
         results
@@ -10602,7 +11159,9 @@ async fn management_apply(
             break;
         }
         if !management_step(library).await {
-            let results = management.results(&handle.job_id, -1, 50).expect("results");
+            let results = management
+                .results(&handle.job_id, -1, 50, None)
+                .expect("results");
             panic!(
                 "apply stuck at {state}: {:?}",
                 results
@@ -10811,6 +11370,7 @@ async fn library_management_tools_journey() {
                     idempotency_key: Some("parity".to_owned()),
                     target_root_id: None,
                     overrides: None,
+                    include_organized: false,
                 },
                 "admin",
             )
@@ -11105,6 +11665,7 @@ async fn library_management_tools_journey() {
         idempotency_key: Some(key.to_owned()),
         target_root_id: None,
         overrides: None,
+        include_organized: false,
     };
     let ready = management
         .create_preview(album_preview("before-off"), "admin")
@@ -11335,6 +11896,7 @@ async fn library_management_tools_journey() {
                 idempotency_key: Some("clash".to_owned()),
                 target_root_id: None,
                 overrides: None,
+                include_organized: false,
             },
             "admin",
         )
@@ -11613,6 +12175,7 @@ async fn library_management_custom_edition_journey() {
         idempotency_key: Some(key.to_owned()),
         target_root_id: None,
         overrides: None,
+        include_organized: false,
     };
     let handle = management
         .create_preview(preview("custom-1"), "admin")
@@ -11790,6 +12353,7 @@ async fn library_management_artwork_journey() {
         idempotency_key: Some(key.to_owned()),
         target_root_id: None,
         overrides: None,
+        include_organized: false,
     };
     let managed_path = || {
         let rel: String = db()
@@ -11980,8 +12544,26 @@ impl ManagedLibrary {
         ),
         enrichment: Option<Arc<dyn droppedneedle_library::management::enrich::EnrichmentPort>>,
     ) -> Self {
+        Self::start_on(
+            tag,
+            configure,
+            enrichment,
+            Arc::new(droppedneedle_kernel::clock::SystemClock),
+        )
+        .await
+    }
+
+    /// As [`Self::start_with`], with the platform on `clock`.
+    async fn start_on(
+        tag: &str,
+        configure: impl Fn(
+            &mut droppedneedle_kernel::runtime_config::sections::LibraryManagementProfile,
+        ),
+        enrichment: Option<Arc<dyn droppedneedle_library::management::enrich::EnrichmentPort>>,
+        clock: Arc<dyn droppedneedle_kernel::clock::Clock>,
+    ) -> Self {
         use droppedneedle_library::management::settings as lm;
-        let (scratch, library, music) = bare_library_with(tag, enrichment).await;
+        let (scratch, library, music) = bare_library_at(tag, enrichment, clock).await;
         std::fs::create_dir_all(&music).expect("music folder");
         add_music_root(&library, &music).await;
         library
@@ -12389,6 +12971,21 @@ impl ManagedLibrary {
         droppedneedle_library::management::models::PreviewHandle,
         Vec<droppedneedle_library::management::models::PlannedItem>,
     ) {
+        self.preview_with(kind, ids, key, false).await
+    }
+
+    /// [`Self::preview`], planning albums already organized too when
+    /// `include_organized` says so.
+    async fn preview_with(
+        &self,
+        kind: droppedneedle_library::management::models::SelectionKind,
+        ids: &[&str],
+        key: &str,
+        include_organized: bool,
+    ) -> (
+        droppedneedle_library::management::models::PreviewHandle,
+        Vec<droppedneedle_library::management::models::PlannedItem>,
+    ) {
         use droppedneedle_library::management::models::Selection;
         use droppedneedle_library::management::service::PreviewRequest;
         let management = self.management();
@@ -12412,6 +13009,7 @@ impl ManagedLibrary {
                     idempotency_key: Some(key.to_owned()),
                     target_root_id: None,
                     overrides: None,
+                    include_organized,
                 },
                 "admin",
             )
@@ -12423,6 +13021,230 @@ impl ManagedLibrary {
             .items;
         (handle, items)
     }
+}
+
+/// A preview's file list and its results list split by scope: Changing
+/// lists the files that are written and change something, Not changing
+/// the files with nothing to change and the blocked ones, and each pages
+/// through only its own files.
+#[tokio::test]
+async fn management_lists_split_into_changing_and_not_changing() {
+    use droppedneedle_library::management::models::{
+        ItemDiff, ItemFilter, ItemScope, SelectionKind,
+    };
+
+    let managed = ManagedLibrary::start("lib-management-scope", |_| {}).await;
+    let (album, _) = managed.add_album("scope", 3).await;
+    let (handle, items) = managed
+        .preview(SelectionKind::Albums, &[&album], "scope-preview")
+        .await;
+    assert_eq!(items.len(), 3);
+    assert!(
+        items
+            .iter()
+            .all(|item| item.eligibility.writes() && item.diff.changes_anything()),
+        "every file is planned to change"
+    );
+    management_apply(&managed.library, &handle).await;
+    // One file planned with nothing to change and one blocked, as a
+    // preview records them.
+    let [changing, unchanged, blocked] = [0, 1, 2].map(|at| items[at].ordinal);
+    let db = managed.db();
+    db.execute(
+        "UPDATE library_management_plan_items SET diff_json = ?3 WHERE job_id = ?1 AND ordinal = ?2",
+        rusqlite::params![
+            handle.job_id,
+            unchanged,
+            serde_json::to_string(&ItemDiff::default()).expect("diff")
+        ],
+    )
+    .expect("no change planned");
+    db.execute(
+        "UPDATE library_management_plan_items SET eligibility = 'blocked', \
+         reason_code = 'UNCONFIRMED_MATCH' WHERE job_id = ?1 AND ordinal = ?2",
+        rusqlite::params![handle.job_id, blocked],
+    )
+    .expect("blocked");
+
+    let management = managed.management();
+    let plan = |scope: Option<ItemScope>| {
+        let filter = ItemFilter {
+            scope,
+            ..ItemFilter::default()
+        };
+        let mut seen = Vec::new();
+        let mut after = -1;
+        loop {
+            let page = management
+                .items(&handle.job_id, after, 1, &filter)
+                .expect("items page");
+            seen.extend(page.items.iter().map(|item| item.ordinal));
+            match page.next_after_ordinal {
+                Some(next) => after = next,
+                None => break seen,
+            }
+        }
+    };
+    let results = |scope: Option<ItemScope>| {
+        let mut seen = Vec::new();
+        let mut after = -1;
+        loop {
+            let page = management
+                .results(&handle.job_id, after, 1, scope)
+                .expect("results page");
+            seen.extend(page.items.iter().map(|item| item.plan.ordinal));
+            match page.next_after_ordinal {
+                Some(next) => after = next,
+                None => break seen,
+            }
+        }
+    };
+    for list in [&plan as &dyn Fn(Option<ItemScope>) -> Vec<i64>, &results] {
+        assert_eq!(list(Some(ItemScope::Changing)), vec![changing]);
+        assert_eq!(list(Some(ItemScope::NotChanging)), vec![unchanged, blocked]);
+        assert_eq!(list(None), vec![changing, unchanged, blocked]);
+    }
+}
+
+/// Each change filter on a preview's file list lists exactly the files the
+/// summary counts for that change, and the artist filter lists only files
+/// on that artist's albums.
+#[tokio::test]
+async fn management_change_filters_list_what_the_summary_counts() {
+    use droppedneedle_library::management::models::{
+        GeneratedFile, ItemDiff, ItemFilter, SelectionKind, SidecarMove, Summary,
+    };
+
+    let managed = ManagedLibrary::start("lib-management-filters", |_| {}).await;
+    let (kinds, _) = managed.add_album("kinds", 6).await;
+    let (other, _) = managed.add_album("other", 1).await;
+    let (handle, items) = managed
+        .preview(SelectionKind::Albums, &[&kinds, &other], "filters-preview")
+        .await;
+    let ordinals: Vec<i64> = items
+        .iter()
+        .filter(|item| item.album_id == kinds)
+        .map(|item| item.ordinal)
+        .collect();
+    assert_eq!(ordinals.len(), 6);
+    let generated = |kind: &str| GeneratedFile {
+        kind: kind.to_owned(),
+        destination_relative_path: format!("kinds/{kind}"),
+    };
+    let diffs = [
+        ItemDiff {
+            tags_changed: true,
+            ..ItemDiff::default()
+        },
+        ItemDiff {
+            artwork_changed: true,
+            ..ItemDiff::default()
+        },
+        ItemDiff {
+            generated: vec![generated("artwork")],
+            ..ItemDiff::default()
+        },
+        ItemDiff {
+            sidecars: vec![SidecarMove {
+                source_relative_path: "kinds/a.cue".to_owned(),
+                destination_relative_path: "kinds/b.cue".to_owned(),
+            }],
+            ..ItemDiff::default()
+        },
+        ItemDiff::default(),
+        ItemDiff {
+            tags_changed: true,
+            artwork_changed: true,
+            ..ItemDiff::default()
+        },
+    ];
+    let db = managed.db();
+    for (ordinal, diff) in ordinals.iter().zip(&diffs) {
+        db.execute(
+            "UPDATE library_management_plan_items SET diff_json = ?3 WHERE job_id = ?1 AND ordinal = ?2",
+            rusqlite::params![handle.job_id, ordinal, serde_json::to_string(diff).expect("diff")],
+        )
+        .expect("diff planned");
+    }
+    db.execute(
+        "UPDATE library_management_plan_items SET eligibility = 'blocked', \
+         reason_code = 'UNCONFIRMED_MATCH' WHERE job_id = ?1 AND ordinal = ?2",
+        rusqlite::params![handle.job_id, ordinals[5]],
+    )
+    .expect("blocked");
+    db.execute(
+        "INSERT INTO local_artists (id, display_name, folded_name, normalized_name, kind, \
+         created_at, updated_at, row_revision) \
+         VALUES ('filter-artist', 'Filter Artist', 'filter artist', 'filter artist', 'person', 0, 0, 1)",
+        [],
+    )
+    .expect("artist");
+    db.execute(
+        "UPDATE local_albums SET album_artist_id = 'filter-artist' WHERE id = ?1",
+        [&other],
+    )
+    .expect("album artist");
+
+    let management = managed.management();
+    let list = |filter: ItemFilter| -> Vec<i64> {
+        management
+            .items(&handle.job_id, -1, 100, &filter)
+            .expect("items page")
+            .items
+            .iter()
+            .map(|item| item.ordinal)
+            .collect()
+    };
+    let planned = management
+        .items(&handle.job_id, -1, 100, &ItemFilter::default())
+        .expect("items")
+        .items;
+    let counted = |count: fn(&Summary) -> i64| -> Vec<i64> {
+        planned
+            .iter()
+            .filter(|item| {
+                let mut summary = Summary::default();
+                summary.count(item);
+                count(&summary) == 1
+            })
+            .map(|item| item.ordinal)
+            .collect()
+    };
+    type Count = fn(&Summary) -> i64;
+    let kinds_of: [(&str, Count); 5] = [
+        ("tags", |summary| summary.tag_change_count),
+        ("path", |summary| summary.path_change_count),
+        ("sidecars", |summary| summary.sidecar_change_count),
+        ("artwork", |summary| summary.artwork_change_count),
+        ("no_change", |summary| summary.no_change_count),
+    ];
+    for (kind, count) in kinds_of {
+        let filter = ItemFilter {
+            change_kind: Some(kind.to_owned()),
+            ..ItemFilter::default()
+        };
+        assert_eq!(
+            list(filter),
+            counted(count),
+            "{kind} lists what the summary counts"
+        );
+    }
+    let artwork = ItemFilter {
+        change_kind: Some("artwork".to_owned()),
+        ..ItemFilter::default()
+    };
+    assert_eq!(list(artwork), vec![ordinals[1], ordinals[2]]);
+    let artist = ItemFilter {
+        artist_id: Some("filter-artist".to_owned()),
+        ..ItemFilter::default()
+    };
+    let others: Vec<i64> = planned
+        .iter()
+        .filter(|item| item.album_id == other)
+        .map(|item| item.ordinal)
+        .collect();
+    assert_eq!(others.len(), 1);
+    assert_eq!(list(artist), others);
 }
 
 /// Automatic management settles album by album: catalog changes made for
@@ -12707,6 +13529,199 @@ fn title_edit(value: &str) -> droppedneedle_library::tags::TagEdit {
     )
 }
 
+/// A run that writes files has the scan read them back once it ends: the
+/// track shows the title and size it wrote, a preview made after that applies
+/// rather than being refused as changed, and the scan of the app's own
+/// write starts no run.
+#[tokio::test]
+async fn a_management_run_has_the_scan_read_what_it_wrote() {
+    use droppedneedle_library::management::models::{SelectionKind, TagEditMode};
+    use droppedneedle_library::management::tag_edit::TagEditRequest;
+    use droppedneedle_library::tags::{TagField, read_fields};
+
+    let managed = ManagedLibrary::start("lib-scan-after-run", |_| {}).await;
+    let (album, tracks) = managed.add_album("first", 1).await;
+    managed.activate().await;
+    let track = &tracks[0];
+    let row = || -> (String, i64) {
+        managed
+            .db()
+            .query_row(
+                "SELECT title, file_size_bytes FROM local_tracks WHERE id = ?1",
+                [track],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("track row")
+    };
+    managed.edit_outside(track, title_edit("Before")).await;
+    assert_eq!(row().0, "Before");
+    managed.library.dirty.clear(&managed.library.dirty.list());
+
+    managed
+        .apply(SelectionKind::Albums, &[&album], "retag")
+        .await;
+    let marked = managed.library.dirty.list();
+    // Only the supervisor's pass, which scans what is marked: no startup
+    // reconciliation and no full rescan.
+    for _ in 0..100 {
+        managed.library.scans.supervisor_tick().await;
+        if managed.library.coordinator.current().is_empty() {
+            break;
+        }
+    }
+    let size = std::fs::metadata(managed.path(track))
+        .expect("file stat")
+        .len();
+    assert_eq!(
+        row(),
+        ("first 1".to_owned(), size as i64),
+        "the scan read the edition's title and the new size"
+    );
+    assert_eq!(marked, vec!["music".to_owned()]);
+    assert!(managed.library.dirty.is_empty(), "the scan took the marks");
+
+    let runs = managed.automatic_runs().len();
+    managed.worker_looks().await;
+    assert_eq!(managed.automatic_runs().len(), runs, "no new run");
+
+    let management = managed.management();
+    let edit = management
+        .create_tag_edit(
+            TagEditRequest {
+                local_track_id: track.clone(),
+                mode: TagEditMode::SaveOverride,
+                expected_settings_revision: managed.settings_revision(),
+                expected_policy_revision: managed
+                    .library
+                    .core
+                    .policy_revision()
+                    .expect("policy revision"),
+                fields: vec![("title".to_owned(), serde_json::json!("Fixed"))],
+                idempotency_key: Some("edit-after-scan".to_owned()),
+            },
+            "admin",
+        )
+        .expect("edit preview");
+    assert!(
+        management_step(&managed.library).await,
+        "edit planning runs"
+    );
+    let applied = management_apply(&managed.library, &edit).await;
+    assert_eq!(applied.job.state.as_str(), "succeeded");
+    assert_eq!(
+        read_fields(track_file(&managed.path(track))).expect("tags read")[&TagField::Title],
+        vec!["Fixed".to_owned()],
+        "the edit was written, not refused"
+    );
+}
+
+/// An album the app matched by itself, its rows carrying what an upgrade
+/// from v2 leaves on them (a matcher stamp, each file's disc and position),
+/// is retagged by a run. The scan reads the files back and sends the album
+/// to identification, which finds the same release: the match keeps its
+/// revisions and its automatic-edition undo, so the run's Undo still puts
+/// the files back.
+#[tokio::test]
+async fn a_run_stays_undoable_after_identification_finds_the_same_release() {
+    use droppedneedle_library::management::models::SelectionKind;
+    use droppedneedle_library::tags::save::{TagEdit, save_tags};
+    use droppedneedle_library::tags::{TagField, read_fields};
+
+    let managed = ManagedLibrary::start("lib-run-reidentified", |_| {}).await;
+    let rel = "auto/01.flac";
+    let file = plant(&managed.music, rel, "management_full.flac");
+    // The fixture's release ids would name another album than the one
+    // MusicBrainz is scripted to answer with.
+    save_tags(
+        &file,
+        &[
+            TagEdit::verbatim(TagField::Title, vec!["auto 1".to_owned()]),
+            TagEdit::verbatim(TagField::MusicBrainzReleaseGroupId, Vec::new()),
+            TagEdit::verbatim(TagField::MusicBrainzReleaseId, Vec::new()),
+            TagEdit::verbatim(TagField::MusicBrainzReleaseTrackId, Vec::new()),
+        ],
+    )
+    .expect("track tagged");
+    rescan(&managed.library).await;
+    let track = managed
+        .library
+        .scan_store
+        .track_at("music", rel)
+        .unwrap()
+        .expect("track indexed");
+    let album = managed
+        .library
+        .scan_store
+        .album_for_track(&track)
+        .unwrap()
+        .expect("album");
+    let release = fitting_release(&managed.library, &album);
+    managed.scratch.identify.set_recall(release);
+    while managed.library.identification.identify_tick().await > 0 {}
+    let held = || -> Vec<String> {
+        let db = managed.db();
+        let mut statement = db
+            .prepare(
+                "SELECT 'album ' || decision_source || ' ' || release_mbid || ' ' \
+                 || row_revision FROM local_album_external_identities \
+                 WHERE local_album_id = ?1 \
+                 UNION ALL SELECT 'track ' || i.release_track_mbid || ' ' || i.row_revision \
+                 FROM local_track_external_identities i JOIN local_tracks t \
+                 ON t.id = i.local_track_id WHERE t.local_album_id = ?1 \
+                 UNION ALL SELECT 'undo ' || id FROM library_automatic_edition_undo \
+                 WHERE local_album_id = ?1",
+            )
+            .expect("query prepares");
+        statement
+            .query_map([&album], |row| row.get(0))
+            .expect("query runs")
+            .collect::<rusqlite::Result<_>>()
+            .expect("rows read")
+    };
+    assert_eq!(held()[0], format!("album automatic {REL_1} 1"));
+    managed.activate().await;
+    managed.edit_outside(&track, title_edit("Before")).await;
+    while managed.library.identification.identify_tick().await > 0 {}
+    managed
+        .db()
+        .execute_batch(&format!(
+            "UPDATE local_album_external_identities \
+             SET matcher_version = 'quiet-reconfirm-v1' WHERE local_album_id = '{album}'; \
+             UPDATE local_track_external_identities SET medium_position = 1, \
+             release_track_position = 1 WHERE local_track_id = '{track}';"
+        ))
+        .expect("rows stamped");
+    managed.library.dirty.clear(&managed.library.dirty.list());
+    let matched = held();
+
+    let run = managed
+        .apply(SelectionKind::Albums, &[&album], "retag")
+        .await;
+    let title = || {
+        read_fields(track_file(&managed.path(&track))).expect("tags read")[&TagField::Title].clone()
+    };
+    assert_eq!(
+        title(),
+        vec!["auto 1".to_owned()],
+        "the run wrote the edition"
+    );
+    for _ in 0..100 {
+        managed.library.scans.supervisor_tick().await;
+        if managed.library.coordinator.current().is_empty() {
+            break;
+        }
+    }
+    let mut identified = 0;
+    while managed.library.identification.identify_tick().await > 0 {
+        identified += 1;
+    }
+
+    assert!(identified > 0, "the scan sent the album to identification");
+    assert_eq!(held(), matched, "the same release changes nothing");
+    managed.undo_run(&run, "undo").await;
+    assert_eq!(title(), vec!["Before".to_owned()], "Undo put the file back");
+}
+
 /// A file the app wrote that is retagged outside it is the user's: the
 /// next automatic run writes nothing, marks the album as taken over and
 /// parks it, and never touches the album's match. The app's own write
@@ -12832,6 +13847,229 @@ async fn a_hand_retag_takes_the_album_over() {
         items[0].facts.warnings
     );
     assert_eq!(file_sha256(&file), edited);
+}
+
+/// A preview of a whole folder leaves out the albums DroppedNeedle already
+/// organized and that have not changed since, and says how many; the dry
+/// run that turns automatic management on agrees. A file rewritten outside
+/// with its size and modified time put back is planned again. "Include
+/// already organized" plans every album, and a preview of one album
+/// always plans it.
+#[tokio::test]
+async fn a_folder_preview_leaves_out_albums_already_organized() {
+    use droppedneedle_library::management::models::{Eligibility, SelectionKind};
+
+    let managed = ManagedLibrary::start("lib-skip-organized", |_| {}).await;
+    let (first, first_tracks) = managed.add_album("first", 2).await;
+    let (second, _) = managed.add_album("second", 1).await;
+    let (organize, items) = managed
+        .preview(SelectionKind::Roots, &["music"], "organize")
+        .await;
+    assert_eq!(items.len(), 3);
+    assert!(items.iter().all(|item| item.eligibility.writes()));
+    management_apply(&managed.library, &organize).await;
+    rescan(&managed.library).await;
+    let summary = |job: &str| managed.management().detail(job).expect("detail").summary;
+
+    let (again, items) = managed
+        .preview(SelectionKind::Roots, &["music"], "again")
+        .await;
+    assert!(items.is_empty(), "{items:?}");
+    let counted = summary(&again.job_id);
+    assert_eq!(
+        (counted.organized_album_count, counted.organized_file_count),
+        (2, 3)
+    );
+    assert_eq!(counted.item_count, 0);
+
+    let (dry_run, _) = managed.dry_run("dry-run", |_| {}).await;
+    let detail = managed
+        .management()
+        .activation_detail(&dry_run.job_id)
+        .expect("dry run detail");
+    assert_eq!(detail.summary.organized_album_count, 2);
+    assert_eq!(detail.summary.item_count, 0);
+    assert!(detail.ready_for_confirmation, "{:?}", detail.stale_reasons);
+
+    // Retagged outside with the same size, and its modified time put back:
+    // only the change time says the file is not as the app left it.
+    let file = managed.path(&first_tracks[0]);
+    let before = std::fs::metadata(&file).expect("stat");
+    droppedneedle_library::tags::save_tags(&file, &[title_edit("FIRST 1")])
+        .expect("retagged outside the app");
+    std::fs::File::options()
+        .write(true)
+        .open(&file)
+        .expect("file opens")
+        .set_modified(before.modified().expect("mtime"))
+        .expect("mtime put back");
+    let after = std::fs::metadata(&file).expect("stat");
+    assert_eq!(after.len(), before.len(), "same size");
+    assert_eq!(after.modified().ok(), before.modified().ok(), "same mtime");
+    rescan(&managed.library).await;
+
+    let (changed, items) = managed
+        .preview(SelectionKind::Roots, &["music"], "changed")
+        .await;
+    assert_eq!(summary(&changed.job_id).organized_album_count, 1);
+    assert!(items.iter().all(|item| item.album_id == first), "{items:?}");
+    assert_eq!(items.len(), 2);
+    let retagged = items
+        .iter()
+        .find(|item| item.track_id.as_deref() == Some(first_tracks[0].as_str()))
+        .expect("the retagged file is planned");
+    assert_eq!(retagged.eligibility, Eligibility::Blocked);
+    assert_eq!(retagged.reason().expect("a reason").code, "CHANGED_OUTSIDE");
+
+    let (everything, items) = managed
+        .preview_with(SelectionKind::Roots, &["music"], "everything", true)
+        .await;
+    assert_eq!(summary(&everything.job_id).organized_album_count, 0);
+    assert_eq!(items.len(), 3);
+    assert!(items.iter().any(|item| item.album_id == second));
+
+    let (alone, items) = managed
+        .preview(SelectionKind::Albums, &[&second], "alone")
+        .await;
+    assert_eq!(summary(&alone.job_id).organized_album_count, 0);
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].album_id, second);
+}
+
+/// Albums already exactly as the profile wants, with no record of it (left
+/// right by v2, another tool, or a run from before the record held what it
+/// holds now): the first folder preview reads them, finds nothing to change
+/// and records them, and the next leaves them all out.
+#[tokio::test]
+async fn a_folder_preview_records_albums_it_finds_already_right() {
+    use droppedneedle_library::management::models::SelectionKind;
+
+    let managed = ManagedLibrary::start("lib-record-organized", |profile| {
+        // No genre source is attached here, and genres stay off so the
+        // album is right as it stands.
+        profile.genres.enabled = false;
+    })
+    .await;
+    managed.add_album("first", 2).await;
+    managed.add_album("second", 1).await;
+    let (organize, _) = managed
+        .preview(SelectionKind::Roots, &["music"], "organize")
+        .await;
+    management_apply(&managed.library, &organize).await;
+    rescan(&managed.library).await;
+    managed
+        .db()
+        .execute_batch(
+            "DELETE FROM library_track_management_identity;
+             DELETE FROM library_track_management_state;",
+        )
+        .expect("records forgotten");
+    let summary = |job: &str| managed.management().detail(job).expect("detail").summary;
+
+    let (first_look, items) = managed
+        .preview(SelectionKind::Roots, &["music"], "first look")
+        .await;
+    assert_eq!(summary(&first_look.job_id).organized_album_count, 0);
+    assert_eq!(items.len(), 3);
+    assert!(
+        items
+            .iter()
+            .all(|item| item.eligibility.writes() && !item.diff.changes_anything()),
+        "{items:?}"
+    );
+
+    let (second_look, items) = managed
+        .preview(SelectionKind::Roots, &["music"], "second look")
+        .await;
+    assert!(items.is_empty(), "{items:?}");
+    let counted = summary(&second_look.job_id);
+    assert_eq!(
+        (counted.organized_album_count, counted.organized_file_count),
+        (2, 3)
+    );
+}
+
+/// A match taken off and chosen again starts its revisions again at 1, so
+/// an album organized from one release and then matched to another can
+/// carry the same revisions: the release it was written from tells them
+/// apart, and a folder preview plans the album.
+#[tokio::test]
+async fn a_folder_preview_plans_an_album_matched_again_to_another_release() {
+    use droppedneedle_library::management::models::SelectionKind;
+
+    let managed = ManagedLibrary::start("lib-organized-rematch", |profile| {
+        // No genre source is attached here, and genres stay off so the
+        // album is right as it stands.
+        profile.genres.enabled = false;
+    })
+    .await;
+    let (album, _) = managed.add_album("first", 2).await;
+    managed.add_album("second", 1).await;
+    let release = || -> String {
+        managed
+            .db()
+            .query_row(
+                "SELECT release_mbid FROM local_album_external_identities \
+                 WHERE local_album_id = ?1",
+                [&album],
+                |row| row.get(0),
+            )
+            .expect("edition")
+    };
+    let rematch = |key: &'static str, to: String| {
+        let managed = &managed;
+        let album = album.clone();
+        async move {
+            let mut db = managed.db();
+            let tx = db.transaction().expect("transaction");
+            droppedneedle_library::edition::choice::detach_by_person(
+                &tx, &album, "DETACHED", "admin", 1.0,
+            )
+            .expect("match taken off");
+            tx.commit().expect("committed");
+            // The scripted MusicBrainz answers for the second album now:
+            // it is told this album's editions again.
+            managed
+                .scratch
+                .identify
+                .set_recall(ambiguous_recall(&managed.library.identify_store, &album));
+            crate::common::library::operations(&managed.library)
+                .choose_edition(
+                    &album,
+                    &to,
+                    shown_revision(&managed.library, &album),
+                    Some("admin"),
+                    false,
+                )
+                .await
+                .expect("edition chosen");
+            let (handle, items) = managed.preview(SelectionKind::Roots, &["music"], key).await;
+            (handle, items)
+        }
+    };
+    let (organize, _) = managed
+        .preview(SelectionKind::Roots, &["music"], "organize")
+        .await;
+    management_apply(&managed.library, &organize).await;
+
+    // Chosen again on its own release, then organized: its record now
+    // holds revision 1 everywhere.
+    let first = release();
+    let (again, items) = rematch("again", first.clone()).await;
+    if items.iter().any(|item| item.diff.changes_anything()) {
+        management_apply(&managed.library, &again).await;
+    }
+    let (_, items) = managed
+        .preview(SelectionKind::Roots, &["music"], "settled")
+        .await;
+    assert!(items.is_empty(), "{items:?}");
+
+    // Taken off again and matched to the other release: revision 1 again.
+    let other = if first == REL_1 { REL_2 } else { REL_1 };
+    let (_, items) = rematch("other", other.to_owned()).await;
+    let planned: Vec<_> = items.iter().filter(|item| item.album_id == album).collect();
+    assert_eq!(planned.len(), 2, "{items:?}");
+    assert!(planned.iter().any(|item| item.diff.changes_anything()));
 }
 
 /// What the app does not manage is not a takeover: a tag outside the
@@ -14674,6 +15912,7 @@ impl ManagedLibrary {
                 idempotency_key: Some(key.to_owned()),
                 target_root_id: None,
                 overrides: None,
+                include_organized: false,
             },
         )
         .await
@@ -15335,6 +16574,7 @@ async fn import_and_management_name_a_file_alike() {
             name: "The Golden Band".to_owned(),
             sort_name: Some("Golden Band, The".to_owned()),
             join: String::new(),
+            disambiguation: None,
         };
         let track = ReleaseTrack {
             id: format!("{n}0000000-0000-4000-8000-00000000000b"),
@@ -15403,6 +16643,7 @@ async fn import_and_management_name_a_file_alike() {
                     idempotency_key: Some(format!("alike-{n}")),
                     target_root_id: None,
                     overrides: None,
+                    include_organized: false,
                 },
                 "admin",
             )
@@ -15472,6 +16713,7 @@ async fn a_file_staging_cannot_read_is_a_local_fault() {
             name: "Artist".to_owned(),
             sort_name: None,
             join: String::new(),
+            disambiguation: None,
         }],
         tracks: vec![ReleaseTrack {
             id: "70000000-0000-4000-8000-00000000001b".to_owned(),
@@ -15527,6 +16769,7 @@ async fn an_import_never_lands_under_an_excluded_path() {
             name: "Live".to_owned(),
             sort_name: None,
             join: String::new(),
+            disambiguation: None,
         }],
         date: Some("2001-02-03".to_owned()),
         media: vec![ReleaseMedium {
@@ -15883,9 +17126,10 @@ async fn a_wide_job_never_writes_over_an_unnoticed_hand_edit() {
         let file = managed.path(&tracks[0]);
         let bytes = file_sha256(&file);
 
+        // The other album is already organized: included, so it plans.
         let items = if case == "profile preview" {
             managed
-                .preview(SelectionKind::Albums, &[&album, &other], "both")
+                .preview_with(SelectionKind::Albums, &[&album, &other], "both", true)
                 .await
                 .1
         } else {
@@ -17053,6 +18297,7 @@ async fn management_preview_blocks_an_album_whose_edition_is_being_placed() {
                 idempotency_key: Some("preview-remap".to_owned()),
                 target_root_id: None,
                 overrides: None,
+                include_organized: false,
             },
             "admin",
         )
@@ -17153,6 +18398,7 @@ fn one_track_per_title(facts: &LocalAlbumFacts) -> RecallResult {
                 name: facts.album_artist_name.clone(),
                 sort_name: None,
                 join: String::new(),
+                disambiguation: None,
             }],
             tracks,
             ..Release::default()
@@ -22254,6 +23500,7 @@ fn sibling_editions(n: u32, title: &str) -> (Release, Release) {
             name: "Radiohead".to_owned(),
             sort_name: None,
             join: String::new(),
+            disambiguation: None,
         }],
         tracks: TITLES
             .iter()
@@ -23959,7 +25206,7 @@ impl droppedneedle_library::management::enrich::EnrichmentPort for LiveAcoustId 
         background: bool,
     ) -> futures_util::future::BoxFuture<
         'a,
-        Result<Vec<droppedneedle_library::management::genre::Candidate>, String>,
+        Result<droppedneedle_library::management::enrich::GenreAnswer, String>,
     > {
         self.scripted
             .listenbrainz_genres(release_group_mbid, background)
@@ -23972,7 +25219,7 @@ impl droppedneedle_library::management::enrich::EnrichmentPort for LiveAcoustId 
         background: bool,
     ) -> futures_util::future::BoxFuture<
         'a,
-        Result<Vec<droppedneedle_library::management::genre::Candidate>, String>,
+        Result<droppedneedle_library::management::enrich::GenreAnswer, String>,
     > {
         self.scripted.lastfm_genres(artist, album, background)
     }
@@ -24185,6 +25432,7 @@ fn chosen_release(count: u32) -> Release {
             name: "Chosen Artist".to_owned(),
             sort_name: None,
             join: String::new(),
+            disambiguation: None,
         }],
         tracks: (1..=count)
             .map(|n| ReleaseTrack {
@@ -24621,6 +25869,7 @@ fn sakamoto_edition(release: &mut Release) {
         name: name.to_owned(),
         sort_name: Some(sort.to_owned()),
         join: join.to_owned(),
+        disambiguation: None,
     };
     release.artists = vec![
         artist(SAKAMOTO, "Ryuichi Sakamoto", "Sakamoto, Ryūichi", " + "),
@@ -24895,6 +26144,7 @@ fn sakamoto_alone(release: &mut Release) {
         name: "坂本龍一".to_owned(),
         sort_name: Some("Sakamoto, Ryūichi".to_owned()),
         join: String::new(),
+        disambiguation: None,
     };
     release.artists = vec![sakamoto.clone()];
     for track in &mut release.tracks {
@@ -24998,7 +26248,7 @@ async fn a_run_that_adds_ids_and_translates_keeps_the_artist() {
     assert_eq!(applied.job.state.as_str(), "succeeded");
     let results = managed
         .management()
-        .results(&handle.job_id, -1, 50)
+        .results(&handle.job_id, -1, 50, None)
         .expect("results");
     for item in &results.items {
         assert_eq!(
@@ -25238,6 +26488,7 @@ async fn an_artist_whose_files_carry_a_merged_id_is_linked_and_kept() {
             name: "Artist X".to_owned(),
             sort_name: None,
             join: String::new(),
+            disambiguation: None,
         };
         release.artists = vec![credit.clone()];
         for track in &mut release.tracks {
@@ -25250,7 +26501,12 @@ async fn an_artist_whose_files_carry_a_merged_id_is_linked_and_kept() {
     });
     rig.identify
         .set_artist(RETIRED, ArtistAnswer::MergedInto(CURRENT.to_owned()));
-    rig.identify.set_artist(CURRENT, ArtistAnswer::Current);
+    rig.identify.set_artist(
+        CURRENT,
+        ArtistAnswer::Current {
+            disambiguation: None,
+        },
+    );
     rig.resume_identification(paused).await;
     let link = format!(
         "SELECT provider_artist_id || ' ' || decision_source \
@@ -26751,6 +28007,7 @@ fn junk_release(
             name: facts.album_artist_name.clone(),
             sort_name: None,
             join: String::new(),
+            disambiguation: None,
         }],
         tracks: tracks
             .iter()
@@ -27568,6 +28825,7 @@ async fn a_carried_library_fetches_its_release_documents_and_keeps_its_links() {
         name: credited.clone(),
         sort_name: None,
         join: String::new(),
+        disambiguation: None,
     };
     rig.identify.set_document(
         REL_1,
@@ -28010,7 +29268,7 @@ async fn the_edition_cover_replaces_nothing_it_may_not() {
     management_apply(&managed.library, &handle).await;
     let results = managed
         .management()
-        .results(&handle.job_id, -1, 50)
+        .results(&handle.job_id, -1, 50, None)
         .expect("results");
     assert!(
         results.items.iter().any(|item| item
@@ -28111,4 +29369,379 @@ async fn restore_brings_the_replaced_cover_back_when_the_archive_cover_is_gone()
         std::fs::read(&cover).expect("the original cover is back"),
         own
     );
+}
+
+/// The scripted sources, with ListenBrainz's genres switched on and off
+/// as the test goes: `None` while it cannot be reached.
+struct FlakyGenres {
+    scripted: Arc<droppedneedle_library::test_support::ScriptedEnrichment>,
+    listenbrainz:
+        std::sync::Mutex<Option<Vec<droppedneedle_library::management::genre::Candidate>>>,
+    /// Run once at the next ListenBrainz read, while a run is planned.
+    on_read: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+impl droppedneedle_library::management::enrich::EnrichmentPort for FlakyGenres {
+    fn listenbrainz_genres<'a>(
+        &'a self,
+        _release_group_mbid: &'a str,
+        _background: bool,
+    ) -> futures_util::future::BoxFuture<
+        'a,
+        Result<droppedneedle_library::management::enrich::GenreAnswer, String>,
+    > {
+        use droppedneedle_library::management::enrich::GenreAnswer;
+        if let Some(hook) = self.on_read.lock().expect("hook").take() {
+            hook();
+        }
+        let answer = self
+            .listenbrainz
+            .lock()
+            .expect("script")
+            .clone()
+            .map(GenreAnswer::Genres)
+            .ok_or_else(|| "ListenBrainz is down".to_owned());
+        Box::pin(async move { answer })
+    }
+
+    fn lastfm_genres<'a>(
+        &'a self,
+        artist: &'a str,
+        album: &'a str,
+        background: bool,
+    ) -> futures_util::future::BoxFuture<
+        'a,
+        Result<droppedneedle_library::management::enrich::GenreAnswer, String>,
+    > {
+        self.scripted.lastfm_genres(artist, album, background)
+    }
+
+    fn lyrics<'a>(
+        &'a self,
+        query: &'a droppedneedle_library::management::enrich::LyricsQuery,
+        background: bool,
+    ) -> futures_util::future::BoxFuture<
+        'a,
+        Result<Option<droppedneedle_library::management::enrich::LyricsFound>, String>,
+    > {
+        self.scripted.lyrics(query, background)
+    }
+
+    fn front_cover<'a>(
+        &'a self,
+        release_mbid: &'a str,
+        release_group_mbid: &'a str,
+        background: bool,
+    ) -> futures_util::future::BoxFuture<
+        'a,
+        Result<Option<droppedneedle_library::management::enrich::Cover>, String>,
+    > {
+        self.scripted
+            .front_cover(release_mbid, release_group_mbid, background)
+    }
+
+    fn edition_cover<'a>(
+        &'a self,
+        release_mbid: &'a str,
+        background: bool,
+    ) -> futures_util::future::BoxFuture<
+        'a,
+        Result<Option<droppedneedle_library::management::enrich::Cover>, String>,
+    > {
+        self.scripted.edition_cover(release_mbid, background)
+    }
+
+    fn release_extras<'a>(
+        &'a self,
+        release_mbid: &'a str,
+        wants: droppedneedle_library::management::enrich::ExtrasWanted,
+        background: bool,
+    ) -> futures_util::future::BoxFuture<
+        'a,
+        Result<droppedneedle_library::matching::model::ReleaseExtras, String>,
+    > {
+        self.scripted
+            .release_extras(release_mbid, wants, background)
+    }
+
+    fn acoustid_lookup<'a>(
+        &'a self,
+        prints: &'a [droppedneedle_library::management::enrich::AcoustIdPrint],
+        background: bool,
+    ) -> futures_util::future::BoxFuture<
+        'a,
+        droppedneedle_library::management::enrich::AcoustIdAnswer,
+    > {
+        self.scripted.acoustid_lookup(prints, background)
+    }
+}
+
+/// `not_before_at` of an album left until something changes.
+const LEFT_UNTIL_CHANGED: i64 = 1_000_000_000_000_000_000;
+
+/// A library folder managed automatically, on a clock the test moves,
+/// whose one album writes ListenBrainz genres. ListenBrainz starts down
+/// when `listenbrainz_down`.
+async fn flaky_genre_library(
+    tag: &str,
+    listenbrainz_down: bool,
+) -> (
+    ManagedLibrary,
+    Arc<FlakyGenres>,
+    Arc<droppedneedle_kernel::test_support::ManualClock>,
+    String,
+    Vec<String>,
+) {
+    use droppedneedle_kernel::clock::Clock as _;
+    use droppedneedle_kernel::runtime_config::sections::GenreSource;
+    let scripted = Arc::new(droppedneedle_library::test_support::ScriptedEnrichment::default());
+    let flaky = Arc::new(FlakyGenres {
+        scripted: scripted.clone(),
+        listenbrainz: std::sync::Mutex::new((!listenbrainz_down).then(rock)),
+        on_read: std::sync::Mutex::new(None),
+    });
+    let clock = Arc::new(droppedneedle_kernel::test_support::ManualClock::at(
+        droppedneedle_kernel::clock::SystemClock.now_ms(),
+    ));
+    let managed = ManagedLibrary::start_on(
+        tag,
+        |profile| {
+            profile.genres.enabled = true;
+            profile.genres.sources = vec![GenreSource::Listenbrainz];
+        },
+        Some(flaky.clone()),
+        clock.clone(),
+    )
+    .await;
+    let (album, tracks) = managed.add_album("first", 1).await;
+    *scripted.relations.lock().expect("script") =
+        Some(managed.scripted_credits(&tracks, |_| concerto_credits()));
+    managed.activate().await;
+    (managed, flaky, clock, album, tracks)
+}
+
+fn rock() -> Vec<droppedneedle_library::management::genre::Candidate> {
+    vec![droppedneedle_library::management::genre::Candidate {
+        name: "Rock".to_owned(),
+        count: Some(10),
+        curated: true,
+    }]
+}
+
+impl ManagedLibrary {
+    /// The album's automatic queue row: reason, tries and when it is due.
+    fn queue_row(&self, album: &str) -> Option<(Option<String>, i64, i64)> {
+        use rusqlite::OptionalExtension as _;
+        self.db()
+            .query_row(
+                "SELECT last_reason_code, attempts, not_before_at \
+                 FROM library_management_automatic_queue WHERE local_album_id = ?1",
+                [album],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .expect("queue read")
+    }
+
+    /// What the last run recorded for the track's file.
+    fn outcome(&self, track: &str) -> Option<String> {
+        self.db()
+            .query_row(
+                "SELECT last_outcome FROM library_track_management_state \
+                 WHERE local_track_id = ?1",
+                [track],
+                |row| row.get(0),
+            )
+            .expect("state read")
+    }
+
+    /// Whether a preview of the whole folder plans the album again.
+    async fn folder_plans(&self, album: &str, key: &str) -> bool {
+        use droppedneedle_library::management::models::SelectionKind;
+        let (_, items) = self.preview(SelectionKind::Roots, &["music"], key).await;
+        items.iter().any(|item| item.album_id == album)
+    }
+}
+
+/// An automatic run that could not read ListenBrainz's genres writes the
+/// album without them and leaves it not organized: a preview of the
+/// folder plans it again, and it is run again by itself about an hour
+/// later. The scan of the run's own writes neither runs it sooner nor
+/// starts its count again. Once ListenBrainz answers, the retry writes
+/// the genres and the album counts as organized.
+#[tokio::test]
+async fn an_automatic_run_that_missed_genres_is_retried_by_itself() {
+    use droppedneedle_kernel::clock::Clock as _;
+    use droppedneedle_library::tags::{TagField, read_fields};
+
+    let (managed, flaky, clock, album, tracks) =
+        flaky_genre_library("lib-missed-genres", true).await;
+    let track = &tracks[0];
+    managed.look(&album).await;
+    assert_eq!(managed.automatic_runs().len(), 1, "the album was written");
+    assert_eq!(managed.outcome(track).as_deref(), Some("managed"));
+    let (code, tries, due) = managed.queue_row(&album).expect("the album waits");
+    assert_eq!((code.as_deref(), tries), (Some("SOURCES_DEFERRED"), 0));
+    let hour = 3_600_000;
+    assert!(
+        (due - clock.now_ms() - hour).abs() <= 1,
+        "about an hour on: {}",
+        due - clock.now_ms()
+    );
+    let skipped = managed.management().automatic_skipped(10).expect("skipped");
+    assert_eq!(skipped[0].reason.code, "SOURCES_DEFERRED");
+    let writes = managed
+        .management()
+        .writes_by_itself(&album)
+        .expect("writes read");
+    assert!(writes.by_itself);
+    assert!(
+        !writes.pending,
+        "the album page does not show a write under way while the retry waits"
+    );
+    assert!(managed.folder_plans(&album, "missed").await);
+
+    // The scan reads the run's writes and queues the album: the worker
+    // looks, and leaves it until its retry is due.
+    rescan(&managed.library).await;
+    managed.worker_looks().await;
+    clock.advance(hour - 60_000);
+    managed.worker_looks().await;
+    assert_eq!(managed.automatic_runs().len(), 1, "not run again yet");
+    let (code, tries, again) = managed.queue_row(&album).expect("the album waits");
+    assert_eq!((code.as_deref(), tries), (Some("SOURCES_DEFERRED"), 0));
+    assert!((again - due).abs() <= 1, "still due at the hour");
+
+    *flaky.listenbrainz.lock().expect("script") = Some(rock());
+    clock.advance(60_000);
+    managed.worker_looks().await;
+    assert_eq!(managed.automatic_runs().len(), 2, "the retry ran");
+    assert_eq!(
+        read_fields(track_file(&managed.path(track))).expect("tags read")[&TagField::Genre],
+        vec!["rock".to_owned()],
+        "the retry wrote the genres"
+    );
+    assert_eq!(managed.outcome(track).as_deref(), Some("succeeded"));
+    assert_eq!(managed.queue_row(&album), None, "nothing left to retry");
+    rescan(&managed.library).await;
+    managed.worker_looks().await;
+    assert_eq!(managed.automatic_runs().len(), 2);
+    assert!(
+        !managed.folder_plans(&album, "organized").await,
+        "the album counts as organized"
+    );
+}
+
+/// While the genre source stays down, the album is run again about an
+/// hour, six hours and a day after each run, then left until something
+/// changes: nothing loops.
+#[tokio::test]
+async fn missed_genres_are_retried_three_times_then_left() {
+    let (managed, _flaky, clock, album, tracks) =
+        flaky_genre_library("lib-missed-genres-retries", true).await;
+    managed.look(&album).await;
+    let hour = 3_600_000;
+    for (retry, wait) in [(1, hour), (2, 6 * hour), (3, 24 * hour)] {
+        clock.advance(wait - 60_000);
+        managed.worker_looks().await;
+        assert_eq!(managed.automatic_runs().len(), retry, "retry {retry} waits");
+        clock.advance(60_000);
+        managed.worker_looks().await;
+        assert_eq!(
+            managed.automatic_runs().len(),
+            retry + 1,
+            "retry {retry} ran"
+        );
+        assert_eq!(managed.outcome(&tracks[0]).as_deref(), Some("managed"));
+    }
+    let (code, tries, due) = managed.queue_row(&album).expect("the album is listed");
+    assert_eq!((code.as_deref(), tries), (Some("SOURCES_DEFERRED"), 3));
+    assert_eq!(due, LEFT_UNTIL_CHANGED, "left until something changes");
+    clock.advance(30 * 24 * hour);
+    managed.worker_looks().await;
+    assert_eq!(managed.automatic_runs().len(), 4, "nothing more");
+}
+
+/// A retry whose preview could not be applied when its planning ended
+/// (the library was switched off meanwhile) is applied at the next look
+/// once the library is back on, and spends no retry.
+#[tokio::test]
+async fn a_retry_planned_as_the_library_went_off_is_applied_once_it_is_back() {
+    use droppedneedle_kernel::runtime_config::secret_sections::TypedLibrary;
+    use droppedneedle_library::tags::{TagField, read_fields};
+
+    let (managed, flaky, clock, album, tracks) =
+        flaky_genre_library("lib-missed-genres-off", true).await;
+    managed.look(&album).await;
+    let switch = {
+        let store = managed.library.settings.store().clone();
+        let core = managed.library.core.clone();
+        move |on: bool| {
+            store
+                .update_secret_blocking::<TypedLibrary, String, _>(move |stored| {
+                    let mut settings = stored.into_inner();
+                    settings.enabled = on;
+                    Ok(settings)
+                })
+                .expect("library switch saved");
+            core.refresh_registry();
+        }
+    };
+    let off = switch.clone();
+    *flaky.listenbrainz.lock().expect("script") = Some(rock());
+    *flaky.on_read.lock().expect("hook") = Some(Box::new(move || off(false)));
+    clock.advance(3_600_000);
+    managed.worker_looks().await;
+    let genre = || read_fields(track_file(&managed.path(&tracks[0]))).expect("tags read");
+    assert!(
+        !genre()[&TagField::Genre].contains(&"rock".to_owned()),
+        "nothing written while the library is off"
+    );
+
+    switch(true);
+    managed.worker_looks().await;
+    assert_eq!(
+        genre()[&TagField::Genre],
+        vec!["rock".to_owned()],
+        "the retry's preview was applied"
+    );
+    assert_eq!(managed.outcome(&tracks[0]).as_deref(), Some("succeeded"));
+    assert_eq!(managed.queue_row(&album), None);
+}
+
+/// A run whose only warnings are lasting ones (no AcoustID key) still
+/// counts as organized: nothing is retried, and a preview of the folder
+/// leaves the album out.
+#[tokio::test]
+async fn a_lasting_warning_still_counts_as_organized() {
+    let (managed, _flaky, _clock, album, tracks) =
+        flaky_genre_library("lib-lasting-warning", false).await;
+    managed.strip_acoustid(&tracks).await;
+    managed.seed_print(&tracks[0], None);
+    managed.look(&album).await;
+    let management = managed.management();
+    let (history, _) = management.history(Default::default()).expect("history");
+    let run = &history
+        .iter()
+        .find(|item| item.origin == "scan_discovered")
+        .expect("the automatic run")
+        .job
+        .id;
+    let items = management
+        .items(run, -1, 100, &Default::default())
+        .expect("items")
+        .items;
+    assert!(
+        items[0]
+            .facts
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("need an AcoustID key")),
+        "{:?}",
+        items[0].facts.warnings
+    );
+    assert!(items[0].diff.deferred_sources.is_empty());
+    assert_eq!(managed.outcome(&tracks[0]).as_deref(), Some("succeeded"));
+    assert_eq!(managed.queue_row(&album), None, "nothing to retry");
+    assert!(!managed.folder_plans(&album, "organized").await);
 }

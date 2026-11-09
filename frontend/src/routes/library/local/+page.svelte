@@ -4,6 +4,7 @@
 	import { browser } from '$app/environment';
 	import { playerStore } from '$lib/features/player/state/player.svelte';
 	import { toastStore } from '$lib/stores/toast';
+	import { authStore } from '$lib/stores/authStore.svelte';
 	import { setQueueMutationToastsSuppressed } from '$lib/features/player/state/playerUtils';
 	import { deckFocus } from '$lib/features/player/state/deckFocus.svelte';
 	import { withBasePath } from '$lib/utils/basePath';
@@ -21,6 +22,7 @@
 	import AlbumImage from '$lib/media/AlbumImage.svelte';
 	import MediaTile from '$lib/media/MediaTile.svelte';
 	import NoFilesBadge from '$lib/features/library/components/NoFilesBadge.svelte';
+	import ContextMenu, { menuTrigger, type MenuPoint } from '$lib/ui/ContextMenu.svelte';
 	import {
 		getLocalRecentV3Query,
 		getLocalAlbumsV3Query,
@@ -38,7 +40,7 @@
 		suggestionToCrateTrack,
 		type SpinAlbum
 	} from '$lib/features/library/queries/LocalV3Adapters';
-	import { ChevronDown, Headphones, Play } from 'lucide-svelte';
+	import { ChevronDown, Headphones, ListPlus, ListStart, Play } from 'lucide-svelte';
 
 	const MBID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 	const isMbid = (id?: string | null): id is string => !!id && MBID_RE.test(id);
@@ -141,13 +143,15 @@
 			trackSourceId: t.track_file_id,
 			trackName: t.title,
 			artistName: t.artist_name,
+			artistId: t.artist_id ?? undefined,
 			trackNumber: 0,
 			discNumber: 1,
 			albumId: t.album_mbid ?? t.album_id,
 			albumName: t.album_name,
 			coverUrl: crateCoverUrl(t),
 			sourceType: 'local',
-			format: (t.format ?? '').toLowerCase()
+			format: (t.format ?? '').toLowerCase(),
+			duration: t.duration_seconds ?? undefined
 		};
 	}
 
@@ -166,19 +170,16 @@
 		void suggestionsQuery.refetch();
 	}
 
+	function playCrateNext(t: CrateTrack) {
+		playerStore.playNext(crateToQueueItem(t));
+		void suggestionsQuery.refetch();
+	}
+
 	async function playAlbum(album: SpinAlbum, shuffle = false) {
 		try {
-			const match = await fetchLocalAlbumTracksV3(album.id);
-			const tracks = [...match.items].sort(
-				(a, b) => a.disc_number - b.disc_number || a.track_number - b.track_number
-			);
-			if (!tracks.length) return;
-			const cover = albumCoverUrl(album);
-			playerStore.playQueue(
-				tracks.map((t) => matchTrackToQueueItem(t, cover)),
-				0,
-				shuffle
-			);
+			const items = await albumQueueItems(album);
+			if (!items.length) return;
+			playerStore.playQueue(items, 0, shuffle);
 			if (album.year) eraDecade = Math.floor(album.year / 10) * 10;
 		} catch {
 			toastStore.notify("Couldn't load that album", 'error');
@@ -194,18 +195,42 @@
 		playerStore.addToQueue(crateToQueueItem(t));
 	}
 
+	async function albumQueueItems(album: SpinAlbum): Promise<QueueItem[]> {
+		const match = await fetchLocalAlbumTracksV3(album.id);
+		const tracks = [...match.items].sort(
+			(a, b) => a.disc_number - b.disc_number || a.track_number - b.track_number
+		);
+		const cover = albumCoverUrl(album);
+		return tracks.map((t) => matchTrackToQueueItem(t, cover));
+	}
+
 	async function queueAlbum(album: SpinAlbum) {
 		try {
-			const match = await fetchLocalAlbumTracksV3(album.id);
-			const tracks = [...match.items].sort(
-				(a, b) => a.disc_number - b.disc_number || a.track_number - b.track_number
-			);
-			if (!tracks.length) return;
-			const cover = albumCoverUrl(album);
-			playerStore.addMultipleToQueue(tracks.map((t) => matchTrackToQueueItem(t, cover)));
+			const items = await albumQueueItems(album);
+			if (items.length) playerStore.addMultipleToQueue(items);
 		} catch {
 			toastStore.notify("Couldn't queue that album", 'error');
 		}
+	}
+
+	async function playAlbumNext(album: SpinAlbum) {
+		try {
+			const items = await albumQueueItems(album);
+			if (items.length) playerStore.playMultipleNext(items);
+		} catch {
+			toastStore.notify("Couldn't queue that album", 'error');
+		}
+	}
+
+	// one menu for every album tile, opened from a tile
+	let albumMenu = $state<(MenuPoint & { album: AlbumCardV3 }) | null>(null);
+
+	function albumMenuItems(album: AlbumCardV3) {
+		return [
+			{ label: 'Play', icon: Play, onclick: () => void playAlbum(album) },
+			{ label: 'Play Next', icon: ListStart, onclick: () => void playAlbumNext(album) },
+			{ label: 'Add to Queue', icon: ListPlus, onclick: () => void queueAlbum(album) }
+		];
 	}
 
 	async function fetchBatch(): Promise<QueueItem[]> {
@@ -319,6 +344,7 @@
 					onRefresh={() => suggestionsQuery.refetch()}
 					onPlay={playCrateTrack}
 					onQueue={queueCrateTrack}
+					onPlayNext={playCrateNext}
 					onQueueAlbum={queueAlbum}
 				/>
 			</div>
@@ -351,7 +377,14 @@
 		{/snippet}
 
 		{#snippet albumTile(album: AlbumCardV3)}
-			<div class="w-36 shrink-0 sm:w-40 lg:w-44">
+			<div
+				class="w-36 shrink-0 sm:w-40 lg:w-44"
+				use:menuTrigger={{
+					enabled: album.track_count > 0,
+					open: (at) => (albumMenu = { ...at, album }),
+					close: () => (albumMenu = null)
+				}}
+			>
 				<MediaTile
 					title={album.title}
 					href={isMbid(album.release_group_mbid)
@@ -469,16 +502,30 @@
 				<div>
 					<p class="font-semibold">No local music yet</p>
 					<p class="text-sm text-muted">
-						Add a music folder in <a
-							href={withBasePath('/settings?tab=library')}
-							class="link link-accent">Settings &rarr; Library</a
-						>, then run a scan.
+						{#if authStore.isAdmin}
+							Add a music folder in <a
+								href={withBasePath('/settings?tab=library')}
+								class="link link-accent">Settings &rarr; Library</a
+							>, then run a scan.
+						{:else}
+							Ask an admin to add a music folder.
+						{/if}
 					</p>
 				</div>
 			</div>
 		{/if}
 	</div>
 </div>
+
+{#if albumMenu}
+	<ContextMenu
+		trigger="point"
+		at={albumMenu}
+		label="{albumMenu.album.title} by {albumMenu.album.artist_name}"
+		items={albumMenuItems(albumMenu.album)}
+		onclose={() => (albumMenu = null)}
+	/>
+{/if}
 
 <QueueDrawer bind:open={queueDrawerOpen} onclose={() => (queueDrawerOpen = false)} />
 

@@ -1,11 +1,12 @@
 # Library Management
 
-Library Management writes MusicBrainz Picard-style tags, artwork and lyrics, and names and files your music, always behind a preview you check first. It is off until an admin enables it, and lives on the Library Management page (admins). How albums are scanned and identified is in [Your library](library.md).
+Library Management writes MusicBrainz Picard-style tags, artwork and lyrics, and names and files your music, always behind a preview you check first. It is off until an admin enables it, and lives on the Library Management page (admins). Its Overview tab shows what is running, recent work, the library at a glance and quick actions. How albums are scanned and identified is in [Your library](library.md).
 
 ## Contents
 
 - [Previews and Apply](#previews-and-apply)
 - [Profiles and fields](#profiles-and-fields)
+- [Naming and tagging scripts](#naming-and-tagging-scripts)
 - [Tags, credits and artist names](#tags-credits-and-artist-names)
 - [Artwork](#artwork)
 - [Lyrics](#lyrics)
@@ -22,7 +23,11 @@ Library Management writes MusicBrainz Picard-style tags, artwork and lyrics, and
 
 Pick library folders, artists, albums or single files, pick a profile, and make a preview. Nothing changes yet. The preview works through your files in the background and then lists every file with its new tags and its new path from the profile's naming script. Each file that will be left alone says why and what to do about it, for example "This album's edition is a best guess nobody has confirmed yet" with a pointer to confirm it. An album is changed as a whole: picking single files of an album that would move still moves the whole album, and if one of its files can't be managed, the rest of the album waits too and says so. Cover art, cue sheets, rip logs and lyrics files in the album folder (the profile's sidecar patterns) move with it; if one would land on an existing file, the album waits with that reason instead of overwriting anything. Renames that only change letter case work too. A file that moves is copied to its new place first, and the old file is removed once the copy is checked; a folder the move leaves empty is removed. A written file keeps its permission bits and gets a new modified time.
 
-Apply writes the albums one at a time; the operation page shows each file's result, and a file that failed says why. If the settings or library folders change after the preview, apply refuses and asks for a new preview. A preview stays usable for the preview retention in the Library Management settings (24 hours by default). Any finished run can be undone the same way: preview the undo, check it, apply it. Undo brings the sidecar files back as well. Files someone changed since are left alone and say so, and a run that was already undone can't be undone twice.
+The file list starts on the Changing tab: only the files Apply will change. Not changing lists the files with nothing to change and the ones left alone, each with its reason; All lists every file. Each tab shows its count, and the summary keeps counting every file and reason. Picking Blocked or Stale under Outcome, or No change under Change, moves the list to All. The tab only changes what the list shows: Apply writes what the preview planned, whichever tab is open. An applied run's results page has the same three tabs.
+
+A preview of more than one album leaves out the albums DroppedNeedle already organized with the same profile, naming script and tagging scripts, whose edition, track matches and kept tag values have not changed and whose files are untouched since, and says how many it left out. An album counts as organized once a run applied it, or once such a preview found every one of its files with nothing to change; nothing is written to the files for that. A run that could not read genres, lyrics, a cover or AcoustID IDs because the source was down does not count, so the next preview plans the album again; in a folder managed automatically the album is also run again by itself about an hour, six hours and a day later, then left until something about it changes. Warnings that stay true (a format that can't hold a value, an existing `.lrc` file, no AcoustID key) still count as organized. So files organized by v2 or by another tool are read by the first preview of their folder, and later previews only read the albums that need work. Turn on "Include already organized" in the preview's Work step to plan them too; that also looks again for new genres, lyrics, credits and archive covers, and makes a cover or lyrics file you deleted again. A preview of one album always plans it.
+
+Apply first shows how many tag, path, artwork and sidecar changes it will make and asks you to type CONFIRM. It then writes the albums one at a time; the operation page shows each file's result, and a file that failed says why. If the settings or library folders change after the preview, apply refuses and asks for a new preview. A preview stays usable for the preview retention in the Library Management settings (24 hours by default). Any finished run can be undone the same way: preview the undo, check it, apply it. Undo brings the sidecar files back as well. Files someone changed since are left alone and say so, and a run that was already undone can't be undone twice.
 
 Turning the library off (Settings > Library) stops Library Management's file changes too, the same way it stops scans: new previews, applies and undos are refused, and automatic management waits until the library is back on, then picks up the albums that queued meanwhile. A run that is writing finishes the album it is on; it and any queued or paused run wait until the library is back on, then go on by themselves. An interrupted write is still put right at startup, and the history stays readable.
 
@@ -37,6 +42,172 @@ The two AcoustID fields come from the file's audio. The fingerprint is the Chrom
 The genre row is the Genres section's switch and mode. Merge is offered for the fields that hold several values. Profiles saved before keep writing what they wrote: a tag that used to be written along with another field (artist sort with artist, the release facts with album, original date with date, disc subtitle with disc number, the release track ID with the recording ID) takes that field's mode, the older spellings (`albumartist`, `track`, `disc`, `year`) fold into their field, and a preserved field still preserves the tags it covered. Profiles that already listed ISRC or album artists now write them. MP4 files have no place for performer or arranger: when a profile or a tagging script would set one there, the preview says so and the file keeps what it has.
 
 A profile can be shared: export gives a `.dnprofile` file and a text code starting `DNLP2:`, carrying the profile's settings and the naming and tagging scripts it uses. Import shows what the profile will do before anything is saved and adds it beside your own profiles, renaming it when the name is taken. A code or file shared from v2 (a code starting `DNLP1:`) is refused; share the profile again from v3.
+
+## Naming and tagging scripts
+
+One script language names files and edits tags. It is used in three places: the import naming script (Settings > Library), which files downloads and drop imports, and a profile's naming scripts and tagging scripts (Library Management > profile > File naming and organization, and Metadata).
+
+### While you write
+
+Under every script box:
+
+- **The example** shows what the script does to a sample track, a moment after you stop typing. For a naming script it is the path the file gets, for a tagging script the tags that change (tags the script leaves alone are not listed). The part your last change altered is highlighted for a second.
+- **One disc, Two discs, Name shared** switch the sample: Radiohead's _OK Computer_ (one disc), The Smashing Pumpkins' _Mellon Collie and the Infinite Sadness_ (two discs, with the edition note "remastered") and Alice Cooper's _Killer_ (an artist name MusicBrainz tells apart with "1964-1975 American rock band"). Switch between them to see a conditional piece appear and disappear.
+- **Blocks** put a value or a ready-made piece at the cursor, and select what they put there. Each shows its value for the sample, or "empty here". A tagging script also has line blocks: Set a tag, Add to a tag, Remove a tag and Only when. Set a tag and Add to a tag leave the cursor in the quotes, ready for the value. Undo takes the last block or fix back.
+- **Mistakes** show as you type, with the line and column. A misspelt value name offers the nearest real one, such as `title` for `titel`, with a button that puts it in. The last good example stays, dimmed, until the script works again.
+- **An empty folder name** for one of the samples shows as a warning with the empty part marked: an import with that path would stop (see [Import naming script](downloads.md#import-naming-script)), and Library Management would leave that file where it is.
+
+The example uses the default path settings. A profile's own path settings, and real collisions, show in a preview.
+
+### Naming scripts
+
+A naming script is one line. Text outside braces is kept as written, and `/` starts a new folder. Inside braces:
+
+- `{name}` is a value, such as `{albumartist}` or `{title}`.
+- `{track:02d}` writes a number at least two digits wide, padded with zeros (`02`). `{track:3}` pads with spaces. This works on `track`, `disc`, `track_number`, `disc_number`, `total_tracks`, `total_discs` and `medium_number`.
+- Anything else is an expression: a function call such as `{default(album_artist_sort, albumartist)}`, text in quotes (`"text"` or `'text'`, with `\n`, `\t`, `\\`, `\"` and `\u00e9` escapes), a whole number, or a list such as `[artist, title]`. An expression can't hold a `}`.
+
+The script must give a relative path: it can't start with `/` or have an empty, `.` or `..` part. Each value is cleaned as it goes in: a `/` or `\` in a value becomes `_`, so only the script's own `/` make folders. With the default path settings the path is then made safe for Windows too:
+
+- `<`, `>`, `:`, `"`, `|`, `?`, `*` and control characters become `_`;
+- spaces and dots at the start or end of a name are dropped, and a Windows device name (`CON`, `NUL`, `COM1` and so on) gets a `_` in front;
+- each folder and file name is cut to 240 bytes, keeping the extension; the whole path may be 4096 bytes;
+- text is put in Unicode NFC form.
+
+A profile's path settings can change these (keep non-ASCII letters or not, spaces to underscores, the replacement character, the length limits, the extension's case). The import naming script always uses the defaults. A name that comes out empty for an album (a value with nothing in it, with nothing else in that folder name) means the file can't be placed: an import stops with "The import naming script gave no usable path", and Library Management leaves the file where it is. Use a ready-made block that adds a piece only when there is one, such as "Edition note in brackets". The import naming script's file name must also end in `.{ext}`.
+
+A profile has a naming script for albums of one disc, and can have another for albums of several discs.
+
+### Values
+
+Every tag the file will have is a value under its field name (see [Profiles and fields](#profiles-and-fields)): `title`, `album`, `artist`, `artists`, `artist_sort`, `album_artist`, `album_artists`, `album_artist_sort`, `track_number`, `total_tracks`, `disc_number`, `total_discs`, `disc_subtitle`, `date`, `original_date`, `release_status`, `release_country`, `release_type`, `compilation`, `asin`, `media`, `label`, `catalog_number`, `barcode`, `isrc`, the `musicbrainz_..._id` fields, and in Library Management also `genre` and the credit fields (`composer`, `conductor` and the rest) when the profile writes them. A tag with one value is text, a tag with several is a list, which reads as its values joined by `; `. Tag values are text: `total_discs` is `"1"`, not `1`.
+
+Naming scripts can also read these. Tagging scripts read `year`, `artist_display`, `album_artist_display`, `genres` and `primary_genre` too.
+
+| Value | What it holds | On the one-disc sample |
+| --- | --- | --- |
+| `albumartist` | The album artist credit, or the track artist when there is none | Radiohead |
+| `artist`, `artist_display` | The track artist credit, such as "Kanye West & Jay-Z" | Radiohead |
+| `album_artist`, `album_artist_display` | The album artist credit | Radiohead |
+| `artists` | Each track artist's name, as a list | Radiohead |
+| `album_artists` | The album artist credit, as a list of one | Radiohead |
+| `artist_sorts`, `album_artist_sorts` | The artist sort and album artist sort tags, as lists | Radiohead |
+| `albumartist_disambiguation` | MusicBrainz's comment telling the first album artist apart from others of the name | (empty; "1964-1975 American rock band" on Name shared) |
+| `artist_disambiguation` | The same for the first track artist | (empty) |
+| `initial` | The album artist's first letter, past a leading "The", in capitals; `#` when it isn't a letter | R |
+| `year` | The first four characters of `date` (the edition's release date) | 1997 |
+| `album_disambiguation` | MusicBrainz's note telling the edition apart ("deluxe edition") | (empty; "remastered" on Two discs) |
+| `release_type` | The release group's primary type then its secondary types, in lower case: `album`, `single`, `ep`, `broadcast`, `other`, with `compilation`, `live`, `soundtrack`, `remix` and the like after it | album |
+| `track`, `disc` | The track and disc number, as numbers | 2, 1 |
+| `medium_number` | The disc number, as a number | 1 |
+| `medium`, `medium_format` | The disc's format | CD |
+| `musicbrainz_id` | The release group's MusicBrainz ID | b1392450-... |
+| `artist_mbid` | The first track artist's MusicBrainz ID | a74b1b7f-... |
+| `genre`, `primary_genre` | The first genre tag | (empty on imports) |
+| `genres` | Every genre tag, as a list | (empty on imports) |
+| `ext`, `extension` | The file's extension, without the dot | flac |
+| `codec` | The file's format, such as `flac` or `mp3` | flac |
+| `quality` | `lossless` for a lossless file, else the bit rate, such as `320kbps` | lossless |
+| `bitrate` | Kilobits a second | 1000 |
+| `sample_rate`, `bit_depth` | Hertz and bits, empty when unknown | 44100, 16 |
+
+`albumartist_disambiguation` and `artist_disambiguation` come from the release MusicBrainz sent. For an album identified before they were kept, a profile whose naming script reads either one looks up the album's artists on MusicBrainz when it plans the album (once a week at most, the same lookup a profile writing MusicBrainz artist names makes), so its preview and automatic runs see them. Imports of new downloads have them from the start. While MusicBrainz can't be asked, those albums wait rather than being named without them.
+
+### Functions
+
+Each function has the names in its row; they work the same. A value counts as empty when it is missing, empty text or an empty list. In a test, empty, `0` and `false` count as no.
+
+| Function | What it gives | Example |
+| --- | --- | --- |
+| `default(a, b, ...)`, `fallback` | The first one that isn't empty | `default(original_date, date)` |
+| `conditional(test, then, else)`, `if` | `then` when `test` is yes, else `else` | `conditional(is_empty(year), "", year)` |
+| `is_empty(x)`, `empty` | Whether `x` is empty | `is_empty(album_disambiguation)` |
+| `equals(a, b)`, `eq` | Whether `a` and `b` are the same. Text and numbers differ: `equals(total_discs, "1")`, but `equals(disc, 1)` | `equals(total_discs, "1")` |
+| `contains(x, part)` | Whether text holds `part`, or a list holds the value `part` | `contains(release_type, "live")` |
+| `not(x)` | The opposite of `x` | `not(is_empty(label))` |
+| `all(a, b, ...)`, `and` | Whether every one is yes | `and(compilation, is_empty(disc_subtitle))` |
+| `any(a, b, ...)`, `or` | Whether one is yes | `or(contains(release_type, "live"), contains(album, "Live"))` |
+| `concat(a, b, ...)` | The values joined with nothing between | `concat(" (", year, ")")` |
+| `join(list, separator)` | A list's values joined by `separator`, `; ` when it is left out | `join(artists, ", ")` |
+| `first(list)` | A list's first value | `first(release_type)` |
+| `slice(x, start, end)` | Characters (or list values) from `start` up to `end`; counted from 0, a negative number counts from the end, `end` can be left out | `slice(date, 0, 4)` |
+| `pad(x, width, fill)` | `x` with `fill` (one character, `0` when left out) in front up to `width` | `pad(disc, 2)` |
+| `replace(x, from, to)` | `x` with every `from` changed to `to` | `replace(album, ":", " -")` |
+| `lower(x)`, `upper(x)` | In lower or upper case | `upper(release_type)` |
+| `title(x)` | Each word with a capital first letter and the rest in lower case | `title(release_type)` gives "Album" |
+| `sortname(x)`, `sort_name` | A leading "The", "A" or "An" moved to the end | `sortname("The Cure")` gives "Cure, The" |
+| `ascii_fold(x)`, `asciifold` | Accents taken off, other non-ASCII letters dropped | `ascii_fold("Björk")` gives "Bjork" |
+| `path_safe(x, replacement)`, `pathsafe` | `<>:"/\|?*` and control characters changed to `replacement` (`_` when left out) | `path_safe(title, "-")` |
+
+A script may be up to 32,768 characters, nest functions 20 deep, and make values of up to 8,192 characters.
+
+### Tagging scripts
+
+A tagging script changes the tags a profile writes, after the profile's fields and before the file is written. It has one statement a line, and the profile runs its tagging scripts in the order they are attached. Values a person saved in the tag editor or as overrides win over every script.
+
+- `set title = title(title)` sets a tag to an expression's value (no braces; the expression is as in a naming script). A `set` whose value is empty leaves the tag as it is; use `delete` to clear a tag.
+- `append genre = "Alternative Rock"` adds a value to a tag that can hold several: the artist and album artist tags and their sort names, release type, label, catalog number, ISRC, the MusicBrainz artist, album artist and work IDs, the credit fields, genre and comment.
+- `delete comment` removes a tag.
+- `if equals(total_discs, "1"):` starts lines that run only when the test is yes; `else:` starts the lines for no, and `end` closes it. Indenting is up to you.
+- A line starting with `#` is a note, and blank lines are skipped.
+
+A tagging script reads and writes tags by their field names. It may also use `albumartist`, `albumartists`, `track`, `disc`, `year` and `publisher`, which set and read `album_artist`, `album_artists`, `track_number`, `disc_number`, `date` and `label` (`year` reads as the date's first four characters, and `set year = ...` writes the date, so the file keeps only what the script gives, such as a four-digit year). It can't read the values only naming scripts have (`quality`, `initial` and the like).
+
+A tagging script can read the file's other tags as `custom.NAME`: `custom.MOOD` is the file's MOOD tag (a Vorbis comment, an ID3 `TXXX` frame or an MP4 freeform item, whatever its capitals), and empty when the file has none or spells the Vorbis key two ways. It can't change them: a script that sets or deletes a `custom.` tag is refused when it is saved, and one saved before that rule leaves those lines out and says so in the run's warnings.
+
+```
+set album = concat(album, " [", upper(first(release_type)), "]")
+if equals(total_discs, "1"):
+    delete disc_subtitle
+end
+delete comment
+```
+
+### Recipes
+
+The disc number only on albums of more than one disc, as Lidarr's single-disc and multi-disc formats do:
+
+```
+{albumartist}/{album}{conditional(is_empty(year), "", concat(" (", year, ")"))}/{conditional(equals(total_discs, "1"), "", concat(pad(disc, 2), "-"))}{track:02d} - {title}.{ext}
+```
+
+gives `Radiohead/OK Computer (1997)/02 - Paranoid Android.flac` and `The Smashing Pumpkins/Mellon Collie and the Infinite Sadness (2012)/02-02 - Bodies.flac`. To put each disc in a folder of its own, give a profile a multi-disc script such as `{albumartist}/{album}/Disc {disc}/{track:02d} - {title}.{ext}`: a `/` that an expression gives becomes `_`, so a conditional can't make a folder.
+
+- Two artists of one name kept apart: `{albumartist}{conditional(is_empty(albumartist_disambiguation), "", concat(" (", albumartist_disambiguation, ")"))}/...` gives `Alice Cooper (1964-1975 American rock band)/...`.
+- The edition in the album folder: `{album}{conditional(is_empty(album_disambiguation), "", concat(" (", album_disambiguation, ")"))}`.
+- The year the album first came out, not the edition's: `{slice(default(original_date, date), 0, 4)}`.
+- Release type in the folder: `{album} [{title(first(release_type))}]` gives `OK Computer [Album]`.
+- Letter folders: `{initial}/{albumartist}/...` gives `R/Radiohead/...`.
+- Sort-name artist folders: `{default(album_artist_sort, albumartist)}/...` gives `Beatles, The/...`.
+
+### Coming from Lidarr
+
+| Lidarr | Here |
+| --- | --- |
+| `{Artist Name}` | `{albumartist}` |
+| `{Artist NameThe}` | `{sortname(albumartist)}` |
+| `{Artist CleanName}` | `{albumartist}` (characters a name can't hold become `_`); `{ascii_fold(albumartist)}` also drops accents |
+| `{Artist Disambiguation}` | `{albumartist_disambiguation}` |
+| `{Album Title}` | `{album}` |
+| `{Album Type}` | `{title(first(release_type))}` |
+| `{Album Disambiguation}` | `{album_disambiguation}` |
+| `{Release Year}` | `{slice(default(original_date, date), 0, 4)}`, or `{year}` for the edition's year |
+| `{Track Title}` | `{title}` |
+| `{Track ArtistName}` | `{artist}` |
+| `{track:00}` | `{track:02d}` |
+| `{medium:00}` | `{disc:02d}` |
+| `{Medium Format}` | `{medium_format}` |
+| `{Quality Title}` | `{quality}` or `{codec}` |
+| `{MediaInfo AudioCodec}` | `{codec}` |
+| `{MediaInfo AudioBitRate}` | `{bitrate}` (kilobits a second) |
+| `{MediaInfo AudioSampleRate}` | `{sample_rate}` |
+| `{MediaInfo AudioBitsPerSample}` | `{bit_depth}` |
+
+A Lidarr format such as `{Artist Name}/{Album Title} ({Release Year})/{Artist Name} - {Album Title} - {track:00} - {Track Title}` becomes:
+
+```
+{albumartist}/{album} ({slice(default(original_date, date), 0, 4)})/{albumartist} - {album} - {track:02d} - {title}.{ext}
+```
 
 ## Tags, credits and artist names
 
@@ -58,7 +229,7 @@ The profile's "Artist credit style" picks how the artist, artists, artist sort, 
 
 ### Genres
 
-With the profile's Genres section on, the genre tag is filled from the sources you list, in order: MusicBrainz (the release's, release group's and recordings' genres above the vote floor), ListenBrainz, Last.fm, and the genres the file already has. Names are spelled the way MusicBrainz's genre list spells them, aliases ("hip-hop", "dnb") become the canonical genre, and the allow, deny and casing lists apply. "Fill missing" only writes files without a genre, "merge" adds to what the file has. When ListenBrainz or Last.fm can't be reached and only MusicBrainz answered, the file keeps its genres and the preview says why.
+With the profile's Genres section on, the genre tag is filled from the sources you list, in order: MusicBrainz (the release's, release group's and recordings' genres above the vote floor), ListenBrainz, Last.fm, and the genres the file already has. Names are spelled the way MusicBrainz's genre list spells them, aliases ("hip-hop", "dnb") become the canonical genre, and the allow, deny and casing lists apply. "Fill missing" only writes files without a genre, "merge" adds to what the file has. When ListenBrainz or Last.fm can't be reached and only MusicBrainz answered, the file keeps its genres and the preview says why. A source switched off in Settings (or Last.fm with no API key) is not asked: the genres come from the other sources, with no warning.
 
 ### ReplayGain
 
@@ -92,7 +263,7 @@ Files a plugin added to the library are listed under "Library files" on that plu
 
 Every album page of your library shows the album's edition on a plate under the artist and year: its name, who picked it ("Your choice", "Picked by DroppedNeedle" or "Best guess"), its year, country and formats, and how many of its tracks your files hold, with any that are missing or that you have in another version.
 
-The album's track list follows the same edition. A track one of your files sits on shows that file's length. A track no file holds is marked "Missing" with the edition's length, and when you have it in another version, "Your version" and that file's length show under its title. Files the edition has no track for are listed once, under "Unmatched files", each saying why: "Another version of track 2", "Second copy of track 3" or "Not on this edition". The "In Library" badge counts the edition's tracks your files hold, out of all of them. The year beside the artist is when the album was first released; the plate shows the edition's own year.
+The album's track list follows the same edition. A track one of your files sits on shows that file's length. On the album page each track shows the file the edition puts on it, even before the file's own tags are written. A track no file holds is marked "Missing" with the edition's length, and when you have it in another version, "Your version" and that file's length show under its title. Files the edition has no track for are listed once, under "Unmatched files", each saying why: "Another version of track 2", "Second copy of track 3" or "Not on this edition". The "In Library" badge counts the edition's tracks your files hold, out of all of them. The year beside the artist is when the album was first released; the plate shows the edition's own year.
 
 Curators (admins and trusted users) press the plate, or open the album with `?edition=choose`, to open the edition sheet. It lists the edition you have now, the releases closest to your files, the editions of the album your files' tags name when the guess fits another, every other edition of the album, and search results: paste any MusicBrainz release link, even one from another album, or a release group link to list that album's editions, or search MusicBrainz by title and artist (the search starts filled in with the album's title and artist). When the guess's audio disagrees, the sheet names the tracks to listen to. Pick one to see what taking it would do: a sentence on how many of your files fit it, and its tracklist beside your files, each track marked as fitting, missing, or another version of a track you have (one row with both lengths), followed by the files it has no track for and the second copies. Your files don't have to fit it one to one, and choosing never deletes anything: second copies, other versions and files the edition has no track for stay in the album with their own tags. An edition that fits none of your files is taken with "Use anyway" instead (see [Using an edition no file fits](#using-an-edition-no-file-fits)).
 
@@ -140,7 +311,7 @@ Edition preferences (Settings > Editions) decide between editions that fit your 
 
 ## Automatic management
 
-On the Automation tab of Library Management, turn a library folder on and pick when it should run (after downloads, after dropped folders are imported, or after a scan finds an album). Before it is saved, a dry run previews the whole folder under the new settings without changing anything; confirm it to switch on, and the operations page lists the dry run as confirmed. From then on, an album that lands or gets identified in that folder is organized with the folder's profile half a minute after it was last queued, once its identification has finished and no scan is running; work on other albums doesn't hold it back, but a running scan of any folder does. It uses the album's chosen edition. Albums whose match is still a best guess are skipped unless "Also manage unconfirmed matches" is on, albums you restored to their originals stay as they are, and a run where a file can't be managed waits on the operations page with the reasons instead of being applied. Changing the folder's profile or rules needs a new dry run. Albums it skips (an unconfirmed match, an out-of-date dry run, a restored album) are listed on the Library Management page with the reason and what to do; choosing a new edition for an album has it re-tagged and re-filed. An album in a folder or path rule set to Local metadata keeps its own tags: Library Management never retags or renames it, automatically or from a preview or an edition's tag write, and the preview and the skipped list say why. The tag editor still writes the fields you change there. Downloads that land in such a folder keep their own tags too: "Get missing tracks", an upgrade or a drop import places each file as it came and records its match without writing the release's tags, and the album page says "Folder keeps its own tags". An upgrade's old file, with your tags, goes to the recycle bin. Other downloads go to the first library folder that is Automatic where they would land, and only land in such a folder untagged when none is. Moving an album into such a folder is still allowed. Management never moves a file under an Excluded path (a library folder set to Excluded, or a path rule there, whatever the letter case): the preview blocks that file with "The destination library folder does not exist or is excluded". If the profile asks for it, and "Post-commit refresh" is on in the settings with the server ticked, each media server set up under Settings is asked to rescan about 15 seconds after a run ends: Jellyfin rescans its libraries, Plex the music sections picked in its settings (or every music section when none is picked) and Navidrome starts a scan, which needs an admin account. Runs that end close together share one rescan per server. The run's page shows how each rescan went. One that fails is retried a few times with growing waits, except when the server is not set up, refuses the sign-in or has no rescan at that address, which ends it at once. The Plex call follows Plex's published API and has not been tried against a real Plex server.
+On the Automation tab of Library Management, turn a library folder on and pick when it should run (after downloads, after dropped folders are imported, or after a scan finds an album). Before it is saved, a dry run previews the whole folder under the new settings without changing anything. Like a preview of a folder, it leaves out the albums already organized under those settings and shows how many under "Already organized"; automatic management leaves those albums alone too. Confirm it to switch on, and the operations page lists the dry run as confirmed. From then on, an album that lands or gets identified in that folder is organized with the folder's profile half a minute after it was last queued, once its identification has finished and no scan is running; work on other albums doesn't hold it back, but a running scan of any folder does. It uses the album's chosen edition. Albums whose match is still a best guess are skipped unless "Also manage unconfirmed matches" is on, albums you restored to their originals stay as they are, and a run where a file can't be managed waits on the operations page with the reasons instead of being applied. Changing the folder's profile or rules needs a new dry run. Albums it skips (an unconfirmed match, an out-of-date dry run, a restored album) are listed on the Library Management page with the reason and what to do; choosing a new edition for an album has it re-tagged and re-filed. An album in a folder or path rule set to Local metadata keeps its own tags: Library Management never retags or renames it, automatically or from a preview or an edition's tag write, and the preview and the skipped list say why. The tag editor still writes the fields you change there. Downloads that land in such a folder keep their own tags too: "Get missing tracks", an upgrade or a drop import places each file as it came and records its match without writing the release's tags, and the album page says "Folder keeps its own tags". An upgrade's old file, with your tags, goes to the recycle bin. Other downloads go to the first library folder that is Automatic where they would land, and only land in such a folder untagged when none is. Moving an album into such a folder is still allowed. Management never moves a file under an Excluded path (a library folder set to Excluded, or a path rule there, whatever the letter case): the preview blocks that file with "The destination library folder does not exist or is excluded". If the profile asks for it, and "Post-commit refresh" is on in the settings with the server ticked, each media server set up under Settings is asked to rescan about 15 seconds after a run ends: Jellyfin rescans its libraries, Plex the music sections picked in its settings (or every music section when none is picked) and Navidrome starts a scan, which needs an admin account. Runs that end close together share one rescan per server. The run's page shows how each rescan went. One that fails is retried a few times with growing waits, except when the server is not set up, refuses the sign-in or has no rescan at that address, which ends it at once. The Plex call follows Plex's published API and has not been tried against a real Plex server.
 
 ### Check existing matches and prepare identities
 
@@ -156,7 +327,7 @@ New files that appear in the folder of an album you left unmanaged, kept as a cu
 
 "Manage it again" on the album page hands it back: the files are then retagged and renamed from the album's edition, which overwrites your changes. When handing every album back from Library Management cannot read an album's files after eight tries, the album is left unmanaged again and its page says the hand-back stopped. A rename or tag edit you make in the app to a file you changed outside does not hand the album back. A tag edit in the app writes every tag DroppedNeedle manages from the edition, not only the one you edit, so its preview shows the values you changed by hand going back. Picard or beets renaming files as they retag counts as a retag.
 
-A preview or a restore of the originals that covers more than one album leaves out an album with a file you changed outside that DroppedNeedle has not noticed yet, with the reason; in a folder managed automatically, that album is also left unmanaged. Preview or restore that album by itself to overwrite your changes. Changes DroppedNeedle does not manage do not count: a tag outside the profile's fields (unless the profile scrubs unmanaged tags, which would remove it), or a file you only moved, which it puts back where the naming rules say. Undoing one of DroppedNeedle's own runs in a folder it manages automatically also leaves the album unmanaged, so the run is not done again by itself. A tagger that runs on a schedule counts like a person: it takes an album over again the next time it runs after you hand the album back.
+A preview or a restore of the originals that covers more than one album leaves out an album with a file you changed outside that DroppedNeedle has not noticed yet, with the reason; in a folder managed automatically, that album is also left unmanaged. Preview or restore that album by itself to overwrite your changes. A file changed outside never counts as already organized, even when the tagger kept its size and modified time. Changes DroppedNeedle does not manage do not count: a tag outside the profile's fields (unless the profile scrubs unmanaged tags, which would remove it), or a file you only moved, which it puts back where the naming rules say. Undoing one of DroppedNeedle's own runs in a folder it manages automatically also leaves the album unmanaged, so the run is not done again by itself. A tagger that runs on a schedule counts like a person: it takes an album over again the next time it runs after you hand the album back.
 
 A FLAC file you replace at the same path with a new copy of the same recording, such as a re-rip or a higher-resolution copy, does not count as a hand edit. It counts as a new copy when its disc and track number are the same, its MusicBrainz recording ID matches the old file's (or, when either file has none, its title tag matches the old file's title tag and the lengths are within 5 seconds), and its sample rate, bit depth or channel count differs or its length moved by more than a second. DroppedNeedle then treats it as a file it has never written: in a folder it manages automatically it writes the album's edition into it, unless another file DroppedNeedle wrote on that album has gone missing, or the album is already unmanaged. The album page lists the new copy under "Album history". Undoing that run puts your copy back as it came and leaves the album unmanaged. Other formats, a copy with the same sound properties, and a copy the scan files under another album still count as a hand edit.
 
@@ -164,7 +335,7 @@ Restoring your music or the DroppedNeedle database from a backup makes every alb
 
 ## Retag joins
 
-Moving, renaming or retagging music files yourself is fine. The next scan sees a moved file as the same track and a moved or retagged album as the same album, so favorites, ratings, play history, playlists and album matches stay put. A file moved to another folder keeps its plays, favorites, ratings and playlist entries whichever folder a scan reads first. When the new folder is read first, they move a scan after the one that sees the old file gone. An artist stays the same artist when its name changes in the tags, for example when Library Management translates or standardizes names. When an album is matched to a MusicBrainz release, by DroppedNeedle or by you, each artist credited on it is linked to its MusicBrainz artist, as long as the album's credits line up with the release's one for one and each name matches the release's (as credited, or one of the artist's MusicBrainz names). Files that carry MusicBrainz artist IDs link their artists too. A linked artist keeps its favorites, plays, links and MusicBrainz page through a rename, and takes the new name once none of its files uses the old one. DroppedNeedle changes or removes a link it made when the album's match changes or the files name another artist, and never changes a link you made, except to follow an artist MusicBrainz merged into another. Two artist records MusicBrainz IDs in their files prove to be one artist are merged at the end of a scan, and the admin's duplicate artists list shows it. If MusicBrainz has merged an artist since your files were tagged, the old ID in your files and MusicBrainz's current ID count as the same artist. DroppedNeedle asks MusicBrainz about an artist ID only when it disagrees with a matched release or with other files. It keeps the old ID on file and never changes your files for it. Library Management writes the current ID the next time it writes the album, if your profile writes MusicBrainz IDs.
+Moving, renaming or retagging music files yourself is fine. The next scan sees a moved file as the same track and a moved or retagged album as the same album, so favorites, ratings, play history, playlists and album matches stay put. A file moved to another folder keeps its plays, favorites, ratings and playlist entries whichever folder a scan reads first. When the new folder is read first, they move a scan after the one that sees the old file gone. An artist stays the same artist when its name changes in the tags, for example when Library Management translates or standardizes names. When an album is matched to a MusicBrainz release, by DroppedNeedle or by you, each artist credited on it is linked to its MusicBrainz artist, as long as the album's credits line up with the release's one for one and each name matches the release's (as credited, or one of the artist's MusicBrainz names). Files that carry MusicBrainz artist IDs link their artists too. A linked artist keeps its favorites, plays, links and MusicBrainz page through a rename, and takes the new name once none of its files uses the old one. DroppedNeedle changes or removes a link it made when the album's match changes or the files name another artist, and never changes a link you made, except to follow an artist MusicBrainz merged into another. Two artist records MusicBrainz IDs in their files prove to be one artist are merged at the end of a scan, and the admin's duplicate artists list shows it. If MusicBrainz has merged an artist since your files were tagged, the old ID in your files and MusicBrainz's current ID count as the same artist. DroppedNeedle asks MusicBrainz about an artist ID only when it disagrees with a matched release or with other files, or when two artists in your library share a name, to show which is which. It keeps the old ID on file and never changes your files for it. Library Management writes the current ID the next time it writes the album, if your profile writes MusicBrainz IDs.
 
 Other music put at a file's path, for example another album copied over an old one with the same file names, or a disc ripped over an old rip, comes in as a new track when its length differs by more than 5 seconds and its MusicBrainz recording ID differs too. When either file has no recording ID, the title tags must differ instead; a title taken from a file name never counts. The old track keeps its plays, favorites, ratings and playlist entries and shows as missing, and the album page lists it under "Album history". Putting the old file back brings the old track back.
 

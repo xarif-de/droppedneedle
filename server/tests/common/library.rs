@@ -325,8 +325,8 @@ impl TestSql for Db {
 /// What a port's calls answer.
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// Library Management's outside sources with nothing to add: genre and
-/// lyrics lookups fail, there is no cover and no AcoustID key, and a
+/// Library Management's outside sources with nothing to add: no genre or
+/// lyrics source is attached, there is no cover and no AcoustID key, and a
 /// release's extras come from the release document identification stored
 /// (each track's recording with no relations, artists under their credited
 /// names), failing for a release it did not store.
@@ -352,9 +352,8 @@ impl EnrichmentPort for NoEnrichment {
         &'a self,
         _release_group_mbid: &'a str,
         _background: bool,
-    ) -> BoxFuture<'a, Result<Vec<droppedneedle_library::management::genre::Candidate>, String>>
-    {
-        Box::pin(async { Err("no outside sources".to_owned()) })
+    ) -> BoxFuture<'a, Result<droppedneedle_library::management::enrich::GenreAnswer, String>> {
+        Box::pin(async { Ok(droppedneedle_library::management::enrich::GenreAnswer::Off) })
     }
 
     fn lastfm_genres<'a>(
@@ -362,9 +361,8 @@ impl EnrichmentPort for NoEnrichment {
         _artist: &'a str,
         _album: &'a str,
         _background: bool,
-    ) -> BoxFuture<'a, Result<Vec<droppedneedle_library::management::genre::Candidate>, String>>
-    {
-        Box::pin(async { Err("no outside sources".to_owned()) })
+    ) -> BoxFuture<'a, Result<droppedneedle_library::management::enrich::GenreAnswer, String>> {
+        Box::pin(async { Ok(droppedneedle_library::management::enrich::GenreAnswer::Off) })
     }
 
     fn lyrics<'a>(
@@ -373,7 +371,7 @@ impl EnrichmentPort for NoEnrichment {
         _background: bool,
     ) -> BoxFuture<'a, Result<Option<droppedneedle_library::management::enrich::LyricsFound>, String>>
     {
-        Box::pin(async { Err("no outside sources".to_owned()) })
+        Box::pin(async { Ok(None) })
     }
 
     fn front_cover<'a>(
@@ -436,6 +434,7 @@ impl EnrichmentPort for NoEnrichment {
                         let name = ArtistName {
                             name: artist.name.clone(),
                             sort_name: artist.sort_name.clone(),
+                            disambiguation: None,
                             aliases: None,
                         };
                         (artist.id.to_ascii_lowercase(), name)

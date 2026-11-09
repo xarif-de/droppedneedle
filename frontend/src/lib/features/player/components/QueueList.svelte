@@ -1,21 +1,27 @@
 <!--
 	The drawer's Queue tab: the queue in play order, the playing track
 	outlined, then "Up next" with the rows that can be dragged, moved with
-	the arrow keys on their handle, or removed. Clear empties what is
-	upcoming and calls `oncleared`, which shuts the drawer.
+	the arrow keys on their handle, or removed. Rows the rating floor will
+	pass over are dimmed and marked Skips, and still play when picked. Clear
+	empties what is upcoming and calls `oncleared`, which shuts the drawer.
 -->
 <script lang="ts">
 	import { isValidMbid } from '$lib/utils/formatting';
 	import { tick } from 'svelte';
-	import { playerStore } from '$lib/features/player/state/player.svelte';
+	import {
+		formatLabel,
+		playerStore,
+		type UnplayableReason
+	} from '$lib/features/player/state/player.svelte';
 	import { toastStore } from '$lib/stores/toast';
-	import { GripVertical, ListMusic, Shuffle, Trash2 } from 'lucide-svelte';
+	import { CircleSlash, GripVertical, ListMusic, Shuffle, Trash2 } from 'lucide-svelte';
 	import AlbumImage from '$lib/media/AlbumImage.svelte';
 	import Button from '$lib/ui/Button.svelte';
 	import IconButton from '$lib/ui/IconButton.svelte';
 	import StatusChip from '$lib/ui/StatusChip.svelte';
 	import NowPlayingIndicator from '$lib/features/player/components/NowPlayingIndicator.svelte';
 	import type { QueueItem } from '$lib/features/player/playback/types';
+	import { skipByRating, skippedRating } from '$lib/features/player/state/skipByRating.svelte';
 
 	interface Props {
 		/** Called after Clear, which ends the reason to keep the queue open. */
@@ -40,6 +46,7 @@
 	const queue = $derived(playerStore.queue);
 	const currentIndex = $derived(playerStore.currentIndex);
 	const upcomingCount = $derived(playerStore.upcomingQueueLength);
+	const floor = $derived(skipByRating.floor);
 	const displayOrder = $derived(
 		playerStore.shuffleEnabled ? playerStore.shuffleOrder : queue.map((_, i) => i)
 	);
@@ -139,6 +146,12 @@
 		toastStore.notify(`Track moved to position ${moved + 1}`, 'info');
 	}
 
+	function unplayableTitle(reason: UnplayableReason, format: string | undefined): string {
+		if (reason === 'conversion_failed') return "Couldn't be converted for this browser";
+		const why = reason === 'converting_off' ? 'transcoding is off' : "the server can't convert it";
+		return `This browser can't play ${formatLabel(format)}, and ${why}`;
+	}
+
 	function formatDuration(seconds?: number): string {
 		if (!seconds || isNaN(seconds)) return '';
 		const m = Math.floor(seconds / 60);
@@ -186,6 +199,10 @@
 				{@const isCurrent = queueIndex === currentIndex}
 				{@const isPlayed = displayPosition < currentDisplayPosition}
 				{@const isReorderable = displayPosition > currentDisplayPosition}
+				{@const unplayable = playerStore.unplayableReasonFor(item)}
+				{@const skipsAt = isReorderable
+					? skippedRating(floor, playerStore.floorRatings, item)
+					: null}
 				{#if displayPosition === currentDisplayPosition + 1}
 					<p class="dn-queue-divider">Up next</p>
 				{/if}
@@ -194,6 +211,7 @@
 					class="dn-queue-row group/item"
 					class:dn-queue-row--current={isCurrent}
 					class:dn-queue-row--played={isPlayed}
+					class:dn-queue-row--skips={skipsAt !== null}
 					class:dn-queue-row--drop={dragOverIndex === displayPosition}
 					draggable={isReorderable}
 					ondragstart={(e) => handleDragStart(e, displayPosition)}
@@ -233,16 +251,30 @@
 						size="full"
 						requestSize={250}
 						rounded="sm"
-						className="size-10 shrink-0 {isPlayed ? 'opacity-60' : ''}"
+						className="size-10 shrink-0 {isPlayed
+							? 'opacity-60'
+							: skipsAt !== null
+								? 'opacity-40'
+								: ''}"
 					/>
 
 					<div class="min-w-0 flex-1">
 						<p class="dn-queue-title truncate">{item.trackName || item.albumName}</p>
-						<p class="truncate text-xs text-muted">{item.artistName}</p>
+						<p class="dn-queue-artist truncate text-xs text-muted">{item.artistName}</p>
 					</div>
 
 					{#if isCurrent && playerStore.isPlaying}
 						<NowPlayingIndicator size="md" color="bg-primary" />
+					{/if}
+					{#if skipsAt !== null}
+						<span class="inline-flex" title={skipsAt > 0 ? `Rated ${skipsAt}★` : 'Not rated'}>
+							<StatusChip size="xs">Skips</StatusChip>
+						</span>
+					{/if}
+					{#if unplayable}
+						<span class="inline-flex" title={unplayableTitle(unplayable, item.format)}>
+							<StatusChip size="xs" icon={CircleSlash}>Can't play</StatusChip>
+						</span>
 					{/if}
 					{#if item.duration}
 						<span class="dn-queue-time">{formatDuration(item.duration)}</span>
@@ -307,6 +339,11 @@
 	}
 	.dn-queue-row--played .dn-queue-title {
 		color: var(--dn-muted);
+	}
+	/* a track the rating floor will pass over */
+	.dn-queue-row--skips .dn-queue-title,
+	.dn-queue-row--skips .dn-queue-artist {
+		opacity: 0.45;
 	}
 	.dn-queue-row--drop {
 		box-shadow: inset 0 2px 0 var(--dn-title);

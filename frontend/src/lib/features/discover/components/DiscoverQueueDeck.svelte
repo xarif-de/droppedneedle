@@ -20,6 +20,7 @@
 	import { withBasePath } from '$lib/utils/basePath';
 	import { playerStore } from '$lib/features/player/state/player.svelte';
 	import { libraryStore } from '$lib/stores/library';
+	import { themeStore } from '$lib/stores/theme.svelte';
 	import { createRequestAlbumMutation } from '$lib/features/downloads/queries/DownloadMutations.svelte';
 	import AlbumImage from '$lib/media/AlbumImage.svelte';
 	import YouTubeIcon from '$lib/media/icons/YouTubeIcon.svelte';
@@ -259,7 +260,7 @@
 		aria-roledescription="carousel"
 		aria-label="Discover Queue"
 	>
-		<div class="dn-deck__ink" data-theme="light">
+		<div class="dn-deck__ink" data-theme={themeStore.paper}>
 			{#if deck.phase === 'loading' || deck.phase === 'idle'}
 				<div class="grid gap-8 lg:grid-cols-[22rem_1fr]">
 					<div class="skeleton skeleton-shimmer aspect-square w-full max-w-80 rounded-md"></div>
@@ -689,8 +690,8 @@
 		filter: drop-shadow(0 10px 18px rgb(14 46 29 / 0.16));
 	}
 
-	/* the paper's own colours: the sheet switches to the light theme so the
-	   controls on it are measured for paper, but keeps the card's stock */
+	/* the paper's own colours: the sheet switches to its own theme so the
+	   controls on it are measured for that stock, but keeps the card's stock */
 	.dn-deck__ink {
 		background: transparent;
 		color: var(--dn-paper-content);
@@ -849,8 +850,8 @@
 		align-items: center;
 		gap: 1.25rem;
 		padding: 1rem 2.25rem calc(1rem + var(--tear, 0.75rem));
-		background-color: var(--dn-paper-content);
-		color: var(--dn-paper);
+		background-color: var(--dn-paper-tile);
+		color: var(--dn-paper-tile-content);
 	}
 	.dn-deck__band-title {
 		flex: none;
@@ -886,7 +887,7 @@
 	.deck-strip-item[aria-selected='true'] {
 		opacity: 1;
 		box-shadow:
-			0 0 0 2px var(--dn-paper-content),
+			0 0 0 2px var(--dn-paper-tile),
 			0 0 0 4px var(--dn-action);
 	}
 	.deck-strip-item:focus-visible {

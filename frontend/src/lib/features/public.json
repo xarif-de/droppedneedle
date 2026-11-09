@@ -96,12 +96,12 @@
 	"library-management": [
 		"components/AlbumOrganizationDialog.svelte",
 		"components/AlbumRetagPairs.svelte",
-		"components/LibraryNamingExample.svelte",
 		"components/LibraryRootPolicyEditor.svelte",
 		"components/LibraryScanScheduleControl.svelte",
 		"components/ManagementHoldSection.svelte",
 		"components/OperationJobStrip.svelte",
 		"components/RecycledRemovals.svelte",
+		"components/ScriptWorkbench.svelte",
 		"queries/LibraryActivityQueries.svelte.ts",
 		"queries/LibraryManagementMutations.svelte.ts",
 		"queries/LibraryManagementPreviewTokens.ts",
@@ -120,6 +120,7 @@
 		"components/LyricsPanel.svelte",
 		"components/NowPlayingIndicator.svelte",
 		"components/NowPlayingWidget.svelte",
+		"components/PlayerTrackMarks.svelte",
 		"playback/audioElement.ts",
 		"playback/launchLocalPlayback.ts",
 		"playback/launchRadio.ts",
@@ -143,6 +144,9 @@
 		"state/playlistModal.svelte.ts"
 	],
 	"profile": [
+		"components/CssSnippetsMenu.svelte",
+		"components/CssVariablesPanel.svelte",
+		"components/cssVocabulary.ts",
 		"queries/ConnectionsQuery.svelte.ts",
 		"queries/connect-apps.svelte.ts",
 		"queries/scrobble-preferences.svelte.ts"

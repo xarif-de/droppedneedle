@@ -43,6 +43,14 @@ pub struct Cover {
     pub mime: String,
 }
 
+/// What a remote genre source answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GenreAnswer {
+    Genres(Vec<Candidate>),
+    /// Switched off by the admin, or no usable key: nothing was asked.
+    Off,
+}
+
 /// The outside sources planning reads. `Err` means the source could not
 /// answer now; `Ok(None)` (or an empty list) that it has nothing.
 pub trait EnrichmentPort: Send + Sync {
@@ -51,14 +59,14 @@ pub trait EnrichmentPort: Send + Sync {
         &'a self,
         release_group_mbid: &'a str,
         background: bool,
-    ) -> BoxFuture<'a, Result<Vec<Candidate>, String>>;
+    ) -> BoxFuture<'a, Result<GenreAnswer, String>>;
     /// `background` asks at background priority (automatic runs).
     fn lastfm_genres<'a>(
         &'a self,
         artist: &'a str,
         album: &'a str,
         background: bool,
-    ) -> BoxFuture<'a, Result<Vec<Candidate>, String>>;
+    ) -> BoxFuture<'a, Result<GenreAnswer, String>>;
     /// `background` asks at background priority (automatic runs).
     fn lyrics<'a>(
         &'a self,
@@ -258,6 +266,25 @@ pub fn names_wanted(
         })
 }
 
+/// Whether the profile's naming scripts read the artists' MusicBrainz
+/// disambiguation, which a release stored before its credits kept it
+/// gets from the artist names lookup.
+pub fn script_names_wanted(pinned: &super::models::PinnedProfile) -> bool {
+    const READ: [&str; 2] = ["albumartist_disambiguation", "artist_disambiguation"];
+    std::iter::once(&pinned.naming_script)
+        .chain(pinned.multi_disc_naming_script.as_ref())
+        .filter_map(|script| super::script::compile_naming(&script.source).ok())
+        .flatten()
+        .any(|segment| match segment {
+            super::script::Segment::Literal(_) => false,
+            super::script::Segment::Variable { name, .. } => READ.contains(&name.as_str()),
+            super::script::Segment::Expression(expr) => expr
+                .variables()
+                .iter()
+                .any(|(name, _, _)| READ.contains(name)),
+        })
+}
+
 /// Make sure the stored document for `release` carries the parts the
 /// profile needs (credits, artist names), fresh: when one is missing,
 /// older than [`RELEASE_FRESH_SECS`] or parsed under an older version,
@@ -267,16 +294,17 @@ pub fn names_wanted(
 pub fn ensure_release_extras(
     port: &dyn EnrichmentPort,
     store: &SqliteIdentifyStore,
-    profile: &droppedneedle_kernel::runtime_config::sections::LibraryManagementProfile,
+    pinned: &super::models::PinnedProfile,
     release: &mut Release,
     background: bool,
 ) -> ReleaseParts {
     if super::custom::is_custom(release) {
         return ReleaseParts::default();
     }
+    let profile = &pinned.profile;
     let wants = ExtrasWanted {
         relations: credits_wanted(profile),
-        names: names_wanted(profile),
+        names: names_wanted(profile) || script_names_wanted(pinned),
     };
     let now_ms = store.clock().now_ms();
     let fresh_ms = (RELEASE_FRESH_SECS * 1000) as i64;
@@ -455,13 +483,14 @@ pub struct ReplayGainValues {
 pub fn gather(
     port: &dyn EnrichmentPort,
     store: &SqliteIdentifyStore,
-    profile: &droppedneedle_kernel::runtime_config::sections::LibraryManagementProfile,
+    pinned: &super::models::PinnedProfile,
     release: &mut Release,
     automatic: bool,
     exact_edition: bool,
 ) -> AlbumExtras {
     use droppedneedle_kernel::runtime_config::sections::GenreSource;
-    let parts = ensure_release_extras(port, store, profile, release, automatic);
+    let profile = &pinned.profile;
+    let parts = ensure_release_extras(port, store, pinned, release, automatic);
     let mut extras = AlbumExtras {
         credits: parts.credits,
         names: parts.names,
@@ -504,15 +533,27 @@ pub fn gather(
     }
     if profile.genres.enabled {
         if profile.genres.sources.contains(&GenreSource::Listenbrainz) {
-            extras.genres.listenbrainz =
-                wait(port.listenbrainz_genres(&release.release_group_id, automatic));
+            extras.genres.listenbrainz = source_genres(wait(
+                port.listenbrainz_genres(&release.release_group_id, automatic),
+            ));
         }
         if profile.genres.sources.contains(&GenreSource::Lastfm) {
             let artist = release.artist_text();
-            extras.genres.lastfm = wait(port.lastfm_genres(&artist, &release.title, automatic));
+            extras.genres.lastfm =
+                source_genres(wait(port.lastfm_genres(&artist, &release.title, automatic)));
         }
     }
     extras
+}
+
+/// A genre source's answer as the projection reads it.
+fn source_genres(answer: Option<GenreAnswer>) -> super::genre::SourceGenres {
+    use super::genre::SourceGenres;
+    match answer {
+        Some(GenreAnswer::Genres(genres)) => SourceGenres::Answered(genres),
+        Some(GenreAnswer::Off) => SourceGenres::Off,
+        None => SourceGenres::Unanswered,
+    }
 }
 
 /// What LRCLIB said about one file's lyrics.

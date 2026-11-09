@@ -1054,6 +1054,84 @@
         ]
       }
     },
+    "/api/v3/admin/users/{id}/custom-css": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "What one user's custom CSS is, never its text.",
+        "operationId": "get_user_custom_css",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "User id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Custom CSS summary",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CustomCssSummary"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "session": [
+              "admin"
+            ]
+          }
+        ]
+      }
+    },
+    "/api/v3/admin/users/{id}/custom-css/turn-off": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Switch one user's custom CSS off, keeping its text so they can see it\nand switch it back on.",
+        "operationId": "turn_off_user_custom_css",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "User id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Custom CSS summary",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CustomCssSummary"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "session": [
+              "admin"
+            ]
+          }
+        ]
+      }
+    },
     "/api/v3/admin/users/{id}/quota": {
       "get": {
         "tags": [
@@ -8722,10 +8800,10 @@
           {
             "name": "format_mode",
             "in": "query",
-            "description": "`with` (default): only albums in one of `formats`; `without`: only\nalbums in none of them.",
+            "description": "Default `with`.",
             "required": false,
             "schema": {
-              "type": "string"
+              "$ref": "#/components/schemas/FormatMode"
             }
           },
           {
@@ -8742,10 +8820,10 @@
           {
             "name": "tracks_mode",
             "in": "query",
-            "description": "`at_least` (default): albums with `min_tracks` or more; `below`:\nalbums with fewer.",
+            "description": "Default `at_least`.",
             "required": false,
             "schema": {
-              "type": "string"
+              "$ref": "#/components/schemas/TracksMode"
             }
           },
           {
@@ -8762,10 +8840,10 @@
           {
             "name": "rating_mode",
             "in": "query",
-            "description": "`at_least` (default): `rating` stars or more; `at_most`: `rating`\nstars or fewer.",
+            "description": "Default `at_least`.",
             "required": false,
             "schema": {
-              "type": "string"
+              "$ref": "#/components/schemas/RatingMode"
             }
           },
           {
@@ -12556,10 +12634,10 @@
           {
             "name": "tracks_mode",
             "in": "query",
-            "description": "`at_least` (default): artists with `min_tracks` or more; `below`:\nartists with fewer.",
+            "description": "Default `at_least`.",
             "required": false,
             "schema": {
-              "type": "string"
+              "$ref": "#/components/schemas/TracksMode"
             }
           },
           {
@@ -12576,10 +12654,10 @@
           {
             "name": "rating_mode",
             "in": "query",
-            "description": "`at_least` (default): `rating` stars or more; `at_most`: `rating`\nstars or fewer.",
+            "description": "Default `at_least`.",
             "required": false,
             "schema": {
-              "type": "string"
+              "$ref": "#/components/schemas/RatingMode"
             }
           },
           {
@@ -12880,6 +12958,85 @@
           },
           "409": {
             "description": "A member changed since the group was read",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "session": [
+              "admin"
+            ]
+          }
+        ]
+      }
+    },
+    "/api/v3/library/artists/duplicate-groups/{group_id}/undo": {
+      "post": {
+        "tags": [
+          "library management"
+        ],
+        "summary": "Undo a join of records made because they share a name: each record\ncomes back with its songs, plays, favorites and ratings, less what\nchanged since, and the records are marked as different artists.",
+        "operationId": "undo_artist_duplicate_group",
+        "parameters": [
+          {
+            "name": "group_id",
+            "in": "path",
+            "description": "Group id of a resolved join",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Join undone",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ArtistDuplicateGroupUndoResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Not authenticated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Admin role required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such group",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Not a join that can be undone, or undone already",
             "content": {
               "application/json": {
                 "schema": {
@@ -16837,6 +16994,20 @@
               "format": "int32",
               "minimum": 0
             }
+          },
+          {
+            "name": "scope",
+            "in": "query",
+            "description": "Only the files that change, or only the others; all when absent.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "description": "Which planned files a list shows, by whether they change.",
+              "enum": [
+                "changing",
+                "not_changing"
+              ]
+            }
           }
         ],
         "responses": {
@@ -16851,7 +17022,7 @@
             }
           },
           "400": {
-            "description": "Bad cursor",
+            "description": "Bad scope or cursor",
             "content": {
               "application/json": {
                 "schema": {
@@ -17414,6 +17585,15 @@
             }
           },
           {
+            "name": "artist_id",
+            "in": "query",
+            "description": "Files on albums by or credited to this local artist.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
             "name": "audio_format",
             "in": "query",
             "required": false,
@@ -17434,6 +17614,20 @@
                 "sidecars",
                 "artwork",
                 "no_change"
+              ]
+            }
+          },
+          {
+            "name": "scope",
+            "in": "query",
+            "description": "Only the files that change, or only the others; all when absent.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "description": "Which planned files a list shows, by whether they change.",
+              "enum": [
+                "changing",
+                "not_changing"
               ]
             }
           }
@@ -21371,10 +21565,10 @@
           {
             "name": "format_mode",
             "in": "query",
-            "description": "`with` (default): only tracks in one of `formats`; `without`: only\ntracks in none of them.",
+            "description": "Default `with`.",
             "required": false,
             "schema": {
-              "type": "string"
+              "$ref": "#/components/schemas/FormatMode"
             }
           },
           {
@@ -21391,10 +21585,10 @@
           {
             "name": "rating_mode",
             "in": "query",
-            "description": "`at_least` (default): `rating` stars or more; `at_most`: `rating`\nstars or fewer.",
+            "description": "Default `at_least`.",
             "required": false,
             "schema": {
-              "type": "string"
+              "$ref": "#/components/schemas/RatingMode"
             }
           },
           {
@@ -22046,6 +22240,179 @@
         ]
       }
     },
+    "/api/v3/me/appearance": {
+      "get": {
+        "tags": [
+          "users"
+        ],
+        "summary": "Read your own theme and custom CSS, with the site's CSS.",
+        "operationId": "get_my_appearance",
+        "responses": {
+          "200": {
+            "description": "Own appearance",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MyAppearance"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "session": [
+              "user"
+            ]
+          }
+        ]
+      },
+      "put": {
+        "tags": [
+          "users"
+        ],
+        "summary": "Save your own theme or custom CSS. A field left out keeps its value,\nand a change any part of which is refused saves nothing.",
+        "operationId": "put_my_appearance",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AppearanceUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Saved appearance",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MyAppearance"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The CSS is refused (`CUSTOM_CSS_REFUSED`, its problems in `details`) or too long (`CUSTOM_CSS_TOO_LONG`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Custom CSS is turned off on this server (`CUSTOM_CSS_TURNED_OFF`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "session": [
+              "user"
+            ]
+          }
+        ]
+      }
+    },
+    "/api/v3/me/appearance/css-saves": {
+      "get": {
+        "tags": [
+          "users"
+        ],
+        "summary": "List your last saves of your custom CSS, newest first.",
+        "operationId": "list_my_css_saves",
+        "responses": {
+          "200": {
+            "description": "Own CSS saves, newest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/CssSave"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "session": [
+              "user"
+            ]
+          }
+        ]
+      }
+    },
+    "/api/v3/me/appearance/import": {
+      "post": {
+        "tags": [
+          "users"
+        ],
+        "summary": "Move the theme and CSS this browser kept to your account, once. An\naccount that already holds them keeps its own and changes nothing.",
+        "operationId": "import_my_appearance",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AppearanceUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The appearance as stored, and whether this call wrote it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AppearanceImported"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The CSS is refused (`CUSTOM_CSS_REFUSED`, its problems in `details`) or too long (`CUSTOM_CSS_TOO_LONG`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Custom CSS is turned off on this server (`CUSTOM_CSS_TURNED_OFF`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "session": [
+              "user"
+            ]
+          }
+        ]
+      }
+    },
     "/api/v3/me/avatar": {
       "post": {
         "tags": [
@@ -22203,6 +22570,16 @@
                 }
               }
             }
+          },
+          "409": {
+            "description": "Last.fm is switched off on this server (LASTFM_OFF)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -22260,6 +22637,16 @@
                 }
               }
             }
+          },
+          "409": {
+            "description": "Last.fm is switched off on this server (LASTFM_OFF), there is no key pair to sign with (PROVIDER_NOT_CONFIGURED), or the sign-in is not approved, expired or not started here (CONFLICT)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -22285,6 +22672,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/LastFmTokenResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Last.fm is switched off on this server (LASTFM_OFF), or there is no key pair to sign with (PROVIDER_NOT_CONFIGURED)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
                 }
               }
             }
@@ -22927,6 +23324,44 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Not authenticated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "session": [
+              "user"
+            ]
+          }
+        ]
+      }
+    },
+    "/api/v3/playback/conversion": {
+      "get": {
+        "tags": [
+          "stream"
+        ],
+        "summary": "Whether a stream that asks for a format is converted, so the web player\nknows before it asks.",
+        "operationId": "playback_conversion",
+        "responses": {
+          "200": {
+            "description": "Whether converting is on",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PlaybackConversion"
                 }
               }
             }
@@ -29228,6 +29663,80 @@
         ]
       }
     },
+    "/api/v3/settings/appearance": {
+      "get": {
+        "tags": [
+          "settings"
+        ],
+        "summary": "Read the site CSS and whether people may add their own.",
+        "operationId": "get_site_appearance",
+        "responses": {
+          "200": {
+            "description": "Site appearance",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Appearance"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "session": [
+              "admin"
+            ]
+          }
+        ]
+      },
+      "put": {
+        "tags": [
+          "settings"
+        ],
+        "summary": "Save the site CSS and whether people may add their own. The site CSS\npasses the same check as a person's, with a longer limit.",
+        "operationId": "put_site_appearance",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Appearance"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Saved site appearance",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Appearance"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The CSS is refused (`CUSTOM_CSS_REFUSED`, its problems in `details`) or too long (`CUSTOM_CSS_TOO_LONG`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "session": [
+              "admin"
+            ]
+          }
+        ]
+      }
+    },
     "/api/v3/settings/connect-apps": {
       "get": {
         "tags": [
@@ -31369,6 +31878,98 @@
         ]
       }
     },
+    "/api/v3/settings/library/import-folder": {
+      "get": {
+        "tags": [
+          "settings"
+        ],
+        "summary": "Read the import folder setting.",
+        "operationId": "get_import_folder",
+        "responses": {
+          "200": {
+            "description": "Import folder",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ImportFolder"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "session": [
+              "admin"
+            ]
+          }
+        ]
+      },
+      "put": {
+        "tags": [
+          "settings"
+        ],
+        "summary": "Save the import folder. Music copied there is imported, then\nremoved from it.",
+        "operationId": "put_import_folder",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ImportFolder"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Saved import folder",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ImportFolder"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "session": [
+              "admin"
+            ]
+          }
+        ]
+      }
+    },
+    "/api/v3/settings/library/import-folder/status": {
+      "get": {
+        "tags": [
+          "settings"
+        ],
+        "summary": "What the import folder is doing now, or why it waits.\n`GET /api/v3/settings/library/import-folder/status`.",
+        "operationId": "import_folder_status_handler",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ImportFolderStatusResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "session": [
+              "admin"
+            ]
+          }
+        ]
+      }
+    },
     "/api/v3/settings/library/policy-apply-preview": {
       "post": {
         "tags": [
@@ -31639,6 +32240,54 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/LibraryScanScheduleResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "session": [
+              "admin"
+            ]
+          }
+        ]
+      }
+    },
+    "/api/v3/settings/library/script-preview": {
+      "post": {
+        "tags": [
+          "settings"
+        ],
+        "summary": "Show a naming or tagging script on the built-in example albums while\nit is written. Nothing is saved; a script that fails answers why in\nthe 200 body.",
+        "operationId": "preview_library_script",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ScriptPreviewRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The script on each example album",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScriptPreviewResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The script is too long",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
                 }
               }
             }
@@ -33174,6 +33823,16 @@
               }
             }
           },
+          "409": {
+            "description": "A format was asked for and the server is not converting",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
           "416": {
             "description": "Range not satisfiable",
             "content": {
@@ -33292,6 +33951,9 @@
           },
           "404": {
             "description": "Unknown audio id"
+          },
+          "409": {
+            "description": "A format was asked for and the server is not converting"
           },
           "429": {
             "description": "Stream capacity exhausted"
@@ -35688,6 +36350,7 @@
           "retag_half_left_alone",
           "retag_dismissal_ended",
           "leftover_joined",
+          "marks_followed",
           "tracks_other_music",
           "tracks_new_copy",
           "artist_from_tracks",
@@ -36641,6 +37304,57 @@
           }
         }
       },
+      "Appearance": {
+        "type": "object",
+        "description": "Site-wide appearance. The server's appearance routes check the sheet\nbefore it is saved; the kernel only holds it.",
+        "properties": {
+          "allow_user_css": {
+            "type": "boolean",
+            "description": "Let people add their own CSS on top of the site's.",
+            "default": true
+          },
+          "site_css": {
+            "type": "string",
+            "description": "CSS every signed-in page loads on top of the app's own styles.",
+            "default": ""
+          }
+        }
+      },
+      "AppearanceImported": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/MyAppearance",
+            "description": "The caller's appearance as stored now."
+          },
+          {
+            "type": "object",
+            "required": [
+              "imported"
+            ],
+            "properties": {
+              "imported": {
+                "type": "boolean",
+                "description": "True when this call wrote it; false when the account already held\none and nothing changed."
+              }
+            }
+          }
+        ],
+        "description": "The answer to the one-time move from the browser."
+      },
+      "AppearanceUpdate": {
+        "type": "object",
+        "description": "A change to the caller's appearance. A field left out keeps its value.",
+        "properties": {
+          "custom_css": {
+            "$ref": "#/components/schemas/CustomCssUpdate",
+            "description": "The caller's own CSS."
+          },
+          "theme": {
+            "$ref": "#/components/schemas/ThemeChoice",
+            "description": "The theme to use."
+          }
+        }
+      },
       "ApplyResult": {
         "type": "string",
         "description": "What Apply did with a finding.",
@@ -36980,13 +37694,18 @@
           "provider_mbids",
           "affected_reference_count",
           "reason_code",
-          "reason"
+          "reason",
+          "can_undo"
         ],
         "properties": {
           "affected_reference_count": {
             "type": "integer",
             "format": "int64",
             "description": "Credits, favorites and plays a merge would move."
+          },
+          "can_undo": {
+            "type": "boolean",
+            "description": "The merge is a join by name an administrator can undo."
           },
           "display_name": {
             "type": "string"
@@ -37046,6 +37765,57 @@
           },
           "state": {
             "$ref": "#/components/schemas/ArtistGroupState"
+          }
+        }
+      },
+      "ArtistDuplicateGroupUndoResponse": {
+        "type": "object",
+        "description": "What undoing a join put back.",
+        "required": [
+          "group_id",
+          "surviving_artist_id",
+          "restored_artist_ids",
+          "put_back",
+          "left_in_place"
+        ],
+        "properties": {
+          "group_id": {
+            "type": "string"
+          },
+          "left_in_place": {
+            "type": "object",
+            "description": "Rows the join moved that changed since and stay where they are.",
+            "additionalProperties": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "put_back": {
+            "type": "object",
+            "description": "Rows moved back, by kind (`album_credits`, `plays`, `favorites`, ...).",
+            "additionalProperties": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "restored_artist_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The records split off again, each live once more."
+          },
+          "surviving_artist_id": {
+            "type": "string",
+            "description": "The record the join kept."
           }
         }
       },
@@ -37760,6 +38530,13 @@
             "type": "integer",
             "format": "int64"
           },
+          "disambiguation": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "MusicBrainz's short note on the linked artist (\"US singer\"), set\nonly while another record has the same name."
+          },
           "favorite_count": {
             "type": "integer",
             "format": "int64"
@@ -38042,6 +38819,13 @@
             ],
             "format": "double",
             "description": "First import time, unix seconds."
+          },
+          "disambiguation": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "MusicBrainz's short note on who this is (\"US singer\"), set only\nwhen another artist in the library has the same name."
           },
           "favorite": {
             "type": "boolean",
@@ -40548,6 +41332,15 @@
           "stop"
         ]
       },
+      "Conversion": {
+        "type": "string",
+        "description": "Whether the server converts a stream that asks for a format.",
+        "enum": [
+          "on",
+          "off",
+          "unavailable"
+        ]
+      },
       "CorrectionKind": {
         "type": "string",
         "description": "Which correction was applied.",
@@ -40681,6 +41474,114 @@
               "null"
             ],
             "description": "Import provenance (`<source>:<id>`), when the playlist was imported."
+          }
+        }
+      },
+      "CssProblem": {
+        "type": "object",
+        "description": "One refused part of a sheet.",
+        "required": [
+          "what",
+          "line"
+        ],
+        "properties": {
+          "line": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The 1-based line it first appears on; 0 for `too_long`.",
+            "minimum": 0
+          },
+          "what": {
+            "type": "string",
+            "description": "What is refused: `backslash`, `import`, `font_face`, `too_long`, or\n`function:<name>` with the name in lower case."
+          }
+        }
+      },
+      "CssRefusal": {
+        "type": "object",
+        "description": "What a refused sheet answers in the error's `details`.",
+        "required": [
+          "problems"
+        ],
+        "properties": {
+          "problems": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CssProblem"
+            },
+            "description": "Each refused part of the sheet, once, in the order the check reads\nthem."
+          }
+        }
+      },
+      "CssSave": {
+        "type": "object",
+        "description": "One kept save of a person's CSS.",
+        "required": [
+          "id",
+          "css",
+          "saved_at"
+        ],
+        "properties": {
+          "css": {
+            "type": "string",
+            "description": "The sheet as saved."
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The save's id."
+          },
+          "saved_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When it was saved, unix milliseconds."
+          }
+        }
+      },
+      "CustomCssSummary": {
+        "type": "object",
+        "description": "What an admin sees of a person's CSS: never the text.",
+        "required": [
+          "has_css",
+          "enabled",
+          "length"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "description": "The person's \"Use my CSS\" switch."
+          },
+          "has_css": {
+            "type": "boolean",
+            "description": "Whether the person has CSS saved."
+          },
+          "length": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The sheet's length in characters, as the limit counts them.",
+            "minimum": 0
+          },
+          "saved_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When the text last changed, unix milliseconds."
+          }
+        }
+      },
+      "CustomCssUpdate": {
+        "type": "object",
+        "description": "A change to a person's own CSS. A field left out keeps its value.",
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "description": "The \"Use my CSS\" switch."
+          },
+          "text": {
+            "type": "string",
+            "description": "The new sheet; an empty one clears it."
           }
         }
       },
@@ -44534,7 +45435,8 @@
         "description": "Where an entry's files came from.",
         "enum": [
           "download",
-          "upload"
+          "upload",
+          "import_folder"
         ]
       },
       "EntryState": {
@@ -44757,6 +45659,15 @@
           "supported",
           "unknown",
           "contradictory"
+        ]
+      },
+      "ExampleAlbum": {
+        "type": "string",
+        "description": "The built-in example albums a script is shown against: one disc, two\ndiscs with an edition note, and an album artist whose name another\nartist shares, told apart by MusicBrainz's disambiguation.",
+        "enum": [
+          "one_disc",
+          "two_discs",
+          "name_shared"
         ]
       },
       "ExtensionCase": {
@@ -45344,6 +46255,14 @@
           }
         }
       },
+      "FormatMode": {
+        "type": "string",
+        "description": "Whether a list keeps the items in its `formats` or the ones in none.",
+        "enum": [
+          "with",
+          "without"
+        ]
+      },
       "GenreAlias": {
         "type": "object",
         "description": "One genre alias.",
@@ -45850,7 +46769,6 @@
           "origin",
           "state",
           "created_at",
-          "expires_at",
           "files"
         ],
         "properties": {
@@ -45887,9 +46805,12 @@
             "description": "The upload's drop import item."
           },
           "expires_at": {
-            "type": "integer",
+            "type": [
+              "integer",
+              "null"
+            ],
             "format": "int64",
-            "description": "When its held files are removed, in milliseconds."
+            "description": "When its held files are removed, in milliseconds. `None` for files\nleft in the import folder, which stay until a person decides."
           },
           "files": {
             "type": "array",
@@ -46066,7 +46987,7 @@
           },
           "source": {
             "type": "string",
-            "description": "`soulseek`, `usenet`, `plugin:<key>` or `upload`."
+            "description": "`soulseek`, `usenet`, `plugin:<key>`, `upload` or `import_folder`."
           },
           "source_task_id": {
             "type": [
@@ -46774,6 +47695,79 @@
           }
         }
       },
+      "ImportFolder": {
+        "type": "object",
+        "description": "The folder on the server DroppedNeedle imports music from by itself and\nempties as it goes. An empty path turns it off.",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "An absolute folder path as the server sees it, or empty for off.",
+            "default": ""
+          }
+        }
+      },
+      "ImportFolderOverlap": {
+        "type": "string",
+        "description": "Which kind of folder the import folder overlaps.",
+        "enum": [
+          "library",
+          "recycle_bin",
+          "downloads",
+          "app"
+        ]
+      },
+      "ImportFolderState": {
+        "type": "string",
+        "description": "What the import folder is doing, or why it waits.",
+        "enum": [
+          "off",
+          "watching",
+          "importing",
+          "waiting_for_scan",
+          "retrying",
+          "library_off",
+          "settings_unreadable",
+          "unreachable",
+          "read_only",
+          "overlaps"
+        ]
+      },
+      "ImportFolderStatusResponse": {
+        "type": "object",
+        "description": "What the import folder is doing, or why it waits.",
+        "required": [
+          "state",
+          "waiting"
+        ],
+        "properties": {
+          "overlap": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ImportFolderOverlap"
+              }
+            ],
+            "description": "With `overlaps`: the kind of folder it overlaps."
+          },
+          "overlap_path": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "With `overlaps`: that folder's path."
+          },
+          "state": {
+            "$ref": "#/components/schemas/ImportFolderState"
+          },
+          "waiting": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Albums found and still to go in."
+          }
+        }
+      },
       "ImportResult": {
         "type": "object",
         "description": "Receipt for a playlist import into the local catalog.",
@@ -47043,7 +48037,7 @@
           },
           "lastfm": {
             "type": "boolean",
-            "description": "Last.fm is connected."
+            "description": "The admin has switched Last.fm on for this server."
           },
           "library": {
             "type": "boolean",
@@ -50703,6 +51697,10 @@
             ],
             "description": "Makes a retried request return the same preview."
           },
+          "include_organized": {
+            "type": "boolean",
+            "description": "Also plan albums already organized with these settings and\nunchanged since. A preview of one album always plans it."
+          },
           "overrides": {
             "oneOf": [
               {
@@ -51193,6 +52191,8 @@
           "sidecar_change_count",
           "estimated_temporary_bytes",
           "expanded_track_count",
+          "organized_album_count",
+          "organized_file_count",
           "reasons",
           "roots",
           "formats",
@@ -51258,6 +52258,16 @@
           "no_change_count": {
             "type": "integer",
             "format": "int64"
+          },
+          "organized_album_count": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Albums left out because they are already organized."
+          },
+          "organized_file_count": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Files of the albums left out as already organized."
           },
           "path_change_count": {
             "type": "integer",
@@ -52227,6 +53237,40 @@
           }
         }
       },
+      "MyAppearance": {
+        "type": "object",
+        "description": "Everything the browser needs to paint the caller's pages.",
+        "required": [
+          "custom_css",
+          "site",
+          "stored"
+        ],
+        "properties": {
+          "custom_css": {
+            "$ref": "#/components/schemas/MyCustomCss",
+            "description": "The caller's own CSS."
+          },
+          "site": {
+            "$ref": "#/components/schemas/SiteAppearance",
+            "description": "The site's CSS and whether the caller's own applies."
+          },
+          "stored": {
+            "type": "boolean",
+            "description": "False while the caller has saved nothing to their account."
+          },
+          "theme": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ThemeChoice"
+              }
+            ],
+            "description": "The theme the caller chose, or null while they chose none."
+          }
+        }
+      },
       "MyConnectApps": {
         "type": "object",
         "description": "The caller's choices for their music apps.",
@@ -52237,6 +53281,32 @@
           "include_public_playlists": {
             "type": "boolean",
             "description": "Apps list other people's public playlists as well as the caller's."
+          }
+        }
+      },
+      "MyCustomCss": {
+        "type": "object",
+        "description": "A person's own CSS.",
+        "required": [
+          "text",
+          "enabled"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "description": "The \"Use my CSS\" switch. Off keeps the text but applies none of it."
+          },
+          "saved_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When the text last changed, unix milliseconds."
+          },
+          "text": {
+            "type": "string",
+            "description": "The sheet, empty when there is none."
           }
         }
       },
@@ -53336,13 +54406,18 @@
                 "provider_mbids",
                 "affected_reference_count",
                 "reason_code",
-                "reason"
+                "reason",
+                "can_undo"
               ],
               "properties": {
                 "affected_reference_count": {
                   "type": "integer",
                   "format": "int64",
                   "description": "Credits, favorites and plays a merge would move."
+                },
+                "can_undo": {
+                  "type": "boolean",
+                  "description": "The merge is a join by name an administrator can undo."
                 },
                 "display_name": {
                   "type": "string"
@@ -55116,6 +56191,19 @@
         "properties": {
           "task_id": {
             "type": "string"
+          }
+        }
+      },
+      "PlaybackConversion": {
+        "type": "object",
+        "description": "Whether the web player's format asks are converted.",
+        "required": [
+          "conversion"
+        ],
+        "properties": {
+          "conversion": {
+            "$ref": "#/components/schemas/Conversion",
+            "description": "On, turned off by an admin, or impossible without ffmpeg."
           }
         }
       },
@@ -58147,6 +59235,14 @@
           }
         }
       },
+      "RatingMode": {
+        "type": "string",
+        "description": "Which side of `rating` a list keeps.",
+        "enum": [
+          "at_least",
+          "at_most"
+        ]
+      },
       "RatingStatusResponse": {
         "type": "object",
         "description": "Rating-status answer.",
@@ -59407,6 +60503,13 @@
             ],
             "format": "int64",
             "description": "Duration in seconds."
+          },
+          "format": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The file's format in the library's names (`flac`, `mp3`, `alac`,\n`m4a` for an MP4 file whose codec the server did not say), when the\nsource reports it."
           },
           "id": {
             "type": "string",
@@ -62017,6 +63120,194 @@
           "policy_apply"
         ]
       },
+      "ScriptNameSuggestion": {
+        "type": "object",
+        "description": "A misspelt name and the known name it is closest to.",
+        "required": [
+          "found",
+          "name"
+        ],
+        "properties": {
+          "found": {
+            "type": "string",
+            "description": "The name as the script wrote it."
+          },
+          "name": {
+            "type": "string"
+          }
+        }
+      },
+      "ScriptPreviewFault": {
+        "type": "object",
+        "description": "Why a script fails, and where.",
+        "required": [
+          "message",
+          "line",
+          "column"
+        ],
+        "properties": {
+          "column": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "line": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "message": {
+            "type": "string"
+          },
+          "suggestion": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ScriptNameSuggestion"
+              }
+            ],
+            "description": "The known name closest to the one the script misspelt."
+          }
+        }
+      },
+      "ScriptPreviewKind": {
+        "type": "string",
+        "description": "Which script is being written.",
+        "enum": [
+          "import_naming",
+          "naming",
+          "tagging"
+        ]
+      },
+      "ScriptPreviewRequest": {
+        "type": "object",
+        "description": "A script to show against the example albums.",
+        "required": [
+          "kind",
+          "source"
+        ],
+        "properties": {
+          "kind": {
+            "$ref": "#/components/schemas/ScriptPreviewKind"
+          },
+          "source": {
+            "type": "string"
+          }
+        }
+      },
+      "ScriptPreviewResponse": {
+        "type": "object",
+        "description": "The script on every example album.",
+        "required": [
+          "samples"
+        ],
+        "properties": {
+          "fault": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ScriptPreviewFault"
+              }
+            ],
+            "description": "Why the script does not compile or breaks a rule; the examples\nthen carry their values only."
+          },
+          "samples": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ScriptPreviewSample"
+            }
+          }
+        }
+      },
+      "ScriptPreviewSample": {
+        "type": "object",
+        "description": "The script on one example album.",
+        "required": [
+          "sample",
+          "tags",
+          "values"
+        ],
+        "properties": {
+          "empty_name_parts": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "The path's names as written, when one of them came out empty\n(each empty one as `\"\"`)."
+          },
+          "fault": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ScriptPreviewFault"
+              }
+            ],
+            "description": "Why the script fails on this example."
+          },
+          "path": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The path a naming script gives the example track."
+          },
+          "sample": {
+            "$ref": "#/components/schemas/ExampleAlbum"
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ScriptTagChange"
+            },
+            "description": "The tags a tagging script changes, by name."
+          },
+          "values": {
+            "type": "object",
+            "description": "Every value the script can read here, as text.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "ScriptTagChange": {
+        "type": "object",
+        "description": "One tag a tagging script changes; `after` is empty when it removes it.",
+        "required": [
+          "name",
+          "before",
+          "after"
+        ],
+        "properties": {
+          "after": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "before": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "name": {
+            "type": "string"
+          }
+        }
+      },
       "ScrobbleNowPlayingRequest": {
         "type": "object",
         "description": "One native now-playing forward, by name.",
@@ -63797,6 +65088,24 @@
           }
         }
       },
+      "SiteAppearance": {
+        "type": "object",
+        "description": "The site's appearance as every signed-in person reads it.",
+        "required": [
+          "css",
+          "allow_user_css"
+        ],
+        "properties": {
+          "allow_user_css": {
+            "type": "boolean",
+            "description": "Whether people's own CSS applies."
+          },
+          "css": {
+            "type": "string",
+            "description": "CSS loaded under every person's own."
+          }
+        }
+      },
       "SkippedReviews": {
         "type": "object",
         "description": "Reviews one reason held back.",
@@ -64779,6 +66088,13 @@
             "type": "string",
             "description": "Album title."
           },
+          "artist_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Local track-artist id, when credited."
+          },
           "artist_name": {
             "type": "string",
             "description": "Track artist display name."
@@ -64933,6 +66249,16 @@
             "description": "Server version, when known."
           }
         }
+      },
+      "ThemeChoice": {
+        "type": "string",
+        "description": "The theme a person chose.",
+        "enum": [
+          "system",
+          "light",
+          "dark",
+          "midnight"
+        ]
       },
       "TopAlbumsResponse": {
         "type": "object",
@@ -65795,6 +67121,14 @@
           }
         }
       },
+      "TracksMode": {
+        "type": "string",
+        "description": "Which side of `min_tracks` a list keeps.",
+        "enum": [
+          "at_least",
+          "below"
+        ]
+      },
       "TransportDto": {
         "type": "string",
         "description": "Credential handoff for session-issuing routes. Mirrors the session login\n`TransportParam` (which owns the mechanism) so this layer stays the only\nplace that needs `ToSchema`.",
@@ -66088,7 +67422,7 @@
           "UNKNOWN_LAYOUT",
           "UNSUPPORTED_PATHS",
           "BACKUP_EXISTS",
-          "V2_WAL_PRESENT",
+          "V2_WAL_UNREADABLE",
           "NOT_ENOUGH_DISK",
           "V2_KEY_NOT_FOUND",
           "V2_KEY_INVALID",

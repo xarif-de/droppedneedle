@@ -1,7 +1,12 @@
 import { operationsQuery } from '$lib/features/library-management/queries/listQueries';
 import { previewItemsQuery } from '$lib/features/library-management/queries/listQueries';
 import { v3 } from '$lib/api/v3/endpoint';
-import { createInfiniteQuery, createQuery, queryOptions } from '@tanstack/svelte-query';
+import {
+	createInfiniteQuery,
+	createQuery,
+	keepPreviousData,
+	queryOptions
+} from '@tanstack/svelte-query';
 import type { Getter } from 'runed';
 
 import { api } from '$lib/api/client';
@@ -22,7 +27,9 @@ import type {
 	LibraryManagementPreviewDetailResponse,
 	LibraryManagementRecoveryDiagnosticsResponse,
 	LibraryManagementResultPageResponse,
-	LibraryManagementTagEditorContext
+	LibraryManagementTagEditorContext,
+	ManagementItemScope,
+	ScriptPreviewKind
 } from './types';
 
 type PreviewQuery = { state: { data?: LibraryManagementPreviewDetailResponse } };
@@ -251,23 +258,30 @@ export const getLibraryManagementOperationResultsQuery = (
 	getUserId: Getter<string | null | undefined>,
 	getJobId: Getter<string | null>,
 	getLimit: Getter<number> = () => 100,
-	getOperationState: Getter<string | null> = () => null
+	getOperationState: Getter<string | null> = () => null,
+	getScope: Getter<ManagementItemScope | undefined> = () => undefined
 ) =>
 	createInfiniteQuery(() => {
 		const jobId = getJobId();
 		const limit = getLimit();
+		const scope = getScope();
 		return {
 			enabled: Boolean(jobId),
 			refetchInterval: (query: ResultsQuery) =>
 				activeResultsRefetchInterval(jobId, getOperationState(), query),
-			queryKey: LibraryManagementQueryKeyFactory.operationResults(getUserId(), jobId ?? '', limit),
+			queryKey: LibraryManagementQueryKeyFactory.operationResults(
+				getUserId(),
+				jobId ?? '',
+				limit,
+				scope
+			),
 			initialPageParam: undefined as string | undefined,
 			queryFn: async ({ pageParam, signal }) =>
 				toResultPage(
 					await api.v3.GET(
 						v3('/api/v3/library/management/operations/{job_id}/results', {
 							path: { job_id: jobId ?? '' },
-							query: { cursor: pageParam, limit }
+							query: { cursor: pageParam, limit, scope }
 						}),
 						{ signal }
 					)
@@ -340,3 +354,31 @@ export const getLibraryManagementPlacementQuery = (
 		queryFn: ({ signal }) =>
 			api.v3.GET(v3('/api/v3/settings/library-management/placement'), { signal })
 	}));
+
+/** How long typing must pause before a script is shown again. */
+export const SCRIPT_PREVIEW_PAUSE_MS = 300;
+
+/**
+ * A script shown on the example albums, asked for once typing pauses. The
+ * last answer stays while the next one loads.
+ */
+export const getScriptPreviewQuery = (kind: Getter<ScriptPreviewKind>, source: Getter<string>) => {
+	let settled = $state(source());
+	$effect(() => {
+		const next = source();
+		const timer = setTimeout(() => (settled = next), SCRIPT_PREVIEW_PAUSE_MS);
+		return () => clearTimeout(timer);
+	});
+	return createQuery(() => ({
+		enabled: settled.trim() !== '',
+		queryKey: LibraryManagementQueryKeyFactory.scriptPreview(kind(), settled),
+		queryFn: ({ signal }) =>
+			api.v3.POST(
+				v3('/api/v3/settings/library/script-preview'),
+				{ kind: kind(), source: settled },
+				{ signal }
+			),
+		placeholderData: keepPreviousData,
+		staleTime: Infinity
+	}));
+};

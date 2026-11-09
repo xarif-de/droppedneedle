@@ -15,8 +15,8 @@ use rusqlite::{Connection, OptionalExtension as _, Transaction, params};
 use super::after_apply::RefreshTarget;
 use super::models::{
     DesiredDocument, Eligibility, HistoryFilter, HistoryItem, ItemDiff, ItemFacts, ItemFilter,
-    ItemPage, JobIntent, JobMode, Origin, PlannedItem, ResultItem, ResultPage, ResultState,
-    Revisions, Summary, TagScope,
+    ItemPage, ItemScope, JobIntent, JobMode, Origin, PlannedItem, ResultItem, ResultPage,
+    ResultState, Revisions, Summary, TagScope,
 };
 use super::reasons::{self, ItemReason};
 use super::sql::{
@@ -356,6 +356,8 @@ pub fn items_page(
             filter.audio_format,
             change,
             limit + 1,
+            filter.scope.map(ItemScope::as_str),
+            filter.artist_id,
         ],
         map_item,
     )?;
@@ -610,8 +612,13 @@ pub fn results(
     job_id: &str,
     after_ordinal: i64,
     limit: i64,
+    scope: Option<ItemScope>,
 ) -> rusqlite::Result<ResultPage> {
-    let page = items_page(conn, job_id, after_ordinal, limit, &ItemFilter::default())?;
+    let filter = ItemFilter {
+        scope,
+        ..ItemFilter::default()
+    };
+    let page = items_page(conn, job_id, after_ordinal, limit, &filter)?;
     let mut work = conn.prepare_cached(sql::WORK_RESULT.text())?;
     let mut items = Vec::with_capacity(page.items.len());
     for plan in page.items {
@@ -842,6 +849,9 @@ pub struct ManagedMark<'a> {
     /// The album's and the file's match revisions the run wrote from.
     pub album_identity_revision: Option<u64>,
     pub track_identity_revision: Option<u64>,
+    /// The release and release track the run wrote from.
+    pub release_mbid: Option<&'a str>,
+    pub release_track_mbid: Option<&'a str>,
     /// The file's place and stat signature after the run.
     pub path_revision: Option<String>,
     /// The file's SHA-256 as the plan read it, for a file the run left as
@@ -849,6 +859,10 @@ pub struct ManagedMark<'a> {
     /// recorded the bytes it placed, and the plan's hash is of the bytes
     /// before the write.
     pub found_sha256: Option<&'a str>,
+    /// The plan could not read an outside source for the file (genres,
+    /// lyrics, a cover, AcoustID): it is recorded `managed`, not
+    /// `succeeded`, so it does not count as organized.
+    pub sources_deferred: bool,
 }
 
 /// Record that a profile run wrote (or left as it wanted) one file.
@@ -871,6 +885,11 @@ pub fn mark_managed(
             crate::clock::ms(now),
             mark.path_revision,
             mark.found_sha256,
+            if mark.sources_deferred {
+                "managed"
+            } else {
+                "succeeded"
+            },
         ],
     )?;
     tx.execute(
@@ -879,6 +898,8 @@ pub fn mark_managed(
             mark.track_id,
             revision(mark.album_identity_revision),
             revision(mark.track_identity_revision),
+            mark.release_mbid,
+            mark.release_track_mbid,
         ],
     )?;
     Ok(())
@@ -916,6 +937,11 @@ pub struct TrackState {
     pub album_identity_revision: Option<i64>,
     pub track_identity_revision: Option<i64>,
     pub path_revision: Option<String>,
+    /// The job that last wrote the file.
+    pub last_operation_job_id: Option<String>,
+    /// The release and release track the file was written from.
+    pub applied_release_mbid: Option<String>,
+    pub applied_release_track_mbid: Option<String>,
 }
 
 impl TrackState {
@@ -923,6 +949,12 @@ impl TrackState {
     /// publisher keeps other text there too, so it stays text.
     pub fn last_run_succeeded(&self) -> bool {
         self.outcome.as_deref() == Some("succeeded")
+    }
+
+    /// The last run wrote this file, or it was published and left
+    /// `managed` (a source its plan could not read, an undo).
+    pub fn last_run_wrote(&self) -> bool {
+        self.last_run_succeeded() || self.outcome.as_deref() == Some("managed")
     }
 
     /// A baseline restore put this file back last.
@@ -950,6 +982,9 @@ pub fn track_state(conn: &Connection, track_id: &str) -> rusqlite::Result<Option
             album_identity_revision: row.applied_album_identity_revision,
             track_identity_revision: row.applied_track_identity_revision,
             path_revision: row.managed_path_revision,
+            last_operation_job_id: row.last_operation_job_id,
+            applied_release_mbid: row.applied_release_mbid,
+            applied_release_track_mbid: row.applied_release_track_mbid,
         })
     })
 }

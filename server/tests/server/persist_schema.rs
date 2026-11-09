@@ -72,7 +72,7 @@ fn schema_rows(connection: &Connection) -> Vec<(String, String, String, Option<S
 fn fresh_migrate_marks_version_and_seeds() {
     let connection = migrated();
     assert_eq!(scalar(&connection, "PRAGMA user_version"), latest_version());
-    assert_eq!(table_names(&connection).len(), 175);
+    assert_eq!(table_names(&connection).len(), 177);
     assert_eq!(
         scalar(
             &connection,
@@ -328,6 +328,26 @@ const SHIPPED: &[(&str, &str)] = &[
         "0139_library_album_listing_revision.sql",
         "69eb3c40823acb9fb3587426ccd6c5a5e488c80e1c92ee95d367e830ac24b085",
     ),
+    (
+        "0140_artist_join_undo.sql",
+        "f3fc8b836d93a8189b46d92fd63eb010ec44d69dc084a0bebf1f498fd0d826c2",
+    ),
+    (
+        "0141_import_folder.sql",
+        "3153174e8569240731263a2052b291b19b758dd6e32bb633c6658fb7bbc96473",
+    ),
+    (
+        "0142_management_applied_release.sql",
+        "d4c8cd38822f03c2845a8ebd8a5ac0e2d2d100380aa34b7c9c690b81cb389663",
+    ),
+    (
+        "0143_appearance.sql",
+        "d46dde6a7c8cb71c45698a7daa1e27dfe9f86dbbbbc465492d964060da2512c4",
+    ),
+    (
+        "0144_v3_cover_paths.sql",
+        "930574621d42b5857f928daec93146f506e6a14b900d3f825d2215af010127f8",
+    ),
 ];
 
 /// The files in `server/migrations/`, by name.
@@ -581,6 +601,168 @@ fn held_reasons_narrow_and_every_held_row_is_kept() {
         ),
         ["held_by_earlier_version:a/01.flac"]
     );
+}
+
+/// Every row of `table` as text, in rowid order, its columns as named.
+fn table_rows(connection: &Connection, table: &str, columns: &str) -> Vec<String> {
+    let mut statement = connection
+        .prepare(&format!("SELECT {columns} FROM {table} ORDER BY rowid"))
+        .unwrap();
+    let count = statement.column_count();
+    statement
+        .query_map([], |row| {
+            (0..count)
+                .map(|at| Ok(format!("{:?}", row.get_ref(at)?)))
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map(|cells| cells.join("|"))
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+/// 0141 lets the import folder's work belong to no user: drop import jobs
+/// gain their source (every carried job an upload), and a held entry may
+/// have no owner and no expiry, a held file may sit in the import folder or
+/// be held as unreadable. Every row keeps its id and rowid, no foreign key
+/// breaks, the indexes come back, nothing else in the schema changes, and
+/// the held triggers bump an owner's revision as before and no longer fail
+/// on an entry of no user.
+#[test]
+fn import_folder_upgrade_keeps_every_row() {
+    let dir = ScratchDir::new("import-folder-upgrade");
+    let path = dir.join("app.db");
+    let connection = migrate(
+        Connection::open(&path).unwrap(),
+        &Chain::new(&MIGRATIONS[..6], None),
+    )
+    .unwrap();
+    assert_eq!(scalar(&connection, "PRAGMA user_version"), 140);
+    connection
+        .execute_batch(
+            "INSERT INTO auth_users (id, display_name, created_at) VALUES ('u1', 'U', 1);
+             INSERT INTO drop_import_jobs (id, user_id, user_name, status, created_at,
+                 upload_name, staging_dir, error)
+                 VALUES ('j1', 'u1', 'U', 'completed', 5, 'Dummy.zip', '/imports/drop/j1', NULL);
+             INSERT INTO drop_import_items (id, job_id, folder_name, status, updated_at,
+                 staging_paths) VALUES (3, 'j1', 'Dummy', 'needs_review', 6, '[]');
+             INSERT INTO acquire_held_entries (id, user_id, origin, group_key, drop_item_id,
+                 state, created_at, expires_at, retry_tries, retry_at)
+                 VALUES (7, 'u1', 'upload', 'upload:3', 3, 'held', 10, 20, 2, 30);
+             INSERT INTO acquire_held_files (id, entry_id, root, path, original_name, source,
+                 reason, state, created_at)
+                 VALUES (42, 7, 'drop', 'j1/01.flac', '01.flac', 'upload', 'no_album_match',
+                 'held', 11);",
+        )
+        .unwrap();
+    let job_columns = "id, user_id, user_name, status, created_at, upload_name, staging_dir, error";
+    let rows = |connection: &Connection| {
+        (
+            table_rows(
+                connection,
+                "drop_import_jobs",
+                &format!("rowid, {job_columns}"),
+            ),
+            table_rows(connection, "drop_import_items", "rowid, *"),
+            table_rows(connection, "acquire_held_entries", "rowid, *"),
+            table_rows(
+                connection,
+                "acquire_held_files",
+                "rowid, id, entry_id, root, path, original_name, release_mbid, \
+                 release_track_mbid, recording_mbid, disc_number, track_number, track_title, \
+                 file_format, duration_seconds, expected_duration_seconds, evidence_title, \
+                 evidence_artist, evidence_score, source, source_task_id, reason, reason_detail, \
+                 state, created_at, resolved_at",
+            ),
+        )
+    };
+    let rebuilt = [
+        "drop_import_jobs",
+        "acquire_held_entries",
+        "acquire_held_files",
+    ];
+    let others = |connection: &Connection| {
+        let mut rows = schema_rows(connection);
+        rows.retain(|(kind, name, _, _)| {
+            let rebuilt_table = kind == "table" && rebuilt.contains(&name.as_str());
+            let held_trigger = kind == "trigger" && name.starts_with("download_activity_held_");
+            !(rebuilt_table || held_trigger)
+        });
+        rows
+    };
+    let (before_rows, before_schema) = (rows(&connection), others(&connection));
+    drop(connection);
+
+    migrate_file(&path, &Chain::new(&MIGRATIONS[..7], None)).unwrap();
+    let connection = Connection::open(&path).unwrap();
+    assert_eq!(scalar(&connection, "PRAGMA user_version"), 141);
+    assert_eq!(rows(&connection), before_rows, "every row as it was");
+    assert_eq!(others(&connection), before_schema, "nothing else changes");
+    assert_eq!(
+        texts(&connection, "SELECT source FROM drop_import_jobs", []),
+        ["upload"]
+    );
+    assert_eq!(
+        scalar(&connection, "SELECT COUNT(*) FROM pragma_foreign_key_check"),
+        0
+    );
+
+    connection
+        .execute_batch("PRAGMA foreign_keys = ON")
+        .unwrap();
+    let global = |connection: &Connection| {
+        scalar(
+            connection,
+            "SELECT revision FROM download_activity_global_revision",
+        )
+    };
+    let user = |connection: &Connection| {
+        scalar(
+            connection,
+            "SELECT COALESCE((SELECT revision FROM download_activity_user_revisions \
+             WHERE user_id = 'u1'), 0)",
+        )
+    };
+    let (global_before, user_before) = (global(&connection), user(&connection));
+    connection
+        .execute_batch(
+            "INSERT INTO drop_import_jobs (id, user_id, status, created_at, upload_name,
+                 staging_dir, source)
+                 VALUES ('j2', NULL, 'processing', 40, 'Import folder', '/import',
+                 'import_folder');
+             INSERT INTO drop_import_items (id, job_id, folder_name, status, updated_at)
+                 VALUES (4, 'j2', 'Odds', 'needs_review', 41);
+             INSERT INTO acquire_held_entries (id, user_id, origin, group_key, drop_item_id,
+                 state, created_at, expires_at)
+                 VALUES (8, NULL, 'import_folder', 'upload:4', 4, 'held', 42, NULL);
+             INSERT INTO acquire_held_files (id, entry_id, root, path, original_name, source,
+                 reason, state, created_at)
+                 VALUES (43, 8, 'import', 'Odds/09.flac', 'Odds/09.flac', 'import_folder',
+                 'corrupt', 'held', 43);
+             UPDATE acquire_held_files SET state = 'discarded' WHERE id = 43;
+             UPDATE acquire_held_entries SET state = 'resolved' WHERE id = 8;",
+        )
+        .expect("work of no user is written");
+    assert_eq!(global(&connection), global_before + 4, "admins see it move");
+    assert_eq!(user(&connection), user_before, "no user's revision moves");
+    connection
+        .execute_batch("UPDATE acquire_held_files SET reason = 'samples' WHERE id = 42")
+        .unwrap();
+    assert_eq!(
+        user(&connection),
+        user_before + 1,
+        "an owner's revision still moves"
+    );
+    for refused in [
+        "INSERT INTO drop_import_jobs (id, user_id, status, created_at, upload_name,
+             staging_dir) VALUES ('j3', NULL, 'processing', 1, 'x', '/x')",
+        "INSERT INTO acquire_held_entries (user_id, origin, group_key, state, created_at,
+             expires_at) VALUES ('u1', 'upload', 'k', 'held', 1, NULL)",
+        "INSERT INTO acquire_held_entries (user_id, origin, group_key, state, created_at,
+             expires_at) VALUES ('u1', 'import_folder', 'k', 'held', 1, NULL)",
+    ] {
+        assert!(connection.execute_batch(refused).is_err(), "{refused}");
+    }
 }
 
 /// 0137 makes the retired-albums index partial (only retired rows) and
@@ -937,6 +1119,349 @@ fn album_listing_revision_upgrade_moves_on_listing_changes() {
     );
 }
 
+/// 0142 gives each managed file's record the release and release track
+/// it was written from, NULL on carried rows, which keep their revisions.
+/// Nothing else in the schema changes.
+#[test]
+fn management_applied_release_upgrade_keeps_every_row() {
+    let dir = ScratchDir::new("management-applied-release");
+    let path = dir.join("app.db");
+    let connection = migrate(
+        Connection::open(&path).unwrap(),
+        &Chain::new(&MIGRATIONS[..7], None),
+    )
+    .unwrap();
+    assert_eq!(scalar(&connection, "PRAGMA user_version"), 141);
+    connection
+        .execute_batch(
+            // The row alone, without the track it belongs to.
+            "PRAGMA foreign_keys = OFF;
+             INSERT INTO library_track_management_identity (local_track_id,
+                 applied_album_identity_revision, applied_track_identity_revision)
+             VALUES ('t1', 3, 5);",
+        )
+        .unwrap();
+    let table = "library_track_management_identity";
+    let others = |connection: &Connection| {
+        let mut rows = schema_rows(connection);
+        rows.retain(|(_, name, _, _)| name != table);
+        rows
+    };
+    let before_schema = others(&connection);
+    drop(connection);
+
+    migrate_file(&path, &Chain::new(&MIGRATIONS[..8], None)).unwrap();
+    let connection = Connection::open(&path).unwrap();
+    assert_eq!(scalar(&connection, "PRAGMA user_version"), 142);
+    assert_eq!(
+        texts(
+            &connection,
+            "SELECT rowid || ':' || local_track_id || ':' || applied_album_identity_revision
+                 || ':' || applied_track_identity_revision || ':'
+                 || COALESCE(applied_release_mbid, '-') || ':'
+                 || COALESCE(applied_release_track_mbid, '-')
+             FROM library_track_management_identity",
+            [],
+        ),
+        ["1:t1:3:5:-:-"],
+        "the row is kept, with no release yet"
+    );
+    assert_eq!(others(&connection), before_schema, "nothing else changes");
+}
+
+/// 0143 adds each person's appearance and their custom CSS saves, empty,
+/// both going with their account. Every carried row stays and nothing else
+/// in the schema changes.
+#[test]
+fn appearance_upgrade_keeps_every_row() {
+    let dir = ScratchDir::new("appearance");
+    let path = dir.join("app.db");
+    let connection = migrate(
+        Connection::open(&path).unwrap(),
+        &Chain::new(&MIGRATIONS[..8], None),
+    )
+    .unwrap();
+    assert_eq!(scalar(&connection, "PRAGMA user_version"), 142);
+    connection
+        .execute_batch(
+            "INSERT INTO auth_users (id, display_name, created_at) VALUES ('u1', 'U', 1);
+             INSERT INTO app_section_prefs (user_id, page, section_key, enabled, updated_at)
+             VALUES ('u1', 'home', 'recent', 0, 2);",
+        )
+        .unwrap();
+    let added = ["app_user_appearances", "app_custom_css_saves"];
+    let others = |connection: &Connection| {
+        let mut rows = schema_rows(connection);
+        rows.retain(|(_, _, table, _)| !added.contains(&table.as_str()));
+        rows
+    };
+    let carried = |connection: &Connection| {
+        texts(
+            connection,
+            "SELECT user_id || ':' || page || ':' || section_key FROM app_section_prefs",
+            [],
+        )
+    };
+    let (before_schema, before_rows) = (others(&connection), carried(&connection));
+    drop(connection);
+
+    migrate_file(&path, &Chain::new(&MIGRATIONS[..9], None)).unwrap();
+    let connection = Connection::open(&path).unwrap();
+    assert_eq!(scalar(&connection, "PRAGMA user_version"), 143);
+    assert_eq!(others(&connection), before_schema, "nothing else changes");
+    assert_eq!(carried(&connection), before_rows, "carried rows stay");
+    let count = |connection: &Connection, table: &str| {
+        scalar(connection, &format!("SELECT COUNT(*) FROM {table}"))
+    };
+    for table in added {
+        assert_eq!(count(&connection, table), 0, "{table} starts empty");
+    }
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys = ON;
+             INSERT INTO app_user_appearances (user_id, theme, updated_at) VALUES ('u1', 'dark', 3);
+             INSERT INTO app_custom_css_saves (user_id, css, saved_at) VALUES ('u1', 'a {}', 3);
+             DELETE FROM auth_users WHERE id = 'u1';",
+        )
+        .unwrap();
+    for table in added {
+        assert_eq!(
+            count(&connection, table),
+            0,
+            "{table} goes with the account"
+        );
+    }
+}
+
+/// 0144 moves cover paths carried from v2 onto v3's routes in the four
+/// tables that keep one: both v2 spellings of a cover path and the media
+/// server image paths move, behind a base path too, another v2 path
+/// becomes no cover, and v3 paths, full addresses and empty values stay.
+/// Nothing else in the schema changes.
+#[test]
+fn v3_cover_paths_upgrade_moves_v2_covers() {
+    let dir = ScratchDir::new("v3-cover-paths");
+    let path = dir.join("app.db");
+    let connection = migrate(
+        Connection::open(&path).unwrap(),
+        &Chain::new(&MIGRATIONS[..9], None),
+    )
+    .unwrap();
+    assert_eq!(scalar(&connection, "PRAGMA user_version"), 143);
+    let covers = [
+        ("a", Some("/api/v1/covers/release-group/rg-1?size=250")),
+        ("b", Some("/api/covers/release/r-1")),
+        ("c", Some("/music/api/v1/jellyfin/image/item-1")),
+        ("d", Some("/api/v1/navidrome/cover/al-1")),
+        ("e", Some("/api/v1/plex/thumb/101")),
+        ("f", Some("/api/v1/library/albums/x/artwork/cached")),
+        ("g", Some("/api/v3/covers/artist/ar-1")),
+        ("h", Some("https://i.ytimg.com/vi/x/hqdefault.jpg")),
+        ("i", None),
+    ];
+    for (key, cover) in covers {
+        connection
+            .execute_batch(&format!(
+                "PRAGMA foreign_keys = OFF;
+                 INSERT INTO catalog_playlist_tracks (id, playlist_id, position, track_name,
+                     artist_name, album_name, cover_url, source_type, created_at)
+                 VALUES ('{key}', 'p1', unicode('{key}'), 'T', 'A', 'L', {cover}, 'local', 1);
+                 INSERT INTO request_history (musicbrainz_id_lower, musicbrainz_id,
+                     artist_name, album_title, cover_url, requested_at, status)
+                 VALUES ('{key}', '{key}', 'A', 'L', {cover}, 1, 'imported');
+                 INSERT INTO wanted_watches (release_group_mbid_lower, release_group_mbid,
+                     user_id, artist_name, album_title, cover_url, kind, created_at,
+                     next_check_at)
+                 VALUES ('{key}', '{key}', 'u1', 'A', 'L', {cover}, 'missing', 1, 1);
+                 INSERT INTO catalog_youtube_links (album_id, album_name, artist_name,
+                     cover_url, created_at)
+                 VALUES ('{key}', 'L', 'A', {cover}, 1);",
+                cover = cover.map_or("NULL".to_owned(), |cover| format!("'{cover}'")),
+            ))
+            .unwrap();
+    }
+    let before_schema = schema_rows(&connection);
+    drop(connection);
+
+    migrate_file(&path, &Chain::new(&MIGRATIONS[..10], None)).unwrap();
+    let connection = Connection::open(&path).unwrap();
+    assert_eq!(scalar(&connection, "PRAGMA user_version"), 144);
+    assert_eq!(
+        schema_rows(&connection),
+        before_schema,
+        "nothing else changes"
+    );
+    for (table, key) in [
+        ("catalog_playlist_tracks", "id"),
+        ("request_history", "musicbrainz_id_lower"),
+        ("wanted_watches", "release_group_mbid_lower"),
+        ("catalog_youtube_links", "album_id"),
+    ] {
+        assert_eq!(
+            texts(
+                &connection,
+                &format!(
+                    "SELECT {key} || ':' || COALESCE(cover_url, '-') FROM {table} ORDER BY {key}"
+                ),
+                [],
+            ),
+            [
+                "a:/api/v3/covers/release-group/rg-1?size=250",
+                "b:/api/v3/covers/release/r-1",
+                "c:/api/v3/remotes/jellyfin/images/item-1",
+                "d:/api/v3/remotes/navidrome/images/al-1",
+                "e:/api/v3/remotes/plex/images/101",
+                "f:-",
+                "g:/api/v3/covers/artist/ar-1",
+                "h:https://i.ytimg.com/vi/x/hqdefault.jpg",
+                "i:-",
+            ],
+            "{table}"
+        );
+    }
+}
+
+/// 0140 rebuilds the catalog action log to take the undo of an artist
+/// join, keeping every row, id and rowid and every index, and gives artist
+/// id checks a disambiguation column, empty on carried rows. Nothing else
+/// changes.
+#[test]
+fn artist_join_undo_upgrade_keeps_the_action_log() {
+    const ARTIST: &str = "00000000-0000-4000-8000-000000000002";
+    let dir = ScratchDir::new("artist-join-undo");
+    let path = dir.join("app.db");
+    let connection = migrate(
+        Connection::open(&path).unwrap(),
+        &Chain::new(&MIGRATIONS[..5], None),
+    )
+    .unwrap();
+    assert_eq!(scalar(&connection, "PRAGMA user_version"), 139);
+    connection
+        .execute_batch(&format!(
+            "INSERT INTO library_catalog_actions (id, idempotency_key, action_kind,
+                 local_artist_id, before_json, after_json, reason_code, created_at)
+             VALUES ('m', NULL, 'merge_artist', '{ARTIST}', '{{}}', '{{\"kind\":\"x\"}}',
+                 'AUTOMATIC_PROVIDER_PROVEN_ARTIST_CONVERGENCE', 5),
+                ('p', 'put-back:1', 'files_put_back', '{ARTIST}', '{{\"undoes\":\"m\"}}',
+                 '{{}}', NULL, 6),
+                ('l', NULL, 'artist_link_set', '{ARTIST}', '{{}}', '{{}}', 'R', 7);
+             DELETE FROM library_catalog_actions WHERE id = 'l';
+             INSERT INTO library_catalog_actions (id, action_kind, local_artist_id,
+                 before_json, after_json, created_at)
+             VALUES ('r', 'review_approve', '{ARTIST}', '{{}}', '{{}}', 8);
+             INSERT INTO library_identify_artist_id_checks (artist_mbid, state,
+                 nominated_at, checked_at)
+             VALUES ('aaaaaaaa-0000-4000-8000-000000000001', 'pending', 1, NULL),
+                ('aaaaaaaa-0000-4000-8000-000000000002', 'kept', 1, 2);"
+        ))
+        .unwrap();
+    let actions = |connection: &Connection| {
+        texts(
+            connection,
+            "SELECT rowid || ':' || id || ':' || COALESCE(idempotency_key, '-') || ':'
+                 || action_kind || ':' || local_artist_id || ':' || before_json || ':'
+                 || after_json || ':' || COALESCE(reason_code, '-') || ':' || created_at
+             FROM library_catalog_actions ORDER BY rowid",
+            [],
+        )
+    };
+    let checks = |connection: &Connection| {
+        texts(
+            connection,
+            "SELECT artist_mbid || ':' || state || ':' || nominated_at || ':'
+                 || COALESCE(checked_at, '-') FROM library_identify_artist_id_checks
+             ORDER BY artist_mbid",
+            [],
+        )
+    };
+    let changed = [
+        "library_catalog_actions",
+        "library_identify_artist_id_checks",
+    ];
+    let others = |connection: &Connection| {
+        let mut rows = schema_rows(connection);
+        rows.retain(|(_, _, table, _)| !changed.contains(&table.as_str()));
+        rows
+    };
+    let indexes = |connection: &Connection| {
+        texts(
+            connection,
+            "SELECT name FROM sqlite_master WHERE type = 'index'
+                 AND tbl_name = 'library_catalog_actions' ORDER BY name",
+            [],
+        )
+    };
+    let (before_actions, before_checks, before_schema, before_indexes) = (
+        actions(&connection),
+        checks(&connection),
+        others(&connection),
+        indexes(&connection),
+    );
+    assert_eq!(before_actions.len(), 3);
+    drop(connection);
+
+    migrate_file(&path, &Chain::new(&MIGRATIONS[..6], None)).unwrap();
+    let connection = Connection::open(&path).unwrap();
+    assert_eq!(scalar(&connection, "PRAGMA user_version"), 140);
+    assert_eq!(
+        actions(&connection),
+        before_actions,
+        "every row and rowid kept"
+    );
+    assert_eq!(checks(&connection), before_checks, "checks kept");
+    assert_eq!(others(&connection), before_schema, "nothing else changes");
+    assert_eq!(indexes(&connection), before_indexes, "every index is back");
+    assert_eq!(
+        scalar(
+            &connection,
+            "SELECT COUNT(*) FROM library_catalog_actions
+             WHERE json_extract(before_json, '$.undoes') = 'm'
+             AND action_kind = 'files_put_back'"
+        ),
+        1
+    );
+    assert_eq!(
+        scalar(
+            &connection,
+            "SELECT COUNT(*) FROM library_identify_artist_id_checks
+             WHERE disambiguation IS NULL"
+        ),
+        2,
+        "carried checks have no note"
+    );
+    connection
+        .execute(
+            "INSERT INTO library_catalog_actions (id, idempotency_key, action_kind,
+                 local_artist_id, before_json, after_json, created_at)
+             VALUES ('u', 'merge-artist-undone:m', 'merge_artist_undone', ?1, '{}', '{}', 9)",
+            [ARTIST],
+        )
+        .unwrap();
+    assert!(
+        connection
+            .execute(
+                "INSERT INTO library_catalog_actions (id, action_kind, local_artist_id,
+                     before_json, after_json, created_at)
+                 VALUES ('w', 'no_such_kind', ?1, '{}', '{}', 9)",
+                [ARTIST],
+            )
+            .is_err(),
+        "the kind check still holds"
+    );
+    assert!(
+        connection
+            .execute(
+                "INSERT INTO library_catalog_actions (id, idempotency_key, action_kind,
+                     local_artist_id, before_json, after_json, created_at)
+                 VALUES ('v', 'merge-artist-undone:m', 'merge_artist_undone', ?1, '{}',
+                     '{}', 9)",
+                [ARTIST],
+            )
+            .is_err(),
+        "an idempotency key is still unique"
+    );
+}
+
 /// Every foreign key and what deleting its parent does. A rebuild that
 /// drops or changes a key's action, or adds a key, fails here: the list
 /// changes in the same commit, on purpose.
@@ -949,7 +1474,9 @@ const FOREIGN_KEYS: &[(&str, &str, &str, &str)] = &[
     ("acquire_held_entries", "drop_item_id", "drop_import_items", "CASCADE"),
     ("acquire_held_entries", "user_id", "auth_users", "CASCADE"),
     ("acquire_held_files", "entry_id", "acquire_held_entries", "CASCADE"),
+    ("app_custom_css_saves", "user_id", "auth_users", "CASCADE"),
     ("app_section_prefs", "user_id", "auth_users", "CASCADE"),
+    ("app_user_appearances", "user_id", "auth_users", "CASCADE"),
     ("auth_app_passwords", "user_id", "auth_users", "CASCADE"),
     ("auth_password_recovery_codes", "user_id", "auth_users", "CASCADE"),
     ("auth_providers", "user_id", "auth_users", "CASCADE"),
@@ -1442,11 +1969,12 @@ fn state<T: Copy>(
 /// Every state column held to its enum.
 #[rustfmt::skip]
 fn state_columns() -> Vec<StateColumn> {
+    use droppedneedle::appearance::ThemeChoice;
     use droppedneedle_acquire::dispatch::DispatchOrigin;
     use droppedneedle_acquire::downloads::landing_rows::ImportOutcome;
     use droppedneedle_acquire::downloads::quarantine::QuarantineReason;
     use droppedneedle_acquire::downloads::state::{AttemptDisposition, AttemptState, TaskStatus};
-    use droppedneedle_acquire::drop_import::store::{DropItemStatus, DropJobStatus};
+    use droppedneedle_acquire::drop_import::store::{DropItemStatus, DropJobSource, DropJobStatus};
     use droppedneedle_acquire::held::store::{EntryOrigin, EntryState, FileState, HeldRoot};
     use droppedneedle_acquire::reason::Reason;
     use droppedneedle_acquire::requests::batches::models::BatchOutcome;
@@ -1524,6 +2052,7 @@ fn state_columns() -> Vec<StateColumn> {
         state("download_tasks", "status", &TaskStatus::ALL, TaskStatus::as_str),
         state("drop_import_items", "status", &DropItemStatus::ALL, DropItemStatus::as_str),
         state("drop_import_jobs", "status", &DropJobStatus::ALL, DropJobStatus::as_str),
+        state("drop_import_jobs", "source", &DropJobSource::ALL, DropJobSource::as_str),
         state("personal_mix_approvals", "state", &ApprovalState::ALL, ApprovalState::as_str),
         state("request_history", "origin", &DispatchOrigin::ALL, DispatchOrigin::as_str),
         state("request_history", "request_kind", &RequestKind::ALL, RequestKind::as_str),
@@ -1555,6 +2084,8 @@ fn state_columns() -> Vec<StateColumn> {
         state("import_pending_links", "mode", &LinkMode::ALL, LinkMode::as_str),
         state("import_pending_links", "ref_kind", &RefKind::ALL, RefKind::as_str),
         state("import_runs", "exit_code", &ExitCode::ALL, ExitCode::as_str),
+        // app
+        state("app_user_appearances", "theme", &ThemeChoice::ALL, ThemeChoice::as_str),
         // auth
         state("auth_providers", "hash_scheme", &HashScheme::ALL, |scheme| scheme.as_tag()),
         state("auth_tokens", "session_kind", &SessionKind::ALL, SessionKind::as_str),
@@ -2449,6 +2980,13 @@ const ALLOWED_LITERALS: &[AllowedLiteral] = &[
         whole: false,
         why: "the backup checks read a backup file's integrity and version, a file the \
               server never opens as its database",
+    },
+    AllowedLiteral {
+        path: "tool/src/export/sql.rs",
+        starts_with: "PRAGMA wal_checkpoint(TRUNCATE)",
+        whole: true,
+        why: "checkpoints the upgrade's private recovered copy of a v2 database, a file no \
+              server opens; v2's own files are never written",
     },
 ];
 

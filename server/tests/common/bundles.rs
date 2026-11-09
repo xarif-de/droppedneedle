@@ -661,6 +661,10 @@ pub fn settings_at(
             store.live(),
             Arc::new(|| Some(Vec::new())),
         ),
+        droppedneedle::appearance::store::AppearanceStore::new(
+            platform.db.clone(),
+            platform.clock.clone(),
+        ),
     )
 }
 
@@ -778,6 +782,20 @@ impl StreamFolder {
                 format
             ],
         );
+    }
+
+    /// Turn "On-the-fly transcoding" on or off in the `connect_apps`
+    /// section the gateways read.
+    pub async fn set_transcoding(&self, enabled: bool) {
+        use droppedneedle_kernel::runtime_config::sections::ConnectApps;
+        self.platform
+            .settings
+            .save(ConnectApps {
+                transcoding_enabled: enabled,
+                ..ConnectApps::default()
+            })
+            .await
+            .expect("connect_apps saves");
     }
 
     /// A gateway over the folder's catalog and folder, a plugin host that

@@ -7,9 +7,11 @@ export function previewItemsQuery(params: LibraryManagementPlanItemParams) {
 		eligibility: params.eligibility,
 		reason_code: params.reasonCode,
 		root_id: params.rootId,
+		artist_id: params.artistId,
 		album_id: params.albumId,
 		audio_format: params.audioFormat,
-		change_kind: params.changeKind
+		change_kind: params.changeKind,
+		scope: params.scope
 	};
 }
 

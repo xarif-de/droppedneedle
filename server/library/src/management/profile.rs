@@ -126,7 +126,7 @@ pub fn pin_assignment(
             droppedneedle_kernel::runtime_config::settings_error::SettingsError::InvalidInput {
                 message,
             } => ManagementError::Invalid(format!(
-                "{message} Edit the profile in Settings > Library Management."
+                "{message} Edit the profile on the Automation tab of Library Management."
             )),
             other => ManagementError::Store(format!("{other:?}")),
         };
@@ -143,7 +143,7 @@ pub fn pin_assignment(
             .ok_or_else(|| {
                 ManagementError::Invalid(format!(
                     "The profile uses a tagging script that no longer exists ({script_id}); \
-                     edit the profile in Settings > Library Management."
+                     edit the profile on the Automation tab of Library Management."
                 ))
             })?;
         tagging_scripts.push(script.clone());
@@ -256,16 +256,25 @@ fn target(name: &str) -> Option<TagField> {
     })
 }
 
+/// The script and naming spellings of tag fields.
+const FIELD_SPELLINGS: [(&str, TagField); 8] = [
+    ("albumartist", TagField::AlbumArtist),
+    ("albumartists", TagField::AlbumArtists),
+    ("track", TagField::TrackNumber),
+    ("disc", TagField::DiscNumber),
+    ("year", TagField::Date),
+    ("publisher", TagField::Label),
+    ("tracktotal", TagField::TrackTotal),
+    ("disctotal", TagField::DiscTotal),
+];
+
 /// A tag field by its name or a script and naming spelling of it.
 pub fn tag_field(name: &str) -> Option<TagField> {
-    TagField::from_name(name).or(match name {
-        "albumartist" => Some(TagField::AlbumArtist),
-        "track" => Some(TagField::TrackNumber),
-        "disc" => Some(TagField::DiscNumber),
-        "year" => Some(TagField::Date),
-        "tracktotal" => Some(TagField::TrackTotal),
-        "disctotal" => Some(TagField::DiscTotal),
-        _ => None,
+    TagField::from_name(name).or_else(|| {
+        FIELD_SPELLINGS
+            .iter()
+            .find(|(spelling, _)| *spelling == name)
+            .map(|(_, field)| *field)
     })
 }
 
@@ -327,19 +336,174 @@ fn joined_mode_value(
     Some(vec![merged])
 }
 
-/// Every field as a script value: one value as text, several as a list.
+/// Fold the naming spellings a tagging script may set (`albumartist`)
+/// onto their tag field, and say so for names nothing can write.
+pub(crate) fn fold_script_names(
+    desired: &mut BTreeMap<String, Vec<String>>,
+    script_name: &str,
+    warnings: &mut Vec<String>,
+) {
+    let names: Vec<String> = desired.keys().cloned().collect();
+    for name in names {
+        if TagField::from_name(&name).is_some() {
+            continue;
+        }
+        let values = desired.remove(&name).unwrap_or_default();
+        match tag_field(&name) {
+            Some(field) => {
+                desired.insert(field.name().to_owned(), values);
+            }
+            None => warnings.push(format!(
+                "The script \"{script_name}\" set \"{name}\", which this server cannot write; it was skipped."
+            )),
+        }
+    }
+}
+
+/// Values as one script value: one value as text, several as a list.
+fn script_value(values: &[String]) -> Value {
+    match values {
+        [] => Value::Text(String::new()),
+        [one] => Value::Text(one.clone()),
+        many => Value::List(many.to_vec()),
+    }
+}
+
+/// Every field as a script value.
 pub fn field_variables(fields: &BTreeMap<String, Vec<String>>) -> Variables {
     fields
         .iter()
-        .map(|(name, values)| {
-            let value = match values.as_slice() {
-                [] => Value::Text(String::new()),
-                [one] => Value::Text(one.clone()),
-                many => Value::List(many.to_vec()),
-            };
-            (name.clone(), value)
+        .map(|(name, values)| (name.clone(), script_value(values)))
+        .collect()
+}
+
+/// The values naming and tagging scripts both read, worked out from the
+/// fields.
+fn derived_variables(fields: &BTreeMap<String, Vec<String>>) -> [(&'static str, Value); 5] {
+    [
+        ("artist_display", Value::Text(first(fields, "artist"))),
+        (
+            "album_artist_display",
+            Value::Text(first(fields, "album_artist")),
+        ),
+        ("primary_genre", Value::Text(first(fields, "genre"))),
+        ("genres", list(fields, "genre")),
+        (
+            "year",
+            Value::Text(first(fields, "date").chars().take(4).collect()),
+        ),
+    ]
+}
+
+/// An empty derived value reads as absent, as a missing field does.
+fn absent_when_empty(value: Value) -> Value {
+    let empty = match &value {
+        Value::Text(text) => text.is_empty(),
+        Value::List(values) => values.is_empty(),
+        _ => false,
+    };
+    if empty { Value::Null } else { value }
+}
+
+/// The variables a tagging script reads: the fields, their script
+/// spellings, the values worked out from them, and the file's own custom
+/// tags (`custom`, from [`custom_variables`]). A name the script itself
+/// set reads as it set it.
+pub fn tagging_variables(fields: &BTreeMap<String, Vec<String>>, custom: &Variables) -> Variables {
+    let mut variables = field_variables(fields);
+    let spellings = FIELD_SPELLINGS.iter().map(|(name, field)| {
+        let values = fields.get(field.name()).cloned().unwrap_or_default();
+        (*name, script_value(&values))
+    });
+    let derived = derived_variables(fields).map(|(name, value)| (name, absent_when_empty(value)));
+    for (name, value) in spellings.chain(derived) {
+        if !fields.contains_key(name) {
+            variables.insert(name.to_owned(), value);
+        }
+    }
+    for (name, value) in custom {
+        variables
+            .entry(name.clone())
+            .or_insert_with(|| value.clone());
+    }
+    variables
+}
+
+/// `NAME` in a script's `custom.NAME`.
+fn custom_name(name: &str) -> Option<&str> {
+    name.get(..7)
+        .filter(|prefix| prefix.eq_ignore_ascii_case("custom."))
+        .map(|_| name[7..].trim())
+        .filter(|name| !name.is_empty())
+}
+
+/// A custom item's own name: a Vorbis comment's, an ID3 `TXXX` frame's
+/// description or an MP4 freeform item's.
+fn native_custom_name(key: &str) -> Option<&str> {
+    key.strip_prefix("vorbis:")
+        .or_else(|| key.strip_prefix("id3:TXXX:"))
+        .or_else(|| key.strip_prefix("mp4:----:"))
+}
+
+/// Every name `program` reads, and every target it sets or deletes.
+fn program_names<'a>(
+    program: &'a [Statement],
+    reads: &mut Vec<&'a str>,
+    targets: &mut Vec<&'a str>,
+) {
+    for statement in program {
+        match statement {
+            Statement::Set(target, expr) | Statement::Append(target, expr) => {
+                targets.push(&target.name);
+                reads.extend(expr.variables().into_iter().map(|(name, ..)| name));
+            }
+            Statement::Delete(target) => targets.push(&target.name),
+            Statement::If(condition, body, alternate) => {
+                reads.extend(condition.variables().into_iter().map(|(name, ..)| name));
+                program_names(body, reads, targets);
+                program_names(alternate, reads, targets);
+            }
+        }
+    }
+}
+
+/// The file's custom tags (a [`TagDocument`]'s `custom`) under each
+/// `custom.NAME` that `program` reads, matched by name ignoring case. A
+/// name the file does not hold reads as nothing.
+fn custom_variables(
+    program: &[Statement],
+    doc_custom: &BTreeMap<String, Vec<String>>,
+) -> Variables {
+    let (mut reads, mut targets) = (Vec::new(), Vec::new());
+    program_names(program, &mut reads, &mut targets);
+    reads
+        .into_iter()
+        .filter_map(|read| {
+            let wanted = custom_name(read)?;
+            let values = doc_custom.iter().find_map(|(key, values)| {
+                native_custom_name(key)
+                    .is_some_and(|name| name.eq_ignore_ascii_case(wanted))
+                    .then_some(values)
+            })?;
+            Some((read.to_owned(), script_value(values)))
         })
         .collect()
+}
+
+/// A warning for each custom tag `program` sets (a stored script from
+/// before saves refused them): scripts read custom tags but never write
+/// them.
+fn custom_target_warnings(program: &[Statement], script_name: &str, warnings: &mut Vec<String>) {
+    let (mut reads, mut targets) = (Vec::new(), Vec::new());
+    program_names(program, &mut reads, &mut targets);
+    let mut seen = BTreeSet::new();
+    for target in targets {
+        if script::is_custom_name(target) && seen.insert(target) {
+            warnings.push(format!(
+                "The script \"{script_name}\" sets \"{target}\", but custom tags are not written; it was skipped."
+            ));
+        }
+    }
 }
 
 /// The tags one file should end up with.
@@ -645,11 +809,20 @@ pub fn plan_tags(
             desired.insert(name.clone(), value);
             protected.insert(name);
         }
+        // A script spelling of a protected field is protected too.
+        for (spelling, field) in FIELD_SPELLINGS {
+            if protected.contains(field.name()) {
+                protected.insert(spelling.to_owned());
+            }
+        }
         for (script, program) in &scripts.0 {
             let program = program
                 .as_ref()
                 .map_err(|fault| reasons::script_failed(&script.name, &fault.to_string()))?;
-            let refresh = |fields: &BTreeMap<String, Vec<String>>| field_variables(fields);
+            let custom = custom_variables(program, &doc.custom);
+            let refresh =
+                move |fields: &BTreeMap<String, Vec<String>>| tagging_variables(fields, &custom);
+            custom_target_warnings(program, &script.name, &mut warnings);
             script::run_tagging(
                 program,
                 &mut desired,
@@ -658,24 +831,7 @@ pub fn plan_tags(
                 &mut script::Budget::default(),
             )
             .map_err(|fault| reasons::script_failed(&script.name, &fault.to_string()))?;
-            // Scripts may use naming spellings (`albumartist`); fold them
-            // onto the tag field, and say so for names nothing can write.
-            let names: Vec<String> = desired.keys().cloned().collect();
-            for name in names {
-                if TagField::from_name(&name).is_some() {
-                    continue;
-                }
-                let values = desired.remove(&name).unwrap_or_default();
-                match tag_field(&name) {
-                    Some(field) => {
-                        desired.insert(field.name().to_owned(), values);
-                    }
-                    None => warnings.push(format!(
-                        "The script \"{}\" set \"{name}\", which this server cannot write; it was skipped.",
-                        script.name
-                    )),
-                }
-            }
+            fold_script_names(&mut desired, &script.name, &mut warnings);
         }
     }
     desired.retain(|_, values| !values.is_empty());
@@ -1131,6 +1287,40 @@ pub struct NamingFacts<'a> {
     pub medium_number: i64,
     /// The edition's MusicBrainz disambiguation, or empty.
     pub album_disambiguation: String,
+    /// The first album artist's MusicBrainz disambiguation, or empty.
+    pub album_artist_disambiguation: String,
+    /// The first track artist's MusicBrainz disambiguation, or empty.
+    pub artist_disambiguation: String,
+}
+
+/// The first album artist's and the first track artist's MusicBrainz
+/// disambiguation, empty where there is none. A track with no credit of
+/// its own is credited to the release's artists, as its tags are. A
+/// release stored before its credits kept the value takes it from the
+/// artist names lookup, which naming scripts that read it ask for.
+pub fn artist_disambiguations(release: &Release, track: &ReleaseTrack) -> (String, String) {
+    let first = |artists: &[crate::matching::model::CreditedArtist]| {
+        let artist = artists.first();
+        artist
+            .and_then(|artist| artist.disambiguation.clone())
+            .or_else(|| {
+                let id = artist?.id.to_ascii_lowercase();
+                release
+                    .artist_names
+                    .as_ref()?
+                    .artists
+                    .get(&id)?
+                    .disambiguation
+                    .clone()
+            })
+            .unwrap_or_default()
+    };
+    let track_artists = if track.artists.is_empty() {
+        &release.artists
+    } else {
+        &track.artists
+    };
+    (first(&release.artists), first(track_artists))
 }
 
 fn first(fields: &BTreeMap<String, Vec<String>>, name: &str) -> String {
@@ -1173,6 +1363,11 @@ pub fn naming_variables(
     facts: &NamingFacts<'_>,
 ) -> Variables {
     let mut variables = field_variables(fields);
+    variables.extend(
+        derived_variables(fields)
+            .into_iter()
+            .map(|(name, value)| (name.to_owned(), value)),
+    );
     let artist = first(fields, "artist");
     let album_artist = first(fields, "album_artist");
     let albumartist = if album_artist.is_empty() {
@@ -1180,16 +1375,12 @@ pub fn naming_variables(
     } else {
         album_artist.clone()
     };
-    let date = first(fields, "date");
-    let genre = first(fields, "genre");
     let kbps = facts.bit_rate.unwrap_or(0);
     let pairs = [
-        ("artist", Value::Text(artist.clone())),
-        ("artist_display", Value::Text(artist)),
+        ("artist", Value::Text(artist)),
         ("artists", list(fields, "artists")),
         ("artist_sorts", list(fields, "artist_sort")),
-        ("album_artist", Value::Text(album_artist.clone())),
-        ("album_artist_display", Value::Text(album_artist)),
+        ("album_artist", Value::Text(album_artist)),
         (
             "album_artists",
             Value::List(fields.get("album_artist").cloned().unwrap_or_default()),
@@ -1197,10 +1388,7 @@ pub fn naming_variables(
         ("album_artist_sorts", list(fields, "album_artist_sort")),
         ("initial", Value::Text(initial(&albumartist))),
         ("albumartist", Value::Text(albumartist)),
-        ("genre", Value::Text(genre.clone())),
-        ("primary_genre", Value::Text(genre)),
-        ("genres", list(fields, "genre")),
-        ("year", Value::Text(date.chars().take(4).collect())),
+        ("genre", Value::Text(first(fields, "genre"))),
         ("track", number(&first(fields, "track_number"))),
         ("disc", number(&first(fields, "disc_number"))),
         ("ext", Value::Text(facts.extension.to_owned())),
@@ -1235,11 +1423,60 @@ pub fn naming_variables(
         ),
         ("medium_format", Value::Text(facts.medium_format.clone())),
         ("medium_number", Value::Int(facts.medium_number)),
+        (
+            "albumartist_disambiguation",
+            Value::Text(facts.album_artist_disambiguation.clone()),
+        ),
+        (
+            "artist_disambiguation",
+            Value::Text(facts.artist_disambiguation.clone()),
+        ),
     ];
     for (name, value) in pairs {
         variables.insert(name.to_owned(), value);
     }
     variables
+}
+
+/// The files Library Management moves with an album in library folder
+/// `root_id`, case-folded: its profile's sidecar patterns, or a new
+/// profile's while no profile is set up. Empty while the settings don't
+/// read, so nothing is taken as a sidecar on a guess.
+pub(crate) fn sidecar_patterns(
+    management: &droppedneedle_kernel::runtime_config::Live<LibraryManagement>,
+    root_id: &str,
+) -> Vec<Vec<char>> {
+    use droppedneedle_kernel::runtime_config::sections::OrganizationManagementSettings;
+    let Some(stored) = management.read() else {
+        return Vec::new();
+    };
+    let mut settings = LibraryManagement::clone(&stored);
+    settings::complete_fields(&mut settings);
+    let assignment = root_assignment(&settings, root_id);
+    let unset = assignment
+        .profile_id
+        .as_deref()
+        .unwrap_or(&settings.default_profile_id)
+        .is_empty();
+    let patterns = if unset {
+        OrganizationManagementSettings::default().sidecar_patterns
+    } else {
+        match settings::pin_profile(&settings, &assignment) {
+            Ok(profile) => profile.organization.sidecar_patterns,
+            Err(error) => {
+                tracing::warn!(
+                    root_id,
+                    ?error,
+                    "a library folder's sidecar patterns don't read; no sidecar is taken"
+                );
+                Vec::new()
+            }
+        }
+    };
+    patterns
+        .iter()
+        .map(|pattern| caseless::default_case_fold_str(pattern).chars().collect())
+        .collect()
 }
 
 #[cfg(test)]
@@ -1865,6 +2102,8 @@ mod tests {
                 medium_format: String::new(),
                 medium_number: 1,
                 album_disambiguation: String::new(),
+                album_artist_disambiguation: String::new(),
+                artist_disambiguation: String::new(),
             };
             script::render_path(
                 "{original_date}/{date}",
@@ -2159,5 +2398,69 @@ mod tests {
         );
         assert_eq!(initial("The Cure"), "C");
         assert_eq!(initial("2Pac"), "#");
+    }
+
+    /// A release stored before its credits kept the artist's
+    /// disambiguation names it from the artist names lookup, which a
+    /// profile whose naming script reads it asks for.
+    #[test]
+    fn a_stored_release_takes_the_disambiguation_from_its_artist_names() {
+        use crate::matching::model::{ArtistName, ArtistNames, CreditedArtist};
+        use droppedneedle_kernel::runtime_config::sections::NamingScript;
+
+        let script = "{albumartist} ({albumartist_disambiguation})/{title}.{ext}";
+        let pinned = |source: &str| PinnedProfile {
+            profile: LibraryManagementProfile::default(),
+            naming_script: NamingScript {
+                source: source.to_owned(),
+                ..NamingScript::default()
+            },
+            multi_disc_naming_script: None,
+            tagging_scripts: Vec::new(),
+            overrides: None,
+        };
+        assert!(super::super::enrich::script_names_wanted(&pinned(script)));
+        assert!(!super::super::enrich::script_names_wanted(&pinned(
+            "{albumartist}/{title}.{ext}"
+        )));
+
+        let id = "4d7928cd-7ed2-4282-8c29-c0c9f966f1bd";
+        let track = ReleaseTrack {
+            title: "Under My Wheels".to_owned(),
+            disc: 1,
+            position: 1,
+            ..ReleaseTrack::default()
+        };
+        let release = Release {
+            artists: vec![CreditedArtist {
+                id: id.to_owned(),
+                name: "Alice Cooper".to_owned(),
+                ..CreditedArtist::default()
+            }],
+            tracks: vec![track.clone()],
+            artist_names: Some(ArtistNames {
+                fetched_at_ms: 1,
+                artists: [(
+                    id.to_owned(),
+                    ArtistName {
+                        name: "Alice Cooper".to_owned(),
+                        disambiguation: Some("1964-1975 American rock band".to_owned()),
+                        ..ArtistName::default()
+                    },
+                )]
+                .into(),
+            }),
+            ..Release::default()
+        };
+        let variables = crate::import::naming::variables(
+            &release,
+            &track,
+            "flac",
+            &crate::tags::read::HeaderInfo::default(),
+        );
+        assert_eq!(
+            crate::import::naming::render(script, &variables, "/music").expect("renders"),
+            "Alice Cooper (1964-1975 American rock band)/Under My Wheels.flac"
+        );
     }
 }

@@ -400,7 +400,8 @@ Run from the repo root. `make help` lists every target.
   from the parsed base. Relay a server's bytes only under a content type of
   ours from a short allowlist, with `nosniff` and a sandbox policy. A path a
   download client or plugin reports is read only from inside that client's
-  folder: a downloaded file is copied or removed only through
+  folder, and a file in the import folder only from inside it: a
+  downloaded or import-folder file is copied or removed only through
   `acquire/src/landing/confine.rs`, which opens it beneath the folder's
   real path one component at a time and never follows a link. That
   opener is the kernel's one no-follow opener (`kernel/src/beneath.rs`),
@@ -541,6 +542,17 @@ Run from the repo root. `make help` lists every target.
   check), or on an album with no match whose files' tags name different
   groups. The new file is held and the old stays. Only a person importing
   that held file passes the check; the quality comparison still runs.
+- The import folder (`acquire/src/import_folder/`) is one admin-set folder
+  that is not, holds no and sits in no library, recycle bin, download or
+  app folder; a pass that finds it overlapping one, not writable, or
+  cannot tell, does nothing. It takes an album folder only once nothing in
+  it has changed for 3 minutes (names starting with `.` are never taken),
+  one album at a time, never while a scan runs, through drop import's
+  steps. A file (music or sidecar) leaves the folder only once the publish
+  journal holds its exact bytes for its item, hashed beneath the folder
+  and unchanged up to the unlink. Its work belongs to no user: its jobs
+  and held entries have no owner, only admins see and act on them, and
+  only while that folder is still the import folder.
 
 **Identity** (product rules, not up for debate)
 - An edition a person chose is the album's identity; a v2 pin carries as
@@ -559,22 +571,29 @@ Run from the repo root. `make help` lists every target.
   `library/src/identity/sql.rs`. `source_gates.rs` holds these reads.
 - Manual and imported identities survive rescans and moves. Automatic ones
   stay revisable and retract on contradiction.
-- Automatic artist reconciliation needs provider proof, never name similarity
-  alone. The only exception: proof for the album (an accepted MusicBrainz
-  release ID or a stored album-level provider-proof row) may stand in for
-  proof on every credit when no provider proof contradicts it and the credits
-  are not composite or ambiguous.
-- A second exception: when a scan leaves an artist record with no credits,
-  the record holds no MusicBrainz link or proof, every credit the scan
-  moved off it went by name alone (no id in the files) to one other record,
-  the two names differ only in capitals, spacing or sort name, no play of
-  it is of a track now credited to someone else, and an admin has not
-  marked them distinct, the emptied record merges into that one at scan
-  end: plays, favourites and ratings move, its id stays an alias and the
-  merge is in the audit. Any other record emptied without provider proof is
-  never merged by itself; when a scan recorded the move and it holds a
-  favourite, rating or play, it is listed in Duplicate artists.
-- A third exception: at the upgrade, a carried v2 row named exactly "Unknown
+- Automatic artist reconciliation needs provider proof, never name
+  similarity alone, with one rule for the same name. Two live records whose
+  names have the same `artist_name_key` (`library/src/scan/naming.rs`:
+  capitals, spacing and the accents of Latin letters, nothing else) are one
+  artist unless something says otherwise: two MusicBrainz ids among them (a
+  link, the files' ids or a current proof), a record whose own ids
+  disagree, or an admin's distinct mark. A credit with no id goes to the
+  record its exact name and sort name key to, else to its same-name
+  record, and never makes a second one. Same-name records join at scan end:
+  plays, favourites and ratings move, the old id stays an alias, and the
+  join is in the merge history with an Undo that puts back what has not
+  changed since and marks the records distinct. Sentinels, Various Artists
+  rows and the names "Unknown Artist" and "Various Artists" are left out.
+  Records MusicBrainz says are different stay apart, and the web UI shows
+  each one's MusicBrainz disambiguation where they share a name.
+- One exception: proof for the album (an accepted MusicBrainz release ID or
+  a stored album-level provider-proof row) may stand in for proof on every
+  credit when no provider proof contradicts it and the credits are not
+  composite or ambiguous.
+- Any other record a scan empties without provider proof is never merged by
+  itself; when a scan recorded the move and it holds a favourite, rating or
+  play, it is listed in Duplicate artists.
+- A second exception: at the upgrade, a carried v2 row named exactly "Unknown
   Artist" merges into the built-in one when it has no MusicBrainz link other
   than a special-purpose id and no source link, nothing names a real id at any
   of its credits or proofs, every credit it holds is under that name, and an
@@ -583,7 +602,8 @@ Run from the repo root. `make help` lists every target.
 - Retired IDs stay as aliases.
 - Every artist merge goes through `retire_artist` with a `MergeBasis`
   built in `corrections/merge_basis.rs` from rows read in the same
-  transaction; the merge history shows each basis.
+  transaction; the merge history shows each basis. Only a same-name join
+  keeps an undo record.
 - Setting or clearing an artist's link by hand never starts a merge; when
   it would, it is refused and the records are merged by an admin.
 - MusicBrainz's special-purpose artist ids (Various Artists, unknown and
@@ -611,6 +631,10 @@ Run from the repo root. `make help` lists every target.
   edition's undo takes the choice back with every match
   made on it; files the app wrote meanwhile are undone through Library
   management.
+- A person's album hearts and ratings on an album with no files move to
+  the copy its release group opens, when both are accepted and that copy
+  has files; a rating on both keeps the copy's. Plays stay, local-only
+  albums keep theirs, and the album's history shows the move.
 - Album and track identities, match state and their undo rows are written
   only through `library/src/identity/`; a source gate holds it.
 
@@ -639,11 +663,15 @@ Run from the repo root. `make help` lists every target.
   ready is held and starts by itself when one is saved. It is never
   refused or lost.
 - Every file kept for a person's decision (a held download, an upload
-  waiting for review) is an entry in acquire's one held list
-  (`acquire/src/held/`), kept 90 days and then removed by its prune. An
-  entry a person is acting on is never removed under them, and a held
-  file is only judged gone when the filesystem says it is absent, never
-  on a read error. A held file the library could not take is retried by
+  waiting for review, a file the import folder could not place) is an
+  entry in acquire's one held list (`acquire/src/held/`). Copies in the
+  app's own folders are kept 90 days and then removed by its prune. A file
+  left in the import folder is the person's own copy: it has no expiry,
+  the prune never touches it, and it leaves the folder only when a person
+  discards it or once the library holds its exact bytes. An entry a
+  person is acting on is never removed under them, and a held file is
+  only judged gone when the filesystem says it is absent, never on a read
+  error. A held file the library could not take is retried by
   itself (`Gate::HeldRetry`), and that retry never places a file on an
   album a person moved it away from, never adds a second copy and never
   replaces a library copy: those wait for a person.
@@ -704,6 +732,7 @@ Run from the repo root. `make help` lists every target.
   Build on `src/lib/ui` (`Button`, `IconButton`, `Card`, `Input`, `Modal`,
   `CardTitle`, `CardActions`, `ConfirmDialog`, `Field`, `TextField`,
   `NumberField`, `SecretField`, `PasswordField`, `SelectField`, `TextAreaField`,
+  `CodeField` (a CSS editor, CodeMirror loaded on first use),
   `ToggleRow`, `RadioCards`, `StatusChip`, `SectionHead` (a shelf's title
   row), `ListPageHeader` (a browse page's title, count, lede or a hub's
   tagline, ticket and record, with an optional brush stroke after the title;
@@ -765,7 +794,19 @@ Run from the repo root. `make help` lists every target.
   outside hosts only from the list in `server/src/security_headers.rs`.
   Loading a script, frame, audio clip or connection from a new host is a
   reviewed edit to that list, with the reason beside it. The browser
-  journeys fail on any violation.
+  journeys fail on any violation. Besides the code editor's own styles,
+  which `CodeField` keeps in its shadow root, the stylesheets made at run
+  time are the site CSS and the person's custom CSS
+  (`lib/stores/customCss.svelte.ts`), site first: applied per user, removed at sign-out, and refused when one
+  holds a backslash, `@import`, `@font-face` or a CSS function off the
+  allowlist in `lib/stores/customCssRules.json`. The server's check
+  (`server/src/appearance/check.rs`) is the one that counts; both checks
+  read that file and pass its cases.
+- The style hooks a person's CSS may rely on are the `data-part` names in
+  `lib/ui/parts.ts`, each set by one component through `part()`. They are
+  a public contract published in `docs/custom-css.md` (`parts.spec.ts`
+  holds the source and the docs to the list): renaming or removing one is
+  announced in the release notes.
 - Text from outside (biographies, album notes, plugin text, release notes)
   renders as text. Markup goes only through `SafeHtml`; eslint rejects a raw
   `{@html}`. A link to an outside address goes through `outsideLink`, which

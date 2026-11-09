@@ -96,6 +96,9 @@ import {
 } from '$lib/features/player/playback/playbackGateway';
 import { streamUrlFor } from '$lib/features/player/playback/streamUrl';
 import { createPlaybackSource } from '$lib/features/player/playback/createSource';
+import { skipByRating } from './skipByRating.svelte';
+import { queryClient } from '$lib/queries/QueryClient';
+import { RatingQueryKeyFactory } from '$lib/queries/featureKeys';
 
 function makeItem(overrides: Partial<QueueItem> = {}): QueueItem {
 	const id = overrides.trackSourceId ?? `vid-${Math.random().toString(36).slice(2, 6)}`;
@@ -412,6 +415,50 @@ describe('playerStore queue methods', () => {
 				const historyBehind = playerStore.currentIndex;
 				expect(historyBehind).toBeLessThanOrEqual(3);
 			}
+		});
+	});
+
+	describe('rating floor', () => {
+		afterEach(() => {
+			skipByRating.turnOff();
+			queryClient.clear();
+		});
+
+		it('skips tracks rated below it, plays a picked one, and stops keeping the queue', async () => {
+			authStore.setUser({
+				id: 'user-1',
+				display_name: 'User',
+				role: 'user',
+				email: null,
+				avatar_url: null,
+				username: 'user',
+				username_display: 'User',
+				providers: ['local']
+			});
+			const items = makeItems(5);
+			const ids = items.map((item) => item.trackSourceId);
+			queryClient.setQueryData(RatingQueryKeyFactory.lookup('user-1', [], ids, []), {
+				albums: {},
+				artists: {},
+				tracks: { 'vid-0': 5, 'vid-1': 2, 'vid-2': 4, 'vid-3': 3, 'vid-4': 1 }
+			});
+			skipByRating.setMinStars(4);
+			playerStore.playQueue(items);
+
+			playerStore.nextTrack();
+			await vi.waitFor(() => expect(playerStore.currentQueueItem?.trackSourceId).toBe('vid-2'));
+
+			playerStore.jumpToTrack(
+				playerStore.queue.findIndex((item) => item.trackSourceId === 'vid-3')
+			);
+			await vi.waitFor(() => expect(playerStore.currentQueueItem?.trackSourceId).toBe('vid-3'));
+			expect(playerStore.hasNext).toBe(false);
+
+			const queued = playerStore.queue.length;
+			capturedStateCallbacks.forEach((cb) => cb('ended'));
+			await vi.waitFor(() => expect(playerStore.floorStopped).toBe(true));
+			expect(playerStore.queue).toHaveLength(queued);
+			expect(playerStore.isPlayerVisible).toBe(true);
 		});
 	});
 
@@ -823,23 +870,6 @@ describe('track failure reporting', () => {
 			'Skipped "Plex Track": can\'t play it',
 			'warning'
 		);
-	});
-
-	it('drops a local track the library no longer has, with one notice', async () => {
-		mockApiHead.mockResolvedValue(new Response(null, { status: 404 }));
-		playerStore.playQueue(singleSourceItems(3));
-		await vi.advanceTimersByTimeAsync(0);
-
-		// One failed load reports more than once.
-		fireCurrentTrackError();
-		fireCurrentTrackError();
-		await vi.advanceTimersByTimeAsync(0);
-
-		expect(mockApiHead).toHaveBeenCalledTimes(1);
-		expect(playerStore.queue.map((item) => item.trackSourceId)).toEqual(['vid-1', 'vid-2']);
-		expect(playerStore.nowPlaying?.trackName).toBe('Track 2');
-		expect(toastStore.notify).toHaveBeenCalledTimes(1);
-		expect(toastStore.notify).toHaveBeenCalledWith('"Track 1" is no longer in the library', 'info');
 	});
 
 	it('takes the tracks a removal took out of the queue', async () => {

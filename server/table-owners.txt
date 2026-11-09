@@ -9,15 +9,30 @@
 # code inside its own transaction, when one album, artist or track row
 # takes the place of another (a merge, or a scan following a retagged
 # album onto its old row):
-#   catalog_user_favorites        catalog   moved to the surviving row
+#   catalog_user_favorites        catalog   moved to the surviving row, or
+#                                           to the copy with files, when an
+#                                           album with no files has one
 #   catalog_user_favorite_names   catalog   moved with their favorite
-#   catalog_user_ratings          catalog   moved to the surviving row; a
+#   catalog_user_ratings          catalog   moved to the surviving row, or
+#                                           to the copy with files, when an
+#                                           album with no files has one; a
 #                                           user who rated both keeps the
 #                                           surviving row's rating
 #   library_play_history          media     moved to the surviving row
 #   catalog_playlist_tracks       catalog   album_id set to the surviving
 #                                           album (a followed retag, or a
 #                                           retag joined across two scans)
+#
+# The undo of an artist join made because two records share a name, also
+# library code in its own transaction, moves back what the join moved:
+#   catalog_user_favorites        catalog   back to the record split off,
+#                                           for a user who still has one on
+#                                           the joined record; the copy the
+#                                           join made is removed if unchanged
+#   catalog_user_favorite_names   catalog   back with their favorite
+#   catalog_user_ratings          catalog   back the same way
+#   library_play_history          media     plays the join moved, back to
+#                                           the record split off
 #
 # Auth's user delete removes catalog_playlists rows by cascade, and their
 # entries and covers with them; it names none of those tables.
@@ -81,7 +96,9 @@ plugin_library_writes
 plugin_tick_state
 
 [app]
+app_custom_css_saves
 app_section_prefs
+app_user_appearances
 
 [compat]
 compat_bookmarks

@@ -152,6 +152,7 @@ pub(crate) fn release(id: &str, group: &str, titles: &[&str], lengths: &[Option<
         name: "Portishead".to_owned(),
         sort_name: Some("Portishead".to_owned()),
         join: String::new(),
+        disambiguation: None,
     };
     Release {
         id: id.to_owned(),
@@ -2979,7 +2980,8 @@ async fn the_orphan_sweep_keeps_folders_still_needed() {
                     replaces: Vec::new(),
                 }],
                 extras: Vec::new(),
-                actor: "u-ada".to_owned(),
+                actor: Some("u-ada".to_owned()),
+                sidecars: Vec::new(),
             })
             .await
             .expect("import publishes");
@@ -3576,6 +3578,7 @@ fn edition(
             name: "Portishead".to_owned(),
             sort_name: Some("Portishead".to_owned()),
             join: String::new(),
+            disambiguation: None,
         }],
         status: Some("Official".to_owned()),
         media: discs
@@ -4968,7 +4971,8 @@ async fn a_held_release_track_is_not_given_away() {
             replaces: Vec::new(),
         }],
         extras: Vec::new(),
-        actor: "u-ada".to_owned(),
+        actor: Some("u-ada".to_owned()),
+        sidecars: Vec::new(),
     })
     .await
     .expect("import publishes");
@@ -7216,7 +7220,8 @@ impl IntakeCase {
                 }
             },
             gate: row.gate,
-            owner: "u-ada".to_owned(),
+            owner: Some("u-ada".to_owned()),
+            sidecars: Vec::new(),
         };
         let library = self.rig.acquire.landing.library().clone();
         match intake::place(library.as_ref(), &batch, pairing, None).await {

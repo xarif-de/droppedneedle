@@ -37,6 +37,13 @@ pub struct ArtistRef {
     /// Sort name (`"Beatles, The"` style), when the service sends one.
     #[serde(rename = "sort-name", default)]
     pub sort_name: Option<String>,
+    /// The artist's comment telling it apart from others of its name
+    /// ("1964-1975 American rock band"). Every credited artist in the
+    /// recorded release lookups of 2026-10-15
+    /// (`server/tests/fixtures/musicbrainz/release_names_*.json`,
+    /// `release_lookup_classical.json`) carries the key, `""` for none.
+    #[serde(default)]
+    pub disambiguation: Option<String>,
     /// Aliases, under the `aliases` include. Seen on 2026-10-15 per
     /// `server/tests/fixtures/musicbrainz/README.md`: BrainzMash release
     /// lookups with `inc=recordings+artist-credits+aliases` and the relation
@@ -859,7 +866,9 @@ pub struct ReleaseGroupBrowsePage {
 /// `{"release-count", "release-offset", "releases"}`. Only each release's
 /// group is read: an artist credited on releases but on no release group
 /// (a band whose album MusicBrainz credits to its singer) has its
-/// discography there.
+/// discography there. Verified 2026-11-05 against the recorded
+/// `/release?artist=` browse with those includes from musicbrainz.org,
+/// `server/tests/fixtures/catalog/mb_artist_releases_band.json`.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct ReleaseBrowsePage {
     /// Total releases the artist has.

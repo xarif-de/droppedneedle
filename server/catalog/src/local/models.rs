@@ -201,7 +201,8 @@ pub enum ArtistListScope {
     All,
     /// Artists leading at least one album.
     AlbumArtists,
-    /// Artists appearing without leading.
+    /// Artists appearing without leading, and album artists who also
+    /// appear on albums someone else leads.
     Contributors,
 }
 
@@ -219,6 +220,36 @@ pub enum TrackListSort {
     Album,
     /// One shuffle per walk, kept across its pages.
     Random,
+}
+
+/// Whether a list keeps the items in its `formats` or the ones in none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FormatMode {
+    /// Only items in one of the formats.
+    With,
+    /// Only items in none of them.
+    Without,
+}
+
+/// Which side of `min_tracks` a list keeps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TracksMode {
+    /// `min_tracks` tracks or more.
+    AtLeast,
+    /// Fewer than `min_tracks` tracks.
+    Below,
+}
+
+/// Which side of `rating` a list keeps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RatingMode {
+    /// `rating` stars or more.
+    AtLeast,
+    /// `rating` stars or fewer.
+    AtMost,
 }
 
 /// Album list query. Unknown `sort` values fail with INVALID_INPUT.
@@ -247,21 +278,18 @@ pub struct AlbumQuery {
     /// Primary track formats, comma-separated, e.g. `flac,mp3`; matching is
     /// case-insensitive. See `format_mode`.
     pub formats: Option<String>,
-    /// `with` (default): only albums in one of `formats`; `without`: only
-    /// albums in none of them.
-    pub format_mode: Option<String>,
+    /// Default `with`.
+    pub format_mode: Option<FormatMode>,
     /// Only albums with at least this many indexed tracks, 1-10000. See
     /// `tracks_mode`.
     pub min_tracks: Option<u32>,
-    /// `at_least` (default): albums with `min_tracks` or more; `below`:
-    /// albums with fewer.
-    pub tracks_mode: Option<String>,
+    /// Default `at_least`.
+    pub tracks_mode: Option<TracksMode>,
     /// Only albums the caller rated, 1-5 stars. See `rating_mode`; albums
     /// they did not rate are left out.
     pub rating: Option<u8>,
-    /// `at_least` (default): `rating` stars or more; `at_most`: `rating`
-    /// stars or fewer.
-    pub rating_mode: Option<String>,
+    /// Default `at_least`.
+    pub rating_mode: Option<RatingMode>,
     /// Only the caller's favourites. Without `sort`, the newest favourite
     /// comes first, and `order=asc` puts the oldest first.
     pub favorites: Option<bool>,
@@ -318,6 +346,9 @@ pub struct ArtistView {
     pub art_missing: bool,
     /// True when the caller favorited this artist.
     pub favorite: bool,
+    /// MusicBrainz's short note on who this is ("US singer"), set only
+    /// when another artist in the library has the same name.
+    pub disambiguation: Option<String>,
 }
 
 /// A library artist with whether the caller favorited it and whether its
@@ -337,6 +368,7 @@ impl From<(ArtistRecord, bool, bool)> for ArtistView {
             date_added: artist.date_added,
             art_missing,
             favorite,
+            disambiguation: artist.disambiguation,
         }
     }
 }
@@ -378,15 +410,13 @@ pub struct ArtistQuery {
     /// they lead, each once. The scope totals count the same artists. See
     /// `tracks_mode`.
     pub min_tracks: Option<u32>,
-    /// `at_least` (default): artists with `min_tracks` or more; `below`:
-    /// artists with fewer.
-    pub tracks_mode: Option<String>,
+    /// Default `at_least`.
+    pub tracks_mode: Option<TracksMode>,
     /// Only artists the caller rated, 1-5 stars. See `rating_mode`;
     /// artists they did not rate are left out.
     pub rating: Option<u8>,
-    /// `at_least` (default): `rating` stars or more; `at_most`: `rating`
-    /// stars or fewer.
-    pub rating_mode: Option<String>,
+    /// Default `at_least`.
+    pub rating_mode: Option<RatingMode>,
     /// Only the caller's favourites. Without `sort`, the newest favourite
     /// comes first, and `order=asc` puts the oldest first.
     pub favorites: Option<bool>,
@@ -542,15 +572,13 @@ pub struct TrackQuery {
     /// Track formats, comma-separated, e.g. `flac,mp3`; matching is
     /// case-insensitive. See `format_mode`.
     pub formats: Option<String>,
-    /// `with` (default): only tracks in one of `formats`; `without`: only
-    /// tracks in none of them.
-    pub format_mode: Option<String>,
+    /// Default `with`.
+    pub format_mode: Option<FormatMode>,
     /// Only tracks the caller rated, 1-5 stars. See `rating_mode`; tracks
     /// they did not rate are left out.
     pub rating: Option<u8>,
-    /// `at_least` (default): `rating` stars or more; `at_most`: `rating`
-    /// stars or fewer.
-    pub rating_mode: Option<String>,
+    /// Default `at_least`.
+    pub rating_mode: Option<RatingMode>,
     /// Only the caller's favourites. Without `sort`, the newest favourite
     /// comes first, and `order=asc` puts the oldest first.
     pub favorites: Option<bool>,
@@ -630,6 +658,8 @@ pub struct SuggestionTrack {
     pub album_title: String,
     /// Track artist display name.
     pub artist_name: String,
+    /// Local track-artist id, when credited.
+    pub artist_id: Option<String>,
     /// Owning local album id.
     pub album_id: String,
     /// True when the owning album has a folder image or an embedded picture.
@@ -666,6 +696,7 @@ impl From<(TrackRecord, SuggestionReason)> for SuggestionTrack {
             title: track.title,
             album_title: track.album_title,
             artist_name: track.artist_name,
+            artist_id: track.artist_id,
             album_id: track.album_id,
             cover_available: track.cover_available,
             format: track.format,

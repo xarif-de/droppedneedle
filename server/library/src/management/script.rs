@@ -26,7 +26,8 @@ const MAX_RUNTIME_STEPS: usize = 10_000;
 const MAX_LIST_VALUES: usize = 100;
 const MAX_VALUE_CHARACTERS: usize = 8_192;
 const MAX_TOTAL_OUTPUT_CHARACTERS: usize = 65_536;
-const MAX_SOURCE_CHARACTERS: usize = 32_768;
+/// The longest script source the compiler reads, in characters.
+pub const MAX_SOURCE_CHARACTERS: usize = 32_768;
 
 /// Windows device names are disarmed even on Linux, so a library copied
 /// to a Windows share stays valid.
@@ -973,6 +974,18 @@ pub fn render_path(
     compat: &PathCompatibilitySettings,
     root: &str,
 ) -> Result<String, ScriptFault> {
+    let rendered = render_text(source, variables, compat)?;
+    finish_path(&rendered, compat, root)
+}
+
+/// A naming template's text before it is checked and cleaned as a path:
+/// each value with the characters a name can't hold replaced, `/` only
+/// where the template wrote one.
+pub fn render_text(
+    source: &str,
+    variables: &Variables,
+    compat: &PathCompatibilitySettings,
+) -> Result<String, ScriptFault> {
     let mut budget = Budget::default();
     let mut rendered = String::new();
     for segment in compile_naming(source)? {
@@ -1011,6 +1024,14 @@ pub fn render_path(
         };
         rendered.push_str(&sanitize_value(&text, compat));
     }
+    Ok(rendered)
+}
+
+fn finish_path(
+    rendered: &str,
+    compat: &PathCompatibilitySettings,
+    root: &str,
+) -> Result<String, ScriptFault> {
     // Windows-compatible names lose leading and trailing dots, so a value
     // of `.` or `..` becomes the replacement there, as `...` already does.
     // Without that cleaning it would name a folder outside the path.
@@ -1206,13 +1227,22 @@ pub fn compile_tagging(source: &str) -> Result<Vec<Statement>, ScriptFault> {
     Ok(statements)
 }
 
+/// Whether a name is a custom tag (`custom.NAME`, whatever its capitals).
+pub fn is_custom_name(name: &str) -> bool {
+    name.len() > 7
+        && name
+            .get(..7)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("custom."))
+}
+
 /// Script variables from the fields a tagging program is editing.
 pub type Refresh = dyn Fn(&BTreeMap<String, Vec<String>>) -> Variables;
 
 /// Run a tagging program over `fields` (managed field name to values).
 /// `variables` supplies read-only values; it is refreshed from `fields`
 /// before each statement by `refresh`. Fields in `protected` keep their
-/// value (a manual override wins). Custom targets (`custom.NAME`) are
+/// value (a manual override wins). An empty value changes nothing, so
+/// `delete` is how a field is cleared. Custom targets (`custom.NAME`) are
 /// evaluated but not written: the staged writer only writes managed
 /// fields.
 pub fn run_tagging(
@@ -1235,14 +1265,15 @@ pub fn run_tagging(
                 run_tagging(branch, fields, protected, refresh, budget)?;
             }
             Statement::Delete(Target { name: target, .. }) => {
-                if !protected.contains(target) && !target.starts_with("custom.") {
+                if !protected.contains(target) && !is_custom_name(target) {
                     fields.insert(target.clone(), Vec::new());
                 }
             }
             Statement::Set(Target { name: target, .. }, expr)
             | Statement::Append(Target { name: target, .. }, expr) => {
                 let value = evaluate(expr, &variables, budget)?;
-                if protected.contains(target) || target.starts_with("custom.") {
+                // An empty value changes nothing; `delete` clears a tag.
+                if value.is_empty() || protected.contains(target) || is_custom_name(target) {
                     continue;
                 }
                 let mut values = if matches!(statement, Statement::Append(..)) {
@@ -1370,5 +1401,36 @@ mod tests {
         assert_eq!(fields["title"], vec!["SONG"]);
         assert_eq!(fields["genre"], vec!["Pop", "Rock"]);
         assert_eq!(fields["album"], vec!["X"]);
+    }
+
+    /// An empty value changes nothing: a set from a value the file lacks
+    /// keeps the tag, and only `delete` clears one.
+    #[test]
+    fn an_empty_value_leaves_its_field_as_it_is() {
+        let program = compile_tagging(
+            "set artist = album_artist_display\nset comment = \"\"\nappend genre = \"\"\ndelete title",
+        )
+        .expect("compiles");
+        let mut fields = BTreeMap::from([
+            ("artist".to_owned(), vec!["Radiohead".to_owned()]),
+            ("comment".to_owned(), vec!["Ripped".to_owned()]),
+            ("genre".to_owned(), vec!["Rock".to_owned()]),
+            ("title".to_owned(), vec!["Paranoid Android".to_owned()]),
+        ]);
+        let refresh = |fields: &BTreeMap<String, Vec<String>>| {
+            crate::management::profile::tagging_variables(fields, &Variables::new())
+        };
+        run_tagging(
+            &program,
+            &mut fields,
+            &std::collections::BTreeSet::new(),
+            &refresh,
+            &mut Budget::default(),
+        )
+        .expect("runs");
+        assert_eq!(fields["artist"], vec!["Radiohead"]);
+        assert_eq!(fields["comment"], vec!["Ripped"]);
+        assert_eq!(fields["genre"], vec!["Rock"]);
+        assert!(fields["title"].is_empty());
     }
 }

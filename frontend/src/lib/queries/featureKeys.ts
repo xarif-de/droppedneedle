@@ -10,6 +10,16 @@ type UserId = string | null | undefined;
 
 // An artist's MusicBrainz link. The caller's: it says whether they set it.
 // Under the library feature, so a catalog refresh reloads it.
+// The caller's theme and custom CSS, which also carry the site's CSS. The
+// site section and one person's CSS summary are the admin's.
+export const AppearanceQueryKeyFactory = {
+	feature: 'appearance',
+	mine: (userId: UserId) => key(userScope(userId), 'appearance', 'mine'),
+	cssSaves: (userId: UserId) => key(userScope(userId), 'appearance', 'mine', 'css-saves'),
+	site: () => key(ADMIN, 'appearance', 'site'),
+	userCustomCss: (accountId: string) => key(ADMIN, 'appearance', 'user-custom-css', accountId)
+};
+
 export const ArtistLinkQueryKeyFactory = {
 	link: (userId: UserId, artistId: string) =>
 		key(userScope(userId), 'library', 'artist-link', artistId)
@@ -106,6 +116,8 @@ export const AlbumMatchKeyFactory = {
 export const ConnectAppsQueryKeyFactory = {
 	feature: 'connect-apps',
 	settings: () => key(SHARED, 'connect-apps', 'settings'),
+	// Whether the web player's tracks are converted: the same for everyone.
+	conversion: () => key(SHARED, 'connect-apps', 'conversion'),
 	appPasswords: (userId: string) => key(userScope(userId), 'connect-apps', 'app-passwords'),
 	mine: (userId: string) => key(userScope(userId), 'connect-apps', 'mine'),
 	// The oversight roster is the same for every admin.

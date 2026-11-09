@@ -12,10 +12,11 @@ use std::sync::Arc;
 use droppedneedle_kernel::db::Lane;
 
 use super::models::{
-    HistoryFilter, HistoryItem, ItemFilter, ItemPage, JobDetail, JobIntent, JobMode,
+    HistoryFilter, HistoryItem, ItemFilter, ItemPage, ItemScope, JobDetail, JobIntent, JobMode,
     ManagementError, Origin, PinnedProfile, PlannedItem, PreviewHandle, ResultPage, Revisions,
     Selection, SelectionKind, Summary, TagEditMode, TagScope,
 };
+use super::organized::{self, AppliedScripts, FileAt, OrganizedPins};
 use super::planner::{self, PlanContext};
 use super::profile::{self, CompiledScripts};
 use super::reasons::{self, ItemReason};
@@ -40,6 +41,9 @@ use droppedneedle_kernel::runtime_config::sections::{
 pub const PAGE_MAX: i64 = 200;
 /// Largest page of history.
 pub const HISTORY_MAX: i64 = 50;
+/// Albums a preview leaves out as organized between two checks for a
+/// pause or stop.
+const ORGANIZED_CHECKPOINT: i64 = 100;
 
 /// A request for a new preview.
 pub struct PreviewRequest {
@@ -50,6 +54,9 @@ pub struct PreviewRequest {
     pub idempotency_key: Option<String>,
     pub target_root_id: Option<String>,
     pub overrides: Option<LibraryManagementRootOverrides>,
+    /// Plan albums already organized too, when the preview spans more
+    /// than one album.
+    pub include_organized: bool,
 }
 
 /// Everything a new job pins.
@@ -359,7 +366,10 @@ impl Management {
             pinned: &pinned,
             target_root_id: request.target_root_id.as_deref(),
             linked_job_id: None,
-            intent: JobIntent::default(),
+            intent: JobIntent {
+                skip_organized: !request.include_organized,
+                ..JobIntent::default()
+            },
             proposed_settings_revision: None,
             retention_hours: stored.preview_retention_hours,
         })
@@ -396,6 +406,7 @@ impl Management {
                 && snapshot.intent().tag_edit == spec.intent.tag_edit
                 && snapshot.intent().duplicate == spec.intent.duplicate
                 && snapshot.intent().edition == spec.intent.edition
+                && snapshot.intent().skip_organized == spec.intent.skip_organized
                 && snapshot.job.requested_by_user_id.as_deref() == spec.actor;
             if !same {
                 return Err(stale(
@@ -612,11 +623,12 @@ impl Management {
         job_id: &str,
         after: i64,
         limit: i64,
+        scope: Option<ItemScope>,
     ) -> Result<ResultPage, ManagementError> {
         self.snapshot(job_id)?;
         let limit = limit.clamp(1, PAGE_MAX);
         self.parts.db.read_blocking("management.results", |conn| {
-            Ok(store::results(conn, job_id, after, limit)?)
+            Ok(store::results(conn, job_id, after, limit, scope)?)
         })
     }
 
@@ -1120,6 +1132,9 @@ impl Management {
                             self.parts.clock.now_secs(),
                         )?)
                     })?;
+                if phase != Some(ManagementPhase::Planning) {
+                    self.scan_written_roots(&job_id);
+                }
                 Ok(true)
             }
         }
@@ -1150,6 +1165,47 @@ impl Management {
             .write_blocking(Lane::Background, "management.checkpoint", |tx| {
                 Ok(jobs::checkpoint(tx, job_id, worker, self.parts.clock.now_secs())?.is_some())
             })
+    }
+
+    /// Have the scan read the library folders a run's published albums
+    /// wrote in, soon, so their tags and sizes show and a new preview is
+    /// not refused as changed. Asked when the run ends, never between
+    /// albums: a scan that starts hands the run back to the queue. Also
+    /// asked at a shutdown and when this worker lost the job's lease; then
+    /// another worker may still be running it, and the scan pauses that
+    /// run before its next album.
+    fn scan_written_roots(&self, job_id: &str) {
+        // One snapshot, so the bundles and their journals agree.
+        let roots = self
+            .parts
+            .db
+            .read_blocking("management.written_roots", |conn| {
+                let mut roots = std::collections::BTreeSet::new();
+                for (_, bundle_id) in store::applied_bundles(conn, job_id)? {
+                    let journals = JournalStore::new(conn)
+                        .bundle(&bundle_id)
+                        .map_err(|error| ManagementError::Store(error.to_string()))?;
+                    for journal in journals {
+                        roots.insert(journal.dest_root);
+                        if let Some((root, _)) = journal.source {
+                            roots.insert(root);
+                        }
+                    }
+                }
+                Ok::<_, ManagementError>(roots)
+            });
+        match roots {
+            Ok(roots) if roots.is_empty() => {}
+            Ok(roots) => {
+                for root in &roots {
+                    self.parts.core.dirty.mark(root);
+                }
+                self.parts.wakeups.notify("scan");
+            }
+            Err(error) => {
+                tracing::warn!(%error, job_id, "written folders unreadable; the next scan reads them");
+            }
+        }
     }
 
     pub(super) fn heartbeat(&self, job_id: &str, worker: &str) -> Result<bool, ManagementError> {
@@ -1508,6 +1564,17 @@ impl Management {
             }
         }
         let person = snapshot.origin == Origin::Manual.as_str();
+        // A preview of one album always reads it, so previewing an album by
+        // itself still writes over changes made outside the app.
+        let skip_organized = intent.skip_organized && ctx.wide;
+        let organized_pins = OrganizedPins {
+            profile_id: &pinned.profile.id,
+            profile_revision: &snapshot.profile_revision,
+            naming_revision: &snapshot.naming_revision,
+            tagging_scripts: organized::script_pins(&pinned.tagging_scripts),
+            expected_root: snapshot.target_root_id.as_deref(),
+        };
+        let mut applied_scripts = AppliedScripts::default();
         let mut summary = Summary::default();
         let mut ordinal = 0;
         for (bundle_ordinal, scope) in albums.iter().enumerate() {
@@ -1520,6 +1587,38 @@ impl Management {
             if tracks.is_empty() {
                 continue;
             }
+            let at: Vec<FileAt<'_>> = tracks
+                .iter()
+                .map(|track| FileAt {
+                    track_id: &track.id,
+                    root_id: &track.root_id,
+                    relative_path: &track.relative_path,
+                })
+                .collect();
+            let before_plan = if skip_organized {
+                if self.already_organized(
+                    &scope.album_id,
+                    &at,
+                    &organized_pins,
+                    &sandbox,
+                    &mut applied_scripts,
+                )? {
+                    summary.organized_album_count += 1;
+                    summary.organized_file_count += tracks.len() as i64;
+                    // Albums left out store nothing, so pausing, stopping
+                    // and the lease are seen to here.
+                    if summary.organized_album_count % ORGANIZED_CHECKPOINT == 0
+                        && (self.checkpoint(&snapshot.job.id, worker)?
+                            || !self.heartbeat(&snapshot.job.id, worker)?)
+                    {
+                        return Ok(None);
+                    }
+                    continue;
+                }
+                Some(self.before_plan(&scope.album_id, &at, &sandbox)?)
+            } else {
+                None
+            };
             let held = ctx.wide && person;
             let before = if held {
                 self.parts
@@ -1544,6 +1643,20 @@ impl Management {
             )?;
             if held {
                 self.hold_changed(&scope.album_id, &snapshot.job.id, &mut items, &before)?;
+            }
+            // An album this plan leaves exactly as it is counts as organized
+            // from now on, so files already right (organized before, by v2
+            // or by another tool) are read once, not by every wide preview.
+            if let Some(before_plan) = &before_plan {
+                self.record_organized(
+                    &scope.album_id,
+                    &at,
+                    &items,
+                    before_plan,
+                    &organized_pins,
+                    &snapshot.job.id,
+                    &sandbox,
+                )?;
             }
             ordinal += items.len() as i64;
             summary.bundle_count += 1;
@@ -1879,6 +1992,7 @@ impl Management {
                 }));
         loop {
             if self.checkpoint(job_id, worker)? {
+                self.scan_written_roots(job_id);
                 return Ok(());
             }
             // A scan starting or the library being switched off hands the
@@ -1917,6 +2031,7 @@ impl Management {
                         Ok::<_, ManagementError>(())
                     },
                 )?;
+                self.scan_written_roots(job_id);
                 return Ok(());
             };
             let Some((failure, bundle_id, mut result)) =

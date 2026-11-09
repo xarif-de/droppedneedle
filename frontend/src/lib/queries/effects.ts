@@ -10,6 +10,7 @@ import {
 import { invalidateQueriesWithPersister } from '$lib/queries/QueryClient';
 import { everyScope, key, userScope } from '$lib/queries/keys';
 import { ArtistQueryKeyFactory } from '$lib/features/artist/queries/ArtistQueryKeyFactory';
+import { AppearanceQueryKeyFactory } from '$lib/queries/featureKeys';
 import { ArtistLinkQueryKeyFactory } from '$lib/queries/featureKeys';
 import { DiscoverQueryKeyFactory } from '$lib/features/discover/queries/DiscoverQueryKeyFactory';
 import { DownloadQueryKeyFactory } from '$lib/features/downloads/queries/DownloadQueryKeyFactory';
@@ -184,10 +185,26 @@ export const EFFECTS = {
 	appPasswordRosterChanged: (): Sweep[] => [
 		{ key: ConnectAppsQueryKeyFactory.adminAppPasswords() }
 	],
-	/** The connect-apps settings. */
-	connectAppsSettingsChanged: (): Sweep[] => [{ key: ConnectAppsQueryKeyFactory.settings() }],
+	/** The connect-apps settings, and whether the web player's tracks are converted. */
+	connectAppsSettingsChanged: (): Sweep[] => [
+		{ key: ConnectAppsQueryKeyFactory.settings() },
+		{ key: ConnectAppsQueryKeyFactory.conversion() }
+	],
 	/** The apps that may sign in through the browser. */
 	appConnectSettingsChanged: (): Sweep[] => [{ key: ConnectAppsQueryKeyFactory.appConnect() }],
+	/** The caller's theme or custom CSS, and its kept saves. */
+	myAppearanceChanged: (userId: UserId): Sweep[] => [
+		{ key: AppearanceQueryKeyFactory.mine(userId) }
+	],
+	/** The site CSS or its switch, which every person's appearance carries. */
+	siteAppearanceChanged: (): Sweep[] => [
+		{ key: AppearanceQueryKeyFactory.site() },
+		{ everyScope: [AppearanceQueryKeyFactory.feature, 'mine'] }
+	],
+	/** One account's custom CSS, as the admin sees it. */
+	userCustomCssChanged: (accountId: string): Sweep[] => [
+		{ key: AppearanceQueryKeyFactory.userCustomCss(accountId) }
+	],
 	/** The caller's own Connect Apps choices. */
 	myConnectAppsChanged: (userId: string): Sweep[] => [
 		{ key: ConnectAppsQueryKeyFactory.mine(userId) }
@@ -241,6 +258,10 @@ export const EFFECTS = {
 	downloadPolicyChanged: (): Sweep[] => [{ key: DownloadQueryKeyFactory.policy() }],
 	/** The wanted watcher's settings. */
 	wantedSettingsChanged: (): Sweep[] => [{ key: DownloadQueryKeyFactory.wantedSettings() }],
+	/** The import folder setting, and so what its status says. */
+	importFolderChanged: (userId: UserId): Sweep[] => [
+		{ key: SettingsQueryKeyFactory.importFolderStatus(userId) }
+	],
 	/** Any download, in the caller's views and the admin's. */
 	anyDownloadChanged: (): Sweep[] => [{ everyScope: [DownloadQueryKeyFactory.feature] }],
 	/** Any request, in the caller's views and the admin's. */
@@ -345,8 +366,11 @@ export const EFFECTS = {
 	pluginFilesChanged: (name: string): Sweep[] => [{ key: PluginQueryKeyFactory.files(name) }],
 	/** One account's profile. */
 	profileChanged: (userId: string): Sweep[] => [{ key: ProfileQueryKeyFactory.profile(userId) }],
-	/** The caller's ratings. */
-	ratingsChanged: (userId: UserId): Sweep[] => [{ key: RatingQueryKeyFactory.user(userId) }],
+	/** The caller's ratings, and the library lists a rating filter narrows. */
+	ratingsChanged: (userId: UserId): Sweep[] => [
+		{ key: RatingQueryKeyFactory.user(userId) },
+		{ key: LibraryQueryKeyFactory.catalog.root(userId), mark: true }
+	],
 	/** Which copies the caller's media servers hold of each album. */
 	albumMatchesChanged: (userId: UserId): Sweep[] => [{ key: AlbumMatchKeyFactory.user(userId) }],
 	/** Everything shown for one of the caller's media servers. */
@@ -485,6 +509,9 @@ export const appPasswordRosterChanged = fact('appPasswordRosterChanged');
 export const connectAppsSettingsChanged = fact('connectAppsSettingsChanged');
 export const appConnectSettingsChanged = fact('appConnectSettingsChanged');
 export const myConnectAppsChanged = fact('myConnectAppsChanged');
+export const myAppearanceChanged = fact('myAppearanceChanged');
+export const siteAppearanceChanged = fact('siteAppearanceChanged');
+export const userCustomCssChanged = fact('userCustomCssChanged');
 export const connectionsChanged = fact('connectionsChanged');
 export const sourcePlaylistsChanged = fact('sourcePlaylistsChanged');
 export const spotifyPlaylistsChanged = fact('spotifyPlaylistsChanged');
@@ -498,6 +525,7 @@ export const usenetSettingsChanged = fact('usenetSettingsChanged');
 export const sourcePriorityChanged = fact('sourcePriorityChanged');
 export const downloadPolicyChanged = fact('downloadPolicyChanged');
 export const wantedSettingsChanged = fact('wantedSettingsChanged');
+export const importFolderChanged = fact('importFolderChanged');
 export const anyDownloadChanged = fact('anyDownloadChanged');
 export const anyRequestChanged = fact('anyRequestChanged');
 export const albumStatusChanged = fact('albumStatusChanged');

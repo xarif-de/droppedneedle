@@ -1,14 +1,16 @@
 <!--
 	The player bar: a bordered panel along the bottom of every signed-in page
-	while a track is loaded. Left, what is playing; middle, the transport and
-	the seek bar; right (medium width and up), the buttons that open the
-	drawer on its Queue, Lyrics and Equalizer tabs, the volume and where the
-	track comes from. "Close player" is a tab on the bar's top edge. Phones
-	get the cover, the names and previous, play and next.
+	while a track is loaded. Left, what is playing, with its heart and stars;
+	middle, skip by rating, the transport and the seek bar; right (medium
+	width and up), the buttons that open the drawer on its Queue, Lyrics and
+	Equalizer tabs, the volume and where the track comes from. "Close
+	player" is a tab on the bar's top edge. Phones get the cover, the names,
+	the heart and previous, play and next.
 -->
 <script lang="ts">
 	import { isValidMbid } from '$lib/utils/formatting';
-	import { playerStore } from '$lib/features/player/state/player.svelte';
+	import { part } from '$lib/ui/parts';
+	import { formatLabel, playerStore } from '$lib/features/player/state/player.svelte';
 	import { deckFocus } from '$lib/features/player/state/deckFocus.svelte';
 	import { eqStore } from '$lib/features/player/state/eq.svelte';
 	import { scrobbleManager } from '$lib/features/player/state/scrobble.svelte';
@@ -27,11 +29,13 @@
 	import Button from '$lib/ui/Button.svelte';
 	import IconButton from '$lib/ui/IconButton.svelte';
 	import StatusChip from '$lib/ui/StatusChip.svelte';
+	import Popover from '$lib/ui/Popover.svelte';
+	import RatingStars from '$lib/ui/RatingStars.svelte';
+	import ToggleRow from '$lib/ui/ToggleRow.svelte';
 	import PlayerTrackMarks from '$lib/features/player/components/PlayerTrackMarks.svelte';
-	import StarPicker from '$lib/features/player/components/StarPicker.svelte';
-	import { libraryTrackId, skipByRating } from '$lib/features/player/state/skipByRating.svelte';
-	import { getRatingsQuery } from '$lib/features/library/queries/ratings.svelte';
+	import { skipByRating } from '$lib/features/player/state/skipByRating.svelte';
 	import { withBasePath } from '$lib/utils/basePath';
+	import { playedAlbumHref, playedArtistHref } from '$lib/utils/entityRoutes';
 	import { getLyricsQuery } from '$lib/features/player/queries/lyrics.svelte';
 	import { authStore } from '$lib/stores/authStore.svelte';
 	import { navidromeFolderScope } from '$lib/features/remote-library/queries/RemoteQueries.svelte';
@@ -51,22 +55,17 @@
 		ListMusic,
 		SlidersHorizontal,
 		FileText,
-		FastForward
+		ListFilter,
+		Star
 	} from 'lucide-svelte';
 
-	// The queue's track ratings, read only while the rating floor is on and
-	// kept fresh by the ratings cache (a rating given anywhere moves it).
-	const queueTrackIds = $derived(
-		skipByRating.minStars > 0
-			? [...new Set(playerStore.queue.map(libraryTrackId).filter((id) => id !== null))].sort()
-			: []
+	const floor = $derived(skipByRating.floor);
+	const floorLabel = $derived(
+		floor.minStars > 0 ? `Skip by rating: ${floor.minStars} stars and up` : 'Skip by rating'
 	);
-	const queueRatings = getRatingsQuery(() =>
-		queueTrackIds.length > 0 ? { trackIds: queueTrackIds } : null
+	const floorStopped = $derived(
+		playerStore.floorStopped && !playerStore.hasNext && floor.minStars > 0
 	);
-	$effect(() => {
-		skipByRating.ratings = queueTrackIds.length > 0 ? (queueRatings.data?.tracks ?? null) : null;
-	});
 
 	const lyricsQuery = getLyricsQuery(
 		() => playerStore.nowPlaying,
@@ -108,7 +107,18 @@
 		return `${mins}:${secs.toString().padStart(2, '0')}`;
 	}
 
+	// A drag moves only the thumb; the seek happens once, on release, so a
+	// conversion starts one new pipe per drag rather than one per step. The
+	// drag value stays until `change` reads it: pointerup comes first, and
+	// clearing it there put the old position back, so nothing seeked.
+	let scrub = $state<number | null>(null);
+
+	function handleScrub(e: Event): void {
+		scrub = Number((e.target as HTMLInputElement).value);
+	}
+
 	function handleSeek(e: Event): void {
+		scrub = null;
 		playerStore.seekTo(Number((e.target as HTMLInputElement).value));
 	}
 
@@ -116,11 +126,10 @@
 		playerStore.setVolume(Number((e.target as HTMLInputElement).value));
 	}
 
-	const MBID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-	function isAlbumLinkable(id: string | undefined): boolean {
-		return !!id && MBID_RE.test(id);
-	}
+	const albumLink = $derived(
+		playedAlbumHref(playerStore.nowPlaying?.albumId, playerStore.nowPlaying?.sourceType === 'local')
+	);
+	const artistLink = $derived(playedArtistHref(playerStore.nowPlaying?.artistId));
 
 	function openInYouTube(): void {
 		const trackSourceId = playerStore.nowPlaying?.trackSourceId;
@@ -131,10 +140,33 @@
 
 	const isYouTube = $derived(playerStore.nowPlaying?.sourceType === 'youtube');
 	const isError = $derived(playerStore.playbackState === 'error');
+	const unplayableReason = $derived(
+		isError && playerStore.currentQueueItem
+			? playerStore.unplayableReasonFor(playerStore.currentQueueItem)
+			: null
+	);
+	const unplayableNote = $derived.by(() => {
+		const format = formatLabel(playerStore.currentQueueItem?.format);
+		switch (unplayableReason) {
+			case 'converting_off':
+				return `This browser can't play ${format}, and transcoding is off.`;
+			case 'cannot_convert':
+				return `This browser can't play ${format}, and this server can't convert it.`;
+			case 'conversion_failed':
+				return "This track couldn't be converted for this browser.";
+			default:
+				return "This track isn't available right now.";
+		}
+	});
+	// What fits beside the cover on a phone; the full note is its accessible text.
+	const unplayableShort = $derived.by(() => {
+		if (!unplayableReason) return null;
+		if (unplayableReason === 'conversion_failed') return "Couldn't convert it";
+		return `Can't play ${formatLabel(playerStore.currentQueueItem?.format)} here`;
+	});
+	const shownProgress = $derived(scrub ?? playerStore.progress);
 	const progressPct = $derived(
-		playerStore.duration > 0
-			? Math.min(100, (playerStore.progress / playerStore.duration) * 100)
-			: 0
+		playerStore.duration > 0 ? Math.min(100, (shownProgress / playerStore.duration) * 100) : 0
 	);
 
 	const playPauseIcon = $derived(
@@ -149,20 +181,24 @@
 </script>
 
 {#snippet albumName()}
-	{#if isAlbumLinkable(playerStore.nowPlaying?.albumId)}
-		<a href={withBasePath(`/album/${playerStore.nowPlaying?.albumId}`)} class="dn-player__link"
-			>{playerStore.nowPlaying?.albumName}</a
-		>
+	{#if albumLink}
+		<a href={albumLink} class="dn-player__link">{playerStore.nowPlaying?.albumName}</a>
 	{:else}
 		{playerStore.nowPlaying?.albumName}
 	{/if}
 {/snippet}
 
+<!-- A star the size of the text around it, for the floor's 4★+. -->
+{#snippet floorStar()}<Star
+		class="mx-px inline size-[1em] -translate-y-px fill-current align-middle"
+		aria-hidden="true"
+	/>{/snippet}
+
+{#snippet floorTag()}{floor.minStars}{@render floorStar()}+{/snippet}
+
 {#snippet artistName()}
-	{#if playerStore.nowPlaying?.artistId}
-		<a href={withBasePath(`/artist/${playerStore.nowPlaying.artistId}`)} class="dn-player__link"
-			>{playerStore.nowPlaying.artistName}</a
-		>
+	{#if artistLink}
+		<a href={artistLink} class="dn-player__link">{playerStore.nowPlaying?.artistName}</a>
 	{:else}
 		{playerStore.nowPlaying?.artistName}
 	{/if}
@@ -170,7 +206,7 @@
 
 {#if barShowing && playerStore.nowPlaying}
 	{@const np = playerStore.nowPlaying}
-	<div class="droppedneedle-player-bar dn-player">
+	<div class="droppedneedle-player-bar dn-player" data-part={part('player-bar')}>
 		<Button
 			variant="neutral"
 			size="xs"
@@ -186,7 +222,7 @@
 		></span>
 
 		<div class="dn-player__grid">
-			<div class="dn-player__now">
+			<div class="dn-player__now" data-part={part('player-bar-now')}>
 				<AlbumImage
 					mbid={isValidMbid(np.albumId) ? np.albumId : ''}
 					customUrl={np.coverUrl ?? null}
@@ -205,19 +241,35 @@
 						{#if np.trackName}{@render albumName()}<span class="px-1" aria-hidden="true">·</span
 							>{/if}{@render artistName()}
 					</p>
-					{#if playerStore.hasQueue}
+					{#if floorStopped}
+						<p class="dn-player__mono mt-0.5" role="status">
+							<span aria-hidden="true">No more {floor.minStars}{@render floorStar()}+ tracks.</span>
+							<span class="sr-only">No more tracks rated {floor.minStars} stars and up.</span>
+						</p>
+					{:else if playerStore.hasQueue}
 						<p class="dn-player__mono mt-0.5 hidden sm:block">
 							Track {playerStore.currentTrackNumber} of {playerStore.queueLength}
 						</p>
 					{/if}
 					{#if isError}
-						<p class="truncate text-xs font-semibold text-error">
-							This track isn't available right now.
+						<p class="line-clamp-2 text-xs font-semibold text-error" title={unplayableNote}>
+							{#if unplayableShort}
+								<span class="sm:hidden" aria-hidden="true">{unplayableShort}</span>
+								<span class="sr-only sm:not-sr-only">{unplayableNote}</span>
+							{:else}
+								{unplayableNote}
+							{/if}
+							{#if unplayableReason === 'converting_off' && authStore.isAdmin}
+								<a href={withBasePath('/settings?tab=connect-apps')} class="dn-player__link"
+									>Turn on</a
+								>
+							{/if}
 						</p>
-					{:else if np.format || (scrobbleManager.enabled && scrobbleManager.status !== 'idle')}
+					{:else}
 						<div class="mt-1 hidden items-center gap-1.5 sm:flex">
+							<PlayerTrackMarks class="-ml-1.5" />
 							{#if np.format}
-								<AudioQualityBadge codec={np.format} compact />
+								<AudioQualityBadge codec={np.format} converted={playerStore.converting} compact />
 							{/if}
 							{#if scrobbleManager.enabled && scrobbleManager.status !== 'idle'}
 								<span class="tooltip tooltip-top" data-tip={scrobbleManager.tooltip}>
@@ -239,29 +291,52 @@
 				</div>
 			</div>
 
-			<div class="dn-player__transport">
+			<div class="dn-player__transport" data-part={part('player-bar-controls')}>
 				<div class="flex items-center gap-1 sm:gap-2.5">
 					{#if playerStore.hasQueue}
-						<span class="hidden sm:inline-flex">
-							<StarPicker
-								label={skipByRating.minStars > 0
-									? `Skipping tracks rated under ${skipByRating.minStars} stars`
-									: 'Skip tracks with low rating'}
-								value={skipByRating.minStars}
-								clear="off"
-								active={skipByRating.minStars > 0}
-								onpick={(stars) => skipByRating.set(stars)}
-							>
-								<span class="relative inline-flex size-5 items-center justify-center">
-									<FastForward class="size-5" aria-hidden="true" />
-									{#if skipByRating.minStars > 0}
-										<span class="badge badge-warning badge-xs absolute -right-2 -top-2 px-1"
-											>{skipByRating.minStars}★</span
-										>
-									{/if}
-								</span>
-							</StarPicker>
-						</span>
+						<Popover
+							look="icon"
+							side="above"
+							align="start"
+							icon={ListFilter}
+							label={floorLabel}
+							title="Skip by rating"
+							tag={floor.minStars > 0 ? floorTag : undefined}
+							on={floor.minStars > 0}
+							class="hidden sm:block"
+						>
+							{#snippet children(close)}
+								<div class="flex flex-wrap items-center gap-x-2 gap-y-1">
+									<span class="text-sm font-semibold">Only play</span>
+									<RatingStars
+										label="Only play"
+										groupLabel={floor.minStars > 0
+											? `Only play tracks rated ${floor.minStars} stars and up`
+											: 'Only play tracks rated: off'}
+										min={2}
+										value={floor.minStars}
+										onchange={(stars) =>
+											stars > 0 ? skipByRating.setMinStars(stars) : skipByRating.turnOff()}
+									/>
+									<span class="text-sm font-semibold">and up</span>
+								</div>
+								<ToggleRow
+									label="Play unrated"
+									bind:checked={
+										() => floor.playUnrated, (value) => skipByRating.setPlayUnrated(value)
+									}
+								/>
+								<Button
+									variant="outline"
+									size="sm"
+									disabled={floor.minStars === 0}
+									onclick={() => {
+										skipByRating.turnOff();
+										close();
+									}}>Turn off</Button
+								>
+							{/snippet}
+						</Popover>
 						<IconButton
 							icon={Shuffle}
 							label="Toggle shuffle"
@@ -271,6 +346,7 @@
 							onclick={() => playerStore.toggleShuffle()}
 						/>
 					{/if}
+					<PlayerTrackMarks stars={false} class="sm:hidden" />
 					<IconButton
 						icon={SkipBack}
 						label="Previous"
@@ -298,12 +374,10 @@
 						disabled={!playerStore.hasNext}
 						onclick={() => playerStore.nextTrack()}
 					/>
-
-					<PlayerTrackMarks />
 				</div>
 
 				<div class="hidden w-full items-center gap-2.5 sm:flex">
-					<span class="dn-player__time text-right">{formatTime(playerStore.progress)}</span>
+					<span class="dn-player__time text-right">{formatTime(shownProgress)}</span>
 					<input
 						type="range"
 						class="dn-range min-w-0 flex-1"
@@ -311,13 +385,14 @@
 						min="0"
 						max={playerStore.duration || 1}
 						step="any"
-						value={playerStore.progress}
+						value={shownProgress}
 						disabled={!playerStore.isSeekable}
-						oninput={handleSeek}
+						oninput={handleScrub}
+						onchange={handleSeek}
+						onpointercancel={() => (scrub = null)}
+						onblur={() => (scrub = null)}
 						aria-label="Seek"
-						aria-valuetext="{formatTime(playerStore.progress)} of {formatTime(
-							playerStore.duration
-						)}"
+						aria-valuetext="{formatTime(shownProgress)} of {formatTime(playerStore.duration)}"
 					/>
 					<span class="dn-player__time">{formatTime(playerStore.duration)}</span>
 				</div>

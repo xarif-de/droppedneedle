@@ -1,11 +1,13 @@
 /* daisyUI themes, shared by app.css and auth.css so every page switches together.
-   Dark is acid ink on black stock, light forest ink on warm paper. Every text
-   pair here was measured against WCAG AA on the page, surface and subtle
-   surface it sits on. */
+   Dark is acid ink on black stock, light forest ink on warm paper, and midnight
+   the dark palette with its paper islands turned dark. Every text pair here
+   was measured against WCAG AA on the page, surface and subtle surface it sits
+   on, and every edge against 3:1. */
 @plugin "daisyui" {
 	themes:
 		dark --default,
-		light;
+		light,
+		midnight;
 }
 @plugin "daisyui/theme" {
 	name: 'dark';
@@ -28,6 +30,39 @@
 	--color-info: #b6ddf5;
 	--color-info-content: #121a12;
 	/* teal, apart from the brand acid */
+	--color-success: #5fd3a8;
+	--color-success-content: #121a12;
+	--color-warning: #f4bc65;
+	--color-warning-content: #121a12;
+	--color-error: #ff837a;
+	--color-error-content: #121a12;
+	--radius-selector: 0.5rem;
+	--radius-field: 0.5rem;
+	--radius-box: 0.75rem;
+	--size-selector: 0.25rem;
+	--size-field: 0.25rem;
+	--border: 1px;
+	--depth: 0;
+	--noise: 0;
+}
+@plugin "daisyui/theme" {
+	name: 'midnight';
+	color-scheme: dark;
+	--color-base-100: #090e0b;
+	--color-base-200: #0b0f0c;
+	--color-base-300: #121713;
+	--color-base-content: #f3f5ef;
+	--color-primary: #b8ef64;
+	--color-primary-content: #121a12;
+	--color-secondary: #d7b8f0;
+	--color-secondary-content: #121a12;
+	--color-accent: #c6f38c;
+	--color-accent-content: #121a12;
+	/* the raised surface: 1.6 on the page, a step past the paper (1.2) */
+	--color-neutral: #2c3a2f;
+	--color-neutral-content: #f3f5ef;
+	--color-info: #b6ddf5;
+	--color-info-content: #121a12;
 	--color-success: #5fd3a8;
 	--color-success-content: #121a12;
 	--color-warning: #f4bc65;
@@ -109,6 +144,9 @@
 	/* the light island (the album track list, Home's Your Music card) */
 	--dn-paper: #f6f3e8;
 	--dn-paper-content: #142016;
+	/* a dark tile on paper (an acid mark's ground, a dark band) and its ink */
+	--dn-paper-tile: #142016;
+	--dn-paper-tile-content: #f6f3e8;
 	--dn-paper-border: #c9d1c4;
 	--dn-focus: #d9f69a;
 	/* input and toggle edges: 3.6 on the surface, 4.0 on the page */
@@ -117,6 +155,33 @@
 	--dn-line: #4d604d;
 	--dn-selected: #1f3222;
 	/* decoration: the frit dots and the record behind a sleeve */
+	--dn-frit: #b8ef64;
+	--dn-frit-opacity: 0.75;
+	--dn-vinyl: #0b0e0c;
+	--dn-vinyl-groove: #2b342b;
+}
+
+[data-theme='midnight'] {
+	/* secondary text: 9.4 on the page, 6.9 on paper, 5.8 on the raised surface */
+	--dn-muted: #a9b8a8;
+	--dn-title: #b8ef64;
+	--dn-action: #b8ef64;
+	--dn-action-content: #121a12;
+	--dn-action-edge: #b8ef64;
+	/* the islands turn dark, 1.4 above the page so a torn sheet still shows,
+	   with light ink (13.0) */
+	--dn-paper: #222d24;
+	--dn-paper-content: #f3f5ef;
+	/* the page's black, so a dark tile on paper stays dark */
+	--dn-paper-tile: #090e0b;
+	--dn-paper-tile-content: #f3f5ef;
+	/* paper and input edges: 5.4 on the page, 4.0 on paper, 3.3 on the
+	   raised surface */
+	--dn-paper-border: #7a8c7a;
+	--dn-focus: #d9f69a;
+	--dn-edge: #7a8c7a;
+	--dn-line: #4d604d;
+	--dn-selected: #2f4733;
 	--dn-frit: #b8ef64;
 	--dn-frit-opacity: 0.75;
 	--dn-vinyl: #0b0e0c;
@@ -133,6 +198,8 @@
 	--dn-action-edge: #1e6a38;
 	--dn-paper: #fffdf5;
 	--dn-paper-content: #0e2e1d;
+	--dn-paper-tile: #0e2e1d;
+	--dn-paper-tile-content: #fffdf5;
 	--dn-paper-border: #aebeaa;
 	--dn-focus: #1e6a38;
 	/* 3.6 on paper, 3.9 on the surface */
@@ -149,7 +216,12 @@
    are too pale on a light background. */
 @custom-variant light (&:where([data-theme=light], [data-theme=light] *));
 
-/* The placeholder cover's palette, the same in both themes. It mirrors
+/* The turntable's tonearm: light on the black record in every theme. */
+:root {
+	--dn-arm: #f3f5ef;
+}
+
+/* The placeholder cover's palette, the same in every theme. It mirrors
    PLACEHOLDER_PALETTE in server/compat/src/subsonic/stream.rs, which draws the
    same pair for Subsonic clients; keep the two in step. */
 :root {

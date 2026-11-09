@@ -8,14 +8,16 @@
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import { albumHref, artistHref } from '$lib/utils/entityRoutes';
-	import { Moon, Search, Sun, UserRound } from 'lucide-svelte';
+	import { Moon, MoonStar, Search, Sun, UserRound } from 'lucide-svelte';
 	import Button from '$lib/ui/Button.svelte';
 	import IconButton from '$lib/ui/IconButton.svelte';
 	import Logo from '$lib/ui/Logo.svelte';
+	import { part } from '$lib/ui/parts';
 	import SearchSuggestions from '$lib/features/search/components/SearchSuggestions.svelte';
 	import ServiceHealthIndicator from '$lib/shell/ServiceHealthIndicator.svelte';
 	import { getApiUrl } from '$lib/api/api-utils';
 	import { authStore } from '$lib/stores/authStore.svelte';
+	import { createThemeSaver } from '$lib/features/profile/state/appearance.svelte';
 	import { themeStore } from '$lib/stores/theme.svelte';
 	import { withBasePath, withoutBasePath } from '$lib/utils/basePath';
 	import type { SuggestResult } from '$lib/features/search/queries/types';
@@ -37,10 +39,21 @@
 	});
 
 	const theme = $derived(themeStore.resolved);
-	const themeLabel = $derived(theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme');
+	const themeLabel = $derived(
+		theme === 'dark'
+			? 'Switch to midnight theme'
+			: theme === 'midnight'
+				? 'Switch to light theme'
+				: 'Switch to dark theme'
+	);
 
+	const saveTheme = createThemeSaver();
+
+	// Saved to the account like the theme cards, so the account's theme does not
+	// undo the choice on the next load.
 	function toggleTheme() {
-		themeStore.set(theme === 'dark' ? 'light' : 'dark');
+		const next = theme === 'light' ? 'dark' : theme === 'dark' ? 'midnight' : 'light';
+		saveTheme(next);
 	}
 
 	function handleSearch() {
@@ -66,10 +79,19 @@
 		<span class="theme-glyph__face theme-glyph__face--sun" class:is-away={theme !== 'light'}>
 			<Sun class={size} />
 		</span>
+		<span
+			class="theme-glyph__face theme-glyph__face--midnight"
+			class:is-away={theme !== 'midnight'}
+		>
+			<MoonStar class={size} />
+		</span>
 	</span>
 {/snippet}
 
-<div class="droppedneedle-topbar navbar sticky top-0 z-50 border-b border-base-300 bg-base-100">
+<div
+	class="droppedneedle-topbar navbar sticky top-0 z-50 border-b border-base-300 bg-base-100"
+	data-part={part('top-bar')}
+>
 	<div class="navbar-start w-auto sm:grow-0" class:grow={!onSearchPage}>
 		<Button variant="ghost" href={withBasePath('/')} class="px-2 sm:px-3" aria-label="Home">
 			{#if onSearchPage}

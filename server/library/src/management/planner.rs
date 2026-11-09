@@ -23,7 +23,7 @@ use super::script;
 use super::selection::{AlbumScope, CatalogTrack};
 use super::service::ManagementParts;
 use super::{automatic, takeover};
-use crate::matching::model::Release;
+use crate::matching::model::{Release, ReleaseTrack};
 use crate::publish::planner::{
     Capability, CollisionGate, DiskPreflight, FileFingerprint, OutputKind, PlanBundle, PlanItem,
     PlanKind, STAGED_HEADROOM_BYTES,
@@ -453,9 +453,10 @@ fn destination(
     ctx: &PlanContext<'_>,
     release: &Release,
     track: &CatalogTrack,
-    disc: u32,
+    release_track: &ReleaseTrack,
     fields: &BTreeMap<String, Vec<String>>,
 ) -> Result<Option<(String, String)>, ItemReason> {
+    let disc = release_track.disc;
     let organization = &ctx.pinned.profile.organization;
     let dest_root = ctx.target_root.unwrap_or(&track.root_id).to_owned();
     if !organization.rename_enabled && !organization.move_enabled && ctx.target_root.is_none() {
@@ -476,6 +477,8 @@ fn destination(
         .map(|ext| ext.to_string_lossy().into_owned())
         .unwrap_or_default();
     let medium = release.media.iter().find(|medium| medium.position == disc);
+    let (album_artist_disambiguation, artist_disambiguation) =
+        profile::artist_disambiguations(release, release_track);
     let facts = NamingFacts {
         extension: &script::cased_extension(&extension, organization.compatibility.extension_case),
         codec: &track.file_format,
@@ -485,6 +488,8 @@ fn destination(
         medium_format: medium.and_then(|m| m.format.clone()).unwrap_or_default(),
         medium_number: i64::from(disc),
         album_disambiguation: release.disambiguation.clone().unwrap_or_default(),
+        album_artist_disambiguation,
+        artist_disambiguation,
     };
     let variables = profile::naming_variables(fields, &facts);
     let rendered = script::render_path(
@@ -655,7 +660,17 @@ fn plan_file(
             value: profile::json_value(value),
         })
         .collect();
-    let destination = destination(ctx, release, track, release_track.disc, &tag_plan.desired)?;
+    // A path that reads the disambiguation would be planned without it.
+    let organization = &ctx.pinned.profile.organization;
+    let names_path =
+        organization.rename_enabled || organization.move_enabled || ctx.target_root.is_some();
+    if names_path
+        && extras.names == super::enrich::Credits::Unavailable
+        && super::enrich::script_names_wanted(ctx.pinned)
+    {
+        return Err(reasons::disambiguation_unavailable());
+    }
+    let destination = destination(ctx, release, track, release_track, &tag_plan.desired)?;
     let (dest_root, dest_rel) =
         destination.unwrap_or_else(|| (track.root_id.clone(), track.relative_path.clone()));
     let moves = dest_root != track.root_id || dest_rel != track.relative_path;
@@ -690,7 +705,25 @@ fn plan_file(
             }
         })
         .collect();
+    // The outside sources this file's plan could not read now. A file
+    // that names one is not counted as organized, so it is planned again.
     item.diff.deferred_sources = tag_plan.deferred.clone();
+    if ctx.pinned.profile.enrichment.lyrics.enabled
+        && lyrics == super::enrich::LyricsAnswer::Deferred
+    {
+        item.diff.deferred_sources.push("lrclib".to_owned());
+    }
+    if extras.cover_deferred {
+        item.diff.deferred_sources.push("cover".to_owned());
+    }
+    if extras.acoustid_waiting.contains(&track.id)
+        || extras
+            .acoustid_notes
+            .iter()
+            .any(|(id, note)| id == &track.id && note == ACOUSTID_OUT_OF_TIME)
+    {
+        item.diff.deferred_sources.push("acoustid".to_owned());
+    }
     item.diff.field_mutations = tag_plan.mutations;
     item.diff.tags_changed = !tag_plan.updates.is_empty();
     if item.diff.tags_changed {
@@ -1538,6 +1571,11 @@ fn acoustid_unavailable() -> ItemReason {
     }
 }
 
+/// The note on the file whose AcoustID values a run's time for analysing
+/// audio ran out before; its plan counts AcoustID as a source not read.
+const ACOUSTID_OUT_OF_TIME: &str = "AcoustID values were not worked out: this run's time for \
+     analysing audio ran out, so the next run does them.";
+
 /// How an album's AcoustID lookup went.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AcoustIdLookup {
@@ -1775,12 +1813,9 @@ pub(crate) fn acoustid_values(
         }
     }
     if let Some(track) = out_of_time {
-        extras.acoustid_notes.push((
-            track.to_owned(),
-            "AcoustID values were not worked out: this run's time for analysing audio ran out, \
-             so the next run does them."
-                .to_owned(),
-        ));
+        extras
+            .acoustid_notes
+            .push((track.to_owned(), ACOUSTID_OUT_OF_TIME.to_owned()));
     }
     let mut unanswered: Option<Unanswered> = None;
     let mut refused = false;
@@ -2228,7 +2263,7 @@ pub fn plan_album(
     let mut extras = super::enrich::gather(
         &*ctx.parts.enrichment,
         &ctx.parts.identify_store,
-        &ctx.pinned.profile,
+        ctx.pinned,
         &mut release,
         !person,
         exact,
@@ -2383,7 +2418,7 @@ pub fn plan_one(
             let mut extras = super::enrich::gather(
                 &*ctx.parts.enrichment,
                 &ctx.parts.identify_store,
-                &ctx.pinned.profile,
+                ctx.pinned,
                 &mut release,
                 false,
                 false,

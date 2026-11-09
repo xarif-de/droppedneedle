@@ -23,7 +23,7 @@
 	changes. The caller closes it by setting `open` to false.
 	`overflowVisible` lets a dropdown inside reach past the box's edge, for a
 	short dialog that holds one.
-	`paper` prints a non-sheet dialog on paper stock (the light theme inside,
+	`paper` prints a non-sheet dialog on paper stock (the sheet's theme inside,
 	an Anton title), for a confirm that starts a write to files.
 -->
 <script lang="ts">
@@ -31,6 +31,8 @@
 	import { X } from 'lucide-svelte';
 	import type { KitIcon } from './Button.svelte';
 	import IconButton from './IconButton.svelte';
+	import { part } from './parts';
+	import { themeStore } from '$lib/stores/theme.svelte';
 
 	interface Props {
 		open: boolean;
@@ -54,7 +56,7 @@
 		onrequestclose?: () => void;
 		/** Lets a dropdown inside reach past the box's edge. */
 		overflowVisible?: boolean;
-		/** Cream paper stock with an Anton title, for a confirm that starts a write. */
+		/** Paper stock with an Anton title, for a confirm that starts a write. */
 		paper?: boolean;
 		onclose?: () => void;
 		children: Snippet;
@@ -173,6 +175,7 @@
 		<div
 			class="modal-box flex h-dvh max-h-dvh w-full max-w-none flex-col overflow-y-auto rounded-none p-0 md:h-[min(88dvh,52rem)] md:max-h-[min(88dvh,52rem)] md:max-w-6xl md:overflow-hidden md:rounded-box"
 			data-testid="modal-sheet"
+			data-part={part('modal')}
 		>
 			<header
 				class="sticky top-0 z-10 flex items-start justify-between gap-3 border-b border-line bg-base-200 px-4 py-3 md:static md:px-6 md:py-4"
@@ -218,10 +221,11 @@
 				'modal-box',
 				widths[size as keyof typeof widths],
 				overflowVisible && 'overflow-visible',
-				paper && 'border-2 border-paper-content',
+				paper && 'border-2 border-paper-content bg-paper',
 				bottomSheet && 'max-sm:max-w-none pb-[calc(env(safe-area-inset-bottom)+1.5rem)] sm:pb-6'
 			]}
-			data-theme={paper ? 'light' : undefined}
+			data-theme={paper ? themeStore.paper : undefined}
+			data-part={part('modal')}
 		>
 			<div class="flex items-start gap-3">
 				{#if Icon}

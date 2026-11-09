@@ -1,16 +1,26 @@
 import { browser } from '$app/environment';
 
-export type ThemePreference = 'system' | 'light' | 'dark';
-type Theme = 'light' | 'dark';
+export type ThemePreference = 'system' | 'light' | 'dark' | 'midnight';
+type Theme = 'light' | 'dark' | 'midnight';
 
-const STORAGE_KEY = 'droppedneedle_theme';
+// This browser's copy, which paints the first frame. Once signed in, the
+// account's theme is written here.
+export const THEME_STORAGE_KEY = 'droppedneedle_theme';
+// The owner tag (see appearance.svelte.ts) of the account this copy was last
+// applied or chosen for. Another account's copy is never uploaded, and an
+// account with no theme of its own sees the default.
+export const THEME_OWNER_STORAGE_KEY = 'droppedneedle_theme_owner';
 const LIGHT_QUERY = '(prefers-color-scheme: light)';
 // Browser chrome colour per theme: each theme's base-100 in src/theme.css.
 // Hardcoded because the theme is applied before any stylesheet has loaded.
-const THEME_COLOR: Record<Theme, string> = { dark: '#090e0b', light: '#f6f3e8' };
+const THEME_COLOR: Record<Theme, string> = {
+	dark: '#090e0b',
+	light: '#f6f3e8',
+	midnight: '#090e0b'
+};
 
 export function parseThemePreference(raw: string | null): ThemePreference {
-	return raw === 'system' || raw === 'light' ? raw : 'dark';
+	return raw === 'system' || raw === 'light' || raw === 'midnight' ? raw : 'dark';
 }
 
 export function resolveTheme(preference: ThemePreference, prefersLight: boolean): Theme {
@@ -21,9 +31,27 @@ export function resolveTheme(preference: ThemePreference, prefersLight: boolean)
 function readPreference(): ThemePreference {
 	if (!browser) return 'dark';
 	try {
-		return parseThemePreference(localStorage.getItem(STORAGE_KEY));
+		return parseThemePreference(localStorage.getItem(THEME_STORAGE_KEY));
 	} catch {
 		return 'dark';
+	}
+}
+
+/** The owner tag of this browser's theme copy, or null when no account has claimed it. */
+export function themeOwner(): string | null {
+	try {
+		return localStorage.getItem(THEME_OWNER_STORAGE_KEY);
+	} catch {
+		return null;
+	}
+}
+
+/** Record `tag` as the owner tag of this browser's theme copy. */
+export function setThemeOwner(tag: string): void {
+	try {
+		localStorage.setItem(THEME_OWNER_STORAGE_KEY, tag);
+	} catch {
+		// private mode: nothing is kept, so there is nothing to own
 	}
 }
 
@@ -50,14 +78,20 @@ function createThemeStore() {
 		});
 	}
 
-	function set(next: ThemePreference): void {
+	/** Show `next` without keeping it as this browser's copy. */
+	function show(next: ThemePreference): void {
 		preference = next;
+		resolved = apply(next);
+	}
+
+	/** Show `next` and keep it as this browser's copy. Saving it to the account is the caller's. */
+	function set(next: ThemePreference): void {
+		show(next);
 		try {
-			localStorage.setItem(STORAGE_KEY, next);
+			localStorage.setItem(THEME_STORAGE_KEY, next);
 		} catch {
 			// private mode: the choice lasts for this page only
 		}
-		resolved = apply(next);
 	}
 
 	return {
@@ -67,7 +101,12 @@ function createThemeStore() {
 		get resolved() {
 			return resolved;
 		},
-		set
+		/** The theme a paper sheet switches to inside: Midnight's dark stock, else light. */
+		get paper(): 'light' | 'midnight' {
+			return resolved === 'midnight' ? 'midnight' : 'light';
+		},
+		set,
+		show
 	};
 }
 

@@ -14,13 +14,11 @@
 //!   by triggers): at least one of its tracks is indexed. Missing tracks
 //!   (gone from disk or in the recycle bin) and excluded ones do not count.
 //!   Player apps never see a live album without files.
-//! - **Listed.** The web UI's album lists show a live album, with or
-//!   without files, until everything of a file-less album has been through
-//!   the recycle bin and left it
-//!   ([`droppedneedle_library::album_gone_through_bin`]): a removed album
-//!   is listed, marked "no files", while any of its files can still be put
-//!   back. One whose files vanished from disk stays listed, unless they
-//!   vanished before it was removed. Every album still opens by its id.
+//! - **Listed.** The web UI's lists show a live album with files, and one
+//!   with none only while Put back can still bring something of it home:
+//!   one definition, [`droppedneedle_library::listed_album`], which the
+//!   lists, their counts and Check albums read. Every album still opens by
+//!   its id.
 //! - **Live track.** A track every read shows is indexed and sits on a
 //!   live album. Merges retire only emptied albums, so a track left on a
 //!   retired one is a leftover no read lists, counts or returns.
@@ -61,30 +59,14 @@ use super::player::{
 use super::stores::{AlbumSort, ArtistScope, ArtistSort, TrackSort};
 use droppedneedle_library::identity::asked_groups;
 use droppedneedle_library::{
-    all_owners, copy_of_group, match_flag_state, named_group_guess, not_yet_identified, owns_group,
-    recording_mbid,
+    all_owners, copy_of_group, listed_album, match_flag_state, named_group_guess,
+    not_yet_identified, owns_group, recording_mbid,
 };
 
 /// An album that has not been merged into another, over an album alias.
 macro_rules! live_album {
     ($album:literal) => {
         concat!("+", $album, ".retired_into_album_id IS NULL")
-    };
-}
-
-/// An album the web UI's lists show, over an album alias: live, and with
-/// files or with something of it not yet through the recycle bin.
-macro_rules! listed_album {
-    ($album:literal) => {
-        concat!(
-            "+",
-            $album,
-            ".retired_into_album_id IS NULL AND (+",
-            $album,
-            ".has_indexed_track = 1 OR NOT (",
-            droppedneedle_library::album_gone_through_bin!(concat!($album, ".id")),
-            "))"
-        )
     };
 }
 
@@ -155,9 +137,7 @@ macro_rules! owned_artist {
     };
 }
 
-pub(crate) use {
-    listed_album, live_album, live_track, musicbrainz, owned_album, owned_artist, track_codec,
-};
+pub(crate) use {live_album, live_track, musicbrainz, owned_album, owned_artist, track_codec};
 
 /// A track an album's track count counts, over a track alias and the
 /// album's id column: an indexed track on that album, whoever is credited
@@ -176,14 +156,17 @@ macro_rules! album_track {
     };
 }
 
-/// Album `$album`'s primary format: its most common indexed track format,
-/// lowercased; NULL for an album without indexed tracks.
+/// Album `$album`'s primary format: its most common indexed track format
+/// as [`track_codec!`] names it (ALAC apart from AAC), lowercased; NULL for
+/// an album without indexed tracks.
 macro_rules! album_primary_format {
     ($album:literal) => {
         concat!(
-            "LOWER((SELECT t2.file_format FROM local_tracks t2 WHERE ",
+            "LOWER((SELECT ",
+            $crate::local::sql::track_codec!("t2"),
+            " AS codec FROM local_tracks t2 WHERE ",
             $crate::local::sql::album_track!("t2", concat!($album, ".id")),
-            " GROUP BY t2.file_format ORDER BY COUNT(*) DESC, t2.file_format LIMIT 1))"
+            " GROUP BY codec ORDER BY COUNT(*) DESC, codec LIMIT 1))"
         )
     };
 }
@@ -267,10 +250,8 @@ droppedneedle_kernel::sql! {
         (ae.local_album_id IS NOT NULL) AS linked, \
         COUNT(t.id) AS track_count, \
         COALESCE(SUM(t.duration_seconds), 0.0) AS total_duration_seconds, \
-        COALESCE(SUM(t.file_size_bytes), 0) AS total_size_bytes, \
-        (SELECT t2.file_format FROM local_tracks t2 \
-         WHERE t2.local_album_id = a.id AND t2.availability = 'indexed' \
-         GROUP BY t2.file_format ORDER BY COUNT(*) DESC, t2.file_format LIMIT 1) AS format, \
+        COALESCE(SUM(t.file_size_bytes), 0) AS total_size_bytes, "
+        + (album_primary_format!("a")) + " AS format, \
         a.year AS year, a.is_compilation AS is_compilation, \
         COALESCE(w.source IN ('folder','embedded'), 0) AS cover_available, \
         CASE WHEN w.source IN ('folder','embedded') THEN w.version END AS art_version, \
@@ -294,11 +275,11 @@ droppedneedle_kernel::sql! {
         album_track!("t", "a.id")
     ));
     /// The album list's filters, shared by its page and its count: listed
-    /// albums, with or without files. Binds: the pattern three times, the
-    /// artist twice, the decade three times, the formats (`,flac,mp3,`)
-    /// twice and whether the album must have one of them (1) or none (0),
-    /// the track bound as [`album_min_tracks!`] binds it, then the user
-    /// whose stars it keeps (or NULL) and [`rated_within!`]'s binds.
+    /// albums. Binds: the pattern three times, the artist twice, the decade
+    /// three times, the formats (`,flac,mp3,`) twice and whether the album
+    /// must have one of them (1) or none (0), the track bound as
+    /// [`album_min_tracks!`] binds it, then the user whose stars it keeps
+    /// (or NULL) and [`rated_within!`]'s binds.
     pub(crate) fragment ALBUM_FILTER = (concat!(
         listed_album!("a"),
         " AND (? IS NULL OR a.title_folded LIKE ? ESCAPE '\\' \
@@ -446,16 +427,17 @@ droppedneedle_kernel::sql! {
             ON tbi.local_artist_id = tal.album_artist_id AND tbi.provider = 'musicbrainz'";
     /// The album, artist, genre, format and rating filters of the track
     /// list, after its text filter: the album twice, the artist twice, the
-    /// genre three times, the formats (`,flac,mp3,`) twice and whether the
-    /// track must be in one of them (1) or none (0), then the user whose
-    /// stars it keeps (or NULL) and [`rated_within!`]'s binds.
+    /// genre three times, the formats (`,flac,alac,`, as [`track_codec!`]
+    /// names them) twice and whether the track must be in one of them (1)
+    /// or none (0), then the user whose stars it keeps (or NULL) and
+    /// [`rated_within!`]'s binds.
     pub(crate) fragment TRACK_SCOPE = " AND (? IS NULL OR t.local_album_id = ?) \
         AND (? IS NULL OR EXISTS (SELECT 1 FROM local_track_artists x \
         WHERE x.local_track_id = t.id AND x.local_artist_id = ?)) \
         AND (? IS NULL OR EXISTS (SELECT 1 FROM local_track_genres g \
         WHERE g.local_track_id = t.id AND g.folded_name = ?) \
         OR t.genre_folded = ?) \
-        AND (? IS NULL OR (instr(?, ',' || LOWER(t.file_format) || ',') > 0) = ?) \
+        AND (? IS NULL OR (instr(?, ',' || LOWER(" + (track_codec!("t")) + ") || ',') > 0) = ?) \
         AND (? IS NULL OR " + (rated_within!("track", "t.id")) + ")";
     /// A live track `t`: indexed, on a live album.
     pub(crate) fragment LIVE_TRACK = (live_track!("t"));
@@ -557,7 +539,15 @@ droppedneedle_kernel::sql! {
     /// subquery per row.
     pub(crate) fragment ARTIST_COLUMNS = "r.id AS id, r.display_name AS name, \
         e.provider_artist_id AS artist_mbid, (e.local_artist_id IS NOT NULL) AS linked, \
-        r.created_at / 1000.0 AS date_added";
+        r.created_at / 1000.0 AS date_added, " + ARTIST_DISAMBIGUATION;
+    /// MusicBrainz's note on artist `r`'s linked artist (`e`), as
+    /// identification stored it, while another live ordinary record has
+    /// the same folded name: what tells two of one name apart.
+    pub(crate) fragment ARTIST_DISAMBIGUATION = "(SELECT NULLIF(c.disambiguation, '') \
+        FROM library_identify_artist_id_checks c WHERE c.artist_mbid = lower(e.provider_artist_id) \
+        AND EXISTS (SELECT 1 FROM local_artists o WHERE o.folded_name = r.folded_name \
+         AND o.id <> r.id AND o.retired_into_artist_id IS NULL \
+         AND o.kind <> 'various_artists')) AS disambiguation";
     /// The artist projection's joins.
     pub(crate) fragment ARTIST_JOINS = "FROM local_artists r " + ARTIST_IDENTITY;
     /// The artist `r`'s MusicBrainz link, `e`.
@@ -668,19 +658,20 @@ droppedneedle_kernel::sql! {
         FROM catalog_track_format_stats WHERE indexed_tracks > 0";
     /// Review, Check albums, local-only and last-scan totals; `to_check`
     /// counts each album once, whichever of the three lists it is on. Local-only
-    /// albums are owned albums with no identity row; best guesses and
-    /// albums nothing fits are live albums with that match state; the last
-    /// scan is the newest completed run.
+    /// albums are owned albums with no identity row; best guesses, albums
+    /// nothing fits and albums flagged as looking wrong are listed albums
+    /// with that state, as the Check albums tabs list them; the last scan
+    /// is the newest completed run.
     pub(crate) STATS_EXTRAS = "SELECT \
         (SELECT COUNT(*) FROM library_identify_reviews WHERE state = 'pending') AS reviews, \
-        (SELECT COUNT(*) FROM local_albums a WHERE a.retired_into_album_id IS NULL \
+        (SELECT COUNT(*) FROM local_albums a WHERE " + (listed_album!("a")) + " \
          AND " + (match_flag_state!("a.id", "unconfirmed")) + ") AS guesses, \
-        (SELECT COUNT(*) FROM local_albums a WHERE a.retired_into_album_id IS NULL \
+        (SELECT COUNT(*) FROM local_albums a WHERE " + (listed_album!("a")) + " \
          AND " + (match_flag_state!("a.id", "unmatched")) + ") AS not_found, \
         (SELECT COUNT(DISTINCT w.local_album_id) FROM library_album_looks_wrong w \
          JOIN local_albums a ON a.id = w.local_album_id \
-         WHERE a.retired_into_album_id IS NULL) AS looks_wrong, \
-        (SELECT COUNT(*) FROM local_albums a WHERE a.retired_into_album_id IS NULL AND ("
+         WHERE " + (listed_album!("a")) + ") AS looks_wrong, \
+        (SELECT COUNT(*) FROM local_albums a WHERE " + (listed_album!("a")) + " AND ("
         + (match_flag_state!("a.id", "unconfirmed")) + " \
          OR EXISTS (SELECT 1 FROM library_album_looks_wrong w WHERE w.local_album_id = a.id) \
          OR EXISTS (SELECT 1 FROM library_identify_reviews r \
@@ -692,9 +683,12 @@ droppedneedle_kernel::sql! {
 
     /// Which of a page of ids a user favorited, for one kind.
     family FAVORITES_IN = favorites_in;
-    /// A user's favorite counts per kind.
-    pub(crate) FAVORITE_COUNTS = "SELECT item_kind AS kind, COUNT(*) AS total \
-        FROM catalog_user_favorites WHERE user_id = ? GROUP BY item_kind";
+    /// A user's favorite counts per kind; albums count while they are
+    /// listed, as the Favourites list shows them.
+    pub(crate) FAVORITE_COUNTS = "SELECT f.item_kind AS kind, COUNT(*) AS total \
+        FROM catalog_user_favorites f WHERE f.user_id = ? \
+        AND (f.item_kind <> 'album' OR EXISTS (SELECT 1 FROM local_albums a \
+        WHERE a.id = f.item_id AND " + (listed_album!("a")) + ")) GROUP BY f.item_kind";
 
     /// The live album a local id or alias names now: the album itself while
     /// it is live, else the album its alias points at (every merge points
@@ -1603,11 +1597,12 @@ pub(crate) fn artist_keys(scope: ArtistScope, sort: ArtistSort, descending: bool
 }
 
 /// The scope of a walk over the kept counts, whose rows are the credited
-/// artists. A bound on the walked count is written on that column, so the
-/// first page seeks it. A lower bound is left out after a cursor: the
-/// cursor came from a row in scope and the walk only moves up from it, so
-/// the cursor alone seeks. Contributors are the rows leading nothing and
-/// the ones with an appearance, so their walk only filters.
+/// artists. Album artists are the rows leading an album: a bound on the
+/// walked album count is written on that column, so the first page seeks
+/// it, and after a cursor the lower bound is left out, since the cursor
+/// came from a row in scope and the walk only moves up from it. Contributors
+/// are the rows leading nothing and the ones with an appearance, which no
+/// one column bounds, so their walk only filters.
 fn counts_scope(
     scope: ArtistScope,
     sort: ArtistSort,

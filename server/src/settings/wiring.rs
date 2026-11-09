@@ -15,6 +15,8 @@
 
 use std::sync::Arc;
 
+use crate::appearance::store::AppearanceStore;
+use crate::appearance::wiring::AppearanceSetup;
 use crate::bootstrap::Outbound;
 use crate::settings::effects::Effects;
 use crate::settings::library_catalog::SqliteLibraryPolicyCatalog;
@@ -46,6 +48,9 @@ pub struct SettingsSetup {
     bins: BinSource,
     /// The scan history the schedule shows its last scan from.
     scans: Arc<LocalCatalog>,
+    /// The appearance routes, which save the site section through the
+    /// same service.
+    appearance: AppearanceSetup,
 }
 
 impl SettingsSetup {
@@ -56,7 +61,9 @@ impl SettingsSetup {
     /// each other. The Verify routes check keys through `probes`, the
     /// section prefs read Last.fm links through `lastfm`, and the Library
     /// Management settings say through `bins` when the recycle bin path is
-    /// not used.
+    /// not used. The appearance routes use `appearance`, the store the
+    /// admin routes share.
+    #[allow(clippy::too_many_arguments)]
     pub fn build(
         platform: &Platform,
         effects: Effects,
@@ -65,6 +72,7 @@ impl SettingsSetup {
         probes: Arc<dyn VerifyProbes>,
         lastfm: LastFmLinks,
         bins: BinSource,
+        appearance: AppearanceStore,
     ) -> Self {
         let store = platform.settings.clone();
         let service = Arc::new(
@@ -76,6 +84,7 @@ impl SettingsSetup {
                 service.clone(),
                 Arc::new(SqliteLibraryPolicyCatalog::new(platform.db.clone())),
             )),
+            appearance: AppearanceSetup::build(platform, appearance, service.clone()),
             service,
             lifecycle: Arc::new(MusicBrainzLifecycle::new(store, effects, outbound.clone())),
             management,
@@ -167,6 +176,11 @@ impl SettingsSetup {
     pub fn prefs(&self) -> &SectionPrefs {
         &self.prefs
     }
+
+    /// The appearance routes' bundle.
+    pub fn appearance(&self) -> &AppearanceSetup {
+        &self.appearance
+    }
 }
 
 /// Every settings route: the section registry's, the hand-written
@@ -177,6 +191,7 @@ pub fn routes() -> Routes<SettingsSetup> {
         .admin(routes!(h::get_schedule, h::put_schedule))
         .admin(routes!(h::get_library, h::put_library))
         .admin(routes!(h::get_library_policy_tree))
+        .admin(routes!(h::preview_library_script))
         .admin(routes!(h::preview_library_policy_impact))
         .admin(routes!(h::preview_library_policy_apply))
         .admin(routes!(h::get_restorable_library_roots))

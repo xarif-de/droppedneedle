@@ -421,7 +421,7 @@ fn auto_retry_sweep_honors_backoff_newest_wins_and_held_gate() {
     let (entry, _) = held
         .hold(
             &NewEntry {
-                user_id: "u1".to_owned(),
+                user_id: Some("u1".to_owned()),
                 origin: EntryOrigin::Download,
                 key: GroupKey::Album("rg-retry".to_owned()),
                 release_group_mbid: Some("rg-retry".to_owned()),
@@ -1030,6 +1030,7 @@ fn portishead(
             name: "Portishead".to_owned(),
             sort_name: Some("Portishead".to_owned()),
             join: String::new(),
+            disambiguation: None,
         }],
         status: Some("Official".to_owned()),
         media: vec![ReleaseMedium {

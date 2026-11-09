@@ -5,7 +5,8 @@
 -->
 <script lang="ts">
 	import { ArrowRight, ChevronRight, Compass } from 'lucide-svelte';
-	import ArtistImage from '$lib/media/ArtistImage.svelte';
+	import ArtistFan from '$lib/media/ArtistFan.svelte';
+	import { createDeckBeat } from '$lib/media/deckBeat.svelte';
 	import { getDiscoverQueueStatusQuery } from '$lib/features/discover/queries/DiscoverQueueQueries';
 	import { withBasePath } from '$lib/utils/basePath';
 	import type { DiscoverPreview } from '$lib/features/discover/queries/types';
@@ -23,7 +24,14 @@
 		queueStatus.data?.status === 'ready' ? (queueStatus.data.item_count ?? null) : null
 	);
 
-	const teaserArtists = $derived((preview?.items ?? []).slice(0, 4));
+	const beat = createDeckBeat();
+	const fanArtists = $derived(
+		(preview?.items ?? []).slice(0, 4).map((artist, i) => ({
+			key: artist.musicbrainz_id ?? `${artist.name}-${i}`,
+			mbid: artist.musicbrainz_id ?? '',
+			available: Boolean(artist.musicbrainz_id)
+		}))
+	);
 	const headline = $derived(
 		queueCount
 			? `${queueCount} fresh albums are waiting in your Discover queue`
@@ -39,24 +47,8 @@
 
 	<div class="relative flex items-center gap-4 sm:gap-6">
 		<div class="ring" aria-hidden="true">
-			{#if teaserArtists.length > 0}
-				<div class="flex -space-x-3">
-					{#each teaserArtists as artist, i (artist.musicbrainz_id ?? `${artist.name}-${i}`)}
-						<div
-							class="size-8 overflow-hidden rounded-full border-2 border-base-100 sm:size-9"
-							style:z-index={teaserArtists.length - i}
-						>
-							<ArtistImage
-								mbid={artist.musicbrainz_id ?? ''}
-								alt=""
-								size="full"
-								requestSize={250}
-								lazy={true}
-								className="block h-full w-full object-cover"
-							/>
-						</div>
-					{/each}
-				</div>
+			{#if fanArtists.length > 0}
+				<ArtistFan artists={fanArtists} cycle={beat.cycle} class="ring-fan" />
 			{:else}
 				<Compass class="size-7 sm:size-8" />
 			{/if}
@@ -126,6 +118,16 @@
 		border-radius: 9999px;
 		background: var(--color-base-100);
 		color: var(--dn-title);
+		container-type: size;
+		overflow: hidden;
+	}
+
+	/* the fan is laid out for a wider box: shrunk and moved up and left, its
+	   front face sits whole inside the ring */
+	.ring :global(.ring-fan) {
+		position: absolute;
+		inset: 0;
+		transform: translate(-6%, -5%) scale(0.9);
 	}
 	@media (min-width: 640px) {
 		.ring {

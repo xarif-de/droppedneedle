@@ -6,6 +6,10 @@ import { vi } from 'vitest';
 export const h = {
 	preview: {} as Record<string, unknown>,
 	items: {} as Record<string, unknown>,
+	/** The plan-items query's params, as the page passes them. */
+	itemParams: null as (() => Record<string, unknown>) | null,
+	/** Artists the library search finds. */
+	searchArtists: [] as Array<{ id: string; name: string }>,
 	apply: vi.fn(),
 	discard: vi.fn(),
 	resolve: vi.fn(),
@@ -34,12 +38,19 @@ export const policyQueriesMock = {
 };
 
 export const libraryQueriesMock = {
-	getLibrarySearchQuery: () => ({ data: { artists: [], albums: [], tracks: [] } })
+	getLibrarySearchQuery: () => ({ data: { artists: h.searchArtists, albums: [], tracks: [] } })
 };
 
 export const queriesMock = {
 	getLibraryManagementPreviewQuery: () => h.preview,
-	getLibraryManagementPlanItemsQuery: () => h.items,
+	getLibraryManagementPlanItemsQuery: (
+		_user: unknown,
+		_job: unknown,
+		getParams: () => Record<string, unknown>
+	) => {
+		h.itemParams = getParams;
+		return h.items;
+	},
 	getLibraryManagementSettingsQuery: () => ({
 		data: { settings_revision: 'settings-1' },
 		isLoading: false,
@@ -92,6 +103,8 @@ export function detail(overrides: Record<string, unknown> = {}): Record<string, 
 			sidecar_change_count: 0,
 			estimated_temporary_bytes: 1024,
 			expanded_track_count: 1,
+			organized_album_count: 0,
+			organized_file_count: 0,
 			reasons: { PATH_COLLISION_DIFFERENT: 1 },
 			roots: { 'root-1': 2 },
 			formats: { flac: 2 },
@@ -166,6 +179,8 @@ export const collisionItem = {
 export function resetPreviewMocks(): void {
 	vi.clearAllMocks();
 	sessionStorage.clear();
+	h.itemParams = null;
+	h.searchArtists = [];
 	h.preview = { data: detail(), isLoading: false, isError: false };
 	h.items = {
 		data: { pages: [{ items: [collisionItem], next_cursor: null }] },

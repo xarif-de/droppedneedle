@@ -4,6 +4,7 @@
 	import { beforeNavigate, afterNavigate } from '$app/navigation';
 	import { withoutBasePath } from '$lib/utils/basePath';
 	import { authStore } from '$lib/stores/authStore.svelte';
+	import { applyAppearance } from '$lib/features/profile/state/appearance.svelte';
 	import { watchMusicBrainzSourceScope } from '$lib/queries/musicbrainz/sourceScope.svelte';
 	import { libraryStore } from '$lib/stores/library';
 	import { getIntegrationStatusQuery } from '$lib/features/home/queries/home.svelte';
@@ -33,6 +34,7 @@
 	import VersionOverlays from '$lib/shell/VersionOverlays.svelte';
 	import Footer from '$lib/shell/Footer.svelte';
 	import FritFrame from '$lib/ui/FritFrame.svelte';
+	import { part } from '$lib/ui/parts';
 	import Toaster from '$lib/ui/Toaster.svelte';
 	import { onMount, onDestroy, untrack } from 'svelte';
 	import { cancelPendingImages } from '$lib/media/lazyImage';
@@ -73,6 +75,8 @@
 	getIntegrationStatusQuery();
 	loadAdvancedSettings();
 	const viewer = $derived({ isAdmin: authStore.isAdmin, isCurator: authStore.isTrusted });
+	// The account's theme, the site's CSS and the person's own, swapped when the account changes.
+	applyAppearance();
 
 	const NAV_PROGRESS_DELAY_MS = 120;
 	const NAV_PROGRESS_MIN_VISIBLE_MS = 220;
@@ -261,7 +265,7 @@
 <DegradedBanner />
 <VersionOverlays bind:updateAvailable={versionUpdateAvailable} />
 
-<div class="drawer md:drawer-open">
+<div class="drawer md:drawer-open" data-part={part('shell')}>
 	<input id="main-drawer" type="checkbox" class="drawer-toggle" aria-label="Expand sidebar" />
 
 	<div
@@ -274,6 +278,7 @@
 		<div
 			class="droppedneedle-main-content flex-1"
 			class:droppedneedle-player-visible={playerStore.isPlayerVisible}
+			data-part={part('page')}
 		>
 			{#if framed}
 				{#key currentPath}<FritFrame />{/key}

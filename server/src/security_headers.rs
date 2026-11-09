@@ -99,6 +99,11 @@ const SHELL_DIRECTIVES: &[&str] = &[
     // No handler attributes, whatever `script-src` becomes.
     "script-src-attr 'none'",
     // Stylesheets from the app's own files. The page builds no `<style>`.
+    // The stylesheets made at run time are the site's CSS and the person's
+    // own (`frontend/src/lib/stores/customCss.svelte.ts`), and the code
+    // editor's own styles inside its shadow root
+    // (`frontend/src/lib/ui/codeEditor.ts`): constructed sheets this policy
+    // does not govern.
     // `'report-sample'` allows nothing. It makes the browser quote the
     // start of a refused style, which is how a style attribute in a bundle
     // is traced to its component. The app sets its own inline styles
@@ -114,7 +119,11 @@ const SHELL_DIRECTIVES: &[&str] = &[
     // pictures from any web address: artist and album art, chart covers,
     // account pictures from Plex, Jellyfin (often plain http on a LAN) and
     // single sign-on, plugin images. A picture cannot run code, and text
-    // from outside renders no images.
+    // from outside renders no images. Because any host is allowed, the
+    // custom CSS check (no `url()` or other fetching function, no
+    // backslash escapes, no `@import` or `@font-face`), which the server
+    // runs before it stores a sheet, is the only thing keeping those
+    // sheets from loading from anywhere (`src/appearance/check.rs`).
     "img-src 'self' data: blob: https: http:",
     // The app's streams, the silent `data:` unlock clip, the preview hosts.
     "media-src 'self' data: https://*.dzcdn.net https://audio-ssl.itunes.apple.com",

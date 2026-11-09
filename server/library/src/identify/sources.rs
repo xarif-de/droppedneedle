@@ -48,8 +48,9 @@ pub struct SourceError(pub String);
 /// What MusicBrainz says about one artist id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ArtistAnswer {
-    /// The id names an artist MusicBrainz still has.
-    Current,
+    /// The id names an artist MusicBrainz still has, with its
+    /// disambiguation ("US singer"), when MusicBrainz gives one.
+    Current { disambiguation: Option<String> },
     /// MusicBrainz merged the id into this one (lowercased).
     MergedInto(String),
     /// No artist has the id.
@@ -576,7 +577,13 @@ impl ReleaseSource for MusicBrainzView {
                 Ok(Some(lookup)) => {
                     let id = lookup.entity.id.trim().to_ascii_lowercase();
                     Ok(if id == asked {
-                        ArtistAnswer::Current
+                        ArtistAnswer::Current {
+                            disambiguation: lookup
+                                .entity
+                                .disambiguation
+                                .map(|text| text.trim().to_owned())
+                                .filter(|text| !text.is_empty()),
+                        }
                     } else if is_valid_mbid(&id) {
                         ArtistAnswer::MergedInto(id)
                     } else {
@@ -1023,6 +1030,12 @@ pub fn names_from_wire(wire: &MbRelease, fetched_at_ms: i64) -> ArtistNames {
                 name: artist.name.clone(),
                 sort_name: artist.sort_name.clone().filter(|sort| !sort.is_empty()),
                 aliases,
+                disambiguation: artist
+                    .disambiguation
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .map(str::to_owned),
             },
         );
     }
@@ -1190,6 +1203,13 @@ fn credits(credit: &[ArtistCreditName]) -> Vec<CreditedArtist> {
                 .clone()
                 .filter(|name| !name.is_empty()),
             join: entry.joinphrase.clone(),
+            disambiguation: entry
+                .artist
+                .disambiguation
+                .as_deref()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(str::to_owned),
         })
         .collect()
 }

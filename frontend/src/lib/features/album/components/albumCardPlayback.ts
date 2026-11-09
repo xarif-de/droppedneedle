@@ -6,13 +6,12 @@ import { readIntegrationStatus } from '$lib/features/home/queries/home.svelte';
 import { playerStore } from '$lib/features/player/state/player.svelte';
 import { toastStore } from '$lib/stores/toast';
 import {
-	recordingFor,
-	REMOTE_FORMAT,
-	remoteStreamKey
+	buildQueueItemsFromLocal,
+	buildRemoteQueueItems,
+	type TrackMeta
 } from '$lib/features/player/playback/queueHelpers';
-import { getCoverUrl } from '$lib/utils/errorHandling';
-import type { LocalTrackInfo, QueueItem } from '$lib/features/player/playback/types';
-import type { RemoteSource, RemoteTrack } from '$lib/features/remote-library/queries/types';
+import type { QueueItem } from '$lib/features/player/playback/types';
+import type { RemoteSource } from '$lib/features/remote-library/queries/types';
 
 export interface AlbumCardMeta {
 	mbid: string;
@@ -24,44 +23,14 @@ export interface AlbumCardMeta {
 
 type SourceResult = { source: 'local' | 'navidrome' | 'jellyfin' | 'plex'; items: QueueItem[] };
 
-function buildLocalItems(tracks: LocalTrackInfo[], meta: AlbumCardMeta): QueueItem[] {
-	const cover = getCoverUrl(meta.coverUrl, meta.mbid);
-	return tracks.map((t) => ({
-		trackSourceId: String(t.track_file_id),
-		trackName: t.title,
-		artistName: meta.artistName,
-		trackNumber: t.track_number,
+function trackMeta(meta: AlbumCardMeta): TrackMeta {
+	return {
 		albumId: meta.mbid,
 		albumName: meta.albumName,
-		coverUrl: cover,
-		sourceType: 'local' as const,
-		artistId: meta.artistId,
-		format: t.format.toLowerCase()
-	}));
-}
-
-function buildRemoteItems(tracks: RemoteTrack[], meta: AlbumCardMeta): QueueItem[] {
-	const cover = getCoverUrl(meta.coverUrl, meta.mbid);
-	return tracks.flatMap((t) => {
-		const key = remoteStreamKey(t);
-		if (!key) return [];
-		return [
-			{
-				trackSourceId: key,
-				trackName: t.title,
-				artistName: meta.artistName,
-				trackNumber: t.track_number ?? 0,
-				albumId: meta.mbid,
-				albumName: meta.albumName,
-				coverUrl: cover,
-				sourceType: t.source,
-				artistId: meta.artistId,
-				format: REMOTE_FORMAT,
-				recordingIds: recordingFor(t.source, t.recording_mbid),
-				plexRatingKey: t.source === 'plex' ? t.id : undefined
-			}
-		];
-	});
+		artistName: meta.artistName,
+		coverUrl: meta.coverUrl,
+		artistId: meta.artistId
+	};
 }
 
 export async function fetchAlbumQueueItems(
@@ -77,7 +46,10 @@ export async function fetchAlbumQueueItems(
 			fetchLocalAlbumMatch(meta.mbid, signal)
 				.then((data) => {
 					if (!data?.found || data.tracks.length === 0) return null;
-					return { source: 'local' as const, items: buildLocalItems(data.tracks, meta) };
+					return {
+						source: 'local' as const,
+						items: buildQueueItemsFromLocal(data.tracks, trackMeta(meta))
+					};
 				})
 				.catch(() => null)
 		);
@@ -90,7 +62,7 @@ export async function fetchAlbumQueueItems(
 			fetchRemoteAlbumMatch(source, meta.mbid, hints, signal)
 				.then((data) => {
 					if (!data.found || data.tracks.length === 0) return null;
-					return { source, items: buildRemoteItems(data.tracks, meta) };
+					return { source, items: buildRemoteQueueItems(data.tracks, trackMeta(meta)) };
 				})
 				.catch(() => null)
 		);

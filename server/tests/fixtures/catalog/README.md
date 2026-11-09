@@ -1,10 +1,11 @@
 # Catalog fixtures
 
 The `mb_*.json` files are MusicBrainz answers that the catalog page tests
-read through the in-repo mock (`server/testkit/src/musicbrainz.rs`). Their
-origin is unknown. They were added with the catalog page tests on 2026-10-06
-as recorded payloads, and no request, date, server or version was noted with
-them. None is known to be made up, and none is marked as recorded.
+read through the in-repo mock (`server/testkit/src/musicbrainz.rs`). Except
+for `mb_artist_releases_band.json`, which says below where it was recorded,
+their origin is unknown. They were added with the catalog page tests on
+2026-10-06 as recorded payloads, and no request, date, server or version was
+noted with them. None is known to be made up.
 
 - `mb_artist.json`: Radiohead, for `artist/{mbid}` with
   `inc=aliases+tags+url-rels`.

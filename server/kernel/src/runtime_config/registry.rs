@@ -94,6 +94,7 @@ section_list! {
         UserPreferences,
         LibraryScanSchedule,
         FilesystemWatcher,
+        ImportFolder,
         WantedWatcher,
         SourcePriority,
         UsenetBackendSetting,
@@ -108,6 +109,7 @@ section_list! {
         InternalState,
         LibraryManagement,
         EditionPreferences,
+        Appearance,
     ],
     secret: [
         ListenBrainzConnection,

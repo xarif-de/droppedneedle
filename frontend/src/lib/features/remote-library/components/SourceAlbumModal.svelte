@@ -21,7 +21,6 @@
 		compareDiscTrack,
 		normalizeDiscNumber,
 		recordingFor,
-		REMOTE_FORMAT,
 		remoteStreamKey,
 		type TrackMeta,
 		type TrackSourceData
@@ -142,8 +141,9 @@
 					albumName: t.album_name,
 					coverUrl: t.image_url ?? null,
 					sourceType: 'jellyfin' as const,
-					format: REMOTE_FORMAT,
-					recordingIds: recordingFor('jellyfin', t.recording_mbid)
+					format: t.format ?? undefined,
+					recordingIds: recordingFor('jellyfin', t.recording_mbid),
+					duration: t.duration_secs ?? undefined
 				}));
 				playerStore.playQueue(items, 0, false);
 			}

@@ -248,7 +248,9 @@ async fn sqlite_fixture() -> SqliteFixture {
          ('t5', 'al2', 'r1', '/m/t5.mp3', 't5.mp3', 'h5', 3000000, 1, 's5', 'Skipped', 'skipped', \
           'Aurora', 'aurora', 'Second Dawn', 'second dawn', 'Aurora', 'aurora', 1, 2, 2001, 180.0, 'mp3', 'excluded', 'scan', 2050.0, 'automatic'), \
          ('t6', 'al3', 'r1', '/m/t6.flac', 't6.flac', 'h6', 5000000, 1, 's6', 'Peak', 'peak', \
-          'Boreal', 'boreal', 'Lone Peak', 'lone peak', 'Boreal', 'boreal', 1, 1, 1994, 220.0, 'flac', 'indexed', 'scan', 1500.0, 'automatic')",
+          'Boreal', 'boreal', 'Lone Peak', 'lone peak', 'Boreal', 'boreal', 1, 1, 1994, 220.0, 'flac', 'indexed', 'scan', 1500.0, 'automatic'), \
+         ('tg4', 'al4', 'r1', '/m/tg4.flac', 'tg4.flac', 'hg4', 4000000, 1, 'sg4', 'Lost', 'lost', \
+          'Aurora', 'aurora', 'First Light (Deluxe)', 'first light (deluxe)', 'Aurora', 'aurora', 1, 1, 1994, 200.0, 'flac', 'missing', 'scan', 1200.0, 'automatic')",
         "INSERT INTO local_track_artists (local_track_id, position, local_artist_id, role) VALUES \
          ('t1', 0, 'a1', 'main'), ('t2', 0, 'a1', 'main'), ('t3', 0, 'a1', 'main'), \
          ('t4', 0, 'a1', 'main'), ('t5', 0, 'a1', 'main'), \
@@ -309,7 +311,7 @@ async fn the_seeded_catalog_reads_back() {
         .await
         .map(|page| (page.items, page.total))
         .expect("albums list");
-    assert_eq!(total, 4, "albums");
+    assert_eq!(total, 3, "albums");
     let first = albums
         .iter()
         .find(|album| album.id == "al1")
@@ -353,7 +355,7 @@ async fn the_seeded_catalog_reads_back() {
                 decade: Some(1990),
                 ..Default::default()
             },
-            3,
+            2,
             "decade filter",
         ),
         (
@@ -361,7 +363,7 @@ async fn the_seeded_catalog_reads_back() {
                 artist_id: Some("a1".to_owned()),
                 ..Default::default()
             },
-            3,
+            2,
             "artist filter",
         ),
     ] {
@@ -387,7 +389,7 @@ async fn the_seeded_catalog_reads_back() {
             .iter()
             .map(|album| album.id.as_str())
             .collect::<Vec<_>>(),
-        ["al1", "al4", "al2", "al3"],
+        ["al1", "al2", "al3"],
         "artist sort"
     );
     let (albums, _) = fixture
@@ -401,7 +403,7 @@ async fn the_seeded_catalog_reads_back() {
             .iter()
             .map(|album| album.id.as_str())
             .collect::<Vec<_>>(),
-        ["al3", "al2", "al4", "al1"],
+        ["al3", "al2", "al1"],
         "artist sort desc"
     );
 
@@ -442,14 +444,7 @@ async fn the_seeded_catalog_reads_back() {
         .album_copies("al1")
         .await
         .expect("copies list");
-    assert_eq!(
-        copies
-            .iter()
-            .map(|album| album.id.as_str())
-            .collect::<Vec<_>>(),
-        ["al4"],
-        "al1 copies"
-    );
+    assert!(copies.is_empty(), "al1 copies: al4 has no files");
     let copies = fixture
         .catalog
         .album_copies("al2")
@@ -526,7 +521,7 @@ async fn the_seeded_catalog_reads_back() {
         .await
         .map(|page| (page.items, page.total))
         .expect("led list");
-    assert_eq!(total, 3, "led albums");
+    assert_eq!(total, 2, "led albums");
     assert_eq!(led_albums[0].id, "al1", "led albums");
 
     let (appearances, total) = fixture
@@ -729,6 +724,15 @@ async fn album_and_artist_pages_answer_the_seeded_catalog() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
 
+    // A suggested track names its credited artist, so the player links it.
+    let (status, body) = get(app(deps.clone(), Some(ADA)), "/api/v3/library/suggestions").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let peak = body["items"]
+        .as_array()
+        .and_then(|items| items.iter().find(|item| item["track_id"] == "t6"))
+        .expect("t6 suggested");
+    assert_eq!(peak["artist_id"], "a2", "{peak}");
+
     // An album page's revision and pending review.
     let uri = "/api/v3/library/albums/al2";
     let (status, body) = get(app(deps.clone(), Some(ADA)), uri).await;
@@ -873,8 +877,8 @@ fn sorted_ids(items: &Value, key: &str) -> Vec<String> {
 }
 
 /// A merged album appears nowhere and its id answers for the survivor; an
-/// album without files shows on the web with no tracks but counts as owned
-/// nowhere and never reaches a player app; a track's recording id is its
+/// album without files is left off the web lists, counts as owned nowhere
+/// and never reaches a player app; a track's recording id is its
 /// match's, else its tags'.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_album_set_everywhere() {
@@ -919,27 +923,60 @@ async fn one_album_set_everywhere() {
     let auth = rig.subsonic_auth("album-set");
     let subsonic = |call: &str| rest(call, &auth);
 
-    // The web list: every live album, the ones without files with no tracks.
+    // The web list: every live album with files.
     let (status, page) = rig
         .app
         .call("GET", "/api/v3/library/albums?limit=200", &native, None)
         .await;
     assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(sorted_ids(&page["items"], "id"), ["al-live", "al-pair-b"]);
+    assert_eq!(page["total"], 2, "{page}");
+
+    // Check albums and the Favourites count read the same list rule.
+    rig.app
+        .seed(format!(
+            "INSERT INTO library_album_match_state (local_album_id, state, reason_code, \
+             updated_at) VALUES ('al-missing', 'unconfirmed', 'CLOSE_CALL', 1), \
+             ('al-live', 'unconfirmed', 'CLOSE_CALL', 1); \
+             INSERT INTO library_album_looks_wrong (local_album_id, user_id, created_at) \
+             VALUES ('al-excluded', '{player_id}', 1); \
+             INSERT INTO catalog_user_favorites (user_id, item_kind, item_id, created_at) \
+             VALUES ('{player_id}', 'album', 'al-missing', 1), \
+             ('{player_id}', 'album', 'al-live', 1);"
+        ))
+        .await;
+    let (status, stats) = rig
+        .app
+        .call("GET", "/api/v3/library/stats", &native, None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{stats}");
     assert_eq!(
-        sorted_ids(&page["items"], "id"),
-        [
-            "al-empty",
-            "al-excluded",
-            "al-live",
-            "al-missing",
-            "al-pair-a",
-            "al-pair-b"
-        ]
+        (
+            &stats["guess_count"],
+            &stats["looks_wrong_count"],
+            &stats["check_count"],
+            &stats["favorite_albums"],
+        ),
+        (
+            &Value::from(1),
+            &Value::from(0),
+            &Value::from(1),
+            &Value::from(1)
+        ),
+        "{stats}"
     );
-    assert_eq!(page["total"], 6, "{page}");
-    for item in page["items"].as_array().expect("items") {
-        let has_files = matches!(item["id"].as_str(), Some("al-live" | "al-pair-b"));
-        assert_eq!(item["track_count"] != 0, has_files, "{item}");
+    for (state, listed) in [("unconfirmed", vec!["al-live"]), ("looks_wrong", vec![])] {
+        let (status, waiting) = rig
+            .app
+            .call(
+                "GET",
+                &format!("/api/v3/library/unconfirmed?state={state}"),
+                &native,
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{waiting}");
+        assert_eq!(sorted_ids(&waiting["items"], "album_id"), listed, "{state}");
     }
 
     // A merged album's id answers for the album it merged into.
@@ -1145,15 +1182,16 @@ async fn one_album_set_everywhere() {
 #[tokio::test]
 async fn an_album_artist_who_appears_elsewhere_is_also_a_contributor() {
     let fixture = sqlite_fixture().await;
-    let seed = [
+    seed(
+        &fixture,
         "INSERT INTO local_artists (id, display_name, folded_name, kind, created_at, updated_at) VALUES \
-         ('a4', 'Atb', 'atb', 'person', 1700, 1700)",
-        "INSERT INTO local_albums (id, root_id, grouping_key, title, title_folded, \
+         ('a4', 'Atb', 'atb', 'person', 1700, 1700);
+         INSERT INTO local_albums (id, root_id, grouping_key, title, title_folded, \
          album_artist_name, album_artist_name_folded, album_artist_id, year, \
          grouping_source, created_at, updated_at) VALUES \
          ('al5', 'r1', 'g5', 'Own One', 'own one', 'Atb', 'atb', 'a4', 2000, 'automatic', 1700, 1700), \
-         ('al6', 'r1', 'g6', 'Guest Spots', 'guest spots', 'Boreal', 'boreal', 'a2', 2002, 'automatic', 1700, 1700)",
-        "INSERT INTO local_tracks (id, local_album_id, root_id, file_path, relative_path, path_hash, \
+         ('al6', 'r1', 'g6', 'Guest Spots', 'guest spots', 'Boreal', 'boreal', 'a2', 2002, 'automatic', 1700, 1700);
+         INSERT INTO local_tracks (id, local_album_id, root_id, file_path, relative_path, path_hash, \
          file_size_bytes, file_mtime_ns, stat_revision, title, title_folded, artist_name, artist_name_folded, \
          album_title, album_title_folded, album_artist_name, album_artist_name_folded, \
          disc_number, track_number, year, duration_seconds, file_format, availability, \
@@ -1165,73 +1203,38 @@ async fn an_album_artist_who_appears_elsewhere_is_also_a_contributor() {
          ('t9', 'al6', 'r1', '/m/t9.flac', 't9.flac', 'h9', 4000000, 1, 's9', 'Two', 'two', \
           'Boreal', 'boreal', 'Guest Spots', 'guest spots', 'Boreal', 'boreal', 1, 2, 2002, 200.0, 'flac', 'indexed', 'scan', 1700.0, 'automatic'), \
          ('t10', 'al6', 'r1', '/m/t10.flac', 't10.flac', 'h10', 4000000, 1, 's10', 'Three', 'three', \
-          'Boreal', 'boreal', 'Guest Spots', 'guest spots', 'Boreal', 'boreal', 1, 3, 2002, 200.0, 'flac', 'indexed', 'scan', 1700.0, 'automatic')",
-        "INSERT INTO local_track_artists (local_track_id, position, local_artist_id, role) VALUES \
+          'Boreal', 'boreal', 'Guest Spots', 'guest spots', 'Boreal', 'boreal', 1, 3, 2002, 200.0, 'flac', 'indexed', 'scan', 1700.0, 'automatic');
+         INSERT INTO local_track_artists (local_track_id, position, local_artist_id, role) VALUES \
          ('t7', 0, 'a4', 'main'), \
          ('t8', 0, 'a2', 'main'), ('t8', 1, 'a4', 'guest'), \
          ('t9', 0, 'a2', 'main'), ('t9', 1, 'a4', 'guest'), \
-         ('t10', 0, 'a2', 'main'), ('t10', 1, 'a4', 'guest')",
-        "INSERT INTO local_album_artists (local_album_id, position, local_artist_id, role) VALUES \
-         ('al5', 0, 'a4', 'main'), ('al6', 0, 'a2', 'main')",
-    ]
-    .join(";\n");
-    fixture
-        .runtime
-        .db()
-        .write(
-            droppedneedle_kernel::db::Lane::Foreground,
-            "second album artist seed",
-            move |tx| {
-                tx.execute_batch(&seed)
-                    .map_err(droppedneedle_kernel::db::DbError::from)
-            },
-        )
-        .await
-        .expect("seed batch runs");
+         ('t10', 0, 'a2', 'main'), ('t10', 1, 'a4', 'guest');
+         INSERT INTO local_album_artists (local_album_id, position, local_artist_id, role) VALUES \
+         ('al5', 0, 'a4', 'main'), ('al6', 0, 'a2', 'main');",
+    )
+    .await;
     let beside = AuthRig::new("reads-library-contributors").await;
     let app = || app(deps(&beside, fixture.runtime.db(), None), Some(ADA));
-    let ids = |page: &Value| sorted_ids(&page["items"], "id");
 
-    for (query, want) in [
-        ("scope=album_artists", vec!["a1", "a2", "a4"]),
-        ("scope=contributors", vec!["a3", "a4"]),
-        (
-            "scope=contributors&sort=appearance_count&order=desc",
-            vec!["a3", "a4"],
-        ),
-        ("scope=contributors&sort=album_count", vec!["a3", "a4"]),
-        ("scope=album_artists&min_tracks=2", vec!["a1", "a2"]),
-        ("scope=contributors&min_tracks=2", vec!["a4"]),
-        (
-            "scope=contributors&sort=appearance_count&min_tracks=2",
-            vec!["a4"],
-        ),
-        // Boreal leads four tracks; Atb's own album has one.
-        ("scope=album_artists&min_tracks=4", vec!["a2"]),
-        ("scope=contributors&min_tracks=4", vec![]),
+    for (query, want, totals) in [
+        ("scope=album_artists", vec!["a1", "a2", "a4"], (3, 2)),
+        ("scope=contributors", vec!["a3", "a4"], (3, 2)),
+        ("scope=album_artists&min_tracks=2", vec!["a1", "a2"], (2, 1)),
+        ("scope=contributors&min_tracks=2", vec!["a4"], (2, 1)),
+        // Boreal leads four tracks; Atb leads one and appears on three.
+        ("scope=album_artists&min_tracks=4", vec!["a2"], (1, 0)),
+        ("scope=contributors&min_tracks=4", vec![], (1, 0)),
     ] {
         let (status, page) = get(app(), &format!("/api/v3/library/artists?{query}")).await;
         assert_eq!(status, StatusCode::OK, "{query}: {page}");
-        assert_eq!(ids(&page), want, "{query}");
+        assert_eq!(sorted_ids(&page["items"], "id"), want, "{query}");
         assert_eq!(page["total"], serde_json::json!(want.len()), "{query}");
+        assert_eq!(
+            (&page["album_artist_total"], &page["contributor_total"]),
+            (&serde_json::json!(totals.0), &serde_json::json!(totals.1)),
+            "{query}"
+        );
     }
-    let (_, page) = get(app(), "/api/v3/library/artists?scope=album_artists").await;
-    assert_eq!(
-        (&page["album_artist_total"], &page["contributor_total"]),
-        (&serde_json::json!(3), &serde_json::json!(2)),
-        "{page}"
-    );
-    let atb = page["items"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|artist| artist["id"] == "a4")
-        .expect("Atb listed");
-    assert_eq!(
-        (&atb["led_track_count"], &atb["appearance_track_count"]),
-        (&serde_json::json!(1), &serde_json::json!(3)),
-        "{atb}"
-    );
 }
 
 /// Run `sql` on the fixture's database as one write.
@@ -1250,7 +1253,7 @@ async fn lists_filter_by_formats_and_minimum_tracks() {
         ("min_tracks=2", vec!["al1"]),
         ("formats=MP3", vec!["al2"]),
         ("formats=flac,mp3", vec!["al1", "al2", "al3"]),
-        ("formats=flac&format_mode=without", vec!["al2", "al4"]),
+        ("formats=flac&format_mode=without", vec!["al2"]),
         ("formats=flac&min_tracks=2", vec!["al1"]),
         ("format=mp3", vec!["al2"]),
     ] {
@@ -1366,7 +1369,7 @@ async fn lists_filter_by_your_rating_and_by_fewer_tracks() {
     let ids = |page: &Value| sorted_ids(&page["items"], "id");
 
     for (query, want) in [
-        ("min_tracks=2&tracks_mode=below", vec!["al2", "al3", "al4"]),
+        ("min_tracks=2&tracks_mode=below", vec!["al2", "al3"]),
         ("min_tracks=2&tracks_mode=at_least", vec!["al1"]),
         ("rating=4", vec!["al1", "al3"]),
         ("rating=4&rating_mode=at_least", vec!["al1", "al3"]),

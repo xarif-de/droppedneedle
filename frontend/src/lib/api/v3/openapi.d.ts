@@ -485,6 +485,43 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v3/admin/users/{id}/custom-css": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** What one user's custom CSS is, never its text. */
+        get: operations["get_user_custom_css"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v3/admin/users/{id}/custom-css/turn-off": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Switch one user's custom CSS off, keeping its text so they can see it
+         *     and switch it back on.
+         */
+        post: operations["turn_off_user_custom_css"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v3/admin/users/{id}/quota": {
         parameters: {
             query?: never;
@@ -3688,6 +3725,27 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v3/library/artists/duplicate-groups/{group_id}/undo": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Undo a join of records made because they share a name: each record
+         *     comes back with its songs, plays, favorites and ratings, less what
+         *     changed since, and the records are marked as different artists.
+         */
+        post: operations["undo_artist_duplicate_group"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v3/library/artists/merge": {
         parameters: {
             query?: never;
@@ -5615,6 +5673,64 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v3/me/appearance": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Read your own theme and custom CSS, with the site's CSS. */
+        get: operations["get_my_appearance"];
+        /**
+         * Save your own theme or custom CSS. A field left out keeps its value,
+         *     and a change any part of which is refused saves nothing.
+         */
+        put: operations["put_my_appearance"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v3/me/appearance/css-saves": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List your last saves of your custom CSS, newest first. */
+        get: operations["list_my_css_saves"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v3/me/appearance/import": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Move the theme and CSS this browser kept to your account, once. An
+         *     account that already holds them keeps its own and changes nothing.
+         */
+        post: operations["import_my_appearance"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v3/me/avatar": {
         parameters: {
             query?: never;
@@ -5884,6 +6000,26 @@ export interface paths {
         post: operations["heartbeat"];
         /** Clear one native device (stop presence). */
         delete: operations["clear_now_playing"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v3/playback/conversion": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Whether a stream that asks for a format is converted, so the web player
+         *     knows before it asks.
+         */
+        get: operations["playback_conversion"];
+        put?: never;
+        post?: never;
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -7693,6 +7829,27 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v3/settings/appearance": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Read the site CSS and whether people may add their own. */
+        get: operations["get_site_appearance"];
+        /**
+         * Save the site CSS and whether people may add their own. The site CSS
+         *     passes the same check as a person's, with a longer limit.
+         */
+        put: operations["put_site_appearance"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v3/settings/connect-apps": {
         parameters: {
             query?: never;
@@ -8393,6 +8550,47 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v3/settings/library/import-folder": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Read the import folder setting. */
+        get: operations["get_import_folder"];
+        /**
+         * Save the import folder. Music copied there is imported, then
+         *     removed from it.
+         */
+        put: operations["put_import_folder"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v3/settings/library/import-folder/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * What the import folder is doing now, or why it waits.
+         *     `GET /api/v3/settings/library/import-folder/status`.
+         */
+        get: operations["import_folder_status_handler"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v3/settings/library/policy-apply-preview": {
         parameters: {
             query?: never;
@@ -8502,6 +8700,27 @@ export interface paths {
         /** Save the scan schedule. */
         put: operations["put_schedule"];
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v3/settings/library/script-preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Show a naming or tagging script on the built-in example albums while
+         *     it is written. Nothing is saved; a script that fails answers why in
+         *     the 200 body.
+         */
+        post: operations["preview_library_script"];
         delete?: never;
         options?: never;
         head?: never;
@@ -9959,7 +10178,7 @@ export interface components {
          * @description What one history entry tells.
          * @enum {string}
          */
-        AlbumHistoryKindView: "tracks_continued" | "tracks_replaced" | "retag_joined" | "retag_half_left_alone" | "retag_dismissal_ended" | "leftover_joined" | "tracks_other_music" | "tracks_new_copy" | "artist_from_tracks" | "edition_changed" | "edition_chosen" | "match_withdrawn" | "edition_change_undone" | "fold_undone" | "unfolded_from" | "hand_back_given_up";
+        AlbumHistoryKindView: "tracks_continued" | "tracks_replaced" | "retag_joined" | "retag_half_left_alone" | "retag_dismissal_ended" | "leftover_joined" | "marks_followed" | "tracks_other_music" | "tracks_new_copy" | "artist_from_tracks" | "edition_changed" | "edition_chosen" | "match_withdrawn" | "edition_change_undone" | "fold_undone" | "unfolded_from" | "hand_back_given_up";
         /**
          * @description An album's history, newest first: at most ten entries, none older than
          *     180 days.
@@ -10429,6 +10648,37 @@ export interface components {
             name: string;
         };
         /**
+         * @description Site-wide appearance. The server's appearance routes check the sheet
+         *     before it is saved; the kernel only holds it.
+         */
+        Appearance: {
+            /**
+             * @description Let people add their own CSS on top of the site's.
+             * @default true
+             */
+            allow_user_css: boolean;
+            /**
+             * @description CSS every signed-in page loads on top of the app's own styles.
+             * @default
+             */
+            site_css: string;
+        };
+        /** @description The answer to the one-time move from the browser. */
+        AppearanceImported: components["schemas"]["MyAppearance"] & {
+            /**
+             * @description True when this call wrote it; false when the account already held
+             *     one and nothing changed.
+             */
+            imported: boolean;
+        };
+        /** @description A change to the caller's appearance. A field left out keeps its value. */
+        AppearanceUpdate: {
+            /** @description The caller's own CSS. */
+            custom_css?: components["schemas"]["CustomCssUpdate"];
+            /** @description The theme to use. */
+            theme?: components["schemas"]["ThemeChoice"];
+        };
+        /**
          * @description What Apply did with a finding.
          * @enum {string}
          */
@@ -10550,6 +10800,8 @@ export interface components {
              * @description Credits, favorites and plays a merge would move.
              */
             affected_reference_count: number;
+            /** @description The merge is a join by name an administrator can undo. */
+            can_undo: boolean;
             display_name: string;
             /** @description Stable for the same set of records. */
             id: string;
@@ -10569,6 +10821,22 @@ export interface components {
              */
             resolved_at?: number | null;
             state: components["schemas"]["ArtistGroupState"];
+        };
+        /** @description What undoing a join put back. */
+        ArtistDuplicateGroupUndoResponse: {
+            group_id: string;
+            /** @description Rows the join moved that changed since and stay where they are. */
+            left_in_place: {
+                [key: string]: number;
+            };
+            /** @description Rows moved back, by kind (`album_credits`, `plays`, `favorites`, ...). */
+            put_back: {
+                [key: string]: number;
+            };
+            /** @description The records split off again, each live once more. */
+            restored_artist_ids: string[];
+            /** @description The record the join kept. */
+            surviving_artist_id: string;
         };
         /** @description Enriched artist counts. Absent counts mean unknown, never zero. */
         ArtistEnrichment: {
@@ -10846,6 +11114,11 @@ export interface components {
             active_credit_count: number;
             /** Format: int64 */
             album_credit_count: number;
+            /**
+             * @description MusicBrainz's short note on the linked artist ("US singer"), set
+             *     only while another record has the same name.
+             */
+            disambiguation?: string | null;
             /** Format: int64 */
             favorite_count: number;
             /** Format: int64 */
@@ -10983,6 +11256,11 @@ export interface components {
              * @description First import time, unix seconds.
              */
             date_added?: number | null;
+            /**
+             * @description MusicBrainz's short note on who this is ("US singer"), set only
+             *     when another artist in the library has the same name.
+             */
+            disambiguation?: string | null;
             /** @description True when the caller favorited this artist. */
             favorite: boolean;
             /** @description Local artist id. */
@@ -12190,6 +12468,11 @@ export interface components {
          */
         ControlRequest: "none" | "pause" | "stop";
         /**
+         * @description Whether the server converts a stream that asks for a format.
+         * @enum {string}
+         */
+        Conversion: "on" | "off" | "unavailable";
+        /**
          * @description Which correction was applied.
          * @enum {string}
          */
@@ -12270,6 +12553,66 @@ export interface components {
             name: string;
             /** @description Import provenance (`<source>:<id>`), when the playlist was imported. */
             source_ref?: string | null;
+        };
+        /** @description One refused part of a sheet. */
+        CssProblem: {
+            /**
+             * Format: int32
+             * @description The 1-based line it first appears on; 0 for `too_long`.
+             */
+            line: number;
+            /**
+             * @description What is refused: `backslash`, `import`, `font_face`, `too_long`, or
+             *     `function:<name>` with the name in lower case.
+             */
+            what: string;
+        };
+        /** @description What a refused sheet answers in the error's `details`. */
+        CssRefusal: {
+            /**
+             * @description Each refused part of the sheet, once, in the order the check reads
+             *     them.
+             */
+            problems: components["schemas"]["CssProblem"][];
+        };
+        /** @description One kept save of a person's CSS. */
+        CssSave: {
+            /** @description The sheet as saved. */
+            css: string;
+            /**
+             * Format: int64
+             * @description The save's id.
+             */
+            id: number;
+            /**
+             * Format: int64
+             * @description When it was saved, unix milliseconds.
+             */
+            saved_at: number;
+        };
+        /** @description What an admin sees of a person's CSS: never the text. */
+        CustomCssSummary: {
+            /** @description The person's "Use my CSS" switch. */
+            enabled: boolean;
+            /** @description Whether the person has CSS saved. */
+            has_css: boolean;
+            /**
+             * Format: int64
+             * @description The sheet's length in characters, as the limit counts them.
+             */
+            length: number;
+            /**
+             * Format: int64
+             * @description When the text last changed, unix milliseconds.
+             */
+            saved_at?: number | null;
+        };
+        /** @description A change to a person's own CSS. A field left out keeps its value. */
+        CustomCssUpdate: {
+            /** @description The "Use my CSS" switch. */
+            enabled?: boolean;
+            /** @description The new sheet; an empty one clears it. */
+            text?: string;
         };
         /** @description Seal a custom edition. */
         CustomEditionBody: {
@@ -13950,7 +14293,7 @@ export interface components {
          * @description Where an entry's files came from.
          * @enum {string}
          */
-        EntryOrigin: "download" | "upload";
+        EntryOrigin: "download" | "upload" | "import_folder";
         /**
          * @description Where an entry is in its life.
          * @enum {string}
@@ -14081,6 +14424,13 @@ export interface components {
          * @enum {string}
          */
         EvidenceClass: "supported" | "unknown" | "contradictory";
+        /**
+         * @description The built-in example albums a script is shown against: one disc, two
+         *     discs with an edition note, and an album artist whose name another
+         *     artist shares, told apart by MusicBrainz's disambiguation.
+         * @enum {string}
+         */
+        ExampleAlbum: "one_disc" | "two_discs" | "name_shared";
         /**
          * @description Extension case policy.
          * @enum {string}
@@ -14308,6 +14658,11 @@ export interface components {
             /** @description Followed artists. */
             artists: components["schemas"]["FollowedArtist"][];
         };
+        /**
+         * @description Whether a list keeps the items in its `formats` or the ones in none.
+         * @enum {string}
+         */
+        FormatMode: "with" | "without";
         /** @description One genre alias. */
         GenreAlias: {
             /**
@@ -14582,9 +14937,10 @@ export interface components {
             drop_item_id?: number | null;
             /**
              * Format: int64
-             * @description When its held files are removed, in milliseconds.
+             * @description When its held files are removed, in milliseconds. `None` for files
+             *     left in the import folder, which stay until a person decides.
              */
-            expires_at: number;
+            expires_at?: number | null;
             files: components["schemas"]["HeldFileResponse"][];
             /** Format: int64 */
             id: number;
@@ -14650,7 +15006,7 @@ export interface components {
             recording_mbid?: string | null;
             release_mbid?: string | null;
             release_track_mbid?: string | null;
-            /** @description `soulseek`, `usenet`, `plugin:<key>` or `upload`. */
+            /** @description `soulseek`, `usenet`, `plugin:<key>`, `upload` or `import_folder`. */
             source: string;
             source_task_id?: string | null;
             /** Format: int64 */
@@ -14938,6 +15294,40 @@ export interface components {
             /** @description The reason as a plain sentence. */
             reason_text?: string | null;
         };
+        /**
+         * @description The folder on the server DroppedNeedle imports music from by itself and
+         *     empties as it goes. An empty path turns it off.
+         */
+        ImportFolder: {
+            /**
+             * @description An absolute folder path as the server sees it, or empty for off.
+             * @default
+             */
+            path: string;
+        };
+        /**
+         * @description Which kind of folder the import folder overlaps.
+         * @enum {string}
+         */
+        ImportFolderOverlap: "library" | "recycle_bin" | "downloads" | "app";
+        /**
+         * @description What the import folder is doing, or why it waits.
+         * @enum {string}
+         */
+        ImportFolderState: "off" | "watching" | "importing" | "waiting_for_scan" | "retrying" | "library_off" | "settings_unreadable" | "unreachable" | "read_only" | "overlaps";
+        /** @description What the import folder is doing, or why it waits. */
+        ImportFolderStatusResponse: {
+            /** @description With `overlaps`: the kind of folder it overlaps. */
+            overlap?: null | components["schemas"]["ImportFolderOverlap"];
+            /** @description With `overlaps`: that folder's path. */
+            overlap_path?: string | null;
+            state: components["schemas"]["ImportFolderState"];
+            /**
+             * Format: int64
+             * @description Albums found and still to go in.
+             */
+            waiting: number;
+        };
         /** @description Receipt for a playlist import into the local catalog. */
         ImportResult: {
             /** @description True when this exact playlist was already imported. */
@@ -15048,7 +15438,7 @@ export interface components {
             download_client: boolean;
             /** @description A Jellyfin source is connected. */
             jellyfin: boolean;
-            /** @description Last.fm is connected. */
+            /** @description The admin has switched Last.fm on for this server. */
             lastfm: boolean;
             /** @description The native library has files. */
             library: boolean;
@@ -16834,6 +17224,11 @@ export interface components {
             expected_settings_revision: string;
             /** @description Makes a retried request return the same preview. */
             idempotency_key?: string | null;
+            /**
+             * @description Also plan albums already organized with these settings and
+             *     unchanged since. A preview of one album always plans it.
+             */
+            include_organized?: boolean;
             /** @description Switches for this run only, on top of the profile. */
             overrides?: null | components["schemas"]["LibraryManagementRootOverrides"];
             profile_id: string;
@@ -17032,6 +17427,16 @@ export interface components {
             metadata_snapshot_ids: string[];
             /** Format: int64 */
             no_change_count: number;
+            /**
+             * Format: int64
+             * @description Albums left out because they are already organized.
+             */
+            organized_album_count: number;
+            /**
+             * Format: int64
+             * @description Files of the albums left out as already organized.
+             */
+            organized_file_count: number;
             /** Format: int64 */
             path_change_count: number;
             /** @description Files per reason code. */
@@ -17468,10 +17873,33 @@ export interface components {
             /** @description Folder name. */
             name: string;
         };
+        /** @description Everything the browser needs to paint the caller's pages. */
+        MyAppearance: {
+            /** @description The caller's own CSS. */
+            custom_css: components["schemas"]["MyCustomCss"];
+            /** @description The site's CSS and whether the caller's own applies. */
+            site: components["schemas"]["SiteAppearance"];
+            /** @description False while the caller has saved nothing to their account. */
+            stored: boolean;
+            /** @description The theme the caller chose, or null while they chose none. */
+            theme?: null | components["schemas"]["ThemeChoice"];
+        };
         /** @description The caller's choices for their music apps. */
         MyConnectApps: {
             /** @description Apps list other people's public playlists as well as the caller's. */
             include_public_playlists: boolean;
+        };
+        /** @description A person's own CSS. */
+        MyCustomCss: {
+            /** @description The "Use my CSS" switch. Off keeps the text but applies none of it. */
+            enabled: boolean;
+            /**
+             * Format: int64
+             * @description When the text last changed, unix milliseconds.
+             */
+            saved_at?: number | null;
+            /** @description The sheet, empty when there is none. */
+            text: string;
         };
         /** @description One naming script. */
         NamingScript: {
@@ -18030,6 +18458,8 @@ export interface components {
                  * @description Credits, favorites and plays a merge would move.
                  */
                 affected_reference_count: number;
+                /** @description The merge is a join by name an administrator can undo. */
+                can_undo: boolean;
                 display_name: string;
                 /** @description Stable for the same set of records. */
                 id: string;
@@ -18708,6 +19138,11 @@ export interface components {
         /** @description The download a pick started. */
         PickResponse: {
             task_id: string;
+        };
+        /** @description Whether the web player's format asks are converted. */
+        PlaybackConversion: {
+            /** @description On, turned off by an admin, or impossible without ffmpeg. */
+            conversion: components["schemas"]["Conversion"];
         };
         /** @description Heartbeat for a live session: keeps presence alive and the scrubber live. */
         PlaybackProgressRequest: {
@@ -20135,6 +20570,11 @@ export interface components {
                 [key: string]: number;
             };
         };
+        /**
+         * @description Which side of `rating` a list keeps.
+         * @enum {string}
+         */
+        RatingMode: "at_least" | "at_most";
         /** @description Rating-status answer. */
         RatingStatusResponse: {
             /**
@@ -20646,6 +21086,12 @@ export interface components {
              * @description Duration in seconds.
              */
             duration_secs?: number | null;
+            /**
+             * @description The file's format in the library's names (`flac`, `mp3`, `alac`,
+             *     `m4a` for an MP4 file whose codec the server did not say), when the
+             *     source reports it.
+             */
+            format?: string | null;
             /** @description Opaque remote id. */
             id: string;
             /** @description Relative images URL under `/api/v3`, when art exists. */
@@ -21809,6 +22255,66 @@ export interface components {
          * @enum {string}
          */
         ScanTrigger: "manual" | "automatic" | "subsonic" | "startup_resume" | "policy_apply";
+        /** @description A misspelt name and the known name it is closest to. */
+        ScriptNameSuggestion: {
+            /** @description The name as the script wrote it. */
+            found: string;
+            name: string;
+        };
+        /** @description Why a script fails, and where. */
+        ScriptPreviewFault: {
+            /** Format: int32 */
+            column: number;
+            /** Format: int32 */
+            line: number;
+            message: string;
+            /** @description The known name closest to the one the script misspelt. */
+            suggestion?: null | components["schemas"]["ScriptNameSuggestion"];
+        };
+        /**
+         * @description Which script is being written.
+         * @enum {string}
+         */
+        ScriptPreviewKind: "import_naming" | "naming" | "tagging";
+        /** @description A script to show against the example albums. */
+        ScriptPreviewRequest: {
+            kind: components["schemas"]["ScriptPreviewKind"];
+            source: string;
+        };
+        /** @description The script on every example album. */
+        ScriptPreviewResponse: {
+            /**
+             * @description Why the script does not compile or breaks a rule; the examples
+             *     then carry their values only.
+             */
+            fault?: null | components["schemas"]["ScriptPreviewFault"];
+            samples: components["schemas"]["ScriptPreviewSample"][];
+        };
+        /** @description The script on one example album. */
+        ScriptPreviewSample: {
+            /**
+             * @description The path's names as written, when one of them came out empty
+             *     (each empty one as `""`).
+             */
+            empty_name_parts?: string[] | null;
+            /** @description Why the script fails on this example. */
+            fault?: null | components["schemas"]["ScriptPreviewFault"];
+            /** @description The path a naming script gives the example track. */
+            path?: string | null;
+            sample: components["schemas"]["ExampleAlbum"];
+            /** @description The tags a tagging script changes, by name. */
+            tags: components["schemas"]["ScriptTagChange"][];
+            /** @description Every value the script can read here, as text. */
+            values: {
+                [key: string]: string;
+            };
+        };
+        /** @description One tag a tagging script changes; `after` is empty when it removes it. */
+        ScriptTagChange: {
+            after: string[];
+            before: string[];
+            name: string;
+        };
         /** @description One native now-playing forward, by name. */
         ScrobbleNowPlayingRequest: {
             /** @description Album title. */
@@ -22561,6 +23067,13 @@ export interface components {
             /** @description Services that failed, or are switched off, while the list was built. */
             unavailable_sources: components["schemas"]["ListenSource"][];
         };
+        /** @description The site's appearance as every signed-in person reads it. */
+        SiteAppearance: {
+            /** @description Whether people's own CSS applies. */
+            allow_user_css: boolean;
+            /** @description CSS loaded under every person's own. */
+            css: string;
+        };
         /** @description Reviews one reason held back. */
         SkippedReviews: {
             /** Format: int32 */
@@ -22975,6 +23488,8 @@ export interface components {
             album_id: string;
             /** @description Album title. */
             album_title: string;
+            /** @description Local track-artist id, when credited. */
+            artist_id?: string | null;
             /** @description Track artist display name. */
             artist_name: string;
             /** @description True when the owning album has a folder image or an embedded picture. */
@@ -23059,6 +23574,11 @@ export interface components {
             /** @description Server version, when known. */
             version?: string | null;
         };
+        /**
+         * @description The theme a person chose.
+         * @enum {string}
+         */
+        ThemeChoice: "system" | "light" | "dark" | "midnight";
         /** @description `GET /artists/{artist_mbid}/top-albums`. */
         TopAlbumsResponse: {
             /** @description Albums, most played first. */
@@ -23428,6 +23948,11 @@ export interface components {
             year?: number | null;
         };
         /**
+         * @description Which side of `min_tracks` a list keeps.
+         * @enum {string}
+         */
+        TracksMode: "at_least" | "below";
+        /**
          * @description Credential handoff for session-issuing routes. Mirrors the session login
          *     `TransportParam` (which owns the mechanism) so this layer stays the only
          *     place that needs `ToSchema`.
@@ -23548,7 +24073,7 @@ export interface components {
          * @description Why the upgrade cannot start, or why a run failed.
          * @enum {string}
          */
-        UpgradeCode: "UNKNOWN_LAYOUT" | "UNSUPPORTED_PATHS" | "BACKUP_EXISTS" | "V2_WAL_PRESENT" | "NOT_ENOUGH_DISK" | "V2_KEY_NOT_FOUND" | "V2_KEY_INVALID" | "V2_KEY_MISMATCH" | "V2_CONFIG_UNREADABLE" | "V2_CONFIG_INVALID" | "MISSING_INSTANCE_ID" | "V2_DATABASE_ERROR" | "EXPORT_FAILED" | "VALIDATION_FAILED" | "CALLBACKS_TO_CHANGE" | "NO_ADMIN_CAN_SIGN_IN" | "LOCKED" | "TOOL_RUNNING" | "FILE_ERROR" | "OCCUPIED" | "NOT_A_FOLDER" | "RANDOM_FAILED" | "ORPHAN_REPAIR_FAILED" | "IMPORT_SETUP_FAILED" | "IMPORT_FAILED" | "ROLLBACK_FAILED" | "BACKUP_NOT_REMOVED" | "NO_BACKUP" | "ALREADY_V2" | "BACKUP_STILL_NEEDED" | "CONFIRMATION_NEEDED" | "USAGE" | "ENVIRONMENT_INVALID" | "INTERNAL";
+        UpgradeCode: "UNKNOWN_LAYOUT" | "UNSUPPORTED_PATHS" | "BACKUP_EXISTS" | "V2_WAL_UNREADABLE" | "NOT_ENOUGH_DISK" | "V2_KEY_NOT_FOUND" | "V2_KEY_INVALID" | "V2_KEY_MISMATCH" | "V2_CONFIG_UNREADABLE" | "V2_CONFIG_INVALID" | "MISSING_INSTANCE_ID" | "V2_DATABASE_ERROR" | "EXPORT_FAILED" | "VALIDATION_FAILED" | "CALLBACKS_TO_CHANGE" | "NO_ADMIN_CAN_SIGN_IN" | "LOCKED" | "TOOL_RUNNING" | "FILE_ERROR" | "OCCUPIED" | "NOT_A_FOLDER" | "RANDOM_FAILED" | "ORPHAN_REPAIR_FAILED" | "IMPORT_SETUP_FAILED" | "IMPORT_FAILED" | "ROLLBACK_FAILED" | "BACKUP_NOT_REMOVED" | "NO_BACKUP" | "ALREADY_V2" | "BACKUP_STILL_NEEDED" | "CONFIRMATION_NEEDED" | "USAGE" | "ENVIRONMENT_INVALID" | "INTERNAL";
         /** @description The run failed or stopped. */
         UpgradeFailure: {
             /** @description What went wrong. */
@@ -25257,6 +25782,52 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+        };
+    };
+    get_user_custom_css: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description User id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Custom CSS summary */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CustomCssSummary"];
+                };
+            };
+        };
+    };
+    turn_off_user_custom_css: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description User id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Custom CSS summary */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CustomCssSummary"];
+                };
             };
         };
     };
@@ -30491,31 +31062,22 @@ export interface operations {
                  *     case-insensitive. See `format_mode`.
                  */
                 formats?: string;
-                /**
-                 * @description `with` (default): only albums in one of `formats`; `without`: only
-                 *     albums in none of them.
-                 */
-                format_mode?: string;
+                /** @description Default `with`. */
+                format_mode?: components["schemas"]["FormatMode"];
                 /**
                  * @description Only albums with at least this many indexed tracks, 1-10000. See
                  *     `tracks_mode`.
                  */
                 min_tracks?: number;
-                /**
-                 * @description `at_least` (default): albums with `min_tracks` or more; `below`:
-                 *     albums with fewer.
-                 */
-                tracks_mode?: string;
+                /** @description Default `at_least`. */
+                tracks_mode?: components["schemas"]["TracksMode"];
                 /**
                  * @description Only albums the caller rated, 1-5 stars. See `rating_mode`; albums
                  *     they did not rate are left out.
                  */
                 rating?: number;
-                /**
-                 * @description `at_least` (default): `rating` stars or more; `at_most`: `rating`
-                 *     stars or fewer.
-                 */
-                rating_mode?: string;
+                /** @description Default `at_least`. */
+                rating_mode?: components["schemas"]["RatingMode"];
                 /**
                  * @description Only the caller's favourites. Without `sort`, the newest favourite
                  *     comes first, and `order=asc` puts the oldest first.
@@ -33202,21 +33764,15 @@ export interface operations {
                  *     `tracks_mode`.
                  */
                 min_tracks?: number;
-                /**
-                 * @description `at_least` (default): artists with `min_tracks` or more; `below`:
-                 *     artists with fewer.
-                 */
-                tracks_mode?: string;
+                /** @description Default `at_least`. */
+                tracks_mode?: components["schemas"]["TracksMode"];
                 /**
                  * @description Only artists the caller rated, 1-5 stars. See `rating_mode`;
                  *     artists they did not rate are left out.
                  */
                 rating?: number;
-                /**
-                 * @description `at_least` (default): `rating` stars or more; `at_most`: `rating`
-                 *     stars or fewer.
-                 */
-                rating_mode?: string;
+                /** @description Default `at_least`. */
+                rating_mode?: components["schemas"]["RatingMode"];
                 /**
                  * @description Only the caller's favourites. Without `sort`, the newest favourite
                  *     comes first, and `order=asc` puts the oldest first.
@@ -33425,6 +33981,65 @@ export interface operations {
                 };
             };
             /** @description A member changed since the group was read */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    undo_artist_duplicate_group: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Group id of a resolved join */
+                group_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Join undone */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ArtistDuplicateGroupUndoResponse"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Admin role required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No such group */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Not a join that can be undone, or undone already */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -36234,6 +36849,8 @@ export interface operations {
                 cursor?: string;
                 /** @description Files per page, 1 to 200 (default 100); more is read as 200. */
                 limit?: number;
+                /** @description Only the files that change, or only the others; all when absent. */
+                scope?: "changing" | "not_changing";
             };
             header?: never;
             path: {
@@ -36253,7 +36870,7 @@ export interface operations {
                     "application/json": components["schemas"]["Page_ManagementResultItemView"];
                 };
             };
-            /** @description Bad cursor */
+            /** @description Bad scope or cursor */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -36628,8 +37245,12 @@ export interface operations {
                 reason_code?: string;
                 root_id?: string;
                 album_id?: string;
+                /** @description Files on albums by or credited to this local artist. */
+                artist_id?: string;
                 audio_format?: string;
                 change_kind?: "tags" | "path" | "sidecars" | "artwork" | "no_change";
+                /** @description Only the files that change, or only the others; all when absent. */
+                scope?: "changing" | "not_changing";
             };
             header?: never;
             path: {
@@ -39366,21 +39987,15 @@ export interface operations {
                  *     case-insensitive. See `format_mode`.
                  */
                 formats?: string;
-                /**
-                 * @description `with` (default): only tracks in one of `formats`; `without`: only
-                 *     tracks in none of them.
-                 */
-                format_mode?: string;
+                /** @description Default `with`. */
+                format_mode?: components["schemas"]["FormatMode"];
                 /**
                  * @description Only tracks the caller rated, 1-5 stars. See `rating_mode`; tracks
                  *     they did not rate are left out.
                  */
                 rating?: number;
-                /**
-                 * @description `at_least` (default): `rating` stars or more; `at_most`: `rating`
-                 *     stars or fewer.
-                 */
-                rating_mode?: string;
+                /** @description Default `at_least`. */
+                rating_mode?: components["schemas"]["RatingMode"];
                 /**
                  * @description Only the caller's favourites. Without `sort`, the newest favourite
                  *     comes first, and `order=asc` puts the oldest first.
@@ -39840,6 +40455,130 @@ export interface operations {
             };
         };
     };
+    get_my_appearance: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Own appearance */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MyAppearance"];
+                };
+            };
+        };
+    };
+    put_my_appearance: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AppearanceUpdate"];
+            };
+        };
+        responses: {
+            /** @description Saved appearance */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MyAppearance"];
+                };
+            };
+            /** @description The CSS is refused (`CUSTOM_CSS_REFUSED`, its problems in `details`) or too long (`CUSTOM_CSS_TOO_LONG`) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Custom CSS is turned off on this server (`CUSTOM_CSS_TURNED_OFF`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    list_my_css_saves: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Own CSS saves, newest first */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CssSave"][];
+                };
+            };
+        };
+    };
+    import_my_appearance: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AppearanceUpdate"];
+            };
+        };
+        responses: {
+            /** @description The appearance as stored, and whether this call wrote it */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AppearanceImported"];
+                };
+            };
+            /** @description The CSS is refused (`CUSTOM_CSS_REFUSED`, its problems in `details`) or too long (`CUSTOM_CSS_TOO_LONG`) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Custom CSS is turned off on this server (`CUSTOM_CSS_TURNED_OFF`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
     post_avatar: {
         parameters: {
             query?: never;
@@ -39950,6 +40689,15 @@ export interface operations {
                     "application/json": components["schemas"]["LastFmConfiguredResponse"];
                 };
             };
+            /** @description Last.fm is switched off on this server (LASTFM_OFF) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
         };
     };
     lastfm_unlink: {
@@ -39992,6 +40740,15 @@ export interface operations {
                     "application/json": components["schemas"]["LastFmSessionResponse"];
                 };
             };
+            /** @description Last.fm is switched off on this server (LASTFM_OFF), there is no key pair to sign with (PROVIDER_NOT_CONFIGURED), or the sign-in is not approved, expired or not started here (CONFLICT) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
         };
     };
     lastfm_token: {
@@ -40010,6 +40767,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["LastFmTokenResponse"];
+                };
+            };
+            /** @description Last.fm is switched off on this server (LASTFM_OFF), or there is no key pair to sign with (PROVIDER_NOT_CONFIGURED) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
         };
@@ -40490,6 +41256,35 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    playback_conversion: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Whether converting is on */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PlaybackConversion"];
                 };
             };
             /** @description Not authenticated */
@@ -44400,6 +45195,59 @@ export interface operations {
             };
         };
     };
+    get_site_appearance: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Site appearance */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Appearance"];
+                };
+            };
+        };
+    };
+    put_site_appearance: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["Appearance"];
+            };
+        };
+        responses: {
+            /** @description Saved site appearance */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Appearance"];
+                };
+            };
+            /** @description The CSS is refused (`CUSTOM_CSS_REFUSED`, its problems in `details`) or too long (`CUSTOM_CSS_TOO_LONG`) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
     get_connect_apps: {
         parameters: {
             query?: never;
@@ -45852,6 +46700,69 @@ export interface operations {
             };
         };
     };
+    get_import_folder: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Import folder */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ImportFolder"];
+                };
+            };
+        };
+    };
+    put_import_folder: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ImportFolder"];
+            };
+        };
+        responses: {
+            /** @description Saved import folder */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ImportFolder"];
+                };
+            };
+        };
+    };
+    import_folder_status_handler: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ImportFolderStatusResponse"];
+                };
+            };
+        };
+    };
     preview_library_policy_apply: {
         parameters: {
             query?: never;
@@ -46049,6 +46960,39 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["LibraryScanScheduleResponse"];
+                };
+            };
+        };
+    };
+    preview_library_script: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ScriptPreviewRequest"];
+            };
+        };
+        responses: {
+            /** @description The script on each example album */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ScriptPreviewResponse"];
+                };
+            };
+            /** @description The script is too long */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
         };
@@ -47097,6 +48041,15 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
+            /** @description A format was asked for and the server is not converting */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
             /** @description Range not satisfiable */
             416: {
                 headers: {
@@ -47179,6 +48132,13 @@ export interface operations {
             };
             /** @description Unknown audio id */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description A format was asked for and the server is not converting */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

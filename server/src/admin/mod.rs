@@ -9,6 +9,7 @@
 
 pub mod backups;
 pub mod cache;
+pub mod custom_css;
 pub mod error;
 pub mod handlers;
 pub mod models;
@@ -19,6 +20,7 @@ pub mod system;
 
 use std::sync::Arc;
 
+use crate::appearance::store::AppearanceStore;
 use droppedneedle_auth::users::UsersDeps;
 use droppedneedle_kernel::db::{BackupService, CheckpointService, Db};
 use droppedneedle_kernel::mount::{Routes, routes};
@@ -70,11 +72,14 @@ pub struct AdminSetup {
     pub precache: crate::bootstrap::jobs::PrecacheTrigger,
     /// Cover and artist image cache, for its stats and clears.
     pub covers: droppedneedle_catalog::artwork::cache::ArtworkCache,
+    /// Each person's appearance, for the custom CSS summary and switch.
+    pub appearance: AppearanceStore,
 }
 
 impl AdminSetup {
     /// Bundle every handle the admin routes use. The provider answer
-    /// cache is the one `providers` holds.
+    /// cache is the one `providers` holds, and `appearance` is the store
+    /// the appearance routes share.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         users: UsersDeps,
@@ -85,8 +90,10 @@ impl AdminSetup {
         checkpoint: CheckpointService,
         precache: crate::bootstrap::jobs::PrecacheTrigger,
         covers: droppedneedle_catalog::artwork::cache::ArtworkCache,
+        appearance: AppearanceStore,
     ) -> Self {
         Self {
+            appearance,
             users,
             quota,
             cache: providers.cache.clone(),
@@ -114,5 +121,7 @@ pub fn routes() -> Routes<AdminSetup> {
         .admin(routes!(handlers::queue_stats))
         .admin(routes!(handlers::provider_stats))
         .admin(routes!(handlers::get_quota, handlers::set_quota))
+        .admin(routes!(handlers::get_user_custom_css))
+        .admin(routes!(handlers::turn_off_user_custom_css))
         .admin(routes!(handlers::run_precache))
 }

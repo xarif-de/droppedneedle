@@ -1,14 +1,8 @@
-target v3.0.0-dev.0002418 b4517e4880d02d4ce29c36e208f1e7ca8b402ba1
+target v3.0.0-dev.0002506 7f5fa758806b8f2f7cfe7043ec4b3afbc26911dc
 topic musicbrainz-user-agent-form 0095b0426b91c753a13801e6e35c686d6b83a146
 topic metabrainz-rates fb2f40426daba33cf347ce44042054969b5bca26
 topic metabrainz-shared-budget 0e73fc616fb0078697467fc70ee5337b4f15c195
 topic login-redirects-to-sso 0508a15d5e6fb70244be41e1e455ae1b96d869d5
 topic no-404-for-missing-art-and-unserved-subsonic 1faa5d12041374349373f228843cd9546f81295b
-topic removed-tracks-leave-the-player 9eea8c04af0504c6df232738d41f3b0e1efee6af
-topic album-back-goes-back 85126cd6d345e0948eee2b7ead088b9a7cbf2f48
-topic removed-album-takes-vanished-files 401c5b72cf184763be22a1286fa3086b73e41e02
-topic artist-releases-fill-the-discography 5d4d89585d4f51f96f26f012f68ac2a838179afa
-topic contributors-keep-album-artists ca940e8b278c32f4f5185aba0282b60b9ee6b0ef
-topic library-filters-rating-and-reverse a52dbf7982524040eed9771e17ba8e7176bc08db
-topic player-heart-stars-and-skip 3a92bcbeb6ca69bafe40ba0323b313df44adca96
+topic clippy-journey-type-alias 4392bc818f1c80898464ea32a0a631ef1998ceda
 topic ci-package-mirror d6a3bf8627c4aa3ae0a4155698df3d81289c6bba

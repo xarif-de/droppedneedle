@@ -1,6 +1,9 @@
 <script lang="ts">
 	import { Radio, Music, LoaderCircle, ExternalLink, Check, Sparkles } from 'lucide-svelte';
 	import { ApiError } from '$lib/api/errors';
+	import { getIntegrationStatusQuery } from '$lib/features/home/queries/home.svelte';
+	import { authStore } from '$lib/stores/authStore.svelte';
+	import { withBasePath } from '$lib/utils/basePath';
 	import { getConnectionsQuery } from '$lib/features/profile/queries/ConnectionsQuery.svelte';
 	import {
 		createConnectListenBrainzMutation,
@@ -38,6 +41,10 @@
 	// sign-in finishes; the account name arrives only with the session, so a
 	// link without one is not linked yet and still needs Connect and Finish.
 	const lfmLinked = $derived(Boolean(lfm?.username));
+	// The admin's switch. While it is off, Connect could only fail.
+	const integrationQuery = getIntegrationStatusQuery();
+	const lfmOff = $derived(integrationQuery.data?.lastfm === false);
+	const lfmNote = $derived(lfmOff ? 'Off on this server.' : 'Link Last.fm above to scrobble.');
 
 	const prefsQuery = getScrobblePreferencesQuery();
 	const prefs = $derived(prefsQuery.data);
@@ -73,6 +80,9 @@
 	let scrobbleListenbrainz = $state(false);
 	let navidromeHandlesExternalScrobbles = $state(true);
 	let primarySource = $state<MusicSource>('listenbrainz');
+	// While Last.fm is off, Home and Discover follow ListenBrainz whatever the
+	// stored choice, so that is the one shown.
+	const shownSource = $derived<MusicSource>(lfmOff ? 'listenbrainz' : primarySource);
 	let nowPlayingVisibility = $state<NowPlayingVisibility>('full');
 	let autoRequestPersonalMix = $state(false);
 	let mixRefreshMessage = $state<string | null>(null);
@@ -123,9 +133,9 @@
 			lfmPendingToken = data.token;
 			window.open(data.auth_url, '_blank', 'popup=yes,noopener,noreferrer');
 		} catch (e) {
-			// 409 means there is no Last.fm app key to link with: the admin has not
-			// saved the server's key pair and this user has not saved their own.
-			if (e instanceof ApiError && e.status === 409) {
+			// No Last.fm app key to link with: the admin has not saved the server's
+			// key pair and this user has not saved their own.
+			if (e instanceof ApiError && e.code === 'PROVIDER_NOT_CONFIGURED') {
 				lfmCredentialsOpen = true;
 				return;
 			}
@@ -356,7 +366,7 @@
 									Finish
 								</Button>
 							</div>
-						{:else if !lfmLinked}
+						{:else if !lfmLinked && !lfmOff}
 							<Button
 								variant="lastfm"
 								size="display-sm"
@@ -370,7 +380,15 @@
 					</div>
 				</div>
 			</div>
-			{#if !lfmLinked && lfmCredentialsOpen}
+			{#if lfmOff && !lfmLinked}
+				<p class="mt-2 px-1 text-xs text-muted">
+					Last.fm is off on this server.
+					{#if authStore.isAdmin}
+						<a class="link" href={withBasePath('/settings?tab=lastfm')}>Settings &gt; Last.fm</a>
+					{/if}
+				</p>
+			{/if}
+			{#if !lfmLinked && !lfmOff && lfmCredentialsOpen}
 				<div class="pf-box mt-2 animate-fade-in-up p-3">
 					<div class="space-y-2">
 						<p class="text-xs text-muted">
@@ -431,8 +449,8 @@
 		<div class="space-y-3 px-1">
 			<ToggleRow
 				label="Scrobble to Last.fm"
-				description={lfmLinked ? undefined : 'Link Last.fm above to scrobble.'}
-				disabled={!lfmLinked || updatePrefsMutation.isPending}
+				description={lfmLinked && !lfmOff ? undefined : lfmNote}
+				disabled={!lfmLinked || lfmOff || updatePrefsMutation.isPending}
 				bind:checked={
 					() => scrobbleLastfm,
 					(checked) => {
@@ -485,10 +503,10 @@
 			>
 				{#each SOURCES as opt (opt.value)}
 					<Button
-						variant={primarySource === opt.value ? 'primary' : 'ghost'}
+						variant={shownSource === opt.value ? 'primary' : 'ghost'}
 						size="sm"
-						aria-pressed={primarySource === opt.value}
-						disabled={updatePrefsMutation.isPending}
+						aria-pressed={shownSource === opt.value}
+						disabled={updatePrefsMutation.isPending || (lfmOff && opt.value === 'lastfm')}
 						onclick={() => selectSource(opt.value)}
 					>
 						{opt.label}

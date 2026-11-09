@@ -80,6 +80,18 @@ On Unraid, keep `/app/cache` on a pool path such as `/mnt/cache/appdata/droppedn
 
 For the media mount, one shared parent (`/data`) with the library and the download client's completions under it keeps imports fast; see [Download clients](download-clients.md#slskd).
 
+### Import folder
+
+The [import folder](downloads.md#import-folder) is a folder you mount read-write and name under Settings > Library. It must not be a library folder, the recycle bin, a download client's folder, `/app/imports`, `/app/config` or `/app/cache`, and must not sit inside or hold one of them: DroppedNeedle checks this on every pass and imports nothing while it overlaps. A read-only mount imports nothing either, because removing what went in is part of the job. On the same disk as the library, files go in faster.
+
+```yaml
+services:
+  droppedneedle:
+    volumes:
+      - /mnt/media/music:/data/music
+      - /mnt/media/to-import:/data/import   # then set /data/import under Settings > Library
+```
+
 ## Where settings live
 
 | Setting | Location |
@@ -119,6 +131,30 @@ For the media mount, one shared parent (`/data`) with the library and the downlo
 | AudioDB images: on or off, key, name search fallback, direct remote images, preferring local cover art | Settings > Advanced |
 | Request history, ignored albums and clean-up interval | Settings > Advanced |
 | App version, update check and release notes | Settings > About |
+| Theme and your own CSS (kept on your account) | Profile > Appearance |
+| Site CSS for every signed-in page, and whether people may add their own (admin) | Settings > Appearance |
+
+### Custom CSS
+
+Profile > Appearance > Custom CSS takes your own CSS rules and applies them to the signed-in app once you save (not the sign-in, setup or app connect pages). Your theme and your CSS are kept on your account, so they follow you to every browser and device you sign in on; each browser also keeps a copy so a reload paints at once. Another account on the same browser does not get them, and signing out takes them off until you sign in again. Up to 20,000 characters. If you used custom CSS or chose a theme before they moved to the account, the first sign-in on that browser moves them up by itself.
+
+The editor checks your CSS as you type, can preview it live before you save, and keeps your last 10 saves on your account (clearing the sheet leaves them there). [Custom CSS](custom-css.md) covers the editor, the variables and the style hooks you can rely on.
+
+An admin can add site CSS under Settings > Appearance (up to 50,000 characters). It loads on every signed-in page on top of the app's own styles, and each person's CSS loads on top of it. The same section has "Let people add their own CSS", on by default: while it is off, nobody's own CSS is applied or can be saved, and their text is kept. An admin can also turn one person's CSS off under Settings > Users (the "Quota and custom CSS" button on their row); the text stays, and they can switch it back on.
+
+Nothing in it may load from elsewhere, so a sheet is refused, with what was not allowed, when it holds `url()` or any other CSS function outside the set that only computes values (colours, gradients, maths such as `calc()` and `var()`, transforms, filters, shapes, timing, grid and selector functions), a backslash, `@import` or `@font-face`. The check reads strings and comments too, so a `url(` inside a comment is refused as well, and a few harmless functions such as `sqrt()` or `@supports selector()` are not on the list.
+
+If your CSS makes the page hard to use, add `?nocustomcss=1` to the address (for example `https://music.example.com/?nocustomcss=1`) and load it. Your CSS and the site CSS stay off until the next full reload, so you can fix yours, turn it off or clear it.
+
+For example, square corners and a softer muted text colour:
+
+```css
+:root, [data-theme] {
+  --radius-box: 0 !important;
+  --radius-field: 0 !important;
+  --dn-muted: #8a8f8a !important;
+}
+```
 
 ## Updating and image tags
 
@@ -133,4 +169,4 @@ Before a new version changes the database schema, DroppedNeedle writes a verifie
 
 A `:dev` tag (`droppedneedle/droppedneedle:dev`) is built from `main` on every push that changes the code, and may break. Pin a commit with `:dev-<short-sha>`. Until v3 is released, `main` and `:dev` are still v2.
 
-Pre-releases are published to the same image under their own version tag, for example `droppedneedle/droppedneedle:v3.1.0-rc.1`. They never move `:latest`, so you only get one by asking for its tag.
+Pre-releases are published to the same image under their own version tag, for example `droppedneedle/droppedneedle:v3.1.0-rc.1`. They never move `:latest`, so you only get one by asking for its tag. `:beta` always points at the newest pre-release, so testers can stay on `droppedneedle/droppedneedle:beta` and get each new one with a pull. A full release does not move it: once the version you were testing is released, switch back to `:latest`.

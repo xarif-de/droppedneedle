@@ -14,6 +14,7 @@
 	import EqPanel from '$lib/features/player/components/EqPanel.svelte';
 	import LyricsPanel from '$lib/features/player/components/LyricsPanel.svelte';
 	import AudioQualityBadge from '$lib/features/player/components/AudioQualityBadge.svelte';
+	import PlayerTrackMarks from '$lib/features/player/components/PlayerTrackMarks.svelte';
 	import DeckVisualiser from '$lib/features/library/components/local/DeckVisualiser.svelte';
 	import { coverTint } from '$lib/features/library/components/local/coverTint';
 	import AlbumImage from '$lib/media/AlbumImage.svelte';
@@ -28,6 +29,7 @@
 	import type { CrateTrack } from '$lib/features/library/queries/types';
 	import type { SpinAlbum } from '$lib/features/library/queries/LocalV3Adapters';
 	import { isValidMbid } from '$lib/utils/formatting';
+	import { playedAlbumHref, playedArtistHref } from '$lib/utils/entityRoutes';
 	import {
 		Play,
 		Pause,
@@ -76,6 +78,8 @@
 	const isPlaying = $derived(playerStore.isPlaying);
 	const format = $derived(playerStore.currentQueueItem?.format ?? null);
 	const isYouTube = $derived(np?.sourceType === 'youtube');
+	const artistLink = $derived(playedArtistHref(np?.artistId));
+	const albumLink = $derived(playedAlbumHref(np?.albumId, isLocal));
 
 	let dragOver = $state(false);
 	let eqPanelOpen = $state(false);
@@ -137,9 +141,14 @@
 		return () => cancelAnimationFrame(raf);
 	});
 
+	let scrubRatio = $state<number | null>(null);
 	// The arm rides inward through the track: 13 degrees is the lead-in groove, 28 the run-out.
 	const progressRatio = $derived(
-		playerStore.duration > 0 ? Math.min(1, playerStore.progress / playerStore.duration) : 0
+		scrubRatio ??
+			(playerStore.duration > 0 ? Math.min(1, playerStore.progress / playerStore.duration) : 0)
+	);
+	const shownProgress = $derived(
+		scrubRatio === null ? playerStore.progress : scrubRatio * playerStore.duration
 	);
 	const armAngle = $derived(np ? 13 + progressRatio * 15 : 0);
 	const armState = $derived(!np ? 'rest' : isPlaying ? 'play' : 'cue');
@@ -151,8 +160,19 @@
 		return `${m}:${s.toString().padStart(2, '0')}`;
 	}
 
+	function seekRatio(e: Event): number {
+		return Number((e.currentTarget as HTMLInputElement).value) / 1000;
+	}
+
+	// A drag moves only the thumb; the seek happens once, on release. The
+	// drag value stays until `change` reads it (pointerup comes first).
+	function onScrub(e: Event) {
+		scrubRatio = seekRatio(e);
+	}
+
 	function onSeek(e: Event) {
-		const ratio = Number((e.currentTarget as HTMLInputElement).value) / 1000;
+		scrubRatio = null;
+		const ratio = seekRatio(e);
 		if (playerStore.duration > 0) playerStore.seekTo(ratio * playerStore.duration);
 	}
 
@@ -395,19 +415,28 @@
 									<span class="truncate">{np.trackName ?? np.albumName}</span>
 								</p>
 								<p class="dn-deck__artist">
-									{np.artistName}{#if np.albumName}<span>&nbsp;&middot; {np.albumName}</span>{/if}
+									{#if artistLink}<a href={artistLink} class="dn-deck__link">{np.artistName}</a
+										>{:else}{np.artistName}{/if}{#if np.albumName}<span
+											>&nbsp;&middot;
+											{#if albumLink}<a href={albumLink} class="dn-deck__link">{np.albumName}</a
+												>{:else}{np.albumName}{/if}</span
+										>{/if}
 								</p>
 							</div>
 						</div>
+						<PlayerTrackMarks alwaysStars />
 					</div>
 					<div class="dn-deck__seek">
-						<span>{fmt(playerStore.progress)}</span>
+						<span>{fmt(shownProgress)}</span>
 						<input
 							type="range"
 							min="0"
 							max="1000"
 							value={Math.round(progressRatio * 1000)}
-							oninput={onSeek}
+							oninput={onScrub}
+							onchange={onSeek}
+							onpointercancel={() => (scrubRatio = null)}
+							onblur={() => (scrubRatio = null)}
 							disabled={!playerStore.isSeekable}
 							aria-label="Seek"
 							class="range range-xs range-primary flex-1"
@@ -480,7 +509,7 @@
 								/>
 							</div>
 						{/if}
-						<div class="ml-auto flex min-w-0 items-center gap-1.5">
+						<div class="ml-auto flex max-w-full flex-wrap items-center gap-1.5">
 							{#if format}
 								<AudioQualityBadge codec={format} compact />
 							{/if}
@@ -1221,6 +1250,13 @@
 		font-size: 0.8125rem;
 		color: var(--dn-muted);
 	}
+	.dn-deck__link {
+		color: inherit;
+	}
+	.dn-deck__link:hover,
+	.dn-deck__link:focus-visible {
+		text-decoration: underline;
+	}
 	.dn-deck__seek {
 		display: flex;
 		align-items: center;
@@ -1245,6 +1281,7 @@
 	}
 	.dn-deck__utility {
 		display: flex;
+		flex-wrap: wrap;
 		align-items: center;
 		gap: 0.25rem;
 		min-width: 0;

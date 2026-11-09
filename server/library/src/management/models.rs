@@ -252,6 +252,9 @@ pub struct JobIntent {
     pub duplicate: Option<DuplicateIntent>,
     /// For an edition's tag write: the edition the person saw.
     pub edition: Option<EditionPin>,
+    /// A preview of more than one album leaves out the albums already
+    /// organized under its pins (see [`super::organized`]).
+    pub skip_organized: bool,
 }
 
 /// The edition a tag write was asked for, with the identity revision the
@@ -345,7 +348,8 @@ pub struct ItemDiff {
     pub artwork_changed: bool,
     /// Native tags outside the managed fields a scrub removes.
     pub scrubbed_raw_tags: Vec<ScrubbedTag>,
-    /// Genre sources that could not be asked.
+    /// Outside sources that could not be read now: a genre source
+    /// (`listenbrainz`, `lastfm`), `lrclib`, `cover` or `acoustid`.
     pub deferred_sources: Vec<String>,
 }
 
@@ -528,6 +532,14 @@ pub struct Summary {
     #[schema(required = true)]
     #[serde(default)]
     pub expanded_track_count: i64,
+    /// Albums left out because they are already organized.
+    #[schema(required = true)]
+    #[serde(default)]
+    pub organized_album_count: i64,
+    /// Files of the albums left out as already organized.
+    #[schema(required = true)]
+    #[serde(default)]
+    pub organized_file_count: i64,
     /// Files per reason code.
     #[schema(required = true)]
     #[serde(default)]
@@ -645,9 +657,32 @@ pub struct ItemFilter {
     pub reason_code: Option<String>,
     pub root_id: Option<String>,
     pub album_id: Option<String>,
+    /// Files on albums by or credited to this local artist.
+    pub artist_id: Option<String>,
     pub audio_format: Option<String>,
-    /// `tags`, `path`, `sidecars`, or `no_change`.
+    /// `tags`, `path`, `sidecars`, `artwork`, or `no_change`.
     pub change_kind: Option<String>,
+    /// Only the files that change, or only the others; none lists all.
+    pub scope: Option<ItemScope>,
+}
+
+/// Which planned files a list shows, by whether they change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ItemScope {
+    /// Files that will be written and whose plan changes something.
+    Changing,
+    /// Files with nothing to change, and blocked or stale files.
+    NotChanging,
+}
+
+impl ItemScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Changing => "changing",
+            Self::NotChanging => "not_changing",
+        }
+    }
 }
 
 /// Where one planned file's write is after apply.
