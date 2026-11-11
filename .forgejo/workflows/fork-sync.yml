@@ -28,12 +28,18 @@ jobs:
           set -eu
           # >>> dagger-install (identical in every workflow that calls dagger; tests/fork/workflows-tests.sh)
           # CLI version = dagger.json engineVersion: one pin, Renovate-managed.
-          # Three tries: one dropped download (curl 56 from dl.dagger.io, 2026-10-24) failed
-          # the run before any check, and a red Renovate PR waits 6 h for its retry.
+          # Through the package gateway first (kubernetes/artifact-proxy /generic/dagger caches the
+          # release tarball and checksums.txt; install.sh still checks the sha256), the origin if that
+          # fails — pipefail makes a failed gateway curl fall through. Three tries: one dropped download
+          # (curl 56 from dl.dagger.io, 2026-10-24) failed the run before any check, and a red Renovate
+          # PR waits 6 h for its retry.
+          g=http://10.43.0.51/generic/dagger
           for i in 1 2 3; do
             v=$(curl -fsS "$GITHUB_SERVER_URL/base/dagger-modules/raw/branch/main/dagger.json" |
               sed -n 's/.*"engineVersion": *"v\{0,1\}\([0-9][0-9.]*\)".*/\1/p') && test -n "$v" &&
-              curl -fsSL https://dl.dagger.io/dagger/install.sh | DAGGER_VERSION="$v" BIN_DIR=/usr/local/bin sh && break
+              { curl -fsSL --connect-timeout 5 "$g/dagger/install.sh" | sed "s#^base=.*#base=\"$g\"#" |
+                  DAGGER_VERSION="$v" BIN_DIR=/usr/local/bin sh ||
+                curl -fsSL https://dl.dagger.io/dagger/install.sh | DAGGER_VERSION="$v" BIN_DIR=/usr/local/bin sh; } && break
             [ "$i" -lt 3 ] || exit 1
             sleep $((i * 10))
           done
