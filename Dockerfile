@@ -9,6 +9,8 @@ FROM node:22.23.4-bookworm-slim AS frontend
 WORKDIR /app/frontend
 # xarif CI passes the artifact cache's npm registry; unset, npm and pnpm use npmjs.
 ARG NPM_CONFIG_REGISTRY
+# ...and the same registry for corepack, which downloads pnpm itself.
+ARG COREPACK_NPM_REGISTRY
 
 ENV PNPM_HOME="/pnpm"
 ENV PATH="$PNPM_HOME:$PATH"
@@ -33,6 +35,12 @@ FROM rust:1.89.0-bookworm AS chef
 # Audio decode: opusic-sys (via symphonia-adapter-libopus) builds a
 # bundled C library through the `cmake` crate, which shells out to the cmake
 # binary. The rust base image ships gcc but not cmake.
+# xarif CI passes the artifact cache's Debian mirror; unset, apt uses deb.debian.org.
+# Build stage only (not shipped), so the rewritten sources may stay.
+ARG XARIF_DEBIAN_MIRROR
+RUN if [ -n "${XARIF_DEBIAN_MIRROR:-}" ]; then for f in /etc/apt/sources.list.d/*.sources /etc/apt/sources.list; do \
+      if [ -f "$f" ]; then sed -i -e "s#https*://deb.debian.org/debian-security#$XARIF_DEBIAN_MIRROR/security#" \
+        -e "s#https*://deb.debian.org/debian#$XARIF_DEBIAN_MIRROR#" "$f"; fi; done; fi
 RUN apt-get update \
     && apt-get install -y --no-install-recommends cmake \
     && rm -rf /var/lib/apt/lists/*
@@ -86,6 +94,12 @@ FROM debian:bookworm-slim AS ffmpeg
 ARG FFMPEG_VERSION=9.0.2
 ARG FFMPEG_SHA256=8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e
 
+# xarif CI passes the artifact cache's Debian mirror; unset, apt uses deb.debian.org.
+# Build stage only (not shipped), so the rewritten sources may stay.
+ARG XARIF_DEBIAN_MIRROR
+RUN if [ -n "${XARIF_DEBIAN_MIRROR:-}" ]; then for f in /etc/apt/sources.list.d/*.sources /etc/apt/sources.list; do \
+      if [ -f "$f" ]; then sed -i -e "s#https*://deb.debian.org/debian-security#$XARIF_DEBIAN_MIRROR/security#" \
+        -e "s#https*://deb.debian.org/debian#$XARIF_DEBIAN_MIRROR#" "$f"; fi; done; fi
 RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential ca-certificates curl libmp3lame-dev libopus-dev nasm pkg-config xz-utils \
     && rm -rf /var/lib/apt/lists/*
@@ -129,10 +143,18 @@ WORKDIR /app
 # python3 runs Python plugins; build with --build-arg PLUGIN_PYTHON=0 for
 # an image without it (plugins that ship their own program still run).
 ARG PLUGIN_PYTHON=1
-RUN apt-get update \
+# xarif CI passes the artifact cache's Debian mirror; the sources are restored in the
+# same RUN, so no layer of the shipped image names it. Unset: deb.debian.org as before.
+ARG XARIF_DEBIAN_MIRROR
+RUN if [ -n "${XARIF_DEBIAN_MIRROR:-}" ]; then cp -a /etc/apt /tmp/apt.orig && \
+      for f in /etc/apt/sources.list.d/*.sources /etc/apt/sources.list; do if [ -f "$f" ]; then sed -i \
+        -e "s#https*://deb.debian.org/debian-security#$XARIF_DEBIAN_MIRROR/security#" \
+        -e "s#https*://deb.debian.org/debian#$XARIF_DEBIAN_MIRROR#" "$f"; fi; done; fi; \
+    apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl gosu libmp3lame0 libopus0 tini tzdata \
     && if [ "$PLUGIN_PYTHON" = "1" ]; then apt-get install -y --no-install-recommends python3; fi \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && if [ -n "${XARIF_DEBIAN_MIRROR:-}" ]; then rm -rf /etc/apt && mv /tmp/apt.orig /etc/apt; fi
 
 # Bake the user at the entrypoint's default PUID/PGID (1000) so the common
 # deployment needs no runtime usermod/groupmod remap. The home is /nonexistent,
