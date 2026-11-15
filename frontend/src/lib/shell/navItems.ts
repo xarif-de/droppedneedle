@@ -6,6 +6,7 @@ import {
 	Cog,
 	Compass,
 	Download,
+	Headphones,
 	Heart,
 	House,
 	Inbox,
@@ -44,6 +45,8 @@ export interface NavItem {
 	/** Where it points instead while an update is waiting. */
 	updateHref?: string;
 	audience: NavAudience;
+	/** A service's own page: listed only while the service is set up and not hidden. */
+	service?: ServiceSource;
 	badge?: NavBadge;
 	/** In the sidebar; with no `active` it never highlights there. */
 	sidebar?: { group: SidebarGroup; active?: NavMatch };
@@ -69,13 +72,38 @@ export const within =
 	(path) =>
 		path === prefix || path.startsWith(`${prefix}/`);
 
+/** Where a connected service's pages start, and the rail's service row entry. */
+export type ServiceSource = 'youtube' | 'jellyfin' | 'navidrome' | 'plex' | 'localfiles';
+
+const SERVICE_PATHS: Record<ServiceSource, string> = {
+	youtube: '/library/youtube',
+	jellyfin: '/library/jellyfin',
+	navidrome: '/library/navidrome',
+	plex: '/library/plex',
+	localfiles: '/library/local'
+};
+
+/** A service's own page, without the base path. */
+export const servicePath = (source: ServiceSource): string => SERVICE_PATHS[source];
+
+const inService: NavMatch = (path) =>
+	Object.values(SERVICE_PATHS).some((prefix) => within(prefix)(path));
+
 // Library Management, Check albums and the Recycle Bin live under /library but are their
 // own destinations.
-const inLibrary: NavMatch = (path) =>
+const inLibraryArea: NavMatch = (path) =>
 	within('/library')(path) &&
 	!within('/library/management')(path) &&
 	!within('/library/review')(path) &&
 	!within('/library/recycle-bin')(path);
+
+// The rail marks a service on its own pages, so Library stays the way back to the hub.
+const inLibrary: NavMatch = (path) => inLibraryArea(path) && !inService(path);
+
+// The bottom bar has no service tabs, so Library stays lit on their pages, except the
+// Listening Room, which lights More.
+const inLibraryOnPhone: NavMatch = (path) =>
+	inLibraryArea(path) && !within(servicePath('localfiles'))(path);
 
 export const navItems: NavItem[] = [
 	{
@@ -112,7 +140,18 @@ export const navItems: NavItem[] = [
 		audience: 'everyone',
 		badge: 'library-sync',
 		sidebar: { group: 'browse', active: inLibrary },
-		bottom: { active: inLibrary }
+		bottom: { active: inLibraryOnPhone }
+	},
+	{
+		// The Listening Room is the local service's page. The rail already lists the
+		// service; on a phone the bottom bar has no room, so the More sheet holds it.
+		id: 'listening-room',
+		label: 'Listening Room',
+		icon: Headphones,
+		href: servicePath('localfiles'),
+		audience: 'everyone',
+		service: 'localfiles',
+		more: { active: within(servicePath('localfiles')) }
 	},
 	{
 		id: 'downloads',
@@ -193,7 +232,7 @@ export const navItems: NavItem[] = [
 		label: 'Recycle Bin',
 		icon: Trash2,
 		href: '/library/recycle-bin',
-		audience: 'admin',
+		audience: 'curator',
 		sidebar: { group: 'admin', active: within('/library/recycle-bin') },
 		more: { active: within('/library/recycle-bin') }
 	},

@@ -4883,6 +4883,28 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v3/library/recycle-bin/accept-folder": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Use the folder the recycle bin path names as the bin.
+         * @description For when the app finds it is not the folder used before, because the
+         *     bin was moved. It is marked as the bin, and removals and upgrades go
+         *     ahead. Nothing is written when it already holds the marker.
+         */
+        post: operations["accept_recycle_bin_folder"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v3/library/recycle-bin/empty": {
         parameters: {
             query?: never;
@@ -8752,31 +8774,11 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Read the ListenBrainz connection (token masked unless unset). */
+        /** Read the ListenBrainz reads switch. */
         get: operations["get_listenbrainz"];
-        /** Save the ListenBrainz connection (a masked token keeps the stored one). */
+        /** Save the ListenBrainz reads switch. */
         put: operations["put_listenbrainz"];
         post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v3/settings/listenbrainz/verify": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Test the submitted ListenBrainz values (a masked token tests the
-         *     stored one). Rate limiting answers 429.
-         */
-        post: operations["verify_listenbrainz"];
         delete?: never;
         options?: never;
         head?: never;
@@ -9690,6 +9692,11 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /** @description The folder an admin chooses as the recycle bin. */
+        AcceptRecycleBinFolderBody: {
+            /** @description The recycle bin path the warning was shown for. */
+            path: string;
+        };
         /**
          * @description Whose account a source is reached through.
          * @enum {string}
@@ -11377,6 +11384,11 @@ export interface components {
             local: boolean;
             /** @description OIDC sign-in is switched on with an issuer and client id. */
             oidc: boolean;
+            /**
+             * @description The login page starts OIDC sign-in at once (`/login?local` still
+             *     shows the other methods); never true while `oidc` is false.
+             */
+            oidc_auto_redirect: boolean;
             /** @description Plex sign-in is switched on. */
             plex: boolean;
         };
@@ -11482,6 +11494,11 @@ export interface components {
         BackupListResponse: {
             /** @description Backups on disk, oldest first. */
             backups: components["schemas"]["BackupView"][];
+            /**
+             * @description True when the database sits on a filesystem held in memory (tmpfs
+             *     or ramfs): it and these backups are lost when the server restarts.
+             */
+            database_in_memory: boolean;
             /**
              * Format: int32
              * @description Rolling retention: the directory keeps this many.
@@ -15442,7 +15459,10 @@ export interface components {
             lastfm: boolean;
             /** @description The native library has files. */
             library: boolean;
-            /** @description ListenBrainz charts and history are available. */
+            /**
+             * @description ListenBrainz reads are switched on for this server. The home page's
+             *     copy is also false while the person has no ListenBrainz link.
+             */
             listenbrainz: boolean;
             /** @description Local files back playback. Home-only; discover leaves it false. */
             localfiles: boolean;
@@ -16298,7 +16318,7 @@ export interface components {
              *     folder's `.recycle` takes its place, or files wait for a folder
              *     that can't be reached. Set on the settings read and save only.
              */
-            recycle_bin_warning?: string | null;
+            recycle_bin_warning?: null | components["schemas"]["RecycleBinWarning"];
             /** @description Settings content revision. */
             settings_revision: string;
             /**
@@ -16737,23 +16757,13 @@ export interface components {
             /** @description ListenBrainz username. */
             username?: string;
         };
-        /** @description ListenBrainz connection. */
-        ListenBrainzConnection: {
+        /** @description ListenBrainz settings: the switch for the app's ListenBrainz reads. */
+        ListenBrainzSettings: {
             /**
-             * @description Master switch.
-             * @default false
+             * @description Read recommendations, popularity and genres from ListenBrainz.
+             * @default true
              */
-            enabled: boolean;
-            /**
-             * @description User token (encrypted at rest; v2 returned it plaintext on GET).
-             * @default
-             */
-            user_token: string;
-            /**
-             * @description Username.
-             * @default
-             */
-            username: string;
+            reads_enabled: boolean;
         };
         /**
          * @description A listening-data service: the one the discover shelves, charts, radio and
@@ -18146,6 +18156,13 @@ export interface components {
         };
         /** @description OIDC connection. */
         OidcConnection: {
+            /**
+             * @description The login page starts single sign-on at once instead of showing its
+             *     sign-in methods; `/login?local` still shows them. Only while single
+             *     sign-on is on and set up.
+             * @default false
+             */
+            auto_redirect: boolean;
             /**
              * @description Client id.
              * @default
@@ -20683,6 +20700,17 @@ export interface components {
              */
             staying: number;
         };
+        /** @description Why the recycle bin path is not used. */
+        RecycleBinWarning: {
+            /**
+             * @description The folder is not the one used as the bin before, so files wait;
+             *     an admin who moved the bin may use it
+             *     (`POST /api/v3/library/recycle-bin/accept-folder`).
+             */
+            accept_folder: boolean;
+            /** @description What the settings say. */
+            message: string;
+        };
         /**
          * @description A private playlist the caller may not read: existence, count, and owner
          *     only. Never the name, tracks, or covers. An admin also gets the ones with
@@ -22783,6 +22811,11 @@ export interface components {
             requires?: string | null;
             /** @description Display title. */
             title: string;
+            /**
+             * @description An admin switched off the service this section needs, so linking
+             *     it would not make the section available.
+             */
+            turned_off: boolean;
             /** @description Layout zone. */
             zone: string;
         };
@@ -23060,6 +23093,11 @@ export interface components {
             asked_source: components["schemas"]["ListenSource"];
             /** @description False when the provider is not set up; the list is then empty. */
             configured: boolean;
+            /**
+             * @description Services that give this list only to an account the person has not
+             *     linked (ListenBrainz's popular songs and albums). Not a failure.
+             */
+            needs_account: components["schemas"]["ListenSource"][];
             /** @description Similar artists, most similar first. */
             similar_artists: components["schemas"]["ArtistRef"][];
             /** @description Provider that answered. */
@@ -23590,6 +23628,11 @@ export interface components {
             asked_source: components["schemas"]["ListenSource"];
             /** @description False when the provider is not set up. */
             configured: boolean;
+            /**
+             * @description Services that give this list only to an account the person has not
+             *     linked (ListenBrainz's popular songs and albums). Not a failure.
+             */
+            needs_account: components["schemas"]["ListenSource"][];
             /** @description Provider that answered. */
             source: components["schemas"]["ListenSource"];
             /** @description Services that failed, or are switched off, while the list was built. */
@@ -23662,6 +23705,11 @@ export interface components {
             asked_source: components["schemas"]["ListenSource"];
             /** @description False when the provider is not set up. */
             configured: boolean;
+            /**
+             * @description Services that give this list only to an account the person has not
+             *     linked (ListenBrainz's popular songs and albums). Not a failure.
+             */
+            needs_account: components["schemas"]["ListenSource"][];
             /** @description Songs, most played first. */
             songs: components["schemas"]["TopSong"][];
             /** @description Provider that answered. */
@@ -24041,7 +24089,8 @@ export interface components {
         UpgradeCallbackFeature: "single_sign_on" | "spotify" | "musicbrainz_contributions";
         /**
          * @description What `upgrade --check` found. It runs every check the upgrade runs
-         *     before it moves anything, and changes nothing.
+         *     before it moves anything, and leaves the v2 files as they are: its
+         *     export goes into the cache folder's `.upgrade-check` and is removed.
          */
         UpgradeCheck: {
             /** @description What stops the upgrade until it is fixed. */
@@ -24073,7 +24122,7 @@ export interface components {
          * @description Why the upgrade cannot start, or why a run failed.
          * @enum {string}
          */
-        UpgradeCode: "UNKNOWN_LAYOUT" | "UNSUPPORTED_PATHS" | "BACKUP_EXISTS" | "V2_WAL_UNREADABLE" | "NOT_ENOUGH_DISK" | "V2_KEY_NOT_FOUND" | "V2_KEY_INVALID" | "V2_KEY_MISMATCH" | "V2_CONFIG_UNREADABLE" | "V2_CONFIG_INVALID" | "MISSING_INSTANCE_ID" | "V2_DATABASE_ERROR" | "EXPORT_FAILED" | "VALIDATION_FAILED" | "CALLBACKS_TO_CHANGE" | "NO_ADMIN_CAN_SIGN_IN" | "LOCKED" | "TOOL_RUNNING" | "FILE_ERROR" | "OCCUPIED" | "NOT_A_FOLDER" | "RANDOM_FAILED" | "ORPHAN_REPAIR_FAILED" | "IMPORT_SETUP_FAILED" | "IMPORT_FAILED" | "ROLLBACK_FAILED" | "BACKUP_NOT_REMOVED" | "NO_BACKUP" | "ALREADY_V2" | "BACKUP_STILL_NEEDED" | "CONFIRMATION_NEEDED" | "USAGE" | "ENVIRONMENT_INVALID" | "INTERNAL";
+        UpgradeCode: "UNKNOWN_LAYOUT" | "UNSUPPORTED_PATHS" | "DATABASE_BEHIND_LINK" | "NON_LOCAL_FILESYSTEM" | "BACKUP_EXISTS" | "V2_WAL_UNREADABLE" | "NOT_ENOUGH_DISK" | "V2_KEY_NOT_FOUND" | "V2_KEY_INVALID" | "V2_KEY_MISMATCH" | "V2_CONFIG_UNREADABLE" | "V2_CONFIG_INVALID" | "MISSING_INSTANCE_ID" | "V2_DATABASE_ERROR" | "V2_TOO_OLD" | "EXPORT_FAILED" | "VALIDATION_FAILED" | "CALLBACKS_TO_CHANGE" | "NO_ADMIN_CAN_SIGN_IN" | "LOCKED" | "TOOL_RUNNING" | "FILE_ERROR" | "OCCUPIED" | "NOT_A_FOLDER" | "RANDOM_FAILED" | "ORPHAN_REPAIR_FAILED" | "IMPORT_SETUP_FAILED" | "IMPORT_FAILED" | "ROLLBACK_FAILED" | "BACKUP_NOT_REMOVED" | "NO_BACKUP" | "ALREADY_V2" | "BACKUP_STILL_NEEDED" | "CONFIRMATION_NEEDED" | "USAGE" | "ENVIRONMENT_INVALID" | "INTERNAL";
         /** @description The run failed or stopped. */
         UpgradeFailure: {
             /** @description What went wrong. */
@@ -38024,8 +38073,75 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
+            /** @description Curator role required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description The server is busy; try again */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    accept_recycle_bin_folder: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AcceptRecycleBinFolderBody"];
+            };
+        };
+        responses: {
+            /** @description The folder is the recycle bin */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Bad body */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
             /** @description Admin role required */
             403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description The path changed, the saved folder can't be used as the bin now, or it can't be written to */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -47050,13 +47166,13 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description ListenBrainz connection */
+            /** @description ListenBrainz reads switch */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ListenBrainzConnection"];
+                    "application/json": components["schemas"]["ListenBrainzSettings"];
                 };
             };
         };
@@ -47070,50 +47186,17 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["ListenBrainzConnection"];
+                "application/json": components["schemas"]["ListenBrainzSettings"];
             };
         };
         responses: {
-            /** @description Saved connection */
+            /** @description Saved switch */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ListenBrainzConnection"];
-                };
-            };
-        };
-    };
-    verify_listenbrainz: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["ListenBrainzConnection"];
-            };
-        };
-        responses: {
-            /** @description Verify verdict */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["VerifyConnectionResponse"];
-                };
-            };
-            /** @description ListenBrainz is rate-limiting this server */
-            429: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
+                    "application/json": components["schemas"]["ListenBrainzSettings"];
                 };
             };
         };

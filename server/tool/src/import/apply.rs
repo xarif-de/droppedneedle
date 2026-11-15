@@ -10,7 +10,7 @@
 //! an import lands whole or not at all.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use droppedneedle_acquire::follows::rows;
 use droppedneedle_auth::federated::users::ProviderBinding;
@@ -21,6 +21,7 @@ use droppedneedle_catalog::concerts::store::{insert_city_in, set_seen_in};
 use droppedneedle_kernel::db::open_connection;
 use droppedneedle_kernel::db::time::Millis;
 use droppedneedle_kernel::runtime_config::{Crypto, LegacyConfig};
+use droppedneedle_library::publish::bin::record_v2_path;
 
 use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 use serde_json::Value;
@@ -30,7 +31,9 @@ use super::carry::bundle::{Bundle, BundleRejection};
 use super::envelope::{ExportFile, Opener, collect_sealed, unseal_value};
 use super::plan::{Plan, Planned, sha_hex};
 use super::report::{ExitCode, ExportProvenance, ImportReport, ReportBuilder, now_ms};
-use super::settings::{configs_equivalent, current_settings, stage_settings, write_settings};
+use super::settings::{
+    configs_equivalent, current_settings, stage_settings, v2_recycle_bin_path, write_settings,
+};
 use super::snapshot::DatabaseSnapshot;
 use super::sql;
 use super::validate::{ValidationIssue, read_export};
@@ -231,7 +234,7 @@ fn import_blocking(request: ImportRequest, provenance: ExportProvenance) -> Impo
     // swapped or inconsistent bundle refuses the import with zero writes.
     let bundle = match prepare_bundle(&conn, &request, &doc) {
         Ok(bundle) => bundle,
-        Err(BundleRejection::Invalid(reason)) => {
+        Err(BundleRejection::Invalid(reason) | BundleRejection::TooOld(reason)) => {
             report.note("export", "attachments".to_owned(), "error", reason.clone());
             return report.finish(ExitCode::FailedValidation, reason);
         }
@@ -280,6 +283,31 @@ fn prepare_bundle(
     };
     super::carry::check_bundle(conn, &found, doc)?;
     Ok(Some(found))
+}
+
+/// The bundle check [`prepare_bundle`] runs, for an export in `folder` that
+/// has no target yet: on v3's schema made in memory, the schema a new
+/// target is migrated to. The upgrade's check runs it, so a v2 the import
+/// would refuse is caught before anything moves.
+pub(crate) fn check_bundle_on_new_schema(
+    root: &Value,
+    folder: &Path,
+) -> Result<(), BundleRejection> {
+    let internal = |what: &str, error: &dyn std::fmt::Display| {
+        BundleRejection::Internal(format!("cannot {what}: {error}"))
+    };
+    let doc: ExportDoc = serde_json::from_value(root.clone())
+        .map_err(|error| internal("read the export", &error))?;
+    let Some(found) = super::carry::bundle::locate(&doc, Some(folder))? else {
+        return Ok(());
+    };
+    let conn =
+        Connection::open_in_memory().map_err(|error| internal("make v3's schema", &error))?;
+    droppedneedle_kernel::db::apply_connection_pragmas(&conn)
+        .map_err(|error| internal("make v3's schema", &error))?;
+    let conn = droppedneedle_kernel::db::migrate(conn, &droppedneedle_kernel::schema::CHAIN)
+        .map_err(|error| internal("make v3's schema", &error))?;
+    super::carry::check_bundle(&conn, &found, &doc)
 }
 
 /// Best-effort provenance for reports on unparseable files.
@@ -458,9 +486,15 @@ fn run_guarded(
     let plan = Plan::decide(doc, &snapshot, unsealed, report);
     plan.apply(&tx, &request.crypto, unsealed)?;
     let settings_written = write_settings(&tx, &staged_config, &request.crypto)?;
+    // Recorded so v2's bin folder is taken by itself only while it holds
+    // entries.
+    let bin_recorded = match v2_recycle_bin_path(&staged_config) {
+        Some(bin) => record_v2_path(&tx, &bin, now_ms())?,
+        None => 0,
+    };
     // A pure re-import (every record and setting identical) writes nothing
     // at all, not even an audit row: idempotency means zero writes.
-    let run_id = if plan.has_writes() || settings_written > 0 {
+    let run_id = if plan.has_writes() || settings_written + bin_recorded > 0 {
         Some(record_import_run(&tx, doc, report, completed_exit(report))?)
     } else {
         None

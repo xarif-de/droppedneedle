@@ -4107,6 +4107,19 @@ fn mp4_integer_atoms_keep_their_type_and_order() {
 /// An MP3 whose ID3 tag (`major` 3 or 4) holds exactly these frames,
 /// built by bytes over the management fixture's audio.
 fn raw_id3_mp3(test: &str, major: u8, frames: &[(&str, Vec<u8>)]) -> (ScratchDir, PathBuf) {
+    let unflagged: Vec<(&str, Vec<u8>, [u8; 2])> = frames
+        .iter()
+        .map(|(id, payload)| (*id, payload.clone(), [0, 0]))
+        .collect();
+    raw_id3_mp3_flagged(test, major, &unflagged)
+}
+
+/// [`raw_id3_mp3`] with each frame's two header flag bytes spelled out.
+fn raw_id3_mp3_flagged(
+    test: &str,
+    major: u8,
+    frames: &[(&str, Vec<u8>, [u8; 2])],
+) -> (ScratchDir, PathBuf) {
     let syncsafe = |size: usize| {
         [
             ((size >> 21) & 0x7F) as u8,
@@ -4116,14 +4129,14 @@ fn raw_id3_mp3(test: &str, major: u8, frames: &[(&str, Vec<u8>)]) -> (ScratchDir
         ]
     };
     let mut body = Vec::new();
-    for (id, payload) in frames {
+    for (id, payload, flags) in frames {
         body.extend_from_slice(id.as_bytes());
         if major == 4 {
             body.extend_from_slice(&syncsafe(payload.len()));
         } else {
             body.extend_from_slice(&(payload.len() as u32).to_be_bytes());
         }
-        body.extend_from_slice(&[0, 0]);
+        body.extend_from_slice(flags);
         body.extend_from_slice(payload);
     }
     body.resize(body.len() + 256, 0);
@@ -4205,6 +4218,148 @@ fn title_save_keeps_frames_lofty_rewrites() {
         assert_eq!(id3_text_values(&path, "TIT2"), texts(&["New"]));
         assert_eq!(after_id3v2(&path), tail);
     }
+}
+
+/// Status flags no longer block a save, so the `ETCO` from #671 (flags
+/// `0x2000`) imports instead of refusing. Frames the save leaves alone
+/// keep their payload and their status flags, raw and text frames alike;
+/// the edited frame goes out with none, and a frame saved again with the
+/// value it holds keeps them. Format flags and reserved bits in either
+/// flag byte still refuse.
+#[test]
+fn frame_status_flags_do_not_block_a_save() {
+    let etco = vec![2, 3, 0, 0, 0, 1];
+    // v2.4: 0x40 tag alter, 0x20 file alter, 0x10 read only; v2.3 spells
+    // them one bit higher.
+    for (test, major, flags) in [
+        ("status-v24", 4, [0x20, 0x00]),
+        ("status-v24-read-only", 4, [0x10, 0x00]),
+        ("status-v23", 3, [0xE0, 0x00]),
+    ] {
+        let frames: Vec<(&str, Vec<u8>, [u8; 2])> = vec![
+            ("TIT2", latin1(&["Probe"]), flags),
+            ("TPE1", latin1(&["Artist"]), flags),
+            ("ETCO", etco.clone(), flags),
+        ];
+        let (_dir, path) = raw_id3_mp3_flagged(test, major, &frames);
+        let tail = after_id3v2(&path);
+        assert_eq!(
+            tags::save::tags_kept(track_file(&path), PicturesPlan::Untouched)
+                .unwrap()
+                .refusal,
+            None,
+            "{test}"
+        );
+
+        tags::save_tags(&path, &[TagEdit::set_title("New")]).unwrap();
+        let (after_major, after) = id3_view(&path);
+        assert_eq!(after_major, major, "{test}");
+        assert_eq!(
+            after
+                .iter()
+                .find(|(id, _)| id == "ETCO")
+                .map(|(_, body)| body),
+            Some(&FrameBody::Raw(etco.clone())),
+            "{test}: the ETCO payload survives"
+        );
+        assert_eq!(id3_text_values(&path, "TIT2"), texts(&["New"]), "{test}");
+        assert_eq!(id3_text_values(&path, "TPE1"), texts(&["Artist"]), "{test}");
+        assert_eq!(
+            id3_frame_flags(&path, "ETCO"),
+            Some(flags),
+            "{test}: the untouched ETCO keeps its status flags"
+        );
+        assert_eq!(
+            id3_frame_flags(&path, "TPE1"),
+            Some(flags),
+            "{test}: the untouched TPE1 keeps its status flags"
+        );
+        assert_eq!(
+            id3_frame_flags(&path, "TIT2"),
+            Some([0, 0]),
+            "{test}: the edited TIT2 has none"
+        );
+        assert_eq!(after_id3v2(&path), tail, "{test}");
+
+        // A restore writes every field back, changed or not: TPE1 saved
+        // with the value it holds keeps its flags.
+        tags::save_tags(&path, &[TagEdit::new(TagField::Artist, texts(&["Artist"]))]).unwrap();
+        assert_eq!(
+            id3_frame_flags(&path, "TPE1"),
+            Some(flags),
+            "{test}: TPE1 saved with its own value keeps its status flags"
+        );
+    }
+
+    // A format flag (compression 0x08/0x80) or a reserved bit changes or
+    // hides the payload, so the inventory refuses and leaves the file.
+    for (test, major, flags, refusal) in [
+        (
+            "format-v24",
+            4,
+            [0x00, 0x08],
+            "carries format or reserved flags this wrapper cannot preserve",
+        ),
+        (
+            "format-v23",
+            3,
+            [0x00, 0x80],
+            "carries format or reserved flags this wrapper cannot preserve",
+        ),
+        (
+            "reserved-v24",
+            4,
+            [0x01, 0x00],
+            "sets a reserved status bit this wrapper cannot preserve",
+        ),
+        (
+            "reserved-second-byte-v23",
+            3,
+            [0x00, 0x01],
+            "carries format or reserved flags this wrapper cannot preserve",
+        ),
+    ] {
+        let frames: Vec<(&str, Vec<u8>, [u8; 2])> = vec![
+            ("TIT2", latin1(&["Probe"]), [0, 0]),
+            ("ETCO", etco.clone(), flags),
+        ];
+        let (_dir, path) = raw_id3_mp3_flagged(test, major, &frames);
+        let before = std::fs::read(&path).unwrap();
+        let reason = match tags::save::tags_kept(track_file(&path), PicturesPlan::Untouched) {
+            Err(TagsError::TagRead { reason, .. }) => reason,
+            other => panic!("expected a refusal, got {other:?}"),
+        };
+        assert!(reason.contains(refusal), "{test}: {reason}");
+        assert!(
+            tags::save_tags(&path, &[TagEdit::set_title("New")]).is_err(),
+            "{test}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before, "{test}");
+    }
+}
+
+/// The two flag bytes of the first `id` frame in the file's ID3v2 tag.
+fn id3_frame_flags(path: &Path, id: &str) -> Option<[u8; 2]> {
+    let bytes = std::fs::read(path).unwrap();
+    let major = bytes[3];
+    let syncsafe = |part: &[u8]| {
+        part.iter()
+            .fold(0usize, |acc, byte| (acc << 7) | usize::from(byte & 0x7F))
+    };
+    let end = 10 + syncsafe(&bytes[6..10]);
+    let mut offset = 10;
+    while offset + 10 <= end && bytes[offset] != 0 {
+        let size = if major == 4 {
+            syncsafe(&bytes[offset + 4..offset + 8])
+        } else {
+            u32::from_be_bytes(bytes[offset + 4..offset + 8].try_into().unwrap()) as usize
+        };
+        if &bytes[offset..offset + 4] == id.as_bytes() {
+            return Some([bytes[offset + 8], bytes[offset + 9]]);
+        }
+        offset += 10 + size;
+    }
+    None
 }
 
 /// What the writer would merge is refused by the pictures plan. Two frames

@@ -350,6 +350,7 @@ pub(crate) async fn build_on(
             &p.settings,
             p.config.imports_dir(),
             p.config.slskd_downloads_path.clone(),
+            p.config.plugins_dir(),
         ),
     )
     .map_err(stage("library setup"))?;
@@ -417,6 +418,7 @@ pub(crate) async fn build_on(
             providers.clone(),
             Arc::new(LiveCatalogSettings::new(config_store)),
             auth.users.clone(),
+            listening.clone(),
         ),
         local,
         PageSources {
@@ -451,7 +453,16 @@ pub(crate) async fn build_on(
         mb_source.clone(),
         queues.queue().clone(),
         outbound.library(&providers, mb_source.clone(), p.clock.clone()),
-        library_ports(p, &providers, &auth, &artwork, &scans, lyrics, library_core),
+        library_ports(
+            p,
+            &providers,
+            &auth,
+            &artwork,
+            &scans,
+            lyrics,
+            library_core,
+            listening.clone(),
+        ),
     )
     .map_err(stage("library setup"))?;
     let library_services = LibraryServices::build(&library);
@@ -725,12 +736,14 @@ fn library_ports(
     scans: &jobs::ScansEnded,
     lyrics: OnlineLyrics,
     core: droppedneedle_library::wiring::LibraryCore,
+    listening: ListeningStore,
 ) -> droppedneedle_library::wiring::LibraryPorts {
     let enrichment = LiveEnrichment::new(
         Upstream::new(
             providers.clone(),
             Arc::new(LiveCatalogSettings::new(&p.settings)),
             auth.users.clone(),
+            listening,
         ),
         artwork.clone(),
         lyrics,

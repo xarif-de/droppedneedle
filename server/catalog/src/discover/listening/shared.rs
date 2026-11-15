@@ -1,10 +1,13 @@
 //! The ListenBrainz rows other areas read without a user's listening data:
-//! search counts and the Weekly Mix. They go through the same cache rows
-//! as [`ListeningData`](super::ListeningData), so one artist is read once
-//! whichever feature asks first.
+//! search counts, album pages and the Weekly Mix. They go through the same
+//! cache rows as [`ListeningData`](super::ListeningData), so one artist is
+//! read once whichever feature asks first. The answers are public, so the
+//! keys carry no token; a read lends the person's own link when it goes
+//! out.
 
 use std::collections::HashMap;
 
+use droppedneedle_media::playback::listening::ListeningStore;
 use droppedneedle_providers::listenbrainz::{
     ListenBrainzClient, ListenBrainzCredentials, SimilarArtist, TopReleaseGroup,
 };
@@ -18,6 +21,38 @@ use super::rows::{AlbumRow, ArtistRow, RankedAlbum, ScoredArtist};
 pub const SIMILAR_ROWS: usize = 25;
 /// An artist's top albums read per artist.
 pub const ARTIST_ALBUM_ROWS: usize = 25;
+
+/// Whose ListenBrainz link a read lends: a person's own, looked up only
+/// when no fresh answer is held, so a fresh one costs no store read; or
+/// no one's. A read never lends the server's account.
+#[derive(Clone)]
+pub enum Lender {
+    /// No one's: the read goes out anonymous.
+    Anonymous,
+    /// This person's own link when they have one, else anonymous.
+    Person(ListeningStore, String),
+}
+
+impl Lender {
+    /// The identity to send now.
+    pub async fn credentials(&self) -> ListenBrainzCredentials {
+        match self {
+            Self::Person(store, user_id) if !user_id.is_empty() => {
+                store.listenbrainz_credentials(user_id).await
+            }
+            _ => ListenBrainzCredentials::default(),
+        }
+    }
+}
+
+/// Whether `creds` carry a token, which ListenBrainz needs for an
+/// artist's top albums and songs.
+pub fn has_token(creds: &ListenBrainzCredentials) -> bool {
+    creds
+        .user_token
+        .as_deref()
+        .is_some_and(|token| !token.is_empty())
+}
 
 fn lower(text: &str) -> String {
     text.trim().to_lowercase()
@@ -114,7 +149,8 @@ pub(super) fn ranked_albums(rows: Vec<TopReleaseGroup>, artist_mbid: &str) -> Ve
 }
 
 /// One artist's most played release groups, `count` at most, read through
-/// the shared rows.
+/// the shared rows. ListenBrainz answers them only with a token: without
+/// one, what is held answers and no fetch is started or joined.
 ///
 /// # Errors
 ///
@@ -124,25 +160,34 @@ pub async fn artist_albums(
     client: &ListenBrainzClient,
     artist_mbid: &str,
     count: usize,
+    lender: &Lender,
     priority: RequestPriority,
 ) -> Result<Vec<RankedAlbum>, ProviderError> {
     let read = count.max(ARTIST_ALBUM_ROWS);
-    let (client, mbid) = (client.clone(), artist_mbid.to_owned());
+    let key = artist_albums_key(artist_mbid, read);
+    if !cache.fresh(&key).await && !has_token(&lender.credentials().await) {
+        let held: Option<Vec<RankedAlbum>> = cache.peek(&key).await.flatten();
+        let mut rows = held.unwrap_or_default();
+        rows.truncate(count);
+        return Ok(rows);
+    }
+    let (client, mbid, lender) = (client.clone(), artist_mbid.to_owned(), lender.clone());
     let rows = cache
         .get_or_fetch(
-            &artist_albums_key(artist_mbid, read),
+            &key,
             Policy::LISTENBRAINZ_ARTIST,
             priority,
             move |priority| async move {
-                let rows = client
-                    .artist_top_release_groups(
-                        &mbid,
-                        read,
-                        &ListenBrainzCredentials::default(),
-                        priority,
-                    )
-                    .await?;
-                Ok(found_or_missing(ranked_albums(rows, &mbid)))
+                let creds = lender.credentials().await;
+                match client
+                    .artist_top_release_groups(&mbid, read, &creds, priority)
+                    .await
+                {
+                    Ok(rows) => Ok(found_or_missing(ranked_albums(rows, &mbid))),
+                    // Not sent: shown as nothing, kept for no one.
+                    Err(ProviderError::NotConfigured { .. }) => Ok(Fetched::Partial(Vec::new())),
+                    Err(error) => Err(error),
+                }
             },
         )
         .await?;
@@ -162,24 +207,19 @@ pub async fn similar_artists(
     client: &ListenBrainzClient,
     artist_mbid: &str,
     limit: usize,
+    lender: &Lender,
     priority: RequestPriority,
 ) -> Result<Vec<ScoredArtist>, ProviderError> {
     let read = limit.max(SIMILAR_ROWS);
-    let (client, mbid) = (client.clone(), artist_mbid.to_owned());
+    let (client, mbid, lender) = (client.clone(), artist_mbid.to_owned(), lender.clone());
     let rows = cache
         .get_or_fetch(
             &similar_key(artist_mbid, read),
             Policy::LISTENBRAINZ_ARTIST,
             priority,
             move |priority| async move {
-                let rows = similar_from(
-                    &client,
-                    &mbid,
-                    read,
-                    &ListenBrainzCredentials::default(),
-                    priority,
-                )
-                .await?;
+                let creds = lender.credentials().await;
+                let rows = similar_from(&client, &mbid, read, &creds, priority).await?;
                 Ok(found_or_missing(rows))
             },
         )
@@ -198,6 +238,7 @@ pub async fn listen_counts(
     cache: &ProviderCacheStore,
     client: &ListenBrainzClient,
     release_group_mbids: &[String],
+    lender: &Lender,
     priority: RequestPriority,
 ) -> Result<HashMap<String, i64>, ProviderError> {
     cache
@@ -206,12 +247,9 @@ pub async fn listen_counts(
             listen_count_key,
             Policy::LISTENBRAINZ_ARTIST,
             |missing| async move {
+                let creds = lender.credentials().await;
                 client
-                    .release_group_popularity(
-                        &missing,
-                        &ListenBrainzCredentials::default(),
-                        priority,
-                    )
+                    .release_group_popularity(&missing, &creds, priority)
                     .await
             },
         )

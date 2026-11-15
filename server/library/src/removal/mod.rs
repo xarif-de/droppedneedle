@@ -171,12 +171,35 @@ const SETTINGS_UNREAD: [Reason; 5] = bin_reasons!(
     "Open the Automation tab of Library Management and save it"
 );
 const DOWNLOADS_UNREAD: [Reason; 5] = bin_reasons!(
-    "No recycle bin is known while the slskd or SABnzbd settings can't be read",
+    "No recycle bin is known while the slskd, SABnzbd or download plugin settings can't be read",
     "Open those settings and save them again"
 );
 const BIN_UNREACHABLE: [Reason; 5] = bin_reasons!(
     "The recycle bin folder can't be reached",
     "Check that its drive or share is mounted and the server can open it"
+);
+const BIN_UNMARKED: [Reason; 5] = bin_reasons!(
+    "DroppedNeedle can't tell the recycle bin folder is the one used before",
+    "If its share isn't mounted, mount it (and restart DroppedNeedle if it started while the share was down); otherwise choose Use this folder under Library Management"
+);
+
+/// The saved recycle bin path is not the one an admin chose to use.
+pub const BIN_PATH_CHANGED: Reason = reason(
+    "STALE_REVISION",
+    "The recycle bin path changed, so nothing was marked.",
+    "Reload the page and try again.",
+);
+/// The saved settings would not use the folder an admin chose as the bin.
+pub const BIN_NOT_USED: Reason = reason(
+    RECYCLE_BIN_UNKNOWN,
+    "The saved recycle bin folder can't be used right now, so nothing was marked.",
+    "Check the recycle bin warning under Library Management.",
+);
+/// The marker could not be made in the folder an admin chose as the bin.
+pub const BIN_UNWRITABLE: Reason = reason(
+    RECYCLE_BIN_UNKNOWN,
+    "The recycle bin folder can't be written to, so nothing was marked.",
+    "Check that the server can write to it, then try again.",
 );
 
 /// What a person reads while no recycle bin is known because `cause`,
@@ -187,6 +210,7 @@ pub fn bins_unknown(cause: BinsUnknown, during: BinUse) -> Reason {
         BinsUnknown::SettingsUnread => &SETTINGS_UNREAD,
         BinsUnknown::DownloadsUnread => &DOWNLOADS_UNREAD,
         BinsUnknown::Unreachable => &BIN_UNREACHABLE,
+        BinsUnknown::Unmarked => &BIN_UNMARKED,
     };
     wordings[during as usize]
 }

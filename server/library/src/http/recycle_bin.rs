@@ -1,12 +1,14 @@
-//! The recycle bin page's routes, for admins: what the bin holds, grouped
-//! by the removal or change that put it there; what emptying it now would
-//! delete; whether it is being emptied; and Empty itself, which queues a
-//! run of the bin's expiry with no retention. Put back is the album's
+//! The recycle bin page's routes: what the bin holds, grouped by the
+//! removal or change that put it there; what emptying it now would delete;
+//! whether it is being emptied; and Empty itself, which queues a run of the
+//! bin's expiry with no retention. The list is for curators; its summary,
+//! status and Empty are for admins, and so is choosing the folder as the
+//! bin when it is not the one used before. Put back is the album's
 //! removal route.
 
 use crate::publish::session::Publishing;
 use axum::{Json, extract::State, http::StatusCode};
-use droppedneedle_auth::Admin;
+use droppedneedle_auth::{Admin, Curator};
 use droppedneedle_kernel::error::{ApiError, Unavailable};
 use droppedneedle_kernel::extract::{ValidJson, ValidQuery};
 use droppedneedle_kernel::mount::{Routes, routes};
@@ -16,6 +18,7 @@ use utoipa::{IntoParams, ToSchema};
 
 use super::blocking;
 use crate::publish::PublishError;
+use crate::publish::bin::AcceptFolderError;
 use crate::publish::bin_contents::{self, BinGroup, BinKind};
 use crate::removal::recycle_bin::{self, Emptied, EmptyingState};
 use crate::wiring::LibraryServices;
@@ -23,10 +26,11 @@ use crate::wiring::LibraryServices;
 /// Recycle bin routes.
 pub fn routes() -> Routes<LibraryServices> {
     Routes::new()
-        .admin(routes!(list_recycle_bin))
+        .curator(routes!(list_recycle_bin))
         .admin(routes!(recycle_bin_summary))
         .admin(routes!(recycle_bin_status))
         .admin(routes!(empty_recycle_bin))
+        .admin(routes!(accept_recycle_bin_folder))
 }
 
 /// The album a group of files came from.
@@ -141,13 +145,13 @@ pub struct EmptyRecycleBinView {
         (status = 200, description = "A page of the recycle bin", body = RecycleBinPage),
         (status = 400, description = "Bad cursor"),
         (status = 401, description = "Not authenticated"),
-        (status = 403, description = "Admin role required"),
+        (status = 403, description = "Curator role required"),
         (status = 503, description = "The server is busy; try again"),
     )
 )]
 pub async fn list_recycle_bin(
     State(state): State<Publishing>,
-    _caller: Admin,
+    _caller: Curator,
     ValidQuery(query): ValidQuery<RecycleBinQuery>,
 ) -> Result<Json<RecycleBinPage>, ApiError> {
     let paging = PageRequest::read(query.limit, query.cursor.as_deref(), 50, 100)?;
@@ -304,6 +308,62 @@ pub async fn empty_recycle_bin(
             joined: enqueued.joined,
         }),
     ))
+}
+
+/// The folder an admin chooses as the recycle bin.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct AcceptRecycleBinFolderBody {
+    /// The recycle bin path the warning was shown for.
+    pub path: String,
+}
+
+/// Use the folder the recycle bin path names as the bin.
+///
+/// For when the app finds it is not the folder used before, because the
+/// bin was moved. It is marked as the bin, and removals and upgrades go
+/// ahead. Nothing is written when it already holds the marker.
+#[utoipa::path(
+    post,
+    tag = "library management",
+    path = "/api/v3/library/recycle-bin/accept-folder",
+    request_body = AcceptRecycleBinFolderBody,
+    responses(
+        (status = 204, description = "The folder is the recycle bin"),
+        (status = 400, description = "Bad body"),
+        (status = 401, description = "Not authenticated"),
+        (status = 403, description = "Admin role required"),
+        (status = 409, description = "The path changed, the saved folder can't be used as the bin now, or it can't be written to"),
+        (status = 503, description = "The server is busy; try again"),
+    )
+)]
+pub async fn accept_recycle_bin_folder(
+    State(state): State<Publishing>,
+    caller: Admin,
+    ValidJson(body): ValidJson<AcceptRecycleBinFolderBody>,
+) -> Result<StatusCode, ApiError> {
+    blocking(move || {
+        state
+            .core
+            .bins
+            .accept_folder(&caller, &body.path)
+            .map_err(accept_error)
+    })
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn accept_error(error: AcceptFolderError) -> ApiError {
+    use crate::removal::{BIN_NOT_USED, BIN_PATH_CHANGED, BIN_UNWRITABLE};
+    let conflict = |reason| super::error::refused(StatusCode::CONFLICT, reason);
+    match error {
+        AcceptFolderError::PathChanged => conflict(BIN_PATH_CHANGED),
+        AcceptFolderError::NotTheBin => conflict(BIN_NOT_USED),
+        AcceptFolderError::Unwritable(error) => {
+            tracing::warn!(%error, "the recycle bin marker could not be written");
+            conflict(BIN_UNWRITABLE)
+        }
+        AcceptFolderError::Db(error) => db_error(error),
+    }
 }
 
 fn db_error(error: droppedneedle_kernel::db::DbError) -> ApiError {

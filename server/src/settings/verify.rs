@@ -8,7 +8,7 @@
 //! 5xx, and never echo the URL or host.
 //!
 //! Probes reuse the production clients (media adapters, slskd and
-//! Usenet clients, the provider clients for MusicBrainz, ListenBrainz,
+//! Usenet clients, the provider clients for MusicBrainz,
 //! Last.fm, YouTube, Ticketmaster and Skiddle), so a passing verify means
 //! the same code path the app uses can reach the upstream. The
 //! [`VerifyProbes`] port keeps tests hermetic: HTTP tests run against
@@ -25,7 +25,6 @@ use droppedneedle_media::remotes::connections::{ConnectionResolver, ResolvedConn
 use droppedneedle_media::remotes::models::SourceName;
 use droppedneedle_media::remotes::source::RemoteHandle;
 use droppedneedle_providers::lastfm::{self, LastFmClient, LastFmCredentials};
-use droppedneedle_providers::listenbrainz::ListenBrainzClient;
 use droppedneedle_providers::musicbrainz::{MbSource, MusicBrainzClient};
 use droppedneedle_providers::oidc::OidcClient;
 use droppedneedle_providers::skiddle::SkiddleClient;
@@ -98,18 +97,6 @@ pub struct PlexVerdict {
     pub message: String,
     /// Music libraries as `(key, title)` (empty unless the probe passed).
     pub libraries: Vec<(String, String)>,
-}
-
-/// ListenBrainz verdict. Rate limiting is its own flag because the
-/// route answers 429 there (v2 parity), not a body verdict.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ListenBrainzVerdict {
-    /// Whether the submitted values checked out.
-    pub valid: bool,
-    /// Human summary.
-    pub message: String,
-    /// The upstream is rate-limiting; the caller answers 429.
-    pub rate_limited: bool,
 }
 
 /// slskd verdict, with the reported server version.
@@ -208,12 +195,6 @@ pub trait VerifyProbes: Send + Sync {
         url: &'a str,
         token: &'a str,
     ) -> BoxFuture<'a, Result<Vec<(String, String)>, String>>;
-    /// ListenBrainz token (or username-only) check.
-    fn listenbrainz<'a>(
-        &'a self,
-        username: &'a str,
-        token: &'a str,
-    ) -> BoxFuture<'a, ListenBrainzVerdict>;
     /// Last.fm app key check, then the shared secret through a signed
     /// `auth.getToken`.
     fn lastfm<'a>(&'a self, key: &'a str, secret: &'a str) -> BoxFuture<'a, ProbeVerdict>;
@@ -249,11 +230,16 @@ pub trait VerifyProbes: Send + Sync {
 pub struct LiveProbes {
     /// Outbound client.
     pub http: reqwest::Client,
+    /// The factory's client that follows a redirect only on the same host,
+    /// for slskd and Prowlarr: their key rides in a header a redirect
+    /// elsewhere would carry to another address.
+    pub same_host: reqwest::Client,
+    /// The factory's client that follows no redirect, which SABnzbd's
+    /// client fetches NZB links through.
+    pub no_redirect: reqwest::Client,
     /// The MusicBrainz client, over the official, BrainzMash and mirror
     /// rows.
     pub musicbrainz: MusicBrainzClient,
-    /// The one ListenBrainz client, which checks ListenBrainz credentials.
-    pub listenbrainz: ListenBrainzClient,
     /// The Last.fm client.
     pub lastfm: LastFmClient,
     /// The YouTube Data API client.
@@ -271,14 +257,22 @@ pub struct LiveProbes {
 }
 
 impl LiveProbes {
-    /// Build over the shared client and the providers' clients, presenting
-    /// this install's stored Plex client id from `install`, as every other
-    /// Plex call does.
-    pub fn new(http: reqwest::Client, providers: &Providers, install: InstallIds) -> Self {
+    /// Build over the shared client, the client that follows a redirect
+    /// only on the same host, the one that follows none and the providers'
+    /// clients, presenting this install's stored Plex client id from
+    /// `install`, as every other Plex call does.
+    pub fn new(
+        http: reqwest::Client,
+        same_host: reqwest::Client,
+        no_redirect: reqwest::Client,
+        providers: &Providers,
+        install: InstallIds,
+    ) -> Self {
         Self {
             http,
+            same_host,
+            no_redirect,
             musicbrainz: providers.musicbrainz.clone(),
-            listenbrainz: providers.listenbrainz.clone(),
             lastfm: providers.lastfm.clone(),
             youtube: providers.youtube.clone(),
             ticketmaster: providers.ticketmaster.clone(),
@@ -558,25 +552,6 @@ impl VerifyProbes for LiveProbes {
         })
     }
 
-    fn listenbrainz<'a>(
-        &'a self,
-        username: &'a str,
-        token: &'a str,
-    ) -> BoxFuture<'a, ListenBrainzVerdict> {
-        Box::pin(async move {
-            // An admin waits on the Verify button.
-            let outcome = self
-                .listenbrainz
-                .verify(username, token, RequestPriority::UserInitiated)
-                .await;
-            ListenBrainzVerdict {
-                valid: outcome.valid,
-                message: outcome.message,
-                rate_limited: outcome.rate_limited,
-            }
-        })
-    }
-
     fn lastfm<'a>(&'a self, key: &'a str, secret: &'a str) -> BoxFuture<'a, ProbeVerdict> {
         Box::pin(async move {
             let creds = LastFmCredentials {
@@ -684,7 +659,7 @@ impl VerifyProbes for LiveProbes {
                 };
             }
             let repo = SlskdRepository::new(
-                SlskdClient::new(ReqwestSlskdHttp::new(self.http.clone(), url, key)),
+                SlskdClient::new(ReqwestSlskdHttp::new(self.same_host.clone(), url, key)),
                 url,
                 key,
                 std::path::PathBuf::new(),
@@ -724,12 +699,21 @@ impl VerifyProbes for LiveProbes {
                 poll_timeout: PROBE_TIMEOUT,
                 ..UsenetPolicy::default()
             };
-            // Two clients over the one HTTP handle: the queue owns its
-            // clone for health + diagnosis, the spare serves the picker.
-            let cats_client =
-                SabnzbdClient::new(self.http.clone(), url, key, 1, Duration::from_secs(1));
+            // Two clients over the same HTTP handles: the queue owns one
+            // for health + diagnosis, the spare serves the picker.
+            let client = || {
+                SabnzbdClient::new(
+                    self.http.clone(),
+                    self.no_redirect.clone(),
+                    url,
+                    key,
+                    1,
+                    Duration::from_secs(1),
+                )
+            };
+            let cats_client = client();
             let queue = SabnzbdQueue::new(
-                SabnzbdClient::new(self.http.clone(), url, key, 1, Duration::from_secs(1)),
+                client(),
                 url,
                 key,
                 std::path::PathBuf::from(downloads_mount),
@@ -801,7 +785,7 @@ impl VerifyProbes for LiveProbes {
                     indexer_count: None,
                 };
             }
-            let client = ProwlarrClient::new(self.http.clone(), url, key, "prowlarr");
+            let client = ProwlarrClient::new(self.same_host.clone(), url, key, "prowlarr");
             let status = match client.system_status(PROBE_TIMEOUT).await {
                 Ok(status) => status,
                 Err(error) => return prowlarr_failure(&error),
@@ -992,6 +976,10 @@ fn prowlarr_failure(error: &droppedneedle_acquire::client_error::ClientError) ->
         }
         Source::RateLimited { .. } => {
             "Prowlarr rate-limited the test. Try again shortly.".to_owned()
+        }
+        Source::Redirected { .. } => {
+            "Prowlarr answered with a redirect, which is not followed. Use the address Prowlarr answers on."
+                .to_owned()
         }
         _ => "Couldn't reach Prowlarr. Check the URL and that Prowlarr is running.".to_owned(),
     };

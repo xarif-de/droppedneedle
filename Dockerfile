@@ -28,7 +28,10 @@ COPY frontend/ ./
 # server can stamp in any BASE_PATH at startup without a rebuild (see
 # frontend/svelte.config.js and server/src/web.rs).
 ENV DROPPEDNEEDLE_BASE_PATH_PLACEHOLDER=1
-RUN pnpm run build
+# The source maps name the packages in the build, for its licence notices; the
+# script removes them once read.
+RUN pnpm run build --sourcemap hidden \
+    && node scripts/notices.mjs build /app/NOTICES-web-ui.txt
 
 FROM rust:1.89.0-bookworm AS chef
 
@@ -65,6 +68,12 @@ FROM chef AS planner
 COPY server/ ./server/
 RUN cd server && cargo chef prepare --recipe-path /app/recipe.json
 
+# cargo-about writes the licence notices for the crates the binaries link
+# (server/about.toml). It is built apart from the dependencies, so their
+# cached layer stays valid.
+FROM chef AS about
+RUN cargo install cargo-about --version 0.9.3 --locked --features cli
+
 FROM chef AS dependencies
 COPY --from=planner /app/recipe.json ./recipe.json
 RUN mkdir -p server \
@@ -77,6 +86,17 @@ COPY server/ ./server/
 COPY sdk/ ./sdk/
 # The custom CSS rules, which the server's check shares with the web UI's.
 COPY frontend/src/lib/stores/customCssRules.json ./frontend/src/lib/stores/customCssRules.json
+
+COPY --from=about /usr/local/cargo/bin/cargo-about /usr/local/cargo/bin/cargo-about
+# The tool links the server, so its graph holds every crate of both binaries.
+# A clarification in about.toml that cannot be fetched or checked only warns,
+# and its crate falls back to a placeholder copyright line, so that warning
+# fails the build.
+RUN mkdir /notices \
+    && cargo about generate --locked --fail --manifest-path server/tool/Cargo.toml --config server/about.toml \
+        --output-file /notices/NOTICES-server.txt server/about.hbs 2>/notices/log \
+    && ! grep -q clarification /notices/log \
+    || { cat /notices/log >&2; exit 1; }
 
 # Only the binaries stay in this layer, which keeps the build cache small.
 RUN cargo build --release --locked --manifest-path server/Cargo.toml --bins -p droppedneedle -p droppedneedle-tool \
@@ -108,6 +128,7 @@ WORKDIR /build
 
 # The image carries what the LGPL asks of whoever ships the program: the licence
 # files, the exact source and, in BUILD, the version and configure line.
+# libmp3lame's Debian source is in lame/, fetched by the step below.
 RUN curl -fsSL --retry 3 -o "ffmpeg-${FFMPEG_VERSION}.tar.xz" "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz" \
     && echo "${FFMPEG_SHA256}  ffmpeg-${FFMPEG_VERSION}.tar.xz" | sha256sum -c - \
     && tar xf "ffmpeg-${FFMPEG_VERSION}.tar.xz" \
@@ -130,6 +151,20 @@ RUN curl -fsSL --retry 3 -o "ffmpeg-${FFMPEG_VERSION}.tar.xz" "https://ffmpeg.or
     && cp COPYING.* CREDITS LICENSE.md /out/doc/ \
     && ./ffmpeg -version > /out/doc/BUILD \
     && cp "../ffmpeg-${FFMPEG_VERSION}.tar.xz" /out/doc/
+
+# libmp3lame is LGPL too, so its Debian source goes beside FFmpeg's: the
+# source package and version dpkg records for the -dev package the build links.
+# The apt sandbox user cannot write to /out, so apt would run this download as
+# root with a warning; the option drops the warning.
+RUN sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/debian.sources \
+    && apt-get update \
+    && src=$(dpkg-query -W -f='${source:Package}=${source:Version}' libmp3lame-dev) \
+    && ver=$(dpkg-query -W -f='${Version}' libmp3lame-dev) \
+    && mkdir -p /out/doc/lame \
+    && cd /out/doc/lame \
+    && apt-get -o APT::Sandbox::User=root source --download-only "$src" \
+    && echo "$ver" > VERSION \
+    && rm -rf /var/lib/apt/lists/*
 
 FROM debian:bookworm-slim
 
@@ -167,9 +202,21 @@ COPY --from=builder /out/droppedneedle /usr/local/bin/droppedneedle
 COPY --from=builder /out/droppedneedle-tool /usr/local/bin/droppedneedle-tool
 COPY --from=ffmpeg /out/ffmpeg /usr/local/bin/ffmpeg
 COPY --from=ffmpeg /out/doc /usr/share/doc/ffmpeg
+# Fails the build when the runtime libmp3lame0 is not the version of the source
+# beside it, so a Debian update between the two stages cannot ship a binary
+# without its source.
+RUN lame=$(dpkg-query -W -f='${Version}' libmp3lame0) \
+    && [ -n "$lame" ] \
+    && [ "$lame" = "$(cat /usr/share/doc/ffmpeg/lame/VERSION)" ] \
+    || { echo "libmp3lame0 $lame does not match the source in /usr/share/doc/ffmpeg/lame; build again without the cache" >&2; exit 1; }
 # The pristine web UI; the server stamps a copy into /app/cache/static at
 # startup (DROPPEDNEEDLE_STATIC_DIR defaults to /app/static).
 COPY --from=frontend /app/frontend/build /app/static
+# DroppedNeedle's licence, and the notices for the crates and the web UI
+# packages it is built from.
+COPY LICENSE /usr/share/doc/droppedneedle/LICENSE
+COPY --from=builder /notices/NOTICES-server.txt /usr/share/doc/droppedneedle/NOTICES-server.txt
+COPY --from=frontend /app/NOTICES-web-ui.txt /usr/share/doc/droppedneedle/NOTICES-web-ui.txt
 COPY entrypoint.sh /app/entrypoint.sh
 
 RUN mkdir -p /app/cache /app/config /app/plugins /app/imports \

@@ -346,6 +346,13 @@ fn cut<T>(rows: Vec<T>, count: usize) -> Vec<T> {
     rows.into_iter().take(count).collect()
 }
 
+/// The albums of `rows` that have a title.
+fn titled(rows: Vec<RankedAlbum>) -> Vec<RankedAlbum> {
+    rows.into_iter()
+        .filter(|row| !row.album.title.is_empty())
+        .collect()
+}
+
 impl ListeningData {
     /// The reads over `network`, cached in `cache`.
     pub fn new(network: Arc<dyn ListeningNetwork>, cache: ProviderCacheStore) -> Self {
@@ -500,6 +507,18 @@ impl ListeningData {
         self.health.popularity_down()
     }
 
+    /// Whether ListenBrainz reads are switched on (false while their
+    /// setting does not read). While they are off every ListenBrainz read
+    /// here answers empty before the cache, so no empty answer is kept for
+    /// when they come back on.
+    pub fn listenbrainz_on(&self) -> bool {
+        self.network.listenbrainz_ready()
+    }
+
+    fn listenbrainz_off(&self) -> bool {
+        !self.listenbrainz_on()
+    }
+
     /// The sitewide ListenBrainz artist chart.
     pub async fn sitewide_artists(
         &self,
@@ -508,6 +527,9 @@ impl ListeningData {
         offset: u32,
         ask: &Ask,
     ) -> ListeningResult<Vec<ArtistRow>> {
+        if self.listenbrainz_off() {
+            return Ok(Default::default());
+        }
         let key = |at: u32| {
             CacheKey::new(
                 Source::ListenBrainz,
@@ -535,6 +557,9 @@ impl ListeningData {
         offset: u32,
         ask: &Ask,
     ) -> ListeningResult<Vec<ListenedAlbum>> {
+        if self.listenbrainz_off() {
+            return Ok(Default::default());
+        }
         let key = |at: u32| {
             CacheKey::new(
                 Source::ListenBrainz,
@@ -562,6 +587,9 @@ impl ListeningData {
         count: u32,
         ask: &Ask,
     ) -> ListeningResult<Vec<ArtistRow>> {
+        if self.listenbrainz_off() {
+            return Ok(Default::default());
+        }
         let user = lower(username);
         let name = username.to_owned();
         let key = |at: u32| {
@@ -587,6 +615,9 @@ impl ListeningData {
         offset: u32,
         ask: &Ask,
     ) -> ListeningResult<Vec<ListenedAlbum>> {
+        if self.listenbrainz_off() {
+            return Ok(Default::default());
+        }
         let user = lower(username);
         let name = username.to_owned();
         let key = |at: u32| {
@@ -619,6 +650,9 @@ impl ListeningData {
         limit: usize,
         ask: &Ask,
     ) -> ListeningResult<Vec<ScoredArtist>> {
+        if self.listenbrainz_off() {
+            return Ok(Default::default());
+        }
         let read = limit.max(SIMILAR_FLOOR);
         let key = shared::similar_key(artist_mbid, read);
         let (user, mbid) = (user_id.to_owned(), artist_mbid.to_owned());
@@ -631,7 +665,10 @@ impl ListeningData {
     }
 
     /// One artist's most played release groups, empty while ListenBrainz
-    /// popularity is down. `user_id` lends its token.
+    /// popularity is down. `user_id` lends its token. ListenBrainz answers
+    /// it only for a linked account: anyone else gets what the cache holds
+    /// from other people's reads, else an empty answer that is not kept and
+    /// is not a failed read.
     pub async fn artist_albums(
         &self,
         user_id: &str,
@@ -639,33 +676,49 @@ impl ListeningData {
         count: usize,
         ask: &Ask,
     ) -> ListeningResult<Vec<RankedAlbum>> {
+        if self.listenbrainz_off() {
+            return Ok(Default::default());
+        }
         if self.popularity_down() {
             return Ok(Vec::new());
         }
         let read = count.max(ARTIST_ALBUMS_FLOOR);
         let key = shared::artist_albums_key(artist_mbid, read);
+        // Without a token the read is never sent, so it starts or joins no
+        // fetch another user's read could share: what is held answers.
+        if !self.cache.fresh(&key).await && !self.network.lends_token(user_id).await {
+            let held: Option<Vec<RankedAlbum>> = self.cache.peek(&key).await.flatten();
+            return Ok(cut(titled(held.unwrap_or_default()), count));
+        }
         let (user, mbid, health) = (
             user_id.to_owned(),
             artist_mbid.to_owned(),
             Arc::clone(&self.health),
         );
         let rows = self
-            .list(key, ARTIST, ask, move |network, priority| async move {
+            .lookup(key, ARTIST, ask, move |network, priority| async move {
                 let found = network.artist_albums(&user, &mbid, read, priority).await;
                 health.note(&found, priority);
-                found
+                match found {
+                    Ok(rows) if rows.is_empty() => Ok(Fetched::Missing),
+                    Ok(rows) => Ok(Fetched::Found(rows)),
+                    Err(ListeningError::Provider(ProviderError::NotConfigured { .. })) => {
+                        Ok(Fetched::Partial(Vec::new()))
+                    }
+                    Err(error) => Err(error),
+                }
             })
-            .await?;
-        let titled: Vec<RankedAlbum> = rows
-            .into_iter()
-            .filter(|row: &RankedAlbum| !row.album.title.is_empty())
-            .collect();
-        Ok(cut(titled, count))
+            .await?
+            .unwrap_or_default();
+        Ok(cut(titled(rows), count))
     }
 
     /// A ListenBrainz user's genres with their listens, most listened
     /// first.
     pub async fn genres(&self, username: &str, ask: &Ask) -> ListeningResult<Vec<(String, i64)>> {
+        if self.listenbrainz_off() {
+            return Ok(Default::default());
+        }
         let key = CacheKey::new(Source::ListenBrainz, &["genres", &lower(username)]).personal();
         let name = username.to_owned();
         self.list(
@@ -683,6 +736,9 @@ impl ListeningData {
         username: &str,
         ask: &Ask,
     ) -> ListeningResult<Vec<AlbumRow>> {
+        if self.listenbrainz_off() {
+            return Ok(Default::default());
+        }
         let key = CacheKey::new(Source::ListenBrainz, &["fresh", &lower(username)]).personal();
         let name = username.to_owned();
         self.list(
@@ -701,6 +757,9 @@ impl ListeningData {
         count: u32,
         ask: &Ask,
     ) -> ListeningResult<Vec<LovedTrack>> {
+        if self.listenbrainz_off() {
+            return Ok(Default::default());
+        }
         let key = CacheKey::new(Source::ListenBrainz, &["loved", &lower(username)]).personal();
         let name = username.to_owned();
         let rows = self
@@ -713,6 +772,9 @@ impl ListeningData {
 
     /// Users whose listening is like this user's, most similar first.
     pub async fn similar_users(&self, username: &str, ask: &Ask) -> ListeningResult<Vec<String>> {
+        if self.listenbrainz_off() {
+            return Ok(Default::default());
+        }
         let key =
             CacheKey::new(Source::ListenBrainz, &["similar_users", &lower(username)]).personal();
         let name = username.to_owned();
@@ -733,6 +795,9 @@ impl ListeningData {
         username: &str,
         ask: &Ask,
     ) -> ListeningResult<Option<WeeklyPlaylist>> {
+        if self.listenbrainz_off() {
+            return Ok(Default::default());
+        }
         let key = CacheKey::new(Source::ListenBrainz, &["weekly", &lower(username)]).personal();
         let (user, name) = (user_id.to_owned(), username.to_owned());
         self.lookup(key, STATS, ask, move |network, priority| async move {
@@ -753,6 +818,9 @@ impl ListeningData {
         recording_mbids: &[String],
         ask: &Ask,
     ) -> ListeningResult<HashMap<String, String>> {
+        if self.listenbrainz_off() {
+            return Ok(Default::default());
+        }
         let watch = Watch::new(ask);
         let found = self
             .cache
@@ -783,6 +851,9 @@ impl ListeningData {
         release_group_mbids: &[String],
         ask: &Ask,
     ) -> ListeningResult<HashMap<String, i64>> {
+        if self.listenbrainz_off() {
+            return Ok(Default::default());
+        }
         if self.popularity_down() {
             let (counts, _) = self
                 .cache

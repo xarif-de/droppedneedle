@@ -4,12 +4,12 @@
 //! runs [`GitHubReleases`], the build tag plus the GitHub releases client
 //! (cached for an hour, quiet on failure).
 //!
-//! Comparison rules: strip leading `v`s, compare numeric release
-//! cores; anything else fails closed as `comparison_failed`. A `dev`
-//! build reports an update as available when comparison fails so the full
-//! UI stays testable. `latest_release` ships only when an
-//! update is available; a missing latest release answers with the current
-//! version alone.
+//! Comparison rules: trim a leading `v`, parse both tags as semver and
+//! compare by precedence (build metadata ignored). Anything else fails
+//! closed as `comparison_failed`. A `dev` build reports an update as
+//! available when comparison fails so the full UI stays testable.
+//! `latest_release` ships only when an update is available; a missing
+//! latest release answers with the current version alone.
 //!
 //! The running version is the image's `COMMIT_TAG`, which `AppConfig`
 //! reads at start, else `dev`.
@@ -163,29 +163,17 @@ pub fn routes() -> Routes<VersionState> {
         .user(routes!(get_releases))
 }
 
-/// Parse a tag into numeric release segments. Leading `v`s are stripped;
-/// the rest must be pure dotted numbers or the tag is unparseable and
-/// comparison fails closed.
-fn release_core(tag: &str) -> Option<Vec<u64>> {
-    let stripped = tag.trim_start_matches('v');
-    if stripped.is_empty() {
-        return None;
-    }
-    let mut segments = Vec::new();
-    for part in stripped.split('.') {
-        if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
-            return None;
-        }
-        segments.push(part.parse::<u64>().ok()?);
-    }
-    Some(segments)
+/// Parse a tag as semver after trimming a leading `v`. Anything that is
+/// not a full semver version is unparseable and comparison fails closed.
+fn parse_tag(tag: &str) -> Option<semver::Version> {
+    semver::Version::parse(tag.strip_prefix('v').unwrap_or(tag)).ok()
 }
 
 /// Compare two tags. Returns `(update_available, comparison_failed)`.
 /// Unparseable tags fail closed.
 fn is_newer(latest_tag: &str, current_tag: &str) -> (bool, bool) {
-    match (release_core(latest_tag), release_core(current_tag)) {
-        (Some(latest), Some(current)) => (latest > current, false),
+    match (parse_tag(latest_tag), parse_tag(current_tag)) {
+        (Some(latest), Some(current)) => (latest.cmp_precedence(&current).is_gt(), false),
         _ => (false, true),
     }
 }
@@ -330,5 +318,52 @@ mod tests {
         assert!(answer.update_available, "dev build");
         assert!(answer.comparison_failed, "dev build");
         assert!(answer.latest_release.is_some(), "dev build");
+    }
+
+    /// A v3 prerelease compares instead of failing: a later beta or the
+    /// final release is an update, an equal or older one is not; the live
+    /// beta.3 answer (latest `v2.15.0`) is up to date.
+    #[test]
+    fn update_check_compares_v3_prereleases() {
+        let beta = current("3.0.0-beta.3");
+
+        for tag in ["v3.0.0-beta.4", "v3.0.0-beta.10", "v3.0.0"] {
+            let answer = build_update_response(&beta, Some(&release(tag)));
+            assert!(answer.update_available, "tag {tag}");
+            assert!(!answer.comparison_failed, "tag {tag}");
+            assert_eq!(answer.latest_version.as_deref(), Some(tag), "tag {tag}");
+            assert!(answer.latest_release.is_some(), "tag {tag}");
+        }
+
+        for tag in ["v3.0.0-beta.3", "v3.0.0-beta.2", "v3.0.0-alpha.9"] {
+            let answer = build_update_response(&beta, Some(&release(tag)));
+            assert!(!answer.update_available, "tag {tag}");
+            assert!(!answer.comparison_failed, "tag {tag}");
+            assert!(answer.latest_release.is_none(), "tag {tag}");
+        }
+
+        // GitHub's latest release is the v2 line; a v3 beta is ahead of it.
+        let answer = build_update_response(&beta, Some(&release("v2.15.0")));
+        assert_eq!(answer.current_version, "3.0.0-beta.3", "v2 latest");
+        assert_eq!(
+            answer.latest_version.as_deref(),
+            Some("v2.15.0"),
+            "v2 latest"
+        );
+        assert!(!answer.update_available, "v2 latest");
+        assert!(!answer.comparison_failed, "v2 latest");
+        assert!(answer.latest_release.is_none(), "v2 latest");
+
+        // A release outranks the beta before it; build metadata is ignored.
+        let answer = build_update_response(&current("3.0.0"), Some(&release("v3.0.0-beta.3")));
+        assert!(!answer.update_available, "release vs beta");
+        assert!(!answer.comparison_failed, "release vs beta");
+
+        let answer = build_update_response(
+            &current("3.0.0-beta.3+sha.abc"),
+            Some(&release("v3.0.0-beta.3")),
+        );
+        assert!(!answer.update_available, "build metadata");
+        assert!(!answer.comparison_failed, "build metadata");
     }
 }

@@ -3238,6 +3238,7 @@ async fn a_restored_backup_still_undoes_and_restores_originals() {
         &scratch.join("app.db"),
         &backups,
         Arc::new(droppedneedle_kernel::clock::SystemClock),
+        false,
     );
     let report = service
         .backup(None, &CancelFlag::never())
@@ -3271,9 +3272,9 @@ async fn a_restored_backup_still_undoes_and_restores_originals() {
     rusqlite::Connection::open(scratch.join("settings.db"))
         .unwrap()
         .backup(
-            rusqlite::DatabaseName::Main,
+            rusqlite::MAIN_DB,
             restored.join("settings.db"),
-            None,
+            rusqlite::backup::NO_PROGRESS,
         )
         .unwrap();
     let library = open_library(&restored).await;
@@ -4686,8 +4687,144 @@ async fn removals_use_the_bin_library_management_names() {
         .remove_track_now(&track, seen_track(&library, &track), true, "admin")
         .expect("track removed");
     assert!(!file.exists());
-    assert_eq!(std::fs::read_dir(&bin).expect("bin").count(), 1);
+    assert_eq!(
+        std::fs::read_dir(&bin).expect("bin").count(),
+        2,
+        "the removal's entry and the bin's marker"
+    );
     assert!(!music.join(".recycle").exists());
+}
+
+/// A removal is refused while the bin's folder lacks the marker its first
+/// use left (an empty folder where a share is not mounted), and the file
+/// stays; the settings say so and offer the folder. An admin who moved the
+/// bin uses it: a stale path is refused, the saved one is marked again and
+/// the removal lands there.
+#[tokio::test]
+async fn a_bin_without_its_marker_waits_until_an_admin_uses_the_folder() {
+    use droppedneedle_kernel::db::DurableLane;
+    use droppedneedle_kernel::runtime_config::sections::LibraryManagement;
+    use droppedneedle_library::removal::{MutationError, Mutations, RECYCLE_BIN_UNKNOWN};
+    // The name the docs tell people to leave in place.
+    const BIN_MARKER: &str = ".droppedneedle-recycle-bin";
+
+    let rig = Rig::start("lib-remove-unmarked-bin").await;
+    let app = &rig.app;
+    let auth = app.login_admin().await;
+    let headers = [("authorization", auth.as_str())];
+    let music = app.config.root_app_dir.join("music");
+    let first = plant(&music, "Band/LP/01.flac", "flac_full_01.flac");
+    let second = plant(&music, "Band/LP/02.flac", "flac_full_02.flac");
+    app.add_library_folder("music", &music).await;
+    let vault = app.config.root_app_dir.join("vault");
+    let bin = vault.join("bin");
+    std::fs::create_dir_all(&bin).expect("bin made");
+    let configured = bin.display().to_string();
+    let saved = configured.clone();
+    app.state()
+        .library_services
+        .setup
+        .settings
+        .store()
+        .update_blocking::<LibraryManagement, String, _>(
+            DurableLane::Foreground,
+            move |mut stored| {
+                stored.recycle_bin_path = saved;
+                Ok(stored)
+            },
+        )
+        .expect("bin saved");
+    let admin: String = app
+        .db()
+        .query_row(
+            "SELECT id FROM auth_users WHERE role = 'admin'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("admin id");
+    let remove = |path: &str| {
+        let track = rig
+            .scan_store
+            .track_at("music", path)
+            .unwrap()
+            .expect("track indexed");
+        let library = app.state().library.clone();
+        let admin = admin.clone();
+        tokio::task::spawn_blocking(move || {
+            let seen = seen_track(&library, &track);
+            Mutations::new(&library).remove_track_now(&track, seen, true, &admin)
+        })
+    };
+    let warning = || async {
+        let (status, body) = app
+            .call("GET", "/api/v3/settings/library-management", &headers, None)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body["recycle_bin_warning"].clone()
+    };
+    let accept = |path: &str| {
+        let body = json!({ "path": path });
+        async move {
+            app.call(
+                "POST",
+                "/api/v3/library/recycle-bin/accept-folder",
+                &headers,
+                Some(body),
+            )
+            .await
+        }
+    };
+
+    remove("Band/LP/01.flac")
+        .await
+        .expect("removal ran")
+        .expect("first track removed");
+    assert!(!first.exists());
+    assert!(
+        bin.join(BIN_MARKER).is_file(),
+        "its first use marked the bin"
+    );
+    assert_eq!(warning().await, json!(null));
+
+    // The share is not mounted: an empty folder is left at its path.
+    std::fs::rename(&bin, vault.join("share")).expect("share away");
+    std::fs::create_dir(&bin).expect("empty folder");
+    let refused = remove("Band/LP/02.flac").await.expect("removal ran");
+    let Err(MutationError::Conflict(reason)) = refused else {
+        panic!("expected a refusal, got {refused:?}");
+    };
+    assert_eq!(reason.code, RECYCLE_BIN_UNKNOWN);
+    assert!(
+        reason
+            .message
+            .contains("can't tell the recycle bin folder is the one used before"),
+        "{reason:?}"
+    );
+    assert!(second.exists(), "the file stays");
+    assert_eq!(std::fs::read_dir(&bin).expect("bin").count(), 0);
+    assert!(!music.join(".recycle").exists(), "no other bin stood in");
+    let shown = warning().await;
+    assert_eq!(shown["accept_folder"], json!(true), "{shown}");
+
+    let (status, body) = accept("/srv/elsewhere").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(std::fs::read_dir(&bin).expect("bin").count(), 0);
+    let (status, body) = accept(&configured).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert!(bin.join(BIN_MARKER).is_file(), "the folder is marked again");
+    assert_eq!(warning().await, json!(null));
+
+    remove("Band/LP/02.flac")
+        .await
+        .expect("removal ran")
+        .expect("second track removed");
+    assert!(!second.exists());
+    assert_eq!(
+        std::fs::read_dir(&bin).expect("bin").count(),
+        2,
+        "the removal's entry and the marker"
+    );
+    rig.stop().await;
 }
 
 /// A `library_management` row that does not decode stops removals with no
@@ -6383,12 +6520,11 @@ async fn expiry_and_an_empty_at_once_mark_every_copy() {
     );
 }
 
-/// A removed album stays in the album list and on its artist's page,
-/// marked as having no files, while its files are in the recycle bin.
-/// Once the bin is emptied it leaves both lists, and its link still
-/// opens it.
+/// A removed album leaves the album list and its artist's page at once,
+/// with both totals, while its link still opens it. Put back lists it
+/// again.
 #[tokio::test]
-async fn a_removed_album_is_listed_until_the_bin_lets_go_of_it() {
+async fn a_removed_album_leaves_the_lists_until_it_is_put_back() {
     let rig = Rig::start("lib-removed-listed").await;
     let app = &rig.app;
     let auth = app.login_admin().await;
@@ -6448,93 +6584,23 @@ async fn a_removed_album_is_listed_until_the_bin_lets_go_of_it() {
         }
     };
 
+    let mut both = vec![(removed.clone(), 1), (kept.clone(), 1)];
+    both.sort();
+    assert_eq!(lists().await, [both.clone(), both.clone()], "before");
+
     let uri = format!(
         "/api/v3/library/albums/{removed}?expected_revision={}&expected_listing_revision={}&delete_files=true",
         album["row_revision"], album["listing_revision"]
     );
     let (status, body) = app.call("DELETE", &uri, &headers, None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    let mut both = vec![(removed.clone(), 0), (kept.clone(), 1)];
-    both.sort();
-    assert_eq!(lists().await, [both.clone(), both], "in the bin: listed");
-
-    let summary = get("/api/v3/library/recycle-bin/summary".to_owned()).await;
-    assert_eq!(summary["files"], json!(1), "{summary}");
-    let before = summary["as_of"].as_i64().expect("as of") + 1000;
-    let (status, body) = app
-        .call(
-            "POST",
-            "/api/v3/library/recycle-bin/empty",
-            &headers,
-            Some(json!({ "before": before })),
-        )
-        .await;
-    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
-    // The empty runs on the job runner's blocking threads: the bound is
-    // wall time.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    loop {
-        let status = get("/api/v3/library/recycle-bin/status".to_owned()).await;
-        if status["state"] == "idle" && status["last_emptied"]["deleted"] == json!(1) {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the bin empties: {status}"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-
     let only = vec![(kept.clone(), 1)];
-    assert_eq!(lists().await, [only.clone(), only], "out of the bin: gone");
+    assert_eq!(lists().await, [only.clone(), only], "in the bin: gone");
     let opened = get(format!("/api/v3/library/albums/{removed}")).await;
     assert_eq!(opened["id"], json!(removed), "its link still opens it");
     assert_eq!(opened["track_count"], json!(0));
-    rig.stop().await;
-}
 
-/// An album removed and put back whose folder then vanishes from disk
-/// leaves the lists: the put-back spent its removal, so nothing of it can
-/// be brought home.
-#[tokio::test]
-async fn an_album_put_back_then_vanished_leaves_the_lists() {
-    let rig = Rig::start("lib-put-back-vanished").await;
-    let app = &rig.app;
-    let auth = app.login_admin().await;
-    let headers = [("authorization", auth.as_str())];
-    let music = app.config.root_app_dir.join("music");
-    plant(&music, "One/LP/01.flac", "flac_full_01.flac");
-    plant(&music, "Two/LP/01.flac", "flac_full_01.flac");
-    app.add_library_folder("music", &music).await;
-    let track = rig
-        .scan_store
-        .track_at("music", "One/LP/01.flac")
-        .unwrap()
-        .expect("track indexed");
-    let album: String = app
-        .db()
-        .query_row(
-            "SELECT local_album_id FROM local_tracks WHERE id = ?1",
-            [&track],
-            |row| row.get(0),
-        )
-        .expect("album id");
-    let get = |uri: String| {
-        let headers = &headers;
-        async move {
-            let (status, body) = app.call("GET", &uri, headers, None).await;
-            assert_eq!(status, StatusCode::OK, "{uri}: {body}");
-            body
-        }
-    };
-    let shown = get(format!("/api/v3/library/albums/{album}")).await;
-    let uri = format!(
-        "/api/v3/library/albums/{album}?expected_revision={}&expected_listing_revision={}&delete_files=true",
-        shown["row_revision"], shown["listing_revision"]
-    );
-    let (status, body) = app.call("DELETE", &uri, &headers, None).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let removals = get(format!("/api/v3/library/albums/{album}/removals")).await;
+    let removals = get(format!("/api/v3/library/albums/{removed}/removals")).await;
     let removal = removals["items"][0]["id"]
         .as_str()
         .expect("removal id")
@@ -6542,28 +6608,13 @@ async fn an_album_put_back_then_vanished_leaves_the_lists() {
     let (status, body) = app
         .call(
             "POST",
-            &format!("/api/v3/library/albums/{album}/removals/{removal}/put-back"),
+            &format!("/api/v3/library/albums/{removed}/removals/{removal}/put-back"),
             &headers,
             None,
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["missing"], json!([]), "{body}");
-
-    std::fs::remove_dir_all(music.join("One")).expect("the folder vanishes");
-    app.scan_library().await;
-
-    let page = get("/api/v3/library/albums?limit=50".to_owned()).await;
-    let listed: Vec<&str> = page["items"]
-        .as_array()
-        .expect("items")
-        .iter()
-        .map(|item| item["id"].as_str().expect("id"))
-        .collect();
-    assert!(
-        !listed.contains(&album.as_str()),
-        "a vanished album leaves the list: {page}"
-    );
+    assert_eq!(lists().await, [both.clone(), both], "put back: listed");
     rig.stop().await;
 }
 
@@ -6661,13 +6712,15 @@ async fn an_album_without_files_leaves_the_lists() {
 
 /// A heart and rating on a copy whose files are gone follow to the copy
 /// with files; that copy keeps its own rating; plays stay; a local-only
-/// album keeps its heart; the copy's history shows the move.
+/// album keeps its heart; the copy's history shows the move. A copy whose
+/// files Put back can still bring home keeps its heart.
 #[tokio::test]
 async fn marks_on_a_copy_without_files_follow_to_the_copy_with_files() {
     use droppedneedle_library::http::history::album_history_view;
+    use droppedneedle_library::removal::Mutations;
 
     let (scratch, library, music) = bare_library("lib-marks-follow-copy").await;
-    for folder in ["gone", "kept", "local"] {
+    for folder in ["gone", "kept", "local", "binned"] {
         plant(&music, &format!("{folder}/01.flac"), "flac_full_01.flac");
     }
     add_music_root(&library, &music).await;
@@ -6689,15 +6742,18 @@ async fn marks_on_a_copy_without_files_follow_to_the_copy_with_files() {
         .expect("album found")
     };
     let (gone, kept, local) = (album_of("gone"), album_of("kept"), album_of("local"));
+    let binned = album_of("binned");
     db.execute_batch(&format!(
         "INSERT INTO local_album_external_identities (local_album_id, provider, \
          release_group_mbid, release_mbid, decision_source, selected_at) VALUES \
          ('{gone}', 'musicbrainz', 'rg-shared', 'rel-gone', 'automatic', 1), \
-         ('{kept}', 'musicbrainz', 'rg-shared', 'rel-kept', 'automatic', 1); \
+         ('{kept}', 'musicbrainz', 'rg-shared', 'rel-kept', 'automatic', 1), \
+         ('{binned}', 'musicbrainz', 'rg-shared', 'rel-binned', 'automatic', 1); \
          INSERT INTO auth_users (id, display_name, role, created_at) \
          VALUES ('fan', 'Fan', 'user', 1); \
          INSERT INTO catalog_user_favorites (user_id, item_kind, item_id, created_at) VALUES \
-         ('fan', 'album', '{gone}', 7), ('fan', 'album', '{local}', 7); \
+         ('fan', 'album', '{gone}', 7), ('fan', 'album', '{local}', 7), \
+         ('fan', 'album', '{binned}', 7); \
          INSERT INTO catalog_user_ratings (user_id, item_kind, item_id, rating, rated_at) VALUES \
          ('fan', 'album', '{gone}', 4, 7), ('fan', 'album', '{kept}', 2, 8); \
          INSERT INTO library_play_history (id, user_id, local_track_id, local_album_id, \
@@ -6709,6 +6765,10 @@ async fn marks_on_a_copy_without_files_follow_to_the_copy_with_files() {
          'fan', 'tag_editor', 1, 7, 7);"
     ))
     .expect("marks and a tag edit planted");
+    add_admin(&library);
+    Mutations::new(&library)
+        .remove_album(&binned, true, true, "admin")
+        .expect("the binned copy is removed");
 
     std::fs::remove_dir_all(music.join("gone")).expect("the copy's folder is deleted");
     std::fs::remove_dir_all(music.join("local")).expect("the local album's folder is deleted");
@@ -6720,12 +6780,13 @@ async fn marks_on_a_copy_without_files_follow_to_the_copy_with_files() {
         }
     }
 
-    let mut hearts = vec![kept.clone(), local.clone()];
+    let mut hearts = vec![kept.clone(), local.clone(), binned.clone()];
     hearts.sort();
     assert_eq!(
         read("SELECT item_id FROM catalog_user_favorites ORDER BY item_id"),
         hearts,
-        "the heart followed to the copy with files; the local album kept its own"
+        "the heart followed to the copy with files; the local album and the \
+         copy in the recycle bin kept their own"
     );
     assert_eq!(
         read("SELECT item_id || ' ' || rating FROM catalog_user_ratings"),
@@ -25311,6 +25372,7 @@ async fn automatic_acoustid_waits_while_library_settings_do_not_read() {
             providers.clone(),
             Arc::new(LiveCatalogSettings::new(&settings)),
             rig.deps.clone(),
+            crate::common::listening_store(&rig.platform),
         ),
         droppedneedle_catalog::test_support::artwork(&rig.platform, &providers),
         OnlineLyrics::new(&providers, settings.live()),

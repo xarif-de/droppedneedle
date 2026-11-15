@@ -50,7 +50,7 @@ use super::target::{SearchTarget, TargetError, Targets};
 use super::usenet::indexer::{Indexer, IndexerQuery};
 use super::usenet::newznab::{IndexerResult, usenet_identity};
 use super::usenet::policy::UsenetPolicy;
-use super::usenet::sabnzbd::{SabnzbdError, SabnzbdQueue};
+use super::usenet::sabnzbd::{NzbGrab, SabnzbdError, SabnzbdQueue};
 use droppedneedle_providers::RequestPriority;
 
 /// A refused request or an answer of the wrong shape is the client
@@ -62,6 +62,7 @@ fn client_error(error: ClientError) -> SourceError {
             SourceError::rejected(Reason::DownloadFailed, error.to_string())
         }
         ClientError::Auth { .. }
+        | ClientError::Redirected { .. }
         | ClientError::NotFound { .. }
         | ClientError::RateLimited { .. }
         | ClientError::Unavailable { .. } => SourceError::Unavailable(error.to_string()),
@@ -800,10 +801,14 @@ impl SabnzbdSource {
             }
         };
         let category = self.category.as_deref().filter(|cat| *cat != "*");
-        let grab = self
+        let indexer_client = self
             .indexers
             .iter()
             .find_map(|indexer| indexer.grab_client(&pick.usenet.indexer_id));
+        let grab = match &indexer_client {
+            Some(client) => NzbGrab::Indexer(client),
+            None => NzbGrab::Direct,
+        };
         // Worker-built job name: the counter keeps failover
         // attempts distinct on the client and matches the orphan shape.
         let handle = if task.download_type == "track" {
@@ -812,7 +817,7 @@ impl SabnzbdSource {
                     task_id,
                     &job_name,
                     Some(pick.usenet.nzb_url.as_str()),
-                    grab.as_ref(),
+                    grab,
                     category,
                     None,
                     None,
@@ -824,7 +829,7 @@ impl SabnzbdSource {
                     task_id,
                     &job_name,
                     Some(pick.usenet.nzb_url.as_str()),
-                    grab.as_ref(),
+                    grab,
                     category,
                     None,
                     None,

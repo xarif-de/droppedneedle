@@ -1,77 +1,83 @@
 <script lang="ts">
 	import '$lib/features/player/components/now-playing.css';
 	import { Headphones, Disc3 } from 'lucide-svelte';
-	import { useIntegrationStatus } from '$lib/features/home/queries/home.svelte';
 	import { authStore } from '$lib/stores/authStore.svelte';
 	import { nowPlayingMerged } from '$lib/features/player/state/nowPlayingMerged.svelte';
 	import { playerStore } from '$lib/features/player/state/player.svelte';
-	import { getSectionPrefsQuery } from '$lib/features/settings/queries/section-prefs.svelte';
 	import YouTubeIcon from '$lib/media/icons/YouTubeIcon.svelte';
 	import JellyfinIcon from '$lib/media/icons/JellyfinIcon.svelte';
 	import NavidromeIcon from '$lib/media/icons/NavidromeIcon.svelte';
 	import PlexIcon from '$lib/media/icons/PlexIcon.svelte';
 	import SidebarServiceHint from '$lib/shell/SidebarServiceHint.svelte';
 	import SidebarVisualiser from '$lib/shell/SidebarVisualiser.svelte';
+	import { servicePath, within, type ServiceSource } from '$lib/shell/navItems';
+	import { useServiceEntries } from '$lib/shell/serviceEntries.svelte';
 	import { withBasePath } from '$lib/utils/basePath';
 
-	const integrations = useIntegrationStatus();
+	interface Props {
+		currentPath: string;
+	}
 
-	const prefsQuery = getSectionPrefsQuery();
-	// fail-open: until prefs load, every service is visible
-	const hidden = $derived(
-		new Set((prefsQuery.data?.pages?.sidebar ?? []).filter((s) => !s.enabled).map((s) => s.key))
-	);
+	let { currentPath }: Props = $props();
+
+	const services = useServiceEntries();
+
+	/** The rail marks the service whose page is showing, so Library stays the way back. */
+	function onService(source: ServiceSource): boolean {
+		return within(servicePath(source))(currentPath);
+	}
 
 	const localPlaying = $derived(
 		playerStore.isPlaying && playerStore.nowPlaying?.sourceType === 'local'
 	);
 
-	function showsEntry(key: string, connected: boolean): boolean {
-		if (hidden.has(key)) return false;
-		return connected || (integrations.current.loaded && authStore.isAdmin);
+	// An entry, or an admin's hint to set the service up.
+	function showsEntry(key: ServiceSource): boolean {
+		if (services.hasEntry(key)) return true;
+		return !services.isHidden(key) && services.integrations.loaded && authStore.isAdmin;
 	}
 
 	const anyEntryVisible = $derived(
-		showsEntry('youtube', integrations.current.youtube) ||
-			showsEntry('jellyfin', integrations.current.jellyfin) ||
-			showsEntry('navidrome', integrations.current.navidrome) ||
-			showsEntry('plex', integrations.current.plex) ||
-			showsEntry('localfiles', integrations.current.localfiles)
+		(['youtube', 'jellyfin', 'navidrome', 'plex', 'localfiles'] as const).some(showsEntry)
 	);
 </script>
 
-{#if integrations.current.loaded && anyEntryVisible}
+{#if services.integrations.loaded && anyEntryVisible}
 	<div class="dn-rail__rule" aria-hidden="true"></div>
 {/if}
 
-{#if !hidden.has('youtube')}
-	{#if integrations.current.youtube}
+{#if !services.isHidden('youtube')}
+	{#if services.hasEntry('youtube')}
 		<li>
 			<a
-				href={withBasePath('/library/youtube')}
+				href={withBasePath(servicePath('youtube'))}
 				class="is-drawer-close:tooltip is-drawer-close:tooltip-right"
+				class:menu-active={onService('youtube')}
 				data-tip="YouTube"
 				aria-label="YouTube"
+				aria-current={onService('youtube') ? 'page' : undefined}
 			>
 				<YouTubeIcon class="h-5 w-5 text-error" />
 				<span class="is-drawer-close:hidden">YouTube</span>
 			</a>
 		</li>
-	{:else if integrations.current.loaded && authStore.isAdmin}
+	{:else if services.integrations.loaded && authStore.isAdmin}
 		<SidebarServiceHint label="YouTube" settingsTab="youtube">
 			{#snippet icon()}<YouTubeIcon class="h-5 w-5 text-error" />{/snippet}
 		</SidebarServiceHint>
 	{/if}
 {/if}
 
-{#if !hidden.has('jellyfin')}
-	{#if integrations.current.jellyfin}
+{#if !services.isHidden('jellyfin')}
+	{#if services.hasEntry('jellyfin')}
 		<li>
 			<a
-				href={withBasePath('/library/jellyfin')}
+				href={withBasePath(servicePath('jellyfin'))}
 				class="is-drawer-close:tooltip is-drawer-close:tooltip-right"
+				class:menu-active={onService('jellyfin')}
 				data-tip="Jellyfin"
 				aria-label="Jellyfin"
+				aria-current={onService('jellyfin') ? 'page' : undefined}
 			>
 				<div class="relative inline-flex">
 					<JellyfinIcon class="h-5 w-5 text-info" />
@@ -88,21 +94,23 @@
 				{/if}
 			</a>
 		</li>
-	{:else if integrations.current.loaded && authStore.isAdmin}
+	{:else if services.integrations.loaded && authStore.isAdmin}
 		<SidebarServiceHint label="Jellyfin" settingsTab="jellyfin">
 			{#snippet icon()}<JellyfinIcon class="h-5 w-5 text-info" />{/snippet}
 		</SidebarServiceHint>
 	{/if}
 {/if}
 
-{#if !hidden.has('navidrome')}
-	{#if integrations.current.navidrome}
+{#if !services.isHidden('navidrome')}
+	{#if services.hasEntry('navidrome')}
 		<li>
 			<a
-				href={withBasePath('/library/navidrome')}
+				href={withBasePath(servicePath('navidrome'))}
 				class="is-drawer-close:tooltip is-drawer-close:tooltip-right"
+				class:menu-active={onService('navidrome')}
 				data-tip="Navidrome"
 				aria-label="Navidrome"
+				aria-current={onService('navidrome') ? 'page' : undefined}
 			>
 				<div class="relative inline-flex">
 					<NavidromeIcon class="h-5 w-5 text-primary" />
@@ -119,21 +127,23 @@
 				{/if}
 			</a>
 		</li>
-	{:else if integrations.current.loaded && authStore.isAdmin}
+	{:else if services.integrations.loaded && authStore.isAdmin}
 		<SidebarServiceHint label="Navidrome" settingsTab="navidrome">
 			{#snippet icon()}<NavidromeIcon class="h-5 w-5 text-primary" />{/snippet}
 		</SidebarServiceHint>
 	{/if}
 {/if}
 
-{#if !hidden.has('plex')}
-	{#if integrations.current.plex}
+{#if !services.isHidden('plex')}
+	{#if services.hasEntry('plex')}
 		<li>
 			<a
-				href={withBasePath('/library/plex')}
+				href={withBasePath(servicePath('plex'))}
 				class="is-drawer-close:tooltip is-drawer-close:tooltip-right"
+				class:menu-active={onService('plex')}
 				data-tip="Plex"
 				aria-label="Plex"
+				aria-current={onService('plex') ? 'page' : undefined}
 			>
 				<div class="relative inline-flex">
 					<PlexIcon class="h-5 w-5 text-[rgb(var(--brand-plex))]" />
@@ -150,21 +160,23 @@
 				{/if}
 			</a>
 		</li>
-	{:else if integrations.current.loaded && authStore.isAdmin}
+	{:else if services.integrations.loaded && authStore.isAdmin}
 		<SidebarServiceHint label="Plex" settingsTab="plex">
 			{#snippet icon()}<PlexIcon class="h-5 w-5 text-[rgb(var(--brand-plex))]" />{/snippet}
 		</SidebarServiceHint>
 	{/if}
 {/if}
 
-{#if !hidden.has('localfiles')}
-	{#if integrations.current.localfiles}
+{#if !services.isHidden('localfiles')}
+	{#if services.hasEntry('localfiles')}
 		<li>
 			<a
-				href={withBasePath('/library/local')}
+				href={withBasePath(servicePath('localfiles'))}
 				class="is-drawer-close:tooltip is-drawer-close:tooltip-right"
+				class:menu-active={onService('localfiles')}
 				data-tip="Local Files"
 				aria-label="Local Files"
+				aria-current={onService('localfiles') ? 'page' : undefined}
 			>
 				<div class="relative inline-flex">
 					<Headphones class="h-5 w-5 text-accent" />
@@ -177,7 +189,7 @@
 				<span class="is-drawer-close:hidden">Local Files</span>
 			</a>
 		</li>
-	{:else if integrations.current.loaded && authStore.isAdmin}
+	{:else if services.integrations.loaded && authStore.isAdmin}
 		<SidebarServiceHint label="Local Files" settingsTab="library">
 			{#snippet icon()}<Headphones class="h-5 w-5 text-accent" />{/snippet}
 		</SidebarServiceHint>
@@ -187,3 +199,10 @@
 {#if authStore.isAdmin}
 	<SidebarVisualiser />
 {/if}
+
+<style>
+	/* an active service's mark takes the fill's ink, whatever its brand colour */
+	a:global(.menu-active) :global(svg) {
+		color: inherit;
+	}
+</style>

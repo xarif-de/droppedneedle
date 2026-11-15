@@ -218,6 +218,7 @@ pub fn catalog_setup_at(
             ))),
             Arc::new(LiveCatalogSettings::new(&platform.settings)),
             users.clone(),
+            super::listening_store(platform),
         ),
         LocalCatalog::new(platform.db.clone()),
         PageSources {
@@ -270,7 +271,12 @@ pub fn offline_catalog(db: &Db, users: UsersDeps) -> Catalog {
                 droppedneedle_providers::test_support::ScriptedWire::new(),
             ))),
             Arc::new(NoMusicBrainz),
-            users,
+            users.clone(),
+            droppedneedle_media::playback::listening::ListeningStore::new(
+                db.clone(),
+                users.crypto.clone(),
+                users.clock.clone(),
+            ),
         ),
         LocalCatalog::new(db.clone()),
         quiet_page_sources(cover_warm_at(
@@ -657,6 +663,8 @@ pub fn settings_at(
             platform.clock.clone(),
         )),
         droppedneedle_library::publish::bin::BinSource::new(
+            platform.db.clone(),
+            platform.clock.clone(),
             store.live(),
             store.live(),
             Arc::new(|| Some(Vec::new())),
@@ -675,6 +683,8 @@ pub fn settings_closed(platform: &Platform) -> droppedneedle::settings::wiring::
         platform,
         Arc::new(droppedneedle::settings::verify::LiveProbes::new(
             platform.http.shared().clone(),
+            platform.http.same_host_redirects().clone(),
+            platform.http.no_redirect().clone(),
             &Providers::closed(),
             droppedneedle_auth::federated::settings::InstallIds::new(platform.settings.clone()),
         )),

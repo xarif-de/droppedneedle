@@ -64,7 +64,9 @@ const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 /// URL, so a caller can tell it from a token that cannot be sent.
 pub const UNUSABLE_ADDRESS: &str = "the ListenBrainz address is not usable";
 
-/// ListenBrainz on the wire. A policy block is [`ProviderError::Disabled`];
+/// ListenBrainz on the wire. Popularity switched off for load is
+/// [`ProviderError::Disabled`]; a read sent without a token to an endpoint
+/// that needs one is [`ProviderError::NotConfigured`], never an outage;
 /// a 429 waits for `X-RateLimit-Reset-In`, else `Retry-After`, and never
 /// more than an hour. The rate-limit headers are described at
 /// https://listenbrainz.readthedocs.io/en/latest/users/api/index.html (read
@@ -90,11 +92,14 @@ pub static SPEC: Spec = Spec {
 fn classify(answer: &Answer<'_>) -> Result<(), ProviderError> {
     let reply = answer.reply;
     let status = reply.status();
-    if is_policy_block(status, &String::from_utf8_lossy(reply.bytes())) {
+    if status == 500 && String::from_utf8_lossy(reply.bytes()).contains("currently disabled") {
         return Err(ProviderError::Disabled {
             provider: SOURCE,
             message: format!("ListenBrainz switched this endpoint off upstream ({status})"),
         });
+    }
+    if status == 401 && wants_token(&String::from_utf8_lossy(reply.bytes())) {
+        return Err(needs_account());
     }
     if status == 429 {
         return Err(ProviderError::RateLimited {
@@ -123,14 +128,37 @@ fn window_spent(reply: &Reply) -> Option<Duration> {
         .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
 }
 
-/// Whether this answer is a deterministic upstream policy block rather
-/// than an ordinary error: the popularity
-/// feature-flag 500, and the anti-scraper 401 added in 2026-07 when
-/// ListenBrainz began gating anonymous popularity calls.
-fn is_policy_block(status: u16, body: &str) -> bool {
-    (status == 500 && body.contains("currently disabled"))
-        || (status == 401
-            && (body.contains("provide an Auth token") || body.contains("AI scrapers")))
+/// Whether a 401 asks for a token rather than refusing one. ListenBrainz
+/// answers an anonymous read of an artist's top release groups or top
+/// recordings this way, while the release-group popularity POST and LB
+/// Radio still answer one (probed 2026-11-13: "Due to bad actors and AI
+/// scrapers causing undue traffic on our sites, you need to provide an Auth
+/// token for this endpoint."), so those two reads are never sent without a
+/// token. Any other 401 is a refused token.
+fn wants_token(body: &str) -> bool {
+    body.contains("provide an Auth token") || body.contains("AI scrapers")
+}
+
+/// A read ListenBrainz answers only with a token, asked without one.
+fn needs_account() -> ProviderError {
+    ProviderError::NotConfigured {
+        provider: SOURCE,
+        message: "ListenBrainz answers this read only with an account".to_owned(),
+    }
+}
+
+/// `creds` when they carry a token, else [`needs_account`]: for the reads
+/// ListenBrainz refuses without one, which are then not sent.
+fn with_token(creds: &ListenBrainzCredentials) -> Result<&ListenBrainzCredentials, ProviderError> {
+    if creds
+        .user_token
+        .as_deref()
+        .is_some_and(|token| !token.is_empty())
+    {
+        Ok(creds)
+    } else {
+        Err(needs_account())
+    }
 }
 
 /// The positive `X-RateLimit-Reset-In` wait in seconds, read by the shared
@@ -186,7 +214,7 @@ pub struct Listen {
 
 /// A genre tag on a release group. Curated genre entries carry
 /// `genre_mbid`; ordinary folksonomy entries omit it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GenreTag {
     /// Tag text (never blank).
     pub tag: String,
@@ -197,7 +225,7 @@ pub struct GenreTag {
 }
 
 /// Release-group metadata: the tags of the group and of its artists.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct ReleaseGroupMetadata {
     /// Artist tags.
     pub artist_tags: Vec<GenreTag>,
@@ -257,6 +285,18 @@ pub fn recording_group_key(recording_mbid: &str) -> CacheKey {
     CacheKey::new(
         Source::ListenBrainz,
         &["recording_group", &recording_mbid.trim().to_lowercase()],
+    )
+}
+
+/// The cache key of one release group's genre tags.
+#[must_use]
+pub fn release_group_genres_key(release_group_mbid: &str) -> CacheKey {
+    CacheKey::new(
+        Source::ListenBrainz,
+        &[
+            "release_group_genres",
+            &release_group_mbid.trim().to_lowercase(),
+        ],
     )
 }
 
@@ -406,19 +446,61 @@ impl ListenBrainzClient {
         creds: &ListenBrainzCredentials,
         priority: RequestPriority,
     ) -> Result<HashMap<String, ReleaseGroupMetadata>, ProviderError> {
-        let mut unique: Vec<String> = Vec::new();
-        for mbid in release_group_mbids {
-            let trimmed = mbid.trim();
-            if !trimmed.is_empty() && !unique.iter().any(|known| known == trimmed) {
-                unique.push(trimmed.to_owned());
-            }
-        }
+        let unique = unique_trimmed(release_group_mbids);
+        let mut known = self.known_genres(&unique, creds, priority).await?;
+        Ok(unique
+            .into_iter()
+            .map(|mbid| {
+                let metadata = known.remove(&mbid).unwrap_or_default();
+                (mbid, metadata)
+            })
+            .collect())
+    }
+
+    /// [`release_group_genres`](Self::release_group_genres) through
+    /// `cache`, each release group kept on its own under
+    /// [`release_group_genres_key`], so only groups not held go out. An id
+    /// the answer leaves out is kept as "nothing there", for the miss time,
+    /// rather than as a group with no tags.
+    ///
+    /// # Errors
+    ///
+    /// The typed failure of the first batch that failed.
+    pub async fn cached_release_group_genres(
+        &self,
+        cache: &ProviderCacheStore,
+        release_group_mbids: &[String],
+        creds: &ListenBrainzCredentials,
+        priority: RequestPriority,
+    ) -> Result<HashMap<String, ReleaseGroupMetadata>, ProviderError> {
+        cache
+            .fetch_each(
+                release_group_mbids,
+                release_group_genres_key,
+                Policy::LISTENBRAINZ_RELEASE_GROUP,
+                |missing| async move {
+                    self.known_genres(&unique_trimmed(&missing), creds, priority)
+                        .await
+                },
+            )
+            .await
+    }
+
+    /// Genre tags of the release groups ListenBrainz knows among `unique`;
+    /// the ones it left out are absent from the map.
+    async fn known_genres(
+        &self,
+        unique: &[String],
+        creds: &ListenBrainzCredentials,
+        priority: RequestPriority,
+    ) -> Result<HashMap<String, ReleaseGroupMetadata>, ProviderError> {
         if unique.len() > MAX_GENRE_IDS {
             return Err(invalid("too many release groups for one genre lookup"));
         }
         let mut resolved: HashMap<String, ReleaseGroupMetadata> = HashMap::new();
-        unique.sort();
-        for batch in unique.chunks(RELEASE_GROUP_BATCH) {
+        let mut sorted = unique.to_vec();
+        sorted.sort();
+        for batch in sorted.chunks(RELEASE_GROUP_BATCH) {
             let ids = batch.join(",");
             let request = self
                 .get(
@@ -442,11 +524,9 @@ impl ListenBrainzClient {
                 });
             };
             for mbid in batch {
-                let metadata = answer
-                    .remove(mbid)
-                    .map(release_group_metadata)
-                    .unwrap_or_default();
-                resolved.insert(mbid.clone(), metadata);
+                if let Some(entry) = answer.remove(mbid) {
+                    resolved.insert(mbid.clone(), release_group_metadata(entry));
+                }
             }
         }
         Ok(resolved)
@@ -501,7 +581,8 @@ impl ListenBrainzClient {
     ///
     /// # Errors
     ///
-    /// The typed failure of the call.
+    /// The typed failure of the call; [`ProviderError::NotConfigured`],
+    /// with nothing sent, when `creds` carry no token.
     pub async fn artist_top_release_groups(
         &self,
         artist_mbid: &str,
@@ -521,7 +602,7 @@ impl ListenBrainzClient {
                 artist_mbid,
             ],
             &[],
-            creds,
+            with_token(creds)?,
         )?;
         Ok(self
             .read_unconfirmed::<TopReleaseGroupsAnswer>(request, priority)
@@ -540,7 +621,8 @@ impl ListenBrainzClient {
     ///
     /// # Errors
     ///
-    /// The typed failure of the call.
+    /// The typed failure of the call; [`ProviderError::NotConfigured`],
+    /// with nothing sent, when `creds` carry no token.
     pub async fn artist_top_recordings(
         &self,
         artist_mbid: &str,
@@ -555,7 +637,7 @@ impl ListenBrainzClient {
         let request = self.get(
             &["1", "popularity", "top-recordings-for-artist", artist_mbid],
             &[],
-            creds,
+            with_token(creds)?,
         )?;
         Ok(self
             .read_unconfirmed::<TopRecordingsAnswer>(request, priority)
@@ -938,6 +1020,18 @@ fn genre_tag(item: TagItem) -> Option<GenreTag> {
 }
 
 /// The tags of one release group and its artists.
+/// The ids once each, trimmed, blanks dropped, in first-seen order.
+fn unique_trimmed(ids: &[String]) -> Vec<String> {
+    let mut unique: Vec<String> = Vec::new();
+    for mbid in ids {
+        let trimmed = mbid.trim();
+        if !trimmed.is_empty() && !unique.iter().any(|known| known == trimmed) {
+            unique.push(trimmed.to_owned());
+        }
+    }
+    unique
+}
+
 fn release_group_metadata(entry: ReleaseGroupEntry) -> ReleaseGroupMetadata {
     let tags = entry.tag.unwrap_or_default();
     ReleaseGroupMetadata {

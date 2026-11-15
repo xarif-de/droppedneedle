@@ -532,6 +532,13 @@
 							disabled={!hasOidcCredentials || oidcLocked}
 						/>
 
+						<ToggleRow
+							label="Go straight to SSO"
+							description="Skip the login page. /login?local still shows it."
+							bind:checked={draft.auto_redirect}
+							disabled={!draft.enabled}
+						/>
+
 						<SaveBar {...oidc.bar} testLabel="Test connection" />
 					</div>
 				{/snippet}

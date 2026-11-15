@@ -1,24 +1,29 @@
 #!/bin/sh
 # Container end-to-end test.
 #
-# 1. ffmpeg: the image's build is LGPL only with its notices beside it, and
-#    every format the scan accepts transcodes to every output, with and without
-#    a seek, using the argument shape of build_cmd in transcode.rs.
-# 2. Smoke: fresh boot, healthy, clean SIGTERM shutdown. Prints cold and
+# 1. Notices: DroppedNeedle's licence and the notices for the crates and web UI
+#    packages it is built from are in the image, libopus's among the crates'
+#    and svelte, read from the source maps, among the packages.
+# 2. ffmpeg: the image's build is LGPL only, with its notices and libmp3lame's
+#    source beside it, and every format the scan accepts transcodes to every
+#    output, with and without a seek, using the argument shape of build_cmd in
+#    transcode.rs.
+# 3. Smoke: fresh boot, healthy, clean SIGTERM shutdown. Prints cold and
 #    warm boot time, idle RSS and shutdown time.
-# 3. PUID: a boot with PUID=568 hands the config and cache folders to uid 568
-#    and the server writes as it; a boot with PUID back at 1000 hands them back.
-# 4. Journeys: on an internal network with no route out, starts the mock
+# 4. PUID: a boot with PUID=568 hands the config and cache folders, and the
+#    imports and plugins folders Docker created owned by root, to uid 568 and
+#    the server writes as it; a boot with PUID back at 1000 hands them back.
+# 5. Journeys: on an internal network with no route out, starts the mock
 #    slskd and MusicBrainz (e2e-mocks.Dockerfile), then runs each browser
 #    journey in frontend/tests/journeys against a fresh server of its own,
 #    after checking that nothing outside resolves or routes from it.
 #
 # Everything runs against containers this script starts under its own names,
 # never against an address passed in. They are removed on exit, pass or fail,
-# as are the two volumes the PUID check makes. The folders mounted are the audio
-# fixtures, read-only, for the ffmpeg check and, as the library at /music, a
-# throwaway copy of two of them, removed on exit. The journeys need the
-# frontend dependencies and Playwright's Chromium
+# as are the two volumes and the imports and plugins folders the PUID check
+# makes. The folders mounted are the audio fixtures, read-only, for the ffmpeg
+# check and, as the library at /music, a throwaway copy of two of them, removed
+# on exit. The journeys need the frontend dependencies and Playwright's Chromium
 # (make frontend-install frontend-browser-install).
 #
 # DN_E2E_IMAGE and DN_E2E_MOCKS_IMAGE name images already built; each one set
@@ -38,6 +43,7 @@ FFMPEG="dn-e2e-ffmpeg"
 FIXTURES="$ROOT/server/tests/fixtures/library"
 WORK=""
 OUT=""
+PUID_WORK=""
 
 cleanup() {
   docker rm -f "$NAME" "$APP" "$MOCKS" "$FFMPEG" >/dev/null 2>&1 || true
@@ -45,6 +51,12 @@ cleanup() {
   docker volume rm "$CONFIG_VOLUME" "$CACHE_VOLUME" >/dev/null 2>&1 || true
   if [ -n "$WORK" ]; then rm -rf "$WORK" || true; fi
   if [ -n "$OUT" ]; then rm -rf "$OUT" || true; fi
+  if [ -n "$PUID_WORK" ]; then
+    # The server writes into the plugins folder as the runtime uid, so the
+    # folders are emptied as root, in the image.
+    docker run --rm -v "$PUID_WORK:/work" --entrypoint rm "$IMAGE" -rf /work/imports /work/plugins >/dev/null 2>&1 || true
+    rm -rf "$PUID_WORK" || true
+  fi
 }
 trap cleanup EXIT
 trap 'exit 130' INT TERM
@@ -146,6 +158,18 @@ transcode() {
   check_output "$MUXER" "$OUT/out" "$LABEL"
 }
 
+check_notices() {
+  for FILE in LICENSE NOTICES-server.txt NOTICES-web-ui.txt; do
+    docker run --rm --network none --entrypoint test "$IMAGE" -s "/usr/share/doc/droppedneedle/$FILE" \
+      || fail "no $FILE in /usr/share/doc/droppedneedle"
+  done
+  docker run --rm --network none --entrypoint grep "$IMAGE" -q Xiph.Org /usr/share/doc/droppedneedle/NOTICES-server.txt \
+    || fail "NOTICES-server.txt has no libopus notice"
+  docker run --rm --network none --entrypoint grep "$IMAGE" -q '^  svelte [0-9]' /usr/share/doc/droppedneedle/NOTICES-web-ui.txt \
+    || fail "NOTICES-web-ui.txt does not list svelte, which only the source maps name"
+  echo "notices: LICENSE, NOTICES-server.txt and NOTICES-web-ui.txt"
+}
+
 check_ffmpeg() {
   docker run -d --name "$FFMPEG" --network none --user 1000:1000 --entrypoint sleep \
     -v "$FIXTURES:/fixtures:ro" "$IMAGE" 600 >/dev/null || fail "ffmpeg container did not start"
@@ -173,6 +197,17 @@ check_ffmpeg() {
   VERSION=$(docker exec "$FFMPEG" ffmpeg -version | sed -n 's/^ffmpeg version \([^ ]*\).*/\1/p')
   docker exec "$FFMPEG" test -s "/usr/share/doc/ffmpeg/ffmpeg-$VERSION.tar.xz" \
     || fail "no source tarball for ffmpeg $VERSION"
+
+  # libmp3lame's Debian source for the version the image links. Debian's file
+  # names drop the epoch.
+  SOURCE=$(docker exec "$FFMPEG" dpkg-query -W -f='${source:Package}' libmp3lame0) \
+    || fail "libmp3lame0 is not installed"
+  LAME=$(docker exec "$FFMPEG" dpkg-query -W -f='${source:Version}' libmp3lame0)
+  LAME=${LAME#*:}
+  for FILE in "${SOURCE}_$LAME.dsc" "${SOURCE}_${LAME%-*}.orig.tar.[gx]z" "${SOURCE}_$LAME.debian.tar.[gx]z"; do
+    docker exec "$FFMPEG" sh -c "test -s /usr/share/doc/ffmpeg/lame/$FILE" \
+      || fail "no $FILE in /usr/share/doc/ffmpeg/lame"
+  done
 
   COUNT=0
   for INPUT in \
@@ -213,6 +248,9 @@ cleanup
 
 echo "image size: $(docker image inspect --format '{{.Size}}' "$IMAGE") bytes"
 
+echo "--- notices ---"
+check_notices
+
 echo "--- ffmpeg ---"
 check_ffmpeg
 
@@ -249,21 +287,33 @@ echo "exit code 0, graceful-shutdown log line present"
 docker rm -f "$NAME" >/dev/null 2>&1 || true
 
 # Fail unless the database the server wrote, and everything else in the config
-# and cache volumes, belongs to the given uid.
+# and cache volumes, belongs to the given uid, and so do the imports and plugins
+# folders.
 data_owned_by() {
   [ "$(docker exec "$NAME" stat -c %u /app/cache/library.db)" = "$1" ] \
     || fail "PUID=$1: library.db is not owned by uid $1"
   OTHERS=$(docker exec "$NAME" find /app/config /app/cache ! -user "$1")
   [ -z "$OTHERS" ] || fail "PUID=$1: not handed over: $OTHERS"
+  for FOLDER in /app/imports /app/plugins; do
+    [ "$(docker exec "$NAME" stat -c %u "$FOLDER")" = "$1" ] \
+      || fail "PUID=$1: $FOLDER is not owned by uid $1"
+  done
 }
 
 echo "--- PUID ---"
+# Docker creates a missing host folder owned by root, as a fresh install's
+# imports and plugins folders are.
+PUID_WORK=$(mktemp -d)
+IMPORTS="$PUID_WORK/imports"
+PLUGINS="$PUID_WORK/plugins"
 boot_and_wait -e PUID=568 -e PGID=568 \
-  -v "$CONFIG_VOLUME:/app/config" -v "$CACHE_VOLUME:/app/cache" >/dev/null
+  -v "$CONFIG_VOLUME:/app/config" -v "$CACHE_VOLUME:/app/cache" \
+  -v "$IMPORTS:/app/imports" -v "$PLUGINS:/app/plugins" >/dev/null
 data_owned_by 568
 docker stop -t 10 "$NAME" >/dev/null || fail "PUID=568 stop failed"
 docker rm -f "$NAME" >/dev/null || fail "PUID=568 rm failed"
-boot_and_wait -v "$CONFIG_VOLUME:/app/config" -v "$CACHE_VOLUME:/app/cache" >/dev/null
+boot_and_wait -v "$CONFIG_VOLUME:/app/config" -v "$CACHE_VOLUME:/app/cache" \
+  -v "$IMPORTS:/app/imports" -v "$PLUGINS:/app/plugins" >/dev/null
 data_owned_by 1000
 echo "PUID=568 took the data folders over, PUID=1000 took them back"
 docker rm -f "$NAME" >/dev/null 2>&1 || true

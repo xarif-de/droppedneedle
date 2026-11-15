@@ -1,7 +1,9 @@
 <script lang="ts">
+	import { tick, untrack } from 'svelte';
 	import { page } from '$app/state';
 	import { goto } from '$app/navigation';
 	import { withBasePath } from '$lib/utils/basePath';
+	import { toastStore } from '$lib/stores/toast';
 	import { Disc3, Heart, Search, X } from 'lucide-svelte';
 	import {
 		getLibraryAlbumFormatsQuery,
@@ -12,7 +14,11 @@
 		type RatingMode,
 		type TracksMode
 	} from '$lib/features/library/components/LibraryFilterMenu.svelte';
-	import { rememberFilters } from '$lib/features/library/state/rememberedFilters.svelte';
+	import {
+		keepFilter,
+		keptFilter,
+		rememberFilters
+	} from '$lib/features/library/state/rememberedFilters.svelte';
 	import type { LibraryV3AlbumsParams } from '$lib/features/library/queries/LibraryQueryKeyFactory';
 	import LibraryAlbumCard from '$lib/features/library/components/LibraryAlbumCard.svelte';
 	import Button from '$lib/ui/Button.svelte';
@@ -27,6 +33,15 @@
 	type Sort = 'recent' | 'title' | 'artist' | 'hearted';
 	const VALID_SORTS: Sort[] = ['recent', 'title', 'artist'];
 
+	function isSort(value: string | null): value is Sort {
+		return VALID_SORTS.some((sort) => sort === value);
+	}
+
+	// All Albums starts on the sort this browser last chose here, in place before the
+	// first render; the favourites view has its own order and never writes this.
+	const keptSort = keptFilter('album-sort', 'sort');
+	let defaultSort = $state<Sort>(isSort(keptSort) ? keptSort : 'recent');
+
 	// browse state lives in the url so it's shareable and back-button stable
 	const params = $derived.by(() => {
 		const sp = page.url.searchParams;
@@ -35,7 +50,7 @@
 		const valid =
 			rawSort && (VALID_SORTS.includes(rawSort) || (favorites && rawSort === 'hearted'));
 		return {
-			sort: valid ? rawSort : favorites ? 'hearted' : 'recent',
+			sort: valid ? rawSort : favorites ? 'hearted' : defaultSort,
 			q: sp.get('q') ?? '',
 			// `format` is the one-format link of before the filter menu.
 			formats: (sp.get('formats') ?? sp.get('format') ?? '')
@@ -131,9 +146,155 @@
 	function toggleFavorites() {
 		setParams({ favorites: params.favorites ? null : '1', sort: null });
 	}
+
+	function setSort(value: string) {
+		setParams({ sort: value });
+		// Only the All Albums order is the default; the favourites view has its own.
+		if (!params.favorites && isSort(value)) {
+			defaultSort = value;
+			keepFilter('album-sort', 'sort', value);
+		}
+	}
+
+	// The A-Z jump. The grid is flat and read a page at a time, so a letter is
+	// reached by loading on until it shows. It follows the list's order: the
+	// title, or the artist on Artist A-Z; any other order switches to Title A-Z.
+	const LETTERS = ['#', ...'ABCDEFGHIJKLMNOPQRSTUVWXYZ'];
+	// A jump stops once the list holds this many pages (2,000 albums).
+	const JUMP_PAGE_LIMIT = 40;
+
+	interface Jump {
+		letter: string;
+		/** The order it runs in, and the one the list was in when it was picked. */
+		sort: Sort;
+		from: Sort;
+		/** The list it was picked on: a change of search, filter or favourites ends it. */
+		list: string;
+		stop: AbortController;
+		started: boolean;
+	}
+
+	const listKey = $derived.by(() => {
+		const { sort: _sort, ...rest } = params;
+		return JSON.stringify(rest);
+	});
+
+	let jumpLetter = $state('');
+	let jump = $state.raw<Jump | null>(null);
+
+	/**
+	 * The letter an album is filed under in the list's order, folded the way the
+	 * server sorts (accents and case off), so "Élan" is under E.
+	 */
+	function albumInitial(album: AlbumView, sort: Sort): string {
+		const name = sort === 'artist' ? album.artist_name : album.title;
+		const first = name.normalize('NFKD').replace(/\p{M}/gu, '').trim().toUpperCase().charAt(0);
+		return first >= 'A' && first <= 'Z' ? first : '#';
+	}
+
+	type Reach = 'found' | 'none' | 'far' | 'stopped';
+
+	/** Resolves once the list is not fetching (a refetch of kept pages), or the jump stops. */
+	async function whenIdle(stop: AbortSignal): Promise<void> {
+		let end = () => {};
+		try {
+			await new Promise<void>((resolve) => {
+				stop.addEventListener('abort', () => resolve(), { once: true });
+				end = $effect.root(() => {
+					$effect(() => {
+						if (!albumsQuery.isFetching) resolve();
+					});
+				});
+			});
+		} finally {
+			end();
+		}
+	}
+
+	async function loadUntil({ letter, sort, stop }: Jump): Promise<Reach> {
+		for (;;) {
+			// A failed page resolves rather than throws; the page shows the query's error.
+			if (stop.signal.aborted || albumsQuery.isError) return 'stopped';
+			const initials = albums.map((album) => albumInitial(album, sort));
+			if (initials.includes(letter)) return 'found';
+			// Titles are sorted by their folded initial, so once a later letter shows this
+			// one has no albums. Artist A-Z sorts on the tags' name, which a card may not show.
+			if (
+				sort === 'title' &&
+				letter !== '#' &&
+				initials.some((initial) => initial !== '#' && initial > letter)
+			) {
+				return 'none';
+			}
+			if (!albumsQuery.hasNextPage) return 'none';
+			if ((albumsQuery.data?.pages.length ?? 0) >= JUMP_PAGE_LIMIT) return 'far';
+			// A next page fetched now would cancel a refetch in flight.
+			await whenIdle(stop.signal);
+			if (stop.signal.aborted) return 'stopped';
+			await albumsQuery.fetchNextPage();
+		}
+	}
+
+	async function runJump(current: Jump): Promise<void> {
+		try {
+			const reach = await loadUntil(current);
+			if (reach === 'none') toastStore.notify(`No albums under ${current.letter}`);
+			if (reach === 'far') toastStore.notify('Too far down to jump; scroll or search instead');
+			if (reach !== 'found') return;
+			await tick();
+			if (current.stop.signal.aborted) return;
+			const target = albums.find((album) => albumInitial(album, current.sort) === current.letter);
+			if (!target) return;
+			// Instant: a smooth scroll passes every card on the way and loads all their covers.
+			document
+				.querySelector(`[data-album-id="${CSS.escape(target.id)}"]`)
+				?.scrollIntoView({ behavior: 'instant', block: 'start' });
+		} finally {
+			endJump(current);
+		}
+	}
+
+	function endJump(current: Jump): void {
+		current.stop.abort();
+		if (jump !== current) return;
+		jump = null;
+		// Back to "Jump to...", so the same letter can be picked again.
+		jumpLetter = '';
+	}
+
+	function jumpToLetter(letter: string): void {
+		if (!letter || jump) return;
+		const sort: Sort = params.sort === 'artist' ? 'artist' : 'title';
+		const from = params.sort;
+		jump = { letter, sort, from, list: listKey, stop: new AbortController(), started: false };
+		if (from !== sort) setSort(sort);
+	}
+
+	// Runs the jump once the list is loaded in its order, and ends it when the search,
+	// a filter, favourites or the order change under it.
+	$effect(() => {
+		const current = jump;
+		if (!current) return;
+		const sort = params.sort;
+		const list = listKey;
+		const ready = !albumsQuery.isLoading && !albumsQuery.isPlaceholderData;
+		untrack(() => {
+			const switching = !current.started && sort === current.from;
+			if (list !== current.list || (sort !== current.sort && !switching)) {
+				endJump(current);
+				return;
+			}
+			if (current.started || sort !== current.sort || !ready) return;
+			current.started = true;
+			void runJump(current);
+		});
+	});
+
+	// Leaving the page stops a jump between pages.
+	$effect(() => () => jump?.stop.abort());
 </script>
 
-<svelte:head><title>Albums · Library</title></svelte:head>
+<svelte:head><title>Albums - DroppedNeedle</title></svelte:head>
 
 <ListPageHeader
 	title={params.favorites ? 'Favourite Albums' : 'All Albums'}
@@ -173,13 +334,24 @@
 		<select
 			class="select dn-toolbar__select"
 			value={params.sort}
-			onchange={(e) => setParams({ sort: (e.target as HTMLSelectElement).value })}
+			onchange={(e) => setSort((e.target as HTMLSelectElement).value)}
 			aria-label="Sort albums"
 		>
 			{#if params.favorites}<option value="hearted">Recently Favourited</option>{/if}
 			<option value="recent">Newest First</option>
 			<option value="title">Title A-Z</option>
 			<option value="artist">Artist A-Z</option>
+		</select>
+		<select
+			class="select dn-toolbar__select dn-toolbar__select--letters"
+			bind:value={jumpLetter}
+			onchange={(e) => jumpToLetter((e.target as HTMLSelectElement).value)}
+			disabled={jump !== null}
+			aria-label="Jump to a letter"
+			title="Jump to a letter in the list's order"
+		>
+			<option value="">Jump to...</option>
+			{#each LETTERS as letter (letter)}<option value={letter}>{letter}</option>{/each}
 		</select>
 		<LibraryFilterMenu
 			minTracks={params.minTracks}
@@ -236,7 +408,7 @@
 	{:else}
 		<div class="dn-list-grid">
 			{#each albums as album (album.id)}
-				<LibraryAlbumCard {album} />
+				<div data-album-id={album.id}><LibraryAlbumCard {album} /></div>
 			{/each}
 		</div>
 
@@ -254,3 +426,10 @@
 		{/if}
 	{/if}
 </div>
+
+<style>
+	/* The A-Z jump lands a card clear of the sticky top bar and its safe area. */
+	.dn-list-grid > :global(*) {
+		scroll-margin-top: calc(4rem + var(--ms-safe-top) + 0.75rem);
+	}
+</style>

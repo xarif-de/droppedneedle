@@ -51,6 +51,8 @@ const DUMMY_GROUP: &str = "4d5e6f70-8b9c-4dae-9f10-2b3c4d5e6f70";
 const BAND: &str = "2fe9cf1f-8019-496e-870c-24f16d4d36c1";
 /// The band's album, its release group credited to Ben Caplan alone.
 const BAND_ALBUM: &str = "deb08635-0f11-4b87-b211-66479b61385f";
+/// Portishead, as the recorded ListenBrainz and Last.fm answers name them.
+const PORTISHEAD_ID: &str = "b7539c32-53e7-4908-bda3-81449c367da6";
 
 fn fixture(name: &str) -> String {
     let path = format!(
@@ -288,6 +290,16 @@ fn routes() -> Vec<Route> {
         ),
         route(
             "/lastfm/2.0/".to_owned(),
+            Some(("method", "artist.getSimilar")),
+            json!({"similarartists": {"artist": [{
+                "name": "Portishead",
+                "mbid": PORTISHEAD_ID,
+                "match": "1",
+            }]}})
+            .to_string(),
+        ),
+        route(
+            "/lastfm/2.0/".to_owned(),
             Some(("mbid", ARTIST)),
             upstream_fixture("lastfm_artist_top_albums"),
         ),
@@ -440,9 +452,18 @@ fn seed_library(app_db: &Path) {
     }
 }
 
+/// Link the test user's ListenBrainz account: ListenBrainz gives an
+/// artist's popular songs and albums only to a linked account.
+async fn link_listenbrainz(rig: &AuthRig) {
+    crate::common::listening_store(&rig.platform)
+        .save_listenbrainz(USER, "ada-lb", "ada-token")
+        .await
+        .expect("ListenBrainz link");
+}
+
 /// The catalog and search routes behind the session gate and request
 /// scope, with MusicBrainz at `mb_url`. The test user has a Last.fm key
-/// and is signed in with [`TOKEN`]. Hold the rig and the app while the
+/// and a linked ListenBrainz account, and is signed in with [`TOKEN`]. Hold the rig and the app while the
 /// router serves: the rig's database and the request wrapper go with them.
 async fn app_with(fixtures: &Fixtures, mb_url: String) -> (axum::Router, (AuthRig, TestApp)) {
     app_seeded(fixtures, mb_url, &[]).await
@@ -461,6 +482,7 @@ async fn app_seeded(
     }
     let rig = AuthRig::new("reads-catalog").await;
     rig.seed_user("ada", Role::User).await;
+    link_listenbrainz(&rig).await;
     rig.sign_in(USER, TOKEN).await;
     let sealed = rig.deps.crypto.encrypt("test-lastfm-key").unwrap();
     rig.deps
@@ -480,6 +502,7 @@ async fn app_seeded(
         Arc::new(fixtures.providers(&http)),
         Arc::new(TestSettings { mb_url }),
         rig.deps.clone(),
+        crate::common::listening_store(&rig.platform),
     );
     let catalog = catalog_on(upstream, &dir);
     let search = SearchDeps::new(
@@ -655,6 +678,7 @@ async fn audiodb_art_comes_from_the_fill_under_its_key() {
             Arc::new(fixtures.providers(&http)),
             settings.clone(),
             rig.deps.clone(),
+            crate::common::listening_store(&rig.platform),
         ),
         &dir,
     );
@@ -917,7 +941,7 @@ async fn an_artist_without_release_groups_lists_those_of_its_releases() {
 #[tokio::test]
 async fn artist_sections_use_listenbrainz_then_lastfm() {
     let fixtures = Fixtures::start().await;
-    let (app, _auth) = app(&fixtures).await;
+    let (app, (rig, _scope)) = app(&fixtures).await;
 
     let similar = get(&app, &format!("/api/v3/artists/{ARTIST}/similar?count=5")).await;
     assert_eq!(similar["source"], "listenbrainz");
@@ -985,13 +1009,14 @@ async fn artist_sections_use_listenbrainz_then_lastfm() {
             "musicbrainz_id": DUMMY_GROUP,
             "title": "Dummy",
             "artist_name": "Portishead",
-            "artist_id": "b7539c32-53e7-4908-bda3-81449c367da6",
+            "artist_id": PORTISHEAD_ID,
             "in_library": false,
             "requested": false,
             "cover_url": format!("/api/v3/covers/release-group/{DUMMY_GROUP}?size=500")
         }]),
-        "no ListenBrainz albums for the similar artists, so Last.fm fills in"
+        "no ListenBrainz albums for the similar artists, so Last.fm's fill in"
     );
+    assert_eq!(similar_albums["source"], "lastfm", "{similar_albums}");
 
     let lastfm = get(
         &app,
@@ -1005,6 +1030,25 @@ async fn artist_sections_use_listenbrainz_then_lastfm() {
     assert_eq!(lastfm["summary"], "Radiohead are an English rock band.");
     assert_eq!(lastfm["listeners"], 6_000_000);
     assert_eq!(lastfm["similar_artists"][0]["name"], "Thom Yorke");
+
+    // Asked for Last.fm with no Last.fm key to read with, ListenBrainz
+    // stands in.
+    rig.deps.lastfm.delete(USER).await.unwrap();
+    let stood_in = get(
+        &app,
+        &format!("/api/v3/artists/{ARTIST}/similar?count=5&source=lastfm"),
+    )
+    .await;
+    assert_eq!(
+        (
+            &stood_in["source"],
+            &stood_in["asked_source"],
+            &stood_in["unavailable_sources"]
+        ),
+        (&json!("listenbrainz"), &json!("lastfm"), &json!(["lastfm"])),
+        "{stood_in}"
+    );
+    assert_eq!(stood_in["similar_artists"][0]["name"], "Lana Del Rey");
 }
 
 #[tokio::test]
@@ -1201,6 +1245,7 @@ async fn lastfm_reads_fall_back_to_the_instance_key() {
             mb_url: String::new(),
         }),
         rig.deps.clone(),
+        crate::common::listening_store(&rig.platform),
     );
     assert!(
         upstream.lastfm("no-key-user").await.is_none(),
@@ -1244,6 +1289,7 @@ async fn a_failed_portrait_lookup_keeps_the_short_outage_marker() {
                 mb_url: format!("{}/mb/ws/2", fixtures.base),
             }),
             rig.deps.clone(),
+            crate::common::listening_store(&rig.platform),
         ),
         &dir,
     );
@@ -1353,6 +1399,7 @@ async fn a_cold_artist_image_waits_out_a_busy_musicbrainz() {
                 mb_url: musicbrainz::MB_API_BASE.to_owned(),
             }),
             rig.deps.clone(),
+            crate::common::listening_store(&rig.platform),
         ),
         &dir,
     );
@@ -1449,6 +1496,7 @@ async fn a_commons_portrait_answers_its_credit_as_plain_text() {
                 mb_url: "http://127.0.0.1:9".to_owned(),
             }),
             rig.deps.clone(),
+            crate::common::listening_store(&rig.platform),
         ),
         &dir,
     );
@@ -1596,6 +1644,8 @@ async fn a_passing_failure_is_not_cached_as_a_short_section() {
     let dir = crate::common::ScratchDir::new("reads-catalog-passing");
     crate::common::migrated_db(&dir.join("app.db"));
     let rig = AuthRig::new("reads-catalog-passing").await;
+    rig.seed_user("ada", Role::User).await;
+    link_listenbrainz(&rig).await;
     let catalog = catalog_on(
         Upstream::new(
             providers,
@@ -1603,6 +1653,7 @@ async fn a_passing_failure_is_not_cached_as_a_short_section() {
                 mb_url: "http://127.0.0.1:9/ws/2".to_owned(),
             }),
             rig.deps.clone(),
+            crate::common::listening_store(&rig.platform),
         ),
         &dir,
     );
@@ -1648,6 +1699,129 @@ async fn a_passing_failure_is_not_cached_as_a_short_section() {
         [BORN_TO_DIE, DUMMY_GROUP],
         "both artists once ListenBrainz answers"
     );
+}
+
+/// [`TestSettings`] with ListenBrainz reads switched off.
+struct ListenBrainzOff(TestSettings);
+
+impl CatalogSettings for ListenBrainzOff {
+    fn musicbrainz(&self) -> Option<MusicBrainzSettings> {
+        self.0.musicbrainz()
+    }
+
+    fn preferences(&self) -> UserPreferences {
+        self.0.preferences()
+    }
+
+    fn advanced(&self) -> AdvancedSettings {
+        self.0.advanced()
+    }
+
+    fn listenbrainz_enabled(&self) -> bool {
+        false
+    }
+
+    fn store_region(&self) -> Option<String> {
+        self.0.store_region()
+    }
+}
+
+/// "You Might Also Like" asks the service the person prefers first, and
+/// the other one when that is switched off; with neither usable it says
+/// it is not set up.
+#[tokio::test]
+async fn similar_albums_follow_the_persons_service() {
+    use droppedneedle_kernel::runtime_config::sections::ListenSource;
+    use droppedneedle_media::playback::listening::PrefsPatch;
+
+    let fixtures = Fixtures::start().await;
+    let (_app_db, dir) = crate::common::migrated_file("similar-albums-sources");
+    let rig = AuthRig::new("similar-albums-sources").await;
+    rig.seed_user("ada", Role::User).await;
+    rig.seed_user("carl", Role::User).await;
+    let sealed = rig.deps.crypto.encrypt("test-lastfm-key").unwrap();
+    rig.deps
+        .lastfm
+        .upsert(
+            USER,
+            LastFmConnection {
+                configured: true,
+                api_key_encrypted: Some(sealed),
+                ..LastFmConnection::default()
+            },
+        )
+        .await
+        .unwrap();
+    let listening = crate::common::listening_store(&rig.platform);
+    let prefer = |source| PrefsPatch {
+        primary_music_source: Some(source),
+        ..PrefsPatch::default()
+    };
+    let http = droppedneedle_kernel::http_client::HttpClientFactory::new().unwrap();
+    let mb_url = format!("{}/mb/ws/2", fixtures.base);
+    let catalog = |settings: Arc<dyn CatalogSettings>| {
+        catalog_on(
+            Upstream::new(
+                Arc::new(fixtures.providers(&http)),
+                settings,
+                rig.deps.clone(),
+                listening.clone(),
+            ),
+            &dir,
+        )
+    };
+    let on = catalog(Arc::new(TestSettings {
+        mb_url: mb_url.clone(),
+    }));
+    let off = catalog(Arc::new(ListenBrainzOff(TestSettings { mb_url })));
+    let ids = |albums: &[droppedneedle_catalog::metadata::models::AlbumRef]| {
+        albums
+            .iter()
+            .filter_map(|album| album.musicbrainz_id.clone())
+            .collect::<Vec<_>>()
+    };
+    let radio = format!("/lb/1/lb-radio/artist/{ARTIST}");
+
+    listening
+        .update_prefs(USER, &prefer(ListenSource::Lastfm))
+        .await
+        .unwrap();
+    let lastfm_first = on
+        .similar_albums(USER, OK_COMPUTER, ARTIST, 2)
+        .await
+        .unwrap();
+    assert_eq!(
+        (lastfm_first.source, lastfm_first.configured),
+        (ListenSource::Lastfm, true)
+    );
+    assert_eq!(ids(&lastfm_first.albums), [DUMMY_GROUP]);
+    assert_eq!(fixtures.hits(&radio), 0, "ListenBrainz was not asked");
+
+    listening
+        .update_prefs(USER, &prefer(ListenSource::Listenbrainz))
+        .await
+        .unwrap();
+    let stood_in = off
+        .similar_albums(USER, OK_COMPUTER, ARTIST, 2)
+        .await
+        .unwrap();
+    assert_eq!(
+        (stood_in.source, stood_in.configured),
+        (ListenSource::Lastfm, true),
+        "ListenBrainz is off, so Last.fm answers"
+    );
+    assert_eq!(ids(&stood_in.albums), [DUMMY_GROUP]);
+
+    let neither = off
+        .similar_albums("user-carl", OK_COMPUTER, ARTIST, 2)
+        .await
+        .unwrap();
+    assert_eq!(
+        (neither.source, neither.configured, neither.albums.len()),
+        (ListenSource::Listenbrainz, false, 0),
+        "ListenBrainz off and no Last.fm key: nothing can be asked"
+    );
+    assert_eq!(fixtures.hits(&radio), 0, "ListenBrainz was never asked");
 }
 
 /// Provider answers outlive a restart: an album header read once from
@@ -1800,6 +1974,8 @@ async fn a_song_nothing_places_is_asked_again_after_a_day() {
     let dir = crate::common::ScratchDir::new("reads-catalog-song-miss");
     crate::common::migrated_db(&dir.join("app.db"));
     let rig = AuthRig::new("reads-catalog-song-miss").await;
+    rig.seed_user("ada", Role::User).await;
+    link_listenbrainz(&rig).await;
     let catalog = catalog_on(
         Upstream::new(
             providers,
@@ -1807,6 +1983,7 @@ async fn a_song_nothing_places_is_asked_again_after_a_day() {
                 mb_url: mb.to_owned(),
             }),
             rig.deps.clone(),
+            crate::common::listening_store(&rig.platform),
         ),
         &dir,
     );

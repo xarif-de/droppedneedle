@@ -237,9 +237,14 @@ pub struct HomeInputs {
     pub discover: DiscoverPages,
 }
 
-/// Sitewide or user album rows that map to a release group.
+/// Sitewide or user album rows that map to a release group, one per
+/// group.
 fn ranked(rows: Vec<ListenedAlbum>) -> Vec<super::listening::RankedAlbum> {
-    rows.into_iter().filter_map(ListenedAlbum::ranked).collect()
+    super::listening::one_per_group(
+        rows.into_iter().filter_map(ListenedAlbum::ranked).collect(),
+        |row| Some(row.album.release_group_mbid.as_str()),
+        |row| row.listen_count,
+    )
 }
 
 impl LiveHome {
@@ -352,6 +357,7 @@ impl LiveHome {
         status: IntegrationStatus,
         off: &HashSet<SectionKey>,
     ) -> HomeResponse {
+        let listenbrainz_on = status.listenbrainz;
         let status = user_status(status, music);
         let library = &self.inner.library;
         let (recent, artists, plays) = tokio::join!(
@@ -374,8 +380,12 @@ impl LiveHome {
                 page_shelves::section(Page::Home, def.key, content)
             })
             .collect();
-        page.service_prompts =
-            shelves::service_prompts(status.listenbrainz, status.download_client, status.lastfm);
+        page.service_prompts = shelves::service_prompts(
+            status.listenbrainz,
+            listenbrainz_on,
+            status.download_client,
+            status.lastfm,
+        );
         page.discover_preview = self.discover_preview(user_id).await;
         page
     }

@@ -58,7 +58,16 @@ struct Built {
 /// after a section it was built from changes, so per-client caches survive
 /// between uses while a saved setting takes effect on the next use.
 pub struct LiveClients {
+    /// The shared client, for SABnzbd.
     http: reqwest::Client,
+    /// The factory's client that follows no redirect, for SABnzbd's client
+    /// to fetch an NZB straight from a Prowlarr or plugin release's link,
+    /// which checks each hop itself.
+    no_redirect: reqwest::Client,
+    /// The factory's client that follows a redirect only on the same host,
+    /// for slskd and Prowlarr: their key rides in a header a redirect
+    /// elsewhere would carry to another address.
+    same_host: reqwest::Client,
     /// Newznab indexers, called through the providers' executor.
     newznab: NewznabIndexers,
     pub(crate) settings: ClientLives,
@@ -74,9 +83,13 @@ pub struct LiveClients {
 impl LiveClients {
     /// Clients over the live sections. `slskd_downloads` is the slskd
     /// downloads mount (`SLSKD_DOWNLOADS_PATH`); `newznab` hands out the
-    /// indexers' clients.
+    /// indexers' clients; `no_redirect` follows no redirect and
+    /// `same_host` only one on the same host.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         http: reqwest::Client,
+        no_redirect: reqwest::Client,
+        same_host: reqwest::Client,
         newznab: NewznabIndexers,
         settings: ClientLives,
         slskd_downloads: PathBuf,
@@ -86,6 +99,8 @@ impl LiveClients {
     ) -> Self {
         Self {
             http,
+            no_redirect,
+            same_host,
             newznab,
             settings,
             slskd_downloads,
@@ -170,11 +185,15 @@ impl LiveClients {
             .as_ref()
             .map(SlskdPolicy::from_saved)
             .unwrap_or_default();
-        let slskd_repo =
-            slskd_repository(http, &settings.slskd, &self.slskd_downloads, slskd_policy);
-        let sab_queue = sabnzbd_queue(http, &settings.sabnzbd, &usenet_policy);
+        let slskd_repo = slskd_repository(
+            &self.same_host,
+            &settings.slskd,
+            &self.slskd_downloads,
+            slskd_policy,
+        );
+        let sab_queue = sabnzbd_queue(http, &self.no_redirect, &settings.sabnzbd, &usenet_policy);
         let newznab = Arc::new(newznab_indexer(&self.newznab, &settings.indexers));
-        let prowlarr = Arc::new(prowlarr_indexer(http, &settings.prowlarr));
+        let prowlarr = Arc::new(prowlarr_indexer(&self.same_host, &settings.prowlarr));
         let mut sources: Vec<Arc<dyn DownloadSource>> = Vec::new();
         if let Some(repo) = slskd_repo.clone()
             && readable
@@ -246,9 +265,11 @@ fn slskd_repository(
     Some(Arc::new(repo))
 }
 
-/// SABnzbd queue, when the section configures one.
+/// SABnzbd queue, when the section configures one. Its API goes through
+/// `http`, and an NZB fetched from its link through `no_redirect`.
 fn sabnzbd_queue(
     http: &reqwest::Client,
+    no_redirect: &reqwest::Client,
     section: &DownloadClients,
     policy: &UsenetPolicy,
 ) -> Option<Arc<SabnzbdQueue>> {
@@ -258,6 +279,7 @@ fn sabnzbd_queue(
     }
     let client = SabnzbdClient::new(
         http.clone(),
+        no_redirect.clone(),
         &sab.url,
         sab.api_key.expose(),
         3,

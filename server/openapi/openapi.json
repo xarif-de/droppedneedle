@@ -18674,7 +18674,89 @@
             }
           },
           "403": {
+            "description": "Curator role required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The server is busy; try again",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "session": [
+              "curator"
+            ]
+          }
+        ]
+      }
+    },
+    "/api/v3/library/recycle-bin/accept-folder": {
+      "post": {
+        "tags": [
+          "library management"
+        ],
+        "summary": "Use the folder the recycle bin path names as the bin.",
+        "description": "For when the app finds it is not the folder used before, because the\nbin was moved. It is marked as the bin, and removals and upgrades go\nahead. Nothing is written when it already holds the marker.",
+        "operationId": "accept_recycle_bin_folder",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AcceptRecycleBinFolderBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "The folder is the recycle bin"
+          },
+          "400": {
+            "description": "Bad body",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Not authenticated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
             "description": "Admin role required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The path changed, the saved folder can't be used as the bin now, or it can't be written to",
             "content": {
               "application/json": {
                 "schema": {
@@ -32371,15 +32453,15 @@
         "tags": [
           "settings"
         ],
-        "summary": "Read the ListenBrainz connection (token masked unless unset).",
+        "summary": "Read the ListenBrainz reads switch.",
         "operationId": "get_listenbrainz",
         "responses": {
           "200": {
-            "description": "ListenBrainz connection",
+            "description": "ListenBrainz reads switch",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ListenBrainzConnection"
+                  "$ref": "#/components/schemas/ListenBrainzSettings"
                 }
               }
             }
@@ -32397,13 +32479,13 @@
         "tags": [
           "settings"
         ],
-        "summary": "Save the ListenBrainz connection (a masked token keeps the stored one).",
+        "summary": "Save the ListenBrainz reads switch.",
         "operationId": "put_listenbrainz",
         "requestBody": {
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/ListenBrainzConnection"
+                "$ref": "#/components/schemas/ListenBrainzSettings"
               }
             }
           },
@@ -32411,59 +32493,11 @@
         },
         "responses": {
           "200": {
-            "description": "Saved connection",
+            "description": "Saved switch",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ListenBrainzConnection"
-                }
-              }
-            }
-          }
-        },
-        "security": [
-          {
-            "session": [
-              "admin"
-            ]
-          }
-        ]
-      }
-    },
-    "/api/v3/settings/listenbrainz/verify": {
-      "post": {
-        "tags": [
-          "settings"
-        ],
-        "summary": "Test the submitted ListenBrainz values (a masked token tests the\nstored one). Rate limiting answers 429.",
-        "operationId": "verify_listenbrainz",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/ListenBrainzConnection"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Verify verdict",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/VerifyConnectionResponse"
-                }
-              }
-            }
-          },
-          "429": {
-            "description": "ListenBrainz is rate-limiting this server",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
+                  "$ref": "#/components/schemas/ListenBrainzSettings"
                 }
               }
             }
@@ -35289,6 +35323,19 @@
   },
   "components": {
     "schemas": {
+      "AcceptRecycleBinFolderBody": {
+        "type": "object",
+        "description": "The folder an admin chooses as the recycle bin.",
+        "required": [
+          "path"
+        ],
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "The recycle bin path the warning was shown for."
+          }
+        }
+      },
       "AccountMode": {
         "type": "string",
         "description": "Whose account a source is reached through.",
@@ -38983,7 +39030,8 @@
           "local",
           "plex",
           "jellyfin",
-          "oidc"
+          "oidc",
+          "oidc_auto_redirect"
         ],
         "properties": {
           "jellyfin": {
@@ -38997,6 +39045,10 @@
           "oidc": {
             "type": "boolean",
             "description": "OIDC sign-in is switched on with an issuer and client id."
+          },
+          "oidc_auto_redirect": {
+            "type": "boolean",
+            "description": "The login page starts OIDC sign-in at once (`/login?local` still\nshows the other methods); never true while `oidc` is false."
           },
           "plex": {
             "type": "boolean",
@@ -39257,7 +39309,8 @@
         "description": "Backup listing, oldest first.",
         "required": [
           "backups",
-          "keep"
+          "keep",
+          "database_in_memory"
         ],
         "properties": {
           "backups": {
@@ -39266,6 +39319,10 @@
               "$ref": "#/components/schemas/BackupView"
             },
             "description": "Backups on disk, oldest first."
+          },
+          "database_in_memory": {
+            "type": "boolean",
+            "description": "True when the database sits on a filesystem held in memory (tmpfs\nor ramfs): it and these backups are lost when the server restarts."
           },
           "keep": {
             "type": "integer",
@@ -48045,7 +48102,7 @@
           },
           "listenbrainz": {
             "type": "boolean",
-            "description": "ListenBrainz charts and history are available."
+            "description": "ListenBrainz reads are switched on for this server. The home page's\ncopy is also false while the person has no ListenBrainz link."
           },
           "localfiles": {
             "type": "boolean",
@@ -49580,9 +49637,13 @@
                 "description": "Every tag field a profile can manage, in the editor's order, with\nthe genre row last."
               },
               "recycle_bin_warning": {
-                "type": [
-                  "string",
-                  "null"
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/RecycleBinWarning"
+                  }
                 ],
                 "description": "Why the recycle bin path is not used, when it is not: each library\nfolder's `.recycle` takes its place, or files wait for a folder\nthat can't be reached. Set on the settings read and save only."
               },
@@ -50457,24 +50518,14 @@
           }
         }
       },
-      "ListenBrainzConnection": {
+      "ListenBrainzSettings": {
         "type": "object",
-        "description": "ListenBrainz connection.",
+        "description": "ListenBrainz settings: the switch for the app's ListenBrainz reads.",
         "properties": {
-          "enabled": {
+          "reads_enabled": {
             "type": "boolean",
-            "description": "Master switch.",
-            "default": false
-          },
-          "user_token": {
-            "type": "string",
-            "description": "User token (encrypted at rest; v2 returned it plaintext on GET).",
-            "default": ""
-          },
-          "username": {
-            "type": "string",
-            "description": "Username.",
-            "default": ""
+            "description": "Read recommendations, popularity and genres from ListenBrainz.",
+            "default": true
           }
         }
       },
@@ -53728,6 +53779,11 @@
         "type": "object",
         "description": "OIDC connection.",
         "properties": {
+          "auto_redirect": {
+            "type": "boolean",
+            "description": "The login page starts single sign-on at once instead of showing its\nsign-in methods; `/login?local` still shows them. Only while single\nsign-on is on and set up.",
+            "default": false
+          },
           "client_id": {
             "type": "string",
             "description": "Client id.",
@@ -59537,6 +59593,24 @@
           }
         }
       },
+      "RecycleBinWarning": {
+        "type": "object",
+        "description": "Why the recycle bin path is not used.",
+        "required": [
+          "message",
+          "accept_folder"
+        ],
+        "properties": {
+          "accept_folder": {
+            "type": "boolean",
+            "description": "The folder is not the one used as the bin before, so files wait;\nan admin who moved the bin may use it\n(`POST /api/v3/library/recycle-bin/accept-folder`)."
+          },
+          "message": {
+            "type": "string",
+            "description": "What the settings say."
+          }
+        }
+      },
       "RedactedPlaylist": {
         "type": "object",
         "description": "A private playlist the caller may not read: existence, count, and owner\nonly. Never the name, tracks, or covers. An admin also gets the ones with\nno owner, which they may delete.",
@@ -64452,7 +64526,8 @@
           "description",
           "zone",
           "enabled",
-          "available"
+          "available",
+          "turned_off"
         ],
         "properties": {
           "available": {
@@ -64481,6 +64556,10 @@
           "title": {
             "type": "string",
             "description": "Display title."
+          },
+          "turned_off": {
+            "type": "boolean",
+            "description": "An admin switched off the service this section needs, so linking\nit would not make the section available."
           },
           "zone": {
             "type": "string",
@@ -65057,7 +65136,8 @@
           "source",
           "configured",
           "asked_source",
-          "unavailable_sources"
+          "unavailable_sources",
+          "needs_account"
         ],
         "properties": {
           "asked_source": {
@@ -65067,6 +65147,13 @@
           "configured": {
             "type": "boolean",
             "description": "False when the provider is not set up; the list is then empty."
+          },
+          "needs_account": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ListenSource"
+            },
+            "description": "Services that give this list only to an account the person has not\nlinked (ListenBrainz's popular songs and albums). Not a failure."
           },
           "similar_artists": {
             "type": "array",
@@ -66268,7 +66355,8 @@
           "source",
           "configured",
           "asked_source",
-          "unavailable_sources"
+          "unavailable_sources",
+          "needs_account"
         ],
         "properties": {
           "albums": {
@@ -66285,6 +66373,13 @@
           "configured": {
             "type": "boolean",
             "description": "False when the provider is not set up."
+          },
+          "needs_account": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ListenSource"
+            },
+            "description": "Services that give this list only to an account the person has not\nlinked (ListenBrainz's popular songs and albums). Not a failure."
           },
           "source": {
             "$ref": "#/components/schemas/ListenSource",
@@ -66450,7 +66545,8 @@
           "source",
           "configured",
           "asked_source",
-          "unavailable_sources"
+          "unavailable_sources",
+          "needs_account"
         ],
         "properties": {
           "asked_source": {
@@ -66460,6 +66556,13 @@
           "configured": {
             "type": "boolean",
             "description": "False when the provider is not set up."
+          },
+          "needs_account": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ListenSource"
+            },
+            "description": "Services that give this list only to an account the person has not\nlinked (ListenBrainz's popular songs and albums). Not a failure."
           },
           "songs": {
             "type": "array",
@@ -67366,7 +67469,7 @@
       },
       "UpgradeCheck": {
         "type": "object",
-        "description": "What `upgrade --check` found. It runs every check the upgrade runs\nbefore it moves anything, and changes nothing.",
+        "description": "What `upgrade --check` found. It runs every check the upgrade runs\nbefore it moves anything, and leaves the v2 files as they are: its\nexport goes into the cache folder's `.upgrade-check` and is removed.",
         "required": [
           "layout",
           "orphans",
@@ -67421,6 +67524,8 @@
         "enum": [
           "UNKNOWN_LAYOUT",
           "UNSUPPORTED_PATHS",
+          "DATABASE_BEHIND_LINK",
+          "NON_LOCAL_FILESYSTEM",
           "BACKUP_EXISTS",
           "V2_WAL_UNREADABLE",
           "NOT_ENOUGH_DISK",
@@ -67431,6 +67536,7 @@
           "V2_CONFIG_INVALID",
           "MISSING_INSTANCE_ID",
           "V2_DATABASE_ERROR",
+          "V2_TOO_OLD",
           "EXPORT_FAILED",
           "VALIDATION_FAILED",
           "CALLBACKS_TO_CHANGE",

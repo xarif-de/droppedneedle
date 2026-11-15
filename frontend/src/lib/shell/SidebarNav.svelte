@@ -1,6 +1,6 @@
 <!--
 	The desktop sidebar: the destinations from `navItems`, the connected
-	services, and the icon row at the bottom (settings, log out, collapse).
+	services, and the icon row at the bottom (settings, collapse, log out).
 	Closed it is a tight icon rail with tooltips; the current destination
 	sits on the action fill.
 -->
@@ -100,7 +100,7 @@
 				{@render entry(item)}
 			{/each}
 
-			<SidebarServices />
+			<SidebarServices {currentPath} />
 
 			{#if requestItems.length > 0}
 				<div class="dn-rail__rule" aria-hidden="true"></div>
@@ -139,7 +139,6 @@
 					{/if}
 				</span>
 			{/each}
-			<IconButton icon={LogOut} label="Log out" onclick={() => void logout()} />
 			<IconButton
 				as="label"
 				for="main-drawer"
@@ -147,6 +146,7 @@
 				label="Toggle sidebar"
 				class="drawer-button is-drawer-open:rotate-y-180"
 			/>
+			<IconButton icon={LogOut} label="Log out" onclick={() => void logout()} />
 		</div>
 	</div>
 </div>

@@ -336,7 +336,9 @@ Run from the repo root. `make help` lists every target.
   `ConnectionResolver` (below), and slskd, SABnzbd, Lidarr and Prowlarr
   through their client in acquire. The caller always states its priority
   (a person waiting is user priority, background work is background);
-  there is no default.
+  there is no default. slskd and Prowlarr calls follow a redirect only on
+  the same host and never to http (the factory's `same_host_redirects`),
+  so their keys go nowhere else; an NZB link follows the grab hop rules.
 - Keep 401/403, 404 and 400 distinct. Raw transport errors never reach a
   response.
 - A client for a user's media server (Jellyfin, Navidrome, Plex) is built
@@ -353,8 +355,8 @@ Run from the repo root. `make help` lists every target.
 - Pace per install is not enough. MetaBrainz counts the total across every
   install, so ListenBrainz and MusicBrainz reads are cached for as long as the
   data allows, background work never refetches what a kept row can answer, and
-  a user's chosen source is honoured. A change that adds calls to them says how
-  many a day, for one active install.
+  a user's chosen source is asked first, the other only when it cannot answer.
+  A change that adds calls to them says how many a day, for one active install.
 - The User-Agent is `DroppedNeedleApp/v<version> (<contact>; <site>)`, the form
   MetaBrainz's gateway matches. Never change it, or send another name to get
   past a refusal, without asking the provider first.
@@ -448,6 +450,12 @@ Run from the repo root. `make help` lists every target.
 - Prefer a healthy, maintained crate over home-made parser, crypto or retry
   code. New licenses and advisory ignores are reviewed edits to
   `server/deny.toml`, with the reason beside them.
+- The image carries `LICENSE` and notices written at build time for every
+  crate the two binaries link (`server/about.toml`) and every package in the
+  web UI build (`frontend/scripts/notices.mjs`), in
+  `/usr/share/doc/droppedneedle/`. A license `deny.toml` allows also goes on
+  `about.toml`'s accepted list, and a crate whose package holds no license
+  text gets a clarification there.
 
 **Library management** (product rules, not up for debate)
 - Scanning and identification never write music files.
@@ -463,9 +471,13 @@ Run from the repo root. `make help` lists every target.
   The catalog revision is a change counter, bumped by every commit that
   changes catalog rows and never compared (a plugin's added file or its
   take-back changes none, so it skips the bump). A write that changes catalog rows bumps it inside its own
-  transaction through `catalog_revision::bump_catalog`; so does a bin
-  change that takes a file-less album off the lists. Event loops wait on
+  transaction through `catalog_revision::bump_catalog`. Event loops wait on
   the lane's commit counter (`Db::commits`), never a timer.
+- The web UI lists an album only while it is live and has files: one
+  definition, `owned_album!` in `library/src/identity/sql.rs`, which every
+  list, count, Check albums and Copies read. A removed album leaves the
+  lists at once and comes back through Put back; every album still opens
+  by its id.
 - Automatic work needs an enabled root, the matching trigger, an accepted
   exact MusicBrainz release or a custom edition a curator chose for the
   album where the folder's settings allow it, and a track mapping for every
@@ -491,6 +503,13 @@ Run from the repo root. `make help` lists every target.
 - A configured recycle bin that cannot be reached makes removals and
   upgrades wait; files never fall back to a library folder's `.recycle`
   while it is down.
+- The configured recycle bin is known by the marker file the app leaves
+  in it on first use. A bin path with a record but no marker in its
+  folder (a share not mounted leaves an empty folder) is not there, and,
+  before it is marked, neither is a folder holding no entry folder while
+  the journal has copies in it or v2 used the path (the upgrade records
+  it): removals and upgrades wait, and only an admin accepting the folder
+  marks it.
 - A removal sends the sidecars matching the folder's Library Management
   patterns (the default list while none is set up) to the recycle bin
   with the music, and Put back brings them home. One named like a removed
@@ -509,7 +528,12 @@ Run from the repo root. `make help` lists every target.
   disk before the file moves.
 - A recycle bin copy is deleted only when the identity recorded when it
   landed in the bin (device, inode, size, mtime, ctime) still matches, or its
-  bytes match the plan hash. Anything else is kept.
+  bytes match the plan hash. Anything else is kept. The one exception is an
+  entry folder no journal row names (every entry v2 left): it is deleted by
+  the date in its name once the retention is up or an admin empties the
+  bin, as v2 did, only at the top of a library folder's `.recycle` or of a
+  marked configured bin, and only while the folder holds nothing but plain
+  files.
 - A scan judges a track gone (walked past) in one place, `walked_past!`
   in `library/src/scan/sqlite_store/`, and never under a folder the run
   refused as a link (`refused_scope!`, a rule's scope or a link the walk
@@ -632,9 +656,10 @@ Run from the repo root. `make help` lists every target.
   made on it; files the app wrote meanwhile are undone through Library
   management.
 - A person's album hearts and ratings on an album with no files move to
-  the copy its release group opens, when both are accepted and that copy
-  has files; a rating on both keeps the copy's. Plays stay, local-only
-  albums keep theirs, and the album's history shows the move.
+  the copy its release group opens, when both are accepted, that copy has
+  files and nothing of the album can still be put back; a rating on both
+  keeps the copy's. Plays stay, local-only albums keep theirs, and the
+  album's history shows the move.
 - Album and track identities, match state and their undo rows are written
   only through `library/src/identity/`; a source gate holds it.
 
@@ -673,8 +698,10 @@ Run from the repo root. `make help` lists every target.
   only judged gone when the filesystem says it is absent, never on a read
   error. A held file the library could not take is retried by
   itself (`Gate::HeldRetry`), and that retry never places a file on an
-  album a person moved it away from, never adds a second copy and never
-  replaces a library copy: those wait for a person.
+  album a person moved it away from and never adds a second copy. It
+  replaces a library copy only to finish an upgrade already decided
+  (`UpgradeBlocked`: held because the old copy could not be taken away,
+  such as while the recycle bin is down). The rest wait for a person.
 - A source outside the download settings, or a format or step the quality
   recipe doesn't list, is never taken by automatic work (picks, failover,
   the search review, the wanted watcher); such a landing is held, one set

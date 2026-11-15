@@ -16,6 +16,8 @@
 		tone?: Tone;
 		/** `md` stands in a row of buttons, at their height. */
 		size?: 'xs' | 'sm' | 'md';
+		/** Let a long label wrap inside a narrow card instead of overflowing. */
+		wrap?: boolean;
 		icon?: KitIcon;
 		/** Layout only: margin, flex. */
 		class?: string;
@@ -25,6 +27,7 @@
 	let {
 		tone = 'neutral',
 		size = 'sm',
+		wrap = false,
 		icon: Icon,
 		class: className = '',
 		children
@@ -48,16 +51,33 @@
 		error: 'bg-error/15 text-error'
 	};
 	const sizes = {
-		xs: 'h-5 rounded-full border px-1.5 text-xs font-bold tracking-wide uppercase',
-		sm: 'h-6 rounded-full border px-2 text-xs font-bold tracking-wide uppercase',
-		md: 'h-10 gap-1.5 rounded-field px-3.5 text-sm font-semibold [&_svg]:size-4'
+		xs: 'border text-xs font-bold tracking-wide uppercase',
+		sm: 'border text-xs font-bold tracking-wide uppercase',
+		md: 'gap-1.5 text-sm font-semibold [&_svg]:size-4'
 	};
+	// One line: a pill at the size's height.
+	const oneLine = {
+		xs: 'h-5 rounded-full px-1.5',
+		sm: 'h-6 rounded-full px-2',
+		md: 'h-10 rounded-field px-3.5'
+	};
+	// Wrapped: softer corners and padding that keep every line inside the chip.
+	const wrapped = {
+		xs: 'rounded-xl px-2 py-1',
+		sm: 'rounded-xl px-2.5 py-1',
+		md: 'rounded-field px-3.5 py-2'
+	};
+	const layout = $derived(
+		wrap
+			? `min-w-0 max-w-full items-start whitespace-normal text-left leading-snug ${wrapped[size]}`
+			: `shrink-0 items-center whitespace-nowrap leading-none ${oneLine[size]}`
+	);
 </script>
 
 <span
-	class="inline-flex shrink-0 items-center gap-1 leading-none whitespace-nowrap {sizes[
-		size
-	]} {size === 'md' ? fills[tone] : chips[tone]} {className}"
+	class="inline-flex gap-1 {layout} {sizes[size]} {size === 'md'
+		? fills[tone]
+		: chips[tone]} {className}"
 >
 	{#if Icon}<Icon class="size-3" aria-hidden="true" />{/if}
 	{@render children()}
