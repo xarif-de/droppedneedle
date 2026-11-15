@@ -1,0 +1,9 @@
+# gitlab.com mirror declarations, read by kubernetes/forgejo resources/mirror-lib.sh
+# from this repo's default branch. The mirror baseline switches EVERY gitlab.com
+# project feature off, so anything this repo needs on its mirror is declared here.
+#
+# This repo publishes container images and the cluster pulls them from the mirror
+# (registry.gitlab.com/xarif/<org>/<name>), so the registry has to be declared: with
+# it disabled an anonymous pull is refused with "DENIED: access forbidden".
+features:
+  container_registry: enabled
