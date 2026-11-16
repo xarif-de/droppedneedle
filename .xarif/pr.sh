@@ -17,7 +17,10 @@
 #   pr.sh pull <topic>   take maintainer fixups from the PR head into the topic (fast-forward only)
 #   pr.sh push <topic>   publish the topic as the PR head (refuses to drop commits the PR head has;
 #                        before the day of its pr-after=, EARLY=1 overrides the hold)
-# .xarif/pr.env (KEY=value lines): FORGEJO (fork clone URL), USER_FORK (the GitHub fork the PRs come
+# .xarif/pr.env (KEY=value lines): FORGEJO (fork clone URL; fetches use it as is, pushes go to
+# FORGEJO_PUSH, default: an https://<host>/<path> FORGEJO rewritten to git@<host>:<path>, because
+# HTTPS pushes to git.xarif.de stall on a credential prompt — the macOS keychain helper hung
+# `save` on 2026-11-15 — and the fleet pushes over SSH), USER_FORK (the GitHub fork the PRs come
 # from: "allow edits from maintainers" needs a user-owned fork), UPSTREAM (owner/repo),
 # UPSTREAM_BASE (the upstream PR base and the line topics start from, default main), UPSTREAM_URL
 # (default https://github.com/$UPSTREAM). BRANCH (default xarif) may come from the env.
@@ -28,6 +31,13 @@ BRANCH=${BRANCH:-xarif}
 envfile=$(git show "origin/$BRANCH:.xarif/pr.env" 2>/dev/null || cat .xarif/pr.env 2>/dev/null || true)
 val() { sed -n "s/^$1=//p" <<<"$envfile" | tail -1; }
 FORGEJO=${FORGEJO:-$(val FORGEJO)}; USER_FORK=${USER_FORK:-$(val USER_FORK)}
+FORGEJO_PUSH=${FORGEJO_PUSH:-$(val FORGEJO_PUSH)}
+if [ -z "$FORGEJO_PUSH" ]; then
+  case $FORGEJO in
+    https://*/*) rest=${FORGEJO#https://}; FORGEJO_PUSH="git@${rest%%/*}:${rest#*/}" ;;
+    *) FORGEJO_PUSH=$FORGEJO ;;
+  esac
+fi
 UPSTREAM=${UPSTREAM:-$(val UPSTREAM)}; UPSTREAM_BASE=${UPSTREAM_BASE:-$(val UPSTREAM_BASE)}; UPSTREAM_BASE=${UPSTREAM_BASE:-main}
 UPSTREAM_URL=${UPSTREAM_URL:-$(val UPSTREAM_URL)}; UPSTREAM_URL=${UPSTREAM_URL:-https://github.com/$UPSTREAM}
 [ -n "$FORGEJO" ] || { echo "no FORGEJO: .xarif/pr.env missing on origin/$BRANCH (run 'git fetch origin' once)" >&2; exit 2; }
@@ -97,7 +107,7 @@ case "$cmd" in
         echo "could not read upstream $UPSTREAM_BASE or the lock target; the topic's base is not checked" >&2
       fi
     fi
-    git push --force-with-lease="refs/xarif/patch/$topic:$seen" "$FORGEJO" "patch/$topic:refs/xarif/patch/$topic"
+    git push --force-with-lease="refs/xarif/patch/$topic:$seen" "$FORGEJO_PUSH" "patch/$topic:refs/xarif/patch/$topic"
     fetch_topic
     echo "topic $topic stored; the next fork-sync picks it up (a new topic also needs its series line, by PR)"; exit 0 ;;
   pull|push) ;;
@@ -129,7 +139,7 @@ case "$cmd" in
     git log --stat "$ours..$theirs"
     read -r -p "store these commits as topic $topic? [y/N] " ok
     [ "$ok" = y ] || { echo "nothing stored"; exit 1; }
-    git push --force-with-lease="refs/xarif/patch/$topic:$(git rev-parse "$ours")" "$FORGEJO" "$theirs:refs/xarif/patch/$topic"
+    git push --force-with-lease="refs/xarif/patch/$topic:$(git rev-parse "$ours")" "$FORGEJO_PUSH" "$theirs:refs/xarif/patch/$topic"
     echo "topic $topic fast-forwarded to the PR head; the next fork-sync picks it up" ;;
   push)
     seen=$(git rev-parse -q --verify "$theirs" || true)
