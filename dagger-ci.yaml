@@ -155,7 +155,7 @@ fork:
         # `ld terminated with signal 9` in a 16 GiB VM at the default, green at -j 3.
         - cargo test --workspace -j 3
     - name: frontend              # jobs Lint, Format & Type Check, Tests
-      image: node:22-bookworm@sha256:e13726ca604184d7a91fcacab1fc09eefd642dc28e79ac34e85540dd93b78cfb
+      image: node:22-bookworm@sha256:ea8bd080e29e91159a41a0dc04672bebac17a3871030c3bae087cbd2922c1850
       workdir: frontend           # .github/node-version: 22; pnpm from package.json packageManager
       caches: [/root/.local/share/pnpm/store, /root/.cache/ms-playwright]
       steps:
