@@ -1,0 +1,86 @@
+# Test specification for the fork image (base/dagger-modules docs/docker-testing.md).
+#
+# The image is upstream's Dockerfile, unchanged: one Rust server, its admin tool, the
+# static web UI and ffmpeg. The tests prove what kubernetes/droppedneedle depends on and
+# what a broken build would hide until the pod crash-loops: both binaries are present AND
+# run (a linking or libc mismatch fails here, not in the cluster), the web UI was built,
+# ffmpeg is there for transcoding, our build args took effect, and the User-Agent topic is
+# in the binary.
+
+tests:
+  - name: image-metadata
+    inspect:
+      expose: [8688]
+      # debian-slim + ffmpeg is most of it. The ceiling catches a build that ships
+      # the cargo target directory or node_modules.
+      max_size: 900MiB
+      labels:
+        org.opencontainers.image.licenses: AGPL-3.0-or-later
+
+  - name: binaries-and-entrypoint-present
+    timeout: 30s
+    steps:
+      - files:
+          - path: /usr/local/bin/droppedneedle
+            mode: "755"
+          - path: /usr/local/bin/droppedneedle-tool
+            mode: "755"
+          - path: /app/entrypoint.sh
+            mode: "755"
+          - path: /app/static/index.html
+
+  - name: server-binary-runs
+    timeout: 60s
+    steps:
+      # --print-openapi dumps the API contract and exits before touching /app/config or
+      # /app/cache (upstream server/src/main.rs): the binary loads and links without a
+      # database. `grep` without -q: -q closes the pipe early and the server then panics
+      # with "failed printing to stdout: Broken pipe" (2026-10-24).
+      - run:
+          - sh -c "/usr/local/bin/droppedneedle --print-openapi | grep '\"openapi\"' >/dev/null && echo SERVER_RUNS"
+        output:
+          expect:
+            - "SERVER_RUNS"
+
+  - name: admin-tool-runs
+    timeout: 30s
+    steps:
+      # The tool restores backups and upgrades databases; it must start even when the
+      # server cannot. `help` prints its usage (upstream server/tool/src/main.rs).
+      - run:
+          - sh -c "/usr/local/bin/droppedneedle-tool help 2>&1 | grep 'Usage:' >/dev/null && echo TOOL_RUNS"
+        output:
+          expect:
+            - "TOOL_RUNS"
+
+  - name: ffmpeg-present
+    timeout: 30s
+    steps:
+      - run:
+          - sh -c "ffmpeg -hide_banner -version | grep '^ffmpeg version' >/dev/null && echo FFMPEG_OK"
+        output:
+          expect:
+            - "FFMPEG_OK"
+
+  - name: no-python-without-plugins
+    timeout: 30s
+    steps:
+      # dagger-ci.yaml build-args PLUGIN_PYTHON=0: upstream installs python3 only to run
+      # Python plugins, and we run none.
+      - run:
+          - sh -c "command -v python3 >/dev/null || echo NO_PYTHON"
+        output:
+          expect:
+            - "NO_PYTHON"
+
+  - name: user-agent-topic-is-in-the-binary
+    timeout: 60s
+    steps:
+      # Topic musicbrainz-user-agent-form: MusicBrainz drops the `DroppedNeedle/` User-Agent.
+      # The format string's literal pieces land in the binary as plain bytes: the topic's
+      # prefix must be there and the dropped form's tail must not, or a sync lost it.
+      - run:
+          - sh -c "grep -a 'DroppedNeedleApp/' /usr/local/bin/droppedneedle >/dev/null && ! grep -a '+https://github.com/DroppedNeedle/DroppedNeedle )' /usr/local/bin/droppedneedle >/dev/null && echo UA_PATCHED"
+        output:
+          expect:
+            - "UA_PATCHED"
