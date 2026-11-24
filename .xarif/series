@@ -3,7 +3,7 @@
 # pr=local: our own policy (rates, the shared MetaBrainz budget, the User-Agent id slot of musicbrainz-user-agent-form, CI package mirror build args, no 404 for misses behind our WAF: upstream declined status changes in #614), never sent upstream.
 # pr-after: meant for upstream, held back until that day — measured in production first, and upstream may solve it meanwhile.
 musicbrainz-user-agent-form base=2b0e19975a05d999f60c3518705d1cbee541b514 pr=local
-metabrainz-rates base=1714ca351002000ab1c5b97ccdcadf3541b881f7 pr=local
+metabrainz-rates base=29b4113715aabcd0203926fdbeb9b454fac2fe5e pr=local
 metabrainz-shared-budget base=b4517e4880d02d4ce29c36e208f1e7ca8b402ba1 pr=local
 no-404-for-missing-art-and-unserved-subsonic base=b4517e4880d02d4ce29c36e208f1e7ca8b402ba1 pr=local
 ci-package-mirror base=2b0e19975a05d999f60c3518705d1cbee541b514 pr=local
