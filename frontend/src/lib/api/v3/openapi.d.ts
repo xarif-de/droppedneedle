@@ -79,6 +79,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v3/acquire/nzbget/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Live NZBGet status against the saved config (admin only). */
+        get: operations["get_nzbget_status"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v3/acquire/sabnzbd/status": {
         parameters: {
             query?: never;
@@ -3885,14 +3902,16 @@ export interface paths {
         /**
          * Link an artist to a MusicBrainz artist by hand. The app's own linking
          *     never changes it. Refused when another artist in the library is that
-         *     MusicBrainz artist: an admin merges them instead.
+         *     MusicBrainz artist, or when artists of its name would then be joined:
+         *     an admin merges them instead.
          */
         put: operations["set_artist_link"];
         post?: never;
         /**
          * Clear an artist's hand-set link. The app then links the artist again
          *     where its albums and files prove one. Refused when that would make it
-         *     the same MusicBrainz artist as another in the library.
+         *     the same MusicBrainz artist as another in the library, or join artists
+         *     of its name.
          */
         delete: operations["clear_artist_link"];
         options?: never;
@@ -4146,6 +4165,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v3/library/duplicates": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Albums the library holds more than once, a page of groups at a time. */
+        get: operations["list_duplicate_albums"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v3/library/folds/{fold_id}/undo": {
         parameters: {
             query?: never;
@@ -4156,9 +4192,10 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Undo the fold of a leftover album: the album, its files and its earlier
-         *     match come back. Plays, favorites and playlist entries moved to the
-         *     album that kept the files stay there.
+         * Undo the fold of a leftover album, or the join of a copy of the album's
+         *     edition: the album, its files and its earlier match come back. Plays,
+         *     favorites and playlist entries moved to the album that kept the files
+         *     stay there.
          */
         post: operations["undo_album_fold"];
         delete?: never;
@@ -6137,6 +6174,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v3/playlists/import": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Import a playlist from an M3U or CSV file. */
+        post: operations["import_playlist_handler"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v3/playlists/{playlist_id}": {
         parameters: {
             query?: never;
@@ -6170,6 +6224,62 @@ export interface paths {
         post: operations["upload_cover_handler"];
         /** Delete a playlist cover. */
         delete: operations["remove_cover_handler"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v3/playlists/{playlist_id}/export": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Export one playlist as extended M3U or CSV.
+         * @description Entries with no local file are left out of either format; the
+         *     `X-DroppedNeedle-Skipped-Tracks` header counts them.
+         */
+        get: operations["export_playlist_handler"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v3/playlists/{playlist_id}/members": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The people a playlist is shared with. */
+        get: operations["list_members_handler"];
+        /** Share a playlist with exactly these people. */
+        put: operations["set_members_handler"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v3/playlists/{playlist_id}/members/me": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Leave a playlist shared with the caller. */
+        delete: operations["leave_playlist_handler"];
         options?: never;
         head?: never;
         patch?: never;
@@ -7925,6 +8035,44 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v3/settings/download-clients/nzbget": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Read the NZBGet connection (password masked unless unset). */
+        get: operations["get_nzbget"];
+        /** Save the NZBGet connection (a masked password keeps the stored one). */
+        put: operations["put_nzbget"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v3/settings/download-clients/nzbget/test": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Test the submitted NZBGet values (a masked password tests the stored
+         *     one). The submitted downloads mount is diagnosed, not the stored one.
+         */
+        post: operations["test_nzbget"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v3/settings/download-clients/policy": {
         parameters: {
             query?: never;
@@ -9408,6 +9556,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v3/users/directory": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The id and display name of every user who set a display name, for
+         *     picking whom to share with.
+         */
+        get: operations["user_directory"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v3/users/{id}/avatar": {
         parameters: {
             query?: never;
@@ -10176,8 +10344,8 @@ export interface components {
             /** @description The first five of those tracks' titles, in album order. */
             track_titles: string[];
             /**
-             * @description For a `leftover_joined` or `artist_from_tracks` entry that can be
-             *     undone now, the id to undo it by; null otherwise.
+             * @description For a `leftover_joined`, `copies_joined` or `artist_from_tracks`
+             *     entry that can be undone now, the id to undo it by; null otherwise.
              */
             undo_id?: string | null;
         };
@@ -10185,7 +10353,7 @@ export interface components {
          * @description What one history entry tells.
          * @enum {string}
          */
-        AlbumHistoryKindView: "tracks_continued" | "tracks_replaced" | "retag_joined" | "retag_half_left_alone" | "retag_dismissal_ended" | "leftover_joined" | "marks_followed" | "tracks_other_music" | "tracks_new_copy" | "artist_from_tracks" | "edition_changed" | "edition_chosen" | "match_withdrawn" | "edition_change_undone" | "fold_undone" | "unfolded_from" | "hand_back_given_up";
+        AlbumHistoryKindView: "tracks_continued" | "tracks_replaced" | "retag_joined" | "retag_half_left_alone" | "retag_dismissal_ended" | "leftover_joined" | "copies_joined" | "marks_followed" | "tracks_other_music" | "tracks_new_copy" | "artist_from_tracks" | "edition_changed" | "edition_chosen" | "match_withdrawn" | "edition_change_undone" | "fold_undone" | "unfolded_from" | "hand_back_given_up";
         /**
          * @description An album's history, newest first: at most ten entries, none older than
          *     180 days.
@@ -10418,6 +10586,12 @@ export interface components {
             favorite: boolean;
             /** @description Most common track format, when any track exists. */
             format?: string | null;
+            /**
+             * @description True when the match is a guess its files' tags contradict
+             *     (`NAMED_GROUP_DIFFERS`). It owns no group through that guess, so the
+             *     album opens as its own page, not as `release_group_mbid`'s.
+             */
+            guess_contradicted: boolean;
             /** @description Local album id. */
             id: string;
             /** @description `local_only` or `linked`. */
@@ -11380,7 +11554,7 @@ export interface components {
         AuthProvidersBody: {
             /** @description Jellyfin sign-in is switched on and the server is set up. */
             jellyfin: boolean;
-            /** @description Username and password; always true. */
+            /** @description Username and password; false when `ALLOW_PASSWORD_LOGIN` is off. */
             local: boolean;
             /** @description OIDC sign-in is switched on with an issuer and client id. */
             oidc: boolean;
@@ -11931,7 +12105,7 @@ export interface components {
          * @description The stable code of a [`CandidateNote`].
          * @enum {string}
          */
-        CandidateNoteCode: "complete" | "incomplete" | "lengths" | "quality" | "no_tracklist" | "names_album" | "title_unclear" | "strong" | "weak" | "turned_down_before";
+        CandidateNoteCode: "complete" | "incomplete" | "title_conflict" | "lengths" | "quality" | "no_tracklist" | "names_album" | "title_unclear" | "strong" | "weak" | "turned_down_before";
         /**
          * @description Why a candidate is outside the download settings. Declared in the order
          *     the page names them: the first that applies is shown.
@@ -13637,11 +13811,65 @@ export interface components {
             schema_version: number;
         };
         /**
+         * @description What a group's copies show. A group lists every one that applies.
+         * @enum {string}
+         */
+        DuplicateClass: "same_release" | "different_releases" | "incomplete_copy";
+        /** @description One album in a duplicate group. */
+        DuplicateCopyView: {
+            /** @description The local album id; its page opens on it. */
+            album_id: string;
+            artist: string;
+            /** @description It has cover art of its own; otherwise the group's cover stands in. */
+            cover_available: boolean;
+            /** @description Who set that match. */
+            decision_source?: null | components["schemas"]["DecisionSource"];
+            /** @description Its match is a guess its files contradict. */
+            doubted: boolean;
+            /** @description How the copy names its group: its match row or its files' tags. */
+            evidence: components["schemas"]["DuplicateEvidence"];
+            /** @description The distinct file formats of its indexed tracks, sorted. */
+            formats: string[];
+            /** @description The release its match row names, when the row names this group. */
+            release_mbid?: string | null;
+            title: string;
+            /**
+             * Format: int64
+             * @description Their bytes.
+             */
+            total_size_bytes: number;
+            /**
+             * Format: int64
+             * @description Indexed tracks the album holds.
+             */
+            track_count: number;
+        };
+        /**
+         * @description How one copy names its group.
+         * @enum {string}
+         */
+        DuplicateEvidence: "stored_match" | "file_tags";
+        /**
          * @description Duplicate evidence kinds, ordered weakest-last:
          *     exact_discogs_url < release_group < barcode < similar.
          * @enum {string}
          */
         DuplicateEvidenceKind: "exact_discogs_url" | "release_group" | "barcode" | "similar";
+        /** @description Albums the library lists more than once. */
+        DuplicateGroupView: {
+            /** @description The first copy's artist. */
+            artist: string;
+            /**
+             * @description What the copies show: a shared release, different releases, a copy
+             *     with fewer tracks. Empty when none applies.
+             */
+            classes: components["schemas"]["DuplicateClass"][];
+            copies: components["schemas"]["DuplicateCopyView"][];
+            /** @description The release group the copies share. */
+            id: string;
+            /** @description The first copy's title, to name the group by. */
+            title: string;
+        };
         /** @description Edition-acquire outcome. */
         EditionAcquireResponse: {
             /** @description Human outcome. */
@@ -14448,6 +14676,11 @@ export interface components {
          * @enum {string}
          */
         ExampleAlbum: "one_disc" | "two_discs" | "name_shared";
+        /**
+         * @description File a playlist export is written as.
+         * @enum {string}
+         */
+        ExportFormat: "m3u8" | "csv";
         /**
          * @description Extension case policy.
          * @enum {string}
@@ -15345,6 +15578,33 @@ export interface components {
              */
             waiting: number;
         };
+        /**
+         * @description File a playlist import is read from.
+         * @enum {string}
+         */
+        ImportFormat: "m3u8" | "csv";
+        /** @description Playlist import body. `content` is capped at 2 MB. */
+        ImportPlaylistBody: {
+            /** @description The file's text. */
+            content: string;
+            /** @description The file's format. */
+            format: components["schemas"]["ImportFormat"];
+            /** @description Name for the new playlist. Must not be blank. */
+            name: string;
+        };
+        /** @description Playlist import answer. */
+        ImportPlaylistResponse: {
+            /** @description Entries that became playlist tracks. */
+            matched: number;
+            /** @description Its name as stored. */
+            name: string;
+            /** @description Entries past the 10,000 an import reads, counted but not read. */
+            over_limit: number;
+            /** @description The new playlist's id. */
+            playlist_id: string;
+            /** @description Entries that did not, in file order. */
+            unmatched: components["schemas"]["ImportUnmatched"][];
+        };
         /** @description Receipt for a playlist import into the local catalog. */
         ImportResult: {
             /** @description True when this exact playlist was already imported. */
@@ -15362,6 +15622,20 @@ export interface components {
              */
             tracks_imported: number;
         };
+        /** @description One entry an import could not match. */
+        ImportUnmatched: {
+            /** @description Artist the file gave, empty when it gave none. */
+            artist: string;
+            /** @description Why the entry was left out. */
+            reason: components["schemas"]["ImportUnmatchedReason"];
+            /** @description Title the file gave, or its file name when it gave none. */
+            title: string;
+        };
+        /**
+         * @description Why an import left an entry out.
+         * @enum {string}
+         */
+        ImportUnmatchedReason: "names_nothing" | "no_match" | "duplicate";
         /** @description Import a batch of accounts from one provider. */
         ImportUsersRequest: {
             /** @description `jellyfin` or `plex`. */
@@ -17608,6 +17882,21 @@ export interface components {
          */
         MbSourceMode: "official" | "mirror" | "community" | "brainzmash";
         /**
+         * @description Share-with body: everyone the playlist is shared with, replacing the
+         *     list; empty unshares it from everyone.
+         */
+        MembersBody: {
+            /** @description Those of them who may change its songs. */
+            editor_ids?: string[];
+            /** @description User ids. */
+            user_ids: string[];
+        };
+        /** @description The people a playlist is shared with, first shared first. */
+        MembersResponse: {
+            /** @description Members. */
+            members: components["schemas"]["PlaylistMember"][];
+        };
+        /**
          * @description A previewed membership change to apply: the previewed change and its
          *     token.
          */
@@ -18149,6 +18438,43 @@ export interface components {
          * @enum {string}
          */
         NowPlayingVisibility: "full" | "track_hidden" | "offline";
+        /**
+         * @description NZBGet connection. NZBGet has no "all categories" wildcard, so an empty
+         *     category lets NZBGet apply its own default. There is no post-processing
+         *     field: NZBGet decides unpack and repair per category, not per job.
+         */
+        NzbgetConnection: {
+            /**
+             * @description Category ("" lets NZBGet choose).
+             * @default
+             */
+            category: string;
+            /**
+             * @description Where DroppedNeedle sees NZBGet's completed dir (`DestDir`).
+             * @default /nzbget-downloads
+             */
+            downloads_mount: string;
+            /**
+             * @description Master switch.
+             * @default false
+             */
+            enabled: boolean;
+            /**
+             * @description Control password (encrypted at rest).
+             * @default
+             */
+            password: string;
+            /**
+             * @description NZBGet base URL.
+             * @default
+             */
+            url: string;
+            /**
+             * @description Control username (`ControlUsername` in nzbget.conf).
+             * @default nzbget
+             */
+            username: string;
+        };
         /** @description OIDC authorize answer: the browser URL for this login. */
         OidcAuthorizeBody: {
             /** @description IdP authorize URL (PKCE + state baked in). */
@@ -18550,6 +18876,30 @@ export interface components {
                  *     link, or while the bins can't be told.
                  */
                 unchecked: number;
+            }[];
+            /** @description Pass back as `cursor` for the next page; null on the last. */
+            next_cursor: string | null;
+            /**
+             * Format: int64
+             * @description Rows in the whole list, for lists that count them.
+             */
+            total: number | null;
+        };
+        /** @description One page of a list. */
+        Page_DuplicateGroupView: {
+            items: {
+                /** @description The first copy's artist. */
+                artist: string;
+                /**
+                 * @description What the copies show: a shared release, different releases, a copy
+                 *     with fewer tracks. Empty when none applies.
+                 */
+                classes: components["schemas"]["DuplicateClass"][];
+                copies: components["schemas"]["DuplicateCopyView"][];
+                /** @description The release group the copies share. */
+                id: string;
+                /** @description The first copy's title, to name the group by. */
+                title: string;
             }[];
             /** @description Pass back as `cursor` for the next page; null on the last. */
             next_cursor: string | null;
@@ -19281,6 +19631,11 @@ export interface components {
              *     has no owner.
              */
             can_delete: boolean;
+            /**
+             * @description True when the caller may change its songs: they own it, or it is
+             *     shared with them to edit.
+             */
+            can_edit: boolean;
             /** @description Up to four track covers for the header. */
             cover_urls: string[];
             /**
@@ -19298,6 +19653,11 @@ export interface components {
             is_public: boolean;
             /** @description Always false on a full detail; true on redacted rows. */
             is_redacted: boolean;
+            /**
+             * @description True when the caller owns the playlist and shares it with chosen
+             *     people.
+             */
+            is_shared: boolean;
             /** @description Display name. */
             name: string;
             /** @description Owner display name. */
@@ -19332,6 +19692,15 @@ export interface components {
         PlaylistListResponse: {
             /** @description Playlists visible to the caller. */
             playlists: components["schemas"]["PlaylistListItem"][];
+        };
+        /** @description One person a playlist is shared with. */
+        PlaylistMember: {
+            /** @description True when they may change its songs. */
+            can_edit: boolean;
+            /** @description Display name. */
+            display_name: string;
+            /** @description User id. */
+            user_id: string;
         };
         /** @description Taste profile behind playlist suggestions. */
         PlaylistProfile: {
@@ -19375,6 +19744,11 @@ export interface components {
              *     has no owner.
              */
             can_delete: boolean;
+            /**
+             * @description True when the caller may change its songs: they own it, or it is
+             *     shared with them to edit.
+             */
+            can_edit: boolean;
             /** @description Up to four track covers for the list tile. */
             cover_urls: string[];
             /**
@@ -19392,6 +19766,11 @@ export interface components {
             is_public: boolean;
             /** @description Always false on a full summary; true on redacted rows. */
             is_redacted: boolean;
+            /**
+             * @description True when the caller owns the playlist and shares it with chosen
+             *     people.
+             */
+            is_shared: boolean;
             /** @description Display name. */
             name: string;
             /** @description Owner display name. */
@@ -19470,7 +19849,11 @@ export interface components {
             artist_name: string;
             /** @description Sources carrying this track, when known. */
             available_sources?: string[] | null;
-            /** @description Cover art URL, when known. */
+            /**
+             * @description Cover art address, when known: one of DroppedNeedle's own cover
+             *     routes, root-relative, or an https image on Spotify, Deezer, Last.fm,
+             *     TheAudioDB or YouTube. Any other stored address reads as null.
+             */
             cover_url?: string | null;
             /**
              * Format: int64
@@ -20234,6 +20617,8 @@ export interface components {
         QuarantineEntry: {
             /** @description The client label: `slskd`, `sabnzbd`, or the source for plugins. */
             client_id: string;
+            /** @description What the check found, when it was recorded. */
+            detail?: string | null;
             /** @description The blocked file (soulseek) or job (usenet). */
             filename: string;
             /** Format: int64 */
@@ -20244,7 +20629,12 @@ export interface components {
             quarantined_at: number;
             /** @description Stable reason code. */
             reason: string;
-            /** @description The reason as a plain sentence. */
+            /**
+             * @description The check that blocklisted it; null on entries from before it was
+             *     recorded.
+             */
+            reason_code?: null | components["schemas"]["Reason"];
+            /** @description The reason as a plain sentence: the check's when it is recorded. */
             reason_text: string;
             release_group_mbid?: string | null;
             /** @description `soulseek`, `usenet` or `plugin:<key>`. */
@@ -22025,50 +22415,6 @@ export interface components {
              */
             url: string;
         };
-        /** @description Live SABnzbd status against the saved config. */
-        SabnzbdStatusResponse: {
-            /** @description Category list, when the probe reached it. */
-            categories: string[];
-            /** @description Completed dir (the mount hint), when the probe reached it. */
-            complete_dir?: string | null;
-            /** @description User-safe summary. */
-            message: string;
-            /** @description True when the saved config probes clean. */
-            valid: boolean;
-            /** @description SABnzbd version, when the probe reached it. */
-            version?: string | null;
-        };
-        /**
-         * @description SABnzbd test verdict: version plus the category list (for the picker),
-         *     the SABnzbd-side completed dir (the mount hint), and the mount
-         *     diagnosis over the submitted mount.
-         */
-        SabnzbdTestResponse: {
-            /** @description Known categories. */
-            categories: string[];
-            /** @description SABnzbd-side completed dir, when known. */
-            complete_dir?: string | null;
-            /** @description Human summary. */
-            message: string;
-            /** @description Whether the submitted mount holds files, when diagnosed. */
-            mount_has_files?: boolean | null;
-            /** @description Actionable mount guidance, when the mount looks wrong. */
-            mount_message?: string | null;
-            /**
-             * Format: int64
-             * @description Sampled downloads resolving under the submitted mount.
-             */
-            resolvable_downloads?: number | null;
-            /**
-             * Format: int64
-             * @description Sampled downloads.
-             */
-            sampled_downloads?: number | null;
-            /** @description Whether the submitted values checked out. */
-            valid: boolean;
-            /** @description Server version, when known. */
-            version?: string | null;
-        };
         /** @description A pause, resume or stop request. */
         ScanControlBody: {
             /**
@@ -22632,6 +22978,26 @@ export interface components {
          */
         SearchRemoteStatus: "ok" | "partial" | "timeout" | "error" | "stale";
         /**
+         * @description What requesting a MusicBrainz song and showing its cover need: the
+         *     release it is shown under (the one its request tries first), its group
+         *     and the credited artist.
+         */
+        SearchRemoteTrackDetail: {
+            /** @description The release's title. */
+            album_title?: string | null;
+            /** @description First credited artist. */
+            artist_mbid?: string | null;
+            /**
+             * Format: int64
+             * @description Recording length, whole seconds.
+             */
+            duration_seconds?: number | null;
+            /** @description The release's group; covers come from it. */
+            release_group_mbid: string;
+            /** @description The release. */
+            release_mbid: string;
+        };
+        /**
          * @description Unified search response: one ranked list per bucket plus the standout
          *     hit per bucket, when one earns it.
          */
@@ -22650,7 +23016,10 @@ export interface components {
             top_artist?: null | components["schemas"]["SearchResultItem"];
             /** @description Standout track hit, if one scored high enough to headline. */
             top_track?: null | components["schemas"]["SearchResultItem"];
-            /** @description Provider health for the track bucket. */
+            /**
+             * @description Provider health for the track bucket; `partial` while MusicBrainz's
+             *     songs are still on their way.
+             */
             track_status: components["schemas"]["SearchRemoteStatus"];
             /** @description Matching tracks, best first. */
             tracks: components["schemas"]["SearchResultItem"][];
@@ -22675,7 +23044,7 @@ export interface components {
              *     Absent for MusicBrainz hits the library lacks.
              */
             id?: string | null;
-            /** @description True when the library holds this artist or album. */
+            /** @description True when the library holds this artist, album or song. */
             in_library: boolean;
             /** @description Result bucket. */
             kind: components["schemas"]["SearchKind"];
@@ -22684,7 +23053,12 @@ export interface components {
              *     for library rows. Absent means unidentified, never failure.
              */
             musicbrainz_id?: string | null;
-            /** @description True when an acquisition request is open for this album. */
+            /**
+             * @description What requesting a song needs; present exactly when `kind` is
+             *     `track` and the library lacks the song.
+             */
+            remote_track?: null | components["schemas"]["SearchRemoteTrackDetail"];
+            /** @description True when an acquisition request is open for this album or song. */
             requested: boolean;
             /**
              * Format: int32
@@ -22700,7 +23074,7 @@ export interface components {
             title: string;
             /**
              * @description Library details of a song hit; present exactly when `kind` is
-             *     `track`.
+             *     `track` and the library holds the song.
              */
             track?: null | components["schemas"]["SearchTrackDetail"];
             /** @description Artist type, or an `Album + Live` style type label. */
@@ -23756,7 +24130,12 @@ export interface components {
             artist_name: string;
             /** @description Sources carrying this track, when known. */
             available_sources?: string[] | null;
-            /** @description Cover art URL, when known. */
+            /**
+             * @description Cover art address, when known. Kept only when it is one of
+             *     DroppedNeedle's own cover routes (a base path before `/api/v3/` is
+             *     cut off) or an https image on Spotify, Deezer, Last.fm, TheAudioDB or
+             *     YouTube; any other address is dropped and the track is still added.
+             */
             cover_url?: string | null;
             /**
              * Format: int32
@@ -24312,6 +24691,37 @@ export interface components {
          */
         UsenetBackend: "indexers" | "prowlarr";
         /**
+         * @description Usenet client test verdict (SABnzbd or NZBGet): version plus the
+         *     category list (for the picker), the client-side completed dir (the mount hint), and the mount
+         *     diagnosis over the submitted mount.
+         */
+        UsenetClientTestResponse: {
+            /** @description Known categories. */
+            categories: string[];
+            /** @description Client-side completed dir, when known. */
+            complete_dir?: string | null;
+            /** @description Human summary. */
+            message: string;
+            /** @description Whether the submitted mount holds files, when diagnosed. */
+            mount_has_files?: boolean | null;
+            /** @description Actionable mount guidance, when the mount looks wrong. */
+            mount_message?: string | null;
+            /**
+             * Format: int64
+             * @description Sampled downloads resolving under the submitted mount.
+             */
+            resolvable_downloads?: number | null;
+            /**
+             * Format: int64
+             * @description Sampled downloads.
+             */
+            sampled_downloads?: number | null;
+            /** @description Whether the submitted values checked out. */
+            valid: boolean;
+            /** @description Server version, when known. */
+            version?: string | null;
+        };
+        /**
          * @description The active Usenet search backend (either/or): `"indexers"` for the
          *     native Newznab priority list, `"prowlarr"` for the single Prowlarr
          *     connection. Unknown values are a 400, never a silent reset.
@@ -24322,6 +24732,34 @@ export interface components {
              * @default indexers
              */
             backend: components["schemas"]["UsenetBackend"];
+        };
+        /** @description Live Usenet client (SABnzbd or NZBGet) status against the saved config. */
+        UsenetStatusResponse: {
+            /** @description Category list, when the probe reached it. */
+            categories: string[];
+            /** @description Completed dir (the mount hint), when the probe reached it. */
+            complete_dir?: string | null;
+            /** @description User-safe summary. */
+            message: string;
+            /** @description True when the saved config probes clean. */
+            valid: boolean;
+            /** @description Client version, when the probe reached it. */
+            version?: string | null;
+        };
+        /**
+         * @description One user as everyone signed in may see them: enough to pick them
+         *     when sharing.
+         */
+        UserDirectoryEntry: {
+            /** @description Display name. */
+            display_name: string;
+            /** @description User id. */
+            id: string;
+        };
+        /** @description Every user who set a display name, by that name. */
+        UserDirectoryResponse: {
+            /** @description Users. */
+            users: components["schemas"]["UserDirectoryEntry"][];
         };
         /** @description Release-type filters for discovery and search. */
         UserPreferences: {
@@ -25242,6 +25680,26 @@ export interface operations {
             };
         };
     };
+    get_nzbget_status: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description NZBGet status */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UsenetStatusResponse"];
+                };
+            };
+        };
+    };
     get_sabnzbd_status: {
         parameters: {
             query?: never;
@@ -25257,7 +25715,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["SabnzbdStatusResponse"];
+                    "application/json": components["schemas"]["UsenetStatusResponse"];
                 };
             };
         };
@@ -25949,6 +26407,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["RecoveryCodeResponse"];
+                };
+            };
+            /** @description Password sign-in is turned off */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
         };
@@ -27473,6 +27940,15 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
+            /** @description Password sign-in is turned off */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
             /** @description Too many attempts for this client or username */
             429: {
                 headers: {
@@ -27656,6 +28132,15 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            /** @description Password sign-in is turned off */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
             };
         };
     };
@@ -32413,7 +32898,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
-            /** @description Curator role required */
+            /** @description Curator role required, or admin role to undo "Leave this album unmanaged" (FORBIDDEN) */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -34584,7 +35069,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
-            /** @description The artist changed since it was read (STALE_REVISION), cannot be linked (ARTIST_NOT_LINKABLE), or other artists are that MusicBrainz artist (ARTIST_LINK_SHARED, listed in details.artists) */
+            /** @description The artist changed since it was read (STALE_REVISION), cannot be linked (ARTIST_NOT_LINKABLE), other artists are that MusicBrainz artist (ARTIST_LINK_SHARED), or artists of its name would then be joined (ARTIST_LINK_JOINS_NAMESAKES); either lists them in details.artists */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -34655,7 +35140,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
-            /** @description The artist changed since it was read (STALE_REVISION), has no hand-set link (ARTIST_LINK_NOT_CHOSEN), or would be the same MusicBrainz artist as others (ARTIST_LINK_SHARED, listed in details.artists) */
+            /** @description The artist changed since it was read (STALE_REVISION), has no hand-set link (ARTIST_LINK_NOT_CHOSEN), would be the same MusicBrainz artist as others (ARTIST_LINK_SHARED), or artists of its name would then be joined (ARTIST_LINK_JOINS_NAMESAKES); either lists them in details.artists */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -35542,6 +36027,58 @@ export interface operations {
             };
         };
     };
+    list_duplicate_albums: {
+        parameters: {
+            query?: {
+                /** @description The previous page's `next_cursor`. */
+                cursor?: string;
+                /** @description Groups per page, 1 to 100 (50 by default); more is read as 100. */
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description One page of duplicate groups */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Page_DuplicateGroupView"];
+                };
+            };
+            /** @description Bad cursor */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Curator role required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
     undo_album_fold: {
         parameters: {
             query?: never;
@@ -35579,7 +36116,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
-            /** @description No fold that can be undone */
+            /** @description No fold or join that can be undone */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -35588,7 +36125,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
-            /** @description The albums changed since the fold */
+            /** @description The albums changed since the fold or join */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -41076,6 +41613,15 @@ export interface operations {
                     "application/json": components["schemas"]["UserResponse"];
                 };
             };
+            /** @description Password sign-in is turned off */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
         };
     };
     post_password: {
@@ -41111,6 +41657,15 @@ export interface operations {
             };
             /** @description Missing or invalid session */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Password sign-in is turned off */
+            403: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -41680,6 +42235,48 @@ export interface operations {
             };
         };
     };
+    import_playlist_handler: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ImportPlaylistBody"];
+            };
+        };
+        responses: {
+            /** @description The new playlist and the match report */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ImportPlaylistResponse"];
+                };
+            };
+            /** @description Bad body, blank name, or a file over 2 MB */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
     get_playlist_handler: {
         parameters: {
             query?: never;
@@ -41985,6 +42582,218 @@ export interface operations {
                 };
             };
             /** @description Unknown playlist id */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    export_playlist_handler: {
+        parameters: {
+            query?: {
+                /** @description `m3u8` (default) or `csv`. */
+                format?: components["schemas"]["ExportFormat"];
+                /**
+                 * @description Added before each entry's path, for a player that stores music under
+                 *     a folder of its own. At most 200 characters; no control characters.
+                 */
+                prefix?: string;
+            };
+            header?: never;
+            path: {
+                /** @description Playlist id */
+                playlist_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The playlist as extended M3U (`audio/x-mpegurl`) or CSV (`text/csv; charset=utf-8`), named in Content-Disposition */
+            200: {
+                headers: {
+                    /** @description Entries left out because they have no local file */
+                    "x-droppedneedle-skipped-tracks"?: number;
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Unknown format */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Unknown playlist id, or one the caller may not read */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    list_members_handler: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Playlist id */
+                playlist_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Members */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MembersResponse"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Owner only */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Unknown playlist id */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    set_members_handler: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Playlist id */
+                playlist_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MembersBody"];
+            };
+        };
+        responses: {
+            /** @description Members now */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MembersResponse"];
+                };
+            };
+            /** @description Bad request body, or an id that names no other user */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Owner only */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Unknown playlist id */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    leave_playlist_handler: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Playlist id */
+                playlist_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Left */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StatusResponse"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Not shared with the caller */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -45476,6 +46285,74 @@ export interface operations {
             };
         };
     };
+    get_nzbget: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description NZBGet connection */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NzbgetConnection"];
+                };
+            };
+        };
+    };
+    put_nzbget: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NzbgetConnection"];
+            };
+        };
+        responses: {
+            /** @description Saved connection */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NzbgetConnection"];
+                };
+            };
+        };
+    };
+    test_nzbget: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NzbgetConnection"];
+            };
+        };
+        responses: {
+            /** @description Verify verdict */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UsenetClientTestResponse"];
+                };
+            };
+        };
+    };
     get_policy: {
         parameters: {
             query?: never;
@@ -45583,7 +46460,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["SabnzbdTestResponse"];
+                    "application/json": components["schemas"]["UsenetClientTestResponse"];
                 };
             };
         };
@@ -48564,6 +49441,26 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    user_directory: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Users by display name */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UserDirectoryResponse"];
                 };
             };
         };

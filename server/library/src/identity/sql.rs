@@ -132,6 +132,21 @@ macro_rules! named_group_guess {
     };
 }
 
+/// The album, a column holding its id, carries the flag a person's
+/// decline left: they took its match off (`DETACHED_BY_PERSON`), or an
+/// admin undid its automatic edition and nothing was put back
+/// (`AUTOMATIC_EDITION_UNDONE`).
+#[macro_export]
+macro_rules! declined_flag {
+    ($album_id:literal) => {
+        concat!(
+            "EXISTS (SELECT 1 FROM library_album_match_state dcf WHERE dcf.local_album_id = ",
+            $album_id,
+            " AND dcf.reason_code IN ('DETACHED_BY_PERSON', 'AUTOMATIC_EDITION_UNDONE'))"
+        )
+    };
+}
+
 /// An album's match is accepted, over an album identity alias: it names a
 /// release, the album carries no match flag, and no custom edition is
 /// active on it. Any decision source counts. Proof, merges and retag joins
@@ -350,6 +365,47 @@ droppedneedle_kernel::sql! {
     /// `availability` looks as good, and would walk every indexed track.
     pub(super) fragment ALBUM_TRACKS = "local_tracks t \
              INDEXED BY idx_local_tracks_album_availability";
+    /// A match v2 carried over from its older catalog that names a
+    /// well-formed release group but no edition, which identification may
+    /// give an edition of that group, once. Over album `a` and its match
+    /// row `i` (the caller binds the provider): the album is live, has no
+    /// custom edition, no match flag of any kind (a detach, an undone
+    /// edition), no review waiting or settled, and no edition found this
+    /// way before, on it or an album merged or retired into it, so a
+    /// person's Undo stays undone.
+    pub(crate) fragment CARRIED_EDITION_OPEN = "i.decision_source = 'legacy_import' \
+             AND trim(COALESCE(i.release_mbid, '')) = '' \
+             AND lower(i.release_group_mbid) GLOB '" + (mbid_shape!()) + "' \
+             AND a.retired_into_album_id IS NULL \
+             AND NOT EXISTS (SELECT 1 FROM library_custom_edition_active cea \
+                 WHERE cea.local_album_id = a.id) \
+             AND NOT " + (match_flagged!("a.id")) + " \
+             AND NOT EXISTS (SELECT 1 FROM library_identify_reviews cer \
+                 WHERE cer.local_album_id = a.id \
+                 AND cer.state IN ('pending','rejected','dismissed','excluded')) \
+             AND NOT EXISTS (SELECT 1 FROM library_catalog_actions cef \
+                 WHERE (cef.local_album_id = a.id \
+                     OR cef.local_album_id IN (SELECT alias FROM local_album_aliases \
+                         WHERE local_album_id = a.id AND kind = 'merged_album') \
+                     OR cef.local_album_id IN (SELECT id FROM local_albums \
+                         WHERE retired_into_album_id = a.id)) \
+                 AND cef.action_kind = 'automatic_exact_edition' \
+                 AND cef.reason_code = 'CARRIED_EDITION_FOUND')";
+
+    /// Whether the album (`?1`, provider `?2`) still holds a carried match
+    /// of group `?3` with no edition that may be given one.
+    pub(super) CARRIED_EDITION_STILL_OPEN = "SELECT EXISTS (SELECT 1 FROM local_albums a \
+             JOIN local_album_external_identities i \
+                 ON i.local_album_id = a.id AND i.provider = ?2 \
+             WHERE a.id = ?1 AND lower(i.release_group_mbid) = lower(?3) AND "
+             + CARRIED_EDITION_OPEN + ")";
+    /// Give the album's (`?1`, provider `?2`) carried match of group `?4`
+    /// release `?3`, keeping its source, its group and who chose it.
+    pub(super) FILL_CARRIED_RELEASE = "UPDATE local_album_external_identities \
+             SET release_mbid = ?3, row_revision = row_revision + 1 \
+             WHERE local_album_id = ?1 AND provider = ?2 AND decision_source = 'legacy_import' \
+             AND trim(COALESCE(release_mbid, '')) = '' \
+             AND lower(release_group_mbid) = lower(?4)";
 
     /// Who decided the album's match (`?1`, provider `?2`).
     pub(super) ALBUM_SOURCE = "SELECT decision_source FROM local_album_external_identities \
@@ -368,13 +424,22 @@ droppedneedle_kernel::sql! {
     pub(super) FORGET_CHOICE_UNDO =
         "DELETE FROM library_edition_choice_undo WHERE local_album_id = ?1";
 
+    /// The revision a new or moved album match row starts at: one past the
+    /// catalog revision, which is raised to a match's revision before the
+    /// match leaves its album
+    /// ([`raise_catalog`](crate::catalog_revision::raise_catalog)). An
+    /// album's match never takes a revision it had before, so a page that
+    /// read an earlier match cannot pass for the new one.
+    pub(super) fragment NEXT_REVISION = "(SELECT COALESCE(MAX(value), 0) + 1 \
+             FROM library_catalog_revision)";
+
     /// Seal an automatic album match (`?1`, provider `?2`, group `?3`,
     /// release `?4`, at `?5`), never over a person's. An automatic row that
     /// already names that group and release is left as it is: its matcher
     /// stamp and attempt are bookkeeping, not a change of match.
     pub(super) SEAL_ALBUM = "INSERT INTO local_album_external_identities (local_album_id, \
              provider, release_group_mbid, release_mbid, decision_source, selected_at, \
-             row_revision) VALUES (?1, ?2, ?3, ?4, 'automatic', ?5, 1) \
+             row_revision) VALUES (?1, ?2, ?3, ?4, 'automatic', ?5, " + NEXT_REVISION + ") \
              ON CONFLICT (local_album_id, provider) DO UPDATE SET \
              release_group_mbid = excluded.release_group_mbid, \
              release_mbid = excluded.release_mbid, decision_source = 'automatic', \
@@ -413,12 +478,12 @@ droppedneedle_kernel::sql! {
     /// automatic or embedded row over a person's.
     pub(super) SAVE_ALBUM_IDENTITY = "INSERT INTO local_album_external_identities \
              (local_album_id, provider, release_group_mbid, release_mbid, decision_source, \
-             selected_at, row_revision) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+             selected_at, row_revision) VALUES (?1, ?2, ?3, ?4, ?5, ?6, " + NEXT_REVISION + ") \
              ON CONFLICT (local_album_id, provider) DO UPDATE SET \
              release_group_mbid = excluded.release_group_mbid, \
              release_mbid = excluded.release_mbid, \
-             decision_source = excluded.decision_source, \
-             selected_at = excluded.selected_at, row_revision = excluded.row_revision \
+             decision_source = excluded.decision_source, selected_at = excluded.selected_at, \
+             row_revision = local_album_external_identities.row_revision + 1 \
              WHERE excluded.decision_source NOT IN " + REVISABLE + " \
              OR local_album_external_identities.decision_source IN " + REVISABLE;
     /// Save a track's match, guarded like the album's.
@@ -440,7 +505,7 @@ droppedneedle_kernel::sql! {
     /// group and release is left as it is.
     pub(super) ACCEPT_ALBUM = "INSERT INTO local_album_external_identities (local_album_id, \
              provider, release_group_mbid, release_mbid, decision_source, selected_at, \
-             row_revision) VALUES (?1, ?2, ?3, ?4, 'automatic', ?5, 1) \
+             row_revision) VALUES (?1, ?2, ?3, ?4, 'automatic', ?5, " + NEXT_REVISION + ") \
              ON CONFLICT (local_album_id, provider) DO UPDATE SET \
              release_group_mbid = excluded.release_group_mbid, \
              release_mbid = excluded.release_mbid, decision_source = 'automatic', \
@@ -579,6 +644,16 @@ droppedneedle_kernel::sql! {
              WHERE b.id = (" + (copy_of_group!("= ?1")) + ")";
     /// Whether any album owns release group `?1` (lowered).
     pub(super) GROUP_OWNED = "SELECT EXISTS (" + (owns_group!("= ?1")) + ")";
+    /// The live album a local-only album would repeat: one titled `?1` by
+    /// `?2` (both folded), one that owns release group `?3` (lowered), or
+    /// one the scan keyed on its release, `?4` (`mbid:` and the lowered
+    /// id). A NULL `?3` or `?4` matches nothing.
+    pub(super) LOCAL_TWIN = "SELECT b.title, COALESCE(b.album_artist_name, '') AS album_artist_name \
+             FROM local_albums b WHERE " + (owned_album!("b")) + " \
+             AND ((b.title_folded = ?1 AND b.album_artist_name_folded = ?2) \
+             OR b.grouping_key = ?4 \
+             OR b.id IN (SELECT album_id FROM (" + (owns_group!("= ?3")) + "))) \
+             ORDER BY b.created_at, b.id LIMIT 1";
     /// Whether the album (`?1`) carries a flag a landing must keep: a
     /// person's detach, an undone automatic edition, or a guess the files
     /// contradict.
@@ -790,7 +865,7 @@ droppedneedle_kernel::sql! {
              matcher_version, attempt_id, selected_by_user_id, selected_at, row_revision) \
              VALUES (?1, ?9, ?2, ?3, ?4, ?5, \
              (SELECT id FROM library_identification_attempts WHERE id = ?6), \
-             (SELECT id FROM auth_users WHERE id = ?7), ?8, 1) \
+             (SELECT id FROM auth_users WHERE id = ?7), ?8, " + NEXT_REVISION + ") \
              ON CONFLICT (local_album_id, provider) DO UPDATE SET \
              release_group_mbid = excluded.release_group_mbid, \
              release_mbid = excluded.release_mbid, \
@@ -828,7 +903,7 @@ droppedneedle_kernel::sql! {
     pub(super) SEAL_PERSONS_ALBUM = "INSERT INTO local_album_external_identities \
              (local_album_id, provider, release_group_mbid, release_mbid, decision_source, \
              selected_by_user_id, selected_at, row_revision) VALUES (?1, ?2, ?3, ?4, 'manual', \
-             (SELECT id FROM auth_users WHERE id = ?5), ?6, 1) \
+             (SELECT id FROM auth_users WHERE id = ?5), ?6, " + NEXT_REVISION + ") \
              ON CONFLICT (local_album_id, provider) DO UPDATE SET \
              release_group_mbid = excluded.release_group_mbid, \
              release_mbid = excluded.release_mbid, decision_source = 'manual', \
@@ -918,11 +993,14 @@ droppedneedle_kernel::sql! {
              ON CONFLICT (local_album_id) DO UPDATE SET state = 'unmatched', \
              reason_code = excluded.reason_code, release_mbid = NULL, candidates_json = '[]', \
              updated_at = excluded.updated_at";
-    /// Mark the album (`?1`) unmatched with reason `?2`, at `?3`, unless it
-    /// carries a flag already.
-    pub(super) MARK_UNMATCHED_UNLESS_FLAGGED = "INSERT INTO library_album_match_state \
+    /// Mark the album (`?1`) unmatched with reason `?2`, at `?3`, keeping
+    /// the candidates of a flag it carries already.
+    pub(super) MARK_UNMATCHED_KEEPING_CANDIDATES = "INSERT INTO library_album_match_state \
              (local_album_id, state, reason_code, release_mbid, candidates_json, updated_at) \
-             VALUES (?1, 'unmatched', ?2, NULL, '[]', ?3) ON CONFLICT (local_album_id) DO NOTHING";
+             VALUES (?1, 'unmatched', ?2, NULL, '[]', ?3) \
+             ON CONFLICT (local_album_id) DO UPDATE SET state = 'unmatched', \
+             reason_code = excluded.reason_code, release_mbid = NULL, \
+             updated_at = excluded.updated_at";
     /// Clear the album's (`?1`) match flag when its reason is `?2`.
     pub(super) CLEAR_FLAG_WITH_REASON = "DELETE FROM library_album_match_state \
              WHERE local_album_id = ?1 AND reason_code = ?2";
@@ -1026,8 +1104,9 @@ droppedneedle_kernel::sql! {
     pub(super) RETRY_REMAP = "UPDATE library_edition_remap_queue SET attempts = attempts + 1, \
              not_before_at = ?2, last_code = ?3 WHERE local_album_id = ?1";
     /// Hand the remap's own sealed row (`?1`, release `?4`, provider `?3`)
-    /// back to automatic choice at `?2`. Only a row this app sealed as a
-    /// person's (`manual`) goes back; a v2 choice is never handed back.
+    /// back to automatic choice at `?2`. Only a `manual` row on that release
+    /// goes back. Only a release-group pin's remap gives up; v2 pins land
+    /// as `manual` too, but are queued "place only", which never does.
     pub(super) GIVE_UP_ALBUM = "UPDATE local_album_external_identities \
              SET decision_source = 'automatic', selected_by_user_id = NULL, selected_at = ?2, \
              row_revision = row_revision + 1 WHERE local_album_id = ?1 AND provider = ?3 \
@@ -1069,7 +1148,7 @@ droppedneedle_kernel::sql! {
     pub(super) HAS_UNPLACED_FILE = "SELECT EXISTS(SELECT 1 FROM " + ALBUM_TRACKS + " \
              WHERE t.local_album_id = ?1 AND t.availability = 'indexed' AND NOT EXISTS \
              (SELECT 1 FROM local_track_external_identities i WHERE i.local_track_id = t.id \
-             AND i.provider = ?2 AND lower(i.release_mbid) = ?3 \
+             AND i.provider = ?2 AND lower(trim(i.release_mbid)) = lower(trim(?3)) \
              AND i.release_track_mbid IS NOT NULL))";
     pub(super) QUEUE_PLACEMENT = "INSERT INTO library_edition_remap_queue (local_album_id, \
              release_mbid, chosen_by_user_id, queued_at, origin) VALUES (?1, ?2, NULL, ?3, ?4) \
@@ -1108,15 +1187,16 @@ droppedneedle_kernel::sql! {
              WHERE local_album_id = ?1 AND state = 'pending'";
     pub(super) REMAP_TO_CARRY = "SELECT release_mbid, chosen_by_user_id, origin \
              FROM library_edition_remap_queue WHERE local_album_id = ?1";
-    /// A match revision neither album (`?1`, `?2`) has had.
-    pub(super) NEXT_SHARED_REVISION = "SELECT MAX(row_revision) + 1 \
+    /// The highest match revision either album (`?1`, `?2`) holds.
+    pub(super) SHARED_REVISION = "SELECT COALESCE(MAX(row_revision), 0) \
              FROM local_album_external_identities WHERE local_album_id IN (?1, ?2)";
     /// Delete the album's (`?1`) match rows of every provider.
     pub(super) DELETE_ALBUM_ROWS = "DELETE FROM local_album_external_identities \
              WHERE local_album_id = ?1";
-    /// Put the match of `?1` on `?2` at revision `?3`.
+    /// Put the match of `?1` on `?2` at the next revision.
     pub(super) CARRY_ALBUM_ROW = "UPDATE local_album_external_identities \
-             SET local_album_id = ?2, row_revision = ?3 WHERE local_album_id = ?1";
+             SET local_album_id = ?2, row_revision = " + NEXT_REVISION + " \
+             WHERE local_album_id = ?1";
     pub(super) MOVE_MATCH_STATE = "UPDATE library_album_match_state SET local_album_id = ?2 \
              WHERE local_album_id = ?1";
     pub(super) SET_REMAP_ORIGIN = "UPDATE library_edition_remap_queue SET origin = ?2 \
@@ -1126,10 +1206,10 @@ droppedneedle_kernel::sql! {
     // Corrections, repairs and imports.
     // -----------------------------------------------------------------
 
-    /// Move the edition of `?1` (provider `?3`) onto `?2`, at its next
+    /// Move the edition of `?1` (provider `?3`) onto `?2`, at the next
     /// revision.
     pub(super) MOVE_EDITION_ROW = "UPDATE local_album_external_identities \
-             SET local_album_id = ?2, row_revision = row_revision + 1 \
+             SET local_album_id = ?2, row_revision = " + NEXT_REVISION + " \
              WHERE local_album_id = ?1 AND provider = ?3";
     /// Drop the match state of `?2` when `?1` has one to move onto it.
     pub(super) MAKE_ROOM_FOR_MATCH_STATE = "DELETE FROM library_album_match_state \
@@ -1155,8 +1235,8 @@ droppedneedle_kernel::sql! {
     /// release `?4`, matcher `?5`, attempt `?6`, by `?7`, at `?8`).
     pub(super) LINK_ALBUM = "INSERT INTO local_album_external_identities (local_album_id, \
              provider, release_group_mbid, release_mbid, decision_source, matcher_version, \
-             attempt_id, selected_by_user_id, selected_at) \
-             VALUES (?1, ?2, ?3, ?4, 'manual', ?5, ?6, ?7, ?8)";
+             attempt_id, selected_by_user_id, selected_at, row_revision) \
+             VALUES (?1, ?2, ?3, ?4, 'manual', ?5, ?6, ?7, ?8, " + NEXT_REVISION + ")";
     /// A person's link of file `?1` of album `?10` on its release track
     /// (provider `?2`, recording `?3`, release `?4`, release track `?5`,
     /// disc `?6`, position `?7`, attempt `?8`, at `?9`).
@@ -1214,12 +1294,108 @@ droppedneedle_kernel::sql! {
     pub(super) PERSONS_TRACK = "SELECT EXISTS(SELECT 1 FROM local_track_external_identities \
              WHERE local_track_id = ?1 AND provider = ?2 AND decision_source IN " + PERSONS
              + ") OR EXISTS(SELECT 1 FROM library_track_hand_matches WHERE local_track_id = ?1)";
-    /// Whether a fold of album `?1` was undone (audit kind `?2`).
+    /// Whether a fold of album `?1`, or of an album merged into it since,
+    /// was undone (audit kind `?2`).
     pub(super) FOLD_UNDONE = "SELECT EXISTS(SELECT 1 FROM library_catalog_actions \
-             WHERE local_album_id = ?1 AND action_kind = ?2)";
+             WHERE action_kind = ?2 AND (local_album_id = ?1 \
+             OR local_album_id IN (SELECT alias FROM local_album_aliases \
+             WHERE local_album_id = ?1 AND kind = 'merged_album') \
+             OR local_album_id IN (SELECT id FROM local_albums \
+             WHERE retired_into_album_id = ?1)))";
     /// Forget that album `?1` was merged into `?2`.
     pub(super) DROP_MERGED_ALIAS = "DELETE FROM local_album_aliases \
              WHERE alias = ?1 AND local_album_id = ?2 AND kind = 'merged_album'";
+
+    // -----------------------------------------------------------------
+    // Copies of one edition: files that land join the copy, and copies
+    // split across folders join at a scan's end.
+    // -----------------------------------------------------------------
+
+    /// The live copies on release `?1` (lowered, provider `?2`) new files
+    /// may join: accepted, or a person's choice with no custom edition. A
+    /// person's choice first, then the oldest.
+    pub(super) COPIES_ON_RELEASE = "SELECT b.id AS local_album_id, e.release_mbid \
+             FROM local_album_external_identities e \
+             JOIN local_albums b ON b.id = e.local_album_id \
+             WHERE e.provider = ?2 AND lower(trim(e.release_mbid)) = ?1 AND "
+             + (owned_album!("b")) + " \
+             AND NOT EXISTS (SELECT 1 FROM library_custom_edition_active c \
+             WHERE c.local_album_id = b.id) \
+             AND (e.decision_source IN " + PERSONS + " OR NOT " + (match_flagged!("b.id")) + ") \
+             ORDER BY e.decision_source NOT IN " + PERSONS + ", b.created_at, b.id";
+    /// The release track and recording of each indexed file of the album
+    /// (`?1`, provider `?2`), lowered.
+    pub(super) COPY_HOLDS = "SELECT lower(trim(i.release_track_mbid)) AS release_track, \
+             lower(trim(" + (recording_mbid!("i", "t")) + ")) AS recording \
+             FROM " + ALBUM_TRACKS + " \
+             LEFT JOIN local_track_external_identities i \
+             ON i.local_track_id = t.id AND i.provider = ?2 \
+             WHERE t.local_album_id = ?1 AND t.availability = 'indexed'";
+    /// Releases (lowered) at least two live copies with an accepted match
+    /// name (provider `?1`).
+    pub(super) SPLIT_RELEASES = "SELECT lower(trim(e.release_mbid)) \
+             FROM local_album_external_identities e \
+             JOIN local_albums b ON b.id = e.local_album_id \
+             WHERE e.provider = ?1 AND " + (owned_album!("b")) + " AND " + (accepted!("e")) + " \
+             GROUP BY lower(trim(e.release_mbid)) HAVING COUNT(*) > 1";
+    /// The live copies with an accepted match on release `?1` (lowered,
+    /// provider `?2`), in the order `copy_of_group!` reads them.
+    pub(super) SPLIT_COPIES = "SELECT b.id FROM local_album_external_identities e \
+             JOIN local_albums b ON b.id = e.local_album_id \
+             WHERE e.provider = ?2 AND lower(trim(e.release_mbid)) = ?1 AND "
+             + (owned_album!("b")) + " AND " + (accepted!("e")) + " \
+             ORDER BY e.decision_source NOT IN " + PERSONS + ", b.created_at, b.id";
+    /// Whether an indexed file of album `?1` and one of album `?2` share a
+    /// release track or a recording (provider `?3`).
+    pub(super) COPIES_SHARE = "SELECT EXISTS(SELECT 1 FROM local_tracks a \
+             JOIN local_tracks b ON b.local_album_id = ?2 AND b.availability = 'indexed' \
+             LEFT JOIN local_track_external_identities ia \
+             ON ia.local_track_id = a.id AND ia.provider = ?3 \
+             LEFT JOIN local_track_external_identities ib \
+             ON ib.local_track_id = b.id AND ib.provider = ?3 \
+             WHERE a.local_album_id = ?1 AND a.availability = 'indexed' \
+             AND (NULLIF(lower(trim(ia.release_track_mbid)), '') \
+             = NULLIF(lower(trim(ib.release_track_mbid)), '') \
+             OR NULLIF(lower(trim(" + (recording_mbid!("ia", "a")) + ")), '') \
+             = NULLIF(lower(trim(" + (recording_mbid!("ib", "b")) + ")), '')))";
+    /// Every file of album `?1`, whatever its availability.
+    pub(super) ALBUM_FILES = "SELECT id, membership_source, membership_locked FROM local_tracks \
+             WHERE local_album_id = ?1 ORDER BY id";
+    /// Put file `?2` back on album `?1` with its grouping (`?3`, locked
+    /// `?4`).
+    pub(super) RESTORE_MEMBERSHIP = "UPDATE local_tracks SET local_album_id = ?1, \
+             membership_source = ?3, membership_locked = ?4, row_revision = row_revision + 1 \
+             WHERE id = ?2";
+    /// The aliases that open album `?1`.
+    pub(super) ALBUM_ALIASES = "SELECT alias FROM local_album_aliases \
+             WHERE local_album_id = ?1 ORDER BY alias";
+    /// The albums retired into album `?1`.
+    pub(super) RETIRED_INTO_ALBUM = "SELECT id FROM local_albums \
+             WHERE retired_into_album_id = ?1 ORDER BY id";
+    /// Point alias `?2` back at album `?1` while it opens album `?3`.
+    pub(super) RESTORE_ALIAS = "UPDATE local_album_aliases SET local_album_id = ?1 \
+             WHERE alias = ?2 AND local_album_id = ?3";
+    /// Retire album `?2` into album `?1` again while it is retired into
+    /// album `?3`.
+    pub(super) RESTORE_RETIREE = "UPDATE local_albums SET retired_into_album_id = ?1 \
+             WHERE id = ?2 AND retired_into_album_id = ?3";
+    /// Album `?1`'s place in the automatic management queue: whether it is
+    /// stamped as retagged by hand.
+    pub(super) QUEUE_ROW = "SELECT retag_followed_at IS NOT NULL \
+             FROM library_management_automatic_queue WHERE local_album_id = ?1";
+    /// The files of album `?1` matched by hand.
+    pub(super) HAND_MATCHED_ON = "SELECT h.local_track_id FROM library_track_hand_matches h \
+             JOIN local_tracks t ON t.id = h.local_track_id WHERE t.local_album_id = ?1 \
+             ORDER BY h.local_track_id";
+    /// Whether file `?1` was matched by hand.
+    pub(super) HAND_MATCHED = "SELECT EXISTS(SELECT 1 FROM library_track_hand_matches \
+             WHERE local_track_id = ?1)";
+    /// Whether file `?1` is on album `?2`.
+    pub(super) ON_ALBUM = "SELECT EXISTS(SELECT 1 FROM local_tracks \
+             WHERE id = ?1 AND local_album_id = ?2)";
+    /// Whether album `?1` has a "leave unmanaged" row.
+    pub(super) HAS_EXCLUSION = "SELECT EXISTS(SELECT 1 FROM library_management_exclusions \
+             WHERE local_album_id = ?1)";
 
     // -----------------------------------------------------------------
     // The checks a repair made, read again inside its command.
@@ -1302,6 +1478,23 @@ droppedneedle_kernel::sql! {
     pub(super) row LiveAutomaticUndo for [LIVE_AUTOMATIC_UNDO] {
         expected_post_album_revision: i64,
         expected_post_identity_revision: i64,
+    }
+    pub(super) row ReleaseCopy for [COPIES_ON_RELEASE] {
+        local_album_id: String,
+        release_mbid: String,
+    }
+    pub(super) row FileMembership for [ALBUM_FILES] {
+        id: String,
+        membership_source: String,
+        membership_locked: bool,
+    }
+    pub(super) row CopyHolds for [COPY_HOLDS] {
+        release_track: Option<String>,
+        recording: Option<String>,
+    }
+    pub(super) row LocalTwinRow for [LOCAL_TWIN] {
+        title: String,
+        album_artist_name: String,
     }
     pub(super) row CopyRow for [COPY_SHOWN] {
         local_album_id: String,

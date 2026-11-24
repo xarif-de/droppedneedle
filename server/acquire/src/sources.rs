@@ -1,4 +1,4 @@
-//! Production source adapters: slskd and SABnzbd behind the downloads
+//! Production source adapters: slskd and the Usenet client behind the downloads
 //! [`DownloadSource`](super::downloads::sources::DownloadSource) seam.
 //!
 //! Each adapter reads the task row from the shared journal, asks
@@ -49,8 +49,10 @@ use super::target::soulseek::{self, SoulseekMiss};
 use super::target::{SearchTarget, TargetError, Targets};
 use super::usenet::indexer::{Indexer, IndexerQuery};
 use super::usenet::newznab::{IndexerResult, usenet_identity};
+use super::usenet::nzbget::NzbgetError;
 use super::usenet::policy::UsenetPolicy;
-use super::usenet::sabnzbd::{NzbGrab, SabnzbdError, SabnzbdQueue};
+use super::usenet::queue::{UsenetClients, UsenetError, client_for_id};
+use super::usenet::sabnzbd::{NzbGrab, SabnzbdError};
 use droppedneedle_providers::RequestPriority;
 
 /// A refused request or an answer of the wrong shape is the client
@@ -69,6 +71,17 @@ fn client_error(error: ClientError) -> SourceError {
     }
 }
 
+fn usenet_error(error: UsenetError) -> SourceError {
+    match error {
+        UsenetError::Sabnzbd(error) => sab_error(error),
+        UsenetError::Nzbget(error) => nzbget_error(error),
+        // The person removed the client that took the job: nothing can
+        // finish it, so the task moves on and is fetched again through the
+        // client in use. Nothing counts against the release.
+        UsenetError::ClientGone(_) => SourceError::rejected(Reason::MovedOn, error.to_string()),
+    }
+}
+
 fn sab_error(error: SabnzbdError) -> SourceError {
     match error {
         SabnzbdError::Client(error) => client_error(error),
@@ -82,6 +95,22 @@ fn sab_error(error: SabnzbdError) -> SourceError {
         | SabnzbdError::NzbRefused { .. }
         | SabnzbdError::NzbPaced { .. }
         | SabnzbdError::AmbiguousIdentity => SourceError::Unavailable(error.to_string()),
+    }
+}
+
+fn nzbget_error(error: NzbgetError) -> SourceError {
+    match error {
+        NzbgetError::Client(error) => client_error(error),
+        NzbgetError::RejectedNzb
+        | NzbgetError::RejectedNzbUrl
+        | NzbgetError::MissingNzbUrl
+        | NzbgetError::NzbTooLarge => {
+            SourceError::rejected(Reason::DownloadFailed, error.to_string())
+        }
+        NzbgetError::Api(_)
+        | NzbgetError::NzbRefused { .. }
+        | NzbgetError::NzbPaced { .. }
+        | NzbgetError::AmbiguousIdentity => SourceError::Unavailable(error.to_string()),
     }
 }
 
@@ -232,6 +261,7 @@ impl SlskdSource {
             tracklist: &target.tracklist,
             wanted: &[],
             single_track: false,
+            release_preferred: target.release_preferred,
         };
         Ok(rank_listing(&hits, request, self.repo.policy())
             .into_iter()
@@ -479,9 +509,11 @@ fn queue_handle(handle: &SourceHandle) -> super::usenet::sabnzbd::TaskHandle {
     }
 }
 
-/// SABnzbd plus the indexers it fetches from, behind the fetch seam.
-pub struct SabnzbdSource {
-    queue: Arc<SabnzbdQueue>,
+/// The Usenet download clients (SABnzbd and NZBGet) plus the indexers they
+/// fetch from, behind the fetch seam. New jobs go to one client; a job
+/// already sent is followed on the client that took it.
+pub struct UsenetSource {
+    clients: UsenetClients,
     indexers: Vec<Arc<dyn Indexer>>,
     policy: UsenetPolicy,
     journal: Arc<Journal>,
@@ -491,12 +523,12 @@ pub struct SabnzbdSource {
     targets: Arc<Targets>,
 }
 
-impl SabnzbdSource {
-    /// Adapter over a configured queue, the indexers it searches (in
+impl UsenetSource {
+    /// Adapter over the configured clients, the indexers it searches (in
     /// order: the first copy of a release wins), the journal, and each
     /// task's target.
     pub fn new(
-        queue: Arc<SabnzbdQueue>,
+        clients: UsenetClients,
         indexers: Vec<Arc<dyn Indexer>>,
         policy: UsenetPolicy,
         journal: Arc<Journal>,
@@ -504,7 +536,7 @@ impl SabnzbdSource {
         targets: Arc<Targets>,
     ) -> Self {
         Self {
-            queue,
+            clients,
             indexers,
             policy,
             journal,
@@ -643,15 +675,19 @@ impl SabnzbdSource {
     }
 }
 
-impl SabnzbdSource {
+impl UsenetSource {
     /// The finished job's folder, with the mount it must sit in.
     async fn landed_in_mount(
         &self,
         handle: &SourceHandle,
     ) -> Result<crate::landing::Landed, SourceError> {
         let seen = self.inspect(handle).await?;
+        let mounts = self
+            .clients
+            .downloads_mounts(&queue_handle(handle))
+            .map_err(usenet_error)?;
         Ok(crate::landing::Landed {
-            mounts: vec![self.queue.downloads_mount().to_path_buf().into()],
+            mounts: mounts.into_iter().map(Into::into).collect(),
             files: seen
                 .paths
                 .into_iter()
@@ -664,7 +700,7 @@ impl SabnzbdSource {
     /// as the automatic path orders them, with those outside the download
     /// settings after the rest. Blocklisted releases are left out.
     async fn search_album(&self, target: &SearchTarget) -> Result<Vec<Candidate>, SourceError> {
-        if !self.queue.is_configured() || !target.has_album() {
+        if !self.clients.adds().is_configured() || !target.has_album() {
             return Ok(Vec::new());
         }
         let blocked = blocklist(&self.journal, &SourceTag::Usenet).await?;
@@ -699,29 +735,29 @@ impl SabnzbdSource {
             .collect()
     }
 
-    /// Whether SABnzbd still lists the job in its queue or history (orphan
+    /// Whether the Usenet client still lists the job in its queue or history (orphan
     /// evidence). A job in neither is gone.
     async fn job_present(&self, handle: &SourceHandle) -> Result<bool, SourceError> {
         let status = self
-            .queue
+            .clients
             .get_status(&queue_handle(handle))
             .await
-            .map_err(sab_error)?;
+            .map_err(usenet_error)?;
         Ok(status.matched_transfers > 0
             && status.status != "completed"
             && status.status != "failed")
     }
 }
 
-impl SabnzbdSource {
+impl UsenetSource {
     async fn enqueue_pick(
         &self,
         task_id: &str,
         candidate_index: i64,
     ) -> Result<SourceHandle, SourceError> {
-        if !self.queue.is_configured() {
+        if !self.clients.adds().is_configured() {
             return Err(SourceError::Unavailable(
-                "sabnzbd not configured".to_owned(),
+                "no Usenet client configured".to_owned(),
             ));
         }
         let task = task_row(&self.journal, task_id).await?;
@@ -746,10 +782,12 @@ impl SabnzbdSource {
             job_name: job_name.clone(),
             nzo_id: String::new(),
         };
-        match self.queue.get_status(&probe).await {
+        // Only the client new jobs go to is asked: the add being repeated
+        // went there, and another client may be off or down.
+        let adds = self.clients.adds();
+        match adds.get_status(&probe).await {
             Ok(status) if status.matched_transfers > 0 => {
-                let nzo_id = self
-                    .queue
+                let nzo_id = adds
                     .inspect_materialization(&probe)
                     .await
                     .map(|seen| seen.nzo_id)
@@ -762,13 +800,13 @@ impl SabnzbdSource {
                 });
             }
             Ok(_) => {}
-            Err(SabnzbdError::AmbiguousIdentity) => {
+            Err(error) if error.is_ambiguous() => {
                 return Err(SourceError::rejected(
                     Reason::DownloadFailed,
                     format!("usenet job {job_name} is ambiguous; refusing a duplicate add"),
                 ));
             }
-            Err(error) => return Err(sab_error(error)),
+            Err(error) => return Err(usenet_error(error)),
         }
         let target = resolve_target(&self.targets, &task).await?;
         let blocked = blocklist(&self.journal, &SourceTag::Usenet).await?;
@@ -800,7 +838,10 @@ impl SabnzbdSource {
                     })?
             }
         };
-        let category = self.category.as_deref().filter(|cat| *cat != "*");
+        let category = self
+            .category
+            .as_deref()
+            .filter(|cat| !cat.is_empty() && *cat != "*");
         let indexer_client = self
             .indexers
             .iter()
@@ -812,31 +853,29 @@ impl SabnzbdSource {
         // Worker-built job name: the counter keeps failover
         // attempts distinct on the client and matches the orphan shape.
         let handle = if task.download_type == "track" {
-            self.queue
-                .enqueue_track(
-                    task_id,
-                    &job_name,
-                    Some(pick.usenet.nzb_url.as_str()),
-                    grab,
-                    category,
-                    None,
-                    None,
-                )
-                .await
+            adds.enqueue_track(
+                task_id,
+                &job_name,
+                Some(pick.usenet.nzb_url.as_str()),
+                grab,
+                category,
+                None,
+                None,
+            )
+            .await
         } else {
-            self.queue
-                .enqueue_album_as(
-                    task_id,
-                    &job_name,
-                    Some(pick.usenet.nzb_url.as_str()),
-                    grab,
-                    category,
-                    None,
-                    None,
-                )
-                .await
+            adds.enqueue_album_as(
+                task_id,
+                &job_name,
+                Some(pick.usenet.nzb_url.as_str()),
+                grab,
+                category,
+                None,
+                None,
+            )
+            .await
         }
-        .map_err(sab_error)?;
+        .map_err(usenet_error)?;
         Ok(SourceHandle {
             job_name: handle.job_name,
             nzo_id: handle.nzo_id,
@@ -849,10 +888,10 @@ impl SabnzbdSource {
     async fn progress(&self, handle: &SourceHandle) -> Result<TransferProgress, SourceError> {
         let queue_handle = queue_handle(handle);
         let status = self
-            .queue
+            .clients
             .get_status(&queue_handle)
             .await
-            .map_err(sab_error)?;
+            .map_err(usenet_error)?;
         let all_terminal = matches!(status.status.as_str(), "completed" | "failed");
         Ok(TransferProgress {
             all_terminal,
@@ -876,10 +915,10 @@ impl SabnzbdSource {
     async fn inspect(&self, handle: &SourceHandle) -> Result<Materialization, SourceError> {
         let queue_handle = queue_handle(handle);
         let seen = self
-            .queue
+            .clients
             .inspect_materialization(&queue_handle)
             .await
-            .map_err(sab_error)?;
+            .map_err(usenet_error)?;
         let paths = if seen.workspace_path.is_empty() {
             Vec::new()
         } else {
@@ -894,19 +933,22 @@ impl SabnzbdSource {
 
     async fn discard_records(&self, handle: &SourceHandle) -> Result<bool, SourceError> {
         let queue_handle = queue_handle(handle);
-        self.queue
+        self.clients
             .discard_client_artifacts(&queue_handle)
             .await
-            .map_err(sab_error)
+            .map_err(usenet_error)
     }
 
     async fn abort_job(&self, handle: &SourceHandle) -> Result<bool, SourceError> {
         let queue_handle = queue_handle(handle);
-        self.queue.abort(&queue_handle).await.map_err(sab_error)
+        self.clients
+            .abort(&queue_handle)
+            .await
+            .map_err(usenet_error)
     }
 }
 
-impl DownloadSource for SabnzbdSource {
+impl DownloadSource for UsenetSource {
     fn tag(&self) -> SourceTag {
         SourceTag::Usenet
     }
@@ -946,6 +988,10 @@ impl DownloadSource for SabnzbdSource {
 
     fn abort<'a>(&'a self, handle: &'a SourceHandle) -> BoxFuture<'a, Result<bool, SourceError>> {
         Box::pin(self.abort_job(handle))
+    }
+
+    fn client_of(&self, handle: &SourceHandle) -> &'static str {
+        client_for_id(&handle.nzo_id).unwrap_or_default()
     }
 
     fn job_active<'a>(&'a self, handle: &'a SourceHandle) -> BoxFuture<'a, Option<bool>> {

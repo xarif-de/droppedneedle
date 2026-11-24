@@ -312,6 +312,113 @@ fn match_query(
     format!("{query} AND ({} OR {title_clause})", boosts.join(" OR "))
 }
 
+/// Whether a text search that MusicBrainz answers with no match at all asks
+/// once more with a [`forgiving_term`]. Typeahead stops: it runs on every
+/// keystroke, and the full search behind it asks again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnEmpty {
+    /// Ask again forgivingly.
+    AskAgain,
+    /// Answer the empty page.
+    Stop,
+}
+
+/// Which words a text search sends: as typed, or the [`forgiving_term`]
+/// a caller asks with once the words as typed matched nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchTerm {
+    /// The escaped text as a phrase and as words.
+    Typed,
+    /// The forgiving term in both places.
+    Forgiving,
+}
+
+/// Longest lone word whose two-word splits are tried: each split is a
+/// phrase as long as the word, so the term grows with the square of it.
+const MAX_SPLIT_LETTERS: usize = 24;
+
+/// One typed word for a Lucene query: escaped, and quoted when it is one of
+/// the operators `AND`, `OR` and `NOT`, which a bare word would turn into.
+fn lucene_word(word: &str) -> String {
+    let escaped = escape_lucene_phrase(word);
+    if matches!(word, "AND" | "OR" | "NOT") {
+        format!("\"{escaped}\"")
+    } else {
+        escaped
+    }
+}
+
+/// The typed words of a text search for a query's free clause, each
+/// through [`lucene_word`].
+pub fn lucene_words(text: &str) -> String {
+    text.split_whitespace()
+        .map(lucene_word)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The term a text search retries with when the words as typed found
+/// nothing, or `None` when there is no second guess. A word of four or
+/// five letters may hold one typo, a longer one two ("beatels"), so it
+/// goes fuzzy by that many edits; one alone of six to
+/// [`MAX_SPLIT_LETTERS`] letters may also be two words run together
+/// ("spiderverse"), so every split into halves of two letters or more
+/// joins it, each a phrase. Several words are ANDed, and an operator word
+/// is quoted, never fuzzed. The term stands where the phrase stood.
+///
+/// The change's author checked this against musicbrainz.org/ws/2 on
+/// 2026-11-14: the split query found the Spider-Verse soundtracks and
+/// `sunflwer~` found Sunflower. Not yet checked against BrainzMash.
+pub fn forgiving_term(text: &str) -> Option<String> {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let fuzzy = |word: &str| {
+        let letters = word.chars().count();
+        if matches!(word, "AND" | "OR" | "NOT") || letters < 4 {
+            lucene_word(word)
+        } else if letters < 6 {
+            format!("{}~1", escape_lucene_phrase(word))
+        } else {
+            format!("{}~", escape_lucene_phrase(word))
+        }
+    };
+    match words.as_slice() {
+        [] => None,
+        [word] => {
+            let letters: Vec<char> = word.chars().collect();
+            if letters.len() < 4 {
+                return None;
+            }
+            let mut guesses = vec![fuzzy(word)];
+            if (6..=MAX_SPLIT_LETTERS).contains(&letters.len())
+                && letters.iter().all(|letter| letter.is_alphanumeric())
+            {
+                guesses.extend((2..=letters.len() - 2).map(|at| {
+                    let (head, tail) = letters.split_at(at);
+                    format!(
+                        "\"{} {}\"",
+                        head.iter().collect::<String>(),
+                        tail.iter().collect::<String>()
+                    )
+                }));
+            }
+            Some(format!("({})", guesses.join(" OR ")))
+        }
+        words => {
+            if words.iter().all(|word| word.chars().count() < 4) {
+                return None;
+            }
+            Some(format!(
+                "({})",
+                words
+                    .iter()
+                    .map(|word| fuzzy(word))
+                    .collect::<Vec<_>>()
+                    .join(" AND ")
+            ))
+        }
+    }
+}
+
 /// Recording query: the recording title as a phrase and, unless blank,
 /// the artist as a phrase.
 pub fn build_recording_query(title: &str, artist: &str) -> String {
@@ -504,5 +611,51 @@ mod tests {
             build_recording_query("Tuesday Morning", "Paul Kossoff"),
             r#"recording:"Tuesday Morning" AND artist:"Paul Kossoff""#
         );
+    }
+
+    #[test]
+    fn forgiving_term_fuzzes_words_and_splits_one_run_together() {
+        assert_eq!(
+            forgiving_term("spiderverse").as_deref(),
+            Some(
+                r#"(spiderverse~ OR "sp iderverse" OR "spi derverse" OR "spid erverse" OR "spide rverse" OR "spider verse" OR "spiderv erse" OR "spiderve rse" OR "spiderver se")"#
+            )
+        );
+        assert_eq!(
+            forgiving_term("beatels").as_deref(),
+            Some(r#"(beatels~ OR "be atels" OR "bea tels" OR "beat els" OR "beate ls")"#)
+        );
+        assert_eq!(
+            forgiving_term("queen").as_deref(),
+            Some("(queen~1)"),
+            "one edit under six letters, and no split"
+        );
+        assert_eq!(
+            forgiving_term("AC/DC").as_deref(),
+            Some(r"(AC\/DC~1)"),
+            "punctuation is not a join"
+        );
+        assert_eq!(
+            forgiving_term("sunflwer post malone").as_deref(),
+            Some("(sunflwer~ AND post~1 AND malone~)")
+        );
+        assert_eq!(
+            forgiving_term("rock AND roll").as_deref(),
+            Some(r#"(rock~1 AND "AND" AND roll~1)"#),
+            "an operator word is quoted, never fuzzed"
+        );
+        assert_eq!(
+            forgiving_term("supercalifragilisticexpialidocious").as_deref(),
+            Some("(supercalifragilisticexpialidocious~)"),
+            "a long word is not split"
+        );
+        assert_eq!(lucene_words("rock AND roll"), r#"rock "AND" roll"#);
+        assert_eq!(
+            forgiving_term("the xx"),
+            None,
+            "nothing long enough to be wrong"
+        );
+        assert_eq!(forgiving_term("u2"), None);
+        assert_eq!(forgiving_term("  "), None);
     }
 }

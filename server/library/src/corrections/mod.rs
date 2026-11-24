@@ -28,7 +28,8 @@
 //! `retag_merge` the join of an album
 //! retagged across two scans, `retag_pairs` the pairs a person joins or
 //! dismisses, `release_join` the join of an album whose files another
-//! album replaced on the same edition, `placement` a scanned file placed
+//! album replaced on the same edition, `copy_join` the join of copies of
+//! one edition split across folders, `placement` a scanned file placed
 //! on its album's edition by its own ids, `continuation` a missing track
 //! continuing into the track that took its place, and `service` the entry
 //! points.
@@ -37,6 +38,7 @@ pub(crate) mod artist_convergence;
 pub(crate) mod artist_join;
 mod artists;
 pub mod continuation;
+pub(crate) mod copy_join;
 mod edition;
 pub(crate) mod membership;
 mod merge_basis;
@@ -51,5 +53,6 @@ pub mod service;
 pub(crate) mod sql;
 
 pub use artist_convergence::{V2Fold, fold_v2_placeholder};
+pub(crate) use merge_basis::same_name_joins;
 pub use merge_basis::{V2PlaceholderFacts, V2PlaceholderKept};
 pub use service::Corrections;

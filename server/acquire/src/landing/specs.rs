@@ -34,7 +34,7 @@ use droppedneedle_library::matching::decide::{ACCEPT_ALBUM, ACCEPT_TRACK};
 use droppedneedle_library::matching::model::credit_text;
 use droppedneedle_library::matching::score::{NAME_GATE, SAME_MASTER_SECS, Support, TrackPair};
 use droppedneedle_library::matching::strings::{
-    artist_subset, fold, string_dist, strip_edition_words,
+    artist_subset, basic_dist, fold, string_dist, strip_edition_words,
 };
 
 /// What a rejection means for retry and failover.
@@ -122,6 +122,9 @@ pub struct Target {
     pub release_group_mbid: String,
     /// The pinned edition, when the ask pinned one.
     pub release_mbid: Option<String>,
+    /// `release_mbid` is only a preference: no person chose it, so another
+    /// release of the same group is accepted.
+    pub release_preferred: bool,
     pub year: Option<i32>,
     /// A single-track download.
     pub is_track: bool,
@@ -560,12 +563,17 @@ const NOISE_WORDS: &[&str] = &[
     "res",
     "bit",
     "khz",
+    "vol",
+    "volume",
 ];
 
-/// Most tagged files name another album by the same artist: their
-/// album titles carry words the
-/// requested title does not. Untagged files never count, so an untagged
-/// rip falls through to matching.
+/// Most tagged files name another album by the same artist: their album
+/// titles carry a word the requested title does not. A word of five
+/// letters or more spelled close to one of the requested title's
+/// ("Rumors" for "Rumours") is not another word; shorter words and
+/// numerals must match exactly, so "II" is not "I". A file tagged with the
+/// requested release group is never a different album. Untagged files
+/// never count, so an untagged rip falls through to matching.
 struct WrongAlbum;
 
 impl ImportSpec for WrongAlbum {
@@ -592,6 +600,19 @@ impl ImportSpec for WrongAlbum {
         let wrong = tagged
             .iter()
             .filter(|file| {
+                let own_group = file
+                    .tag
+                    .musicbrainz_release_group_id
+                    .as_deref()
+                    .is_some_and(|group| {
+                        !target.release_group_mbid.is_empty()
+                            && group
+                                .trim()
+                                .eq_ignore_ascii_case(&target.release_group_mbid)
+                    });
+                if own_group {
+                    return false;
+                }
                 let artist = file
                     .tag
                     .album_artist
@@ -603,7 +624,7 @@ impl ImportSpec for WrongAlbum {
                 same_artist
                     && content_words(album_tag(file), &artist_words)
                         .iter()
-                        .any(|word| !wanted.contains(word))
+                        .any(|word| !wanted.iter().any(|want| same_word(word, want)))
             })
             .count();
         if wrong * 2 > tagged.len() {
@@ -786,7 +807,11 @@ impl ImportSpec for ReleaseFound {
 
 /// With a pinned edition, files whose own tags name another release are
 /// another edition: rejected, so the next source is tried. Untagged files
-/// are judged by the pinned tracklist alone.
+/// are judged by the pinned tracklist alone, and so is a song's file from
+/// another edition of its album, which the accept notes
+/// ([`super::matching::MatchSummary::set_aside`]). A preferred edition
+/// takes any release of its group; files tagged as another group's
+/// release are another album.
 struct PinnedEdition;
 
 impl ImportSpec for PinnedEdition {
@@ -798,6 +823,22 @@ impl ImportSpec for PinnedEdition {
         let Some(pin) = subject.target.release_mbid.as_deref() else {
             return Verdict::accept();
         };
+        if subject.target.release_preferred {
+            return match subject
+                .matched
+                .and_then(|matched| matched.other_album.as_deref())
+            {
+                Some(other) => Verdict::reject(
+                    Reason::WrongAlbum,
+                    Disposition::Permanent,
+                    Some(QuarantineReason::VerifyFailed),
+                    format!(
+                        "the files are tagged as release {other}, which belongs to another album"
+                    ),
+                ),
+                None => Verdict::accept(),
+            };
+        }
         let pinned = subject
             .matched
             .and_then(|matched| matched.best())
@@ -809,9 +850,9 @@ impl ImportSpec for PinnedEdition {
         // The album copy of a single the person chose to take from its
         // album names the album's release, not another edition.
         let album_copy = |index: &usize| {
-            subject
-                .matched
-                .is_some_and(|matched| matched.album_copies.contains_key(index))
+            subject.matched.is_some_and(|matched| {
+                matched.album_copies.contains_key(index) || matched.set_aside.contains_key(index)
+            })
         };
         let tagged: Vec<&str> = subject
             .landing
@@ -835,7 +876,15 @@ impl ImportSpec for PinnedEdition {
                 ),
             );
         }
-        Verdict::accept()
+        let set_aside = subject
+            .matched
+            .and_then(|matched| matched.set_aside.values().min());
+        match set_aside {
+            Some(release) => Verdict::note(format!(
+                "the song is taken from release {release}, another edition of the album"
+            )),
+            None => Verdict::accept(),
+        }
     }
 }
 
@@ -849,8 +898,22 @@ impl ImportSpec for IdsAgree {
     }
 
     fn check(&self, subject: &Subject<'_>) -> Verdict {
-        match subject.matched.map(|matched| &matched.state) {
-            Some(MatchState::Contradictory) => Verdict::hold(
+        match subject.matched {
+            // Files of another edition taken for a song: what contradicts
+            // the pinned release is that edition, refused as one.
+            Some(matched)
+                if matched.state == MatchState::Contradictory
+                    && subject.target.is_track
+                    && !matched.set_aside.is_empty() =>
+            {
+                Verdict::reject(
+                    Reason::NotPinnedEdition,
+                    Disposition::Permanent,
+                    Some(QuarantineReason::VerifyFailed),
+                    "the files' MusicBrainz ids name recordings the pinned edition lacks",
+                )
+            }
+            Some(matched) if matched.state == MatchState::Contradictory => Verdict::hold(
                 Reason::TagMismatch,
                 "the files' MusicBrainz ids name a different release",
             ),
@@ -1558,10 +1621,15 @@ fn has_phrase(text: &[String], phrase: &str) -> bool {
         .any(|window| window.iter().zip(&wanted).all(|(have, want)| have == want))
 }
 
-/// The words that make an album title itself: edition suffixes, artist
-/// words, numbers and noise removed, each word folded.
+/// The words that make an album title itself: apostrophes inside words
+/// dropped ("What's" is "whats"), edition suffixes, artist words, numbers
+/// and noise removed, each word folded.
 fn content_words(title: &str, artist_words: &[String]) -> Vec<String> {
-    words(&strip_edition_words(title))
+    let title: String = title
+        .chars()
+        .filter(|ch| !matches!(ch, '\'' | '\u{2019}'))
+        .collect();
+    words(&strip_edition_words(&title))
         .into_iter()
         .filter(|word| !artist_words.contains(word))
         .filter(|word| !NOISE_WORDS.contains(&word.as_str()))
@@ -1569,6 +1637,15 @@ fn content_words(title: &str, artist_words: &[String]) -> Vec<String> {
         .map(|word| fold(&word))
         .filter(|word| !word.is_empty())
         .collect()
+}
+
+/// Two content words are one word when equal, or when both have five
+/// letters or more and are spelled within matching's name gate.
+fn same_word(left: &str, right: &str) -> bool {
+    left == right
+        || (left.chars().count() >= 5
+            && right.chars().count() >= 5
+            && basic_dist(left, right) <= NAME_GATE)
 }
 
 #[cfg(test)]

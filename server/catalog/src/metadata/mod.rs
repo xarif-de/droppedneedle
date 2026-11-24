@@ -75,8 +75,13 @@ pub struct PageSources {
 struct Inner {
     upstream: Upstream,
     local: LocalCatalog,
-    /// Discographies and tracklists being fetched in the background.
+    /// Discographies, tracklists and search listen counts being fetched
+    /// in the background.
     warming: Mutex<HashSet<String>>,
+    /// While background fetches of search listen counts fail: when the
+    /// last one started, so the next waits, and its failure is not logged
+    /// again.
+    listens_failing: Mutex<Option<tokio::time::Instant>>,
 }
 
 impl Catalog {
@@ -93,6 +98,7 @@ impl Catalog {
                 upstream,
                 local,
                 warming: Mutex::new(HashSet::new()),
+                listens_failing: Mutex::new(None),
             }),
             follows,
             purchase_links,
@@ -237,6 +243,21 @@ impl Catalog {
             HashSet::new()
         });
         (owned, requested)
+    }
+
+    /// The recording MBIDs among `mbids` with an open request, failing soft
+    /// like [`Self::album_flags`].
+    pub(crate) async fn track_flags(&self, mbids: &[String]) -> HashSet<String> {
+        if mbids.is_empty() {
+            return HashSet::new();
+        }
+        self.local()
+            .requested_tracks(mbids)
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "song request flags failed; showing none");
+                HashSet::new()
+            })
     }
 
     /// Owned flags for a set of artist MBIDs, failing soft like

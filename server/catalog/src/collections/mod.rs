@@ -7,9 +7,12 @@
 //! handlers read.
 
 pub mod db;
+mod entry_cover;
 pub mod error;
 pub mod handlers;
 pub mod http;
+mod import;
+pub mod library_links;
 pub mod models;
 pub mod remote_import;
 pub mod service;
@@ -26,6 +29,11 @@ pub use state::CollectionsState;
 /// base64, with room for the rest of the JSON.
 const COVER_BODY_BYTES: usize = service::MAX_COVER_BYTES.div_ceil(3) * 4 + 1024;
 
+/// The import body's cap: the largest playlist file the service takes, with
+/// room for JSON escaping (a quote becomes two bytes) and the rest of the
+/// body.
+const IMPORT_BODY_BYTES: usize = import::MAX_IMPORT_BYTES * 2 + 64 * 1024;
+
 /// The collections routes at their full `/api/v3` paths, each for any
 /// signed-in user. Following and the auto-download approvals are the
 /// follows' routes in acquisition. The cover upload takes a body up to
@@ -39,15 +47,21 @@ pub fn routes() -> Routes<CollectionsState> {
         remove_cover_handler
     );
     let cover = cover.layer(DefaultBodyLimit::max(COVER_BODY_BYTES));
+    let (import_schemas, import_paths, import_route) = routes!(import_playlist_handler);
+    let import_route = import_route.layer(DefaultBodyLimit::max(IMPORT_BODY_BYTES));
     Routes::new()
         .user(routes!(list_playlists_handler, create_playlist_handler))
+        .user((import_schemas, import_paths, import_route))
         .user(routes!(check_tracks_handler))
         .user(routes!(
             get_playlist_handler,
             update_playlist_handler,
             delete_playlist_handler
         ))
+        .user(routes!(export_playlist_handler))
         .user(routes!(set_visibility_handler))
+        .user(routes!(list_members_handler, set_members_handler))
+        .user(routes!(leave_playlist_handler))
         .user(routes!(add_tracks_handler))
         .user(routes!(remove_tracks_handler))
         .user(routes!(reorder_track_handler))

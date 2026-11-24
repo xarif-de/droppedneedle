@@ -1,10 +1,11 @@
 //! Drop import journey: a zip holding two album folders is unpacked; the
 //! folder whose tags match a release is published into the library (as a
 //! drop, under the naming template, its bonus track alongside) and
-//! resolves the open request for that album; the folder nothing
-//! identifies waits in the held list with a reason, its job folder kept
+//! resolves the open request for that album; the folder whose files name
+//! two albums waits in the held list with a reason, its job folder kept
 //! while it does, and discarding it removes its files and then the job
-//! folder. A second drop with a better copy of
+//! folder. A folder nothing identifies goes in as a local-only album. A
+//! second drop with a better copy of
 //! a track replaces the library's file, which goes to the recycle bin. Real
 //! landing port, publisher and catalog over one scratch database;
 //! MusicBrainz is a scripted release source.
@@ -18,6 +19,7 @@ use std::time::Duration;
 use droppedneedle_acquire::db::AcquireDb;
 use droppedneedle_acquire::downloads::queue_rows::Viewer as HeldViewer;
 use droppedneedle_acquire::drop_import::Viewer;
+use droppedneedle_acquire::drop_import::extract::LOOSE_UNIT_NAME;
 use droppedneedle_acquire::drop_import::store::{DropItemStatus, DropJobStatus, JobRecord};
 use droppedneedle_acquire::held::store::Entry;
 use droppedneedle_acquire::landing::library::LibraryLanding;
@@ -35,6 +37,7 @@ use droppedneedle_library::wiring::LibrarySetup;
 use futures_util::future::BoxFuture;
 
 use crate::common::auth::AuthRig;
+use crate::common::library::TestSql as _;
 use crate::common::library::{every_priority, library_at};
 
 const GROUP: &str = "7d0b7a1e-0000-4000-8000-000000000001";
@@ -245,6 +248,7 @@ async fn dropped_album_lands_and_the_unknown_folder_waits_for_review() {
     let sour_times = tagged(&work, "flac_full_02.flac", "Dummy", "Sour Times", 2);
     let hidden = tagged(&work, "flac_full_01.flac", "Dummy", "Hidden Track", 3);
     let stranger = tagged(&work, "flac_full_01.flac", "Nothing Alike", "Glory Box", 9);
+    let other = tagged(&work, "flac_full_02.flac", "Something Else", "Roads", 10);
     let mysterons = tagged(&work, "flac_full_01.flac", "Dummy", "Mysterons", 1);
     let impostor = tagged(&work, "flac_full_01.flac", "Dummy", "Glory Box", 1);
     let lengths = [None, length_ms(&sour_times, &work)];
@@ -290,6 +294,7 @@ async fn dropped_album_lands_and_the_unknown_folder_waits_for_review() {
             ("Dummy/02 - Sour Times.flac", &sour_times),
             ("Dummy/03 - Hidden Track.flac", &hidden),
             ("Odds/09 Glory Box.flac", &stranger),
+            ("Odds/10 Roads.flac", &other),
         ],
     )
     .await;
@@ -333,7 +338,7 @@ async fn dropped_album_lands_and_the_unknown_folder_waits_for_review() {
     assert_eq!(odd.reason_code, Some(Reason::NoAlbumMatch));
     assert!(odd.detail.is_some());
     let (entry, staged) = entry_of(&acquire, &curator.user_id, odd.id).await;
-    assert_eq!(staged.len(), 1);
+    assert_eq!(staged.len(), 2);
     assert!(staged.iter().all(|path| path.is_file()));
     assert!(entry.expires_at > Some(entry.created_at));
     // The job's folder stays while a file of it waits for a decision.
@@ -408,16 +413,16 @@ async fn dropped_album_lands_and_the_unknown_folder_waits_for_review() {
     assert!(!shelf.join("0101 Mysterons.mp3").exists(), "recycled");
 }
 
-/// An unidentified upload whose discs hold files of the same name waits as
-/// one entry with every file: CD1/01.flac and CD2/01.flac are two files,
-/// both kept on disk.
+/// An upload whose discs hold files of the same name and whose tags name
+/// two albums waits as one entry with every file: CD1/01.flac and
+/// CD2/01.flac are two files, both kept on disk.
 #[tokio::test]
 async fn same_named_files_on_two_discs_both_wait() {
     let (_db, library, dir, auth) = bundles().await;
     let work = dir.join("work");
     std::fs::create_dir_all(&work).expect("work dir");
     let first = tagged(&work, "flac_full_01.flac", "Nothing Alike", "Glory Box", 1);
-    let second = tagged(&work, "flac_full_02.flac", "Nothing Alike", "Roads", 1);
+    let second = tagged(&work, "flac_full_02.flac", "Something Else", "Roads", 1);
     let acquire = acquire_over(
         &auth,
         &library,
@@ -446,6 +451,218 @@ async fn same_named_files_on_two_discs_both_wait() {
     assert!(
         staged.iter().all(|path| path.is_file()),
         "a waiting file was swept"
+    );
+}
+
+/// Files dropped without a folder whose tags name two albums wait. The held
+/// entry keeps the album and artist most of their tags name, so its card
+/// and Match search start from those rather than from the loose-files
+/// unit's name.
+#[tokio::test]
+async fn an_unmatched_loose_upload_keeps_the_names_its_tags_give() {
+    let (_db, library, dir, auth) = bundles().await;
+    let work = dir.join("work");
+    std::fs::create_dir_all(&work).expect("work dir");
+    let glory = tagged(&work, "flac_full_01.flac", "Nothing Alike", "Glory Box", 1);
+    let roads = tagged(&work, "flac_full_02.flac", "Nothing Alike", "Roads", 2);
+    let numb = tagged(&work, "flac_full_01.flac", "Something Else", "Numb", 3);
+    let acquire = acquire_over(
+        &auth,
+        &library,
+        Arc::new(LibraryLanding::new(
+            &library,
+            every_priority(Arc::new(OneRelease(release(&["Mysterons"], &[None])))),
+        )),
+    );
+    let curator = Viewer {
+        user_id: "u-curator".to_owned(),
+        admin: false,
+    };
+    // Bare files, not an archive or a folder: they form the loose-files unit.
+    let incoming = acquire.drops.incoming_dir();
+    std::fs::create_dir_all(&incoming).expect("incoming");
+    let mut uploads = Vec::new();
+    for (name, bytes) in [
+        ("01 Glory Box.flac", &glory),
+        ("02 Roads.flac", &roads),
+        ("03 Numb.flac", &numb),
+    ] {
+        let upload = incoming.join(name);
+        std::fs::write(&upload, bytes).expect("upload");
+        uploads.push((name.to_owned(), upload));
+    }
+    let job = uploads_and_settle(&acquire, &curator, uploads).await;
+    assert_eq!(job.status, DropJobStatus::Completed, "{:?}", job.error);
+    let item = &job.items[0];
+    assert_eq!(item.folder_name, LOOSE_UNIT_NAME);
+    assert_eq!(
+        item.status,
+        DropItemStatus::NeedsReview,
+        "{:?}",
+        item.detail
+    );
+    assert_eq!(item.reason_code, Some(Reason::NoAlbumMatch));
+    let (entry, _) = entry_of(&acquire, &curator.user_id, item.id).await;
+    assert_eq!(entry.album_title.as_deref(), Some("Nothing Alike"));
+    assert_eq!(entry.artist_name.as_deref(), Some("Portishead"));
+}
+
+/// An upload MusicBrainz cannot place goes into the library as a local-only
+/// album: filed by its tags under the naming script, its bytes and tags as
+/// they came, with no match and no flag, and offered to identification.
+/// Nothing waits. The same upload again is held, told the library has it,
+/// and the library keeps one album.
+#[tokio::test]
+async fn an_upload_nothing_identifies_goes_in_as_a_local_album() {
+    let (_db, library, dir, auth) = bundles().await;
+    let music = dir.join("music");
+    let work = dir.join("work");
+    std::fs::create_dir_all(&work).expect("work dir");
+    let glory = tagged(&work, "flac_full_01.flac", "Nothing Alike", "Glory Box", 9);
+    let acquire = acquire_over(
+        &auth,
+        &library,
+        Arc::new(LibraryLanding::new(
+            &library,
+            every_priority(Arc::new(OneRelease(release(&["Mysterons"], &[None])))),
+        )),
+    );
+    let curator = Viewer {
+        user_id: "u-curator".to_owned(),
+        admin: false,
+    };
+    let job = drop_zip(
+        &acquire,
+        &curator,
+        "upload-local",
+        &[("Odds/09 Glory Box.flac", &glory)],
+    )
+    .await;
+    let item = &job.items[0];
+    assert_eq!(item.status, DropItemStatus::Imported, "{:?}", item.detail);
+    assert_eq!(
+        item.detail.as_deref(),
+        Some("Imported 1 file as a local album, not matched yet.")
+    );
+    let placed = music.join("Portishead/Nothing Alike (1997)/0109 Glory Box.flac");
+    assert_eq!(
+        std::fs::read(&placed).expect("placed"),
+        glory,
+        "bytes and tags as they came"
+    );
+    let db = acquire.db.db();
+    let drops: i64 = db.one(
+        "SELECT COUNT(*) FROM local_tracks WHERE availability = 'indexed' \
+         AND ingest_source = 'drop'",
+        [],
+    );
+    assert_eq!(drops, 1, "indexed as a drop");
+    let identities: i64 = db.one("SELECT COUNT(*) FROM local_album_external_identities", []);
+    let flags: i64 = db.one("SELECT COUNT(*) FROM library_album_match_state", []);
+    assert_eq!((identities, flags), (0, 0), "no match and no flag");
+    let jobs: Vec<String> = db.column("SELECT kind || ':' || state FROM library_identify_jobs", []);
+    assert_eq!(jobs, vec!["automatic:queued".to_owned()]);
+    let held = acquire
+        .held
+        .list(
+            &HeldViewer {
+                user_id: curator.user_id.clone(),
+                admin: false,
+            },
+            None,
+            None,
+            false,
+        )
+        .await
+        .expect("held list");
+    assert!(held.is_empty(), "nothing waits: {held:?}");
+
+    let again = drop_zip(
+        &acquire,
+        &curator,
+        "upload-again",
+        &[("Odds/09 Glory Box.flac", &glory)],
+    )
+    .await;
+    let twin = &again.items[0];
+    assert_eq!(twin.status, DropItemStatus::NeedsReview);
+    assert_eq!(twin.reason_code, Some(Reason::NoAlbumMatch));
+    assert!(
+        twin.detail.as_deref().is_some_and(
+            |detail| detail.contains("Your library already has Nothing Alike by Portishead.")
+        ),
+        "{:?}",
+        twin.detail
+    );
+    let albums: i64 = db.one(
+        "SELECT COUNT(*) FROM local_albums WHERE has_indexed_track = 1",
+        [],
+    );
+    assert_eq!(albums, 1, "the library keeps one album");
+}
+
+/// A local-only upload the library puts off (it is switched off) is held,
+/// and the held loop places it by itself once the library is back.
+#[tokio::test]
+async fn a_local_only_upload_put_off_is_placed_once_the_library_is_back() {
+    use droppedneedle_kernel::runtime_config::secret_sections::TypedLibrary;
+
+    let (_db, library, dir, auth) = bundles().await;
+    let music = dir.join("music");
+    let work = dir.join("work");
+    std::fs::create_dir_all(&work).expect("work dir");
+    let glory = tagged(&work, "flac_full_01.flac", "Nothing Alike", "Glory Box", 9);
+    let acquire = acquire_over(
+        &auth,
+        &library,
+        Arc::new(LibraryLanding::new(
+            &library,
+            every_priority(Arc::new(OneRelease(release(&["Mysterons"], &[None])))),
+        )),
+    );
+    let switch = |on: bool| {
+        library
+            .settings
+            .store()
+            .update_secret_blocking::<TypedLibrary, String, _>(move |stored| {
+                let mut settings = stored.into_inner();
+                settings.enabled = on;
+                Ok(settings)
+            })
+            .expect("library switch saved");
+        library.core.refresh_registry();
+    };
+    let curator = Viewer {
+        user_id: "u-curator".to_owned(),
+        admin: false,
+    };
+    switch(false);
+    let job = drop_zip(
+        &acquire,
+        &curator,
+        "upload-off",
+        &[("Odds/09 Glory Box.flac", &glory)],
+    )
+    .await;
+    assert_eq!(job.items[0].status, DropItemStatus::NeedsReview);
+    assert_eq!(job.items[0].reason_code, Some(Reason::LibraryOff));
+    assert!(files_under(&music).is_empty(), "nothing lands while off");
+
+    switch(true);
+    acquire.held.tend().await;
+    assert!(
+        music
+            .join("Portishead/Nothing Alike (1997)/0109 Glory Box.flac")
+            .is_file(),
+        "the held loop placed it: {:?}",
+        files_under(&music)
+    );
+    let now = job_now(&acquire.drops, &curator, &job.id).await;
+    assert_eq!(
+        now.items[0].status,
+        DropItemStatus::Imported,
+        "{:?}",
+        now.items[0].detail
     );
 }
 
@@ -637,7 +854,14 @@ async fn a_hand_match_finds_the_edition_in_a_large_group() {
         let mut files: Vec<(String, Vec<u8>)> = Vec::new();
         for (index, title) in TITLES[..3].iter().enumerate() {
             let track = index as u32 + 1;
-            let mut bytes = tagged(&work, "flac_full_01.flac", "Rough Mixes", title, track);
+            // The third file's tags name another album, so nothing places
+            // the upload by itself.
+            let album = if track == 3 {
+                "Rough Cuts"
+            } else {
+                "Rough Mixes"
+            };
+            let mut bytes = tagged(&work, "flac_full_01.flac", album, title, track);
             if case == 1 {
                 let path = work.join(format!("{track:02}-{title}.flac"));
                 let named = TagEdit::new(TagField::MusicBrainzReleaseId, vec![release_id(1, 130)]);
@@ -717,7 +941,17 @@ async fn a_deferred_upload_match_leaves_its_files_as_they_were() {
     let work = dir.join("work");
     std::fs::create_dir_all(&work).expect("work dir");
     let bytes = tagged(&work, "flac_full_01.flac", "Odds", "Numb", 1);
-    let job = drop_zip(&acquire, &curator, "odds", &[("Odds/01 Numb.flac", &bytes)]).await;
+    let other = tagged(&work, "flac_full_02.flac", "Evens", "Roads", 2);
+    let job = drop_zip(
+        &acquire,
+        &curator,
+        "odds",
+        &[
+            ("Odds/01 Numb.flac", &bytes),
+            ("Odds/02 Roads.flac", &other),
+        ],
+    )
+    .await;
     let item = &job.items[0];
     assert_eq!(
         item.status,
@@ -726,7 +960,12 @@ async fn a_deferred_upload_match_leaves_its_files_as_they_were() {
         item.detail
     );
     let (entry, _) = entry_of(&acquire, &curator.user_id, item.id).await;
-    let file_id = entry.files[0].id;
+    let file_id = entry
+        .files
+        .iter()
+        .find(|file| file.original_name.contains("Numb"))
+        .expect("held")
+        .id;
     // AcoustID heard another recording; the app's guess was another album.
     let (release, track, recording) = (
         GUESS.to_owned(),
@@ -917,7 +1156,7 @@ async fn a_matched_uploads_bonus_track_is_not_retried_onto_the_old_guess() {
     std::fs::create_dir_all(&work).expect("work dir");
     let mysterons = tagged(&work, "flac_full_01.flac", "Odds", "Mysterons", 1);
     let sour_times = tagged(&work, "flac_full_02.flac", "Odds", "Sour Times", 2);
-    let hidden = tagged(&work, "flac_full_01.flac", "Odds", "Hidden Track", 3);
+    let hidden = tagged(&work, "flac_full_01.flac", "Evens", "Hidden Track", 3);
     let job = drop_zip(
         &acquire,
         &curator,
@@ -1032,27 +1271,34 @@ async fn drop_zip(
         }
         zip.finish().expect("zip finish");
     }
-    let job = upload_and_settle(acquire, curator, upload).await;
+    let job = upload_and_settle(acquire, curator, "Purchase.zip", upload).await;
     assert_eq!(job.status, DropJobStatus::Completed, "{:?}", job.error);
     job
 }
 
-/// Start a drop job on the zip at `upload` and wait for the
-/// `drop_import_updated` event that announces it settled: a job that
-/// settles without one leaves the person's open tabs waiting on the poll.
+/// Start a drop job on `upload`, the file the person named `name`, and wait
+/// for the `drop_import_updated` event that announces it settled: a job
+/// that settles without one leaves the person's open tabs waiting on the
+/// poll.
 async fn upload_and_settle(
     acquire: &droppedneedle_acquire::AcquireSetup,
     curator: &Viewer,
+    name: &str,
     upload: PathBuf,
+) -> JobRecord {
+    uploads_and_settle(acquire, curator, vec![(name.to_owned(), upload)]).await
+}
+
+/// [`upload_and_settle`] for several files in one upload.
+async fn uploads_and_settle(
+    acquire: &droppedneedle_acquire::AcquireSetup,
+    curator: &Viewer,
+    uploads: Vec<(String, PathBuf)>,
 ) -> JobRecord {
     let mut events = acquire.events.subscribe(&curator.user_id);
     let job = acquire
         .drops
-        .create_job(
-            &curator.user_id,
-            "Cora",
-            vec![("Purchase.zip".to_owned(), upload)],
-        )
+        .create_job(&curator.user_id, "Cora", uploads)
         .await
         .expect("job starts");
     loop {
@@ -1135,7 +1381,7 @@ async fn a_damaged_entry_discards_the_whole_archive() {
     let upload = incoming.join("upload-liar");
     std::fs::write(&upload, &bytes).expect("upload");
 
-    let job = upload_and_settle(&acquire, &curator, upload).await;
+    let job = upload_and_settle(&acquire, &curator, "Purchase.zip", upload).await;
     let indexed: i64 = acquire.db.db().one("SELECT COUNT(*) FROM local_tracks", []);
     assert_eq!(indexed, 0, "files of the damaged archive were imported");
     assert_eq!(job.status, DropJobStatus::Failed, "{:?}", job.items);
@@ -1431,4 +1677,110 @@ async fn job_now(
         .into_iter()
         .find(|job| job.id == id)
         .expect("job")
+}
+
+/// Scan every library folder to its end.
+async fn scan_library(library: &LibrarySetup) {
+    use droppedneedle_library::scan::{ScanKind, ScanRequest, ScanTrigger};
+    let registry = library.core.live_registry();
+    library
+        .coordinator
+        .request_run(&ScanRequest {
+            kind: ScanKind::Incremental,
+            trigger: ScanTrigger::Manual,
+            scopes: registry.scheduled_root_scopes(),
+            requested_by_user_id: None,
+            policy_revision: registry.fingerprint().to_owned(),
+        })
+        .expect("scan requested");
+    for _ in 0..100 {
+        library.scans.supervisor_tick().await;
+        if library.coordinator.current().is_empty() {
+            break;
+        }
+    }
+    assert!(library.coordinator.current().is_empty());
+}
+
+/// An upload of the tracks an album in the library is missing joins that
+/// album and its folder, wherever the naming script would file them.
+#[tokio::test]
+async fn an_upload_of_the_missing_tracks_joins_the_album() {
+    let (_db, library, dir, auth) = bundles().await;
+    let music = dir.join("music");
+    let work = dir.join("work");
+    std::fs::create_dir_all(&work).expect("work dir");
+    let sour_times = tagged(&work, "flac_full_02.flac", "Dummy", "Sour Times", 2);
+    let lengths = [None, length_ms(&sour_times, &work)];
+    let dummy = release(&["Mysterons", "Sour Times"], &lengths);
+    let acquire = acquire_over(
+        &auth,
+        &library,
+        Arc::new(LibraryLanding::new(
+            &library,
+            every_priority(Arc::new(OneRelease(dummy.clone()))),
+        )),
+    );
+
+    // The library holds "Mysterons", in a folder of its own, on the
+    // edition a person chose.
+    let owned = music.join("My Dummy/01 Mysterons.flac");
+    std::fs::create_dir_all(owned.parent().expect("folder")).expect("copy folder");
+    std::fs::write(
+        &owned,
+        tagged(&work, "flac_full_01.flac", "Dummy", "Mysterons", 1),
+    )
+    .expect("copy planted");
+    scan_library(&library).await;
+    let db = acquire.db.db();
+    let album: String = db.one(
+        "SELECT local_album_id FROM local_tracks WHERE relative_path = 'My Dummy/01 Mysterons.flac'",
+        [],
+    );
+    let mysterons = &dummy.tracks[0];
+    db.run_sql(&format!(
+        "INSERT INTO local_album_external_identities (local_album_id, provider, \
+         release_group_mbid, release_mbid, decision_source, selected_by_user_id, selected_at) \
+         VALUES ('{album}', 'musicbrainz', '{GROUP}', '{RELEASE}', 'manual', 'u-curator', 5); \
+         INSERT INTO local_track_external_identities (local_track_id, provider, \
+         recording_mbid, release_mbid, release_track_mbid, medium_position, \
+         release_track_position, decision_source, selected_at) SELECT id, 'musicbrainz', \
+         '{}', '{RELEASE}', '{}', 1, 1, 'manual', 5 FROM local_tracks \
+         WHERE local_album_id = '{album}';",
+        mysterons.recording_id, mysterons.id
+    ))
+    .expect("edition chosen");
+
+    let curator = Viewer {
+        user_id: "u-curator".to_owned(),
+        admin: false,
+    };
+    let job = drop_zip(
+        &acquire,
+        &curator,
+        "upload-rest",
+        &[("Dummy/02 - Sour Times.flac", &sour_times)],
+    )
+    .await;
+    assert!(
+        job.items
+            .iter()
+            .all(|item| item.status == DropItemStatus::Imported),
+        "{:?}",
+        job.items
+    );
+    let joined: (String, String) = db.row(
+        "SELECT relative_path, local_album_id FROM local_tracks WHERE title = 'Sour Times'",
+        [],
+    );
+    assert_eq!(
+        joined,
+        ("My Dummy/0102 Sour Times.flac".to_owned(), album),
+        "the upload joins the album, beside its files"
+    );
+    let albums: i64 = db.one(
+        "SELECT COUNT(*) FROM local_albums WHERE retired_into_album_id IS NULL",
+        [],
+    );
+    assert_eq!(albums, 1, "no second album");
 }

@@ -472,6 +472,7 @@ fn quarantine_expires_and_holds_files_only_in_its_sandbox() {
             "soulseek",
             &identity,
             QuarantineReason::VerifyFailed.as_str(),
+            None,
             Some("rg-1"),
             now,
             ttl,
@@ -493,6 +494,7 @@ fn quarantine_expires_and_holds_files_only_in_its_sandbox() {
             "job-1",
             QuarantineReason::Corrupt.as_str(),
             None,
+            None,
             now + ttl + 2.0,
             ttl,
         )
@@ -507,6 +509,7 @@ fn quarantine_expires_and_holds_files_only_in_its_sandbox() {
             "soulseek",
             &identity,
             QuarantineReason::VerifyFailed.as_str(),
+            None,
             Some("rg-1"),
             now + ttl + 3.0,
             ttl,
@@ -896,6 +899,7 @@ async fn failing_cleanup_shows_on_service_health_until_it_clears() {
         Arc::new(droppedneedle_acquire::target::Targets::new(
             journal.clone(),
             Arc::new(crate::common::acquire::FixedAlbums::default()),
+            crate::common::bundles::closed_catalog(journal.db().db()).await,
         )),
         Arc::new(droppedneedle_acquire::landing::LandingService::new(
             journal,

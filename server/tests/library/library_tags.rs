@@ -1600,6 +1600,41 @@ fn mixed_v23_edits_write_v24_homes() {
     }
 }
 
+/// A v2.3 tag whose genre frame holds several values, as taggers write
+/// them, is saved as ID3v2.4: lofty's v2.3 writer would rewrite them as
+/// `(Pop)Rock`, which reads back as one other value (#692).
+#[test]
+fn v23_multi_valued_genre_is_saved_as_v24() {
+    let (_scratch, path) = v23_file(
+        "tags-v23-genres",
+        &[
+            ("TIT2", &latin1(&["Opener"])),
+            ("TCON", &latin1(&["Pop", "Rock"])),
+        ],
+    );
+    let audio = mp3_audio_tail(&std::fs::read(&path).unwrap()).to_vec();
+    assert!(!tags::save::id3_lands_as_v23(track_file(&path)).unwrap());
+    let notes = tags::save::tags_kept(track_file(&path), PicturesPlan::Untouched)
+        .unwrap()
+        .upgrade_notes;
+    assert_eq!(
+        notes,
+        vec![
+            "Its ID3v2.3 genre tag holds several genres, which only ID3v2.4 can keep, so it is \
+             saved as ID3v2.4."
+                .to_owned()
+        ]
+    );
+
+    let report = tags::save_tags(&path, &[TagEdit::set_title("Second Song")]).unwrap();
+    assert_eq!(report.id3_version.as_deref(), Some("2.4"));
+    assert_eq!(id3_text_values(&path, "TCON"), texts(&["Pop", "Rock"]));
+    let fields = tags::read_fields(track_file(&path)).unwrap();
+    assert_eq!(fields[&TagField::Genre], texts(&["Pop", "Rock"]));
+    assert_eq!(fields[&TagField::Title], texts(&["Second Song"]));
+    assert_eq!(mp3_audio_tail(&std::fs::read(&path).unwrap()), audio);
+}
+
 #[test]
 fn save_pure_v23_stays_v23() {
     // A genuinely pure v2.3 tag (synthetic header over real MP3 audio):
@@ -4100,6 +4135,118 @@ fn mp4_integer_atoms_keep_their_type_and_order() {
     assert_eq!(view(&m4a), before);
 }
 
+/// An m4a from iTunes carries its genre as a legacy numeric `gnre` atom,
+/// which reads as the genre it numbers. Other edits leave it alone; a
+/// genre edit writes `©gen` in its place, and the save checks both as the
+/// one genre field (#692).
+#[test]
+fn m4a_genre_edit_replaces_a_legacy_numeric_genre() {
+    use lofty::config::{ParseOptions, WriteOptions};
+    use lofty::file::AudioFile as _;
+    use lofty::mp4::{Atom, AtomData, AtomIdent, DataType, Mp4File};
+    use lofty::tag::TagExt as _;
+    let (_scratch, m4a) = temp_copy("management_full.m4a", "legacy-genre");
+    let mut file =
+        Mp4File::read_from(&mut std::fs::File::open(&m4a).unwrap(), ParseOptions::new()).unwrap();
+    let mut ilst = file.ilst_mut().unwrap().clone();
+    ilst.remove(&AtomIdent::Fourcc(*b"\xa9gen")).for_each(drop);
+    // iTunes stores the ID3v1 genre number plus one: 18 is Rock.
+    ilst.insert(Atom::new(
+        AtomIdent::Fourcc(*b"gnre"),
+        AtomData::Unknown {
+            code: DataType::Reserved,
+            data: vec![0, 18],
+        },
+    ));
+    ilst.save_to_path(&m4a, WriteOptions::new()).unwrap();
+    let gnre = |path: &Path| {
+        mp4_atoms(path)
+            .into_iter()
+            .filter(|atom| &atom.kind == b"gnre")
+            .flat_map(|atom| atom.data)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(gnre(&m4a), [vec![0, 18]]);
+    let genre =
+        |path: &Path| tags::read_fields(track_file(path)).unwrap()[&TagField::Genre].clone();
+    assert_eq!(genre(&m4a), texts(&["Rock"]), "it reads as its name");
+    let kept = tags::save::tags_kept(track_file(&m4a), PicturesPlan::Untouched).unwrap();
+    assert!(
+        kept.left_alone.iter().all(|(key, _)| key != "mp4:gnre"),
+        "{kept:?}"
+    );
+
+    tags::save_tags(&m4a, &[TagEdit::set_title("Later")]).expect("saves");
+    assert_eq!(gnre(&m4a), [vec![0, 18]], "another edit leaves it alone");
+    assert!(mp4_text(&m4a, b"\xa9gen").is_empty());
+    assert_eq!(genre(&m4a), texts(&["Rock"]));
+    tags::save_tags(
+        &m4a,
+        &[TagEdit::new(TagField::Genre, vec!["Indie".to_owned()])],
+    )
+    .expect("saves");
+    assert_eq!(mp4_text(&m4a, b"\xa9gen"), ["Indie"]);
+    assert!(gnre(&m4a).is_empty());
+
+    // A `gnre` beside a `©gen`, which lofty drops on read, stays too.
+    let mut file =
+        Mp4File::read_from(&mut std::fs::File::open(&m4a).unwrap(), ParseOptions::new()).unwrap();
+    let mut ilst = file.ilst_mut().unwrap().clone();
+    ilst.insert(Atom::new(
+        AtomIdent::Fourcc(*b"gnre"),
+        AtomData::Unknown {
+            code: DataType::Reserved,
+            data: vec![0, 18],
+        },
+    ));
+    ilst.save_to_path(&m4a, WriteOptions::new()).unwrap();
+    assert_eq!(gnre(&m4a), [vec![0, 18]]);
+    tags::save_tags(&m4a, &[TagEdit::set_title("Both")]).expect("saves");
+    assert_eq!(gnre(&m4a), [vec![0, 18]], "both atoms stay");
+    assert_eq!(mp4_text(&m4a, b"\xa9gen"), ["Indie"]);
+}
+
+/// Atoms lofty's read drops survive a save as the file held them: an
+/// 8-byte integer (lofty reads 1 to 4 bytes) and an empty integer payload,
+/// as iTunes and some taggers write `cnID` and `pgap` (#692).
+#[test]
+fn m4a_atoms_lofty_cannot_read_survive_a_save() {
+    use lofty::config::{ParseOptions, WriteOptions};
+    use lofty::file::AudioFile as _;
+    use lofty::mp4::{Atom, AtomData, AtomIdent, DataType, Mp4File};
+    use lofty::tag::TagExt as _;
+    let (_scratch, m4a) = temp_copy("management_full.m4a", "dropped-atoms");
+    let mut file =
+        Mp4File::read_from(&mut std::fs::File::open(&m4a).unwrap(), ParseOptions::new()).unwrap();
+    let mut ilst = file.ilst_mut().unwrap().clone();
+    for (code, kind, data) in [
+        (
+            *b"cnID",
+            DataType::BeSignedInteger,
+            0x1_2345_6789u64.to_be_bytes().to_vec(),
+        ),
+        (*b"pgap", DataType::BeSignedInteger, Vec::new()),
+    ] {
+        ilst.insert(Atom::new(
+            AtomIdent::Fourcc(code),
+            AtomData::Unknown { code: kind, data },
+        ));
+    }
+    ilst.save_to_path(&m4a, WriteOptions::new()).unwrap();
+    let held = |path: &Path| {
+        mp4_atoms(path)
+            .into_iter()
+            .filter(|atom| matches!(&atom.kind, b"cnID" | b"pgap"))
+            .map(|atom| (atom.kind, atom.types, atom.data))
+            .collect::<Vec<_>>()
+    };
+    let planted = held(&m4a);
+    assert_eq!(planted.len(), 2);
+
+    tags::save_tags(&m4a, &[TagEdit::set_title("Later")]).expect("saves");
+    assert_eq!(held(&m4a), planted);
+}
+
 // ---------------------------------------------------------------------------
 // Save wrapper: frames lofty would re-encode go back byte for byte
 // ---------------------------------------------------------------------------
@@ -4828,4 +4975,96 @@ fn scan_and_editor_agree_on_writable_fields() {
         "scan and the editor disagree:\n{}",
         differences.join("\n")
     );
+}
+
+/// The FLAC metadata blocks of `bytes` as `(type, body)`, and the audio
+/// after them.
+fn flac_blocks(bytes: &[u8]) -> (Vec<(u8, Vec<u8>)>, Vec<u8>) {
+    let mut blocks = Vec::new();
+    let mut offset = 4;
+    loop {
+        let header = bytes[offset];
+        let len = u32::from_be_bytes([0, bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]])
+            as usize;
+        blocks.push((header & 0x7F, bytes[offset + 4..offset + 4 + len].to_vec()));
+        offset += 4 + len;
+        if header & 0x80 != 0 {
+            return (blocks, bytes[offset..].to_vec());
+        }
+    }
+}
+
+/// A FLAC stream holding `blocks` then `audio`.
+fn flac_from_blocks(blocks: &[(u8, Vec<u8>)], audio: &[u8]) -> Vec<u8> {
+    let mut out = b"fLaC".to_vec();
+    for (index, (kind, body)) in blocks.iter().enumerate() {
+        let last = if index + 1 == blocks.len() { 0x80 } else { 0 };
+        out.push(kind | last);
+        out.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
+        out.extend_from_slice(body);
+    }
+    out.extend_from_slice(audio);
+    out
+}
+
+/// A Vorbis comment block body holding `vendor` and `pairs`.
+fn comment_block(vendor: &str, pairs: &[&str]) -> Vec<u8> {
+    let mut out = (vendor.len() as u32).to_le_bytes().to_vec();
+    out.extend_from_slice(vendor.as_bytes());
+    out.extend_from_slice(&(pairs.len() as u32).to_le_bytes());
+    for pair in pairs {
+        out.extend_from_slice(&(pair.len() as u32).to_le_bytes());
+        out.extend_from_slice(pair.as_bytes());
+    }
+    out
+}
+
+/// A FLAC file carrying a second Vorbis comment block, against the spec
+/// but written by some taggers, saves when the last block, the one every
+/// tag read takes, holds every tag of the first: the save keeps it as one
+/// block and changes nothing else. When the first holds a tag the last
+/// lacks, the save would lose it, so it is refused and the file left as
+/// it was (#714).
+#[test]
+fn flac_with_two_comment_blocks_keeps_the_last() {
+    let (_scratch, path) = temp_copy("flac_full_01.flac", "flac-two-comment-blocks");
+    let (mut blocks, audio) = flac_blocks(&std::fs::read(&path).unwrap());
+    let first = blocks
+        .iter()
+        .position(|(kind, _)| *kind == 4)
+        .expect("a comment block");
+    blocks[first].1 = comment_block("first encoder", &["title=Second", "COMMENT="]);
+    blocks.push((
+        4,
+        comment_block("second encoder", &["TITLE=Second", "MOOD=Calm"]),
+    ));
+    std::fs::write(&path, flac_from_blocks(&blocks, &audio)).unwrap();
+
+    tags::save_tags(&path, &[TagEdit::set_title("Edited")]).expect("saves");
+
+    let (after, after_audio) = flac_blocks(&std::fs::read(&path).unwrap());
+    assert_eq!(
+        after.iter().filter(|(kind, _)| *kind == 4).count(),
+        1,
+        "one comment block"
+    );
+    assert_eq!(vorbis_values(&path, "TITLE"), ["Edited"]);
+    assert_eq!(vorbis_values(&path, "MOOD"), ["Calm"]);
+    assert_eq!(vorbis_vendor(&path), "second encoder");
+    assert_eq!(after_audio, audio, "audio unchanged");
+
+    blocks[first].1 = comment_block("first encoder", &["TITLE=Second", "GENRE=Jazz"]);
+    std::fs::write(&path, flac_from_blocks(&blocks, &audio)).unwrap();
+    let before = std::fs::read(&path).unwrap();
+    let message = tags::save::tags_kept(track_file(&path), PicturesPlan::Untouched)
+        .unwrap()
+        .refusal
+        .expect("refused");
+    assert!(message.contains("more than one tag block"), "{message}");
+    let result = tags::save_tags(&path, &[TagEdit::set_title("Edited")]);
+    assert!(
+        matches!(result, Err(TagsError::SaveRefused { .. })),
+        "{result:?}"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), before, "file unchanged");
 }

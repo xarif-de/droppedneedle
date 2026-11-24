@@ -72,7 +72,7 @@ fn schema_rows(connection: &Connection) -> Vec<(String, String, String, Option<S
 fn fresh_migrate_marks_version_and_seeds() {
     let connection = migrated();
     assert_eq!(scalar(&connection, "PRAGMA user_version"), latest_version());
-    assert_eq!(table_names(&connection).len(), 179);
+    assert_eq!(table_names(&connection).len(), 180);
     assert_eq!(
         scalar(
             &connection,
@@ -304,7 +304,7 @@ fn sqlite_is_built_without_memory_counters() {
     );
 }
 
-/// The SHA-256 of every file in `server/migrations/`. A file on `v3` is
+/// The SHA-256 of every file in `server/migrations/`. A file on `main` is
 /// never edited, renumbered or removed: a schema change is a new file, and
 /// a new file adds its line here.
 const SHIPPED: &[(&str, &str)] = &[
@@ -355,6 +355,30 @@ const SHIPPED: &[(&str, &str)] = &[
     (
         "0146_v2_recycle_bin_paths.sql",
         "209f36d809799bb4e7a8c80bdc39344f04aff470c4d275be1d57e99182224a26",
+    ),
+    (
+        "0147_management_written_stat.sql",
+        "416464a8803407293e0c21a3a3b3ba2c18e02dfd91158ce3bdb936ac9985ea19",
+    ),
+    (
+        "0148_download_quarantine_reason.sql",
+        "6dd9190f517b20a1ab8f3f6ac546ed1d70e9e29385f4f6e7c02f6967b610473e",
+    ),
+    (
+        "0149_playlist_members.sql",
+        "c6aaabe169099a26500fccae2ca5dc27ba14466a9cdbc75e50080b04fe0d1f73",
+    ),
+    (
+        "0150_playlist_local_source.sql",
+        "f55b5fe55aebab155d8114f61d0ef3e68bc9ee643651a7786b45676a4a798706",
+    ),
+    (
+        "0151_auth_display_name_chosen.sql",
+        "f3726ab1956bc587398b9b40fda101bf52d1c454386a9c7161d503008fb31409",
+    ),
+    (
+        "0152_playlist_unlinked_entries.sql",
+        "637f4833cb49e7c5678f31df2c463a0ed6ff4f8c6064df1d8327dd661d3c3ee5",
     ),
 ];
 
@@ -1370,6 +1394,205 @@ fn recycle_bin_marks_upgrade_adds_an_empty_table() {
     );
 }
 
+/// 0149 adds the table of playlist members, empty, and changes nothing
+/// else: every playlist stays as shared as it was.
+#[test]
+fn playlist_members_upgrade_adds_an_empty_table() {
+    let dir = ScratchDir::new("playlist-members");
+    let path = dir.join("app.db");
+    let connection = migrate(
+        Connection::open(&path).unwrap(),
+        &Chain::new(&MIGRATIONS[..14], None),
+    )
+    .unwrap();
+    assert_eq!(scalar(&connection, "PRAGMA user_version"), 148);
+    let before_schema = schema_rows(&connection);
+    drop(connection);
+
+    migrate_file(&path, &Chain::new(&MIGRATIONS[..15], None)).unwrap();
+    let connection = Connection::open(&path).unwrap();
+    assert_eq!(scalar(&connection, "PRAGMA user_version"), 149);
+    let mut after = schema_rows(&connection);
+    after.retain(|(_, _, table, _)| table != "catalog_playlist_members");
+    assert_eq!(after, before_schema, "nothing else changes");
+    assert_eq!(
+        scalar(&connection, "SELECT COUNT(*) FROM catalog_playlist_members"),
+        0
+    );
+}
+
+/// 0150 stores library entries under the web player's source name: the
+/// names Subsonic and Jellyfin apps and v2 wrote become `local`, in the
+/// source and in the list of sources, each name kept once in its first
+/// place. Other entries and the schema stay as they were.
+#[test]
+fn playlist_local_source_upgrade_renames_old_local_names() {
+    let dir = ScratchDir::new("playlist-local-source");
+    let path = dir.join("app.db");
+    let connection = migrate(
+        Connection::open(&path).unwrap(),
+        &Chain::new(&MIGRATIONS[..15], None),
+    )
+    .unwrap();
+    assert_eq!(scalar(&connection, "PRAGMA user_version"), 149);
+    let entries = [
+        (
+            "a",
+            "droppedneedle-local",
+            Some(r#"["droppedneedle-local"]"#),
+        ),
+        ("b", "howler", Some(r#"["howler","local","youtube"]"#)),
+        (
+            "c",
+            "youtube",
+            Some(r#"["youtube","droppedneedle-local","howler"]"#),
+        ),
+        ("d", "local", None),
+        ("e", "plex", Some(r#"["plex"]"#)),
+    ];
+    for (key, source, sources) in entries {
+        connection
+            .execute_batch(&format!(
+                "PRAGMA foreign_keys = OFF;
+                 INSERT INTO catalog_playlist_tracks (id, playlist_id, position, track_name,
+                     artist_name, album_name, source_type, available_sources, created_at)
+                 VALUES ('{key}', 'p1', unicode('{key}'), 'T', 'A', 'L', '{source}', {sources}, 1);",
+                sources = sources.map_or("NULL".to_owned(), |list| format!("'{list}'")),
+            ))
+            .unwrap();
+    }
+    let before_schema = schema_rows(&connection);
+    drop(connection);
+
+    migrate_file(&path, &Chain::new(&MIGRATIONS[..16], None)).unwrap();
+    let connection = Connection::open(&path).unwrap();
+    assert_eq!(scalar(&connection, "PRAGMA user_version"), 150);
+    assert_eq!(
+        schema_rows(&connection),
+        before_schema,
+        "nothing else changes"
+    );
+    assert_eq!(
+        texts(
+            &connection,
+            "SELECT id || ' ' || source_type || ' ' || COALESCE(available_sources, '-') \
+             FROM catalog_playlist_tracks ORDER BY id",
+            [],
+        ),
+        [
+            r#"a local ["local"]"#,
+            r#"b local ["local","youtube"]"#,
+            r#"c youtube ["youtube","local"]"#,
+            "d local -",
+            r#"e plex ["plex"]"#,
+        ]
+    );
+}
+
+/// 0151 records whose display name its person chose. Only an account that
+/// signs in with its password alone, whose display name is not its login
+/// name in any case, counts as having chosen it; a name a sign-in service
+/// gave, or a login name, does not. Nothing else changes, and the flag is
+/// 0 or 1.
+#[test]
+fn display_name_chosen_upgrade_marks_only_typed_names() {
+    let dir = ScratchDir::new("display-name-chosen");
+    let path = dir.join("app.db");
+    let connection = migrate(
+        Connection::open(&path).unwrap(),
+        &Chain::new(&MIGRATIONS[..16], None),
+    )
+    .unwrap();
+    assert_eq!(scalar(&connection, "PRAGMA user_version"), 150);
+    connection
+        .execute_batch(
+            "INSERT INTO auth_users (id, display_name, role, created_at, username, \
+                 username_display) VALUES \
+                 ('ana', 'Ana Lima', 'user', 1, 'ana', 'ana'), \
+                 ('tim', 'Tim', 'user', 1, 'tim', 'tim'), \
+                 ('mum', 'Mum Smith', 'user', 1, 'mum-smith', 'mum-smith'), \
+                 ('jo', 'Jo Bloggs', 'user', 1, 'jo', 'jo'), \
+                 ('sso', 'Single Sign', 'user', 1, NULL, NULL); \
+             INSERT INTO auth_providers (id, user_id, provider, provider_uid, created_at) VALUES \
+                 ('p1', 'ana', 'local', 'ana', 1), ('p2', 'tim', 'local', 'tim', 1), \
+                 ('p3', 'mum', 'jellyfin', 'jf-1', 1), ('p4', 'jo', 'local', 'jo', 1), \
+                 ('p5', 'jo', 'plex', 'plex-1', 1), ('p6', 'sso', 'oidc', 'sub-1', 1);",
+        )
+        .unwrap();
+    let mut before_schema = schema_rows(&connection);
+    before_schema.retain(|(_, name, _, _)| name != "auth_users");
+    drop(connection);
+
+    migrate_file(&path, &Chain::new(&MIGRATIONS[..17], None)).unwrap();
+    let connection = Connection::open(&path).unwrap();
+    assert_eq!(scalar(&connection, "PRAGMA user_version"), 151);
+    let mut after = schema_rows(&connection);
+    after.retain(|(_, name, _, _)| name != "auth_users");
+    assert_eq!(after, before_schema, "nothing else changes");
+    assert_eq!(
+        texts(
+            &connection,
+            "SELECT id FROM auth_users WHERE display_name_chosen = 1 ORDER BY id",
+            [],
+        ),
+        ["ana"]
+    );
+    assert!(
+        connection
+            .execute_batch("UPDATE auth_users SET display_name_chosen = 2 WHERE id = 'tim'")
+            .is_err(),
+        "the flag is 0 or 1"
+    );
+}
+
+/// 0152 adds only an index over the playlist entries with no source yet,
+/// and a read of those entries goes through it rather than every entry.
+#[test]
+fn playlist_unlinked_entries_upgrade_adds_one_index() {
+    let dir = ScratchDir::new("playlist-unlinked-entries");
+    let path = dir.join("app.db");
+    let connection = migrate(
+        Connection::open(&path).unwrap(),
+        &Chain::new(&MIGRATIONS[..17], None),
+    )
+    .unwrap();
+    assert_eq!(scalar(&connection, "PRAGMA user_version"), 151);
+    let before = schema_rows(&connection);
+    drop(connection);
+
+    migrate_file(&path, &Chain::new(&MIGRATIONS[..18], None)).unwrap();
+    let connection = Connection::open(&path).unwrap();
+    assert_eq!(scalar(&connection, "PRAGMA user_version"), 152);
+    let mut after = schema_rows(&connection);
+    after.retain(|row| !before.contains(row));
+    assert_eq!(
+        after
+            .iter()
+            .map(|(kind, name, table, _)| (kind.as_str(), name.as_str(), table.as_str()))
+            .collect::<Vec<_>>(),
+        [(
+            "index",
+            "idx_catalog_playlist_tracks_unlinked",
+            "catalog_playlist_tracks"
+        )]
+    );
+    let plan = connection
+        .prepare(
+            "EXPLAIN QUERY PLAN SELECT id FROM catalog_playlist_tracks \
+             WHERE source_type = '' AND library_file_id IS NULL AND album_id IS NOT NULL",
+        )
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(3))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+        .join(" ");
+    assert!(
+        plan.contains("idx_catalog_playlist_tracks_unlinked"),
+        "{plan}"
+    );
+}
+
 /// 0146 adds the table of recycle bin paths v2 used, empty, and changes
 /// nothing else: only an upgrade from v2 records a path in it.
 #[test]
@@ -1411,6 +1634,102 @@ fn v2_recycle_bin_paths_upgrade_adds_an_empty_table() {
             .is_err(),
         "the table is strict"
     );
+}
+
+/// 0147 gives each file's management record the stat revision of the file
+/// a profile run last placed from the album's match, NULL on carried rows,
+/// which keep every value. Nothing else in the schema changes.
+#[test]
+fn management_written_stat_upgrade_keeps_every_row() {
+    let dir = ScratchDir::new("management-written-stat");
+    let path = dir.join("app.db");
+    let connection = migrate(
+        Connection::open(&path).unwrap(),
+        &Chain::new(&MIGRATIONS[..12], None),
+    )
+    .unwrap();
+    assert_eq!(scalar(&connection, "PRAGMA user_version"), 146);
+    connection
+        .execute_batch(
+            // The row alone, without the track it belongs to.
+            "PRAGMA foreign_keys = OFF;
+             INSERT INTO library_track_management_state (local_track_id,
+                 applied_projection_hash, written_sha256, last_outcome, row_revision)
+             VALUES ('t1', 'placed', 'placed', 'succeeded', 4);",
+        )
+        .unwrap();
+    let table = "library_track_management_state";
+    let others = |connection: &Connection| {
+        let mut rows = schema_rows(connection);
+        rows.retain(|(_, name, _, _)| name != table);
+        rows
+    };
+    let before_schema = others(&connection);
+    drop(connection);
+
+    migrate_file(&path, &Chain::new(&MIGRATIONS[..13], None)).unwrap();
+    let connection = Connection::open(&path).unwrap();
+    assert_eq!(scalar(&connection, "PRAGMA user_version"), 147);
+    assert_eq!(
+        texts(
+            &connection,
+            "SELECT rowid || ':' || local_track_id || ':' || applied_projection_hash || ':'
+                 || written_sha256 || ':' || last_outcome || ':' || row_revision || ':'
+                 || COALESCE(written_stat_revision, '-')
+             FROM library_track_management_state",
+            [],
+        ),
+        ["1:t1:placed:placed:succeeded:4:-"],
+        "the row is kept, with no stat yet"
+    );
+    assert_eq!(others(&connection), before_schema, "nothing else changes");
+}
+
+/// 0148 gives each blocklist row the reason and detail of the check that
+/// blocklisted it, NULL on carried rows, which keep every value. Nothing
+/// else in the schema changes.
+#[test]
+fn download_quarantine_reason_upgrade_keeps_every_row() {
+    let dir = ScratchDir::new("download-quarantine-reason");
+    let path = dir.join("app.db");
+    let connection = migrate(
+        Connection::open(&path).unwrap(),
+        &Chain::new(&MIGRATIONS[..13], None),
+    )
+    .unwrap();
+    assert_eq!(scalar(&connection, "PRAGMA user_version"), 147);
+    connection
+        .execute_batch(
+            "INSERT INTO download_quarantine (source, identity, release_group_mbid, reason,
+                 quarantined_at)
+             VALUES ('soulseek', 'peer/a.flac', 'rg-1', 'verify_failed', 5);",
+        )
+        .unwrap();
+    let table = "download_quarantine";
+    let others = |connection: &Connection| {
+        let mut rows = schema_rows(connection);
+        rows.retain(|(_, name, _, _)| name != table);
+        rows
+    };
+    let before_schema = others(&connection);
+    drop(connection);
+
+    migrate_file(&path, &Chain::new(&MIGRATIONS[..14], None)).unwrap();
+    let connection = Connection::open(&path).unwrap();
+    assert_eq!(scalar(&connection, "PRAGMA user_version"), 148);
+    assert_eq!(
+        texts(
+            &connection,
+            "SELECT id || ':' || source || ':' || identity || ':' || release_group_mbid || ':'
+                 || reason || ':' || quarantined_at || ':' || COALESCE(reason_code, '-') || ':'
+                 || COALESCE(detail, '-')
+             FROM download_quarantine",
+            [],
+        ),
+        ["1:soulseek:peer/a.flac:rg-1:verify_failed:5:-:-"],
+        "the row is kept, with no reason yet"
+    );
+    assert_eq!(others(&connection), before_schema, "nothing else changes");
 }
 
 /// 0140 rebuilds the catalog action log to take the undo of an artist
@@ -1582,6 +1901,8 @@ const FOREIGN_KEYS: &[(&str, &str, &str, &str)] = &[
     ("catalog_ignored_releases", "user_id", "auth_users", "CASCADE"),
     ("catalog_new_release_seen_marks", "user_id", "auth_users", "CASCADE"),
     ("catalog_playlist_covers", "playlist_id", "catalog_playlists", "CASCADE"),
+    ("catalog_playlist_members", "playlist_id", "catalog_playlists", "CASCADE"),
+    ("catalog_playlist_members", "user_id", "auth_users", "CASCADE"),
     ("catalog_playlist_tracks", "playlist_id", "catalog_playlists", "CASCADE"),
     ("catalog_playlists", "user_id", "auth_users", "CASCADE"),
     ("catalog_user_favorite_names", "user_id, item_kind, item_id", "catalog_user_favorites", "CASCADE"),
@@ -2711,17 +3032,23 @@ fn every_registered_statement_prepares() {
 /// of a live album, the continuation sweep's walk of every missing track
 /// when no album is named, and the remap sweep over every identified album's
 /// tracks.
-/// Discover's three: radio's two track reads, which filter on ids worked out
-/// per track over the whole library, and the check for any local file, which
-/// stops at the first row.
+/// Discover's four: radio's two track reads, which filter on ids worked out
+/// per track over the whole library, the check for any local file, which
+/// stops at the first row, and the owned groups with their album artist
+/// links, which read every tagged track for albums owned through their tags.
 /// The library policy settings' three: the save preview's totals, which count
 /// every track under the scopes asked about, the list of folders the catalog
 /// holds tracks for, and the check for any track, which stops at the first
 /// row. An admin opens these by hand.
+/// The duplicates list, a curator's page that lists groups across the whole
+/// library: it reads every tagged file to find the groups' owners.
+/// The playlist import's one read: every live track once, to build the index
+/// it matches the file's entries against, on a request a person started.
 const TRACK_WALKS: &[&str] = &[
     "droppedneedle_library::scan::sql::ALBUM_TRACKS",
     "droppedneedle_library::corrections::sql::CANDIDATE_ALBUMS",
     "droppedneedle_library::corrections::sql::CANDIDATES",
+    "droppedneedle_library::duplicates::sql::DUPLICATE_ALBUMS",
     "droppedneedle_catalog::local::sql::TRACK_PAGE_LIKE",
     "droppedneedle_catalog::local::sql::TRACK_PAGE_WORDS",
     "droppedneedle_catalog::local::sql::TRACK_COUNT_LIKE",
@@ -2733,6 +3060,7 @@ const TRACK_WALKS: &[&str] = &[
     "droppedneedle_catalog::local::sql::GENRE_TRACKS",
     "droppedneedle_catalog::local::sql::GENRE_TRACK_COUNT",
     "droppedneedle_catalog::local::sql::PLAYABLE_COUNTS",
+    "droppedneedle_catalog::local::sql::IMPORT_TRACKS",
     "droppedneedle_catalog::local::sql::PLAYER_TRACK_PAGE",
     "droppedneedle_catalog::local::sql::PLAYER_TRACK_COUNT",
     "droppedneedle_catalog::local::sql::PLAYER_TRACKS_UNPLAYED",
@@ -2746,6 +3074,7 @@ const TRACK_WALKS: &[&str] = &[
     "droppedneedle_catalog::discover::sql::RADIO_TRACKS_BY_ARTISTS",
     "droppedneedle_catalog::discover::sql::RADIO_TRACKS_OF_ALBUMS",
     "droppedneedle_catalog::discover::sql::HAS_LOCAL_FILES",
+    "droppedneedle_catalog::discover::sql::LIBRARY_ALBUMS",
     "droppedneedle::settings::sql::SCOPE_TOTALS",
     "droppedneedle::settings::sql::CATALOG_ROOTS",
     "droppedneedle::settings::sql::ANY_TRACK",

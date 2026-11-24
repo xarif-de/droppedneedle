@@ -29,7 +29,9 @@ pub struct PlaylistTrack {
     pub artist_id: Option<String>,
     /// Library track source id, when resolved.
     pub track_source_id: Option<String>,
-    /// Cover art URL, when known.
+    /// Cover art address, when known: one of DroppedNeedle's own cover
+    /// routes, root-relative, or an https image on Spotify, Deezer, Last.fm,
+    /// TheAudioDB or YouTube. Any other stored address reads as null.
     pub cover_url: Option<String>,
     /// Preferred source type, empty when unresolved.
     pub source_type: String,
@@ -79,6 +81,12 @@ pub struct PlaylistSummary {
     pub is_public: bool,
     /// True when the caller owns the playlist.
     pub is_owner: bool,
+    /// True when the caller owns the playlist and shares it with chosen
+    /// people.
+    pub is_shared: bool,
+    /// True when the caller may change its songs: they own it, or it is
+    /// shared with them to edit.
+    pub can_edit: bool,
     /// True when the caller may delete it: its owner, or an admin when it
     /// has no owner.
     pub can_delete: bool,
@@ -115,6 +123,12 @@ pub struct PlaylistDetail {
     pub is_public: bool,
     /// True when the caller owns the playlist.
     pub is_owner: bool,
+    /// True when the caller owns the playlist and shares it with chosen
+    /// people.
+    pub is_shared: bool,
+    /// True when the caller may change its songs: they own it, or it is
+    /// shared with them to edit.
+    pub can_edit: bool,
     /// True when the caller may delete it: its owner, or an admin when it
     /// has no owner.
     pub can_delete: bool,
@@ -158,6 +172,87 @@ pub struct PlaylistListResponse {
     pub playlists: Vec<PlaylistListItem>,
 }
 
+/// File a playlist export is written as.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ExportFormat {
+    /// Extended M3U, the format Navidrome reads.
+    #[default]
+    M3u8,
+    /// CSV with a header row.
+    Csv,
+}
+
+/// Playlist export query.
+#[derive(Debug, Clone, Default, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct ExportQuery {
+    /// `m3u8` (default) or `csv`.
+    pub format: Option<ExportFormat>,
+    /// Added before each entry's path, for a player that stores music under
+    /// a folder of its own. At most 200 characters; no control characters.
+    pub prefix: Option<String>,
+}
+
+/// File a playlist import is read from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ImportFormat {
+    /// Extended M3U (`.m3u` or `.m3u8`).
+    M3u8,
+    /// CSV with a header row.
+    Csv,
+}
+
+/// Playlist import body. `content` is capped at 2 MB.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct ImportPlaylistBody {
+    /// Name for the new playlist. Must not be blank.
+    pub name: String,
+    /// The file's format.
+    pub format: ImportFormat,
+    /// The file's text.
+    pub content: String,
+}
+
+/// One entry an import could not match.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ImportUnmatched {
+    /// Title the file gave, or its file name when it gave none.
+    pub title: String,
+    /// Artist the file gave, empty when it gave none.
+    pub artist: String,
+    /// Why the entry was left out.
+    pub reason: ImportUnmatchedReason,
+}
+
+/// Why an import left an entry out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ImportUnmatchedReason {
+    /// The entry names no path, title or artist.
+    NamesNothing,
+    /// No live local file matches it.
+    NoMatch,
+    /// An earlier entry in the file already added that track.
+    Duplicate,
+}
+
+/// Playlist import answer.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ImportPlaylistResponse {
+    /// The new playlist's id.
+    pub playlist_id: String,
+    /// Its name as stored.
+    pub name: String,
+    /// Entries that became playlist tracks.
+    pub matched: usize,
+    /// Entries that did not, in file order.
+    pub unmatched: Vec<ImportUnmatched>,
+    /// Entries past the 10,000 an import reads, counted but not read.
+    pub over_limit: usize,
+}
+
 /// Create-playlist body.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CreatePlaylistBody {
@@ -181,6 +276,35 @@ pub struct VisibilityBody {
     pub is_public: bool,
 }
 
+/// One person a playlist is shared with.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PlaylistMember {
+    /// User id.
+    pub user_id: String,
+    /// Display name.
+    pub display_name: String,
+    /// True when they may change its songs.
+    pub can_edit: bool,
+}
+
+/// The people a playlist is shared with, first shared first.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct MembersResponse {
+    /// Members.
+    pub members: Vec<PlaylistMember>,
+}
+
+/// Share-with body: everyone the playlist is shared with, replacing the
+/// list; empty unshares it from everyone.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct MembersBody {
+    /// User ids.
+    pub user_ids: Vec<String>,
+    /// Those of them who may change its songs.
+    #[serde(default)]
+    pub editor_ids: Vec<String>,
+}
+
 /// One track to add.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct TrackInput {
@@ -196,7 +320,10 @@ pub struct TrackInput {
     pub artist_id: Option<String>,
     /// Library track source id, when known.
     pub track_source_id: Option<String>,
-    /// Cover art URL, when known.
+    /// Cover art address, when known. Kept only when it is one of
+    /// DroppedNeedle's own cover routes (a base path before `/api/v3/` is
+    /// cut off) or an https image on Spotify, Deezer, Last.fm, TheAudioDB or
+    /// YouTube; any other address is dropped and the track is still added.
     pub cover_url: Option<String>,
     /// Preferred source type.
     #[serde(default)]

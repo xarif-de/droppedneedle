@@ -8,13 +8,22 @@
 use droppedneedle_kernel::db::statement::ListLen;
 use droppedneedle_kernel::db::time::Millis;
 
-use droppedneedle_library::owns_group;
+use droppedneedle_auth::listed_user;
+use droppedneedle_library::{copy_of_group, owns_group};
 
 droppedneedle_kernel::sql! {
-    /// The caller may read the playlist: it is theirs, or it is public.
-    fragment READABLE = "(COALESCE(p.user_id = ?1, 0) OR p.is_public != 0)";
+    /// The caller may read the playlist: it is theirs, it is public, or it
+    /// is shared with them.
+    fragment READABLE = "(COALESCE(p.user_id = ?1, 0) OR p.is_public != 0 \
+         OR EXISTS (SELECT 1 FROM catalog_playlist_members m \
+         WHERE m.playlist_id = p.id AND m.user_id = ?1))";
     /// The playlist is the caller's.
     fragment OWNED = "p.user_id = ?1";
+    /// The caller may change the playlist's songs: it is theirs, or it is
+    /// shared with them to edit.
+    fragment EDITABLE = "(COALESCE(p.user_id = ?1, 0) OR EXISTS (SELECT 1 \
+         FROM catalog_playlist_members m WHERE m.playlist_id = p.id AND m.user_id = ?1 \
+         AND m.can_edit = 1))";
     /// One playlist with its aggregates, in `PlaylistRow`'s mapper order.
     fragment PLAYLIST_COLUMNS = "SELECT p.id, p.name, p.user_id, \
          COALESCE(u.display_name, u.username), p.is_public, p.source_ref, \
@@ -26,7 +35,10 @@ droppedneedle_kernel::sql! {
          (SELECT COUNT(*) FROM catalog_playlist_tracks t \
           WHERE t.playlist_id = p.id AND t.library_file_id IS NOT NULL), \
          (SELECT COALESCE(SUM(CAST(t.duration_ms AS REAL)), 0.0) / 1000.0 FROM catalog_playlist_tracks t \
-          WHERE t.playlist_id = p.id AND t.library_file_id IS NOT NULL)";
+          WHERE t.playlist_id = p.id AND t.library_file_id IS NOT NULL), \
+         (SELECT m.can_edit FROM catalog_playlist_members m \
+          WHERE m.playlist_id = p.id AND m.user_id = ?1), \
+         EXISTS (SELECT 1 FROM catalog_playlist_members m WHERE m.playlist_id = p.id)";
     /// The tables a playlist row is read from.
     fragment PLAYLIST_FROM = " FROM catalog_playlists p \
          LEFT JOIN auth_users u ON u.id = p.user_id \
@@ -58,6 +70,10 @@ droppedneedle_kernel::sql! {
     pub(super) GET_OWNED = PLAYLIST_COLUMNS + PLAYLIST_FROM + " WHERE p.id = ?2 AND " + OWNED;
     /// Whether the caller owns playlist `?2`, which they may read.
     pub(super) READABLE_OWNER = "SELECT COALESCE(p.user_id = ?1, 0) FROM catalog_playlists p \
+         WHERE p.id = ?2 AND " + READABLE;
+    /// Whether the caller may change the songs of playlist `?2`, which
+    /// they may read.
+    pub(super) READABLE_EDITOR = "SELECT " + EDITABLE + " FROM catalog_playlists p \
          WHERE p.id = ?2 AND " + READABLE;
     /// The first `?2` entry covers of one playlist `?1`.
     pub(super) PLAYLIST_COVERS = "SELECT cover_url FROM catalog_playlist_tracks \
@@ -93,6 +109,10 @@ droppedneedle_kernel::sql! {
 
     /// Whether playlist `?1` is user `?2`'s.
     pub(super) OWNED_GUARD = "SELECT 1 FROM catalog_playlists WHERE id = ?1 AND user_id = ?2";
+    /// Whether user `?1` may change the songs of playlist `?2`.
+    pub(super) EDIT_GUARD = "SELECT 1 FROM catalog_playlists p WHERE p.id = ?2 AND " + EDITABLE;
+    /// Stamp playlist `?2` as changed at `?1`, milliseconds.
+    pub(super) STAMP = "UPDATE catalog_playlists SET updated_at = ?1 WHERE id = ?2";
     /// Stamp user `?3`'s playlist `?2` as changed at `?1`, milliseconds.
     pub(super) TOUCH = "UPDATE catalog_playlists SET updated_at = ?1 \
          WHERE id = ?2 AND user_id = ?3";
@@ -137,6 +157,102 @@ droppedneedle_kernel::sql! {
     /// An entry's known sources, as a JSON list.
     pub(super) SET_AVAILABLE_SOURCES = "UPDATE catalog_playlist_tracks SET available_sources = ?1 \
          WHERE id = ?2 AND playlist_id = ?3";
+    /// The albums that own entry `e`'s release group.
+    fragment ENTRY_OWNERS = (owns_group!("= lower(e.album_id)"));
+    /// The caller's playlist `?2`'s entries with no source yet, each with
+    /// the indexed library tracks on the albums that own its release group,
+    /// entry by entry in playlist order. An entry's tracks come first from
+    /// the copy a lookup by its group opens, then album by album.
+    pub(super) LIBRARY_COPY_CANDIDATES = "SELECT e.id AS entry_id, e.track_name AS entry_title, \
+         COALESCE(e.disc_number, 1) AS entry_disc, e.track_number AS entry_track, \
+         t.id AS track_id, t.title AS track_title, t.disc_number AS track_disc, \
+         t.track_number AS track_number \
+         FROM catalog_playlist_tracks e JOIN local_tracks t \
+         ON t.local_album_id IN (SELECT album_id FROM (" + ENTRY_OWNERS + ")) \
+         AND +t.availability = 'indexed' \
+         WHERE e.playlist_id = (SELECT p.id FROM catalog_playlists p WHERE p.id = ?2 AND "
+        + OWNED + ") AND e.source_type = '' AND e.library_file_id IS NULL \
+         AND e.album_id IS NOT NULL \
+         ORDER BY e.position, t.local_album_id IS NOT ("
+        + (copy_of_group!("= lower(e.album_id)"))
+        + "), t.local_album_id, t.disc_number, t.track_number, t.id";
+    /// An entry with no source yet and a library track that may be its copy.
+    pub(super) row LibraryCopyCandidate for [LIBRARY_COPY_CANDIDATES] {
+        entry_id: String,
+        entry_title: String,
+        entry_disc: i64,
+        entry_track: Option<i64>,
+        track_id: String,
+        track_title: String,
+        track_disc: i64,
+        track_number: i64,
+    }
+    /// Point entry `?3` of the caller's playlist `?2`, still without a
+    /// source, at library track `?4` while that track is indexed.
+    pub(super) LINK_LIBRARY_COPY = "UPDATE catalog_playlist_tracks SET track_source_id = ?4, \
+         library_file_id = ?4, source_type = 'local', available_sources = '[\"local\"]' \
+         WHERE id = ?3 AND playlist_id = (SELECT p.id FROM catalog_playlists p \
+         WHERE p.id = ?2 AND " + OWNED + ") AND source_type = '' AND library_file_id IS NULL \
+         AND EXISTS (SELECT 1 FROM local_tracks t WHERE t.id = ?4 AND +t.availability = 'indexed')";
+    /// Every playlist, with its owner, holding an entry with no source yet
+    /// whose release group an album with an indexed track owns: the ones a
+    /// link pass opens.
+    pub(super) PLAYLISTS_TO_LINK = "SELECT DISTINCT p.user_id AS user_id, p.id AS playlist_id \
+         FROM catalog_playlist_tracks e JOIN catalog_playlists p ON p.id = e.playlist_id \
+         WHERE e.source_type = '' AND e.library_file_id IS NULL AND e.album_id IS NOT NULL \
+         AND p.user_id IS NOT NULL AND EXISTS (SELECT 1 FROM local_tracks t \
+         WHERE t.local_album_id IN (SELECT album_id FROM (" + ENTRY_OWNERS + ")) \
+         AND +t.availability = 'indexed') ORDER BY p.user_id, p.id";
+    /// A playlist a link pass opens, and its owner.
+    pub(super) row PlaylistToLink for [PLAYLISTS_TO_LINK] {
+        user_id: String,
+        playlist_id: String,
+    }
+    /// What a link pass follows: the library's catalog revision, which
+    /// every change to its albums and tracks moves, and the latest change
+    /// to any playlist, which adding entries moves.
+    pub(super) LINK_MARK = "SELECT COALESCE((SELECT value FROM library_catalog_revision \
+         WHERE singleton = 1), 0) AS catalog_revision, \
+         COALESCE((SELECT MAX(updated_at) FROM catalog_playlists), 0) AS playlists_changed";
+    /// Where the library and the playlists stood at a link pass.
+    pub(super) row LinkMark for [LINK_MARK] {
+        catalog_revision: i64,
+        playlists_changed: i64,
+    }
+    /// The people the caller's playlist `?2` is shared with, first shared
+    /// first: user id, display name and whether they may edit.
+    /// A member whose person did not choose their display name shows as
+    /// "No display name".
+    pub(super) MEMBERS = "SELECT u.id AS user_id, CASE WHEN "
+        + (listed_user!("u"))
+        + " THEN u.display_name ELSE 'No display name' END AS display_name, \
+         m.can_edit AS can_edit FROM catalog_playlist_members m \
+         JOIN auth_users u ON u.id = m.user_id WHERE m.playlist_id = ?2 \
+         AND EXISTS (SELECT 1 FROM catalog_playlists p WHERE p.id = ?2 AND " + OWNED + ") \
+         ORDER BY m.added_at, u.id";
+    /// One person a playlist is shared with.
+    pub(super) row MemberColumns for [MEMBERS] {
+        user_id: String,
+        display_name: String,
+        can_edit: bool,
+    }
+    /// How many of the user ids in the JSON array `?1` name a user the
+    /// user directory lists, or one already sharing playlist `?2`, who
+    /// stays whether or not they chose a display name.
+    pub(super) KNOWN_USERS = "SELECT COUNT(*) FROM auth_users u \
+         WHERE u.id IN (SELECT value FROM json_each(?1)) AND (" + (listed_user!("u"))
+        + " OR EXISTS (SELECT 1 FROM catalog_playlist_members m \
+         WHERE m.playlist_id = ?2 AND m.user_id = u.id))";
+    /// Unshare playlist `?1` from everyone not in the JSON array `?2`.
+    pub(super) DROP_MEMBERS = "DELETE FROM catalog_playlist_members \
+         WHERE playlist_id = ?1 AND user_id NOT IN (SELECT value FROM json_each(?2))";
+    /// Share playlist `?1` with user `?2` at `?3`, milliseconds, who may
+    /// edit when `?4`; one already sharing it keeps when they were added.
+    pub(super) ADD_MEMBER = "INSERT INTO catalog_playlist_members (playlist_id, user_id, added_at, \
+         can_edit) VALUES (?1, ?2, ?3, ?4) \
+         ON CONFLICT DO UPDATE SET can_edit = excluded.can_edit";
+    /// Take user `?2` off playlist `?1`.
+    pub(super) LEAVE = "DELETE FROM catalog_playlist_members WHERE playlist_id = ?1 AND user_id = ?2";
     /// Store or replace one playlist's uploaded cover.
     pub(super) UPSERT_COVER = "INSERT INTO catalog_playlist_covers (playlist_id, content_type, image, \
          updated_at) VALUES (?1, ?2, ?3, ?4) ON CONFLICT (playlist_id) DO UPDATE SET \
@@ -144,6 +260,26 @@ droppedneedle_kernel::sql! {
          updated_at = excluded.updated_at";
     /// Delete one playlist's uploaded cover.
     pub(super) DELETE_COVER = "DELETE FROM catalog_playlist_covers WHERE playlist_id = ?1";
+
+    /// The entries of playlist `?2`, which the caller may read, in order,
+    /// each with its live local file's album artist and path relative to
+    /// its library root. A removed file reads as no file.
+    pub(super) EXPORT_ENTRIES = "SELECT pt.track_name, pt.artist_name, pt.album_name, \
+         t.album_artist_name, pt.duration_ms, t.relative_path \
+         FROM catalog_playlist_tracks pt \
+         LEFT JOIN local_tracks t ON t.id = pt.library_file_id AND "
+        + (crate::local::sql::LIVE_TRACK)
+        + " WHERE pt.playlist_id = (SELECT p.id FROM catalog_playlists p WHERE p.id = ?2 AND "
+        + READABLE + ") ORDER BY pt.position";
+    /// One playlist entry as an export lists it.
+    pub(crate) row PlaylistExportRow for [EXPORT_ENTRIES] {
+        track_name: String,
+        artist_name: String,
+        album_name: String,
+        album_artist_name: Option<String>,
+        duration_ms: Option<i64>,
+        relative_path: Option<String>,
+    }
 
     /// A user's favorites, of one kind `?2` or every kind, newest first.
     pub(super) FAVORITES = "SELECT f.item_id AS item_id, \

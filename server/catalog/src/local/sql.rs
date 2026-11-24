@@ -233,7 +233,8 @@ droppedneedle_kernel::sql! {
         a.album_artist_id AS artist_id, \
         ae.release_group_mbid AS release_group_mbid, ae.release_mbid AS release_mbid, \
         rte.provider_artist_id AS artist_mbid, \
-        (ae.local_album_id IS NOT NULL) AS linked, \
+        (ae.local_album_id IS NOT NULL) AS linked, "
+        + (named_group_guess!("a.id")) + " AS guess_contradicted, \
         COUNT(t.id) AS track_count, \
         COALESCE(SUM(t.duration_seconds), 0.0) AS total_duration_seconds, \
         COALESCE(SUM(t.file_size_bytes), 0) AS total_size_bytes, "
@@ -334,10 +335,12 @@ droppedneedle_kernel::sql! {
     /// The album one release group (`?1`, any case) opens.
     pub(crate) ALBUM_BY_GROUP = "SELECT " + ALBUM_COLUMNS + " " + ALBUM_JOINS
         + " WHERE a.id = (" + (copy_of_group!("= lower(?1)")) + ") GROUP BY a.id";
-    /// Other listed albums of an album's release group, oldest first.
+    /// Other listed albums of an album's release group, oldest first. The
+    /// provider term on `ae` drops the left join, so the lowered group index
+    /// is searched instead of every album.
     pub(crate) ALBUM_COPIES = "SELECT " + ALBUM_COLUMNS + " " + ALBUM_JOINS
-        + " WHERE ae.release_group_mbid = \
-        (SELECT i.release_group_mbid FROM local_album_external_identities i \
+        + " WHERE " + (musicbrainz!("ae")) + " AND lower(ae.release_group_mbid) = \
+        (SELECT lower(i.release_group_mbid) FROM local_album_external_identities i \
          WHERE i.local_album_id = ? AND " + (musicbrainz!("i")) + ") \
         AND a.id != ? AND " + (owned_album!("a"))
         + " GROUP BY a.id ORDER BY a.created_at ASC, a.id ASC";
@@ -479,6 +482,20 @@ droppedneedle_kernel::sql! {
     pub(crate) TRACK_HAS_LYRICS = "SELECT EXISTS (SELECT 1 FROM local_tracks t \
         JOIN local_track_lyrics l ON l.local_track_id = t.id \
         WHERE t.id = (" + CURRENT_TRACK + ") AND " + LIVE_TRACK + ")";
+    /// The identity of every live track, for matching an imported
+    /// playlist: id, root-relative path, folded title, folded artist and
+    /// folded album.
+    pub(crate) IMPORT_TRACKS = "SELECT t.id, t.relative_path, t.title_folded, \
+         t.artist_name_folded, t.album_title_folded FROM local_tracks t \
+         WHERE " + LIVE_TRACK;
+    /// One live track as the playlist import matches it.
+    pub(crate) row ImportTrack for [IMPORT_TRACKS] {
+        id: String,
+        relative_path: String,
+        title_folded: String,
+        artist_name_folded: Option<String>,
+        album_title_folded: String,
+    }
     /// A page of an album's indexed tracks, disc and track order.
     pub(crate) ALBUM_TRACKS = "SELECT " + TRACK_COLUMNS + " " + TRACK_JOINS
         + " WHERE t.local_album_id = ? AND t.availability = 'indexed' \
@@ -649,7 +666,9 @@ droppedneedle_kernel::sql! {
     /// with that state, as the Check albums tabs list them; the last scan
     /// is the newest completed run.
     pub(crate) STATS_EXTRAS = "SELECT \
-        (SELECT COUNT(*) FROM library_identify_reviews WHERE state = 'pending') AS reviews, \
+        (SELECT COUNT(*) FROM library_identify_reviews r JOIN local_albums a \
+         ON a.id = r.local_album_id WHERE r.state = 'pending' AND " + (owned_album!("a")) + ") \
+         AS reviews, \
         (SELECT COUNT(*) FROM local_albums a WHERE " + (owned_album!("a")) + " \
          AND " + (match_flag_state!("a.id", "unconfirmed")) + ") AS guesses, \
         (SELECT COUNT(*) FROM local_albums a WHERE " + (owned_album!("a")) + " \
@@ -679,15 +698,18 @@ droppedneedle_kernel::sql! {
     /// The live album a local id or alias names now: the album itself while
     /// it is live, else the album its alias points at (every merge points
     /// older aliases at the survivor), else the album it was retired into.
-    pub(crate) CURRENT_ALBUM = "SELECT id FROM ( \
-        SELECT id, 0 AS rank FROM local_albums WHERE id = ?1 AND retired_into_album_id IS NULL \
+    pub(crate) CURRENT_ALBUM = "SELECT id FROM (" + ALBUM_ITSELF + " \
         UNION ALL SELECT b.id, 1 FROM local_album_aliases x \
          JOIN local_albums b ON b.id = x.local_album_id \
          WHERE x.alias = lower(?1) AND b.retired_into_album_id IS NULL \
-        UNION ALL SELECT b.id, 2 FROM local_albums a \
-         JOIN local_albums b ON b.id = a.retired_into_album_id \
-         WHERE a.id = ?1 AND b.retired_into_album_id IS NULL) \
-        ORDER BY rank LIMIT 1";
+        UNION ALL " + ALBUM_RETIRED_INTO + ") ORDER BY rank LIMIT 1";
+    /// The album `?1` names while it is live, ranked first.
+    pub(crate) fragment ALBUM_ITSELF = "SELECT id, 0 AS rank FROM local_albums \
+        WHERE id = ?1 AND retired_into_album_id IS NULL";
+    /// The live album `?1` was retired into, ranked after its aliases.
+    pub(crate) fragment ALBUM_RETIRED_INTO = "SELECT b.id, 2 FROM local_albums a \
+        JOIN local_albums b ON b.id = a.retired_into_album_id \
+        WHERE a.id = ?1 AND b.retired_into_album_id IS NULL";
     /// [`CURRENT_ALBUM`] for a list of identifiers at once: each asked
     /// identifier with the album it names now, or NULL.
     family CURRENT_ALBUMS = current_albums;
@@ -718,8 +740,7 @@ droppedneedle_kernel::sql! {
     /// Owned albums identified as one of the releases: album id and the
     /// lowercase release.
     family OWNERS_BY_RELEASE = owners_by_release;
-    /// The album one release group (`?1`, lowercase) opens when no copy is
-    /// owned.
+    /// The album one release group (`?1`, lowercase) opens, owned or not.
     pub(crate) LIVE_COPY_BY_GROUP = (copy_of_group!("= ?1"));
 
     /// Every identified artist credited on an owned album: lowercase MBID
@@ -761,23 +782,35 @@ droppedneedle_kernel::sql! {
         + ") ORDER BY 1";
     /// Request statuses that count as requested on catalog pages: open, not
     /// finished.
-    pub(crate) fragment OPEN_REQUEST = "request_kind = 'album' \
-        AND status IN ('pending','downloading','queued','awaiting_approval')";
+    pub(crate) fragment OPEN_STATUS = "status IN ('pending','downloading','queued','awaiting_approval')";
+    /// An open album request.
+    pub(crate) fragment OPEN_REQUEST = "request_kind = 'album' AND " + OPEN_STATUS;
     /// The album MBIDs among a list with an open request.
     family REQUESTED_IN = requested_in;
+    /// The recording MBIDs among a list with an open request. A song's
+    /// ledger key is its MBID behind `track:`.
+    family REQUESTED_TRACKS_IN = requested_tracks_in;
     /// The live local artist behind one lowercase MBID.
     pub(crate) LOCAL_ARTIST = "SELECT a.display_name FROM local_artist_external_identities e \
         JOIN local_artists a ON a.id = e.local_artist_id \
         WHERE e.provider = 'musicbrainz' AND a.retired_into_artist_id IS NULL \
         AND lower(e.provider_artist_id) = ? LIMIT 1";
-    /// The identified owned albums one artist MBID leads, newest first.
-    pub(crate) LOCAL_ARTIST_ALBUMS = "SELECT e.release_group_mbid, b.title, b.year \
+    /// The release groups one artist MBID leads that an album owns through
+    /// its match row ([`owns_group!`]), newest first: the lowercase group,
+    /// and the title and year of its oldest owning copy, one row per group.
+    /// The bare columns come from the row `MIN(b.created_at)` picks.
+    pub(crate) LOCAL_ARTIST_ALBUMS = "SELECT release_group_mbid, title, year FROM ( \
+        SELECT lower(e.release_group_mbid) AS release_group_mbid, b.title AS title, \
+        b.year AS year, b.title_folded AS title_folded, MIN(b.created_at) \
         FROM local_artist_external_identities ae \
         JOIN local_albums b ON b.album_artist_id = ae.local_artist_id \
         JOIN local_album_external_identities e ON e.local_album_id = b.id AND "
         + (musicbrainz!("e")) + " WHERE lower(ae.provider_artist_id) = ? AND "
         + (musicbrainz!("ae")) + " AND " + (owned_album!("b"))
-        + " ORDER BY b.year IS NULL, b.year DESC, b.title_folded";
+        + " AND EXISTS (SELECT 1 FROM (" + (owns_group!("= lower(e.release_group_mbid)"))
+        + ") owner WHERE owner.album_id = b.id) \
+        GROUP BY lower(e.release_group_mbid)) \
+        ORDER BY year IS NULL, year DESC, title_folded";
     /// The indexed tracks one artist MBID (lowercase) is credited on, on
     /// albums that own a release group by [`owns_group!`], so a lookup by
     /// that group opens the album: title, recording MBID, the lowercase group,
@@ -832,12 +865,18 @@ droppedneedle_kernel::sql! {
     /// total counted at one revision holds until it moves.
     pub(crate) CATALOG_REVISION = "SELECT COALESCE((SELECT value \
         FROM library_catalog_revision WHERE singleton = 1), 0)";
-    /// The release group a library album, or the album it merged into, is
-    /// identified as.
-    pub(crate) GROUP_FOR_ALBUM = "SELECT e.release_group_mbid FROM local_albums b \
-        JOIN local_album_external_identities e \
-          ON e.local_album_id = COALESCE(b.retired_into_album_id, b.id) AND "
-        + (musicbrainz!("e")) + " WHERE b.id = ? LIMIT 1";
+    /// The release group the album a local id or alias names now is
+    /// identified as, in [`CURRENT_ALBUM`]'s order. A v2 release-group
+    /// alias is left out: it is a real MusicBrainz id, asked as one.
+    pub(crate) GROUP_FOR_ALBUM = "SELECT e.release_group_mbid \
+        FROM local_album_external_identities e WHERE e.local_album_id = ( \
+        SELECT id FROM (" + ALBUM_ITSELF + " \
+        UNION ALL SELECT b.id, 1 FROM local_album_aliases x \
+         JOIN local_albums b ON b.id = x.local_album_id \
+         WHERE x.alias = lower(?1) AND x.kind <> 'legacy_release_group' \
+         AND b.retired_into_album_id IS NULL \
+        UNION ALL " + ALBUM_RETIRED_INTO + ") ORDER BY rank LIMIT 1) AND "
+        + (musicbrainz!("e")) + " LIMIT 1";
 
     /// A player track's columns over [`PLAYER_TRACK_JOINS`]: every tag a
     /// player shows, all genres joined by the unit separator.
@@ -2018,6 +2057,16 @@ pub(crate) fn requested_in(ids: ListLen) -> String {
     format!(
         "SELECT musicbrainz_id_lower FROM request_history \
          WHERE {OPEN_REQUEST} AND musicbrainz_id_lower IN ({})",
+        marks(ids)
+    )
+}
+
+/// The recording MBIDs among `ids` ledger keys (`track:` and the lowercase
+/// MBID) with an open request.
+pub(crate) fn requested_tracks_in(ids: ListLen) -> String {
+    format!(
+        "SELECT substr(musicbrainz_id_lower, 7) FROM request_history \
+         WHERE request_kind = 'track' AND {OPEN_STATUS} AND musicbrainz_id_lower IN ({})",
         marks(ids)
     )
 }

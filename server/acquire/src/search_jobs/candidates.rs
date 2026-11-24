@@ -16,6 +16,7 @@
 //! What cannot be fetched at all (blocklisted, password-protected, past
 //! retention, nothing importable) is never listed.
 
+use droppedneedle_library::tags::format_for_extension;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
@@ -82,6 +83,9 @@ pub enum CandidateNoteCode {
     Complete,
     /// The folder misses some of the edition's tracks.
     Incomplete,
+    /// The folder holds the whole edition, but a file's name gives another
+    /// title than the track it fills.
+    TitleConflict,
     /// Some track lengths are off the edition's.
     Lengths,
     /// The search does not show the quality of some files.
@@ -252,6 +256,13 @@ impl Candidate {
     /// Outside the download settings: automatic picks never take it.
     pub fn is_refused(&self) -> bool {
         !self.view.refusal.is_empty()
+    }
+
+    /// A folder that holds none of the release's tracks: it shows the
+    /// tracklist and matched none of it, so it is not a copy of the album.
+    /// Sources that do not count tracks never report this.
+    pub fn holds_nothing(&self) -> bool {
+        self.view.tracks_total.is_some_and(|total| total > 0) && self.view.tracks_matched == Some(0)
     }
 
     /// The reason the page names first, when it is refused.
@@ -545,38 +556,59 @@ fn folder_note(pick: &FolderPick) -> (CandidateTier, CandidateNote) {
             "The search does not show the quality of some files.".to_owned(),
         );
     }
-    (
-        CandidateTier::Recommended,
-        CandidateNote::new(
+    // A title conflict only says what the folder looks like: the ranking
+    // already puts it after a folder whose names agree.
+    let note = match pick.title_conflicts.as_slice() {
+        [] => CandidateNote::new(
             CandidateNoteCode::Complete,
             format!("Holds all {} tracks of this edition.", pick.total),
         ),
-    )
+        [one] => CandidateNote::new(
+            CandidateNoteCode::TitleConflict,
+            format!(
+                "Holds all {} tracks of this edition, but \"{}\" fills \"{}\" under another title.",
+                pick.total, one.file, one.title
+            ),
+        ),
+        [first, ..] => CandidateNote::new(
+            CandidateNoteCode::TitleConflict,
+            format!(
+                "Holds all {} tracks of this edition, but {} files fill tracks under other titles, such as \"{}\" for \"{}\".",
+                pick.total,
+                pick.title_conflicts.len(),
+                first.file,
+                first.title
+            ),
+        ),
+    };
+    (CandidateTier::Recommended, note)
 }
 
-/// `FLAC 24-bit`, `MP3 320` and so on, from the folder's files: the lowest
-/// bitrate of lossy files, the highest bit depth of lossless ones.
+/// Use the lowest bitrate of lossy tracks or the highest bit depth of
+/// lossless tracks. When formats differ, list the formats.
 fn soulseek_format(files: &[SearchResult]) -> Option<String> {
-    let first = files.first()?;
-    let extension = first.extension.to_ascii_uppercase();
-    if extension.is_empty() {
-        return None;
+    let audio = files.iter().filter_map(|file| {
+        format_for_extension(&file.extension).map(|format| (format.as_str(), file))
+    });
+    let mut formats: Vec<_> = audio.clone().map(|(format, _)| format).collect();
+    formats.sort_unstable();
+    formats.dedup();
+    let format = *formats.first()?;
+    if formats.len() > 1 {
+        return Some(formats.join(" / ").to_ascii_uppercase());
     }
-    let lossless = matches!(
-        extension.as_str(),
-        "FLAC" | "ALAC" | "WAV" | "APE" | "WV" | "AIFF" | "AIF"
-    );
-    if lossless {
-        let depth = files.iter().filter_map(|file| file.bit_depth).max();
+    let label = format.to_ascii_uppercase();
+    if matches!(format, "flac" | "wav") {
+        let depth = audio.filter_map(|(_, file)| file.bit_depth).max();
         return Some(match depth {
-            Some(depth) if depth > 0 => format!("{extension} {depth}-bit"),
-            _ => extension,
+            Some(depth) if depth > 0 => format!("{label} {depth}-bit"),
+            _ => label,
         });
     }
-    let bitrate = files.iter().filter_map(|file| file.bitrate).min();
+    let bitrate = audio.filter_map(|(_, file)| file.bitrate).min();
     Some(match bitrate {
-        Some(bitrate) if bitrate > 0 => format!("{extension} {bitrate}"),
-        _ => extension,
+        Some(bitrate) if bitrate > 0 => format!("{label} {bitrate}"),
+        _ => label,
     })
 }
 

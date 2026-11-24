@@ -29,11 +29,14 @@ use super::artist_links::{self, ArtistLink, ArtistLinkError};
 use super::merged_ids;
 use super::models::{
     AlbumIdentity, Alias, AliasKind, AutomaticSeal, CandidateEvidence, FingerprintState,
-    IdentifyJob, JobState, LocalAlbumFacts, LocalTrackFacts, MatchFlag, ReviewItem, ReviewState,
-    TrackIdentity,
+    IdentifyJob, IdentifyKind, JobState, LocalAlbumFacts, LocalTrackFacts, MatchFlag, ReviewItem,
+    ReviewState, TrackIdentity,
 };
 pub(crate) use super::queue::bump_identification_stream;
-use super::queue::{INSERT_JOB, idempotency_key};
+use super::queue::{
+    Answering, INSERT_JOB, MAX_BACKOFF_SECONDS, MAX_DEFERRAL_ATTEMPTS, idempotency_key,
+    outage_cutoffs, queue_retry,
+};
 pub use super::queue::{album_input_revision, offer_album};
 use super::sources::ArtistAnswer;
 use super::stores::{Approval, AttemptLanding, RELEASE_FRESH_SECS, StoreError, land_job};
@@ -43,8 +46,8 @@ use crate::corrections::artist_convergence::{
 };
 use crate::corrections::continuation::{DRAIN_BOUND, Scope, continue_tracks, drain_continuations};
 use crate::identify::sql::{
-    AlbumFactTrack, AlbumFactsRow, DocumentCopy, JobRow, LAND_JOB, MatchFlagRow, ReviewRow,
-    StoredDocument, StoredFingerprint,
+    AlbumFactTrack, AlbumFactsRow, DocumentCopy, JobRow, LAND_JOB, MatchFlagRow, OUTAGE_PROBE,
+    OutageProbe, REQUEUE_PROBE, REQUEUE_WAITED_OUT, ReviewRow, StoredDocument, StoredFingerprint,
 };
 pub(crate) use crate::identity::follow::{
     chosen_matches_differ, match_chosen, merge_moves_match, release_chosen, settle_followed_match,
@@ -286,6 +289,9 @@ impl SqliteIdentifyStore {
         job: &IdentifyJob,
     ) -> Result<Option<(AutomaticOutcome, IdentifyJob)>, StoreError> {
         self.land_with("identify.seal_automatic", job, |tx| {
+            if declined_for(tx, job, &seal.local_album_id)? {
+                return Ok(AutomaticOutcome::PersonsChoice);
+            }
             identity::seal_automatic(
                 tx,
                 seal,
@@ -310,6 +316,9 @@ impl SqliteIdentifyStore {
         job: &IdentifyJob,
     ) -> Result<Option<(AutomaticOutcome, IdentifyJob)>, StoreError> {
         self.land_with("identify.retract", job, |tx| {
+            if declined_for(tx, job, local_album_id)? {
+                return Ok(AutomaticOutcome::PersonsChoice);
+            }
             identity::retract(
                 tx,
                 local_album_id,
@@ -321,6 +330,48 @@ impl SqliteIdentifyStore {
                 },
             )
         })
+    }
+
+    /// Give the album's carried match of `group` the edition `release` and
+    /// land the job, in one transaction ([`identity::fill_carried_edition`]);
+    /// as [`seal_and_land`](Self::seal_and_land) for moved files and a lost
+    /// lease.
+    pub fn fill_carried_and_land(
+        &self,
+        local_album_id: &str,
+        group: &str,
+        release: &str,
+        input_revision: &str,
+        job: &IdentifyJob,
+    ) -> Result<Option<(AutomaticOutcome, IdentifyJob)>, StoreError> {
+        self.land_with("identify.fill_carried_edition", job, |tx| {
+            identity::fill_carried_edition(
+                tx,
+                local_album_id,
+                group,
+                release,
+                Inputs {
+                    input_revision,
+                    now: self.clock.now_secs(),
+                },
+            )
+        })
+    }
+
+    /// The lowered release group of the album's match carried over from
+    /// v2 with no edition, while identification may still give it one;
+    /// `None` otherwise.
+    pub fn carried_edition_open(&self, local_album_id: &str) -> Result<Option<String>, StoreError> {
+        self.db
+            .read_blocking("identify.carried_edition_open", |conn| {
+                Ok(conn
+                    .query_row(
+                        crate::identify::sql::CARRIED_EDITION_GROUP.text(),
+                        params![local_album_id, PROVIDER],
+                        |row| row.get(0),
+                    )
+                    .optional()?)
+            })
     }
 
     /// Run `work` and land `job` after it on one transaction. Files that
@@ -338,10 +389,20 @@ impl SqliteIdentifyStore {
             let outcome = work(tx)?;
             let mut landed = job.clone();
             if outcome == AutomaticOutcome::InputMoved {
+                let now_ms = self.clock.now_ms().max(0);
+                // A person's attempt hands over to a job that is theirs too.
+                if job.kind == IdentifyKind::Manual {
+                    queue_retry(
+                        tx,
+                        &job.local_album_id,
+                        job.requested_by_user_id.as_deref(),
+                        now_ms,
+                    )?;
+                }
                 land_job(
                     &mut landed,
                     AttemptLanding::Failed,
-                    self.clock.now_ms().max(0) as u64,
+                    now_ms as u64,
                     Some("INPUT_MOVED"),
                 );
             }
@@ -374,6 +435,16 @@ impl SqliteIdentifyStore {
             })
     }
 
+    /// True when the album carries the flag a person's decline left: they
+    /// took its match off, or an admin undid its automatic edition and
+    /// nothing was put back. Identification leaves such an album alone
+    /// until a person asks it to look again.
+    pub fn declined(&self, local_album_id: &str) -> Result<bool, StoreError> {
+        self.db.read_blocking("identify.declined", |conn| {
+            Ok(album_declined(conn, local_album_id)?)
+        })
+    }
+
     /// The album's match flag, if identification is unsure of it.
     pub fn match_flag(&self, local_album_id: &str) -> Result<Option<MatchFlag>, StoreError> {
         self.db.read_blocking("identify.match_flag", |conn| {
@@ -402,6 +473,21 @@ impl SqliteIdentifyStore {
                 .optional()?)
         })
     }
+}
+
+fn album_declined(conn: &Connection, local_album_id: &str) -> rusqlite::Result<bool> {
+    conn.prepare_cached(crate::identify::sql::ALBUM_DECLINED.text())?
+        .query_row(params![local_album_id], |row| row.get(0))
+}
+
+/// A job no person asked for, on an album a person declined: the seal or
+/// retraction it would land writes nothing.
+fn declined_for(
+    tx: &Transaction<'_>,
+    job: &IdentifyJob,
+    local_album_id: &str,
+) -> rusqlite::Result<bool> {
+    Ok(job.kind != IdentifyKind::Manual && album_declined(tx, local_album_id)?)
 }
 
 /// Why a landing wrote nothing.
@@ -1538,6 +1624,90 @@ impl SqliteIdentifyStore {
                 .query_row(crate::identify::sql::JOB.text(), params![job_id], map_job)
                 .optional()?)
         })
+    }
+
+    /// Queue one job that ran out of deferrals on an outage again, to see
+    /// whether the outside services answer: the one waiting longest, and
+    /// only while no job on an outage code is live and none landed in the
+    /// ladder's last step. Its id and the code it waited out, or `None`
+    /// when no probe is due.
+    pub fn probe_after_outage(&self, now_ms: u64) -> Result<Option<(String, String)>, StoreError> {
+        let [(c1, t1), (c2, t2), (c3, t3)] = outage_cutoffs(
+            now_ms,
+            Answering {
+                musicbrainz: true,
+                acoustid: true,
+            },
+        );
+        let quiet_since = now_ms as i64 - (MAX_BACKOFF_SECONDS * 1000) as i64;
+        let pick = |conn: &Connection| {
+            conn.query_row(
+                OUTAGE_PROBE.text(),
+                params![c1, t1, c2, t2, c3, t3, quiet_since],
+                OutageProbe::read,
+            )
+            .optional()
+        };
+        // The idle loop asks every few seconds and nearly always finds
+        // nothing, so it asks a reader first.
+        if self
+            .db
+            .read_blocking("identify.outage_probe", |conn| {
+                Ok::<_, StoreError>(pick(conn)?)
+            })?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        self.db
+            .write_blocking(Lane::Background, "identify.outage_probe", |tx| {
+                changing(tx, |tx| {
+                    let Some(probe) = pick(tx)? else {
+                        return Ok(None);
+                    };
+                    tx.execute(
+                        REQUEUE_PROBE.text(),
+                        params![probe.id, MAX_DEFERRAL_ATTEMPTS - 1, now_ms as i64],
+                    )?;
+                    bump_identification_stream(tx)?;
+                    Ok(Some((probe.id, probe.failure_code)))
+                })
+            })
+            .map(|written| self.landed(written))
+    }
+
+    /// Queue again, for one attempt each, the jobs that ran out of
+    /// deferrals on an outage of a service `answering` covers and are due.
+    /// How many were queued.
+    pub fn requeue_after_outage(
+        &self,
+        now_ms: u64,
+        answering: Answering,
+    ) -> Result<usize, StoreError> {
+        let [(c1, t1), (c2, t2), (c3, t3)] = outage_cutoffs(now_ms, answering);
+        self.db
+            .write_blocking(Lane::Background, "identify.requeue_after_outage", |tx| {
+                changing(tx, |tx| {
+                    let queued = tx.execute(
+                        REQUEUE_WAITED_OUT.text(),
+                        params![
+                            c1,
+                            t1,
+                            c2,
+                            t2,
+                            c3,
+                            t3,
+                            MAX_DEFERRAL_ATTEMPTS - 1,
+                            now_ms as i64
+                        ],
+                    )?;
+                    if queued > 0 {
+                        bump_identification_stream(tx)?;
+                    }
+                    Ok(queued)
+                })
+            })
+            .map(|written| self.landed(written))
     }
 
     pub fn jobs_for_album(&self, local_album_id: &str) -> Result<Vec<IdentifyJob>, StoreError> {

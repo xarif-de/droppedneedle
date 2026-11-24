@@ -8,6 +8,7 @@ use droppedneedle_kernel::db::time::Millis;
 use super::artist_links::ProofSubject;
 use super::models::{IdentifyKind, JobState, MatchFlagState, ReviewState};
 use crate::identity::DecisionSource;
+use crate::identity::sql::CARRIED_EDITION_OPEN;
 use crate::identity::sql::PERSONS;
 use crate::identity::sql::REVISABLE;
 use crate::identity::sql::accepted;
@@ -167,9 +168,42 @@ droppedneedle_kernel::sql! {
     pub(super) WAITING_JOB_FOR_RETRY = "SELECT id FROM library_identify_jobs \
              WHERE local_album_id = ?1 AND state IN ('queued','deferred') \
              ORDER BY input_revision <> ?2, created_at LIMIT 1";
+    /// Wake waiting job `?4` for a person's retry: it takes revision `?1`
+    /// and key `?2`, runs from `?3` at priority `?5` or better, and becomes
+    /// a manual job asked for by `?6` (an unknown user keeps the requester).
     pub(super) BRING_RETRY_FORWARD = "UPDATE OR IGNORE library_identify_jobs SET input_revision = ?1, \
              idempotency_key = ?2, not_before_at = MIN(not_before_at, ?3), \
-             priority = MIN(priority, ?5), updated_at = ?3 WHERE id = ?4";
+             priority = MIN(priority, ?5), kind = 'manual', \
+             requested_by_user_id = COALESCE((SELECT id FROM auth_users WHERE id = ?6), \
+             requested_by_user_id), updated_at = ?3 WHERE id = ?4";
+    /// How many backlog identify jobs were queued after `?1`.
+    pub(super) BACKLOG_QUEUED_SINCE = "SELECT COUNT(*) FROM library_identify_jobs \
+             WHERE kind = 'historical' AND created_at > ?1";
+    /// Albums due another look at `?1`, longest waiting first, at most
+    /// `?2`: listed, unmatched or guessed, not declined, with no custom
+    /// edition, no person's match and no job waiting, running or in
+    /// Attention. One is due once its last job is older than `?3`, `?4`,
+    /// `?5` or `?6` after its first to fourth finished look, then `?7`.
+    pub(super) RELOOK_DUE = "SELECT b.id FROM local_albums b \
+         WHERE " + (crate::owned_album!("b")) + " AND " + (crate::match_flagged!("b.id")) + " \
+         AND NOT " + (crate::declined_flag!("b.id")) + " \
+         AND NOT EXISTS (SELECT 1 FROM library_custom_edition_active c \
+             WHERE c.local_album_id = b.id) \
+         AND NOT EXISTS (SELECT 1 FROM local_album_external_identities e \
+             WHERE e.local_album_id = b.id AND e.provider = 'musicbrainz' \
+             AND e.decision_source IN " + PERSONS + ") \
+         AND NOT EXISTS (SELECT 1 FROM library_identify_jobs w WHERE w.local_album_id = b.id \
+             AND w.state IN ('queued','running','deferred','attention')) \
+         AND COALESCE((SELECT max(l.updated_at) FROM library_identify_jobs l \
+             WHERE l.local_album_id = b.id), 0) \
+           + CASE (SELECT COUNT(*) FROM library_identify_jobs s \
+             WHERE s.local_album_id = b.id AND s.state = 'succeeded') \
+             WHEN 0 THEN ?3 WHEN 1 THEN ?3 WHEN 2 THEN ?4 WHEN 3 THEN ?5 WHEN 4 THEN ?6 \
+             ELSE ?7 END <= ?1 \
+         ORDER BY COALESCE((SELECT max(l.updated_at) FROM library_identify_jobs l \
+             WHERE l.local_album_id = b.id), 0), b.id LIMIT ?2";
+    /// The album (`?1`) carries the flag a person's decline left.
+    pub(super) ALBUM_DECLINED = "SELECT " + (crate::declined_flag!("?1"));
     pub(super) BUMP_IDENTIFICATION_STREAM = "INSERT INTO library_event_stream_revisions (stream_kind, value) \
          VALUES ('identification', 1) \
          ON CONFLICT (stream_kind) DO UPDATE SET value = value + 1";
@@ -184,6 +218,12 @@ droppedneedle_kernel::sql! {
                  AND json_extract(after_json, '$.outcome') = 'restored' \
                  AND lower(json_extract(before_json, '$.identity.release_group_mbid')) \
                      = lower(?2))";
+    /// The lowered release group of the album's (`?1`, provider `?2`)
+    /// carried match with no edition, while it may be given one.
+    pub(super) CARRIED_EDITION_GROUP = "SELECT lower(i.release_group_mbid) FROM local_albums a \
+                 JOIN local_album_external_identities i \
+                     ON i.local_album_id = a.id AND i.provider = ?2 \
+                 WHERE a.id = ?1 AND " + CARRIED_EDITION_OPEN;
     pub(super) MATCH_FLAG = "SELECT state, reason_code, release_mbid, candidates_json \
                      FROM library_album_match_state WHERE local_album_id = ?1";
     pub(super) ALBUM_FACTS = "SELECT title, COALESCE(album_artist_name, '') AS album_artist_name, is_compilation, year \
@@ -390,6 +430,36 @@ droppedneedle_kernel::sql! {
                                  AND NOT EXISTS (SELECT 1 FROM library_work_control \
                                      WHERE queue_kind = 'identification' AND state = 'paused') \
                                  ORDER BY priority, created_at, rowid LIMIT 1";
+    /// Job `j` ran out of deferrals on an outage and is due again: it is
+    /// in Attention with code `?1`, `?3` or `?5`, landed at or before that
+    /// code's cutoff (`?2`, `?4`, `?6`), and is its album's newest job with
+    /// no other job live on the album. A person's own job on an album
+    /// whose match they have since taken off waits for them.
+    pub(super) fragment WAITED_OUT = "j.state = 'attention' \
+     AND ((j.failure_code = ?1 AND j.updated_at <= ?2) OR (j.failure_code = ?3 AND j.updated_at <= ?4) \
+      OR (j.failure_code = ?5 AND j.updated_at <= ?6)) \
+     AND NOT EXISTS (SELECT 1 FROM library_identify_jobs o \
+      WHERE o.local_album_id = j.local_album_id AND o.id <> j.id \
+      AND (o.state IN ('queued','running','deferred') OR o.updated_at > j.updated_at \
+       OR (o.updated_at = j.updated_at AND o.rowid > j.rowid))) \
+     AND NOT (j.kind = 'manual' AND " + (crate::declined_flag!("j.local_album_id")) + ")";
+    /// The job to try first after an outage: the one waiting longest, while
+    /// no job on an outage code is live and none landed after `?7`.
+    pub(super) OUTAGE_PROBE = "SELECT j.id, j.failure_code FROM library_identify_jobs j \
+     WHERE " + WAITED_OUT + " \
+     AND NOT EXISTS (SELECT 1 FROM library_identify_jobs l \
+      WHERE l.failure_code IN (?1, ?3, ?5) \
+      AND (l.state IN ('queued','running','deferred') OR (l.state = 'attention' AND l.updated_at > ?7))) \
+     ORDER BY j.updated_at, j.rowid LIMIT 1";
+    /// Queue job `?1` again after an outage, for one attempt (`?2`
+    /// attempts spent) from `?3`.
+    pub(super) REQUEUE_PROBE = "UPDATE library_identify_jobs SET state = 'queued', attempts = ?2, \
+     not_before_at = ?3, lease_expires_at = NULL, updated_at = ?3 WHERE id = ?1";
+    /// Queue every job due after an outage again, for one attempt (`?7`
+    /// attempts spent) from `?8`.
+    pub(super) REQUEUE_WAITED_OUT = "UPDATE library_identify_jobs SET state = 'queued', attempts = ?7, \
+     not_before_at = ?8, lease_expires_at = NULL, updated_at = ?8 \
+     WHERE id IN (SELECT j.id FROM library_identify_jobs j WHERE " + WAITED_OUT + ")";
     pub(super) JOB = "SELECT " + JOB_COLUMNS + " FROM library_identify_jobs WHERE id = ?1";
     pub(super) JOBS_FOR_ALBUM = "SELECT " + JOB_COLUMNS + " FROM library_identify_jobs \
                  WHERE local_album_id = ?1 ORDER BY created_at, rowid";
@@ -520,7 +590,13 @@ droppedneedle_kernel::sql! {
         id: Option<String>,
         selected_at: Millis,
     }
-    pub(super) row NamedArtist for [SHARING, FOLLOWS_OUT, FOLLOWS_IN] {
+    /// The live ordinary records (sentinels `?2`, `?3`) with record `?1`'s
+    /// folded name, `?1` among them while it is one.
+    pub(super) NAMESAKES = "SELECT n.id, n.display_name FROM local_artists a \
+         JOIN local_artists n ON n.folded_name = a.folded_name \
+         WHERE a.id = ?1 AND n.retired_into_artist_id IS NULL AND n.kind <> 'various_artists' \
+         AND n.id NOT IN (?2, ?3) ORDER BY n.created_at, n.id";
+    pub(super) row NamedArtist for [SHARING, FOLLOWS_OUT, FOLLOWS_IN, NAMESAKES] {
         id: String,
         display_name: String,
     }
@@ -536,6 +612,10 @@ droppedneedle_kernel::sql! {
         requested_by_user_id: Option<String>,
         failure_code: Option<String>,
         lease_expires_at: Option<Millis>,
+    }
+    pub(super) row OutageProbe for [OUTAGE_PROBE] {
+        id: String,
+        failure_code: String,
     }
     pub(super) row ReviewRow for [GET, PENDING_FOR_ALBUM] {
         id: String,

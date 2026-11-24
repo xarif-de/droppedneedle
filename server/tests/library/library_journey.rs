@@ -309,15 +309,15 @@ impl Rig {
     /// Wait until the app is done with the edition a person chose for the
     /// album. Approving a candidate that names only a release queues the
     /// placing of the album's files for the operations loop. When it gets
-    /// there it places them, or hands the album back to automatic choice,
-    /// and either way moves the album's identity and the catalog revision:
-    /// a preview sealed before then is stale, and an Undo after it is
-    /// blocked. A tag write asked for before then is refused with the
-    /// message a person sees, so a journey waits here before it writes.
+    /// there it places them, or keeps the choice and says why they are not
+    /// on it, and either way moves the catalog revision: a preview sealed
+    /// before then is stale. A tag write asked for before then is refused
+    /// with the message a person sees, so a journey waits here before it
+    /// writes.
     async fn edition_settled(&self, album: &str) {
         let db = self.app.db();
         self.app
-            .until("the chosen edition is placed or handed back", || {
+            .until("the chosen edition is placed or kept unplaced", || {
                 let waiting: i64 = db
                     .query_row(
                         "SELECT COUNT(*) FROM library_edition_remap_queue \
@@ -491,7 +491,7 @@ fn file_edition_review(store: &SqliteIdentifyStore, album_id: &str) -> String {
         penalties: Vec::new(),
     };
     let id = format!("rev-{album_id}");
-    droppedneedle_library::identify::review::file_review(
+    droppedneedle_library::test_support::file_review(
         store,
         &id,
         album_id,
@@ -1440,7 +1440,7 @@ async fn an_editions_tags_are_written_as_the_folders_profile_says() {
         .expect("files")
         .iter()
         .find(|file| file["path"] == json!("album-e/01.flac"))
-        .expect("the first file is planned")
+        .unwrap_or_else(|| panic!("the first file is planned: {planned}"))
         .clone();
     let change = |field: &str| {
         first["changes"]
@@ -4000,6 +4000,59 @@ async fn library_journey_undo_automatic_edition() {
     let (status, _) = app.call("POST", &undo, &headers, Some(fresh)).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "an undo is used once");
 
+    // A change to the files does not bring the undone match back:
+    // identification leaves the album alone and asks MusicBrainz nothing.
+    let recalls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    {
+        let recalls = recalls.clone();
+        let release = release.clone();
+        scripted.recall_from(move |_| {
+            recalls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            RecallResult {
+                releases: vec![release.clone()],
+                ..RecallResult::default()
+            }
+        });
+    }
+    let flag_and_reviews = || -> (String, i64, i64) {
+        app.db()
+            .query_row(
+                "SELECT state || ':' || reason_code, updated_at, \
+                 (SELECT COUNT(*) FROM library_identify_reviews WHERE local_album_id = ?1) \
+                 FROM library_album_match_state WHERE local_album_id = ?1",
+                [&album],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("the album is flagged")
+    };
+    let before = flag_and_reviews();
+    assert_eq!(before.0, "unmatched:AUTOMATIC_EDITION_UNDONE");
+    {
+        use droppedneedle_library::tags::TagField;
+        use droppedneedle_library::tags::save::{TagEdit, save_tags};
+        save_tags(
+            &music.join("album-r/01.flac"),
+            &[TagEdit::verbatim(
+                TagField::Genre,
+                vec!["Edited".to_owned()],
+            )],
+        )
+        .expect("retagged outside the app");
+    }
+    let (status, body) = app
+        .call(
+            "POST",
+            &format!("/api/v3/library/albums/{album}/rescan"),
+            &headers,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    rig.identified(&album, 1).await;
+    assert!(rig.identify_store.album_identity(&album).unwrap().is_none());
+    assert_eq!(flag_and_reviews(), before, "flag and reviews as they were");
+    assert_eq!(recalls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
     // Retrying the review identifies the album again, as a scan would,
     // and the job that asked for it finishes. The same request sent again
     // answers the job the first one started.
@@ -5210,6 +5263,7 @@ async fn an_upgrade_held_for_one_file_keeps_that_files_old_copy() {
                     path: source,
                     track: index,
                     replaces,
+                    set_aside: false,
                 }
             })
             .collect();
@@ -5356,6 +5410,7 @@ async fn an_upgrade_plans_again_when_a_replaced_track_comes_back() {
                 path: source,
                 track: 0,
                 replaces,
+                set_aside: false,
             }],
             extras: Vec::new(),
             actor: None,
@@ -6173,6 +6228,7 @@ async fn a_switched_off_library_takes_no_file_changes() {
                 path: download.clone(),
                 track: 0,
                 replaces: Vec::new(),
+                set_aside: false,
             }],
             extras: Vec::new(),
             actor: None,
@@ -6713,13 +6769,21 @@ async fn an_album_without_files_leaves_the_lists() {
 /// A heart and rating on a copy whose files are gone follow to the copy
 /// with files; that copy keeps its own rating; plays stay; a local-only
 /// album keeps its heart; the copy's history shows the move. A copy whose
-/// files Put back can still bring home keeps its heart.
+/// files Put back can still bring home keeps its heart. The marks wait a
+/// day after the files went missing, so a share that was briefly not
+/// mounted moves nothing.
 #[tokio::test]
 async fn marks_on_a_copy_without_files_follow_to_the_copy_with_files() {
+    use droppedneedle_kernel::clock::Clock as _;
+    use droppedneedle_kernel::test_support::ManualClock;
     use droppedneedle_library::http::history::album_history_view;
     use droppedneedle_library::removal::Mutations;
 
-    let (scratch, library, music) = bare_library("lib-marks-follow-copy").await;
+    let clock = Arc::new(ManualClock::at(
+        droppedneedle_kernel::clock::SystemClock.now_ms(),
+    ));
+    let (scratch, library, music) =
+        bare_library_at("lib-marks-follow-copy", None, clock.clone()).await;
     for folder in ["gone", "kept", "local", "binned"] {
         plant(&music, &format!("{folder}/01.flac"), "flac_full_01.flac");
     }
@@ -6774,11 +6838,26 @@ async fn marks_on_a_copy_without_files_follow_to_the_copy_with_files() {
     std::fs::remove_dir_all(music.join("local")).expect("the local album's folder is deleted");
     rescan(&library).await;
     let worker = crate::common::library::repair_worker(&library);
-    for _ in 0..20 {
-        if !droppedneedle_library::repairs::tick(&worker, "worker").await {
-            break;
+    let settle = || async {
+        for _ in 0..20 {
+            if !droppedneedle_library::repairs::tick(&worker, "worker").await {
+                break;
+            }
         }
-    }
+    };
+    clock.advance(3_600_000);
+    settle().await;
+    let mut waiting = vec![gone.clone(), local.clone(), binned.clone()];
+    waiting.sort();
+    assert_eq!(
+        read("SELECT item_id FROM catalog_user_favorites ORDER BY item_id"),
+        waiting,
+        "an hour after the files went missing the heart stays"
+    );
+
+    clock.advance(86_400_000);
+    rescan(&library).await;
+    settle().await;
 
     let mut hearts = vec![kept.clone(), local.clone(), binned.clone()];
     hearts.sort();
@@ -8480,8 +8559,10 @@ async fn custom_edition_is_sealed_on_the_album_and_undone() {
 /// "Leave unmanaged" made directly on an automatically matched album: a
 /// stale revision changes nothing; otherwise the release goes, the group
 /// stays as the person's choice, the album is held as their choice and a
-/// queued placement is dropped. Undo brings the release and placements
-/// back and lifts the hold, or keeps a hold the person had set before.
+/// queued placement is dropped. Only an admin's Undo lifts it, as only an
+/// admin may "Manage it again"; a trusted user's is refused and changes
+/// nothing. Undo brings the release and placements back and lifts the
+/// hold, or keeps a hold the person had set before.
 /// "Manage it again" lifts it too.
 #[tokio::test]
 async fn leave_unmanaged_on_the_album_and_undo() {
@@ -8584,6 +8665,35 @@ async fn leave_unmanaged_on_the_album_and_undo() {
     );
     assert_eq!(catalog_actions(&db, &album, "leave_unmanaged"), 1);
 
+    // A trusted user may not lift it.
+    let trusted = app.login_user("tris").await;
+    let (status, body) = app
+        .call(
+            "PUT",
+            &format!("/api/v3/admin/users/{}/role", trusted.user_id),
+            &headers,
+            Some(json!({"role": "trusted"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = app
+        .call(
+            "POST",
+            &format!("{edition}/undo"),
+            &[("authorization", trusted.authorization.as_str())],
+            Some(json!({
+                "expected_identity_revision": edition_revision(app, &headers, &album).await,
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"]["code"], json!("FORBIDDEN"));
+    assert_eq!(identity(), left);
+    assert_eq!(
+        management_hold(app, &headers, &album).await["kind"],
+        json!("your_choice")
+    );
+
     // Undo: the release and its placements are back, the hold is lifted.
     let (status, body) = app
         .call(
@@ -8601,8 +8711,9 @@ async fn leave_unmanaged_on_the_album_and_undo() {
     assert_eq!(match_state().as_deref(), Some("unconfirmed"));
     assert_eq!(management_hold(app, &headers, &album).await, Value::Null);
 
-    // A hold the person set before stays through the undo, and "Manage it
-    // again" lifts it.
+    // A hold the person set before stays through the undo, which a trusted
+    // user may then make since it lifts nothing, and "Manage it again"
+    // lifts it.
     app.seed_with(EXCLUDE_BY_HAND, [&album]).await;
     let (status, body) = app
         .call(
@@ -8617,7 +8728,7 @@ async fn leave_unmanaged_on_the_album_and_undo() {
         .call(
             "POST",
             &format!("{edition}/undo"),
-            &headers,
+            &[("authorization", trusted.authorization.as_str())],
             Some(json!({
                 "expected_identity_revision": edition_revision(app, &headers, &album).await,
             })),
@@ -11128,37 +11239,6 @@ async fn library_journey_identity_repair_and_preparation() {
         )
         .await;
     }
-    let (_, job) = app
-        .call(
-            "POST",
-            "/api/v3/library/management/identity-preparations",
-            &headers,
-            Some(json!({"idempotency_key": "prep-auto"})),
-        )
-        .await;
-    let auto_path = format!(
-        "/api/v3/library/management/identity-preparations/{}",
-        job["id"].as_str().expect("id")
-    );
-    let ready = settle_repair(app, &headers, &auto_path).await;
-    assert_eq!(ready["state"], json!("ready"), "{ready}");
-    let (_, findings) = app
-        .call("GET", &format!("{auto_path}/findings"), &headers, None)
-        .await;
-    let item = &findings["items"][0];
-    assert_eq!(
-        item["apply_result"],
-        json!("EDITION_AUTO_ACCEPTED"),
-        "{findings}"
-    );
-    assert_eq!(item["suggested_edition"]["auto_gate"], json!("AUTO_ACCEPT"));
-    let accepted = rig
-        .identify_store
-        .album_identity(&album)
-        .unwrap()
-        .expect("accepted");
-    assert_eq!(accepted.release_mbid.as_deref(), Some(release.id.as_str()));
-    // A confident acceptance is applied as confirmed: no flag remains.
     let match_state = || -> Option<String> {
         use rusqlite::OptionalExtension as _;
         droppedneedle_kernel::db::open_connection(&app.config.library_db_path)
@@ -11172,6 +11252,58 @@ async fn library_journey_identity_repair_and_preparation() {
             .optional()
             .expect("match state")
     };
+    // An album a person took the match off is left alone: the report
+    // still suggests the edition, held by the gate.
+    let held_by_person = |item: &Value, why: &str| {
+        assert_eq!(
+            item["finding_code"],
+            json!("exact_release_suggested"),
+            "{why}: {item}"
+        );
+        assert_eq!(
+            item["suggested_edition"]["auto_gate"],
+            json!("PERSON_DECLINED"),
+            "{why}"
+        );
+        assert!(
+            rig.identify_store.album_identity(&album).unwrap().is_none(),
+            "{why}: no edition is given"
+        );
+    };
+    app.seed_with(
+        "UPDATE library_album_match_state SET reason_code = 'DETACHED_BY_PERSON' \
+         WHERE local_album_id = ?1",
+        [&album],
+    )
+    .await;
+    let (detached_path, item) = prepare_identities(app, &headers, "prep-detached").await;
+    held_by_person(&item, "detached");
+    assert_eq!(
+        match_state().as_deref(),
+        Some("unmatched:DETACHED_BY_PERSON")
+    );
+    discard_preparation(app, &headers, &detached_path).await;
+    app.seed_with(
+        "UPDATE library_album_match_state SET reason_code = 'NO_CANDIDATE' \
+         WHERE local_album_id = ?1",
+        [&album],
+    )
+    .await;
+
+    let (auto_path, item) = prepare_identities(app, &headers, "prep-auto").await;
+    assert_eq!(
+        item["apply_result"],
+        json!("EDITION_AUTO_ACCEPTED"),
+        "{item}"
+    );
+    assert_eq!(item["suggested_edition"]["auto_gate"], json!("AUTO_ACCEPT"));
+    let accepted = rig
+        .identify_store
+        .album_identity(&album)
+        .unwrap()
+        .expect("accepted");
+    assert_eq!(accepted.release_mbid.as_deref(), Some(release.id.as_str()));
+    // A confident acceptance is applied as confirmed: no flag remains.
     assert_eq!(match_state(), None);
     let undo = &item["automatic_undo"];
     let (status, body) = app
@@ -11187,9 +11319,57 @@ async fn library_journey_identity_repair_and_preparation() {
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(rig.identify_store.album_identity(&album).unwrap().is_none());
-    // The undo puts back the match state the acceptance replaced.
-    assert_eq!(match_state().as_deref(), Some("unmatched:NO_CANDIDATE"));
+    // The undo leaves no match, so the album is marked undone.
+    assert_eq!(
+        match_state().as_deref(),
+        Some("unmatched:AUTOMATIC_EDITION_UNDONE")
+    );
+
+    // The undo stays undone: the next preparation does not accept again.
+    discard_preparation(app, &headers, &auto_path).await;
+    let (_, item) = prepare_identities(app, &headers, "prep-after-undo").await;
+    held_by_person(&item, "undone");
+    assert_eq!(
+        match_state().as_deref(),
+        Some("unmatched:AUTOMATIC_EDITION_UNDONE")
+    );
     rig.stop().await;
+}
+
+/// Run a Prepare identities report to ready; its path and first finding.
+async fn prepare_identities(app: &TestApp, headers: &[(&str, &str)], key: &str) -> (String, Value) {
+    let (_, job) = app
+        .call(
+            "POST",
+            "/api/v3/library/management/identity-preparations",
+            headers,
+            Some(json!({"idempotency_key": key})),
+        )
+        .await;
+    let path = format!(
+        "/api/v3/library/management/identity-preparations/{}",
+        job["id"].as_str().expect("id")
+    );
+    let ready = settle_repair(app, headers, &path).await;
+    assert_eq!(ready["state"], json!("ready"), "{ready}");
+    let (_, findings) = app
+        .call("GET", &format!("{path}/findings"), headers, None)
+        .await;
+    (path, findings["items"][0].clone())
+}
+
+/// Dismiss a Prepare identities report, so another can start.
+async fn discard_preparation(app: &TestApp, headers: &[(&str, &str)], path: &str) {
+    let job = settle_repair(app, headers, path).await;
+    let (status, body) = app
+        .call(
+            "POST",
+            &format!("{path}/discard"),
+            headers,
+            Some(json!({"expected_row_revision": job["row_revision"]})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 }
 
 /// Apply a ready preview from its handle and run the worker once.
@@ -13678,12 +13858,13 @@ async fn a_management_run_has_the_scan_read_what_it_wrote() {
 
 /// An album the app matched by itself, its rows carrying what an upgrade
 /// from v2 leaves on them (a matcher stamp, each file's disc and position),
-/// is retagged by a run. The scan reads the files back and sends the album
-/// to identification, which finds the same release: the match keeps its
-/// revisions and its automatic-edition undo, so the run's Undo still puts
-/// the files back.
+/// is retagged by a run. The scan reads the files back, and identification,
+/// asked again, finds the same release: the match keeps its revisions and
+/// its automatic-edition undo, so the run's Undo still puts the files back,
+/// and the scan after the Undo identifies the album again.
 #[tokio::test]
 async fn a_run_stays_undoable_after_identification_finds_the_same_release() {
+    use droppedneedle_library::identify::models::IdentifyKind;
     use droppedneedle_library::management::models::SelectionKind;
     use droppedneedle_library::tags::save::{TagEdit, save_tags};
     use droppedneedle_library::tags::{TagField, read_fields};
@@ -13739,7 +13920,11 @@ async fn a_run_stays_undoable_after_identification_finds_the_same_release() {
             .collect::<rusqlite::Result<_>>()
             .expect("rows read")
     };
-    assert_eq!(held()[0], format!("album automatic {REL_1} 1"));
+    assert!(
+        held()[0].starts_with(&format!("album automatic {REL_1} ")),
+        "{:?}",
+        held()
+    );
     managed.activate().await;
     managed.edit_outside(&track, title_edit("Before")).await;
     while managed.library.identification.identify_tick().await > 0 {}
@@ -13772,15 +13957,147 @@ async fn a_run_stays_undoable_after_identification_finds_the_same_release() {
             break;
         }
     }
+    managed
+        .library
+        .identification
+        .enqueue_identify(&album, IdentifyKind::Manual, "admin")
+        .expect("identification queued");
     let mut identified = 0;
     while managed.library.identification.identify_tick().await > 0 {
         identified += 1;
     }
 
-    assert!(identified > 0, "the scan sent the album to identification");
+    assert!(identified > 0, "the album was identified again");
     assert_eq!(held(), matched, "the same release changes nothing");
     managed.undo_run(&run, "undo").await;
     assert_eq!(title(), vec!["Before".to_owned()], "Undo put the file back");
+    let jobs = || {
+        managed.count(&format!(
+            "SELECT COUNT(*) FROM library_identify_jobs WHERE local_album_id = '{album}'"
+        ))
+    };
+    let queued = jobs();
+    rescan(&managed.library).await;
+    assert_eq!(jobs(), queued + 1, "the undone album is identified again");
+}
+
+/// The app's own write sends no album back to identification. An album
+/// the app matched by itself is retagged and filed by a run, and the scan
+/// that reads the files back (their new release ID groups them as a new
+/// album, which the old one follows) queues no identification, so
+/// MusicBrainz is not asked again: the tags are the ones the app wrote
+/// from the album's match. A file then changed outside the app sends the
+/// album back.
+#[tokio::test]
+async fn the_apps_own_write_is_not_identified_again() {
+    use droppedneedle_library::management::models::SelectionKind;
+
+    let managed = ManagedLibrary::start("lib-own-write-not-identified", |_| {}).await;
+    let (album, tracks) = managed.add_album("own", 2).await;
+    managed.match_by_the_app(&album);
+    let jobs = || {
+        managed.count(&format!(
+            "SELECT COUNT(*) FROM library_identify_jobs WHERE local_album_id = '{album}'"
+        ))
+    };
+    let (queued, bytes) = (jobs(), managed.bytes(&tracks));
+    managed
+        .apply(SelectionKind::Albums, &[&album], "retag")
+        .await;
+    assert_ne!(managed.bytes(&tracks), bytes, "the run wrote the files");
+    rescan(&managed.library).await;
+    assert_eq!(jobs(), queued, "the scan queues no identification");
+    assert_eq!(
+        managed.library.identification.identify_tick().await,
+        0,
+        "no identification runs, so MusicBrainz is not asked"
+    );
+
+    managed
+        .edit_outside(&tracks[0], title_edit("Changed by hand"))
+        .await;
+    assert_eq!(jobs(), queued + 1, "the changed file is identified again");
+}
+
+/// A tag edit in the app writes a person's values, not the album's match:
+/// a file whose MusicBrainz release ID was changed with the tag editor
+/// sends its album back to identification on the next scan, as an edit
+/// outside the app does.
+#[tokio::test]
+async fn a_tag_edit_in_the_app_is_identified_again() {
+    use droppedneedle_library::management::models::TagEditMode;
+    use droppedneedle_library::management::tag_edit::TagEditRequest;
+    use droppedneedle_library::tags::{TagField, read_fields};
+
+    let managed = ManagedLibrary::start("lib-tag-edit-identified", |_| {}).await;
+    let (album, tracks) = managed.add_album("edited", 1).await;
+    managed.match_by_the_app(&album);
+    let jobs = || {
+        managed.count(&format!(
+            "SELECT COUNT(*) FROM library_identify_jobs WHERE local_album_id = '{album}'"
+        ))
+    };
+    let queued = jobs();
+    let management = managed.management();
+    let edit = management
+        .create_tag_edit(
+            TagEditRequest {
+                local_track_id: tracks[0].clone(),
+                mode: TagEditMode::WriteOnce,
+                expected_settings_revision: managed.settings_revision(),
+                expected_policy_revision: managed
+                    .library
+                    .core
+                    .policy_revision()
+                    .expect("policy revision"),
+                fields: vec![("musicbrainz_release_id".to_owned(), json!(REL_2))],
+                idempotency_key: Some("edit-release".to_owned()),
+            },
+            "admin",
+        )
+        .expect("edit preview");
+    assert!(
+        management_step(&managed.library).await,
+        "edit planning runs"
+    );
+    let applied = management_apply(&managed.library, &edit).await;
+    assert_eq!(applied.job.state.as_str(), "succeeded");
+    assert_eq!(
+        read_fields(track_file(&managed.path(&tracks[0]))).expect("tags read")
+            [&TagField::MusicBrainzReleaseId],
+        vec![REL_2.to_owned()],
+        "the edit was written"
+    );
+    rescan(&managed.library).await;
+    assert_eq!(jobs(), queued + 1, "the edited album is identified again");
+}
+
+/// A file changed outside the app since its last scan holds what
+/// identification has not read, even once a profile run writes over it:
+/// the scan after the run sends its album back to identification.
+#[tokio::test]
+async fn a_run_over_a_file_changed_since_its_scan_is_identified_again() {
+    use droppedneedle_library::management::models::SelectionKind;
+
+    let managed = ManagedLibrary::start("lib-run-over-unscanned-edit", |_| {}).await;
+    let (album, tracks) = managed.add_album("unscanned", 2).await;
+    managed.match_by_the_app(&album);
+    let jobs = || {
+        managed.count(&format!(
+            "SELECT COUNT(*) FROM library_identify_jobs WHERE local_album_id = '{album}'"
+        ))
+    };
+    let queued = jobs();
+    droppedneedle_library::tags::save_tags(
+        &managed.path(&tracks[0]),
+        &[title_edit("Changed before the run")],
+    )
+    .expect("retagged outside the app");
+    managed
+        .apply(SelectionKind::Albums, &[&album], "retag")
+        .await;
+    rescan(&managed.library).await;
+    assert_eq!(jobs(), queued + 1, "the album is identified again");
 }
 
 /// A file the app wrote that is retagged outside it is the user's: the
@@ -16417,6 +16734,7 @@ async fn an_import_in_place_of_a_missing_track_marks_nothing() {
                 path: source,
                 track: 1,
                 replaces: Vec::new(),
+                set_aside: false,
             }],
             extras: Vec::new(),
             actor: None,
@@ -16430,10 +16748,10 @@ async fn an_import_in_place_of_a_missing_track_marks_nothing() {
     assert_eq!(managed.count(STEPPED_BACK), 0);
 }
 
-/// An import onto an album whose match cannot be read writes none of the
-/// album's identity: the person's album row, the track rows and the flag
-/// stay as they were, the file still lands, and the album is offered to
-/// identification instead.
+/// An import onto an album whose match cannot be read leaves the album's
+/// identity alone: the person's album row and the flag stay as they were.
+/// The file still lands on its track as the person's, and the album is
+/// offered to identification instead.
 #[tokio::test]
 async fn an_import_that_cannot_read_the_albums_match_leaves_it_alone() {
     use droppedneedle_library::import::{DownloadImport, ImportOrigin, ImportSource};
@@ -16468,6 +16786,7 @@ async fn an_import_that_cannot_read_the_albums_match_leaves_it_alone() {
                     path: source,
                     track,
                     replaces: Vec::new(),
+                    set_aside: false,
                 }
             })
             .collect();
@@ -16540,7 +16859,34 @@ async fn an_import_that_cannot_read_the_albums_match_leaves_it_alone() {
         "it takes the missing track's id"
     );
 
-    assert_eq!(identity(&db), before, "nothing of the match is written");
+    let placed = format!("track {missing} ");
+    let without_selected_at = |row: &str| {
+        row.rsplit_once(' ')
+            .map_or(row, |(rest, _)| rest)
+            .to_owned()
+    };
+    let expected: Vec<String> = before
+        .iter()
+        .map(|row| {
+            if row.starts_with(&placed) {
+                without_selected_at(&row.replacen(" automatic ", " manual ", 1))
+            } else {
+                row.clone()
+            }
+        })
+        .collect();
+    let after: Vec<String> = identity(&db)
+        .iter()
+        .map(|row| {
+            if row.starts_with(&placed) {
+                without_selected_at(row)
+            } else {
+                row.clone()
+            }
+        })
+        .collect();
+    // A joined file on a person's edition is placed as the person's, as Get missing tracks places it.
+    assert_eq!(after, expected, "only the placed track's row changes");
     let live_jobs: i64 = db
         .query_row(
             "SELECT COUNT(*) FROM library_identify_jobs WHERE local_album_id = ?1 \
@@ -16676,6 +17022,7 @@ async fn import_and_management_name_a_file_alike() {
                     path: source,
                     track: 0,
                     replaces: Vec::new(),
+                    set_aside: false,
                 }],
                 extras: Vec::new(),
                 actor: None,
@@ -16798,6 +17145,7 @@ async fn a_file_staging_cannot_read_is_a_local_fault() {
                 path: source.clone(),
                 track: 0,
                 replaces: Vec::new(),
+                set_aside: false,
             }],
             extras: Vec::new(),
             actor: None,
@@ -16865,6 +17213,7 @@ async fn an_import_never_lands_under_an_excluded_path() {
                 path: source,
                 track: 0,
                 replaces: Vec::new(),
+                set_aside: false,
             }],
             extras: Vec::new(),
             actor: None,
@@ -17006,6 +17355,7 @@ fn join_second_track(
                 path: source,
                 track: 1,
                 replaces: Vec::new(),
+                set_aside: false,
             }],
             extras: Vec::new(),
             actor: None,
@@ -17123,6 +17473,65 @@ async fn a_join_lands_beside_its_copy() {
         snapshot_tree(&front).is_empty(),
         "{case}: nothing in the first folder"
     );
+}
+
+/// "Get missing tracks" placing a file on the edition a person chose takes
+/// that choice's Undo away: its record knows nothing of the new file and
+/// would take it off its track. A scan that joins nothing leaves the Undo.
+#[tokio::test]
+async fn a_placed_download_takes_the_edition_choice_undo_away() {
+    let managed = ManagedLibrary::start("lib-import-join-choice-undo", |_| {}).await;
+    let (album, tracks) = managed.add_album("first", 2).await;
+    std::fs::remove_file(managed.path(&tracks[1])).expect("file removed");
+    rescan(&managed.library).await;
+    let current = managed
+        .library
+        .identify_store
+        .album_identity(&album)
+        .expect("identity reads")
+        .and_then(|identity| identity.release_mbid)
+        .expect("an edition");
+    let other = if current == REL_1 { REL_2 } else { REL_1 };
+    crate::common::library::operations(&managed.library)
+        .choose_edition(
+            &album,
+            other,
+            shown_revision(&managed.library, &album),
+            Some("admin"),
+            false,
+        )
+        .await
+        .expect("another edition chosen");
+    let undo_available = || {
+        droppedneedle_library::identity::reads::undo_available(&managed.db(), &album)
+            .expect("reads")
+    };
+    rescan(&managed.library).await;
+    assert!(undo_available(), "a scan that joins nothing keeps the Undo");
+
+    let imported = join_second_track(&managed, &album).expect("imported");
+    let relative = imported.paths[0]
+        .strip_prefix(&managed.music)
+        .expect("in the library")
+        .to_string_lossy()
+        .into_owned();
+    let track = managed
+        .library
+        .scan_store
+        .track_at("music", &relative)
+        .unwrap()
+        .expect("track indexed");
+    let placed: Option<String> = managed
+        .db()
+        .query_row(
+            "SELECT release_mbid FROM local_track_external_identities \
+             WHERE local_track_id = ?1",
+            [&track],
+            |row| row.get(0),
+        )
+        .expect("the file's match");
+    assert_eq!(placed.as_deref(), Some(other), "the file is on the edition");
+    assert!(!undo_available(), "the choice's Undo is gone");
 }
 
 /// A file v2 tagged, changed by hand since, then renamed in the app: the
@@ -19089,7 +19498,7 @@ async fn an_approved_release_is_placed_and_its_undo_survives() {
     recall.releases[0].id = REL_2.to_owned();
     recall.releases[0].release_group_id = "rg-2".to_owned();
     let release = recall.releases[0].clone();
-    droppedneedle_library::identify::review::file_review(
+    droppedneedle_library::test_support::file_review(
         &library.identify_store,
         "rev-approved",
         &album,
@@ -19163,7 +19572,7 @@ async fn an_approved_release_is_placed_and_its_undo_survives() {
     }
 
     crate::common::library::operations(&library)
-        .undo_edition_choice(&album, shown_revision(&library, &album), "curator")
+        .undo_edition_choice(&album, shown_revision(&library, &album), "curator", None)
         .expect("the approval's undo still applies");
     let undone = choice_row(&db, &album);
     assert_eq!(
@@ -19180,6 +19589,65 @@ async fn an_approved_release_is_placed_and_its_undo_survives() {
         files.iter().map(|row| (&row.0, &row.1)).collect::<Vec<_>>(),
         "the files are as before"
     );
+}
+
+/// A release a curator approved that MusicBrainz then does not list stays
+/// the curator's choice, and the album says why its files are not on it.
+#[tokio::test]
+async fn an_approved_release_that_is_not_listed_stays_chosen() {
+    use droppedneedle_library::identify::models::{
+        CandidateEvidence, EvidenceClass, TrackEvidence,
+    };
+
+    let (scratch, library, album, tracks) = chosen_album_at_rest("lib-approved-not-listed").await;
+    let db = scratch_db(&scratch);
+    let release = fitting_release(&library, &album).releases[0].clone();
+    droppedneedle_library::test_support::file_review(
+        &library.identify_store,
+        "rev-not-listed",
+        &album,
+        "EDITION_UNCERTAIN",
+        vec![CandidateEvidence {
+            candidate_key: format!("rg-2:{REL_2}"),
+            release_group_mbid: "rg-2".to_owned(),
+            release_mbid: Some(REL_2.to_owned()),
+            album_title: "Album".to_owned(),
+            album_artist_name: String::new(),
+            track_evidence: tracks
+                .iter()
+                .zip(&release.tracks)
+                .map(|(track, on_release)| TrackEvidence {
+                    local_track_id: track.clone(),
+                    classification: EvidenceClass::Supported,
+                    evidence_kinds: Vec::new(),
+                    recording_mbid: Some(on_release.recording_id.clone()),
+                    release_track_mbid: Some(on_release.id.clone()),
+                })
+                .collect(),
+            score: 1.0,
+            reason_code: "EDITION_UNCERTAIN".to_owned(),
+            distance: 0.0,
+            penalties: Vec::new(),
+        }],
+    )
+    .unwrap();
+    approve(&library, "rev-not-listed", &format!("rg-2:{REL_2}"));
+    let approved = choice_row(&db, &album);
+
+    remap_once(&library, &scratch.identify, RecallResult::default()).await;
+    assert_eq!(remap_row(&db, &album), None);
+    assert_eq!(choice_row(&db, &album), approved, "the approval stands");
+    assert_eq!(
+        (approved.0.as_str(), approved.1.as_deref()),
+        ("manual", Some(REL_2))
+    );
+    assert_eq!(
+        match_state(&db, &album).as_deref(),
+        Some("CHOSEN_EDITION_NOT_LISTED")
+    );
+    crate::common::library::operations(&library)
+        .undo_edition_choice(&album, shown_revision(&library, &album), "curator", None)
+        .expect("the approval's undo still applies");
 }
 
 /// An album retagged by hand across two scans, whose edition a person
@@ -20067,7 +20535,7 @@ async fn a_persons_match_joins_an_album_retagged_without_its_ids() {
     assert_eq!(retired_into(&db, &album), None);
     exclude_by_hand(&db, &album);
     let key = format!("rg-1:{REL_1}");
-    droppedneedle_library::identify::review::file_review(
+    droppedneedle_library::test_support::file_review(
         &library.identify_store,
         "rev-join",
         &own_row,
@@ -21601,6 +22069,7 @@ async fn an_import_during_a_scan_is_not_judged_gone() {
                 path: source,
                 track,
                 replaces: Vec::new(),
+                set_aside: false,
             }
         })
         .collect();
@@ -22198,6 +22667,7 @@ async fn an_imported_track_takes_the_history_of_the_one_it_replaces() {
                     path: source,
                     track,
                     replaces: Vec::new(),
+                    set_aside: false,
                 }
             })
             .collect();
@@ -22293,7 +22763,7 @@ async fn an_approval_continues_a_track_once_its_files_are_placed() {
     .expect("starred");
 
     let key = format!("rg-1:{REL_1}");
-    droppedneedle_library::identify::review::file_review(
+    droppedneedle_library::test_support::file_review(
         &library.identify_store,
         "rev-approve",
         &album,
@@ -24008,8 +24478,7 @@ async fn albums_an_older_matcher_misplaced_are_looked_at_once() {
 /// has one, the album's status says the edition is not chosen yet. After
 /// the upgrade such a match the app made (A) is identified once more, by
 /// itself, and lands on the edition its files fit, which can be undone. A
-/// group a person chose, now (B) or in v2 (C), is left alone. It happens
-/// once per database.
+/// group a person chose (B) is left alone. It happens once per database.
 #[tokio::test]
 async fn albums_matched_to_a_group_only_get_an_edition_once() {
     use droppedneedle_library::edition::status::edition_status;
@@ -24018,7 +24487,7 @@ async fn albums_matched_to_a_group_only_get_an_edition_once() {
     use droppedneedle_library::tags::save::{TagEdit, save_tags};
 
     let (scratch, library, music) = bare_library("lib-group-only-relook").await;
-    let editions: Vec<Release> = (1..=3)
+    let editions: Vec<Release> = (1..=2)
         .map(|n| sibling_editions(n, &format!("Group Only {n}")).0)
         .collect();
     // Files tagged with their release group and recordings, no release.
@@ -24065,12 +24534,12 @@ async fn albums_matched_to_a_group_only_get_an_edition_once() {
             .unwrap()
             .expect("album")
     };
-    let (a, b, c) = (album(0), album(1), album(2));
+    let (a, b) = (album(0), album(1));
     scratch.identify.set_recall(RecallResult {
         releases: editions.clone(),
         ..RecallResult::default()
     });
-    assert_eq!(library.identification.identify_tick().await, 3);
+    assert_eq!(library.identification.identify_tick().await, 2);
 
     // What v2 carried: the group only, with no track matches.
     let db = droppedneedle_kernel::db::open_connection(&scratch.to_path_buf().join("app.db"))
@@ -24091,7 +24560,6 @@ async fn albums_matched_to_a_group_only_get_an_edition_once() {
     };
     group_only(&a, "embedded");
     group_only(&b, "manual");
-    group_only(&c, "legacy_import");
     let reason = |album: &str| {
         let status = edition_status(&db, album)
             .expect("status reads")
@@ -24102,7 +24570,6 @@ async fn albums_matched_to_a_group_only_get_an_edition_once() {
     assert_eq!(code, "EDITION_NOT_CHOSEN");
     assert!(message.starts_with("Edition not chosen yet"), "{message}");
     assert_eq!(reason(&b).0, "CHOSEN");
-    assert_eq!(reason(&c).0, "CHOSEN");
     let queued = || -> Vec<String> {
         let mut stmt = db
             .prepare(
@@ -24156,7 +24623,6 @@ async fn albums_matched_to_a_group_only_get_an_edition_once() {
         Some((Some(editions[0].id.clone()), "automatic".to_owned()))
     );
     assert_eq!(release_of(&b), Some((None, "manual".to_owned())));
-    assert_eq!(release_of(&c), Some((None, "legacy_import".to_owned())));
     assert_eq!(reason(&a).0, "SUPPORTED");
     let undo: i64 = db
         .query_row(
@@ -24173,6 +24639,303 @@ async fn albums_matched_to_a_group_only_get_an_edition_once() {
     let restarted = crate::common::library::repair_worker(&library);
     droppedneedle_library::repairs::tick(&restarted, "worker").await;
     assert!(queued().is_empty());
+}
+
+/// v2 carried some matches from its older catalog as a release group with
+/// no edition, stamped as imported though no person chose them. After the
+/// upgrade such a match (C) is identified once more and, when its files
+/// surely fit one edition of that same group, gets that edition: it keeps
+/// its source and group, the album page says DroppedNeedle found it, and
+/// its Undo holds for good. One whose files fit its group but whose tags
+/// name another, on every file (E) or on one (H), is not even looked up.
+/// One whose files fit an edition recall puts in another group (G), and
+/// one that names an edition already (F), stay exactly as they were.
+#[tokio::test]
+async fn a_v2_carried_group_only_match_gets_the_edition_its_files_fit() {
+    use droppedneedle_library::edition::status::edition_status;
+    use droppedneedle_library::identify::models::IdentifyKind;
+    use droppedneedle_library::tags::TagField;
+    use droppedneedle_library::tags::save::{TagEdit, save_tags};
+
+    let (scratch, library, music) = bare_library("lib-carried-group-only").await;
+    const ANOTHER_GROUP: &str = "5e1a0000-0009-4000-8000-0000000000ff";
+    const MOVED_GROUP: &str = "5e1a0000-0008-4000-8000-0000000000ff";
+    let editions: Vec<Release> = (1..=5)
+        .map(|n| sibling_editions(n, &format!("Carried {n}")).0)
+        .collect();
+    // Files tagged with their recordings and no release. E's name another
+    // group, G's none, and only H's first file names another group.
+    for (index, release) in editions.iter().enumerate() {
+        for (number, track) in release.tracks.iter().enumerate() {
+            let group = match (index, number) {
+                (1, _) | (4, 0) => vec![ANOTHER_GROUP.to_owned()],
+                (2, _) | (4, _) => Vec::new(),
+                _ => vec![release.release_group_id.clone()],
+            };
+            let file = plant(
+                &music,
+                &format!("album-{index}/{:02}.flac", number + 1),
+                "flac_full_01.flac",
+            );
+            save_tags(
+                &file,
+                &[
+                    TagEdit::verbatim(TagField::Title, vec![track.title.clone()]),
+                    TagEdit::verbatim(TagField::Album, vec![release.title.clone()]),
+                    TagEdit::verbatim(TagField::Artist, vec!["Radiohead".to_owned()]),
+                    TagEdit::verbatim(TagField::AlbumArtist, vec!["Radiohead".to_owned()]),
+                    TagEdit::verbatim(TagField::TrackNumber, vec![(number + 1).to_string()]),
+                    TagEdit::verbatim(TagField::MusicBrainzReleaseId, Vec::new()),
+                    TagEdit::verbatim(TagField::MusicBrainzReleaseGroupId, group),
+                    TagEdit::verbatim(
+                        TagField::MusicBrainzRecordingId,
+                        vec![track.recording_id.clone()],
+                    ),
+                    TagEdit::verbatim(TagField::MusicBrainzReleaseTrackId, Vec::new()),
+                ],
+            )
+            .expect("file tagged");
+        }
+    }
+    add_music_root(&library, &music).await;
+    let album = |index: usize| {
+        let track = library
+            .scan_store
+            .track_at("music", &format!("album-{index}/01.flac"))
+            .unwrap()
+            .expect("track indexed");
+        library
+            .scan_store
+            .album_for_track(&track)
+            .unwrap()
+            .expect("album")
+    };
+    let (c, e, g, f, h) = (album(0), album(1), album(2), album(3), album(4));
+    scratch.identify.set_recall(RecallResult {
+        releases: editions.clone(),
+        ..RecallResult::default()
+    });
+    assert_eq!(library.identification.identify_tick().await, 5);
+
+    // What v2 carried. C: its group, with its files' recordings carried as
+    // imported too. E and H: the group their files fit. G: a group recall
+    // answers for with the one its files fit. F: an edition.
+    let db = droppedneedle_kernel::db::open_connection(&scratch.to_path_buf().join("app.db"))
+        .expect("db opens");
+    let carried = |album: &str, group: &str| {
+        db.execute(
+            "UPDATE local_album_external_identities SET release_mbid = NULL, \
+             release_group_mbid = ?2, decision_source = 'legacy_import' \
+             WHERE local_album_id = ?1",
+            rusqlite::params![album, group],
+        )
+        .expect("identity carried");
+    };
+    carried(&c, &editions[0].release_group_id);
+    db.execute(
+        "UPDATE local_track_external_identities SET release_mbid = NULL, \
+         release_track_mbid = NULL, medium_position = NULL, release_track_position = NULL, \
+         decision_source = 'legacy_import' WHERE local_track_id IN \
+         (SELECT id FROM local_tracks WHERE local_album_id = ?1)",
+        [&c],
+    )
+    .expect("tracks carried");
+    carried(&e, &editions[1].release_group_id);
+    carried(&g, MOVED_GROUP);
+    carried(&h, &editions[4].release_group_id);
+    for album in [&e, &g, &h] {
+        db.execute(
+            "DELETE FROM local_track_external_identities WHERE local_track_id IN \
+             (SELECT id FROM local_tracks WHERE local_album_id = ?1)",
+            [album],
+        )
+        .expect("tracks carried");
+    }
+    for album in [&c, &e, &g, &h, &f] {
+        db.execute(
+            "DELETE FROM library_album_match_state WHERE local_album_id = ?1",
+            [album],
+        )
+        .expect("no flag carried");
+    }
+    scratch
+        .identify
+        .moved_groups
+        .lock()
+        .expect("script")
+        .insert(MOVED_GROUP.to_owned(), editions[2].release_group_id.clone());
+    db.execute(
+        "UPDATE local_album_external_identities SET decision_source = 'legacy_import' \
+         WHERE local_album_id = ?1",
+        [&f],
+    )
+    .expect("identity carried");
+    let row = |album: &str| -> Vec<rusqlite::types::Value> {
+        db.query_row(
+            "SELECT * FROM local_album_external_identities WHERE local_album_id = ?1",
+            [album],
+            |row| {
+                (0..row.as_ref().column_count())
+                    .map(|column| row.get(column))
+                    .collect()
+            },
+        )
+        .expect("identity reads")
+    };
+    let kept: Vec<_> = [&e, &g, &h, &f]
+        .into_iter()
+        .map(|album| row(album))
+        .collect();
+    let revision = |album: &str| -> i64 {
+        db.query_row(
+            "SELECT row_revision FROM local_album_external_identities WHERE local_album_id = ?1",
+            [album],
+            |row| row.get(0),
+        )
+        .expect("revision reads")
+    };
+    let before = revision(&c);
+    let queued = || -> Vec<String> {
+        let mut stmt = db
+            .prepare(
+                "SELECT local_album_id FROM library_identify_jobs \
+                 WHERE state = 'queued' ORDER BY local_album_id",
+            )
+            .expect("queue reads");
+        stmt.query_map([], |row| row.get(0))
+            .expect("queue reads")
+            .collect::<Result<_, _>>()
+            .expect("queue reads")
+    };
+    assert!(queued().is_empty());
+
+    carried_from_v2(&db);
+    droppedneedle_library::repairs::tick(
+        &crate::common::library::repair_worker(&library),
+        "worker",
+    )
+    .await;
+    let mut expected = vec![c.clone(), e.clone(), g.clone(), h.clone()];
+    expected.sort();
+    assert_eq!(queued(), expected);
+    scratch.identify.recalled.lock().expect("recalled").clear();
+    assert_eq!(library.identification.identify_tick().await, 4);
+    let mut recalled = scratch.identify.recalled.lock().expect("recalled").clone();
+    recalled.sort();
+    let mut looked_up = vec![c.clone(), g.clone()];
+    looked_up.sort();
+    assert_eq!(
+        recalled, looked_up,
+        "files naming another group are not looked up"
+    );
+
+    let release_of = |album: &str| {
+        library
+            .identify_store
+            .album_identity(album)
+            .unwrap()
+            .map(|identity| {
+                (
+                    identity.release_group_mbid,
+                    identity.release_mbid,
+                    identity.decision_source.as_str().to_owned(),
+                )
+            })
+    };
+    assert_eq!(
+        release_of(&c),
+        Some((
+            Some(editions[0].release_group_id.clone()),
+            Some(editions[0].id.clone()),
+            "legacy_import".to_owned()
+        ))
+    );
+    assert_eq!(revision(&c), before + 1);
+    let now: Vec<_> = [&e, &g, &h, &f]
+        .into_iter()
+        .map(|album| row(album))
+        .collect();
+    assert_eq!(now, kept, "the other carried matches are untouched");
+    let status = edition_status(&db, &c)
+        .expect("status reads")
+        .expect("album known");
+    assert_eq!(status.reason.code, "CARRIED_EDITION_FOUND");
+    let actions: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM library_catalog_actions WHERE local_album_id = ?1 \
+             AND action_kind = 'automatic_exact_edition' AND reason_code = 'CARRIED_EDITION_FOUND'",
+            [&c],
+            |row| row.get(0),
+        )
+        .expect("actions read");
+    assert_eq!(actions, 1);
+    let undo_at: i64 = db
+        .query_row(
+            "SELECT expected_identity_revision FROM library_edition_choice_undo \
+             WHERE local_album_id = ?1",
+            [&c],
+            |row| row.get(0),
+        )
+        .expect("the album page can undo it");
+    assert_eq!(undo_at, before + 1);
+    assert_eq!(
+        remap_row(&db, &c).map(|row| row.0),
+        Some("place_only".to_owned())
+    );
+
+    // The files are placed on the edition in the background.
+    assert!(
+        crate::common::library::operations(&library)
+            .remap_next()
+            .await
+            .expect("remap step"),
+        "the placement was handled"
+    );
+    let unplaced: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM local_tracks t WHERE t.local_album_id = ?1 \
+             AND t.availability = 'indexed' AND NOT EXISTS (SELECT 1 \
+             FROM local_track_external_identities i WHERE i.local_track_id = t.id \
+             AND i.release_mbid = ?2 AND i.release_track_mbid IS NOT NULL)",
+            rusqlite::params![c, editions[0].id],
+            |row| row.get(0),
+        )
+        .expect("placements read");
+    assert_eq!(unplaced, 0, "every file is on a track of the edition");
+
+    // Undo on the album page takes it back, and nothing fills it again.
+    crate::common::library::operations(&library)
+        .undo_edition_choice(&c, shown_revision(&library, &c), "curator", None)
+        .expect("the found edition can be undone");
+    let group_only = Some((
+        Some(editions[0].release_group_id.clone()),
+        None,
+        "legacy_import".to_owned(),
+    ));
+    assert_eq!(release_of(&c), group_only);
+    library
+        .identification
+        .enqueue_identify(&c, IdentifyKind::Manual, "admin")
+        .expect("identification queued");
+    assert_eq!(library.identification.identify_tick().await, 1);
+    assert_eq!(release_of(&c), group_only);
+
+    // The next start looks no more.
+    droppedneedle_library::repairs::tick(
+        &crate::common::library::repair_worker(&library),
+        "worker",
+    )
+    .await;
+    assert!(queued().is_empty());
+    let marked: bool = db
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM library_operation_jobs \
+             WHERE idempotency_key = 'carried-group-only-edition:v1:backfill')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("marker reads");
+    assert!(marked);
 }
 
 /// Before matching read the release group the files' tags name, an album

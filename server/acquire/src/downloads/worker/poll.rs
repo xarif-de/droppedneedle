@@ -21,8 +21,12 @@ const POLL_BACKOFF_BASE_SECONDS: f64 = 30.0;
 /// comes back is polled again within a few minutes.
 const POLL_BACKOFF_CAP_SECONDS: f64 = 5.0 * 60.0;
 
-/// A source whose client stopped answering polls: how many poll passes
-/// failed in a row and when it is polled again.
+/// One client's jobs: the source, and which of its clients holds them
+/// ([`DownloadSource::client_of`]).
+pub(super) type PollLane = (SourceTag, &'static str);
+
+/// A client that stopped answering polls: how many poll passes failed in
+/// a row and when it is polled again.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct PollBackoff {
     failures: u32,
@@ -56,7 +60,7 @@ enum Polled {
     /// The client answered (or the task needed no poll).
     Answered,
     /// The client did not answer.
-    Unavailable(SourceTag),
+    Unavailable(PollLane),
 }
 
 /// Per-task poll memory: byte progress across passes.
@@ -96,7 +100,7 @@ impl DownloadWorker {
             cache.retain(|task_id, _| live.contains(task_id.as_str()));
         }
         if let Ok(mut backoff) = self.poll_backoff.lock() {
-            backoff.retain(|tag, _| pass.sources.iter().any(|source| source.tag() == *tag));
+            backoff.retain(|(tag, _), _| pass.sources.iter().any(|source| source.tag() == *tag));
         }
         // Grouped by the source of each task's live attempt; the task row's
         // own source names only a candidate a person picked.
@@ -116,34 +120,37 @@ impl DownloadWorker {
         .await;
     }
 
-    /// Poll one source's tasks in turn. The first poll its client does not
-    /// answer backs the source off; its other tasks wait for a later pass,
-    /// and their stall clocks keep running.
+    /// Poll one source's tasks in turn. The first poll a client does not
+    /// answer backs that client off; its other tasks wait for a later pass,
+    /// and their stall clocks keep running. The source's other clients'
+    /// tasks are still polled.
     async fn poll_round(self: &Arc<Self>, pass: &Pass, tasks: Vec<&TaskRow>) {
         for task in tasks {
             match self.poll_one(pass, task).await {
                 Polled::Answered => {}
-                Polled::Unavailable(tag) => {
+                Polled::Unavailable(lane) => {
                     if let Ok(mut backoff) = self.poll_backoff.lock() {
-                        let next = PollBackoff::after_failure(backoff.get(&tag).copied(), pass.now);
+                        let next =
+                            PollBackoff::after_failure(backoff.get(&lane).copied(), pass.now);
                         tracing::warn!(
-                            source = %tag,
+                            source = %lane.0,
+                            client = lane.1,
                             failures = next.failures,
                             retry_in_seconds = (next.not_before - pass.now).round(),
                             "download client not answering; polls back off"
                         );
-                        backoff.insert(tag, next);
+                        backoff.insert(lane, next);
                     }
                 }
             }
         }
     }
 
-    /// Whether `tag`'s client is backing off at `now`.
-    fn backing_off(&self, tag: &SourceTag, now: f64) -> bool {
+    /// Whether `lane`'s client is backing off at `now`.
+    fn backing_off(&self, lane: &PollLane, now: f64) -> bool {
         self.poll_backoff
             .lock()
-            .is_ok_and(|backoff| backoff.get(tag).is_some_and(|wait| now < wait.not_before))
+            .is_ok_and(|backoff| backoff.get(lane).is_some_and(|wait| now < wait.not_before))
     }
 
     /// Poll one live task: judge the sample, then complete, fail over, or
@@ -195,7 +202,8 @@ impl DownloadWorker {
             // worker that knows them rather than failing it here.
             return Polled::Answered;
         };
-        if self.backing_off(&attempt.row.source, now) {
+        let lane = (attempt.row.source.clone(), source.client_of(&handle));
+        if self.backing_off(&lane, now) {
             return Polled::Answered;
         }
         let mut memory = self.poll_memory(&task.id, task, &attempt.row, now);
@@ -242,7 +250,7 @@ impl DownloadWorker {
                     give_way_waited,
                 )
                 .await;
-                self.clear_backoff(&attempt.row.source);
+                self.clear_backoff(&lane);
                 Polled::Answered
             }
             Err(SourceError::Rejected { reason, detail }) => {
@@ -256,7 +264,7 @@ impl DownloadWorker {
                     Some(QuarantineReason::DownloadFailed),
                 )
                 .await;
-                self.clear_backoff(&attempt.row.source);
+                self.clear_backoff(&lane);
                 Polled::Answered
             }
             Err(error) => {
@@ -271,17 +279,17 @@ impl DownloadWorker {
                 })
                 .await;
                 match error {
-                    SourceError::Unavailable(_) => Polled::Unavailable(attempt.row.source.clone()),
+                    SourceError::Unavailable(_) => Polled::Unavailable(lane),
                     _ => Polled::Answered,
                 }
             }
         }
     }
 
-    /// Forget a source's backoff once its client answers again.
-    fn clear_backoff(&self, tag: &SourceTag) {
+    /// Forget a client's backoff once it answers again.
+    fn clear_backoff(&self, lane: &PollLane) {
         if let Ok(mut backoff) = self.poll_backoff.lock() {
-            backoff.remove(tag);
+            backoff.remove(lane);
         }
     }
 
@@ -469,7 +477,7 @@ impl DownloadWorker {
         if let Some(quarantine) = quarantine
             && outcome.reason.against_source()
         {
-            self.quarantine_failed(task, attempt, handle, quarantine, now)
+            self.quarantine_failed(task, attempt, handle, quarantine, outcome, now)
                 .await;
         }
         let settled_state = match source.discard(handle).await {
@@ -507,38 +515,52 @@ impl DownloadWorker {
     }
 
     /// Blocklist a failed release by source identity, scoped to the album
-    /// for retry-clearing.
+    /// for retry-clearing, with the outcome that failed it.
     async fn quarantine_failed(
         &self,
         task: &TaskRow,
         attempt: &AttemptRow,
         handle: &SourceHandle,
         quarantine: QuarantineReason,
+        outcome: TaskOutcome<'_>,
         now: f64,
     ) {
         let identities = failover_identities(handle);
         if identities.is_empty() {
             return;
         }
+        let (reason, text) = (outcome.reason, outcome.text.to_owned());
         let source = attempt.source.to_string();
         let scope = if task.release_group_mbid.is_empty() {
             None
         } else {
             Some(task.release_group_mbid.clone())
         };
-        self.step("downloads.quarantine", move |store| {
-            for identity in &identities {
-                store.record_quarantine(
-                    &source,
-                    identity,
-                    quarantine.as_str(),
-                    scope.as_deref(),
-                    now,
-                    QUARANTINE_TTL_SECONDS,
-                )?;
-            }
-            Ok(())
-        })
-        .await;
+        let recorded = self
+            .step("downloads.quarantine", move |store| {
+                for identity in &identities {
+                    store.record_quarantine(
+                        &source,
+                        identity,
+                        quarantine.as_str(),
+                        Some(TaskOutcome::new(reason, &text)),
+                        scope.as_deref(),
+                        now,
+                        QUARANTINE_TTL_SECONDS,
+                    )?;
+                }
+                Ok(())
+            })
+            .await;
+        if recorded.is_some() {
+            tracing::info!(
+                task_id = %task.id,
+                source = %attempt.source,
+                blocklist = quarantine.as_str(),
+                code = outcome.reason.code(),
+                detail = outcome.text,
+                "download source blocklisted"
+            );
+        }
     }
 }

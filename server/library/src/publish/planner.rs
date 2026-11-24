@@ -211,6 +211,12 @@ pub struct Adoption {
     /// edition.
     #[serde(default)]
     pub track: Option<JoinedTrack>,
+    /// A song's file from another edition of the album: the seal leaves
+    /// the album's identity and match flag alone, as for a joined file.
+    /// Written only when true, so a bundle stored before the field writes
+    /// back unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub set_aside: bool,
     /// What the placement read of the joined copy's folder. The commit
     /// refuses the bundle when the copy has moved since; a resumed commit
     /// has none and finishes.
@@ -239,6 +245,10 @@ pub struct AlbumJoin {
     pub release_mbid: String,
     /// The release group of the release the files were matched to.
     pub release_group_mbid: String,
+    /// Chosen by import planning for the copy on the import's own release:
+    /// the commit refuses it once that copy no longer names the release.
+    #[serde(default)]
+    pub exact: bool,
 }
 
 /// Where an imported file sits on its release.
@@ -266,6 +276,7 @@ impl Adoption {
         ingest_source: String,
         join: Option<AlbumJoin>,
         track: Option<JoinedTrack>,
+        set_aside: bool,
     ) -> Self {
         Self {
             policy: journaled.map_or(crate::scan::models::EffectivePolicy::Automatic, |adopt| {
@@ -279,6 +290,7 @@ impl Adoption {
             ingest_source,
             join: journaled.and_then(|adopt| adopt.join.clone()).or(join),
             track: journaled.and_then(|adopt| adopt.track.clone()).or(track),
+            set_aside: journaled.is_some_and(|adopt| adopt.set_aside) || set_aside,
             copy_seal: None,
         }
     }
@@ -326,6 +338,13 @@ pub struct PlanBundle {
     /// undo. A bundle that carries one carries nothing else.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub added: Option<super::add::Added>,
+    /// A profile run wrote the bundle from the album's match, over files as
+    /// the last scan read them (not a tag edit, an Undo or a restore): its
+    /// commit records each placed file's stat, so the scan that reads the
+    /// files back does not identify the album again. False on every other
+    /// bundle and on bundles recorded before it was kept.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub from_match: bool,
 }
 
 /// A removal's undo: files one removal took to the recycle bin, going

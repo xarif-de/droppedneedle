@@ -28,6 +28,9 @@ pub struct ImportedFile<'a> {
     pub identity: &'a ReleaseIdentity,
     /// The file joined the library album it was fetched for.
     pub joined: bool,
+    /// A song's file from another edition of the album, filed as this
+    /// release. Like a joined file it never confirms the album's match.
+    pub set_aside: bool,
 }
 
 /// The album an import's files make up: the one holding most of them,
@@ -47,12 +50,16 @@ pub fn import_album(conn: &Connection, track_ids: &[&str]) -> rusqlite::Result<O
 /// - The album the files make up ([`import_album`]) gets an automatic row
 ///   on the import's release and its match flag is cleared, unless a
 ///   person decided its match, it already names another release (it keeps
-///   it, and the files keep only their recordings), or the files joined it
-///   (a few fetched tracks never confirm the album's match).
+///   it, and the files keep only their recordings), the files joined it
+///   (a few fetched tracks never confirm the album's match), or a file is
+///   a song taken from another edition (it adds the song; an album with
+///   no row yet is offered to identification instead).
 /// - Each file with a recording gets an automatic track row where no
 ///   person decided it. A file on another album keeps only its recording,
 ///   and that album is offered to identification.
 /// - Every album that took a file is queued for automatic management.
+/// - Files that name no release (a local-only album) seal nothing: their
+///   album is offered to identification.
 ///
 /// The seal runs under a savepoint. A row it reads that does not decode
 /// rolls back only the seal: the files stay, the failure is logged and the
@@ -82,6 +89,15 @@ pub fn adopt_import(
         if *other != album {
             offer_album(tx, other, now_ms)?;
         }
+    }
+    // A local-only album names no release: nothing is sealed, and it is
+    // offered to identification like a scanned album.
+    if files
+        .iter()
+        .all(|file| file.identity.release_mbid.is_empty())
+    {
+        offer_album(tx, &album, now_ms)?;
+        return Ok(());
     }
     let on_album: Vec<bool> = albums
         .iter()
@@ -157,6 +173,16 @@ fn seal(
         .iter()
         .zip(on_album)
         .any(|(file, on)| *on && file.joined);
+    let set_aside = files
+        .iter()
+        .zip(on_album)
+        .any(|(file, on)| *on && file.set_aside);
+    // A song from another edition is placed on the album's edition only
+    // while the album's row names the import's release.
+    let album_answers = current
+        .as_ref()
+        .and_then(|row| row.release_mbid.as_deref())
+        .is_some_and(answers);
     let mut wrote = false;
     if keeps_flag {
         tracing::info!(album, "landing keeps the album's match flag");
@@ -166,6 +192,14 @@ fn seal(
             release = release.release_mbid,
             "download matched another edition; the album keeps its own"
         );
+    } else if set_aside {
+        tracing::info!(
+            album,
+            "a song from another edition adds its file; the album's match stays as it is"
+        );
+        if current.is_none() {
+            offer_album(tx, album, (now * 1000.0) as i64)?;
+        }
     } else if !joined {
         wrote |= save_album(
             tx,
@@ -175,7 +209,7 @@ fn seal(
                 release_group_mbid: Some(release.release_group_mbid.clone()),
                 release_mbid: Some(release.release_mbid.clone()),
                 decision_source: DecisionSource::Automatic,
-                row_revision: current.as_ref().map_or(1, |row| row.row_revision + 1),
+                row_revision: 0,
             },
             now,
         )? > 0;
@@ -199,7 +233,10 @@ fn seal(
                 recording_mbid: Some(file.identity.recording_mbid.clone()),
                 // A track of another edition, or on another album, keeps
                 // only its recording.
-                release_track_mbid: (held.is_none() && !keeps_flag && *on)
+                release_track_mbid: (held.is_none()
+                    && !keeps_flag
+                    && *on
+                    && (!file.set_aside || album_answers))
                     .then(|| file.identity.release_track_mbid.clone()),
                 decision_source: DecisionSource::Automatic,
                 row_revision: current.as_ref().map_or(1, |row| row.row_revision + 1),
@@ -216,7 +253,8 @@ fn seal(
 
 /// Save an album's match at `now`, never an automatic or embedded row
 /// over a person's (the statement's own guard). Rows written: 0 when a
-/// person's row holds the album.
+/// person's row holds the album. The stored revision is the row's own:
+/// `identity.row_revision` is not read.
 pub(crate) fn save_album(
     tx: &Transaction<'_>,
     identity: &AlbumIdentity,
@@ -238,7 +276,6 @@ pub(crate) fn save_album(
             identity.release_mbid,
             identity.decision_source.as_str(),
             crate::clock::ms(now),
-            identity.row_revision.max(1) as i64,
         ])?;
     if written == 0 {
         tracing::warn!(

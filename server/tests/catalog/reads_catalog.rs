@@ -1171,6 +1171,117 @@ async fn musicbrainz_outage_falls_back_to_the_library() {
     );
 }
 
+/// A library album id is shaped like a MusicBrainz id. An old id of a
+/// merged album, an alias and a live copy's id each open the group the
+/// album holding them now is identified as, without asking MusicBrainz;
+/// an id the library does not hold is still asked there, and so is a
+/// release group a v2 album carried as an alias.
+#[tokio::test]
+async fn an_old_or_local_album_id_opens_its_album_without_asking_musicbrainz() {
+    const RETIRED: &str = "5e6f7081-9cad-4ebf-8a21-3c4d5e6f7081";
+    const ALIAS: &str = "6f708192-adbe-4fc0-9b32-4d5e6f708192";
+    const LIVE_COPY: &str = "708192a3-becf-40d1-8c43-5e6f708192a3";
+    let fixtures = Fixtures::start().await;
+    let extra = [
+        format!(
+            "INSERT INTO local_albums (id, root_id, grouping_key, title, title_folded, \
+             album_artist_name, album_artist_name_folded, album_artist_id, year, \
+             grouping_source, created_at, updated_at, retired_into_album_id) VALUES \
+             ('{RETIRED}', 'root-1', 'g-old', 'OK Computer', 'ok computer', 'Radiohead', \
+             'radiohead', 'artist-radiohead', 1997, 'manual', 2, 2, 'album-okc'), \
+             ('{LIVE_COPY}', 'root-1', 'g-copy', 'OK Computer', 'ok computer', 'Radiohead', \
+             'radiohead', 'artist-radiohead', 1997, 'manual', 3, 3, NULL)"
+        ),
+        format!(
+            "INSERT INTO local_album_aliases (alias, local_album_id, kind, created_at) \
+             VALUES ('{ALIAS}', 'album-okc', 'merged_album', 2), \
+             ('{UNKNOWN_ALBUM}', 'album-okc', 'legacy_release_group', 2)"
+        ),
+        format!(
+            "INSERT INTO local_album_external_identities \
+             (local_album_id, provider, release_group_mbid, decision_source, selected_at) \
+             VALUES ('{LIVE_COPY}', 'musicbrainz', '{OK_COMPUTER}', 'automatic', 3)"
+        ),
+    ];
+    let (app, _auth) = app_seeded(&fixtures, format!("{}/mb/ws/2", fixtures.base), &extra).await;
+
+    for id in [RETIRED, ALIAS, LIVE_COPY] {
+        let album = get(&app, &format!("/api/v3/albums/{id}/basic")).await;
+        assert_eq!(album["musicbrainz_id"], OK_COMPUTER, "{id}: {album}");
+        assert_eq!(
+            fixtures.hits(&format!("/mb/ws/2/release-group/{id}")),
+            0,
+            "{id} is never asked of MusicBrainz"
+        );
+    }
+    let (status, _) = call(
+        &app,
+        Method::GET,
+        &format!("/api/v3/albums/{UNKNOWN_ALBUM}/basic"),
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        fixtures.hits(&format!("/mb/ws/2/release-group/{UNKNOWN_ALBUM}")),
+        1,
+        "a release group the library does not hold, or holds only as a v2 alias, is asked once"
+    );
+}
+
+/// With MusicBrainz down, the artist's discography from the library lists
+/// each group the library owns once, however many copies hold it, and never
+/// the group of a guess its files contradict.
+#[tokio::test]
+async fn the_library_discography_lists_each_owned_group_once() {
+    let fixtures = Fixtures::start().await;
+    let extra = [
+        "INSERT INTO local_albums (id, root_id, grouping_key, title, title_folded, \
+         album_artist_name, album_artist_name_folded, album_artist_id, year, \
+         grouping_source, created_at, updated_at) VALUES \
+         ('album-okc-mp3', 'root-1', 'g-okc-mp3', 'OK Computer', 'ok computer', 'Radiohead', \
+         'radiohead', 'artist-radiohead', 1997, 'manual', 2, 2), \
+         ('album-guess', 'root-1', 'g-guess', 'Kid A?', 'kid a?', 'Radiohead', \
+         'radiohead', 'artist-radiohead', 2000, 'manual', 3, 3)"
+            .to_owned(),
+        format!(
+            "INSERT INTO local_album_external_identities \
+             (local_album_id, provider, release_group_mbid, decision_source, selected_at) VALUES \
+             ('album-okc-mp3', 'musicbrainz', '{OK_COMPUTER}', 'automatic', 2), \
+             ('album-guess', 'musicbrainz', '{KID_A}', 'automatic', 3)"
+        ),
+        "INSERT INTO library_album_match_state (local_album_id, state, reason_code, \
+         candidates_json, updated_at) VALUES \
+         ('album-guess', 'unconfirmed', 'NAMED_GROUP_DIFFERS', '[]', 3)"
+            .to_owned(),
+        format!(
+            "INSERT INTO local_tracks (id, local_album_id, root_id, file_path, relative_path, \
+             path_hash, file_size_bytes, file_mtime_ns, stat_revision, title, title_folded, \
+             artist_name, artist_name_folded, album_title, album_title_folded, disc_number, \
+             track_number, duration_seconds, file_format, ingest_source, imported_at, \
+             membership_source, embedded_release_group_mbid) VALUES \
+             ('track-okc-mp3', 'album-okc-mp3', 'root-1', '/music/airbag.mp3', 'airbag.mp3', \
+             'hash-mp3', 1000, 0, 'stat-mp3', 'Airbag', 'airbag', 'Radiohead', 'radiohead', \
+             'OK Computer', 'ok computer', 1, 1, 284.0, 'mp3', 'scan', 0, 'manual', NULL), \
+             ('track-guess', 'album-guess', 'root-1', '/music/guess.flac', 'guess.flac', \
+             'hash-guess', 1000, 0, 'stat-guess', 'Idioteque', 'idioteque', 'Radiohead', \
+             'radiohead', 'Kid A?', 'kid a?', 1, 1, 309.0, 'flac', 'scan', 0, 'manual', \
+             '{LIVE}')"
+        ),
+    ];
+    let (app, _auth) = app_seeded(&fixtures, "http://127.0.0.1:9/ws/2".to_owned(), &extra).await;
+
+    let releases = get(&app, &format!("/api/v3/artists/{ARTIST}/releases")).await;
+    assert_eq!(releases["source"], "library");
+    let ids: Vec<&str> = releases["albums"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|album| album["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, [OK_COMPUTER], "{releases}");
+}
+
 /// Search joins MusicBrainz with the library unless it is scoped to the
 /// library. The library scope goes first: it answers from the library
 /// alone, MusicBrainz is never asked, and only library rows come back.
@@ -1195,15 +1306,20 @@ async fn search_joins_musicbrainz_unless_scoped_to_the_library() {
     assert_eq!(body["album_status"], "ok");
     assert_eq!(
         titles(&body["albums"]),
-        ["OK Computer", "OK Computer Live Bootleg", "Kid A"],
-        "compilations filtered, library-only rows kept, ranked by score"
+        [
+            "OK Computer",
+            "OK Computer Live Bootleg",
+            "OK Computer OKNOTOK 1997 2017",
+            "Kid A"
+        ],
+        "compilations shown, library-only rows kept, ranked by score"
     );
     assert_eq!(body["albums"][0]["id"], "album-okc");
     assert_eq!(body["albums"][0]["musicbrainz_id"], OK_COMPUTER);
     assert_eq!(body["albums"][0]["in_library"], true);
     assert_eq!(body["albums"][1]["musicbrainz_id"], Value::Null);
-    assert!(body["albums"][2]["id"].is_null());
-    assert_eq!(body["albums"][2]["requested"], true);
+    assert!(body["albums"][3]["id"].is_null());
+    assert_eq!(body["albums"][3]["requested"], true);
     assert_eq!(body["top_album"]["title"], "OK Computer");
     assert_eq!(
         titles(&body["artists"]),
@@ -1218,7 +1334,11 @@ async fn search_joins_musicbrainz_unless_scoped_to_the_library() {
     // The library-only bootleg must show in "see all" too, not only in the overview.
     assert_eq!(
         titles(&page["results"]),
-        ["OK Computer", "OK Computer Live Bootleg", "Kid A"]
+        [
+            "OK Computer",
+            "OK Computer Live Bootleg",
+            "OK Computer OKNOTOK 1997 2017"
+        ]
     );
     assert_eq!(page["results"][0]["id"], "album-okc");
 

@@ -1,6 +1,7 @@
 # DroppedNeedle v3 - working contract
 
-Rules for all work on the `v3` branch. `main` holds v2 and is frozen.
+Rules for all work on `main`, which holds v3. v2 is frozen; its last
+release is `v2.15.0`.
 
 DroppedNeedle is a self-hosted, multi-user music request and discovery app:
 one Rust server (Axum, tokio, SQLite) that manages a library, acquires music
@@ -277,9 +278,9 @@ Run from the repo root. `make help` lists every target.
   its own stamp; a file whose first line is `-- no-transaction` runs as
   written. A stamp the runner does not expect is refused before anything is
   written, the pre-upgrade backup included. Never edit, renumber or remove a
-  migration once it is on `v3`, the baseline included (a test pins each
+  migration once it is on `main`, the baseline included (a test pins each
   file's hash): a schema change is a new number. Each new one ships an
-  upgrade test. They land on `v3` in number order: the runner skips any
+  upgrade test. They land on `main` in number order: the runner skips any
   migration below the database's version, so a later number landing first
   loses the earlier one on every database that boots in between.
 - A migration that rebuilds a table other tables reference starts with
@@ -414,6 +415,13 @@ Run from the repo root. `make help` lists every target.
   response, and `Cache-Control: no-store` on any `/api/v3` JSON answer that
   sets no cache rule of its own. A route sets its own policy only to be
   stricter. Compat responses are left alone.
+- A playlist entry's cover address is loaded by everyone who reads the
+  playlist, so it is kept only through `entry_cover`
+  (`catalog/src/collections/entry_cover.rs`): one of DroppedNeedle's own
+  image routes, cut to start at `/api/v3/`, or https on its short list of
+  art hosts. The playlist store applies it where an entry is written and
+  where its cover is read; anything else reads as no cover. A host goes on
+  that list only as an exact name or a suffix only that service owns.
 
 **Config and dependencies**
 - Deployment values come from the environment only through `AppConfig::load`,
@@ -471,8 +479,12 @@ Run from the repo root. `make help` lists every target.
   The catalog revision is a change counter, bumped by every commit that
   changes catalog rows and never compared (a plugin's added file or its
   take-back changes none, so it skips the bump). A write that changes catalog rows bumps it inside its own
-  transaction through `catalog_revision::bump_catalog`. Event loops wait on
-  the lane's commit counter (`Db::commits`), never a timer.
+  transaction through `catalog_revision::bump_catalog`. It is also the
+  high-water mark album match revisions start above: a new or moved match
+  row takes one past it, and a removal first raises it to the row's
+  revision (`raise_catalog`, never lowered), so an album never sees one of
+  its revisions twice. Event loops wait on the lane's commit counter
+  (`Db::commits`), never a timer.
 - The web UI lists an album only while it is live and has files: one
   definition, `owned_album!` in `library/src/identity/sql.rs`, which every
   list, count, Check albums and Copies read. A removed album leaves the
@@ -560,23 +572,54 @@ Run from the repo root. `make help` lists every target.
   before included.
 - An empty Vorbis comment (`NAME=`) is not kept: it reads as absent and a
   write drops it. It is the one exception to "unrelated tags survive".
+- A file with no album artist tag is filed under "Various Artists" when it
+  is flagged as a compilation, else under its artist without a
+  "feat."/"ft."/"featuring" part (`untagged_album_artist` in
+  `library/src/scan/naming.rs`). A file whose stored row already holds its
+  plain artist tag as the album artist (filed by the earlier rule, v2's
+  rows included) keeps that rule, so no album splits or rekeys when its
+  files are read again.
 - Publisher phases keep their crash-injection tests. Archive extraction
   rejects traversal and links, and enforces size limits.
 - Acquire replaces no file on an album tagging would refuse (the same
   check), or on an album with no match whose files' tags name different
   groups. The new file is held and the old stays. Only a person importing
   that held file passes the check; the quality comparison still runs.
+- An upload or an import-folder album that identification cannot place on
+  a release (no album found, or tags naming an album the files don't fit)
+  goes in as a local-only album. It goes in only when every file names
+  one album and album artist by the scan's rules, from the tags or else an
+  `Artist - Album` folder, and the library has no live album of that
+  name, release or release group (the tags'); otherwise it is held. It is
+  filed by the import naming script from those names, keeps its tags as
+  they came, replaces and joins nothing, and has no match and no flag;
+  the commit that adds it offers it to identification. A download that
+  does not fit its request is never placed this way.
+- A download's edition is a pin only when a person picked it, the library
+  holds the album in it, or the download fetches for a copy ("Get missing
+  tracks", upgrades): only that release is accepted. Any other release on
+  a task is a preference (`TaskPlan::release_preferred`): tried first,
+  another release of the same release group accepted, a release of
+  another group refused. A missing flag means a pin.
+- Files that land for a release the library holds join its copy when
+  acquire names no copy and none of the files replaces a track, chosen
+  once in library import planning whichever way they came: a live copy on
+  that release whose match is accepted or a person's, holding none of
+  their tracks, first a person's choice and then the oldest. A copy on
+  another edition, a guess, a custom edition, or a copy with no files is
+  not joined.
 - The import folder (`acquire/src/import_folder/`) is one admin-set folder
   that is not, holds no and sits in no library, recycle bin, download or
   app folder; a pass that finds it overlapping one, not writable, or
   cannot tell, does nothing. It takes an album folder only once nothing in
   it has changed for 3 minutes (names starting with `.` are never taken),
   one album at a time, never while a scan runs, through drop import's
-  steps. A file (music or sidecar) leaves the folder only once the publish
-  journal holds its exact bytes for its item, hashed beneath the folder
-  and unchanged up to the unlink. Its work belongs to no user: its jobs
-  and held entries have no owner, only admins see and act on them, and
-  only while that folder is still the import folder.
+  steps; an album identification cannot place goes in local-only. A file
+  (music or sidecar) leaves the folder only once the publish journal
+  holds its exact bytes for its item, hashed beneath the folder and
+  unchanged up to the unlink. Its work belongs to no user: its jobs and
+  held entries have no owner, only admins see and act on them, and only
+  while that folder is still the import folder.
 
 **Identity** (product rules, not up for debate)
 - An edition a person chose is the album's identity; a v2 pin carries as
@@ -593,8 +636,25 @@ Run from the repo root. `make help` lists every target.
   `NAMED_GROUP_DIFFERS` flag. The accepted tier, the match flags and a
   track's recording id (its row's, else its tags') are named once in
   `library/src/identity/sql.rs`. `source_gates.rs` holds these reads.
-- Manual and imported identities survive rescans and moves. Automatic ones
-  stay revisable and retract on contradiction.
+- Manual and imported identities survive rescans and moves. An imported
+  match that names a release group but no edition may gain one edition of
+  that group, at most once, when identification confirms the files fit
+  it; it keeps its source and its group, never takes a guess, and is
+  listed in the album's history with an Undo. Automatic ones stay
+  revisable and retract on contradiction.
+- A match a person took off, or an automatic edition an admin undid with
+  nothing to go back to, stays off: the album keeps its
+  `DETACHED_BY_PERSON` or `AUTOMATIC_EDITION_UNDONE` flag
+  (`declined_flag!`), and identification leaves it alone, whatever its
+  files do, until a person picks an edition or asks it to look again (a
+  `manual` job). An undo that leaves no match marks the album
+  `AUTOMATIC_EDITION_UNDONE`, whatever flag it puts back.
+- An album whose last identification found nothing, or only guessed, is
+  looked at again by itself: 1, 3, 7 and 14 days after its last look, then
+  every 30 days, as backlog work. At most 20 backlog looks are queued in
+  any 24 hours, restarts included, so a large library waits at that
+  ceiling. A person's choice, a declined album, a custom edition and an
+  album with a job in Attention are left alone.
 - Automatic artist reconciliation needs provider proof, never name
   similarity alone, with one rule for the same name. Two live records whose
   names have the same `artist_name_key` (`library/src/scan/naming.rs`:
@@ -637,6 +697,22 @@ Run from the repo root. `make help` lists every target.
   release outside it is only ever an unconfirmed guess, and stays one
   until a person confirms it or the files' tags name its group. An
   automatic match withdrawn on contradiction keeps an undo.
+- A song request takes the song from any edition of its album: a file
+  tagged with the album's group and carrying its own recording id, in a
+  format whose tags the import writes. It adds the song and never changes
+  the album's identity. An upgrade still needs the album's edition; in a
+  folder that keeps its own tags the song keeps its edition's tags and
+  joins the album's copy on the album's edition.
+- Two live copies whose accepted match names the same release, sharing no
+  release track or recording, every file of both placed on a release
+  track, neither grouped by hand, kept apart by a person or by an undo, or
+  hands-off unless both are, join at a scan's end, the joined files locked
+  to the album that keeps them. Catalog only, listed in the album's
+  history with an Undo that brings the copy, its files and its match back
+  and keeps it apart; hearts, ratings, plays and playlist entries stay.
+  A locked file whose tags now give the key its album's other files were
+  retagged to counts as retagged with them: it stays on its album, and
+  the album follows the retag.
 - A release MusicBrainz will not give in a readable form is never
   evidence: identification waits and retries rather than marking an
   album unmatched, and an unreadable tagged release leaves only an
@@ -696,12 +772,14 @@ Run from the repo root. `make help` lists every target.
   discards it or once the library holds its exact bytes. An entry a
   person is acting on is never removed under them, and a held file is
   only judged gone when the filesystem says it is absent, never on a read
-  error. A held file the library could not take is retried by
-  itself (`Gate::HeldRetry`), and that retry never places a file on an
-  album a person moved it away from and never adds a second copy. It
-  replaces a library copy only to finish an upgrade already decided
-  (`UpgradeBlocked`: held because the old copy could not be taken away,
-  such as while the recycle bin is down). The rest wait for a person.
+  error. A held file the library could not take is retried by itself
+  (`Gate::HeldRetry`); an upload or import-folder entry held with no file
+  on a track is placed local-only again instead, from its tags and with
+  no identification. That retry never places a file on an album a person
+  moved it away from and never adds a second copy. It replaces a library
+  copy only to finish an upgrade already decided (`UpgradeBlocked`: held
+  because the old copy could not be taken away, such as while the
+  recycle bin is down). The rest wait for a person.
 - A source outside the download settings, or a format or step the quality
   recipe doesn't list, is never taken by automatic work (picks, failover,
   the search review, the wanted watcher); such a landing is held, one set

@@ -32,8 +32,8 @@ use crate::common::bundles::quiet_ticks;
 use droppedneedle_testkit::slskd::{MOCK_API_KEY, MockSlskd};
 use slskd::{
     DownloadPolicy, EnqueueFile, HttpFault, HttpReply, Locator, ReqwestSlskdHttp, SlskdClient,
-    SlskdHttp, SlskdRepository, SlskdSearchResponse, SlskdUserSearchResponse, TaskHandle,
-    aggregate_status, album_query_ladder, match_transfers,
+    SlskdHttp, SlskdRepository, SlskdSearchResponse, SlskdTransfer, SlskdUserSearchResponse,
+    TaskHandle, aggregate_status, album_query_ladder, match_transfers,
 };
 
 fn test_policy() -> DownloadPolicy {
@@ -639,6 +639,63 @@ async fn status_matches_and_judges_each_transfer() {
     );
 }
 
+/// Track counts exclude sidecars in any transfer state, while the batch
+/// still waits for them and accounts for their bytes and outcomes.
+#[test]
+fn status_counts_audio_tracks_and_accounts_for_sidecar_transfers() {
+    let track = SlskdTransfer {
+        filename: r"Album\01 Track.FLAC".to_owned(),
+        size: 100,
+        bytes_transferred: 100,
+        state: "Completed, Succeeded".to_owned(),
+        ..SlskdTransfer::default()
+    };
+    let cover = SlskdTransfer {
+        filename: r"Album\cover.jpg".to_owned(),
+        size: 25,
+        bytes_transferred: 25,
+        state: "Completed, Succeeded".to_owned(),
+        ..SlskdTransfer::default()
+    };
+    let mut cue = SlskdTransfer {
+        filename: "Album/album.cue".to_owned(),
+        size: 10,
+        bytes_transferred: 5,
+        state: "InProgress".to_owned(),
+        ..SlskdTransfer::default()
+    };
+    let handle = TaskHandle::new(
+        "peer",
+        vec![
+            track.filename.clone(),
+            cover.filename.clone(),
+            cue.filename.clone(),
+        ],
+    );
+
+    let moving = aggregate_status(&handle, &[&track, &cover, &cue]);
+    assert_eq!(moving.status, "downloading");
+    assert!(moving.has_active_transfer);
+    assert_eq!((moving.bytes_downloaded, moving.bytes_total), (130, 135));
+
+    cue.state = "Completed, Errored".to_owned();
+    let partial = aggregate_status(&handle, &[&track, &cover, &cue]);
+    assert_eq!(partial.status, "partial");
+    assert_eq!(
+        partial.succeeded_filenames,
+        [track.filename, cover.filename]
+    );
+    assert_eq!(
+        (
+            partial.files_total,
+            partial.files_completed,
+            partial.files_failed
+        ),
+        (1, 1, 0),
+        "total, completed and failed audio tracks"
+    );
+}
+
 // Locator tests.
 
 /// The locator finds only this transfer's file: the leaf, flat and
@@ -877,7 +934,7 @@ async fn failover_walks_every_peer() {
     let source = SlskdSource::new(
         std::sync::Arc::new(repository(&mock)),
         journal.clone(),
-        no_targets(&journal),
+        no_targets(&journal).await,
     );
 
     let mut peers: Vec<String> = Vec::new();
@@ -908,6 +965,7 @@ async fn failover_walks_every_peer() {
                             &format!("{user}/{file}"),
                         ),
                         "failed",
+                        None,
                         None,
                         1.0e12,
                         86_400.0,
@@ -960,6 +1018,51 @@ fn album_peer(username: &str, extension: &str) -> serde_json::Value {
     serde_json::json!({"username": username, "hasFreeUploadSlot": true, "uploadSpeed": 1_000_000,
         "queueLength": 0, "fileCount": files.len(), "lockedFileCount": 0,
         "files": files, "lockedFiles": [], "token": 1})
+}
+
+#[tokio::test]
+async fn album_search_finds_the_same_title_with_different_punctuation() {
+    use droppedneedle_acquire::downloads::plan::ExpectedTrack;
+    use droppedneedle_acquire::target::soulseek::choose;
+
+    let mock = MockSlskd::start().await.expect("mock starts");
+    mock.script_responses(Vec::new());
+    let neutral = "Artist Album 1959 1986";
+    mock.script_query(neutral, vec![album_peer("copy", "flac")]);
+    let target = SearchTarget {
+        artist: "Artist".to_owned(),
+        album_title: "Album 1959–1986".to_owned(),
+        year: Some(2024),
+        tracklist: ["Alpha", "Beta"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, title)| ExpectedTrack {
+                disc_number: 1,
+                track_number: index as i64 + 1,
+                duration_seconds: Some(200.0 + index as f64),
+                title: Some(title.to_owned()),
+                recording_mbid: None,
+                release_track_mbid: None,
+            })
+            .collect(),
+        wanted: vec![],
+        track: None,
+        release_preferred: false,
+    };
+
+    let result = choose(&repository(&mock), &target, |_| true).await;
+    let queries = mock.search_texts();
+    let choice = result.unwrap_or_else(|reason| panic!("{reason:?}; queries: {queries:?}"));
+    assert_eq!(choice.pick.coverage, 2);
+    assert_eq!(
+        queries,
+        [
+            "Artist Album 1959–1986 2024",
+            "*rtist Album 1959–1986 2024",
+            "Artist Album 1959–1986",
+            neutral
+        ]
+    );
 }
 
 /// A saved policy keeping one tier, with a one-entry recipe, each source
@@ -1063,6 +1166,7 @@ async fn soulseek_picks_follow_the_saved_quality_policy() {
         tracklist: Vec::new(),
         wanted: Vec::new(),
         track: None,
+        release_preferred: false,
     };
 
     seed_album_task(&journal, "task-mp3-only").await;
@@ -1110,7 +1214,7 @@ async fn soulseek_counts_only_readable_files_as_audio() {
     let source = SlskdSource::new(
         Arc::new(repository(&mock)),
         journal.clone(),
-        no_targets(&journal),
+        no_targets(&journal).await,
     );
     let target = SearchTarget {
         artist: "Artist".to_owned(),
@@ -1119,6 +1223,7 @@ async fn soulseek_counts_only_readable_files_as_audio() {
         tracklist: Vec::new(),
         wanted: Vec::new(),
         track: None,
+        release_preferred: false,
     };
 
     mock.script_responses(vec![

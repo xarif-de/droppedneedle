@@ -81,6 +81,8 @@ function toPageSummary(summary: PlaylistSummaryV3): PlaylistSummary {
 		updated_at: epochSecToIso(summary.updated_at),
 		is_public: summary.is_public,
 		is_owner: summary.is_owner,
+		is_shared: summary.is_shared,
+		can_edit: summary.can_edit,
 		can_delete: summary.can_delete,
 		owner_name: summary.owner_name ?? null,
 		is_redacted: false

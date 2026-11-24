@@ -14,9 +14,7 @@ use std::sync::Arc;
 
 use droppedneedle_catalog::artwork::ArtworkService;
 use droppedneedle_catalog::artwork::covers::{CoverArt, CoverLookup};
-use droppedneedle_catalog::collections::service::{
-    CollectionsService, LOCAL_SOURCE, SavedPlaylist, Visible,
-};
+use droppedneedle_catalog::collections::service::{CollectionsService, SavedPlaylist, Visible};
 use droppedneedle_catalog::collections::store::play_marks::MarkScope;
 use droppedneedle_catalog::collections::store::playlists::NewEntry;
 use droppedneedle_catalog::collections::store::ratings::{ItemRating, RatedKind};
@@ -580,13 +578,16 @@ impl CompatLibrary {
         Ok(self.catalog.playable_counts().await?)
     }
 
-    /// The playlists the user's apps list: their own, and other people's
-    /// public ones when they asked for those. Opening one by id does not
-    /// pass through here, so an app keeps a public playlist it already holds.
+    /// The playlists the user's apps list: their own, those shared with
+    /// them, and other people's public ones when they asked for those.
+    /// Opening one by id does not pass through here, so an app keeps a
+    /// public playlist it already holds.
     pub async fn playlists(&self, user_id: &str) -> Result<Vec<Visible>, CompatError> {
         let include_public = self.user_settings.include_public_playlists(user_id).await?;
         let mut playlists = self.service().visible_playlists(user_id).await?;
-        playlists.retain(|playlist| playlist.is_owner || include_public);
+        playlists.retain(|playlist| {
+            playlist.is_owner || playlist.row.shared_with_caller || include_public
+        });
         Ok(playlists)
     }
 
@@ -622,16 +623,16 @@ impl CompatLibrary {
             .collect())
     }
 
-    /// Entries of one of the user's own playlists as `(entry id, library
-    /// file id)`, in order; None when it is not theirs.
-    pub async fn owned_entries(
+    /// Entries of a playlist the user may change the songs of as `(entry
+    /// id, library file id)`, in order; None when they may not.
+    pub async fn editable_entries(
         &self,
         user_id: &str,
         playlist_id: &str,
     ) -> Result<Option<Vec<(String, Option<String>)>>, CompatError> {
         Ok(self
             .service()
-            .owned_entries(user_id, playlist_id)
+            .editable_entries(user_id, playlist_id)
             .await?
             .map(|tracks| {
                 tracks
@@ -769,8 +770,8 @@ impl CompatLibrary {
                 artist_id: track.artist_id,
                 track_source_id: Some(track.id.clone()),
                 cover_url: None,
-                source_type: LOCAL_SOURCE.to_owned(),
-                available_sources: Some(vec![LOCAL_SOURCE.to_owned()]),
+                source_type: "local".to_owned(),
+                available_sources: Some(vec!["local".to_owned()]),
                 format: Some(track.format),
                 track_number: i32::try_from(track.track_number).ok(),
                 disc_number: i32::try_from(track.disc_number).ok(),

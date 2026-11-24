@@ -8,24 +8,31 @@
 //! Admins hold one extra right: deleting a playlist with no owner. A private
 //! one is listed to admins only, as a stub; to anyone else it does not exist.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use droppedneedle_auth::users::roles::{Admin, Principal};
 
 use super::CollectionsService;
+use super::favorites::library_error;
+use crate::collections::db::StoreError;
 use crate::collections::error::CollectionsError;
+use crate::collections::import;
 use crate::collections::models::{
     AddTracksBody, AddTracksResponse, CheckTracksBody, CheckTracksResponse, CoverUploadBody,
-    CreatePlaylistBody, PlaylistDetail, PlaylistListItem, PlaylistListResponse, PlaylistSummary,
-    PlaylistTrack, RedactedPlaylist, ResolveSourcesResponse, TrackInput, UpdatePlaylistBody,
-    UpdateTrackBody,
+    CreatePlaylistBody, ExportFormat, ImportPlaylistBody, ImportPlaylistResponse,
+    ImportUnmatchedReason as Reason, MembersResponse, PlaylistDetail, PlaylistListItem,
+    PlaylistListResponse, PlaylistSummary, PlaylistTrack, RedactedPlaylist, ResolveSourcesResponse,
+    TrackInput, UpdatePlaylistBody, UpdateTrackBody,
 };
+use crate::collections::sql::PlaylistExportRow;
 use crate::collections::store::PlaylistStore;
 pub use crate::collections::store::playlists::SavedPlaylist;
 use crate::collections::store::playlists::{
     CoverImage, EntryNames, Listed, NewEntry, PlaylistRow, Written,
 };
+use crate::local::player::PlayerTrack;
 use crate::metadata::clean_recording;
+use droppedneedle_kernel::playlist_files::{self, Entry};
 
 /// Longest accepted playlist name.
 const MAX_NAME_LEN: usize = 200;
@@ -33,23 +40,23 @@ const MAX_NAME_LEN: usize = 200;
 pub(crate) const MAX_COVER_BYTES: usize = 5 * 1024 * 1024;
 /// Cover mime allowlist.
 const COVER_TYPES: [&str; 3] = ["image/png", "image/jpeg", "image/webp"];
-/// Source type of an entry added from the local library by a compat client.
-pub const LOCAL_SOURCE: &str = "droppedneedle-local";
-/// Accepted source types and what they normalize to. `howler` is the old name
-/// of the local source.
+/// Accepted source types and what they normalize to. `howler` and
+/// `droppedneedle-local` are older names of the local library source.
 const SOURCE_TYPES: [(&str, &str); 8] = [
     ("", ""),
     ("local", "local"),
     ("howler", "local"),
+    ("droppedneedle-local", "local"),
     ("jellyfin", "jellyfin"),
     ("navidrome", "navidrome"),
     ("plex", "plex"),
     ("youtube", "youtube"),
-    (LOCAL_SOURCE, LOCAL_SOURCE),
 ];
 
 /// Most tracks one membership check accepts.
 const MAX_CHECK_TRACKS: usize = 1000;
+/// Longest accepted export path prefix, characters.
+const MAX_EXPORT_PREFIX_LEN: usize = 200;
 
 /// One playlist the caller may read.
 #[derive(Debug, Clone)]
@@ -58,6 +65,17 @@ pub struct Visible {
     pub row: PlaylistRow,
     /// True when the caller owns it.
     pub is_owner: bool,
+}
+
+/// One playlist rendered for download.
+#[derive(Debug, Clone)]
+pub struct PlaylistExport {
+    /// The playlist's name, safe as a filename stem.
+    pub file_stem: String,
+    /// The rendered file.
+    pub body: String,
+    /// Entries left out because they have no local file.
+    pub skipped: usize,
 }
 
 /// Trimmed non-empty name or 400.
@@ -83,8 +101,36 @@ fn clean_source(raw: &str) -> Result<String, CollectionsError> {
         })
 }
 
+/// Normalized source types, each once, in their first order, or 400.
 fn clean_sources(raw: &[String]) -> Result<Vec<String>, CollectionsError> {
-    raw.iter().map(|source| clean_source(source)).collect()
+    let mut sources = Vec::with_capacity(raw.len());
+    for source in raw {
+        let source = clean_source(source)?;
+        if !sources.contains(&source) {
+            sources.push(source);
+        }
+    }
+    Ok(sources)
+}
+
+/// Trimmed export path prefix without its trailing slash; `None` when
+/// empty. Control characters are refused: a line-oriented format cannot
+/// carry them.
+fn clean_export_prefix(raw: Option<&str>) -> Result<Option<String>, CollectionsError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let prefix = raw.trim();
+    if prefix.chars().any(char::is_control) {
+        return Err(CollectionsError::invalid(
+            "Path prefix must not contain control characters",
+        ));
+    }
+    if prefix.chars().count() > MAX_EXPORT_PREFIX_LEN {
+        return Err(CollectionsError::invalid("Path prefix is too long"));
+    }
+    let prefix = prefix.trim_end_matches('/');
+    Ok((!prefix.is_empty()).then(|| prefix.to_owned()))
 }
 
 /// Canonical cover URL for a playlist.
@@ -110,6 +156,8 @@ fn summary(row: &PlaylistRow, user_id: &str, admin: bool) -> PlaylistSummary {
         updated_at: row.updated_at,
         is_public: row.is_public,
         is_owner: owns(row, user_id),
+        is_shared: owns(row, user_id) && row.has_members,
+        can_edit: owns(row, user_id) || row.shared_to_edit,
         can_delete: can_delete(row.owner_id.as_deref(), user_id, admin),
         owner_name: row.owner_name.clone(),
         is_redacted: false,
@@ -136,6 +184,8 @@ fn detail(
         updated_at: summary.updated_at,
         is_public: summary.is_public,
         is_owner: summary.is_owner,
+        is_shared: summary.is_shared,
+        can_edit: summary.can_edit,
         can_delete: summary.can_delete,
         owner_name: summary.owner_name,
         is_redacted: false,
@@ -168,7 +218,7 @@ fn to_entry(input: &TrackInput) -> Result<NewEntry, CollectionsError> {
         .map(clean_sources)
         .transpose()?;
     let library_file_id = match (&input.track_source_id, source_type.as_str()) {
-        (Some(id), "local" | LOCAL_SOURCE) if !id.is_empty() => Some(id.clone()),
+        (Some(id), "local") if !id.is_empty() => Some(id.clone()),
         _ => None,
     };
     Ok(NewEntry {
@@ -189,6 +239,40 @@ fn to_entry(input: &TrackInput) -> Result<NewEntry, CollectionsError> {
         library_file_id,
         recording_mbid: input.recording_mbid.as_deref().and_then(clean_recording),
     })
+}
+
+/// The playlist entry for one matched library track: the file's names, its
+/// album's artwork when the album has some, its local id and its recording
+/// id, as a local track the web UI adds.
+fn import_entry(track: &PlayerTrack) -> NewEntry {
+    let cover_url = track.cover_available.then(|| {
+        let version = track
+            .art_version
+            .map(|version| format!("&v={version}"))
+            .unwrap_or_default();
+        format!(
+            "/api/v3/library/albums/{}/artwork?size=250{version}",
+            track.album_id
+        )
+    });
+    NewEntry {
+        track_name: track.title.clone(),
+        artist_name: track.artist_name.clone(),
+        album_name: track.album_title.clone(),
+        album_id: Some(track.album_id.clone()),
+        artist_id: track.artist_id.clone(),
+        track_source_id: Some(track.id.clone()),
+        cover_url,
+        source_type: "local".to_owned(),
+        available_sources: Some(vec!["local".to_owned()]),
+        format: Some(track.format.clone()),
+        track_number: i32::try_from(track.track_number).ok(),
+        disc_number: i32::try_from(track.disc_number).ok(),
+        duration: track.duration_seconds,
+        plex_rating_key: None,
+        library_file_id: Some(track.id.clone()),
+        recording_mbid: track.recording_mbid.as_deref().and_then(clean_recording),
+    }
 }
 
 impl CollectionsService<'_> {
@@ -233,6 +317,49 @@ impl CollectionsService<'_> {
                 Err(CollectionsError::NotFound)
             }
         }
+    }
+
+    /// The outcome of a song write. A write that found nothing is 403 for
+    /// a reader who may not edit, and 404 otherwise: the playlist or entry
+    /// is gone, or the caller may not read it.
+    async fn found_edit<T>(
+        &self,
+        user_id: &str,
+        playlist_id: &str,
+        written: Written<T>,
+    ) -> Result<T, CollectionsError> {
+        match written {
+            Written::Done(value) => Ok(value),
+            Written::Missing => match self
+                .playlists()
+                .visible_to(user_id)
+                .may_edit(playlist_id)
+                .await?
+            {
+                Some(false) => Err(CollectionsError::Forbidden {
+                    message: "You can't change this playlist's songs".to_owned(),
+                }),
+                _ => Err(CollectionsError::NotFound),
+            },
+        }
+    }
+
+    /// The playlist as the caller reads it, when they may change its songs
+    /// but do not own it. Apps send a playlist's name and visibility back
+    /// with every song save, so when the owner's write refuses such a
+    /// caller, a value already as asked is no change; any other change
+    /// stays the owner's.
+    async fn editor_row(
+        &self,
+        user_id: &str,
+        playlist_id: &str,
+    ) -> Result<Option<PlaylistRow>, CollectionsError> {
+        Ok(self
+            .playlists()
+            .visible_to(user_id)
+            .get(playlist_id)
+            .await?
+            .filter(|row| row.shared_to_edit && !owns(row, user_id)))
     }
 
     /// The playlists the caller may read, name order.
@@ -321,18 +448,74 @@ impl CollectionsService<'_> {
             .await?)
     }
 
-    /// Entries of one of the caller's own playlists, in order; None when it
-    /// is not theirs or is gone.
-    pub async fn owned_entries(
+    /// Entries of a playlist the caller may change the songs of, in order;
+    /// None when they may not or it is gone.
+    pub async fn editable_entries(
         &self,
         user_id: &str,
         playlist_id: &str,
     ) -> Result<Option<Vec<PlaylistTrack>>, CollectionsError> {
-        let playlists = self.playlists();
-        if playlists.visible_to(user_id).is_owner(playlist_id).await? != Some(true) {
+        let visible = self.playlists().visible_to(user_id);
+        if visible.may_edit(playlist_id).await? != Some(true) {
             return Ok(None);
         }
-        Ok(Some(playlists.owned_by(user_id).tracks(playlist_id).await?))
+        Ok(Some(visible.tracks(playlist_id).await?))
+    }
+
+    /// One playlist the caller may read, rendered as `format`. Entries
+    /// with no local file are left out; `skipped` counts them. `prefix`
+    /// goes before each path, for a player that stores music elsewhere.
+    pub async fn export_playlist(
+        &self,
+        user_id: &str,
+        playlist_id: &str,
+        format: ExportFormat,
+        prefix: Option<&str>,
+    ) -> Result<PlaylistExport, CollectionsError> {
+        let prefix = clean_export_prefix(prefix)?;
+        let row = self.readable_playlist(user_id, playlist_id).await?;
+        let entries: Vec<PlaylistExportRow> = self
+            .playlists()
+            .visible_to(user_id)
+            .export_entries(playlist_id)
+            .await?;
+        let mut kept: Vec<(&PlaylistExportRow, String)> = Vec::new();
+        let mut skipped = 0;
+        for entry in &entries {
+            let Some(path) = entry
+                .relative_path
+                .as_deref()
+                .and_then(playlist_files::writable_path)
+            else {
+                skipped += 1;
+                continue;
+            };
+            let path = match &prefix {
+                Some(prefix) => format!("{prefix}/{path}"),
+                None => path.to_owned(),
+            };
+            kept.push((entry, path));
+        }
+        let rendered: Vec<Entry<'_>> = kept
+            .iter()
+            .map(|(entry, path)| Entry {
+                title: &entry.track_name,
+                artist: &entry.artist_name,
+                album: &entry.album_name,
+                album_artist: entry.album_artist_name.as_deref().unwrap_or(""),
+                duration_seconds: entry.duration_ms.map(|ms| ms / 1000),
+                path,
+            })
+            .collect();
+        let body = match format {
+            ExportFormat::M3u8 => playlist_files::render_m3u(None, &row.name, &rendered),
+            ExportFormat::Csv => playlist_files::render_csv(&rendered),
+        };
+        Ok(PlaylistExport {
+            file_stem: playlist_files::safe_playlist_stem(&row.name),
+            body,
+            skipped,
+        })
     }
 
     /// One playlist detail. `admin` says the caller may delete it when it
@@ -409,6 +592,85 @@ impl CollectionsService<'_> {
         })
     }
 
+    /// Import a playlist file into a new private playlist of the caller's.
+    /// Matched tracks are inserted in file order; the first occurrence of
+    /// a track wins and later ones are reported.
+    pub async fn import_playlist_file(
+        &self,
+        user_id: &str,
+        body: &ImportPlaylistBody,
+    ) -> Result<ImportPlaylistResponse, CollectionsError> {
+        let name = clean_name(&body.name)?;
+        if body.content.len() > import::MAX_IMPORT_BYTES {
+            return Err(CollectionsError::invalid(
+                "Playlist file is larger than 2 MB",
+            ));
+        }
+        let import::Parsed {
+            entries,
+            over_limit,
+        } = import::parse(body.format, &body.content);
+        let identities = self
+            .state
+            .items
+            .track_identities()
+            .await
+            .map_err(library_error)?;
+        let index = import::ImportIndex::new(identities);
+        let mut matched: Vec<(&import::ParsedEntry, String)> = Vec::new();
+        let mut seen = HashSet::new();
+        let mut unmatched = Vec::new();
+        for entry in &entries {
+            if entry.path.trim().is_empty()
+                && entry.title.trim().is_empty()
+                && entry.artist.trim().is_empty()
+            {
+                unmatched.push(import::unmatched(entry, Reason::NamesNothing));
+                continue;
+            }
+            let Some(id) = index.find(entry) else {
+                unmatched.push(import::unmatched(entry, Reason::NoMatch));
+                continue;
+            };
+            if !seen.insert(id.to_owned()) {
+                unmatched.push(import::unmatched(entry, Reason::Duplicate));
+                continue;
+            }
+            matched.push((entry, id.to_owned()));
+        }
+        let ids: Vec<String> = matched.iter().map(|(_, id)| id.clone()).collect();
+        let tracks = self
+            .state
+            .items
+            .tracks_by_ids(&ids)
+            .await
+            .map_err(library_error)?;
+        let by_id: HashMap<String, PlayerTrack> = tracks
+            .into_iter()
+            .map(|track| (track.id.clone(), track))
+            .collect();
+        let mut new_entries = Vec::with_capacity(matched.len());
+        for (entry, id) in &matched {
+            match by_id.get(id) {
+                Some(track) => new_entries.push(import_entry(track)),
+                None => unmatched.push(import::unmatched(entry, Reason::NoMatch)),
+            }
+        }
+        let matched = new_entries.len();
+        let (playlist_id, _) = self
+            .playlists()
+            .owned_by(user_id)
+            .create_with(&name, new_entries)
+            .await?;
+        Ok(ImportPlaylistResponse {
+            playlist_id,
+            name,
+            matched,
+            unmatched,
+            over_limit,
+        })
+    }
+
     /// Replace a playlist's entries with `entries` and, when `name` is
     /// given, rename it, as one write.
     pub async fn replace_with_entries(
@@ -422,8 +684,27 @@ impl CollectionsService<'_> {
         let written = self
             .playlists()
             .owned_by(user_id)
-            .replace_named(playlist_id, name.as_deref(), entries)
+            .replace_named(playlist_id, name.as_deref(), entries.clone())
             .await?;
+        if let Written::Missing = written
+            && let Some(row) = self.editor_row(user_id, playlist_id).await?
+            && name.as_ref().is_none_or(|name| *name == row.name)
+        {
+            let written = self
+                .playlists()
+                .editable_by(user_id)
+                .replace_entries(playlist_id, entries)
+                .await?;
+            self.found_edit(user_id, playlist_id, written).await?;
+            let row = self.readable_playlist(user_id, playlist_id).await?;
+            return Ok(SavedPlaylist {
+                id: row.id,
+                name: row.name,
+                is_public: row.is_public,
+                created_at: row.created_at,
+                updated_at: row.updated_at,
+            });
+        }
         self.found(user_id, playlist_id, written).await
     }
 
@@ -466,6 +747,12 @@ impl CollectionsService<'_> {
             .owned_by(user_id)
             .rename(playlist_id, &name)
             .await?;
+        if let Written::Missing = written
+            && let Some(row) = self.editor_row(user_id, playlist_id).await?
+            && row.name == name
+        {
+            return Ok(());
+        }
         self.found(user_id, playlist_id, written).await
     }
 
@@ -534,7 +821,83 @@ impl CollectionsService<'_> {
             .owned_by(user_id)
             .set_public(playlist_id, public)
             .await?;
+        if let Written::Missing = written
+            && let Some(row) = self.editor_row(user_id, playlist_id).await?
+            && row.is_public == public
+        {
+            return Ok(());
+        }
         self.found(user_id, playlist_id, written).await
+    }
+
+    /// The people the caller's playlist is shared with.
+    pub async fn members(
+        &self,
+        user_id: &str,
+        playlist_id: &str,
+    ) -> Result<MembersResponse, CollectionsError> {
+        self.require_owner(user_id, playlist_id).await?;
+        let members = self
+            .playlists()
+            .owned_by(user_id)
+            .members(playlist_id)
+            .await?;
+        Ok(MembersResponse { members })
+    }
+
+    /// Share the caller's playlist with exactly `user_ids`, of whom
+    /// `editor_ids` may change its songs; empty unshares it. Every id must
+    /// name another user, and every editor must be one of them.
+    pub async fn set_members(
+        &self,
+        user_id: &str,
+        playlist_id: &str,
+        mut user_ids: Vec<String>,
+        editor_ids: &[String],
+    ) -> Result<MembersResponse, CollectionsError> {
+        user_ids.sort();
+        user_ids.dedup();
+        let unknown = || CollectionsError::invalid("Share only with other users of this server");
+        if user_ids.iter().any(|id| id == user_id) {
+            return Err(unknown());
+        }
+        if editor_ids
+            .iter()
+            .any(|id| user_ids.binary_search(id).is_err())
+        {
+            return Err(CollectionsError::invalid(
+                "Only people it is shared with can edit it",
+            ));
+        }
+        let editors: HashSet<&String> = editor_ids.iter().collect();
+        let members = user_ids
+            .iter()
+            .map(|id| (id.clone(), editors.contains(id)))
+            .collect();
+        let written = self
+            .playlists()
+            .owned_by(user_id)
+            .set_members(playlist_id, members)
+            .await?;
+        if !self.found(user_id, playlist_id, written).await? {
+            return Err(unknown());
+        }
+        self.members(user_id, playlist_id).await
+    }
+
+    /// Stop seeing a playlist shared with the caller; 404 when it is not
+    /// shared with them.
+    pub async fn leave(&self, user_id: &str, playlist_id: &str) -> Result<(), CollectionsError> {
+        if self
+            .playlists()
+            .visible_to(user_id)
+            .leave(playlist_id)
+            .await?
+        {
+            Ok(())
+        } else {
+            Err(CollectionsError::NotFound)
+        }
     }
 
     /// Insert ready-made entries at a position (None appends); returns the
@@ -548,10 +911,10 @@ impl CollectionsService<'_> {
     ) -> Result<Vec<String>, CollectionsError> {
         let written = self
             .playlists()
-            .owned_by(user_id)
+            .editable_by(user_id)
             .insert(playlist_id, position, entries)
             .await?;
-        self.found(user_id, playlist_id, written).await
+        self.found_edit(user_id, playlist_id, written).await
     }
 
     /// Add native tracks at a position, or append.
@@ -571,7 +934,7 @@ impl CollectionsService<'_> {
             .await?;
         let tracks = self
             .playlists()
-            .owned_by(user_id)
+            .visible_to(user_id)
             .tracks(playlist_id)
             .await?
             .into_iter()
@@ -589,10 +952,10 @@ impl CollectionsService<'_> {
     ) -> Result<usize, CollectionsError> {
         let written = self
             .playlists()
-            .owned_by(user_id)
+            .editable_by(user_id)
             .remove(playlist_id, entry_ids)
             .await?;
-        self.found(user_id, playlist_id, written).await
+        self.found_edit(user_id, playlist_id, written).await
     }
 
     /// Remove one entry; an unknown entry is 404.
@@ -621,10 +984,10 @@ impl CollectionsService<'_> {
     ) -> Result<usize, CollectionsError> {
         let written = self
             .playlists()
-            .owned_by(user_id)
+            .editable_by(user_id)
             .move_entry(playlist_id, entry_id, position)
             .await?;
-        self.found(user_id, playlist_id, written).await
+        self.found_edit(user_id, playlist_id, written).await
     }
 
     /// Update one entry's source fields.
@@ -641,12 +1004,14 @@ impl CollectionsService<'_> {
             .as_deref()
             .map(clean_sources)
             .transpose()?;
-        let owned = self.playlists().owned_by(user_id);
-        let written = owned
+        let written = self
+            .playlists()
+            .editable_by(user_id)
             .update_sources(playlist_id, entry_id, source_type, sources)
             .await?;
-        self.found(user_id, playlist_id, written).await?;
-        owned
+        self.found_edit(user_id, playlist_id, written).await?;
+        self.playlists()
+            .visible_to(user_id)
             .tracks(playlist_id)
             .await?
             .into_iter()
@@ -685,12 +1050,50 @@ impl CollectionsService<'_> {
         Ok(CheckTracksResponse { membership })
     }
 
-    /// Each entry's known sources.
+    /// Link every playlist's entries to the library copies it now holds,
+    /// as opening the playlist does; how many entries were linked.
+    pub async fn link_library_everywhere(&self) -> Result<usize, CollectionsError> {
+        let mut linked = 0;
+        for (owner, playlist_id) in self.playlists().to_link().await? {
+            match self
+                .playlists()
+                .owned_by(&owner)
+                .link_library_copies(&playlist_id)
+                .await
+            {
+                Ok(count) => linked += count,
+                Err(StoreError::Busy(operation)) => {
+                    return Err(CollectionsError::Busy { operation });
+                }
+                // One playlist failing holds back none of the others.
+                Err(error) => tracing::warn!(
+                    playlist_id,
+                    %error,
+                    "could not link a playlist's entries to the library"
+                ),
+            }
+        }
+        Ok(linked)
+    }
+
+    /// Each entry's known sources. First, on the caller's own playlist, an
+    /// entry with no source yet whose album the library owns is pointed at
+    /// the library's copy, so an imported song plays once its album is in.
     pub async fn resolve_sources(
         &self,
         user_id: &str,
         playlist_id: &str,
     ) -> Result<ResolveSourcesResponse, CollectionsError> {
+        // Best effort: the sources read below answer either way, and the
+        // next visit links again.
+        if let Err(error) = self
+            .playlists()
+            .owned_by(user_id)
+            .link_library_copies(playlist_id)
+            .await
+        {
+            tracing::warn!(%error, "playlist entries not linked to the library");
+        }
         let sources = self
             .playlist_entries(user_id, playlist_id)
             .await?
@@ -787,7 +1190,7 @@ impl CollectionsService<'_> {
             return Ok((existing, true));
         };
         if !entries.is_empty() {
-            let written = playlists.insert(&id, None, entries).await?;
+            let written = playlists.songs().insert(&id, None, entries).await?;
             self.found(owner_id, &id, written).await?;
         }
         Ok((id, false))

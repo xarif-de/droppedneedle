@@ -18,7 +18,7 @@ use crate::dispatch::DownloadDispatch;
 use crate::downloads::journal::Journal;
 use crate::downloads::store::StoreError;
 use crate::downloads::worker::{
-    DownloadWorker, WorkerPorts, WorkerSettings, run_startup_recovery, sabnzbd_mount,
+    DownloadWorker, WorkerPorts, WorkerSettings, run_startup_recovery, usenet_mounts,
 };
 use crate::drop_import::DropImports;
 use crate::drop_import::store::{DropStore, StoreError as DropStoreError};
@@ -315,6 +315,9 @@ pub struct AcquirePorts {
     /// MusicBrainz reads: edition tracklists, and the album a single track
     /// is on.
     pub album_lookup: Arc<dyn AlbumLookup>,
+    /// The album pages: a download no person picked an edition for
+    /// prefers the edition its album page shows.
+    pub catalog: droppedneedle_catalog::metadata::Catalog,
     /// The follow poll's MusicBrainz reader.
     pub release_poll: Arc<dyn ReleasePoll>,
     /// Plugin download sources, plugin indexers that feed usenet, and
@@ -417,13 +420,13 @@ pub(crate) fn usenet_indexers(
 
 /// The download folders no recycle bin may overlap: the staging folder,
 /// slskd's downloads and incomplete folders while slskd is set up,
-/// SABnzbd's completed-downloads folder, and each enabled download
+/// each Usenet client's completed-downloads folder, and each enabled download
 /// plugin's folders. An empty folder setting names no folder, so it guards
 /// nothing.
 fn download_trees(
     staging_root: &Path,
     slskd: Option<(PathBuf, PathBuf)>,
-    sab_mount: Option<PathBuf>,
+    usenet_mounts: Vec<PathBuf>,
     plugins: Vec<PathBuf>,
 ) -> Vec<PathBuf> {
     std::iter::once(staging_root.to_owned())
@@ -432,7 +435,7 @@ fn download_trees(
                 .into_iter()
                 .flat_map(|(downloads, incomplete)| [downloads, incomplete]),
         )
-        .chain(sab_mount)
+        .chain(usenet_mounts)
         .chain(plugins)
         .filter(|tree| !tree.as_os_str().is_empty())
         .collect()
@@ -555,7 +558,7 @@ pub fn recycle_guard(
         Some(download_trees(
             &staging_root,
             slskd_folders,
-            sabnzbd_mount(&section),
+            usenet_mounts(&section),
             plugin_trees(&plugins, &plugins_dir)?,
         ))
     })
@@ -592,7 +595,11 @@ impl AcquireSetup {
             ClientLives::new(&config_store),
             config.slskd_downloads_path.clone(),
             stores.journal.clone(),
-            Arc::new(Targets::new(stores.journal.clone(), ports.album_lookup)),
+            Arc::new(Targets::new(
+                stores.journal.clone(),
+                ports.album_lookup,
+                ports.catalog,
+            )),
             ports.plugins.clone(),
         ));
         let events = platform.events.clone();

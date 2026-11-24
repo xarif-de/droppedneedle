@@ -233,9 +233,10 @@ impl Policy {
     /// Where a merged MusicBrainz id now points: merges are rare and
     /// final.
     pub const MERGED_ID: Self = Self::RELEASE_TO_GROUP;
-    /// A search.
+    /// A search: a day, so every view of a query shares one answer; a
+    /// search that found nothing is asked again sooner.
     pub const SEARCH: Self = Self {
-        fresh: Duration::from_secs(HOUR),
+        fresh: Duration::from_secs(24 * HOUR),
         miss: MB_MISS,
     };
     /// An artist page's discovery sections.
@@ -253,6 +254,8 @@ impl Policy {
     };
     /// A release group's genre tags: kept as long as an artist's lists.
     pub const LISTENBRAINZ_RELEASE_GROUP: Self = Self::LISTENBRAINZ_ARTIST;
+    /// A recording's listen count: kept as long as a group's.
+    pub const LISTENBRAINZ_RECORDING: Self = Self::LISTENBRAINZ_ARTIST;
     /// The release group of a recording: it barely changes.
     pub const RECORDING_TO_GROUP: Self = Self {
         fresh: Duration::from_secs(30 * 24 * HOUR),

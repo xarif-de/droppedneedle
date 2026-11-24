@@ -107,6 +107,7 @@ fn every_secret_section_masks_and_keeps() {
     }
     check!(SlskdConnection, api_key, SECRET_MASK, true, "");
     check!(DownloadClients, sabnzbd.api_key, SECRET_MASK, true, "");
+    check!(DownloadClients, nzbget.password, SECRET_MASK, false, "");
     check!(ProwlarrConnection, api_key, SECRET_MASK, true, "");
     check!(LidarrImportConnection, api_key, SECRET_MASK, true, "");
     check!(JellyfinConnection, api_key, SECRET_MASK, false, "");
@@ -344,6 +345,7 @@ fn secrets_never_appear_in_debug_output() {
     assert_redacted(lidarr, "redact-me");
     let mut clients = DownloadClients::default();
     *clients.sabnzbd.api_key.expose_mut() = "redact-me".to_owned();
+    *clients.nzbget.password.expose_mut() = "redact-me".to_owned();
     assert_redacted(clients, "redact-me");
     let mut indexer = NewznabIndexer::default();
     *indexer.api_key.expose_mut() = "redact-me".to_owned();
@@ -544,6 +546,32 @@ fn musicbrainz_official_clamp_and_mirror_rules() {
     let reread: MusicBrainzSettings = store.get().unwrap();
     assert_eq!(reread.rate_limit, official);
     assert!(!reread.clamped_to_official_limits);
+    // Every musicbrainz.org host is the public service: Unlimited there
+    // saves as the official pace.
+    let settings = MusicBrainzSettings {
+        source_mode: droppedneedle_kernel::runtime_config::sections::MbSourceMode::Mirror,
+        api_url: "https://beta.musicbrainz.org/ws/2".to_owned(),
+        rate_limit: 0.0,
+        ..Default::default()
+    };
+    let saved = store.save_blocking(settings).unwrap();
+    assert_eq!(saved.rate_limit, official);
+    for (url, public) in [
+        ("http://TEST.musicbrainz.org:5000/ws/2", true),
+        ("https://musicbrainz.org./ws/2", true),
+        ("https://beta.musicbrainz.org?/ws/2", true),
+        ("https://beta.musicbrainz.org\\ws\\2", true),
+        ("https://mirror.test@musicbrainz.org/ws/2", true),
+        ("https://musicbrainz.org@mirror.test/ws/2", false),
+        ("https://musicbrainz.org.mirror.test/ws/2", false),
+        ("https://notmusicbrainz.org/ws/2", false),
+    ] {
+        assert_eq!(
+            droppedneedle_kernel::runtime_config::sections::is_mb_rate_policy_public_host(url),
+            public,
+            "{url}"
+        );
+    }
     let settings = MusicBrainzSettings {
         source_mode: droppedneedle_kernel::runtime_config::sections::MbSourceMode::Mirror,
         api_url: "not-a-url".to_owned(),

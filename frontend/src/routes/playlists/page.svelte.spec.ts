@@ -19,7 +19,8 @@ vi.mock('$lib/features/playlists/queries/PlaylistV3Queries.svelte', () => ({
 }));
 vi.mock('$lib/features/playlists/queries/PlaylistV3Mutations.svelte', () => ({
 	createPlaylistV3Mutation: () => ({ mutateAsync: mockMutateAsync, isPending: false }),
-	createDeletePlaylistV3Mutation: () => ({ mutateAsync: vi.fn(), isPending: false })
+	createDeletePlaylistV3Mutation: () => ({ mutateAsync: vi.fn(), isPending: false }),
+	createImportPlaylistV3Mutation: () => ({ mutateAsync: vi.fn(), isPending: false })
 }));
 vi.mock('$lib/features/profile/queries/ConnectionsQuery.svelte', () => ({
 	getConnectionsQuery: () => ({ data: undefined, isPending: false })
@@ -56,6 +57,8 @@ function makePlaylist(overrides: Record<string, unknown> = {}): PlaylistListItem
 		updated_at: 1767312000,
 		is_public: false,
 		is_owner: true,
+		is_shared: false,
+		can_edit: true,
 		can_delete: false,
 		owner_name: null,
 		is_redacted: false,
@@ -120,6 +123,8 @@ describe('Playlists list page', () => {
 					id: 'stray',
 					name: 'Old Mix',
 					is_owner: false,
+					is_shared: false,
+					can_edit: false,
 					is_public: true,
 					owner_name: null,
 					can_delete: true
@@ -139,6 +144,8 @@ describe('Playlists list page', () => {
 					id: 'theirs',
 					name: 'Ann Mix',
 					is_owner: false,
+					is_shared: false,
+					can_edit: false,
 					is_public: true,
 					owner_name: 'Ann'
 				})

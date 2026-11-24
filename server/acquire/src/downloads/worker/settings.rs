@@ -21,7 +21,7 @@ pub struct WorkerSettings {
     clients: Arc<LiveClients>,
     policy: Live<DownloadPolicy>,
     source_priority: Live<SourcePriority>,
-    sabnzbd: Live<DownloadClients>,
+    usenet: Live<DownloadClients>,
     library: Live<TypedLibrary>,
     musicbrainz: Live<MusicBrainzSettings>,
 }
@@ -33,7 +33,7 @@ impl WorkerSettings {
             clients,
             policy: store.live(),
             source_priority: store.live(),
-            sabnzbd: store.live(),
+            usenet: store.live(),
             library: store.live(),
             musicbrainz: store.live(),
         }
@@ -79,7 +79,7 @@ impl WorkerSettings {
     }
 
     /// The worker tuning as saved right now, or `None` while a section it
-    /// needs does not read. An unreadable SABnzbd section is an
+    /// needs does not read. An unreadable Usenet client section is an
     /// unconfigured one, as in the client set, so slskd keeps working.
     pub(crate) fn config(&self) -> Option<WorkerConfig> {
         if !self.readable() {
@@ -87,24 +87,64 @@ impl WorkerSettings {
         }
         let policy = self.policy.read()?;
         let source_priority = self.source_priority.read()?;
-        let sab = self.sabnzbd.read().unwrap_or_default();
-        let sab_mount = sabnzbd_mount(&sab);
-        Some(worker_config(&policy, &source_priority, sab_mount))
+        let usenet = self.usenet.read().unwrap_or_default();
+        Some(worker_config(
+            &policy,
+            &source_priority,
+            orphan_mounts(&usenet),
+        ))
     }
 }
 
-/// SABnzbd's completed-downloads folder, while SABnzbd is set up.
-pub(crate) fn sabnzbd_mount(section: &DownloadClients) -> Option<PathBuf> {
-    (!section.sabnzbd.url.is_empty()).then(|| PathBuf::from(&section.sabnzbd.downloads_mount))
+/// Every Usenet client's completed-downloads folder while that client is
+/// set up, enabled or not: the folders no recycle bin may overlap.
+pub(crate) fn usenet_mounts(section: &DownloadClients) -> Vec<PathBuf> {
+    distinct(
+        [
+            (&section.sabnzbd.url, &section.sabnzbd.downloads_mount),
+            (&section.nzbget.url, &section.nzbget.downloads_mount),
+        ]
+        .into_iter()
+        .filter(|(url, _)| !url.is_empty())
+        .map(|(_, mount)| PathBuf::from(mount)),
+    )
+}
+
+/// The folders the orphan sweep walks: the completed-downloads folder of
+/// each Usenet client the client set builds (SABnzbd needs its key as well
+/// as its URL), enabled or not, so a job a client took is swept there
+/// after a switch.
+fn orphan_mounts(section: &DownloadClients) -> Vec<PathBuf> {
+    let sab = &section.sabnzbd;
+    let nzbget = &section.nzbget;
+    let sab_set_up = !sab.url.is_empty() && !sab.api_key.expose().is_empty();
+    distinct(
+        [
+            sab_set_up.then(|| PathBuf::from(&sab.downloads_mount)),
+            (!nzbget.url.is_empty()).then(|| PathBuf::from(&nzbget.downloads_mount)),
+        ]
+        .into_iter()
+        .flatten(),
+    )
+}
+
+/// The folders once each, in order.
+fn distinct(mounts: impl Iterator<Item = PathBuf>) -> Vec<PathBuf> {
+    mounts.fold(Vec::new(), |mut kept, mount| {
+        if !kept.contains(&mount) {
+            kept.push(mount);
+        }
+        kept
+    })
 }
 
 /// Worker tuning bound from the download-policy section. Only the
-/// SABnzbd complete dir is walked: slskd folders cannot prove client
+/// Usenet complete dirs are walked: slskd folders cannot prove client
 /// inactivity from the folder name, so they always keep.
 fn worker_config(
     policy: &DownloadPolicy,
     source_priority: &SourcePriority,
-    sab_mount: Option<PathBuf>,
+    usenet_mounts: Vec<PathBuf>,
 ) -> WorkerConfig {
     let mut source_order: Vec<SourceTag> = source_priority
         .0
@@ -114,9 +154,10 @@ fn worker_config(
     if source_order.is_empty() {
         source_order = vec![SourceTag::Soulseek, SourceTag::Usenet];
     }
-    let orphan_roots = sab_mount
-        .map(|mount| vec![(SourceTag::Usenet, mount)])
-        .unwrap_or_default();
+    let orphan_roots = usenet_mounts
+        .into_iter()
+        .map(|mount| (SourceTag::Usenet, mount))
+        .collect();
     WorkerConfig {
         max_concurrent_downloads: clamp_usize(policy.max_concurrent_downloads).max(1),
         max_failover_attempts: policy.max_failover_attempts.max(0),

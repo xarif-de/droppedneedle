@@ -93,7 +93,7 @@ pub struct TransferProgress {
     pub queue_position_end: Option<i64>,
     /// Total bytes of the batch, when the client knows it.
     pub total_bytes: Option<u64>,
-    /// Files in the batch (usenet jobs count as one).
+    /// Files in the batch (Soulseek counts audio tracks and Usenet counts jobs).
     pub files_total: u32,
     /// Files finished so far.
     pub files_completed: u32,
@@ -180,6 +180,13 @@ pub trait DownloadSource: Send + Sync {
 
     /// Abort a live batch. Returns false when nothing was running.
     fn abort<'a>(&'a self, handle: &'a SourceHandle) -> BoxFuture<'a, Result<bool, SourceError>>;
+
+    /// Which of the source's clients holds a handle's job, when the source
+    /// has more than one (Usenet: SABnzbd or NZBGet). Polls back off per
+    /// client, so one client that is down holds up only its own jobs.
+    fn client_of(&self, _handle: &SourceHandle) -> &'static str {
+        ""
+    }
 
     /// Whether the client still owns one job (orphan evidence). `None`
     /// means the source cannot tell, and the folder stays.

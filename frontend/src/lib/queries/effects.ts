@@ -253,13 +253,15 @@ export const EFFECTS = {
 	downloadReadinessChanged: (): Sweep[] => [
 		{ key: DownloadQueryKeyFactory.clientStatus() },
 		{ key: DownloadQueryKeyFactory.sabnzbdStatus() },
+		{ key: DownloadQueryKeyFactory.nzbgetStatus() },
 		{ everyScope: [HomeQueryKeyFactory.feature] }
 	],
 	/** The Soulseek connection settings. */
 	slskdSettingsChanged: (): Sweep[] => [{ key: DownloadQueryKeyFactory.clientConfig() }],
-	/** The Usenet settings: SABnzbd, Prowlarr, the indexers and the search backend. */
+	/** The Usenet settings: SABnzbd, NZBGet, Prowlarr, the indexers and the search backend. */
 	usenetSettingsChanged: (): Sweep[] => [
 		{ key: DownloadQueryKeyFactory.sabnzbd() },
+		{ key: DownloadQueryKeyFactory.nzbget() },
 		{ key: DownloadQueryKeyFactory.prowlarr() },
 		{ key: DownloadQueryKeyFactory.indexers() }
 	],
@@ -372,9 +374,10 @@ export const EFFECTS = {
 	homeChanged: (): Sweep[] => [{ everyScope: [HomeQueryKeyFactory.feature] }],
 	/** The caller's playlist list. */
 	playlistListChanged: (userId: UserId): Sweep[] => [{ key: PlaylistQueryKeyFactory.list(userId) }],
-	/** One playlist. */
+	/** One playlist, and whom it is shared with. */
 	playlistChanged: (userId: UserId, playlistId: string): Sweep[] => [
-		{ key: PlaylistQueryKeyFactory.detail(userId, playlistId) }
+		{ key: PlaylistQueryKeyFactory.detail(userId, playlistId) },
+		{ key: PlaylistQueryKeyFactory.members(userId, playlistId) }
 	],
 	/** Installed plugins, in every scope. */
 	pluginsChanged: (): Sweep[] => [{ everyScope: [PluginQueryKeyFactory.feature] }],

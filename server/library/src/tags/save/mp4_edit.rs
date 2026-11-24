@@ -3,7 +3,7 @@
 
 use lofty::config::WriteOptions;
 use lofty::file::{TaggedFile, TaggedFileExt as _};
-use lofty::mp4::{Atom, AtomData, AtomIdent, Ilst};
+use lofty::mp4::{Atom, AtomData, AtomIdent, DataType, Ilst};
 use lofty::tag::{Accessor as _, TagExt as _, TagType};
 
 use super::edit::{foreign, supersede};
@@ -217,6 +217,13 @@ pub(super) fn apply(
         .unwrap_or_default();
     if let Some(atoms) = atoms {
         repair_mp4_text(&mut native, atoms);
+        let genre_edited = edits
+            .iter()
+            .any(|edit| matches!(edit, Mp4Edit::Text { code, .. } if code == b"\xa9gen"));
+        if !genre_edited {
+            keep_legacy_genre(&mut native, atoms);
+        }
+        keep_dropped_atoms(&mut native, atoms);
     }
     for edit in edits {
         match edit {
@@ -346,6 +353,80 @@ fn repair_mp4_text(native: &mut Ilst, atoms: &[Mp4AtomTruth]) {
     texts.retain(|(ident, _)| !skipped.contains(ident));
     for (ident, values) in texts {
         replace_mp4(native, ident, &values);
+    }
+}
+
+/// Put back the file's legacy `gnre` atom, as iTunes writes a genre,
+/// with its data type and bytes, so a save that leaves the genre alone
+/// leaves it as it was. lofty's read turns it into a `©gen`, which goes
+/// unless the file held its own, or drops it beside one.
+fn keep_legacy_genre(native: &mut Ilst, atoms: &[Mp4AtomTruth]) {
+    let Some((data, data_type)) =
+        atoms
+            .iter()
+            .find(|atom| atom.kind == *b"gnre")
+            .and_then(|atom| {
+                let data = match atom.items.as_slice() {
+                    [Mp4Item::Integer(number)] => {
+                        u16::try_from(*number).ok()?.to_be_bytes().to_vec()
+                    }
+                    [Mp4Item::Bytes(bytes)] => bytes.clone(),
+                    _ => return None,
+                };
+                Some((data, atom.types.first().copied().flatten()?))
+            })
+    else {
+        return;
+    };
+    if !atoms.iter().any(|atom| atom.kind == *b"\xa9gen") {
+        let _ = native.remove(&AtomIdent::Fourcc(*b"\xa9gen")).count();
+    }
+    native.insert(Atom::new(
+        AtomIdent::Fourcc(*b"gnre"),
+        AtomData::Unknown {
+            code: DataType::from(data_type),
+            data,
+        },
+    ));
+}
+
+/// Put back atoms lofty's read dropped, with their own bytes: an integer
+/// of 8 bytes (lofty reads integer types at 1 to 4, so an iTunes `cnID`
+/// of 8 is lost) or an empty payload (`pgap`). An edit to the same atom
+/// replaces it after.
+fn keep_dropped_atoms(native: &mut Ilst, atoms: &[Mp4AtomTruth]) {
+    for atom in atoms {
+        // `gnre` is `keep_legacy_genre`'s, and pictures are saved apart.
+        if matches!(&atom.kind, b"----" | b"gnre" | b"covr")
+            || native.get(&AtomIdent::Fourcc(atom.kind)).is_some()
+        {
+            continue;
+        }
+        let data = atom
+            .items
+            .iter()
+            .zip(&atom.types)
+            .filter_map(|(item, code)| {
+                let data = match item {
+                    // lofty reads 1 to 4 bytes, so a single integer it dropped
+                    // is 8. An atom of several boxes stays refused.
+                    Mp4Item::Integer(number)
+                        if atom.items.len() == 1 && matches!(code, Some(21 | 22)) =>
+                    {
+                        number.to_be_bytes().to_vec()
+                    }
+                    Mp4Item::Bytes(bytes) => bytes.clone(),
+                    _ => return None,
+                };
+                Some(AtomData::Unknown {
+                    code: DataType::from((*code)?),
+                    data,
+                })
+            })
+            .collect();
+        if let Some(restored) = Atom::from_collection(AtomIdent::Fourcc(atom.kind), data) {
+            native.insert(restored);
+        }
     }
 }
 

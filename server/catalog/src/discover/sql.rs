@@ -12,7 +12,7 @@ use droppedneedle_kernel::db::time::Millis;
 use crate::artwork::local::art_tracks_column;
 use crate::local::sql::{live_album, musicbrainz, owned_album, owned_artist, track_codec};
 use droppedneedle_library::identity::asked_groups;
-use droppedneedle_library::{named_group_guess, not_yet_identified, owns_group, recording_mbid};
+use droppedneedle_library::{all_owners, not_yet_identified, owns_group, recording_mbid};
 
 droppedneedle_kernel::sql! {
     // -- ownership -----------------------------------------------------------
@@ -50,25 +50,19 @@ droppedneedle_kernel::sql! {
 
     // -- the discover page's library reads ------------------------------------
 
-    /// Identified owned albums, newest changes first. A guess the files'
-    /// tags contradict is not one; neither is an album owned through its
-    /// tags alone, which has no match to list.
-    pub(super) IDENTIFIED_ALBUMS = (concat!(
-        "SELECT lower(ae.release_group_mbid) AS release_group_mbid, \
+    /// Every album that owns a release group, by [`all_owners!`], the rule
+    /// the serve's hide reads, with its album artist's MBID.
+    pub(super) LIBRARY_ALBUMS = (concat!(
+        "SELECT o.group_mbid AS release_group_mbid, \
          lower(aie.provider_artist_id) AS artist_mbid \
-         FROM local_albums a \
-         JOIN local_album_external_identities ae ON ae.local_album_id = a.id AND ",
-        musicbrainz!("ae"),
-        " LEFT JOIN local_artist_external_identities aie \
+         FROM (",
+        all_owners!(),
+        ") o JOIN local_albums a ON a.id = o.album_id \
+         LEFT JOIN local_artist_external_identities aie \
            ON aie.local_artist_id = a.album_artist_id AND ",
-        musicbrainz!("aie"),
-        " WHERE ",
-        owned_album!("a"),
-        " AND NOT ",
-        named_group_guess!("a.id"),
-        " GROUP BY a.id ORDER BY a.updated_at DESC, a.id LIMIT ?1"
+        musicbrainz!("aie")
     ));
-    pub(super) row IdentifiedAlbum for [IDENTIFIED_ALBUMS] {
+    pub(super) row LibraryAlbumColumns for [LIBRARY_ALBUMS] {
         release_group_mbid: String,
         artist_mbid: Option<String>,
     }
@@ -232,7 +226,9 @@ droppedneedle_kernel::sql! {
         year: Option<i64>,
         art_version: Option<i64>,
     }
-    /// The artists with the most albums.
+    /// The artists with the most albums. No placeholder ranks: not the
+    /// sentinel rows (by kind), and not a row tags keyed for one of the
+    /// names they go by, folded as the scan folds a display name.
     pub(super) TOP_ARTISTS = "SELECT ar.id AS id, ar.display_name AS display_name, \
          (SELECT aie.provider_artist_id FROM local_artist_external_identities aie \
           WHERE aie.local_artist_id = ar.id AND aie.provider = 'musicbrainz' \
@@ -243,6 +239,9 @@ droppedneedle_kernel::sql! {
            AND album.retired_into_album_id IS NULL \
          JOIN local_artists ar ON ar.id = credit.local_artist_id \
            AND ar.retired_into_artist_id IS NULL \
+           AND ar.kind NOT IN ('various_artists', 'unknown') \
+           AND ar.folded_name NOT IN ('various artists', 'various', 'va', \
+             'unknown artist', 'unknown artists') \
          WHERE EXISTS (SELECT 1 FROM local_tracks t WHERE t.local_album_id = album.id \
            AND t.availability = 'indexed') \
          GROUP BY ar.id \
@@ -359,9 +358,11 @@ droppedneedle_kernel::sql! {
         album_artist_mbid: String,
         release_group_mbid: Option<String>,
     }
-    /// A playlist the caller may read: their own or a public one.
-    pub(super) VISIBLE_PLAYLIST = "SELECT id FROM catalog_playlists \
-         WHERE id = ?1 AND (user_id = ?2 OR is_public = 1)";
+    /// A playlist the caller may read: their own, a public one, or one
+    /// shared with them.
+    pub(super) VISIBLE_PLAYLIST = "SELECT id FROM catalog_playlists p \
+         WHERE id = ?1 AND (user_id = ?2 OR is_public = 1 OR EXISTS (SELECT 1 \
+         FROM catalog_playlist_members m WHERE m.playlist_id = p.id AND m.user_id = ?2))";
     /// A playlist's entries in playlist order: the stored artist id (a
     /// media server's own id for an imported playlist), the artist name,
     /// and the MusicBrainz id of the first credited artist of a library

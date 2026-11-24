@@ -9,7 +9,7 @@ use droppedneedle_kernel::db::statement::ListLen;
 use crate::local::sql::{
     TRACK_TEXT_MATCH, TRACK_WORD_LIKE, musicbrainz, owned_album, owned_artist, track_codec,
 };
-use droppedneedle_library::recording_mbid;
+use droppedneedle_library::{named_group_guess, recording_mbid};
 
 droppedneedle_kernel::sql! {
     /// One page of artist hits: live rows whose folded name contains the
@@ -40,27 +40,37 @@ droppedneedle_kernel::sql! {
         disambiguation: Option<String>,
         owned: bool,
     }
-    /// One page of album hits: owned albums whose folded title or album
-    /// artist contains the pattern, exact title first. Binds: the contains
-    /// pattern twice, the folded query, the prefix pattern, limit, offset.
-    pub(super) ALBUM_HITS = (concat!(
+    /// One album page's columns and the rows it reads. A guess its files
+    /// contradict gives no group: the hit opens as the album itself.
+    fragment ALBUM_START = (concat!(
         "SELECT b.id AS id, b.title AS title, b.title_folded AS title_folded, \
          b.album_artist_name AS album_artist_name, b.year AS year, \
-         e.release_group_mbid AS mbid, (w.local_album_id IS NOT NULL) AS own_art \
+         CASE WHEN ",
+        named_group_guess!("b.id"),
+        " THEN NULL ELSE e.release_group_mbid END AS mbid, \
+         (w.local_album_id IS NOT NULL) AS own_art \
          FROM local_albums b \
          LEFT JOIN local_album_artwork w ON w.local_album_id = b.id \
          AND w.source IN ('folder','embedded') \
          LEFT JOIN local_album_external_identities e ON e.local_album_id = b.id AND ",
         musicbrainz!("e"),
         " WHERE ",
-        owned_album!("b"),
-        " AND (b.title_folded LIKE ? ESCAPE '\\' \
-         OR COALESCE(b.album_artist_name_folded, '') LIKE ? ESCAPE '\\') \
-         ORDER BY CASE WHEN b.title_folded = ? THEN 0 \
-         WHEN b.title_folded LIKE ? ESCAPE '\\' THEN 1 ELSE 2 END, \
-         b.title_folded ASC LIMIT ? OFFSET ?"
+        owned_album!("b")
     ));
-    pub(super) row AlbumHit for [ALBUM_HITS] {
+    /// One word of an album query: it appears in the folded title or the
+    /// folded album artist.
+    fragment ALBUM_WORD_LIKE = " AND (b.title_folded LIKE ? ESCAPE '\\' \
+        OR COALESCE(b.album_artist_name_folded, '') LIKE ? ESCAPE '\\')";
+    /// An album page's rank and cut: exact title first, then a title
+    /// prefix, then the rest.
+    fragment ALBUM_END = " ORDER BY CASE WHEN b.title_folded = ? THEN 0 \
+        WHEN b.title_folded LIKE ? ESCAPE '\\' THEN 1 ELSE 2 END, \
+        b.title_folded ASC LIMIT ? OFFSET ?";
+    /// One page of album hits: owned albums matching every word of the query
+    /// in their title or album artist. Binds: the contains pattern twice per
+    /// word, the folded query, the prefix pattern, limit, offset.
+    family ALBUM_HITS = album_hits;
+    pub(super) row AlbumHit for family [album_hits] {
         id: String,
         title: String,
         title_folded: String,
@@ -140,6 +150,8 @@ droppedneedle_kernel::sql! {
     }
     /// Song hits through the FTS index, in `SongHit`'s columns.
     family SONG_HITS_WORDS = song_hits_words;
+    /// The library's copies of a list of recordings, in `SongHit`'s columns.
+    family SONG_HITS_BY_RECORDING = song_hits_by_recording;
 }
 
 /// `SONG_HITS_WORDS` for a query with `short` words under 3 characters.
@@ -147,5 +159,33 @@ pub(super) fn song_hits_words(short: ListLen) -> String {
     format!(
         "{SONG_START}{TRACK_TEXT_MATCH}{}{SONG_END}",
         TRACK_WORD_LIKE.repeat(short.get())
+    )
+}
+
+/// `SONG_HITS_BY_RECORDING` for `ids` lowercase recording MBIDs, each bound
+/// three times: the indexed tracks whose recording id as pages read it (the
+/// match row's, else the tags') is one of them, on an album the lists show.
+/// They rank in the tiers of the query bound first, like every song hit.
+pub(super) fn song_hits_by_recording(ids: ListLen) -> String {
+    let marks = vec!["?"; ids.get()].join(",");
+    format!(
+        "{SONG_START}t.id IN (SELECT ct.id FROM local_tracks ct \
+         JOIN local_albums cb ON cb.id = ct.local_album_id \
+         LEFT JOIN local_track_external_identities ce ON ce.local_track_id = ct.id AND {} \
+         WHERE {} AND lower({}) IN ({marks}) \
+         AND ct.id IN (SELECT local_track_id FROM local_track_external_identities \
+         WHERE lower(recording_mbid) IN ({marks}) UNION SELECT id FROM local_tracks \
+         WHERE lower(COALESCE(embedded_recording_mbid, '')) IN ({marks}))){SONG_END}",
+        musicbrainz!("ce"),
+        owned_album!("cb"),
+        recording_mbid!("ce", "ct"),
+    )
+}
+
+/// `ALBUM_HITS` for a query of `words` words.
+pub(super) fn album_hits(words: ListLen) -> String {
+    format!(
+        "{ALBUM_START}{}{ALBUM_END}",
+        ALBUM_WORD_LIKE.repeat(words.get())
     )
 }

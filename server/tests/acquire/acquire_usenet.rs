@@ -1616,7 +1616,8 @@ async fn usenet_enqueue_reattaches_to_existing_job() {
     use droppedneedle_acquire::downloads::journal::Journal;
     use droppedneedle_acquire::downloads::sources::{DownloadSource, SourceError};
     use droppedneedle_acquire::downloads::store::NewTask;
-    use droppedneedle_acquire::sources::SabnzbdSource;
+    use droppedneedle_acquire::sources::UsenetSource;
+    use droppedneedle_acquire::usenet::queue::UsenetQueue;
     use std::sync::Arc;
 
     let task_id = "0123456789abcdef0123456789abcdef";
@@ -1660,8 +1661,8 @@ async fn usenet_enqueue_reattaches_to_existing_job() {
         std::env::temp_dir(),
         policy.clone(),
     ));
-    let source = SabnzbdSource::new(
-        queue,
+    let source = UsenetSource::new(
+        UsenetQueue::Sabnzbd(queue).into(),
         vec![Arc::new(NewznabIndexer::new(
             Vec::new(),
             Duration::from_secs(5),
@@ -1670,7 +1671,7 @@ async fn usenet_enqueue_reattaches_to_existing_job() {
         policy,
         journal.clone(),
         None,
-        no_targets(&journal),
+        no_targets(&journal).await,
     );
     let handle = source.enqueue(task_id, 0).await.expect("re-attaches");
     assert_eq!(handle.job_name, job_name);

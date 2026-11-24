@@ -12,7 +12,7 @@ mod identify;
 
 pub use contrib::*;
 pub use enrichment::{ScriptedAcoustId, ScriptedEnrichment};
-pub use identify::FakeProviders;
+pub use identify::{FakeProviders, file_review};
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -44,6 +44,7 @@ pub fn statement_files() -> Vec<StatementFile> {
         crate::sql::registered(),
         crate::activity::sql::registered(),
         crate::corrections::sql::registered(),
+        crate::duplicates::sql::registered(),
         crate::identify::sql::registered(),
         crate::import::sql::registered(),
         crate::catalog_actions::sql::registered(),

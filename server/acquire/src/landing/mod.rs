@@ -64,6 +64,7 @@ use droppedneedle_kernel::runtime_config::sections::{
     DownloadPolicy, ImportFolder, LibraryManagement,
 };
 use droppedneedle_library::identify::sources::AcoustIdUnavailable;
+use droppedneedle_library::matching::decide::ACCEPT_TRACK;
 use droppedneedle_library::matching::score::MERGE_LOOKUPS;
 use droppedneedle_providers::RequestPriority;
 
@@ -355,8 +356,10 @@ impl LandingService {
         // the pinned-edition check all use it. A download fetched for one
         // copy is matched against that copy's release instead. An edition
         // that does not read is never taken as none: the landing waits.
+        // Either way the release is no longer only a preference.
         if let Some(planned) = &target.planned_album {
             target.release_mbid = Some(planned.release_mbid.trim().to_ascii_lowercase());
+            target.release_preferred = false;
         } else if !target.release_group_mbid.is_empty() {
             let pin = match library.chosen_edition(&target.release_group_mbid).await {
                 Ok(pin) => pin,
@@ -378,6 +381,7 @@ impl LandingService {
                     tracing::info!(task_id = %task.id, %pin, "landing follows the album's chosen edition");
                 }
                 target.release_mbid = Some(pin);
+                target.release_preferred = false;
             }
         }
         // Sizes key on the exact reported file, never on a bare name: two
@@ -443,7 +447,9 @@ impl LandingService {
                     release_mbid: None,
                     distance: None,
                 };
-                let held = self.hold_decided(task, &target, &landing, &decision).await;
+                let held = self
+                    .hold_decided(task, &target, &landing, &decision, None)
+                    .await;
                 Acted::holding(decision, held)
             }
             None => {
@@ -469,7 +475,9 @@ impl LandingService {
                         .await
                     }
                     _ => {
-                        let held = self.hold_decided(task, &target, &landing, &decision).await;
+                        let held = self
+                            .hold_decided(task, &target, &landing, &decision, Some(&matched))
+                            .await;
                         Acted::holding(decision, held)
                     }
                 }
@@ -639,15 +647,19 @@ impl LandingService {
         .await
     }
 
-    /// Hold every audio file of a decision that holds. Answers how many
-    /// were held, and whether none were because the album already holds
-    /// its one set of files the recipe does not list.
+    /// Hold every audio file of a decision that holds, each with the track
+    /// of the closest release matching paired it with, when that pair is
+    /// within the track gate. A file paired further off stays unpaired, so
+    /// it offers no Import and claims no track in the held list.
+    /// Answers how many were held, and whether none were because the album
+    /// already holds its one set of files the recipe does not list.
     async fn hold_decided(
         &self,
         task: &TaskRow,
         target: &Target,
         landing: &Landing,
         decision: &Decision,
+        matched: Option<&MatchSummary>,
     ) -> (usize, bool) {
         let Outcome::Hold { code, detail } = &decision.outcome else {
             return (0, false);
@@ -655,17 +667,22 @@ impl LandingService {
         if *code == Reason::FormatNotListed && self.format_set_held(task, target).await {
             return (0, true);
         }
+        let found = matched.and_then(MatchSummary::best);
         let held: Vec<Held<'_>> = landing
             .audio
             .iter()
-            .map(|file| Held {
+            .enumerate()
+            .map(|(index, file)| Held {
                 file,
-                track: None,
+                track: found
+                    .and_then(|found| found.scored.pair_for(index))
+                    .filter(|pair| pair.distance <= ACCEPT_TRACK)
+                    .map(|pair| pair.track),
                 code: *code,
                 detail: detail.clone(),
             })
             .collect();
-        (self.hold(task, target, landing, None, held).await, false)
+        (self.hold(task, target, landing, found, held).await, false)
     }
 
     /// Whether this album's open entry already holds copies the recipe does
@@ -793,9 +810,11 @@ impl LandingService {
             files: landing
                 .audio
                 .iter()
-                .map(|file| intake::IntakeFile {
+                .enumerate()
+                .map(|(index, file)| intake::IntakeFile {
                     file: file.clone(),
                     held_for: None,
+                    set_aside: matched.set_aside.contains_key(&index),
                 })
                 .collect(),
             target: intake::Target {
@@ -1146,6 +1165,9 @@ impl LandingService {
             missing_positions: serde_json::to_string(&missing).unwrap_or_else(|_| "[]".into()),
             decided_at: self.journal.db().now_unix_f64(),
         };
+        // A landing that was not a clean import logs which check said so.
+        let code = row.reason_code.map(Reason::code);
+        let detail = code.and(row.detail.clone());
         // A long outage lands every pass: it records the wait once.
         let waiting = matches!(
             &result,
@@ -1187,6 +1209,8 @@ impl LandingService {
             outcome = outcome.as_str(),
             imported,
             held,
+            code,
+            detail = detail.as_deref(),
             "download landing decided"
         );
         LandingReport {
@@ -1201,16 +1225,24 @@ impl LandingService {
 
 /// What the task asked for, from its row, details, and plan.
 pub fn target_for(task: &TaskRow, details: &TaskDetails, plan: &TaskPlan) -> Target {
+    let release_mbid = details
+        .release_mbid
+        .clone()
+        .or_else(|| plan.release_mbid.clone())
+        .map(|mbid| mbid.trim().to_ascii_lowercase())
+        .filter(|mbid| !mbid.is_empty());
+    // A release in the details that the plan is not for is a pin.
+    let release_preferred = task.download_type == "album"
+        && plan.release_preferred
+        && release_mbid
+            .as_deref()
+            .is_some_and(|release| plan.is_for(release));
     Target {
         artist_name: task.artist_name.clone(),
         album_title: task.album_title.clone(),
         release_group_mbid: task.release_group_mbid.trim().to_ascii_lowercase(),
-        release_mbid: details
-            .release_mbid
-            .clone()
-            .or_else(|| plan.release_mbid.clone())
-            .map(|mbid| mbid.trim().to_ascii_lowercase())
-            .filter(|mbid| !mbid.is_empty()),
+        release_mbid,
+        release_preferred,
         year: details.year,
         is_track: task.download_type == "track",
         recording_mbid: task

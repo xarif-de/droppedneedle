@@ -369,12 +369,11 @@ impl Catalog {
     }
 
     /// The release-group MBID a route's album id names. A library album
-    /// id resolves to the group it is identified as; anything
-    /// else that is not an MBID is rejected.
+    /// id, alias or merged-away id resolves to the group the album holding
+    /// it now is identified as; anything else that is not an MBID is
+    /// rejected. Library ids are shaped like MBIDs, so the library is asked
+    /// first: one keyed read, and MusicBrainz is never asked for them.
     async fn album_id(&self, raw_id: &str) -> Result<String, CatalogError> {
-        if let Ok(id) = checked_mbid(raw_id, "album") {
-            return Ok(id);
-        }
         let local = raw_id.trim();
         if !local.is_empty() && local.len() <= 128 {
             let found = self
@@ -507,6 +506,26 @@ impl Catalog {
             owned: evidence.owned_release,
             chosen: evidence.chosen_release,
         })
+    }
+
+    /// The edition the album page shows for `group` when only the saved
+    /// edition preferences chose it, for a download no person picked an
+    /// edition for. `None` when the library's files or a person decide
+    /// the page's edition, when the preferences do not read, or when
+    /// MusicBrainz does not know the group. The group is read from the
+    /// cache, else fetched at `priority`.
+    pub async fn request_edition(
+        &self,
+        group: &str,
+        priority: RequestPriority,
+    ) -> Result<Option<String>, CatalogError> {
+        let Some(detail) = self.group_detail_at(group, priority).await? else {
+            return Ok(None);
+        };
+        let selection = self.select_edition(&detail).await?;
+        Ok(selection
+            .selected
+            .filter(|_| selection.basis == Some("preferred")))
     }
 
     /// The edition the saved edition preferences pick, MusicBrainz's rank

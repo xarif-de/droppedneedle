@@ -3,7 +3,7 @@
 //! [`crate::db::migrate`] before anything serves.
 //!
 //! The list starts with the v3 baseline. A schema change is a new file with
-//! the next number, added here in order; a file on `v3` is never edited,
+//! the next number, added here in order; a file on `main` is never edited,
 //! renumbered or removed.
 
 use crate::db::migrate::{Chain, Migration};
@@ -32,6 +32,12 @@ pub static MIGRATIONS: &[Migration<'static>] = &[
     migration!(144, "0144_v3_cover_paths.sql"),
     migration!(145, "0145_v3_recycle_bin_marks.sql"),
     migration!(146, "0146_v2_recycle_bin_paths.sql"),
+    migration!(147, "0147_management_written_stat.sql"),
+    migration!(148, "0148_download_quarantine_reason.sql"),
+    migration!(149, "0149_playlist_members.sql"),
+    migration!(150, "0150_playlist_local_source.sql"),
+    migration!(151, "0151_auth_display_name_chosen.sql"),
+    migration!(152, "0152_playlist_unlinked_entries.sql"),
 ];
 
 /// The stamp of a database made by the migration chain the baseline

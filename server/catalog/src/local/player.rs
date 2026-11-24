@@ -12,6 +12,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
+use super::sqlite::like_pattern;
 use droppedneedle_kernel::db::fold_text;
 use droppedneedle_kernel::db::statement::{ListLen, Statement};
 use droppedneedle_providers::musicbrainz::is_valid_mbid;
@@ -704,15 +705,6 @@ impl Agreement {
     }
 }
 
-/// Folded LIKE pattern for a substring filter.
-fn like_pattern(raw: &str) -> String {
-    let folded = fold_text(raw)
-        .replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_");
-    format!("%{folded}%")
-}
-
 /// A text value.
 fn text(value: &str) -> Value {
     Value::Text(value.to_owned())
@@ -1041,6 +1033,17 @@ impl LocalCatalog {
         self.read(name, move |conn| scalar::<i64>(conn, &text, &values))
             .await
             .map(unsigned)
+    }
+
+    /// The identity of every live track, for matching an imported
+    /// playlist.
+    pub(crate) async fn track_identities(&self) -> Result<Vec<sql::ImportTrack>, StoreError> {
+        self.read_long("player.track_identities", |conn| {
+            conn.prepare(sql::IMPORT_TRACKS.text())?
+                .query_map([], sql::ImportTrack::read)?
+                .collect::<rusqlite::Result<_>>()
+        })
+        .await
     }
 
     /// Tracks by id, in no particular order; unknown or unstreamable ids

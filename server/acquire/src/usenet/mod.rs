@@ -1,8 +1,10 @@
-//! Usenet acquisition: SABnzbd + Newznab + Prowlarr.
+//! Usenet acquisition: SABnzbd and NZBGet, Newznab and Prowlarr.
 //!
-//! The download half of Usenet lives here: [`sabnzbd`] enqueues NZBs and
-//! tracks jobs, [`newznab`] and [`prowlarr`] search indexers for releases,
-//! and [`indexer`] is the one search seam they and plugin indexers share.
+//! The download half of Usenet lives here: [`sabnzbd`] and [`nzbget`]
+//! enqueue NZBs and track jobs, [`queue`] sends a new job to one of them
+//! and each later call to the client that took the job, [`newznab`] and
+//! [`prowlarr`] search indexers for releases, and [`indexer`] is the one
+//! search seam they and plugin indexers share.
 //! [`policy`] carries the Usenet quality tiers, search recipe, timeouts,
 //! and retention gates. The testkit crate serves the loopback
 //! SAB/Newznab/Prowlarr servers the contract tests run against. No test
@@ -10,7 +12,7 @@
 //!
 //! HTTP seam: Newznab indexers are services on the internet, so they are
 //! called through their client in the providers crate, on its executor.
-//! SABnzbd and Prowlarr are services the user runs: each takes an
+//! SABnzbd, NZBGet and Prowlarr are services the user runs: each takes an
 //! injected `reqwest::Client` (built once from the shared
 //! `HttpClientFactory`) and is never paced.
 //!
@@ -22,8 +24,11 @@
 
 pub mod indexer;
 pub mod newznab;
+pub mod nzbget;
+pub mod nzbget_models;
 pub mod policy;
 pub mod prowlarr;
+pub mod queue;
 pub mod sabnzbd;
 pub mod sabnzbd_models;
 

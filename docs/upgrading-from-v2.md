@@ -71,8 +71,8 @@ checks the library against your files on its first scan.
    database and that file, and keeps every write v2 had saved, as v2's own
    next start would. v2's files are never changed.
 
-2. Change the image in your compose file to a v3 tag (such as `:v3.0.0`, or
-   `:latest` once v3 is released). Leave the volumes as they are.
+2. Change the image in your compose file to `:latest` (or a version such as
+   `:v3.0.0`). Leave the volumes as they are.
 
 3. Start it:
 
@@ -463,13 +463,15 @@ Albums that were waiting on a review question in v2 go back on v3's
 identify queue, so v3 asks again with its own candidates.
 
 Four passes run in the background after an upgrade: an album v2 matched only
-to a release group is identified once more to find its edition, unless a
-person chose that group; an album matched by itself on a release outside
-the group all its files name is checked once more; an album matched by
-itself on an edition whose barcode or catalog number differs from its
-files', with no MusicBrainz release ID in them, is checked once more after
-its files' edition tags are read; and the artist MusicBrainz links v2 made stay in
-place until each album's release details arrive and are checked. See
+to a release group is identified once more to find its edition (one v2
+carried over from its older catalog keeps its group and takes an edition of
+it only when the files clearly fit one), unless a person chose that group;
+an album matched by itself on a release outside the group all its files name
+is checked once more; an album matched by itself on an edition whose barcode
+or catalog number differs from its files', with no MusicBrainz release ID in
+them, is checked once more after its files' edition tags are read; and the
+artist MusicBrainz links v2 made stay in place until each album's release
+details arrive and are checked. See
 [Your library](library.md#album-organization).
 
 A song that points at something v2 itself no longer had (say a queued song

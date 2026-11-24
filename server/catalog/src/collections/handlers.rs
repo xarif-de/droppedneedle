@@ -6,25 +6,28 @@
 use axum::{
     Json,
     extract::{Path, State},
-    http::{StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
 
 use droppedneedle_auth::User;
 use droppedneedle_kernel::error::ApiError;
 use droppedneedle_kernel::extract::{ValidJson, ValidQuery};
+use droppedneedle_media::stream::download::attachment_headers;
 
 use super::{
     error::CollectionsError,
     http::{HttpResult, playlist_private},
     models::{
         AddTracksBody, AddTracksResponse, CheckTracksBody, CheckTracksResponse, CoverUploadBody,
-        CoverUploadResponse, CreatePlaylistBody, FavoriteStatusResponse, FollowStatusResponse,
-        FollowedArtistListResponse, NewReleaseListResponse, PlaylistDetail, PlaylistListResponse,
-        PlaylistSummary, PlaylistTrack, RatingLookupBody, RatingLookupResponse,
-        RatingStatusResponse, RecentReleasesQuery, RemoveTracksBody, RemoveTracksResponse,
-        ReorderBody, ReorderResponse, ResolveSourcesResponse, SetFavoriteBody, SetRatingBody,
-        StatusResponse, UnseenCountResponse, UpdatePlaylistBody, UpdateTrackBody, VisibilityBody,
+        CoverUploadResponse, CreatePlaylistBody, ExportFormat, ExportQuery, FavoriteStatusResponse,
+        FollowStatusResponse, FollowedArtistListResponse, ImportPlaylistBody,
+        ImportPlaylistResponse, MembersBody, MembersResponse, NewReleaseListResponse,
+        PlaylistDetail, PlaylistListResponse, PlaylistSummary, PlaylistTrack, RatingLookupBody,
+        RatingLookupResponse, RatingStatusResponse, RecentReleasesQuery, RemoveTracksBody,
+        RemoveTracksResponse, ReorderBody, ReorderResponse, ResolveSourcesResponse,
+        SetFavoriteBody, SetRatingBody, StatusResponse, UnseenCountResponse, UpdatePlaylistBody,
+        UpdateTrackBody, VisibilityBody,
     },
     service::CollectionsService,
     state::CollectionsState,
@@ -80,6 +83,29 @@ pub async fn create_playlist_handler(
         .create_playlist(caller.user_id(), &body)
         .await?;
     Ok((StatusCode::CREATED, Json(detail)))
+}
+
+/// Import a playlist from an M3U or CSV file.
+#[utoipa::path(
+    post,
+    path = "/api/v3/playlists/import",
+    tag = "collections",
+    request_body = ImportPlaylistBody,
+    responses(
+        (status = 201, description = "The new playlist and the match report", body = ImportPlaylistResponse),
+        (status = 400, description = "Bad body, blank name, or a file over 2 MB"),
+        (status = 401, description = "Not authenticated"),
+    )
+)]
+pub async fn import_playlist_handler(
+    State(state): State<CollectionsState>,
+    User(caller): User,
+    ValidJson(body): ValidJson<ImportPlaylistBody>,
+) -> HttpResult<(StatusCode, Json<ImportPlaylistResponse>)> {
+    let imported = CollectionsService::new(&state)
+        .import_playlist_file(caller.user_id(), &body)
+        .await?;
+    Ok((StatusCode::CREATED, Json(imported)))
 }
 
 /// Read one playlist.
@@ -168,6 +194,55 @@ pub async fn delete_playlist_handler(
     Ok(Json(ok("Playlist deleted")))
 }
 
+/// Entries an export leaves out, because they have no local file.
+const SKIPPED_TRACKS_HEADER: &str = "x-droppedneedle-skipped-tracks";
+
+/// Export one playlist as extended M3U or CSV.
+///
+/// Entries with no local file are left out of either format; the
+/// `X-DroppedNeedle-Skipped-Tracks` header counts them.
+#[utoipa::path(
+    get,
+    path = "/api/v3/playlists/{playlist_id}/export",
+    tag = "collections",
+    params(
+        ("playlist_id" = String, Path, description = "Playlist id"),
+        ExportQuery
+    ),
+    responses(
+        (status = 200, description = "The playlist as extended M3U (`audio/x-mpegurl`) or CSV (`text/csv; charset=utf-8`), named in Content-Disposition",
+            headers(("x-droppedneedle-skipped-tracks" = usize, description = "Entries left out because they have no local file"))),
+        (status = 400, description = "Unknown format"),
+        (status = 401, description = "Not authenticated"),
+        (status = 404, description = "Unknown playlist id, or one the caller may not read"),
+    )
+)]
+pub async fn export_playlist_handler(
+    State(state): State<CollectionsState>,
+    User(caller): User,
+    Path(playlist_id): Path<String>,
+    ValidQuery(query): ValidQuery<ExportQuery>,
+) -> HttpResult<Response> {
+    let format = query.format.unwrap_or_default();
+    let export = CollectionsService::new(&state)
+        .export_playlist(
+            caller.user_id(),
+            &playlist_id,
+            format,
+            query.prefix.as_deref(),
+        )
+        .await?;
+    let (extension, content_type) = match format {
+        ExportFormat::M3u8 => (".m3u8", "audio/x-mpegurl"),
+        ExportFormat::Csv => (".csv", "text/csv; charset=utf-8"),
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    attachment_headers(&mut headers, &format!("{}{extension}", export.file_stem));
+    headers.insert(SKIPPED_TRACKS_HEADER, HeaderValue::from(export.skipped));
+    Ok((headers, export.body).into_response())
+}
+
 /// Flip playlist visibility.
 #[utoipa::path(
     patch,
@@ -194,6 +269,87 @@ pub async fn set_visibility_handler(
             .set_visibility(caller.user_id(), &playlist_id, body.is_public)
             .await?,
     ))
+}
+
+/// The people a playlist is shared with.
+#[utoipa::path(
+    get,
+    path = "/api/v3/playlists/{playlist_id}/members",
+    tag = "collections",
+    params(("playlist_id" = String, Path, description = "Playlist id")),
+    responses(
+        (status = 200, description = "Members", body = MembersResponse),
+        (status = 401, description = "Not authenticated"),
+        (status = 403, description = "Owner only"),
+        (status = 404, description = "Unknown playlist id"),
+    )
+)]
+pub async fn list_members_handler(
+    State(state): State<CollectionsState>,
+    User(caller): User,
+    Path(playlist_id): Path<String>,
+) -> HttpResult<Json<MembersResponse>> {
+    Ok(Json(
+        CollectionsService::new(&state)
+            .members(caller.user_id(), &playlist_id)
+            .await?,
+    ))
+}
+
+/// Share a playlist with exactly these people.
+#[utoipa::path(
+    put,
+    path = "/api/v3/playlists/{playlist_id}/members",
+    tag = "collections",
+    params(("playlist_id" = String, Path, description = "Playlist id")),
+    request_body = MembersBody,
+    responses(
+        (status = 200, description = "Members now", body = MembersResponse),
+        (status = 400, description = "Bad request body, or an id that names no other user"),
+        (status = 401, description = "Not authenticated"),
+        (status = 403, description = "Owner only"),
+        (status = 404, description = "Unknown playlist id"),
+    )
+)]
+pub async fn set_members_handler(
+    State(state): State<CollectionsState>,
+    User(caller): User,
+    Path(playlist_id): Path<String>,
+    ValidJson(body): ValidJson<MembersBody>,
+) -> HttpResult<Json<MembersResponse>> {
+    Ok(Json(
+        CollectionsService::new(&state)
+            .set_members(
+                caller.user_id(),
+                &playlist_id,
+                body.user_ids,
+                &body.editor_ids,
+            )
+            .await?,
+    ))
+}
+
+/// Leave a playlist shared with the caller.
+#[utoipa::path(
+    delete,
+    path = "/api/v3/playlists/{playlist_id}/members/me",
+    tag = "collections",
+    params(("playlist_id" = String, Path, description = "Playlist id")),
+    responses(
+        (status = 200, description = "Left", body = StatusResponse),
+        (status = 401, description = "Not authenticated"),
+        (status = 404, description = "Not shared with the caller"),
+    )
+)]
+pub async fn leave_playlist_handler(
+    State(state): State<CollectionsState>,
+    User(caller): User,
+    Path(playlist_id): Path<String>,
+) -> HttpResult<Json<StatusResponse>> {
+    CollectionsService::new(&state)
+        .leave(caller.user_id(), &playlist_id)
+        .await?;
+    Ok(Json(ok("Left the playlist")))
 }
 
 /// Add tracks to a playlist.

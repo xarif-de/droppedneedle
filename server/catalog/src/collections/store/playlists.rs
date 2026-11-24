@@ -8,9 +8,12 @@
 //! Every call names whose it is. [`PlaylistStore::owned_by`] reads and
 //! writes one user's own playlists: each write checks the owner in its own
 //! statement or transaction, so a write to another user's playlist changes
-//! nothing and answers [`Written::Missing`]. [`PlaylistStore::visible_to`]
-//! reads what one user may see: their own playlists and public ones, with
-//! the line drawn in SQL. [`PlaylistStore::strays`] lets an admin delete a
+//! nothing and answers [`Written::Missing`]. [`PlaylistStore::editable_by`]
+//! changes the songs of a playlist the user owns or is shared with to
+//! edit, checked the same way. [`PlaylistStore::visible_to`]
+//! reads what one user may see: their own playlists, public ones and those
+//! shared with them, with the line drawn in SQL, and lets them leave one
+//! shared with them. [`PlaylistStore::strays`] lets an admin delete a
 //! playlist with no owner, and nothing else.
 //!
 //! Positions are dense and zero based. `UNIQUE(playlist_id, position)`
@@ -20,10 +23,11 @@
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 
 use super::super::db::{CollectionsDb, StoreError};
-use super::super::models::PlaylistTrack;
-use super::super::sql;
+use super::super::entry_cover::entry_cover;
+use super::super::models::{PlaylistMember, PlaylistTrack};
+use super::super::sql::{self, PlaylistExportRow};
 use droppedneedle_auth::users::roles::Admin;
-use droppedneedle_kernel::db::DbError;
+use droppedneedle_kernel::db::{DbError, fold_text};
 
 /// How many track covers a summary carries.
 const SUMMARY_COVER_COUNT: i64 = 4;
@@ -57,6 +61,12 @@ pub struct PlaylistRow {
     pub streamable_count: usize,
     /// Summed durations of those entries, seconds.
     pub streamable_duration: f64,
+    /// True when the playlist is shared with the user reading it.
+    pub shared_with_caller: bool,
+    /// True when it is shared with the user reading it to edit.
+    pub shared_to_edit: bool,
+    /// True when the playlist is shared with anyone.
+    pub has_members: bool,
     /// Up to four entry covers in position order.
     pub cover_urls: Vec<String>,
 }
@@ -95,7 +105,7 @@ pub struct NewEntry {
     pub artist_id: Option<String>,
     /// Source-specific track id.
     pub track_source_id: Option<String>,
-    /// Cover URL.
+    /// Cover URL; stored only when `entry_cover` keeps it.
     pub cover_url: Option<String>,
     /// Preferred source type.
     pub source_type: String,
@@ -177,7 +187,20 @@ pub struct OwnedPlaylists<'a> {
     user_id: &'a str,
 }
 
-/// What one user may read: their own playlists and public ones.
+/// The playlists one user may change the songs of: their own, and those
+/// shared with them to edit. Everything else about a playlist stays its
+/// owner's, through [`OwnedPlaylists`].
+#[derive(Clone, Copy, Debug)]
+pub struct EditablePlaylists<'a> {
+    store: &'a PlaylistStore,
+    user_id: &'a str,
+    /// Only the owner's own playlists, for work done for the owner with
+    /// no request (Weekly Mix, Spotify import): editors never widen it.
+    owner_only: bool,
+}
+
+/// What one user may read: their own playlists, public ones and those
+/// shared with them.
 #[derive(Clone, Copy, Debug)]
 pub struct VisiblePlaylists<'a> {
     store: &'a PlaylistStore,
@@ -213,6 +236,9 @@ fn playlist_from_row(row: &Row<'_>) -> rusqlite::Result<PlaylistRow> {
         total_duration: row.get(10)?,
         streamable_count: count(row.get(11)?),
         streamable_duration: row.get(12)?,
+        shared_with_caller: row.get::<_, Option<i64>>(13)?.is_some(),
+        shared_to_edit: row.get::<_, Option<i64>>(13)? == Some(1),
+        has_members: row.get::<_, i64>(14)? != 0,
         cover_urls: Vec::new(),
     })
 }
@@ -228,7 +254,10 @@ fn track_from_row(row: &Row<'_>) -> rusqlite::Result<PlaylistTrack> {
         album_id: row.get(5)?,
         artist_id: row.get(6)?,
         track_source_id: row.get(7)?,
-        cover_url: row.get(8)?,
+        cover_url: row
+            .get::<_, Option<String>>(8)?
+            .as_deref()
+            .and_then(entry_cover),
         source_type: row.get(9)?,
         available_sources: sources.as_deref().and_then(decode_sources),
         format: row.get(11)?,
@@ -265,6 +294,76 @@ fn encode_sources(sources: Option<&Vec<String>>) -> Option<String> {
     sources.map(|list| serde_json::Value::from(list.clone()).to_string())
 }
 
+/// A title as linking compares it: folded, typographic apostrophes read as
+/// plain ones, and dashes and brackets as spaces, so "Opener - Live" keys
+/// as "Opener (Live)" does.
+fn title_key(title: &str) -> String {
+    let spaced: String = fold_text(title)
+        .chars()
+        .map(|character| match character {
+            '\u{2018}' | '\u{2019}' | '\u{02bc}' => '\'',
+            '-' | '\u{2010}'..='\u{2015}' | '\u{2212}' | '(' | ')' | '[' | ']' => ' ',
+            other => other,
+        })
+        .collect();
+    spaced.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// An entry's title and a library track's name the same song: the shorter
+/// key is the longer or a whole-word start of it, so "Song" agrees with
+/// "Song - 2011 Remaster" and "Go" does not with "Gone".
+fn titles_agree(entry: &str, track: &str) -> bool {
+    let (entry, track) = (title_key(entry), title_key(track));
+    let (short, long) = if entry.len() <= track.len() {
+        (entry, track)
+    } else {
+        (track, entry)
+    };
+    !short.is_empty()
+        && long
+            .strip_prefix(short.as_str())
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
+}
+
+/// The library track each entry links to: the one at its disc and track
+/// number whose title agrees, else one titled the same elsewhere on the
+/// album, as another edition orders it. `candidates` are grouped by entry,
+/// the preferred copy's tracks first.
+fn library_links(candidates: &[sql::LibraryCopyCandidate]) -> Vec<(String, String)> {
+    candidates
+        .chunk_by(|a, b| a.entry_id == b.entry_id)
+        .filter_map(|copies| {
+            let at_place = copies.iter().find(|copy| {
+                (copy.entry_disc, copy.entry_track) == (copy.track_disc, Some(copy.track_number))
+                    && titles_agree(&copy.entry_title, &copy.track_title)
+            });
+            let same_title = || {
+                copies
+                    .iter()
+                    .find(|copy| title_key(&copy.entry_title) == title_key(&copy.track_title))
+            };
+            at_place
+                .or_else(same_title)
+                .map(|copy| (copy.entry_id.clone(), copy.track_id.clone()))
+        })
+        .collect()
+}
+
+/// The caller's playlist's entries with no source yet and their candidate
+/// library tracks.
+fn library_copy_candidates(
+    conn: &Connection,
+    user_id: &str,
+    playlist_id: &str,
+) -> rusqlite::Result<Vec<sql::LibraryCopyCandidate>> {
+    conn.prepare(sql::LIBRARY_COPY_CANDIDATES.text())?
+        .query_map(
+            params![user_id, playlist_id],
+            sql::LibraryCopyCandidate::read,
+        )?
+        .collect()
+}
+
 /// One playlist row and its first entry covers, or None.
 fn one_playlist(
     conn: &Connection,
@@ -284,7 +383,10 @@ fn one_playlist(
     };
     row.cover_urls = conn
         .prepare(sql::PLAYLIST_COVERS.text())?
-        .query_map(params![playlist_id, SUMMARY_COVER_COUNT], |row| row.get(0))?
+        .query_map(params![playlist_id, SUMMARY_COVER_COUNT], |row| {
+            row.get::<_, String>(0)
+        })?
+        .filter_map(|url| url.map(|url| entry_cover(&url)).transpose())
         .collect::<rusqlite::Result<_>>()?;
     Ok(Some(row))
 }
@@ -304,7 +406,9 @@ fn fill_covers<'a>(
     })?;
     for cover in covers {
         let (id, url) = cover?;
-        by_playlist.entry(id).or_default().push(url);
+        if let Some(url) = entry_cover(&url) {
+            by_playlist.entry(id).or_default().push(url);
+        }
     }
     for row in rows {
         if let Some(urls) = by_playlist.remove(&row.id) {
@@ -331,6 +435,43 @@ fn owns(tx: &Transaction, playlist_id: &str, user_id: &str) -> rusqlite::Result<
 fn touch(tx: &Transaction, playlist_id: &str, user_id: &str, now: i64) -> rusqlite::Result<bool> {
     let changed = tx.execute(sql::TOUCH.text(), params![now, playlist_id, user_id])?;
     Ok(changed > 0)
+}
+
+/// Whether `user_id` may change the songs of playlist `playlist_id`: as
+/// its owner, or also as an editor unless `owner_only`.
+fn may_edit(
+    tx: &Transaction,
+    playlist_id: &str,
+    user_id: &str,
+    owner_only: bool,
+) -> rusqlite::Result<bool> {
+    if owner_only {
+        return owns(tx, playlist_id, user_id);
+    }
+    Ok(tx
+        .query_row(
+            sql::EDIT_GUARD.text(),
+            params![user_id, playlist_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+/// Bump `updated_at` of a playlist the user may edit to `now`,
+/// milliseconds; false when it is gone or they may not.
+fn touch_editable(
+    tx: &Transaction,
+    playlist_id: &str,
+    user_id: &str,
+    owner_only: bool,
+    now: i64,
+) -> rusqlite::Result<bool> {
+    if !may_edit(tx, playlist_id, user_id, owner_only)? {
+        return Ok(false);
+    }
+    tx.execute(sql::STAMP.text(), params![now, playlist_id])?;
+    Ok(true)
 }
 
 /// Insert one empty playlist row made at `now`, milliseconds.
@@ -396,7 +537,7 @@ fn insert_entries(
             entry.album_id,
             entry.artist_id,
             entry.track_source_id,
-            entry.cover_url,
+            entry.cover_url.as_deref().and_then(entry_cover),
             entry.source_type,
             encode_sources(entry.available_sources.as_ref()),
             entry.format,
@@ -424,11 +565,46 @@ impl PlaylistStore {
         Self { db }
     }
 
+    /// Every playlist, as (owner, playlist), holding an entry with no source
+    /// that an album now in the library owns.
+    pub async fn to_link(&self) -> Result<Vec<(String, String)>, StoreError> {
+        self.db
+            .read("playlists.to_link", |conn| {
+                let rows = conn
+                    .prepare(sql::PLAYLISTS_TO_LINK.text())?
+                    .query_map([], sql::PlaylistToLink::read)?
+                    .map(|row| row.map(|row| (row.user_id, row.playlist_id)))
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await
+    }
+
+    /// Where the library's catalog and the playlists stand: a link pass
+    /// has nothing new to do while neither moved.
+    pub async fn link_mark(&self) -> Result<(i64, i64), StoreError> {
+        self.db
+            .read("playlists.link_mark", |conn| {
+                let mark = conn.query_row(sql::LINK_MARK.text(), [], sql::LinkMark::read)?;
+                Ok((mark.catalog_revision, mark.playlists_changed))
+            })
+            .await
+    }
+
     /// One user's own playlists, to read and change.
     pub fn owned_by<'a>(&'a self, user_id: &'a str) -> OwnedPlaylists<'a> {
         OwnedPlaylists {
             store: self,
             user_id,
+        }
+    }
+
+    /// The playlists one user may change the songs of.
+    pub fn editable_by<'a>(&'a self, user_id: &'a str) -> EditablePlaylists<'a> {
+        EditablePlaylists {
+            store: self,
+            user_id,
+            owner_only: false,
         }
     }
 
@@ -443,6 +619,163 @@ impl PlaylistStore {
     /// Playlists with no owner, which only an admin may delete.
     pub fn strays(&self, _admin: &Admin) -> StrayPlaylists<'_> {
         StrayPlaylists { store: self }
+    }
+}
+
+impl EditablePlaylists<'_> {
+    /// Insert entries at `position` (clamped; None appends). Returns the
+    /// new entry ids.
+    pub async fn insert(
+        &self,
+        playlist_id: &str,
+        position: Option<usize>,
+        entries: Vec<NewEntry>,
+    ) -> Result<Written<Vec<String>>, StoreError> {
+        let (user_id, playlist_id) = (self.user_id.to_owned(), playlist_id.to_owned());
+        let (now, owner_only) = (self.store.db.now_ms(), self.owner_only);
+        self.store
+            .db
+            .write("playlists.insert", move |tx| {
+                if !touch_editable(tx, &playlist_id, &user_id, owner_only, now)? {
+                    return Ok(Written::Missing);
+                }
+                let added = insert_entries(tx, &playlist_id, position, &entries, now)?;
+                Ok(Written::Done(added))
+            })
+            .await
+    }
+
+    /// Replace every entry with `entries`, in order, in one transaction: a
+    /// write that fails leaves the old entries in place.
+    pub async fn replace_entries(
+        &self,
+        playlist_id: &str,
+        entries: Vec<NewEntry>,
+    ) -> Result<Written<()>, StoreError> {
+        let (user_id, playlist_id) = (self.user_id.to_owned(), playlist_id.to_owned());
+        let (now, owner_only) = (self.store.db.now_ms(), self.owner_only);
+        self.store
+            .db
+            .write("playlists.replace_entries", move |tx| {
+                if !touch_editable(tx, &playlist_id, &user_id, owner_only, now)? {
+                    return Ok(Written::Missing);
+                }
+                tx.execute(sql::CLEAR_ENTRIES.text(), params![playlist_id])?;
+                insert_entries(tx, &playlist_id, None, &entries, now)?;
+                Ok(Written::Done(()))
+            })
+            .await
+    }
+
+    /// Remove entries by id, skipping unknown ids. Returns how many went.
+    pub async fn remove(
+        &self,
+        playlist_id: &str,
+        entry_ids: &[String],
+    ) -> Result<Written<usize>, StoreError> {
+        let (user_id, playlist_id) = (self.user_id.to_owned(), playlist_id.to_owned());
+        let entry_ids = entry_ids.to_vec();
+        let (now, owner_only) = (self.store.db.now_ms(), self.owner_only);
+        self.store
+            .db
+            .write("playlists.remove", move |tx| {
+                if !touch_editable(tx, &playlist_id, &user_id, owner_only, now)? {
+                    return Ok(Written::Missing);
+                }
+                let mut removed = 0;
+                {
+                    let mut stmt = tx.prepare(sql::REMOVE_ENTRY.text())?;
+                    for id in &entry_ids {
+                        removed += stmt.execute(params![playlist_id, id])?;
+                    }
+                }
+                let order = entry_order(tx, &playlist_id)?;
+                write_order(tx, &order)?;
+                Ok(Written::Done(removed))
+            })
+            .await
+    }
+
+    /// Move one entry to `position`, clamped. Returns where it landed, or
+    /// `Missing` when the playlist or entry is gone.
+    pub async fn move_entry(
+        &self,
+        playlist_id: &str,
+        entry_id: &str,
+        position: usize,
+    ) -> Result<Written<usize>, StoreError> {
+        let (user_id, playlist_id, entry_id) = (
+            self.user_id.to_owned(),
+            playlist_id.to_owned(),
+            entry_id.to_owned(),
+        );
+        let (now, owner_only) = (self.store.db.now_ms(), self.owner_only);
+        self.store
+            .db
+            .write("playlists.move", move |tx| {
+                if !may_edit(tx, &playlist_id, &user_id, owner_only)? {
+                    return Ok(Written::Missing);
+                }
+                let mut order = entry_order(tx, &playlist_id)?;
+                let Some(from) = order.iter().position(|id| *id == entry_id) else {
+                    return Ok(Written::Missing);
+                };
+                let id = order.remove(from);
+                let at = position.min(order.len());
+                order.insert(at, id);
+                write_order(tx, &order)?;
+                tx.execute(sql::STAMP.text(), params![now, playlist_id])?;
+                Ok(Written::Done(at))
+            })
+            .await
+    }
+
+    /// Replace one entry's source fields.
+    pub async fn update_sources(
+        &self,
+        playlist_id: &str,
+        entry_id: &str,
+        source_type: Option<String>,
+        available_sources: Option<Vec<String>>,
+    ) -> Result<Written<()>, StoreError> {
+        let (user_id, playlist_id, entry_id) = (
+            self.user_id.to_owned(),
+            playlist_id.to_owned(),
+            entry_id.to_owned(),
+        );
+        let (now, owner_only) = (self.store.db.now_ms(), self.owner_only);
+        self.store
+            .db
+            .write("playlists.update_sources", move |tx| {
+                if !may_edit(tx, &playlist_id, &user_id, owner_only)? {
+                    return Ok(Written::Missing);
+                }
+                let exists = tx
+                    .query_row(
+                        sql::ENTRY_EXISTS.text(),
+                        params![playlist_id, entry_id],
+                        |_| Ok(()),
+                    )
+                    .optional()?;
+                if exists.is_none() {
+                    return Ok(Written::Missing);
+                }
+                if let Some(source_type) = &source_type {
+                    tx.execute(
+                        sql::SET_SOURCE_TYPE.text(),
+                        params![source_type, entry_id, playlist_id],
+                    )?;
+                }
+                if let Some(sources) = &available_sources {
+                    tx.execute(
+                        sql::SET_AVAILABLE_SOURCES.text(),
+                        params![encode_sources(Some(sources)), entry_id, playlist_id],
+                    )?;
+                }
+                tx.execute(sql::STAMP.text(), params![now, playlist_id])?;
+                Ok(Written::Done(()))
+            })
+            .await
     }
 }
 
@@ -466,6 +799,18 @@ impl StrayPlaylists<'_> {
 }
 
 impl VisiblePlaylists<'_> {
+    /// Stop sharing playlist `playlist_id` with the user; false when it
+    /// was not shared with them.
+    pub async fn leave(&self, playlist_id: &str) -> Result<bool, StoreError> {
+        let (user_id, playlist_id) = (self.user_id.to_owned(), playlist_id.to_owned());
+        self.store
+            .db
+            .write("playlists.leave", move |tx| {
+                Ok(tx.execute(sql::LEAVE.text(), params![playlist_id, user_id])? > 0)
+            })
+            .await
+    }
+
     /// Every playlist in name order: the readable ones with aggregates and
     /// cover tiles, other users' private ones as existence only. A private
     /// playlist with no owner is listed only when `with_private_strays`.
@@ -477,7 +822,7 @@ impl VisiblePlaylists<'_> {
                 let mut stmt = conn.prepare(sql::LIST_ALL.text())?;
                 let mut listed = stmt
                     .query_map(params![user_id, with_private_strays], |row| {
-                        if row.get::<_, i64>(13)? != 0 {
+                        if row.get::<_, i64>(15)? != 0 {
                             Ok(Listed::Readable(playlist_from_row(row)?))
                         } else {
                             Ok(Listed::Hidden {
@@ -548,6 +893,24 @@ impl VisiblePlaylists<'_> {
             .await
     }
 
+    /// Whether the user may change the songs of a playlist they may read;
+    /// None when they may not read it.
+    pub async fn may_edit(&self, playlist_id: &str) -> Result<Option<bool>, StoreError> {
+        let (user_id, playlist_id) = (self.user_id.to_owned(), playlist_id.to_owned());
+        self.store
+            .db
+            .read("playlists.may_edit", move |conn| {
+                Ok(conn
+                    .query_row(
+                        sql::READABLE_EDITOR.text(),
+                        params![user_id, playlist_id],
+                        |row| Ok(row.get::<_, i64>(0)? != 0),
+                    )
+                    .optional()?)
+            })
+            .await
+    }
+
     /// Entries of a playlist the caller may read, in position order; none
     /// when they may not read it.
     pub async fn tracks(&self, playlist_id: &str) -> Result<Vec<PlaylistTrack>, StoreError> {
@@ -558,6 +921,24 @@ impl VisiblePlaylists<'_> {
                 Ok(conn
                     .prepare(sql::TRACKS_READABLE.text())?
                     .query_map(params![user_id, playlist_id], track_from_row)?
+                    .collect::<rusqlite::Result<_>>()?)
+            })
+            .await
+    }
+
+    /// Entries of a playlist the caller may read, in position order, each
+    /// with its live local file's album artist and root-relative path.
+    pub(crate) async fn export_entries(
+        &self,
+        playlist_id: &str,
+    ) -> Result<Vec<PlaylistExportRow>, StoreError> {
+        let (user_id, playlist_id) = (self.user_id.to_owned(), playlist_id.to_owned());
+        self.store
+            .db
+            .read("playlists.export_entries", move |conn| {
+                Ok(conn
+                    .prepare(sql::EXPORT_ENTRIES.text())?
+                    .query_map(params![user_id, playlist_id], PlaylistExportRow::read)?
                     .collect::<rusqlite::Result<_>>()?)
             })
             .await
@@ -615,6 +996,17 @@ impl VisiblePlaylists<'_> {
 }
 
 impl OwnedPlaylists<'_> {
+    /// Song writes on the user's own playlists only, for work done for
+    /// them with no request: a playlist shared with them to edit is not
+    /// theirs to rebuild.
+    pub fn songs(&self) -> EditablePlaylists<'_> {
+        EditablePlaylists {
+            store: self.store,
+            user_id: self.user_id,
+            owner_only: true,
+        }
+    }
+
     /// One of the user's playlists with aggregates, or None.
     pub async fn get(&self, playlist_id: &str) -> Result<Option<PlaylistRow>, StoreError> {
         let (user_id, playlist_id) = (self.user_id.to_owned(), playlist_id.to_owned());
@@ -794,41 +1186,65 @@ impl OwnedPlaylists<'_> {
             .await
     }
 
-    /// Insert entries at `position` (clamped; None appends). Returns the
-    /// new entry ids.
-    pub async fn insert(
-        &self,
-        playlist_id: &str,
-        position: Option<usize>,
-        entries: Vec<NewEntry>,
-    ) -> Result<Written<Vec<String>>, StoreError> {
+    /// The people one of the user's playlists is shared with, first
+    /// shared first; none when it is not theirs.
+    pub async fn members(&self, playlist_id: &str) -> Result<Vec<PlaylistMember>, StoreError> {
         let (user_id, playlist_id) = (self.user_id.to_owned(), playlist_id.to_owned());
-        let now = self.store.db.now_ms();
         self.store
             .db
-            .write("playlists.insert", move |tx| {
-                if !touch(tx, &playlist_id, &user_id, now)? {
-                    return Ok(Written::Missing);
-                }
-                let added = insert_entries(tx, &playlist_id, position, &entries, now)?;
-                Ok(Written::Done(added))
+            .read("playlists.members", move |conn| {
+                Ok(conn
+                    .prepare(sql::MEMBERS.text())?
+                    .query_map(params![user_id, playlist_id], |row| {
+                        let member = sql::MemberColumns::read(row)?;
+                        Ok(PlaylistMember {
+                            user_id: member.user_id,
+                            display_name: member.display_name,
+                            can_edit: member.can_edit,
+                        })
+                    })?
+                    .collect::<rusqlite::Result<_>>()?)
             })
             .await
     }
 
-    /// Replace every entry with `entries`, in order, in one transaction: a
-    /// write that fails leaves the old entries in place.
-    pub async fn replace_entries(
+    /// Share the playlist with exactly `members`, each `(user id, may
+    /// edit)`, keeping when each person was first shared it. False, and
+    /// nothing changes, when an id names no user.
+    pub async fn set_members(
         &self,
         playlist_id: &str,
-        entries: Vec<NewEntry>,
-    ) -> Result<Written<()>, StoreError> {
-        Ok(
-            match self.replace_named(playlist_id, None, entries).await? {
-                Written::Done(_) => Written::Done(()),
-                Written::Missing => Written::Missing,
-            },
-        )
+        members: Vec<(String, bool)>,
+    ) -> Result<Written<bool>, StoreError> {
+        let (user_id, playlist_id) = (self.user_id.to_owned(), playlist_id.to_owned());
+        let now = self.store.db.now_ms();
+        self.store
+            .db
+            .write("playlists.set_members", move |tx| {
+                if !owns(tx, &playlist_id, &user_id)? {
+                    return Ok(Written::Missing);
+                }
+                let ids: Vec<&String> = members.iter().map(|(id, _)| id).collect();
+                let listed = serde_json::to_string(&ids)
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+                let known: usize = tx.query_row(
+                    sql::KNOWN_USERS.text(),
+                    params![listed, playlist_id],
+                    |row| row.get(0),
+                )?;
+                if known != members.len() {
+                    return Ok(Written::Done(false));
+                }
+                tx.execute(sql::DROP_MEMBERS.text(), params![playlist_id, listed])?;
+                for (member, can_edit) in &members {
+                    tx.execute(
+                        sql::ADD_MEMBER.text(),
+                        params![playlist_id, member, now, can_edit],
+                    )?;
+                }
+                Ok(Written::Done(true))
+            })
+            .await
     }
 
     /// Replace every entry with `entries` and, when `name` is given, rename
@@ -876,113 +1292,47 @@ impl OwnedPlaylists<'_> {
             .await
     }
 
-    /// Remove entries by id, skipping unknown ids. Returns how many went.
-    pub async fn remove(
-        &self,
-        playlist_id: &str,
-        entry_ids: &[String],
-    ) -> Result<Written<usize>, StoreError> {
+    /// Point each entry with no source yet whose album the library owns at
+    /// the library's copy (see [`library_links`]); when the album is held
+    /// twice, the copy a lookup by its group opens comes first. Answers how
+    /// many entries that linked; none when the playlist is not the user's.
+    /// Opening a playlist runs this, and so does an import once its rows
+    /// are written (an importer that stores rows with no source should
+    /// too), so music apps list the songs before anyone opens the page.
+    /// The links are worked out on a read; the writer is taken only when
+    /// there is something to link, and each link checks again that the
+    /// entry has no source, the track is indexed and the playlist is the
+    /// user's.
+    pub async fn link_library_copies(&self, playlist_id: &str) -> Result<usize, StoreError> {
         let (user_id, playlist_id) = (self.user_id.to_owned(), playlist_id.to_owned());
-        let entry_ids = entry_ids.to_vec();
+        let links = {
+            let (user_id, playlist_id) = (user_id.clone(), playlist_id.clone());
+            self.store
+                .db
+                .read("playlists.library_copy_candidates", move |conn| {
+                    let candidates = library_copy_candidates(conn, &user_id, &playlist_id)?;
+                    Ok(library_links(&candidates))
+                })
+                .await?
+        };
+        if links.is_empty() {
+            return Ok(0);
+        }
         let now = self.store.db.now_ms();
         self.store
             .db
-            .write("playlists.remove", move |tx| {
-                if !touch(tx, &playlist_id, &user_id, now)? {
-                    return Ok(Written::Missing);
-                }
-                let mut removed = 0;
-                {
-                    let mut stmt = tx.prepare(sql::REMOVE_ENTRY.text())?;
-                    for id in &entry_ids {
-                        removed += stmt.execute(params![playlist_id, id])?;
-                    }
-                }
-                let order = entry_order(tx, &playlist_id)?;
-                write_order(tx, &order)?;
-                Ok(Written::Done(removed))
-            })
-            .await
-    }
-
-    /// Move one entry to `position`, clamped. Returns where it landed, or
-    /// `Missing` when the playlist or entry is gone.
-    pub async fn move_entry(
-        &self,
-        playlist_id: &str,
-        entry_id: &str,
-        position: usize,
-    ) -> Result<Written<usize>, StoreError> {
-        let (user_id, playlist_id, entry_id) = (
-            self.user_id.to_owned(),
-            playlist_id.to_owned(),
-            entry_id.to_owned(),
-        );
-        let now = self.store.db.now_ms();
-        self.store
-            .db
-            .write("playlists.move", move |tx| {
-                if !owns(tx, &playlist_id, &user_id)? {
-                    return Ok(Written::Missing);
-                }
-                let mut order = entry_order(tx, &playlist_id)?;
-                let Some(from) = order.iter().position(|id| *id == entry_id) else {
-                    return Ok(Written::Missing);
-                };
-                let id = order.remove(from);
-                let at = position.min(order.len());
-                order.insert(at, id);
-                write_order(tx, &order)?;
-                touch(tx, &playlist_id, &user_id, now)?;
-                Ok(Written::Done(at))
-            })
-            .await
-    }
-
-    /// Replace one entry's source fields.
-    pub async fn update_sources(
-        &self,
-        playlist_id: &str,
-        entry_id: &str,
-        source_type: Option<String>,
-        available_sources: Option<Vec<String>>,
-    ) -> Result<Written<()>, StoreError> {
-        let (user_id, playlist_id, entry_id) = (
-            self.user_id.to_owned(),
-            playlist_id.to_owned(),
-            entry_id.to_owned(),
-        );
-        let now = self.store.db.now_ms();
-        self.store
-            .db
-            .write("playlists.update_sources", move |tx| {
-                if !owns(tx, &playlist_id, &user_id)? {
-                    return Ok(Written::Missing);
-                }
-                let exists = tx
-                    .query_row(
-                        sql::ENTRY_EXISTS.text(),
-                        params![playlist_id, entry_id],
-                        |_| Ok(()),
-                    )
-                    .optional()?;
-                if exists.is_none() {
-                    return Ok(Written::Missing);
-                }
-                if let Some(source_type) = &source_type {
-                    tx.execute(
-                        sql::SET_SOURCE_TYPE.text(),
-                        params![source_type, entry_id, playlist_id],
+            .write("playlists.link_library_copies", move |tx| {
+                let mut linked = 0;
+                for (entry_id, track_id) in &links {
+                    linked += tx.execute(
+                        sql::LINK_LIBRARY_COPY.text(),
+                        params![user_id, playlist_id, entry_id, track_id],
                     )?;
                 }
-                if let Some(sources) = &available_sources {
-                    tx.execute(
-                        sql::SET_AVAILABLE_SOURCES.text(),
-                        params![encode_sources(Some(sources)), entry_id, playlist_id],
-                    )?;
+                if linked > 0 {
+                    touch(tx, &playlist_id, &user_id, now)?;
                 }
-                touch(tx, &playlist_id, &user_id, now)?;
-                Ok(Written::Done(()))
+                Ok(linked)
             })
             .await
     }
@@ -1028,5 +1378,36 @@ impl OwnedPlaylists<'_> {
                 Ok(Written::Done(()))
             })
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::titles_agree;
+
+    #[test]
+    fn titles_agree_across_typography_and_suffixes() {
+        for (entry, track) in [
+            ("Opener", "Opener"),
+            ("Don’t Stop", "Don't Stop"),
+            ("Re-Entry", "Re‐Entry"),
+            ("Song", "Song - 2011 Remaster"),
+            ("Opener - Live", "Opener (live)"),
+            ("CAFÉ", "cafe"),
+            ("Song 2011 Remaster", "Song"),
+        ] {
+            assert!(titles_agree(entry, track), "{entry:?} / {track:?}");
+        }
+        for (entry, track) in [
+            ("Opener", "Second Song"),
+            ("", "Second Song"),
+            ("Intro", ""),
+            ("Go", "Gone"),
+            ("Love", "Lovesong"),
+            ("Lovesong", "Love"),
+            ("The Song", "Song"),
+        ] {
+            assert!(!titles_agree(entry, track), "{entry:?} / {track:?}");
+        }
     }
 }

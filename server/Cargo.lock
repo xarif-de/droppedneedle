@@ -528,7 +528,7 @@ dependencies = [
 
 [[package]]
 name = "droppedneedle"
-version = "3.0.0"
+version = "3.1.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -577,7 +577,7 @@ dependencies = [
 
 [[package]]
 name = "droppedneedle-acquire"
-version = "3.0.0"
+version = "3.1.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -608,7 +608,7 @@ dependencies = [
 
 [[package]]
 name = "droppedneedle-auth"
-version = "3.0.0"
+version = "3.1.0"
 dependencies = [
  "argon2",
  "axum",
@@ -642,7 +642,7 @@ dependencies = [
 
 [[package]]
 name = "droppedneedle-catalog"
-version = "3.0.0"
+version = "3.1.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -665,13 +665,14 @@ dependencies = [
  "time",
  "tokio",
  "tracing",
+ "url",
  "utoipa",
  "uuid",
 ]
 
 [[package]]
 name = "droppedneedle-compat"
-version = "3.0.0"
+version = "3.1.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -698,7 +699,7 @@ dependencies = [
 
 [[package]]
 name = "droppedneedle-kernel"
-version = "3.0.0"
+version = "3.1.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -729,7 +730,7 @@ dependencies = [
 
 [[package]]
 name = "droppedneedle-library"
-version = "3.0.0"
+version = "3.1.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -765,7 +766,7 @@ dependencies = [
 
 [[package]]
 name = "droppedneedle-media"
-version = "3.0.0"
+version = "3.1.0"
 dependencies = [
  "axum",
  "caseless",
@@ -794,7 +795,7 @@ dependencies = [
 
 [[package]]
 name = "droppedneedle-plugins"
-version = "3.0.0"
+version = "3.1.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -820,7 +821,7 @@ dependencies = [
 
 [[package]]
 name = "droppedneedle-providers"
-version = "3.0.0"
+version = "3.1.0"
 dependencies = [
  "base64 0.22.1",
  "caseless",
@@ -854,7 +855,7 @@ dependencies = [
 
 [[package]]
 name = "droppedneedle-tool"
-version = "3.0.0"
+version = "3.1.0"
 dependencies = [
  "aes",
  "argon2",
@@ -3342,9 +3343,9 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "9.0.4"
+version = "9.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a954114b47a54df49f83d2722814e86b23d4bb1b54a1b90fb7d92b41619ddc22"
+checksum = "6e04976da629d3b04204ba8105b396a193af8ad2583b2c79bfb3ab8af580a11e"
 dependencies = [
  "crc32fast",
  "flate2",

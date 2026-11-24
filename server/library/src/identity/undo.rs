@@ -62,6 +62,16 @@ impl PartialEq for ExclusionRow {
     }
 }
 
+impl ExclusionRow {
+    /// The same choice, whatever revision the row is at: a copy of it on
+    /// another album starts its own count.
+    pub(crate) fn same_choice(&self, other: &Self) -> bool {
+        self.reason == other.reason
+            && self.excluded_by_user_id == other.excluded_by_user_id
+            && crate::clock::ms(self.excluded_at) == crate::clock::ms(other.excluded_at)
+    }
+}
+
 /// A queued placement of the album's files, as the undo keeps it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct RemapRow {
@@ -342,6 +352,23 @@ pub(crate) fn record_and_keep(
     Ok(action)
 }
 
+/// Forget the album's edition choice undo because files joined the album
+/// since: its record knows nothing of them, and putting it back would take
+/// them off their tracks. A person can still choose another edition.
+pub(crate) fn forget_choice_undo(tx: &Transaction<'_>, album_id: &str) -> rusqlite::Result<()> {
+    tx.prepare_cached(sql::FORGET_CHOICE_UNDO.text())?
+        .execute(params![album_id])?;
+    Ok(())
+}
+
+/// Forget the album's automatic edition undo because files joined the
+/// album since, for the same reason as [`forget_choice_undo`].
+pub(crate) fn forget_automatic_undo(tx: &Transaction<'_>, album_id: &str) -> rusqlite::Result<()> {
+    tx.prepare_cached(sql::FORGET_AUTOMATIC_UNDO.text())?
+        .execute(params![album_id])?;
+    Ok(())
+}
+
 /// Key a carried undo still at identity revision `from` to `to`, the
 /// revision an automatic seal or retraction left, and clear its mark.
 pub(crate) fn carry_undo(
@@ -355,6 +382,35 @@ pub(crate) fn carry_undo(
     Ok(())
 }
 
+impl HoldChange {
+    /// The change altered the "leave unmanaged" row and it is still as the
+    /// change left it, so undo puts the earlier one back.
+    fn puts_back_exclusion(&self, current: &Hold) -> bool {
+        self.before.exclusion != self.after.exclusion && current.exclusion == self.after.exclusion
+    }
+}
+
+/// Whether taking back the album's last edition change would lift a
+/// "leave unmanaged", which only an admin may do. False for an undo
+/// [`undo`] refuses as stale.
+pub fn undo_lifts_exclusion(conn: &Connection, album_id: &str) -> rusqlite::Result<bool> {
+    let kept = conn
+        .prepare_cached(sql::CHOICE_UNDO.text())?
+        .query_row(params![album_id], sql::ChoiceUndoRow::read)
+        .optional()?;
+    let Some(kept) = kept else {
+        return Ok(false);
+    };
+    if kept.expected_identity_revision != identity_revision(conn, album_id)? {
+        return Ok(false);
+    }
+    let Some(held) = kept.prior_hold_json else {
+        return Ok(false);
+    };
+    let change: HoldChange = from_json(&held)?;
+    Ok(change.before.exclusion.is_none() && change.puts_back_exclusion(&hold(conn, album_id)?))
+}
+
 /// Put back each part of the hold `change` altered, while that part is
 /// still as the change left it.
 fn restore_hold(
@@ -366,7 +422,7 @@ fn restore_hold(
 ) -> rusqlite::Result<()> {
     let current = hold(tx, album_id)?;
     let (before, after) = (&change.before, &change.after);
-    if before.exclusion != after.exclusion && current.exclusion == after.exclusion {
+    if change.puts_back_exclusion(&current) {
         match &before.exclusion {
             None => {
                 tx.prepare_cached(sql::DELETE_EXCLUSION.text())?
@@ -699,11 +755,11 @@ pub fn undo_automatic(
         }
         None => {
             // The row is the automatic one (`fresh`); a carried undo stays,
-            // keyed to the album having no match. A flag says so (the one put
-            // back, else a new one), so the files' tags do not bring the
-            // match back.
+            // keyed to the album having no match. The album is marked undone
+            // whatever flag was put back (its candidates stay), so neither
+            // the files' tags nor identification bring the match back.
             delete_album_row(tx, album_id, Rows::Revisable)?;
-            tx.prepare_cached(sql::MARK_UNMATCHED_UNLESS_FLAGGED.text())?
+            tx.prepare_cached(sql::MARK_UNMATCHED_KEEPING_CANDIDATES.text())?
                 .execute(params![
                     album_id,
                     "AUTOMATIC_EDITION_UNDONE",

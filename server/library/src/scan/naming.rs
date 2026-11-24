@@ -14,6 +14,51 @@ pub const VARIOUS_ARTISTS_ID: &str = "00000000-0000-4000-8000-000000000001";
 pub const UNKNOWN_ARTIST_ID: &str = "00000000-0000-4000-8000-000000000002";
 /// The name a credit with no artist gets, keyed to the sentinel.
 pub const UNKNOWN_ARTIST: &str = "Unknown Artist";
+/// The album artist of a compilation whose files name none.
+pub const VARIOUS_ARTISTS: &str = "Various Artists";
+
+/// The album artist of a file with no album artist tag: "Various Artists"
+/// when it is flagged as a compilation, else its artist without a featured
+/// part. Empty when the file names no artist either, so path naming applies.
+#[must_use]
+pub fn untagged_album_artist(compilation: bool, artist: &str) -> &str {
+    let artist = artist.trim();
+    if artist.is_empty() {
+        ""
+    } else if compilation {
+        VARIOUS_ARTISTS
+    } else {
+        without_featured(artist)
+    }
+}
+
+/// A credit without its featured part: "A feat. B", "A ft. B",
+/// "A featuring B", "A (feat. B)" and "A [ft. B]" are "A", whatever the case.
+/// "&", ",", " x ", "with", "vs" and a bare "feat" never cut.
+#[must_use]
+pub fn without_featured(credit: &str) -> &str {
+    const MARKERS: [&str; 9] = [
+        " feat. ",
+        " ft. ",
+        " featuring ",
+        "(feat. ",
+        "[feat. ",
+        "(ft. ",
+        "[ft. ",
+        "(featuring ",
+        "[featuring ",
+    ];
+    let lowered = credit.to_ascii_lowercase();
+    let cut = MARKERS
+        .iter()
+        .filter_map(|marker| lowered.find(marker))
+        .min();
+    let main = match cut {
+        Some(at) => credit[..at].trim(),
+        None => credit.trim(),
+    };
+    if main.is_empty() { credit.trim() } else { main }
+}
 
 /// A stable UUID-shaped id from a namespaced key.
 pub(crate) fn stable_id(key: &str) -> String {
@@ -282,6 +327,94 @@ fn is_numbered_disc(segment: &str) -> bool {
     rest.is_empty()
 }
 
+/// Number words a disc folder may spell out.
+const DISC_NUMBER_WORDS: [&str; 10] = [
+    "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+];
+
+/// True for a folder named disc, disk or cd and a number, written in
+/// digits or as a word up to ten, with optionally ` of N`, a separator
+/// and a subtitle, or a bracketed suffix after it: `CD2`,
+/// `Disc 1 - The Early Years`, `CD 1 of 2`, `Disc One`,
+/// `Disc 1 (Remastered)`, `CD2_Live`. Volumes are left out:
+/// `Vol. 1 - Greatest Hits` is often an album of its own.
+fn is_disc_folder_titled(segment: &str) -> bool {
+    let lower = segment.trim().to_lowercase();
+    let Some(after_word) = ["disc", "disk", "cd"]
+        .iter()
+        .find_map(|word| lower.strip_prefix(word))
+    else {
+        return false;
+    };
+    let rest = after_word
+        .trim_start_matches(|ch: char| ch.is_whitespace() || matches!(ch, '.' | '_' | '-'));
+    let separated = rest.len() < after_word.len();
+    let digits = rest.len()
+        - rest
+            .trim_start_matches(|ch: char| ch.is_ascii_digit())
+            .len();
+    let tail = if digits > 0 {
+        &rest[digits..]
+    } else if separated
+        && let Some(tail) = DISC_NUMBER_WORDS
+            .iter()
+            .find_map(|word| rest.strip_prefix(word))
+    {
+        tail
+    } else {
+        return false;
+    };
+    disc_folder_tail(tail)
+}
+
+/// What may follow a disc folder's number: nothing, ` of N`, a separator
+/// and a subtitle, or a bracketed suffix.
+fn disc_folder_tail(tail: &str) -> bool {
+    if tail.is_empty() {
+        return true;
+    }
+    let trimmed = tail.trim_start();
+    if tail.starts_with(char::is_whitespace)
+        && let Some(total) = trimmed.strip_prefix("of ")
+    {
+        let total = total.trim_start();
+        let digits = total.len()
+            - total
+                .trim_start_matches(|ch: char| ch.is_ascii_digit())
+                .len();
+        return digits > 0 && disc_folder_tail(&total[digits..]);
+    }
+    if trimmed.starts_with(['-', '_', ':', '.']) {
+        return true;
+    }
+    (trimmed.starts_with('(') && trimmed.ends_with(')'))
+        || (trimmed.starts_with('[') && trimmed.ends_with(']'))
+}
+
+/// The folder a tag- or release-id-named file's album sits in: its
+/// [`grouping_directory`], with a disc folder that carries a subtitle
+/// (`Disc 1 - The Early Years`, `CD 1 of 2`) also folded into its parent. Path-named
+/// files keep the strict [`grouping_directory`], which their keys carry.
+pub fn album_folder(relative_path: &str) -> String {
+    let directory = grouping_directory(relative_path);
+    let parent = relative_path
+        .rsplit_once('/')
+        .map(|(parent, _)| parent)
+        .unwrap_or("");
+    if parent.is_empty() || directory != parent {
+        return directory;
+    }
+    let (grand, name) = parent.rsplit_once('/').unwrap_or(("", parent));
+    if !is_disc_folder_titled(name) {
+        return directory;
+    }
+    if grand.is_empty() {
+        ".".to_owned()
+    } else {
+        grand.to_owned()
+    }
+}
+
 /// Separator inside name-based album keys; never part of a folded name.
 pub const KEY_SEPARATOR: char = '\u{1f}';
 
@@ -517,6 +650,44 @@ pub fn parse_names_from_path(relative_path: &str) -> ParsedNames {
 mod tests {
     use super::*;
 
+    /// A file with no album artist tag files under "Various Artists" when
+    /// flagged as a compilation, else under its artist with only a spelled
+    /// out featured part cut.
+    #[test]
+    fn untagged_album_artist_cases() {
+        assert_eq!(untagged_album_artist(true, "A feat. C"), VARIOUS_ARTISTS);
+        assert_eq!(untagged_album_artist(true, "  "), "");
+        assert_eq!(untagged_album_artist(false, ""), "");
+        for (artist, album_artist) in [
+            ("A feat. C", "A"),
+            ("A ft. D", "A"),
+            ("A featuring C", "A"),
+            ("A (feat. C)", "A"),
+            ("A [feat. C]", "A"),
+            ("A (ft. C)", "A"),
+            ("A FEAT. C", "A"),
+            ("A Ft. D", "A"),
+            ("A feat. C feat. D", "A"),
+            ("  A feat. C  ", "A"),
+            ("A & B", "A & B"),
+            ("A, B", "A, B"),
+            ("A x B", "A x B"),
+            ("A with B", "A with B"),
+            ("A vs. B", "A vs. B"),
+            ("Little Feat", "Little Feat"),
+            ("Little Feat feat. C", "Little Feat"),
+            ("A feat C", "A feat C"),
+            ("A feat.", "A feat."),
+            ("Feat. C", "Feat. C"),
+        ] {
+            assert_eq!(
+                untagged_album_artist(false, artist),
+                album_artist,
+                "{artist}"
+            );
+        }
+    }
+
     /// Disc folders fold into their album's folder, and a file with no
     /// tags falls back to the common Artist/Artist - Album (Year) layout.
     #[test]
@@ -542,6 +713,40 @@ mod tests {
         assert_eq!(grouping_directory("CD2/01.flac"), ".");
         assert_eq!(grouping_directory("A/Album/01.flac"), "A/Album");
         assert_eq!(grouping_directory("01.flac"), ".");
+
+        // Tag-named files also fold a disc folder that carries a subtitle;
+        // the strict form above stays as it is.
+        for titled in [
+            "Disc 1 - The Early Years",
+            "CD 1 of 2",
+            "Disc One",
+            "Disc 1 (Remastered)",
+            "CD2_Live",
+        ] {
+            assert!(is_disc_folder_titled(titled), "{titled}");
+            assert!(!is_disc_directory(titled), "{titled}");
+            assert_eq!(
+                album_folder(&format!("A/Album/{titled}/01.flac")),
+                "A/Album"
+            );
+        }
+        for other in [
+            "Discography",
+            "(CD1",
+            "Disco 2",
+            "Vol. 1 - Hits",
+            "Monstercat 001",
+            "Disc",
+        ] {
+            assert!(!is_disc_folder_titled(other), "{other}");
+            assert_eq!(
+                album_folder(&format!("A/{other}/01.flac")),
+                format!("A/{other}")
+            );
+        }
+        assert_eq!(album_folder("A/Album/CD1/01.flac"), "A/Album");
+        assert_eq!(album_folder("Disc 2 - Later/01.flac"), ".");
+        assert_eq!(album_folder("A/Album/01.flac"), "A/Album");
 
         let parsed = parse_names_for_row("Artist/Artist - Album (1999)/CD1/03 - Title.flac");
         assert_eq!(parsed.artist.as_deref(), Some("Artist"));

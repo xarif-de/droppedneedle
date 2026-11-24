@@ -332,13 +332,19 @@ droppedneedle_kernel::sql! {
          local_artist_id = excluded.local_artist_id, credited_name = excluded.credited_name, \
          join_phrase = excluded.join_phrase, artist_mbid = excluded.artist_mbid";
     pub(super) DROP_ALBUM_CREDITS_FROM = "DELETE FROM local_album_artists WHERE local_album_id = ?1 AND position >= ?2";
-    pub(super) TRACK_AT_PATH_FACTS = "SELECT id, local_album_id, availability, duration_seconds, \
-             embedded_recording_mbid, title_folded, title_provenance, disc_number, \
-             track_number, sample_rate, bit_depth, channels \
-             FROM local_tracks WHERE root_id = ?1 AND relative_path = ?2";
+    pub(super) TRACK_AT_PATH_FACTS = "SELECT t.id, t.local_album_id, t.availability, \
+             t.duration_seconds, t.embedded_recording_mbid, t.title_folded, t.title_provenance, \
+             t.disc_number, t.track_number, t.sample_rate, t.bit_depth, t.channels, \
+             t.tag_album_title, t.tag_album_artist_name, t.embedded_release_mbid, \
+             t.embedded_release_group_mbid, t.embedded_release_track_mbid, \
+             h.local_track_id IS NOT NULL AS has_edition_tags, h.media, h.barcode, \
+             h.catalog_number, h.release_country, h.total_discs \
+             FROM local_tracks t LEFT JOIN local_track_edition_tags h ON h.local_track_id = t.id \
+             WHERE t.root_id = ?1 AND t.relative_path = ?2";
     pub(super) MOVE_TRACK_PATH = "UPDATE local_tracks SET root_id = ?2, relative_path = ?3, path_hash = ?4, \
                  file_path = ?5, row_revision = row_revision + 1 WHERE id = ?1";
-    pub(super) TRACK_MEMBERSHIP = "SELECT membership_source, membership_locked = 1 AS locked FROM local_tracks WHERE id = ?1";
+    pub(super) TRACK_MEMBERSHIP = "SELECT membership_source, membership_locked = 1 AS locked, \
+         COALESCE(album_artist_name_folded, '') AS album_artist_folded FROM local_tracks WHERE id = ?1";
     pub(super) TRACK_EXISTS = "SELECT EXISTS(SELECT 1 FROM local_tracks WHERE id = ?1)";
     pub(super) WRITE_TRACK_ROW = "INSERT INTO local_tracks (id, local_album_id, root_id, file_path, relative_path, \
          path_hash, file_size_bytes, file_mtime_ns, stat_revision, stat_revision_kind, \
@@ -899,11 +905,19 @@ droppedneedle_kernel::sql! {
            WHERE left_behind.local_album_id = ?2 AND " + (holds!("left_behind", "?1")) + ")";
     /// Whether a track row still holds album `?2` in run `?1`.
     pub(super) ALBUM_HELD_IN_RUN = "SELECT EXISTS(SELECT 1 FROM local_tracks t WHERE t.local_album_id = ?2 AND " + (holds!("t", "?1")) + ")";
-    /// Albums a departure on record or a move of run `?1` names, not retired, that no track row holds.
+    /// Whether a track row not locked to album `?2` still holds it in run `?1`.
+    pub(super) ALBUM_HELD_UNLOCKED_IN_RUN = "SELECT EXISTS(SELECT 1 FROM local_tracks t WHERE t.local_album_id = ?2 \
+             AND t.membership_locked = 0 AND " + (holds!("t", "?1")) + ")";
+    /// The track rows locked to album `?2` that hold it in run `?1`.
+    pub(super) LOCKED_HOLDERS_IN_RUN = "SELECT t.id FROM local_tracks t WHERE t.local_album_id = ?2 \
+             AND t.membership_locked = 1 AND " + (holds!("t", "?1")) + " ORDER BY t.id";
+    /// Albums a departure on record or a move of run `?1` names, not retired, that no track row holds
+    /// but rows locked to them.
     pub(super) ALBUMS_NO_ROW_HOLDS = "SELECT a.id FROM local_albums a WHERE a.retired_into_album_id IS NULL \
              AND a.id IN (SELECT previous_album_id FROM library_album_departures \
                UNION SELECT previous_album_id FROM library_scan_album_moves WHERE run_id = ?1) \
-             AND NOT EXISTS (SELECT 1 FROM local_tracks t WHERE t.local_album_id = a.id AND " + (holds!("t", "?1")) + ") \
+             AND NOT EXISTS (SELECT 1 FROM local_tracks t WHERE t.local_album_id = a.id \
+               AND t.membership_locked = 0 AND " + (holds!("t", "?1")) + ") \
              ORDER BY a.id";
     /// The (root, path) pairs a scan of run `?1` writes no row for: where a
     /// track lies that a write fencing it names (`fenced_by!`: still open, or
@@ -949,6 +963,12 @@ droppedneedle_kernel::sql! {
      SELECT j.dest_root, j.dest_rel FROM library_publish_journal j \
       WHERE j.track_id IS NOT NULL AND j.source_root IS NOT NULL \
         AND (j.source_root IS NOT j.dest_root OR j.source_rel IS NOT j.dest_rel) AND " + (awaits_admin!());
+    /// Whether track `?1`'s file, at stat revision `?2`, is as a profile run
+    /// last placed it from the album's match, with the app's record still
+    /// the bytes it placed.
+    pub(super) AS_THE_APP_PLACED_IT = "SELECT EXISTS (SELECT 1 FROM library_track_management_state \
+             WHERE local_track_id = ?1 AND written_stat_revision = ?2 \
+             AND written_sha256 = applied_projection_hash)";
     /// Lift the holds run `?1` settled (`?2` is now).
     pub(super) LIFT_SETTLED_HOLDS = "DELETE FROM library_scan_held_scopes AS h WHERE " + HOLD_LIFTS;
     /// The held rows of live albums the holds run `?1` lifts let go, with each one's earliest hold.
@@ -1190,10 +1210,22 @@ droppedneedle_kernel::sql! {
         sample_rate: Option<i64>,
         bit_depth: Option<i64>,
         channels: Option<i64>,
+        tag_album_title: Option<String>,
+        tag_album_artist_name: Option<String>,
+        embedded_release_mbid: Option<String>,
+        embedded_release_group_mbid: Option<String>,
+        embedded_release_track_mbid: Option<String>,
+        has_edition_tags: bool,
+        media: Option<String>,
+        barcode: Option<String>,
+        catalog_number: Option<String>,
+        release_country: Option<String>,
+        total_discs: Option<i64>,
     }
     pub(super) row TrackMembership for [TRACK_MEMBERSHIP] {
         membership_source: GroupingSource,
         locked: bool,
+        album_artist_folded: String,
     }
     pub(super) row TrackAndAlbum for [TRACK_AND_ALBUM_AT_PATH] {
         id: String,

@@ -111,6 +111,12 @@ pub const OPERATION_CHANGED: Reason = reason(
     "The operation changed since you last loaded it.",
     "Reload the operation and try again.",
 );
+// Forbidden.
+pub const LEAVE_UNMANAGED_UNDO_NEEDS_ADMIN: Reason = reason(
+    "FORBIDDEN",
+    "Only an admin can undo \"Leave this album unmanaged\".",
+    "Ask an admin to undo it.",
+);
 pub const UNDO_STALE: Reason = reason(
     STALE,
     "The album's match changed after the automatic choice, so undoing it would bring back an outdated match.",
@@ -266,6 +272,11 @@ pub const ARTIST_LINK_STALE: Reason = reason(
 pub const ARTIST_LINK_SHARED: Reason = reason(
     "ARTIST_LINK_SHARED",
     "Other artists in the library are this MusicBrainz artist too.",
+    "An admin can merge them in Duplicate artists.",
+);
+pub const ARTIST_LINK_JOINS_NAMESAKES: Reason = reason(
+    "ARTIST_LINK_JOINS_NAMESAKES",
+    "Other artists of this name would then be joined.",
     "An admin can merge them in Duplicate artists.",
 );
 pub const ARTIST_LINK_NOT_CHOSEN: Reason = reason(
@@ -596,6 +607,11 @@ pub fn match_reason(code: &str) -> Reason {
             "CHOSEN",
             "Someone chose this edition, so automatic matching leaves it alone.",
             "Pick another edition, or let DroppedNeedle choose again.",
+        ),
+        "CARRIED_EDITION_FOUND" => reason(
+            "CARRIED_EDITION_FOUND",
+            "This album came over from v2 without an edition; DroppedNeedle found the one your files fit.",
+            "Pick another edition if it is wrong, or undo it from the album page.",
         ),
         "CHOSEN_EDITION_FITS_NO_FILE" => reason(
             "CHOSEN_EDITION_FITS_NO_FILE",

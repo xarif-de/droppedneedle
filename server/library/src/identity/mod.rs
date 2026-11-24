@@ -15,7 +15,9 @@
 //! away. A person's choice, and one carried over from v2, is never touched
 //! by automatic work, with one exception that can be undone: the catalog
 //! repair that folds the stray half of an album a v2 import split in two
-//! ([`fold_legacy`], [`undo_fold`]).
+//! ([`fold_legacy`], [`undo_fold`]). The join of two copies of one
+//! edition at a scan's end drops the joined copy's match the same way and
+//! keeps it for its undo ([`record_copy`], [`undo_copy_join`]).
 //!
 //! Only this module writes these tables; a source gate holds it.
 //!
@@ -27,6 +29,7 @@
 //! the edition undo brings it back with the row.
 
 mod automatic;
+mod copies;
 mod custom;
 mod fold;
 pub(crate) mod follow;
@@ -43,10 +46,18 @@ use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, 
 use rusqlite::{Transaction, params};
 use serde::{Deserialize, Serialize};
 
+use crate::catalog_revision::raise_catalog;
+
 pub(crate) use automatic::write_match_flag;
 pub use automatic::{
-    Accepted, AutomaticOutcome, Expected, Inputs, Placed, accept_automatic, retract, seal_automatic,
+    Accepted, AutomaticOutcome, CARRIED_EDITION_FOUND, Expected, Inputs, Placed, accept_automatic,
+    fill_carried_edition, retract, seal_automatic,
 };
+pub use copies::{
+    COPIES_JOIN_UNDONE_REASON, COPIES_JOINED_REASON, JoinedCopy, ReleaseCopy, copy_join_undoable,
+    copy_on_release, undo_copy_join,
+};
+pub(crate) use copies::{copies_overlap, record_copy, split_copies};
 pub use custom::{Custom, custom_edition};
 pub(crate) use fold::fold_legacy;
 pub use fold::{
@@ -65,7 +76,8 @@ pub use person::{
 pub(crate) use person::{TrackRow, drop_edition, upsert_track_identity};
 pub use release::ReleaseIdentity;
 pub use sql::asked_groups;
-pub use undo::{AutomaticUndo, AutomaticUndone, undo, undo_automatic};
+pub use undo::{AutomaticUndo, AutomaticUndone, undo, undo_automatic, undo_lifts_exclusion};
+pub(crate) use undo::{forget_automatic_undo, forget_choice_undo};
 
 /// Why a person's identity command wrote nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,9 +217,10 @@ pub(crate) enum Rows {
     Revisable,
 }
 
-/// Delete the album's match row and both of its undo rows. A row
-/// inserted again starts at revision 1, so an undo kept for an earlier row
-/// could otherwise match the next one and put back what it replaced.
+/// Delete the album's match row and both of its undo rows. The catalog
+/// revision is raised to the row's revision, so a row inserted again starts
+/// above every revision the album had; the undo rows still go, since they
+/// name a match that is no longer there.
 /// `Rows::Any` clears the undo rows whenever the album is left with no
 /// match, so it also runs before another album's row is moved onto this
 /// one. `Rows::Revisable` clears them only when it deleted a row: an album
@@ -221,6 +234,7 @@ pub(crate) fn delete_album_row(
 ) -> rusqlite::Result<bool> {
     match rows {
         Rows::Any => {
+            raise_catalog(tx, reads::identity_revision(tx, album_id)?)?;
             let deleted = tx
                 .prepare_cached(sql::DELETE_ALBUM_ROW.text())?
                 .execute(params![album_id, PROVIDER])?;
@@ -241,6 +255,7 @@ pub(crate) fn delete_album_row(
                 .prepare_cached(sql::DELETE_REVISABLE_ALBUM_ROW.text())?
                 .execute(params![album_id, PROVIDER])?;
             if deleted > 0 {
+                raise_catalog(tx, revision)?;
                 tx.prepare_cached(sql::FORGET_AUTOMATIC_UNDO.text())?
                     .execute(params![album_id])?;
                 tx.prepare_cached(sql::FORGET_UNCARRIED_CHOICE_UNDO.text())?

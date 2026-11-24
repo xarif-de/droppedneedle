@@ -19,7 +19,9 @@ Who can do what, the ways people sign in, and how to get back in when a password
 | Trusted | Requests start immediately, no approval | Library curation: editions, matches, the review queue, drop imports, removals, the Recycle Bin (not emptying it) and upgrades. No settings or users |
 | User | Requests wait for admin approval | Nothing admin side |
 
-The first account is always admin. Later accounts are created by an admin or automatically on first Jellyfin, Plex, or OIDC sign-in (all start as User). Every login method is switched on and off in the UI; no environment variables involved.
+The first account is always admin. Later accounts are created by an admin or automatically on first Jellyfin, Plex, or OIDC sign-in (all start as User). Plex, Jellyfin and OIDC sign-in are switched on and off in the UI. Username and password sign-in is on unless the server is started with `ALLOW_PASSWORD_LOGIN=false` (see [Configuration](configuration.md)); then the sign-in page offers only the other methods, and passwords cannot be set, changed or recovered. First-admin setup and app passwords still work.
+
+Any signed-in user can see other users' display names, and nothing else about them, when sharing a playlist. Only names people chose are listed: someone shows up there once they save a display name under Profile, or when an admin typed one other than their username while making their account. A name that came from Jellyfin, Plex or single sign-on is never listed.
 
 ## Sessions
 
@@ -60,6 +62,8 @@ The code works once, for 15 minutes: open "Forgot password?" on the sign-in page
 
 An account that only signs in through OIDC, Plex or Jellyfin has no password yet. The command says so, and the code then gives the account its first password; its other sign-in stays linked. Only the host command can do that: a code made by an admin under Settings > Users is for accounts that already have a password. It is still simpler to keep one admin with a username and password.
 
+If the server runs with `ALLOW_PASSWORD_LOGIN=false`, the code cannot be used until you start it again with `ALLOW_PASSWORD_LOGIN=true` (or without the variable). Turn it back off once you are in.
+
 The command asks for no password of its own: anyone with access to the machine and its data folders can run it.
 
 ## Single sign-on (OIDC)
@@ -95,6 +99,26 @@ Either way the user's own media account is linked for playback, so plays count f
 ## Scripts and the API
 
 The OpenAPI document is served at `/openapi.json` on your instance. Apart from sign-in, setup and the OAuth callbacks, every `/api/v3/*` route takes a Bearer token or the session cookie; the Wrapped API takes its own key. Everything under `/api/v3/settings/*` needs Admin, except reading the Connect Apps settings, and `/health` stays public for the container check.
+
+### Tokens for scripts
+
+A script or command-line tool should keep a token, not the account's password. It sends the token in an `Authorization: Bearer <token>` header. There are two ways to get one:
+
+- Sign in with `POST /api/v3/auth/login`, sending `"transport": "bearer"` with the username and password. The answer's `token` field holds the token. Leave the transport out and the server sets a cookie and returns no token. With `ALLOW_PASSWORD_LOGIN=false` the login route answers 403. An account that signs in only through Jellyfin sends its Jellyfin username and password to `POST /api/v3/auth/jellyfin/login` instead, with the same `transport` field, while Jellyfin sign-in is switched on.
+- From a signed-in session, `POST /api/v3/auth/device-sessions` with a `label` of 1 to 80 characters that names the script mints a token for it. The answer's `token` field holds the token. Minting a label that is already in use replaces the old token, which stops working at once. A device token cannot mint another one. The web UI has no screen for this yet.
+
+Sign in once from a shell (this needs `jq`). The password is read from a prompt, not written into the script:
+
+```bash
+printf "Password: "; read -rs DN_PASSWORD; echo; export DN_PASSWORD
+TOKEN=$(jq -nc '{username: "alice", password: $ENV.DN_PASSWORD, transport: "bearer"}' \
+  | curl -fsS https://music.example.com/api/v3/auth/login \
+      -H "Content-Type: application/json" -d @- \
+  | jq -r .token)
+unset DN_PASSWORD
+```
+
+A token lasts 30 days from when it was issued, and there is no refresh. After that the script signs in again, or a new device token is minted. The server keeps only a hash of each token, so a lost token cannot be shown again. Every token shows in Profile > Sessions, and "Sign out everywhere" ends them all. App passwords and app-connect tokens work only on the Subsonic and Jellyfin APIs, never on `/api/v3`.
 
 ### Wrapped API
 

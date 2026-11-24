@@ -68,6 +68,10 @@ pub struct TrackCommit {
     /// What an adopted file indexes as, read from the published file
     /// before the commit's transaction by [`read_adopted`].
     pub indexed: Option<crate::scan::store::CommitIndexedItem>,
+    /// The placed file's stat revision as a scan spells it, read by
+    /// [`read_placed_stats`] for a bundle written from the album's match;
+    /// `None` otherwise.
+    pub placed_stat: Option<String>,
     /// The rows a track that is not adopted was sealed against. The commit
     /// refuses the bundle when they moved, or when there is no seal.
     pub sealed: Option<CommitSeal>,
@@ -235,6 +239,7 @@ pub(super) fn commit_bundle(
                     track_id: &track.track_id,
                     identity,
                     joined: joined.is_some(),
+                    set_aside: adoption.set_aside,
                 });
             }
             if let (Some(joined), Some(join), Some(on)) = (joined, &adoption.join, &adoption.track)
@@ -258,7 +263,8 @@ pub(super) fn commit_bundle(
                 track.fingerprint,
                 track.mgmt_state.as_str(),
                 crate::clock::ms(now),
-                written
+                written,
+                track.placed_stat
             ],
         )?;
     }
@@ -448,33 +454,24 @@ pub(crate) fn joined_album(
     conn: &Connection,
     join: &AlbumJoin,
 ) -> rusqlite::Result<Option<JoinedAlbum>> {
-    let found: Option<(String, Option<String>, Option<String>)> = conn
+    let found = conn
         .query_row(
             crate::publish::sql::JOINED_ALBUM.text(),
-            rusqlite::params![join.album_id],
-            |row| {
-                let row = crate::publish::sql::JoinedAlbumRow::read(row)?;
-                Ok((row.id, row.release_mbid, row.release_group_mbid))
-            },
+            rusqlite::params![join.album_id, join.release_mbid, join.release_group_mbid],
+            crate::publish::sql::JoinedAlbumRow::read,
         )
         .optional()?;
-    let Some((album_id, release, group)) = found else {
+    let Some(row) = found else {
         return Ok(None);
     };
-    let names = |held: &Option<String>, wanted: &str| {
-        !wanted.trim().is_empty()
-            && held
-                .as_deref()
-                .is_some_and(|held| held.trim().eq_ignore_ascii_case(wanted.trim()))
-    };
-    Ok(if names(&release, &join.release_mbid) {
+    Ok(if row.release_named {
         Some(JoinedAlbum {
-            album_id,
+            album_id: row.id,
             placed: true,
         })
-    } else if names(&group, &join.release_group_mbid) {
+    } else if row.group_named {
         Some(JoinedAlbum {
-            album_id,
+            album_id: row.id,
             placed: false,
         })
     } else {
@@ -522,6 +519,8 @@ pub(crate) fn copy_folder(
 
 /// Refuse the bundle when a file's joined copy no longer sits where its
 /// placement read it: the file would be on that album in the wrong folder.
+/// A join import planning chose for the copy on the import's release is
+/// refused too once that copy no longer names the release.
 fn check_copy_seals(conn: &Connection, commit: &BundleCommit) -> Result<(), PublishError> {
     for track in &commit.tracks {
         let Some(adoption) = &track.adopt else {
@@ -530,11 +529,13 @@ fn check_copy_seals(conn: &Connection, commit: &BundleCommit) -> Result<(), Publ
         let (Some(join), Some(seal)) = (&adoption.join, &adoption.copy_seal) else {
             continue;
         };
-        let folder = match joined_album(conn, join)? {
+        let joined = joined_album(conn, join)?;
+        let left_release = join.exact && !joined.as_ref().is_some_and(|joined| joined.placed);
+        let folder = match joined {
             Some(joined) => copy_folder(conn, &joined.album_id, seal.disc)?,
             None => None,
         };
-        if folder != seal.folder {
+        if left_release || folder != seal.folder {
             return Err(PublishError::JoinChanged(
                 format!(
                     "the album of track {} moved while it was being written",
@@ -659,6 +660,27 @@ pub(super) fn read_adopted(
         )?);
     }
     Ok(())
+}
+
+/// Read the stat of each library file a commit placed, never through a
+/// link, before its transaction, as a scan spells it. Only a bundle
+/// written from the album's match ([`super::planner::PlanBundle::from_match`])
+/// reads them. A file whose stat cannot be read records none: the next
+/// scan then offers its album to identification as for any change.
+pub(super) fn read_placed_stats(tracks: &mut [TrackCommit]) {
+    for track in tracks.iter_mut().filter(|track| track.adopt.is_none()) {
+        track.placed_stat = match paths::FileStat::read(Path::new(&track.file_path)) {
+            Ok(stat) => Some(crate::scan::exact_stat_revision(stat.size, stat.mtime_ns)),
+            Err(error) => {
+                tracing::warn!(
+                    track_id = %track.track_id,
+                    %error,
+                    "the placed file's stat was not read; the next scan reads it as any change"
+                );
+                None
+            }
+        };
+    }
 }
 
 /// What the published file at `path` (`root_id:rel_path`) indexes as,

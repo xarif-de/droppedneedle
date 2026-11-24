@@ -12,6 +12,7 @@ use droppedneedle_kernel::jobs::{
 use tokio::runtime::Handle;
 
 use super::clock::LibraryClock as _;
+use super::identify::queue::Answering;
 use super::publish::PublishError;
 use super::publish::expiry::{self, ExpiryPass, ExpiryReport};
 use super::publish::paths::{Root, Sandbox};
@@ -47,6 +48,8 @@ const UNDO_MOVE_BUSY_RETRY: Duration = Duration::from_secs(5);
 const UNDO_MOVE_BUSY_CAP: Duration = Duration::from_secs(300);
 /// Recycle-bin expiry.
 pub const RECYCLE_EXPIRY_JOB: &str = "library-recycle-expiry";
+/// The daily look again at unmatched and guessed albums.
+pub const RELOOK_JOB: &str = "library-identify-relook";
 
 /// Every always-on library loop, by name.
 pub const LOOPS: &[&str] = &[
@@ -60,6 +63,7 @@ pub const LOOPS: &[&str] = &[
     PUBLISH_JOB,
     RECYCLE_EXPIRY_JOB,
     LEFTOVERS_JOB,
+    RELOOK_JOB,
 ];
 
 /// Scan idle ceiling: how often the scan loop looks for scheduled work
@@ -101,6 +105,45 @@ struct Drain {
     store_failed: bool,
 }
 
+/// What one drain did about the jobs an outage left in Attention: at most
+/// one probe, then, once the probe showed its service answering, one
+/// requeue of the jobs waiting on that service.
+#[derive(Default)]
+struct AfterOutage {
+    probed: bool,
+    /// The probe's job id and the code it waited out, until it lands.
+    probe: Option<(String, String)>,
+    answering: Option<Answering>,
+}
+
+impl AfterOutage {
+    /// Note what an attempt showed, when it was the probe. An attempt that
+    /// ended before asking any service shows nothing.
+    fn heard(&mut self, report: &super::identify::service::AttemptReport) {
+        use super::identify::service::{ALBUM_GONE, CHOSEN_EDITION_KEPT, PERSON_DECLINED};
+        if self
+            .probe
+            .as_ref()
+            .is_none_or(|(id, _)| *id != report.job.id)
+        {
+            return;
+        }
+        let Some((_, was)) = self.probe.take() else {
+            return;
+        };
+        if matches!(
+            report.reason_code.as_str(),
+            ALBUM_GONE | CHOSEN_EDITION_KEPT | PERSON_DECLINED
+        ) {
+            return;
+        }
+        let answering = Answering::after_probe(&was, report.job.failure_code.as_deref());
+        if answering.musicbrainz || answering.acoustid {
+            self.answering = Some(answering);
+        }
+    }
+}
+
 /// Artist ids asked about after each identification attempt, and when
 /// the queue is empty.
 const ATTEMPT_ARTIST_LOOKUPS: usize = 3;
@@ -127,6 +170,14 @@ const LEFTOVERS_EVERY: Duration = Duration::from_secs(600);
 const LEFTOVERS_JITTER: Duration = Duration::from_secs(60);
 /// Row code of a leftover check that failed.
 const LEFTOVERS_FAILED: &str = "LEFTOVER_CHECK_FAILED";
+
+/// The look-again sweep runs once a day, its first pass an hour after
+/// start, with a spread added to each.
+const RELOOK_EVERY: Duration = Duration::from_secs(86_400);
+const RELOOK_FIRST: Duration = Duration::from_secs(3600);
+const RELOOK_JITTER: Duration = Duration::from_secs(600);
+/// Row code of a look-again pass that did not run.
+const RELOOK_FAILED: &str = "IDENTIFY_RELOOK_FAILED";
 
 impl Scans {
     /// Supervisor inputs, rebuilt per call so settings-swap rebuilds
@@ -297,6 +348,7 @@ impl Identification {
     /// also saying whether a store call failed, so the loop backs off.
     async fn identify_drain(&self, stop: &CancellationToken) -> Drain {
         let mut drain = Drain::default();
+        let mut outage = AfterOutage::default();
         loop {
             if stop.is_cancelled() {
                 break;
@@ -321,6 +373,9 @@ impl Identification {
             let job = match claimed {
                 Ok(Some(job)) => job,
                 Ok(None) => {
+                    if self.after_outage(&mut outage) {
+                        continue;
+                    }
                     self.resolve_merged_artist_ids(IDLE_ARTIST_LOOKUPS, stop)
                         .await;
                     self.fetch_waiting_documents(stop).await;
@@ -341,6 +396,7 @@ impl Identification {
                 report = attempt => match report {
                     Ok(Some(report)) => {
                         drain.attempted += 1;
+                        outage.heard(&report);
                         // What the match proves about the album's artists,
                         // before automatic management plans the album.
                         if let Err(error) = self
@@ -364,7 +420,6 @@ impl Identification {
                             report.outcome,
                             super::identify::models::IdentificationOutcome::Identified
                                 | super::identify::models::IdentificationOutcome::EditionUncertain
-                                | super::identify::models::IdentificationOutcome::KeptTagged
                         ) {
                             let identification = self.clone();
                             let album = report.job.local_album_id.clone();
@@ -396,6 +451,52 @@ impl Identification {
             }
         }
         drain
+    }
+
+    /// On an empty queue, try again the jobs an outage left in Attention:
+    /// requeue those waiting on a service the drain's probe showed
+    /// answering, else queue one probe. `true` when a job was queued, so
+    /// the drain claims again.
+    fn after_outage(&self, outage: &mut AfterOutage) -> bool {
+        let now = self.clock.now_ms_u64();
+        if let Some(answering) = outage.answering.take() {
+            return match self.identify_store.requeue_after_outage(now, answering) {
+                Ok(0) => false,
+                Ok(count) => {
+                    tracing::info!(
+                        count,
+                        musicbrainz = answering.musicbrainz,
+                        acoustid = answering.acoustid,
+                        "identification that waited out an outage is tried again"
+                    );
+                    true
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "jobs that waited out an outage not queued; a later drain tries again");
+                    false
+                }
+            };
+        }
+        if outage.probed {
+            return false;
+        }
+        outage.probed = true;
+        match self.identify_store.probe_after_outage(now) {
+            Ok(Some((job_id, code))) => {
+                tracing::info!(
+                    job_id,
+                    code,
+                    "identification that waited out an outage is tried once"
+                );
+                outage.probe = Some((job_id, code));
+                true
+            }
+            Ok(None) => false,
+            Err(error) => {
+                tracing::warn!(%error, "no identification probed after an outage; a later drain tries again");
+                false
+            }
+        }
     }
 
     /// Settle a claimed job whose attempt hit a store error. Busy: the
@@ -743,6 +844,25 @@ pub(crate) fn start_loops(
                 ),
                 Ok(_) => {}
                 Err(error) => return Err(TickError::new(LEFTOVERS_FAILED, error)),
+            }
+            Ok(Next::Continue)
+        },
+    )?;
+    let (db, clock) = (setup.db.clone(), setup.core.clock.clone());
+    supervisor.periodic_blocking(
+        RELOOK_JOB,
+        Schedule::new(RELOOK_EVERY)
+            .with_initial_delay(RELOOK_FIRST)
+            .with_jitter(RELOOK_JITTER)
+            .with_backoff(Duration::from_secs(60), RELOOK_EVERY),
+        move |_ctx| {
+            match caught("look again", || {
+                super::identify::relook::look_again(&db, clock.now_ms())
+            })? {
+                Ok(0) => {}
+                Ok(offered) => tracing::info!(offered, "albums offered to identification again"),
+                // A busy database backs the loop off; the albums stay due.
+                Err(error) => return Err(TickError::new(RELOOK_FAILED, error)),
             }
             Ok(Next::Continue)
         },

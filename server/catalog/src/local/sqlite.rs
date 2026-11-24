@@ -47,34 +47,67 @@ use super::stores::{
 };
 
 /// Escape the LIKE metacharacters in a folded filter, then wrap for
-/// substring matching.
-fn like_pattern(raw: &str) -> String {
+/// substring matching; a dash matches any dash.
+pub(crate) fn like_pattern(raw: &str) -> String {
     let mut folded = droppedneedle_kernel::db::fold_text(raw);
     folded = folded
         .replace('\\', "\\\\")
         .replace('%', "\\%")
         .replace('_', "\\_");
-    format!("%{folded}%")
+    format!("%{}%", any_dash(&folded))
+}
+
+/// The dashes a title is typed with: the keyboard hyphen, and the hyphen,
+/// figure dash, en and em dash, horizontal bar and minus MusicBrainz and
+/// tag editors write, which folding keeps apart.
+pub(crate) const DASHES: [char; 7] = [
+    '-', '\u{2010}', '\u{2012}', '\u{2013}', '\u{2014}', '\u{2015}', '\u{2212}',
+];
+
+/// An escaped LIKE pattern with each dash matching any one character, so
+/// "spider-verse" finds "Spider‐Verse" and "Spider Verse".
+pub(crate) fn any_dash(pattern: &str) -> String {
+    pattern.replace(DASHES, "_")
 }
 
 /// FTS5 trigram match expression for the words of 3 or more characters in
 /// a track search, or `None` when there is no such word or the query holds
 /// a NUL byte (which would truncate the bind). Each word becomes a quoted
 /// phrase and the phrases are AND-ed, so every word must appear, in any of
-/// the indexed columns. A trigram phrase is exact substring, but only for 3
-/// or more characters: shorter phrases silently match nothing, which is why
-/// [`TextSearch`] checks short words with LIKE instead.
+/// the indexed columns. A word with a dash is any of its spellings with
+/// every dash one of [`DASHES`] or a space, so "t-pain" finds "T‐Pain" and
+/// "T Pain" and still needs the "t". A trigram phrase is exact substring,
+/// but only for 3 or more characters: shorter phrases silently match
+/// nothing, which is why [`TextSearch`] checks short words with LIKE
+/// instead.
 pub(crate) fn fts_match_phrase(raw: &str) -> Option<String> {
     let folded = droppedneedle_kernel::db::fold_text(raw);
     if folded.contains('\0') {
         return None;
     }
+    let phrase = |word: &str| format!("\"{}\"", word.replace('"', "\"\""));
     let phrases = folded
         .split_whitespace()
         .filter(|word| word.chars().count() >= 3)
-        .map(|word| format!("\"{}\"", word.replace('"', "\"\"")))
+        .map(|word| {
+            if !word.contains(DASHES) {
+                return phrase(word);
+            }
+            let spellings: Vec<String> = DASHES
+                .iter()
+                .chain(&[' '])
+                .map(|dash| phrase(&word.replace(DASHES, &dash.to_string())))
+                .collect();
+            format!("({})", spellings.join(" OR "))
+        })
         .collect::<Vec<_>>();
     (!phrases.is_empty()).then(|| phrases.join(" AND "))
+}
+
+/// Text with every dash a space, for comparing a title with a query the
+/// way the dash-forgiving patterns match them.
+pub(crate) fn dashes_as_spaces(text: &str) -> String {
+    text.replace(DASHES, " ")
 }
 
 /// A track text search on the FTS index. Every word must appear in the
@@ -442,8 +475,9 @@ impl LocalCatalog {
         .await
     }
 
-    /// The live album one release-group mbid names: the oldest copy with
-    /// files, else the oldest copy. None is absence, never failure.
+    /// The live album one release-group mbid names: a copy with files,
+    /// then one a person chose, then the oldest. None is absence, never
+    /// failure.
     pub async fn get_album_by_release_group(
         &self,
         release_group_mbid: &str,

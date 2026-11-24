@@ -177,7 +177,7 @@ async fn answers(world: &World, group: &str) -> Answers {
         in_discover_library: droppedneedle_catalog::discover::page::library::LibraryReads::new(
             db.clone(),
         )
-        .identified_albums(1000)
+        .owned_albums()
         .await
         .expect("discover's library")
         .iter()
@@ -196,7 +196,7 @@ fn owned_by(album: &str) -> Answers {
         pinned: None,
         plays: Some(album.to_owned()),
         downloads: Some(album.to_owned()),
-        in_discover_library: false,
+        in_discover_library: true,
     }
 }
 
@@ -275,6 +275,42 @@ async fn a_named_group_guess_counts_for_the_group_its_tags_name() {
     assert_eq!(answers(&world, &named).await, owned_by("al-guess"));
 }
 
+// The album views say which album's guess its files contradict, so the
+// web UI opens it as its own page rather than the group it guessed.
+#[tokio::test]
+async fn album_views_name_a_guess_its_files_contradict() {
+    let (guessed, named) = (group(1), group(2));
+    let world = world(
+        album(
+            "al-guess",
+            Some((&guessed, &release(1))),
+            Some(("unconfirmed", "NAMED_GROUP_DIFFERS")),
+            &[Some(&named)],
+        ) + &album(
+            "al-match",
+            Some((&named, &release(2))),
+            None,
+            &[Some(&named)],
+        ),
+    )
+    .await;
+    let catalog =
+        droppedneedle_catalog::local::store::LocalCatalog::new(world.runtime.db().clone());
+    let contradicted = |id: &'static str| {
+        let catalog = &catalog;
+        async move {
+            catalog
+                .get_album(id)
+                .await
+                .expect("album")
+                .expect("album exists")
+                .guess_contradicted
+        }
+    };
+    assert!(contradicted("al-guess").await);
+    assert!(!contradicted("al-match").await);
+}
+
 // A doubted guess inside the group still owns it and keeps its edition.
 #[tokio::test]
 async fn a_same_group_guess_still_owns() {
@@ -290,7 +326,6 @@ async fn a_same_group_guess_still_owns() {
         answers(&world, &g).await,
         Answers {
             pinned: Some(release(1)),
-            in_discover_library: true,
             ..owned_by("al-weak")
         }
     );
@@ -378,6 +413,7 @@ async fn acquisition_and_the_catalog_agree_on_every_kind_of_album() {
             said.owned,
             said.in_owned_set,
             said.discover_links.is_some(),
+            said.in_discover_library,
         ];
         assert!(
             all.iter().all(|answer| *answer == said.holds),

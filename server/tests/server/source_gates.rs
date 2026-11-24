@@ -407,6 +407,10 @@ const IDENTITY_USES: &[(&str, &str)] = &[
         "queues the album for automatic management, one statement",
     ),
     (
+        "management::automatic::stamp_retag_followed",
+        "the undo of a join of copies puts back the copy's \"retagged by hand\" stamp",
+    ),
+    (
         "identify::queue",
         "offers the album to identification and reads its input revision",
     ),
@@ -706,8 +710,8 @@ const DECISION_SOURCE_READS: IdentityRead = IdentityRead {
         ),
         (
             "tool/src/import/carry/sql.rs",
-            2,
-            "the offline import reads the pin rows it has just written as a person's",
+            3,
+            "the offline import reads the pin rows it has just written as a person's, and moves a pin over a match v2's own importer made",
         ),
     ],
 };
@@ -868,6 +872,7 @@ const SPAWN_SITES: &[(&str, usize, &str)] = &[
     ("acquire/src/requests/service/edition.rs", 1, AWAITED),
     ("acquire/src/search_jobs/mod.rs", 1, SEARCH),
     ("acquire/src/slskd/repository.rs", 3, AWAITED),
+    ("acquire/src/usenet/nzbget.rs", 2, AWAITED),
     ("acquire/src/usenet/sabnzbd.rs", 4, AWAITED),
     ("acquire/src/downloads/worker/mod.rs", 1, LIBRARY_CHECK),
     ("acquire/src/downloads/worker/landings.rs", 3, WORKER_CHILD),
@@ -878,11 +883,13 @@ const SPAWN_SITES: &[(&str, usize, &str)] = &[
     ("auth/src/users/hibp.rs", 1, REQUEST),
     ("catalog/src/metadata/artist.rs", 1, CATALOG_WARM),
     ("catalog/src/metadata/discovery.rs", 1, CATALOG_WARM),
+    ("catalog/src/metadata/search.rs", 1, CATALOG_WARM),
     ("catalog/src/discover/content.rs", 1, DISCOVER_BUILD),
     ("catalog/src/discover/home/mod.rs", 1, DISCOVER_BUILD),
     ("catalog/src/discover/page/mod.rs", 2, DISCOVER_BUILD),
     ("catalog/src/discover/queue/mod.rs", 1, DISCOVER_BUILD),
     ("catalog/src/local/file_lyrics.rs", 1, REQUEST),
+    ("catalog/src/local/store.rs", 1, REQUEST),
     ("catalog/src/local/perf_tests.rs", 1, BENCHMARKS),
     ("catalog/src/artwork/cache.rs", 1, IMAGE_WORK),
     ("catalog/src/artwork/cache.rs", 1, COVER_INDEX_LOAD),

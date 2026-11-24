@@ -15,7 +15,8 @@ use super::models::{
     AppPasswordCreatedResponse, AppPasswordListResponse, AppPasswordRecord, AppPasswordView,
     DeviceSessionMint, DeviceSessionResponse, LastFmConnection, LastFmSessionResponse,
     LastFmTokenResponse, LocalCredential, PasswordReset, ProfileResponse, RecoveryCode,
-    RecoveryCodeResponse, SessionListResponse, SessionView, UserRecord, UserResponse,
+    RecoveryCodeResponse, SessionListResponse, SessionView, UserDirectoryResponse, UserRecord,
+    UserResponse,
 };
 use super::roles::{Admin, Principal, Role};
 use super::stores::{LastFmError, LastFmKeys, RoleChange, StoreError, UserDeletion};
@@ -345,6 +346,7 @@ pub async fn change_password(
     current_password: &str,
     new_password: &str,
 ) -> Result<UserResponse, UsersError> {
+    deps.require_password_login()?;
     let local = deps
         .users
         .local_credential(caller.user_id())
@@ -390,6 +392,7 @@ pub async fn set_local_password(
     caller: &Principal,
     new_password: &str,
 ) -> Result<UserResponse, UsersError> {
+    deps.require_password_login()?;
     caller.require_standard_session()?;
     let existing = deps
         .users
@@ -498,6 +501,14 @@ pub fn companion_label(user_agent: &str) -> &str {
     user_agent
         .strip_prefix(COMPANION_LABEL_PREFIX)
         .unwrap_or(user_agent)
+}
+
+/// GET /users/directory: the id and display name of every user who set a
+/// display name, by name, for picking whom to share with. Nothing else
+/// about them, and never a login name.
+pub async fn user_directory(deps: &UsersDeps) -> Result<UserDirectoryResponse, UsersError> {
+    let users = deps.users.directory().await.map_err(store_internal)?;
+    Ok(UserDirectoryResponse { users })
 }
 
 /// GET /auth/sessions: own sessions, current first, then newest first.
@@ -997,6 +1008,7 @@ pub async fn admin_mint_recovery_code(
     _admin: &Admin,
     user_id: &str,
 ) -> Result<RecoveryCodeResponse, UsersError> {
+    deps.require_password_login()?;
     issue_recovery_code(
         &deps.users,
         &deps.recovery,
@@ -1033,6 +1045,7 @@ pub async fn admin_mint_recovery_code(
 /// future path that removes a local password must delete the account's
 /// pending codes in the same transaction.
 pub async fn reset_password(deps: &UsersDeps, body: &PasswordReset) -> Result<(), UsersError> {
+    deps.require_password_login()?;
     validate_password(&body.new_password)?;
     let canonical = canonicalize_recovery_code(&body.recovery_code);
     let now = clock_now(deps);

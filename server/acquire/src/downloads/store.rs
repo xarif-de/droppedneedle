@@ -305,6 +305,10 @@ pub struct QuarantineRow {
     pub release_group_mbid: Option<String>,
     /// Why it was blocklisted.
     pub reason: String,
+    /// The check that blocklisted it, when it was recorded.
+    pub reason_code: Option<Reason>,
+    /// What that check found, when it was recorded.
+    pub detail: Option<String>,
     /// Block time (unix seconds; stored as milliseconds).
     pub quarantined_at: f64,
 }
@@ -318,6 +322,10 @@ impl QuarantineRow {
             identity: row.get("identity")?,
             release_group_mbid: row.get("release_group_mbid")?,
             reason: row.get("reason")?,
+            reason_code: row
+                .get::<_, Option<String>>("reason_code")?
+                .and_then(|code| Reason::from_code(&code)),
+            detail: row.get("detail")?,
             quarantined_at: secs(row.get("quarantined_at")?),
         })
     }
@@ -1081,15 +1089,18 @@ impl<'conn> DownloadStore<'conn> {
         Ok(true)
     }
 
-    /// Blocklist a release by source identity, pruning expired rows first.
+    /// Blocklist a release by source identity, pruning expired rows first,
+    /// with the outcome that blocklisted it when there is one.
     ///
     /// The prune-on-write keeps the table small
     /// and the TTL self-heal lands on disk, not just filtered on read.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_quarantine(
         &self,
         source: &str,
         identity: &str,
         reason: &str,
+        outcome: Option<TaskOutcome<'_>>,
         release_group_mbid: Option<&str>,
         now: f64,
         ttl_seconds: f64,
@@ -1100,7 +1111,15 @@ impl<'conn> DownloadStore<'conn> {
         )?;
         self.conn.execute(
             sql::INSERT_QUARANTINE.text(),
-            rusqlite::params![source, identity, release_group_mbid, reason, ms(now)],
+            rusqlite::params![
+                source,
+                identity,
+                release_group_mbid,
+                reason,
+                ms(now),
+                outcome.map(|outcome| outcome.reason.code()),
+                outcome.map(|outcome| outcome.text),
+            ],
         )?;
         Ok(())
     }
@@ -1169,6 +1188,19 @@ impl<'conn> DownloadStore<'conn> {
         Ok(removed as i64)
     }
 
+    /// Lift the album's blocklist entries for another edition: a song may
+    /// be taken from any edition of its album.
+    pub fn delete_edition_refusals_for_album(
+        &self,
+        release_group_mbid: &str,
+    ) -> Result<i64, StoreError> {
+        let removed = self.conn.execute(
+            sql::DELETE_EDITION_REFUSALS_FOR_ALBUM.text(),
+            rusqlite::params![release_group_mbid],
+        )?;
+        Ok(removed as i64)
+    }
+
     /// Every distinct reason spelling the journal stores.
     pub fn stored_reason_spellings(&self) -> Result<Vec<String>, StoreError> {
         self.rows(sql::STORED_REASONS.text(), [], |row| row.get(0))
@@ -1183,6 +1215,17 @@ impl<'conn> DownloadStore<'conn> {
     pub fn list_retryable(&self, max_retry_count: i64) -> Result<Vec<TaskRow>, StoreError> {
         self.rows(
             sql::RETRYABLE.text(),
+            rusqlite::params![max_retry_count],
+            TaskRow::from_row,
+        )
+    }
+
+    /// Failed album tasks the retry pass never looks at again: past the retry
+    /// ceiling, or superseded by a newer task for the same ask. Upgrades are
+    /// excluded, as in [`Self::list_retryable`].
+    pub fn list_settleable(&self, max_retry_count: i64) -> Result<Vec<TaskRow>, StoreError> {
+        self.rows(
+            sql::SETTLEABLE.text(),
             rusqlite::params![max_retry_count],
             TaskRow::from_row,
         )

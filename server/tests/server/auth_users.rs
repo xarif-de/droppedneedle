@@ -258,6 +258,76 @@ async fn avatar_upload_rejects_svg_and_oversize() {
     }
 }
 
+/// Any signed-in user may list who else uses the server, to share with
+/// them, and learns each person's id and display name and nothing more.
+/// Only display names people chose are listed: one saved under Profile
+/// ("Tim" for tim included), or typed when a password account was made.
+/// A name a sign-in service gave ("First Last" for first-last) and the
+/// login name an account was made with are never listed.
+#[tokio::test]
+async fn the_user_directory_names_people_and_nothing_else() {
+    let (rig, _admin, user) = rig_with_admin().await;
+    let named = |id: &str, username: &str, display_name: &str| models::UserRecord {
+        id: id.to_owned(),
+        username: Some(username.to_owned()),
+        username_display: Some(username.to_owned()),
+        display_name: display_name.to_owned(),
+        email: None,
+        avatar_url: None,
+        role: Role::User,
+        created_at: TEST_NOW,
+        last_login_at: None,
+    };
+    rig.deps
+        .users
+        .insert(named("user-first", "first-last", "First Last"))
+        .await
+        .unwrap();
+    rig.auth
+        .users
+        .insert_with_local_credential(
+            named("user-ana", "ana", "Ana Lima"),
+            models::LocalCredential {
+                id: "cred-ana".to_owned(),
+                user_id: "user-ana".to_owned(),
+                scheme: "argon2id".to_owned(),
+                hash: crate::common::auth::password_hash().to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    let tim = rig.seed_user("tim", Role::User).await;
+    rig.seed_session(&tim.id, "sess-tim").await;
+    let (status, body) = call(
+        test_app(&rig, Some(principal_for(&tim, "sess-tim"))),
+        "PATCH",
+        "/api/v3/me",
+        Some(json!({"display_name": "Tim"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = call(
+        test_app(&rig, Some(principal_for(&user, "sess-molly"))),
+        "GET",
+        "/api/v3/users/directory",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let users = body["users"].as_array().expect("users");
+    let ids: Vec<&str> = users
+        .iter()
+        .filter_map(|user| user["id"].as_str())
+        .collect();
+    assert_eq!(ids, ["user-ana", "user-tim"], "by display name");
+    for listed in users {
+        let mut keys: Vec<&String> = listed.as_object().expect("user").keys().collect();
+        keys.sort();
+        assert_eq!(keys, ["display_name", "id"]);
+    }
+}
+
 #[tokio::test]
 async fn recovery_failures_share_one_message() {
     let (rig, admin, user) = rig_with_admin().await;

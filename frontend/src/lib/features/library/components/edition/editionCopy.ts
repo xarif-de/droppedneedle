@@ -41,6 +41,17 @@ export function editionYear(date: string | null | undefined): string | null {
 	return date?.slice(0, 4) || null;
 }
 
+const COUNTRY_NAMES = new Map([
+	['XW', 'Worldwide'],
+	['XE', 'Europe'],
+	['XU', 'Unknown country']
+]);
+
+export function countryLabel(code: string | null | undefined): string | null {
+	if (typeof code !== 'string') return null;
+	return COUNTRY_NAMES.get(code.toUpperCase()) ?? code;
+}
+
 /** Line 1 everywhere: the disambiguation, else "{first format} edition". */
 export function editionName(facts: EditionFactsLike): string {
 	const disambiguation = facts.disambiguation?.trim();
@@ -54,7 +65,7 @@ export function editionName(facts: EditionFactsLike): string {
 export function editionFactsLine(facts: EditionFactsLike): string {
 	return [
 		editionYear(facts.date),
-		facts.country,
+		countryLabel(facts.country),
 		formatsLabel(facts.formats),
 		facts.track_count ? count(facts.track_count, 'track', 'tracks') : null
 	]
@@ -138,6 +149,10 @@ export interface PlateCopy {
 }
 
 function chipFor(status: EditionStatus): PlateCopy['chip'] {
+	// An edition the app found for an album v2 carried over without one.
+	if (status.reason.code === 'CARRIED_EDITION_FOUND') {
+		return { label: 'Picked by DroppedNeedle', kind: 'picked' };
+	}
 	if (status.state === 'chosen') return { label: 'Your choice', kind: 'yours' };
 	if (status.state === 'confirmed') return { label: 'Picked by DroppedNeedle', kind: 'picked' };
 	if (status.state === 'unconfirmed') return { label: 'Best guess', kind: 'guess' };
@@ -181,7 +196,7 @@ export function plateCopy(
 		const facts = plan
 			? [
 					editionYear(plan.edition.date) ? `Released ${editionYear(plan.edition.date)}` : null,
-					plan.edition.country,
+					countryLabel(plan.edition.country),
 					formatsLabel(plan.edition.formats),
 					`${kept} of ${count(total, 'track', 'tracks')}`
 				]

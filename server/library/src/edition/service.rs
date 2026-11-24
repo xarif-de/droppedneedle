@@ -23,6 +23,7 @@ use crate::reasons;
 use crate::reidentify::candidates::evaluation;
 use crate::reidentify::models::ReidentificationCandidate;
 use crate::reidentify::store;
+use droppedneedle_auth::Admin;
 use droppedneedle_kernel::db::Lane;
 use droppedneedle_providers::RequestPriority;
 
@@ -499,16 +500,23 @@ impl Operations {
     }
 
     /// Take back the album's last edition change, decided on the album's
-    /// `expected_identity_revision`. Blocking.
+    /// `expected_identity_revision`. Lifting a "leave unmanaged" that way
+    /// needs an admin, as "Manage it again" does. Blocking.
     pub fn undo_edition_choice(
         &self,
         album_id: &str,
         expected_identity_revision: i64,
         actor: &str,
+        admin: Option<&Admin>,
     ) -> Result<(), OperationError> {
         self.db
             .write_blocking(Lane::Foreground, "operations.undo_edition_choice", |tx| {
                 choice::guard_revision(tx, album_id, expected_identity_revision)?;
+                if admin.is_none() && choice::undo_lifts_exclusion(tx, album_id)? {
+                    return Err(OperationError::Forbidden(
+                        reasons::LEAVE_UNMANAGED_UNDO_NEEDS_ADMIN,
+                    ));
+                }
                 choice::undo(tx, album_id, actor, self.clock.now_secs())
             })
     }
@@ -591,10 +599,20 @@ impl Operations {
                     {
                         choice::retry_remap(tx, &pending, reason.code, now)?
                     }
-                    // An edition the album already has is never given up: it
-                    // stays, and the album shows why its files are not on it.
+                    // An edition MusicBrainz does not list is never given
+                    // up, whether the album has it already or a person chose
+                    // or approved it: it stays, and the album shows why its
+                    // files are not on it. Only a release-group pin's
+                    // fanned-out release goes back.
                     Err(OperationError::NotFound(reason))
-                        if reason.code == reasons::EDITION_NOT_FOUND.code && place_only =>
+                        if reason.code == reasons::EDITION_NOT_FOUND.code
+                            && pending.origin == RemapOrigin::GroupPin =>
+                    {
+                        choice::give_up_remap(tx, &pending, reason.code, now)?;
+                        crate::catalog_revision::bump_catalog(tx)?;
+                    }
+                    Err(OperationError::NotFound(reason))
+                        if reason.code == reasons::EDITION_NOT_FOUND.code =>
                     {
                         choice::keep_unplaceable_choice(
                             tx,
@@ -603,12 +621,6 @@ impl Operations {
                             choice::CHOSEN_NOT_LISTED,
                             now,
                         )?;
-                        crate::catalog_revision::bump_catalog(tx)?;
-                    }
-                    Err(OperationError::NotFound(reason))
-                        if reason.code == reasons::EDITION_NOT_FOUND.code =>
-                    {
-                        choice::give_up_remap(tx, &pending, reason.code, now)?;
                         crate::catalog_revision::bump_catalog(tx)?;
                     }
                     Err(OperationError::Invalid(reason))

@@ -33,6 +33,7 @@ Everything user-editable lives in the web UI and is stored in the database, so a
 |-|-|-|
 | `CONTACT_EMAIL` | `contact@droppedneedle.com` | Contact address in the outbound User-Agent; MusicBrainz asks for one, so set your own if you run many lookups |
 | `DISCOVER_WARMER_ENABLED` | `true` | Keeps each user's Discover page and discover queue fresh in the background while they use them. `false` builds them only when someone opens the page |
+| `ALLOW_PASSWORD_LOGIN` | `true` | Username and password sign-in. `false` turns off password login, recovery and changes, so people sign in only through Plex, Jellyfin or OIDC; first-admin setup, app passwords and the v2 admin password on the upgrade page still work. Set it back to `true` and restart if the identity provider is unreachable, and before using a host recovery code ([Forgotten passwords and recovery](accounts-and-sign-in.md#forgotten-passwords-and-recovery)) |
 | `SHUTDOWN_GRACE_PERIOD` | `10` | Seconds to finish open requests and stop background work on shutdown |
 | `HTTP_TIMEOUT` | `30` | Outbound request timeout, seconds |
 | `HTTP_CONNECT_TIMEOUT` | `10` | Outbound connect timeout, seconds |
@@ -100,7 +101,7 @@ services:
 |-|-|
 | Library paths, import naming script, scan schedule, folder watching, AcoustID key, storage cap | Settings > Library |
 | Library Management profiles, previews, recovery, the recycle bin folder and retention | Library Management (admin), also reached from Organize files under Settings > Library |
-| Download clients (slskd, SABnzbd), source priority, quality tiers, picking a copy, wanted watcher, Usenet retention days | Settings > Download Client |
+| Download clients (slskd, SABnzbd, NZBGet), source priority, quality tiers, picking a copy, wanted watcher, Usenet retention days | Settings > Download Client |
 | Newznab indexers or Prowlarr | Settings > Indexers / Prowlarr |
 | Edition preferences, managing unconfirmed matches | Settings > Editions |
 | Lidarr import ([below](#lidarr-import)) | Settings > Lidarr Import |
@@ -109,7 +110,7 @@ services:
 | Navidrome | Settings > Navidrome |
 | Plex | Settings > Plex |
 | Local files (the built-in library) | Settings > Library |
-| Last.fm app key (admin, once per instance) | Settings > Last.fm |
+| Last.fm app key (admin, once per instance; the account that owns it needs Last.fm Pro from 1 December 2026) | Settings > Last.fm |
 | YouTube API key | Settings > YouTube |
 | Spotify client ID and secret | Settings > Spotify |
 | Ticketmaster and Skiddle keys, sweep scope | Settings > Live Events |
@@ -178,6 +179,6 @@ docker compose up -d
 
 Before a new version changes the database schema, DroppedNeedle writes a verified backup of the database. If an update goes wrong, see [Going back after a failed update](backups-and-restore.md#going-back-after-a-failed-update).
 
-A `:dev` tag (`droppedneedle/droppedneedle:dev`) is built from `main` on every push that changes the code, and may break. Pin a commit with `:dev-<short-sha>`. Until v3 is released, `main` and `:dev` are still v2.
+A `:dev` tag (`droppedneedle/droppedneedle:dev`) is built from `main` on every push that changes the code, and may break. Pin a commit with `:dev-<short-sha>`.
 
 Pre-releases are published to the same image under their own version tag, for example `droppedneedle/droppedneedle:v3.1.0-rc.1`. They never move `:latest`, so you only get one by asking for its tag. `:beta` always points at the newest pre-release, so testers can stay on `droppedneedle/droppedneedle:beta` and get each new one with a pull. A full release does not move it: once the version you were testing is released, switch back to `:latest`.
