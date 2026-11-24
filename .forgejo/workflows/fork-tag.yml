@@ -1,0 +1,12 @@
+# Tags xarif as v<upstream>-xarif.<n> when its lock changed (base/dagger-modules docs/fork.md);
+# the tag push runs ci.yml, which publishes the image.
+name: fork-tag
+on:
+  push: { branches: [xarif] }
+  workflow_dispatch:
+    inputs:
+      FORCE: { description: '1 = tag even when the lock is unchanged', required: false, default: '0' }
+jobs:
+  tag:
+    uses: base/dagger-modules/.forgejo/workflows/dagger-fork-tag.yml@main
+    secrets: inherit
