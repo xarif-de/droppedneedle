@@ -6,7 +6,7 @@ image:
   build-args: [PLUGIN_PYTHON=0]   # python3 only runs Python plugins (upstream Dockerfile); we run none
   publish:
     branches: []                  # only the fork's release tags v*-xarif.N publish
-    release-build-args: ["COMMIT_TAG=${CI_REF_NAME}"]   # the version check and the MusicBrainz User-Agent name the release
+    release-build-args: ["COMMIT_TAG=${CI_REF_NAME}"]   # upstream's version check names the release
 fork:
   upstream: https://github.com/DroppedNeedle/DroppedNeedle
   upstream-branch: main           # v3 moved to main with v3.0.0 (the v3 branch stopped at 2026-11-13, contained in main)
