@@ -20,32 +20,31 @@ fork drops it again.
 
 | Ref | Meaning |
 |---|---|
-| `xarif` | default branch: an upstream v3 commit + every patch topic + this infra layer. Changes only through pull requests. |
+| `xarif` | default branch: an upstream release (v3.x.y) + every patch topic + this infra layer. Changes only through pull requests. |
 | `refs/xarif/patch/<topic>` | one change, shaped like an upstream pull request (no xarif files). Not a branch: a branch push would run the upstream's own workflows on our runner. A `patch/*` branch is refused and never used |
 | `sync/next` | the next candidate, written by the bot `fork-bot` |
-| `v3.0.0-dev.<n>-xarif.<m>` | a fork release: `<n>` is the upstream commit's position on `v3` (7 digits, e.g. `0001900`; the first release still has `1857`), so later commits get higher numbers; all of them sort before upstream's `v3.0.0` |
+| `v3.x.y-xarif.<m>` | a fork release on upstream release `v3.x.y` |
+| `v3.0.0-dev.<n>-xarif.<m>` | an older fork release from the time v3 had no releases (until 2026-11-24): `<n>` is the commit's position on the old `v3` branch; all of them sort before `v3.0.0` |
 
 ## How a release happens
 
-v3 has no upstream releases yet, so the fork follows the branch `v3` (`track: branch` in
-`dagger-ci.yaml`):
+The fork follows upstream's releases (`track: release` in `dagger-ci.yaml`; upstream
+develops v3 on `main` and releases from it since v3.0.0):
 
-1. `fork-sync` runs every 6 hours. Its target is the newest commit of `v3` that is at
-   least 24 hours old and whose upstream checks all passed (upstream checks only the last
-   commit of a push). It keeps the current target for 72 hours before it moves on. It
-   rebases the patch topics onto the target in series order and adds this infra layer. If
-   the result differs from `xarif`, it pushes `sync/next` and opens or updates one pull
-   request.
+1. `fork-sync` runs every 6 hours. Its target is the newest upstream Release (not a
+   pre-release) published at least 24 hours ago. It rebases the patch topics onto the
+   target in series order and adds this infra layer. If the result differs from `xarif`,
+   it pushes `sync/next` and opens or updates one pull request.
 2. `fork-check` runs on that pull request. It recomputes the candidate (it must be
    identical) and runs the upstream test suites: server (fmt, clippy, tests, cargo-deny)
    and frontend (lint, format, type check, vitest).
 3. When the checks pass, Forgejo merges the pull request by fast-forward.
-4. `fork-tag` tags `xarif` with the next `v3.0.0-dev.<n>-xarif.<m>`; `ci` builds and
-   publishes the image.
+4. `fork-tag` tags `xarif` with the next `v3.x.y-xarif.<m>`; `ci` builds and publishes
+   the image.
 
-When upstream releases v3.0.0: an infra pull request sets `track: release` and drops
-`version` and `interval`. The first release that contains our current commit becomes the
-target, and `v3.0.0-xarif.1` sorts after every `-dev` release.
+Until 2026-11-24 the fork followed the branch `v3` (`track: branch`, releases
+`v3.0.0-dev.<n>-xarif.<m>`). Upstream stopped that branch on 2026-11-13 and moved to
+`main`; the first release target was v3.1.0, which contains the last locked v3 commit.
 
 If something needs a human, `fork-bot` opens an issue labelled `fork-blocked` (the sync
 stopped) or `fork-advisory` (a security advisory; the sync continues). Each issue says
