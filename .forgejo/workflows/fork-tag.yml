@@ -6,6 +6,11 @@ on:
   workflow_dispatch:
     inputs:
       FORCE: { description: '1 = tag even when the lock is unchanged', required: false, default: '0' }
+# One run per repo at a time; later runs queue, none is replaced
+# (base/dagger-modules docs/ci.md#one-runner-slot-per-repo).
+concurrency:
+  group: one-runner-slot-per-repo
+  cancel-in-progress: false
 jobs:
   tag:
     uses: base/dagger-modules/.forgejo/workflows/dagger-fork-tag.yml@main

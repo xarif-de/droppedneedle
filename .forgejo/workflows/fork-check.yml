@@ -3,6 +3,11 @@
 name: fork-check
 on:
   pull_request:
+# One run per repo at a time; later runs queue, none is replaced
+# (base/dagger-modules docs/ci.md#one-runner-slot-per-repo).
+concurrency:
+  group: one-runner-slot-per-repo
+  cancel-in-progress: false
 jobs:
   check:
     uses: base/dagger-modules/.forgejo/workflows/dagger-fork-check.yml@main
