@@ -138,6 +138,10 @@ fork:
     - name: server                # jobs Tests, Clippy, Format; Licenses/Audit = cargo-deny (deny: on for server/Cargo.toml)
       image: rust:1.89.0-bookworm@sha256:948f9b08a66e7fe01b03a98ef1c7568292e07ec2e4fe90d88c07bb14563c84ff
       workdir: server             # rustup follows rust-toolchain.toml, also when upstream moves it
+      # mr-boxington + Storage Box archive (base/dagger-modules docs/fork.md "cache: mbx"): measured
+      # on this workspace 2026-11-27, leaf-crate change 76 s vs 367-485 s, an evicted cache refilled
+      # in ~1.5 min instead of a cold build; a kernel change gains nothing.
+      cache: mbx
       # tests on 4 threads: the module's default test-threads (base/dagger-modules 92c5325); 16
       # threads under the runner's 8-CPU quota time out an upstream test (PoolTimedOut)
       steps:
