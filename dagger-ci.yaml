@@ -142,20 +142,30 @@ fork:
       # on this workspace 2026-11-27, leaf-crate change 76 s vs 367-485 s, an evicted cache refilled
       # in ~1.5 min instead of a cold build; a kernel change gains nothing.
       cache: mbx
+      # lld instead of GNU ld for the test binaries (rust 1.89 links with GNU ld; rust-lld is the
+      # default only from 1.90 on x86_64-unknown-linux-gnu). DROP THIS (env, `lld` in the apt step,
+      # the lld proof step) when upstream's rust-toolchain.toml moves to >= 1.90. Measured on the
+      # runner 2026-11-27, cold `cargo test --workspace --no-run`: GNU ld -j3 501 s with a cgroup
+      # memory peak of 11.4 GB (the dind limit is 12 GiB, an OOM wipes the engine cache); lld -j3
+      # 413 s / 9.2 GB, -j4 360 s / 9.9 GB, -j6 325 s / 10.1 GB. target.<triple>.rustflags is
+      # ignored once RUSTFLAGS or CARGO_ENCODED_RUSTFLAGS is set: the proof step checks the linker.
+      env:
+        CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -Clink-arg=-fuse-ld=lld
       # tests on 4 threads: the module's default test-threads (base/dagger-modules 92c5325); 16
       # threads under the runner's 8-CPU quota time out an upstream test (PoolTimedOut)
       steps:
-        - apt-get update -qq && apt-get install -y -qq --no-install-recommends cmake   # opusic-sys builds a bundled C library
+        - apt-get update -qq && apt-get install -y -qq --no-install-recommends cmake lld   # cmake: opusic-sys builds a bundled C library; lld: see env
         - rustup component add clippy rustfmt
         - cargo fmt --check
         - cargo clippy --workspace --all-targets -- -D warnings
         - cargo clippy --workspace --lib --bins -- -D warnings
-        # -j 3: at the default (one build job per CPU) this step filled the dind container's
-        # then 8 GiB and the run thrashed for hours (sync PR #75, 2026-10-27: `cargo test` from
-        # 01:20Z, OOM kill in the runner pod at 03:04Z; kubernetes/forgejo-runner now allows
-        # 12 GiB). Linking the test binaries in parallel is the measured peak: locally
-        # `ld terminated with signal 9` in a 16 GiB VM at the default, green at -j 3.
-        - cargo test --workspace -j 3
+        # -j 4 with lld (above: 9.9 GB peak, a 2 GB margin to the 12 GiB dind). History: at the
+        # default (one build job per CPU) this step filled the dind container's then 8 GiB and the
+        # run thrashed for hours (sync PR #75, 2026-10-27: OOM kill in the runner pod at 03:04Z);
+        # with GNU ld `ld terminated with signal 9` in a 16 GiB VM at the default, green at -j 3.
+        - cargo test --workspace -j 4
+        # Proof that the test binaries were linked by lld, not silently by GNU ld (see env).
+        - 'f=$(find "${CARGO_TARGET_DIR:-target}/debug/deps" -maxdepth 1 -type f -perm -u+x -name "droppedneedle_kernel-*" | head -1) && readelf -p .comment "$f" | grep -q "LLD" && echo "linked by lld: $f"'
     - name: frontend              # jobs Lint, Format & Type Check, Tests
       image: node:22-bookworm@sha256:7c400d78797d8cbe3f6bb21d2227b86af4cd24b0014cc9f62ff989cc16de988e
       workdir: frontend           # .github/node-version: 22; pnpm from package.json packageManager
